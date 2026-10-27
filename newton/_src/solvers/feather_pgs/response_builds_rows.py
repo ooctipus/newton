@@ -1,0 +1,2920 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build the row responses of the free-body and factor-row representations, and publish their velocities.
+
+A :class:`.response_operator.ResponseOperator` owns the arithmetic a sweep runs on a row's response. Its *build*
+forms that response from the row's Jacobian and the mass operator, and its *publication* turns the impulses a solve
+applied into velocities outside the sweeps. This module holds the builds and publications of four representations:
+
+- :class:`.response_operator.FreeBody6` (rows over at most two free bodies): each body's ``H^-1`` (the Schur inverse
+  of its spatial inertia), each row's ``MiJt = H^-1 J^T`` per body and ``1 / A_ii``, the rows' body coordinates in
+  each addressing a mapping reads (a world's local body slots, world and global coordinates, the packed row word),
+  and the publication ``v += M^-1 J^T lambda`` of a world's impulses;
+- :class:`.response_operator.SparsePairJY` (a compact dense articulation plus two scalar coordinates): a row's dense
+  response through the compact factor, its two sparse slots ``(J, J / m)`` merged when they share a coordinate, and
+  its diagonal ``(dense + sparse) + cfm``;
+- :class:`.response_operator.SparseFactor` (rows ``Z = L^-1 P J^T`` packed by support): the internal rows' unit
+  columns of ``L^-1`` (position limits, velocity limits, mimic), and the publication ``v = v_hat + P^T L^-T u`` of a
+  world's factor-coordinate velocity change;
+- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): ``Z = L^-1
+  J^T`` with ``A_ii = |Z|^2 + cfm`` in a world without free-body rows, ``Y = L^-T Z`` with ``A_ii = J Y + cfm``
+  otherwise, and the held form ``L^T Y`` of physical rows;
+
+and :class:`BilateralElimination`, the Schur transform of a :class:`.response_operator.DenseJY` build that folds a
+world's bilateral block into the responses of its other rows.
+
+**API.** Each operator class returns its build from ``build()`` (``FreeBody6.build()``, ``SparsePairJY.build()``,
+``SparseFactor.build()``, ``FactorRows.build()``): a frozen descriptor whose members are the Warp kernels (or cached
+factories of kernel variants, or a Warp function) of each step of the build and of the publication. A member keeps
+the parameters, order and dispatch of the kernel or factory it replaces, so a launch site takes either unchanged;
+:data:`DROP_INS` maps each replaced module global to its member. The arithmetic of a step is one function per
+representation and mapping, called by every kernel that runs the step:
+
+- the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``bilateral_product``...):
+  a Warp kernel keeps the expression tree of the code it replaces, bit for bit on both devices, and its adjoint;
+- the native kernels call the operator's emitters (:meth:`.FreeBody6.pack` writes the row word that
+  :meth:`.FreeBody6.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
+  :class:`.SparseFactor` reads; :meth:`.FactorRows.forward` and :meth:`.FactorRows.transposed` are the factor
+  products of a lane per coordinate).
+
+Where two sites of a step differ only by accident (the order of an operation, a guard), the step keeps each site's
+form, chosen by a compile-time argument, and its documentation names the difference: the forms are unified when the
+replaced sites are removed.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Callable
+from functools import cache
+
+import warp as wp
+
+from ...sim import BodyFlags
+from . import kernel_template
+from .compact_contact import CompactBoundary, _Vec6, solve_six
+from .contact_input import ContactInput
+from .contact_laws import (
+    contact_bodies,
+    contact_friction,
+    contact_friction_points,
+    contact_geometry,
+    contact_points,
+    contact_restitution,
+    contact_row_frame,
+    contact_tangent_basis,
+    free_body_jacobian,
+    jacobian_entry,
+    prescribed_target,
+)
+from .dense_rows import DenseRows
+from .device_preludes import cuda_native, dual_native, lane_group
+from .friction_patches import FrictionPatches, patch_friction_location
+from .kernel_template import Dispatch, KernelTemplate, python_kernel
+from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_MIMIC,
+    PREELIM_MAX_ROWS,
+    _preelim_vec,
+    dense_cholesky,
+    dense_index,
+    preelim_solve,
+    spatial_matrix_block_inverse,
+)
+from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
+from .projection_laws import PROJECTION_LAW
+from .response_operator import FactorComponent, FactorRows, FreeBody6, Lanes
+from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
+from .row_metadata import _validate_mf_metadata_encoding
+from .sparse_mass_matrix import _SparseMassMatrixIndices, _SparseRowSupport
+from .sparse_row_projection import _sparse_contact_projection_source
+from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_record
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Free-body rows (FreeBody6)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A free-body row acts on at most two free rigid bodies, ``a`` and ``b`` (a negative body for none), through six
+# Jacobian entries each. Its response is ``MiJt = H^-1 J^T`` per body, with ``H`` the body's spatial inertia in
+# articulation-local coordinates (its free root joint's), and the sweeps step by ``1 / A_ii`` with
+# ``A_ii = cfm + J_a MiJt_a + J_b MiJt_b``. A body's six velocity coordinates start at its articulation's first
+# coordinate, in the addressing the mapping reads: global (``articulation_dof_start``), world
+# (``articulation_world_dof_offset``) or the world's local body slot (:func:`free_body_slot`).
+
+
+@wp.func
+def body_coordinate(body: int, body_to_articulation: wp.array[int], first: wp.array[int]) -> int:
+    """The first velocity coordinate of ``body`` in the addressing ``first`` (per articulation), -1 for no body."""
+    if body < 0:
+        return -1
+    return first[body_to_articulation[body]]
+
+
+@wp.func
+def free_body_inverse(inertia: wp.spatial_matrix, kinematic: bool) -> wp.spatial_matrix:
+    """``H^-1`` of a free body: the Schur inverse of its spatial inertia's 3x3 blocks; zero for a kinematic body.
+
+    ``H`` is the spatial inertia alone: a free joint's armature is not part of it (the articulated factors add
+    armature to ``H``'s diagonal).
+    """
+    if kinematic:
+        return wp.spatial_matrix(0.0)
+    return spatial_matrix_block_inverse(inertia)
+
+
+@wp.func
+def free_body_side(inverse: wp.spatial_matrix, jacobian: wp.spatial_vector):
+    """One body's response ``H^-1 J^T`` and its term ``J H^-1 J^T`` of the diagonal (Warp's matrix-vector product:
+    column 0 times ``J_0``, then each later column's product added in order)."""
+    response = inverse * jacobian
+    return response, wp.dot(jacobian, response)
+
+
+@wp.func
+def free_body_response(
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    world: int,
+    row: int,
+    body_a: int,
+    body_b: int,
+    inverse: wp.array[wp.spatial_matrix],
+    cfm: float,
+    MiJt_a: wp.array3d[float],
+    MiJt_b: wp.array3d[float],
+) -> float:
+    """Build row ``row``'s responses ``MiJt_a``, ``MiJt_b`` and return its stored diagonal ``1 / A_ii``.
+
+    ``A_ii = cfm + J_a MiJt_a + J_b MiJt_b`` adds each present body's term in turn to ``cfm``; a non-positive
+    ``A_ii`` stores zero (the row does not move).
+    """
+    jacobian_a = wp.spatial_vector(
+        J_a[world, row, 0],
+        J_a[world, row, 1],
+        J_a[world, row, 2],
+        J_a[world, row, 3],
+        J_a[world, row, 4],
+        J_a[world, row, 5],
+    )
+    jacobian_b = wp.spatial_vector(
+        J_b[world, row, 0],
+        J_b[world, row, 1],
+        J_b[world, row, 2],
+        J_b[world, row, 3],
+        J_b[world, row, 4],
+        J_b[world, row, 5],
+    )
+    diagonal = cfm
+    if body_a >= 0:
+        response, term = free_body_side(inverse[body_a], jacobian_a)
+        diagonal += term
+        for k in range(6):
+            MiJt_a[world, row, k] = response[k]
+    if body_b >= 0:
+        response, term = free_body_side(inverse[body_b], jacobian_b)
+        diagonal += term
+        for k in range(6):
+            MiJt_b[world, row, k] = response[k]
+    if diagonal > 0.0:
+        return 1.0 / diagonal
+    return 0.0
+
+
+@wp.func
+def free_body_row_velocity(
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    world: int,
+    row: int,
+    body_a: int,
+    body_b: int,
+    body_to_articulation: wp.array[int],
+    first: wp.array[int],
+    velocity: wp.array[float],
+) -> float:
+    """``J_row v`` over a velocity in the addressing ``first``: from zero, body ``a``'s six products, then ``b``'s."""
+    value = float(0.0)
+    if body_a >= 0:
+        start = body_coordinate(body_a, body_to_articulation, first)
+        for k in range(6):
+            value += J_a[world, row, k] * velocity[start + k]
+    if body_b >= 0:
+        start = body_coordinate(body_b, body_to_articulation, first)
+        for k in range(6):
+            value += J_b[world, row, k] * velocity[start + k]
+    return value
+
+
+@wp.func
+def free_body_row_rhs(
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+    world: int,
+    row: int,
+    body_a: int,
+    body_b: int,
+    row_type: int,
+    phi: float,
+    target: float,
+    restitution: float,
+    body_to_articulation: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    incident_velocity: wp.array[float],
+    max_depenetration_velocity: wp.array[float],
+    beta: float,
+    contact_w: float,
+    dt: float,
+    speculative_scale: float,
+    restitution_threshold: float,
+):
+    """A free-body row's position-pass ``rhs`` and regularization weight, by the row laws (:mod:`.row_laws`).
+
+    A contact takes :func:`.row_laws.contact_rhs` with its bodies' depenetration cap, and, when restitutive, the
+    rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity less its target (weight 1); a
+    friction row its anchor law (the row builder folded the anchor gain into ``phi``); a speed row ``phi -
+    target`` (its limit); any other row ``-target``. The sweeps recompute ``J v``: ``rhs`` holds the bias only.
+    """
+    inv_dt = 1.0 / dt
+    rhs = -target
+    row_w = float(1.0)
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        cap = contact_depenetration_cap(body_a, body_b, max_depenetration_velocity)
+        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, 1.0, speculative_scale, contact_w, cap, 0.0)
+        if restitution > 0.0:
+            relative_incident = free_body_row_velocity(
+                J_a, J_b, world, row, body_a, body_b, body_to_articulation, articulation_dof_start, incident_velocity
+            )
+            relative_incident -= target
+            fires, bounce = contact_restitution_rhs(
+                phi, relative_incident, target, restitution, dt, restitution_threshold
+            )
+            if fires:
+                rhs = bounce
+                # An impact is impulsive, not a spring: keep the rebound exact.
+                row_w = 1.0
+    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
+        rhs, _w = row_rhs(row_type, phi, 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
+    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        rhs = phi - target
+    return rhs, row_w
+
+
+@wp.func
+def free_body_slot(
+    world: int,
+    body: int,
+    count: int,
+    capacity: int,
+    body_to_articulation: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    body_list: wp.array2d[int],
+    body_dof_start: wp.array2d[int],
+):
+    """``body``'s slot in its world's local body list and the list's new length.
+
+    A body not yet listed is appended (with its first global coordinate) while the list holds fewer than
+    ``capacity`` bodies; past it the body gets slot -1, as does no body (a negative one).
+    """
+    slot = int(-1)
+    if body >= 0:
+        for b in range(count):
+            if body_list[world, b] == body:
+                slot = b
+                break
+        if slot < 0 and count < capacity:
+            slot = count
+            body_list[world, count] = body
+            body_dof_start[world, count] = body_coordinate(body, body_to_articulation, articulation_dof_start)
+            count += 1
+    return slot, count
+
+
+@wp.func
+def free_body_publish(
+    world: int,
+    body: int,
+    component: int,
+    count: int,
+    local_body_a: wp.array2d[int],
+    local_body_b: wp.array2d[int],
+    MiJt_a: wp.array3d[float],
+    MiJt_b: wp.array3d[float],
+    impulses: wp.array2d[float],
+) -> float:
+    """``(M^-1 J^T lambda)`` at coordinate ``component`` of the world's local body ``body``: the rows in order,
+    each nonzero impulse times the row's response on that body (side ``a``, then ``b``), from zero."""
+    delta = float(0.0)
+    for i in range(count):
+        impulse = impulses[world, i]
+        if impulse == 0.0:
+            continue
+        if local_body_a[world, i] == body:
+            delta += MiJt_a[world, i, component] * impulse
+        if local_body_b[world, i] == body:
+            delta += MiJt_b[world, i, component] * impulse
+    return delta
+
+
+@wp.kernel(enable_backward=False)
+def free_body_inverse_kernel(
+    free_rigid_body_indices: wp.array[int],
+    body_I_s: wp.array[wp.spatial_matrix],
+    is_free_rigid: wp.array[int],
+    body_to_articulation: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    # outputs
+    mf_body_Hinv: wp.array[wp.spatial_matrix],
+):
+    """Store ``H^-1`` (:func:`free_body_inverse`) of each free rigid body, one thread per body."""
+    b = free_rigid_body_indices[wp.tid()]
+    art = body_to_articulation[b]
+    if art < 0:
+        return
+    if is_free_rigid[art] == 0:
+        return
+    mf_body_Hinv[b] = free_body_inverse(body_I_s[b], (body_flags[b] & BodyFlags.KINEMATIC) != 0)
+
+
+@wp.kernel(enable_backward=False)
+def free_body_rows_kernel(
+    mf_constraint_count: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    mf_body_Hinv: wp.array[wp.spatial_matrix],
+    mf_phi: wp.array2d[float],
+    mf_row_type: wp.array2d[int],
+    mf_target_velocity: wp.array2d[float],
+    mf_row_restitution: wp.array2d[float],
+    has_target_velocity: int,
+    body_to_articulation: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    incident_velocity: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
+    pgs_cfm: float,
+    pgs_beta: float,
+    contact_w: float,
+    dt: float,
+    contact_speculative_scale: float,
+    restitution_velocity_threshold: float,
+    mf_max_constraints: int,
+    # outputs
+    mf_eff_mass_inv: wp.array2d[float],
+    mf_MiJt_a: wp.array3d[float],
+    mf_MiJt_b: wp.array3d[float],
+    mf_rhs: wp.array2d[float],
+    mf_row_w: wp.array2d[float],
+):
+    """Build each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
+
+    One thread per row slot (``world * mf_max_constraints + row``). The two passes share the launch and the rows'
+    reads; the response depends on the mass and ``J`` alone, the ``rhs`` on the row laws' inputs. The row weight is
+    written only when contacts are regularized (``contact_w < 1``).
+    """
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    i = tid % mf_max_constraints
+    if i >= mf_constraint_count[world]:
+        return
+    body_a = mf_body_a[world, i]
+    body_b = mf_body_b[world, i]
+    mf_eff_mass_inv[world, i] = free_body_response(
+        mf_J_a, mf_J_b, world, i, body_a, body_b, mf_body_Hinv, pgs_cfm, mf_MiJt_a, mf_MiJt_b
+    )
+    target = float(0.0)
+    if has_target_velocity != 0:
+        target = mf_target_velocity[world, i]
+    rhs, row_w = free_body_row_rhs(
+        mf_J_a,
+        mf_J_b,
+        world,
+        i,
+        body_a,
+        body_b,
+        mf_row_type[world, i],
+        mf_phi[world, i],
+        target,
+        mf_row_restitution[world, i],
+        body_to_articulation,
+        articulation_dof_start,
+        incident_velocity,
+        rigid_body_max_depenetration_velocity,
+        pgs_beta,
+        contact_w,
+        dt,
+        contact_speculative_scale,
+        restitution_velocity_threshold,
+    )
+    mf_rhs[world, i] = rhs
+    if contact_w < 1.0:
+        mf_row_w[world, i] = row_w
+
+
+@wp.kernel(enable_backward=False)
+def free_body_map_kernel(
+    mf_constraint_count: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    body_to_articulation: wp.array[int],
+    art_dof_start: wp.array[int],
+    max_mf_bodies: int,
+    # outputs
+    mf_body_list: wp.array2d[int],
+    mf_body_dof_start: wp.array2d[int],
+    mf_body_count: wp.array[int],
+    mf_local_body_a: wp.array2d[int],
+    mf_local_body_b: wp.array2d[int],
+):
+    """List each world's bodies in row order and give every row its bodies' local slots (:func:`free_body_slot`).
+
+    One thread per world. A world with more than ``max_mf_bodies`` bodies gives the later bodies slot -1, which
+    the sweeps that read slots treat as no body.
+    """
+    world = wp.tid()
+    count = int(0)
+    for i in range(mf_constraint_count[world]):
+        slot_a, count = free_body_slot(
+            world,
+            mf_body_a[world, i],
+            count,
+            max_mf_bodies,
+            body_to_articulation,
+            art_dof_start,
+            mf_body_list,
+            mf_body_dof_start,
+        )
+        mf_local_body_a[world, i] = slot_a
+        slot_b, count = free_body_slot(
+            world,
+            mf_body_b[world, i],
+            count,
+            max_mf_bodies,
+            body_to_articulation,
+            art_dof_start,
+            mf_body_list,
+            mf_body_dof_start,
+        )
+        mf_local_body_b[world, i] = slot_b
+    mf_body_count[world] = count
+
+
+@wp.kernel(enable_backward=False)
+def free_body_coordinates_kernel(
+    mf_constraint_count: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    body_to_articulation: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    mf_max_constraints: int,
+    # outputs
+    mf_dof_a: wp.array2d[int],
+    mf_dof_b: wp.array2d[int],
+):
+    """Give each row its bodies' first world coordinates (:func:`body_coordinate`), one thread per row slot."""
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    c = tid % mf_max_constraints
+    if c >= mf_constraint_count[world]:
+        return
+    mf_dof_a[world, c] = body_coordinate(mf_body_a[world, c], body_to_articulation, articulation_world_dof_offset)
+    mf_dof_b[world, c] = body_coordinate(mf_body_b[world, c], body_to_articulation, articulation_world_dof_offset)
+
+
+@wp.kernel(enable_backward=False)
+def free_body_publish_kernel(
+    mf_constraint_count: wp.array[int],
+    mf_body_count: wp.array[int],
+    mf_body_dof_start: wp.array2d[int],
+    mf_local_body_a: wp.array2d[int],
+    mf_local_body_b: wp.array2d[int],
+    mf_MiJt_a: wp.array3d[float],
+    mf_MiJt_b: wp.array3d[float],
+    mf_impulses: wp.array2d[float],
+    max_mf_bodies: int,
+    set_output_to_delta: int,
+    # in/out
+    velocity: wp.array[float],
+):
+    """Publish the velocity change of a world's impulses (:func:`free_body_publish`) onto ``velocity``.
+
+    One thread per (world, local body, coordinate). The change replaces the velocity (``set_output_to_delta``) or
+    is added to it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
+    """
+    tid = wp.tid()
+    component = tid % 6
+    local_body = (tid // 6) % max_mf_bodies
+    world = tid // (6 * max_mf_bodies)
+    if local_body >= mf_body_count[world]:
+        return
+    global_dof = mf_body_dof_start[world, local_body] + component
+    delta = free_body_publish(
+        world,
+        local_body,
+        component,
+        mf_constraint_count[world],
+        mf_local_body_a,
+        mf_local_body_b,
+        mf_MiJt_a,
+        mf_MiJt_b,
+        mf_impulses,
+    )
+    if set_output_to_delta != 0:
+        velocity[global_dof] = delta
+    else:
+        velocity[global_dof] += delta
+
+
+@cache
+def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kernel:
+    """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBody6.pack`).
+
+    A warp per world (``wp.launch_tiled`` over the worlds, 32 threads), a lane per row; the word holds the rows'
+    world coordinates, stored inverse diagonal, right-hand side, type and parent. CUDA only. ``device_arch`` keys
+    the variant as the replaced factory's does.
+    """
+    _validate_mf_metadata_encoding(mf_max_constraints)
+    word = FreeBody6().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
+    body = f"""    int m_mf = mf_constraint_count.data[world];
+    int off_mf = world * {mf_max_constraints};
+    int off_meta = off_mf * 4;
+
+    for (int i = LANE; i < m_mf; i += STRIDE) {{
+        int da = mf_dof_a.data[off_mf + i];
+        int db = mf_dof_b.data[off_mf + i];
+        float diag = mf_eff_mass_inv.data[off_mf + i];
+        float rhs_val = mf_rhs.data[off_mf + i];
+        int rt = mf_row_type.data[off_mf + i];
+        int par = mf_row_parent.data[off_mf + i];
+
+{word}
+        *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
+    }}
+#endif
+"""
+    return KernelTemplate(
+        f"free_body_meta_{mf_max_constraints}",
+        kernel_template.params(
+            ("mf_constraint_count", wp.array[int]),
+            ("mf_dof_a", wp.array2d[int]),
+            ("mf_dof_b", wp.array2d[int]),
+            ("mf_eff_mass_inv", wp.array2d[float]),
+            ("mf_rhs", wp.array2d[float]),
+            ("mf_row_type", wp.array2d[int]),
+            ("mf_row_parent", wp.array2d[int]),
+            ("mf_meta", wp.array2d[int]),
+        ),
+        cuda_native(body, preludes=(lane_group(32),)),
+        dispatch=kernel_template.WORLDS,
+        composed=True,
+        native_name="free_body_meta_native",
+    ).kernel()
+
+
+@dataclasses.dataclass(frozen=True)
+class FreeBody6Build:
+    """The build and publication of free-body rows (:class:`.response_operator.FreeBody6`).
+
+    Attributes:
+        inverse: Each free rigid body's ``H^-1`` (:func:`free_body_inverse_kernel`); one thread per body.
+        rows: Each row's responses, stored inverse diagonal and ``rhs`` (:func:`free_body_rows_kernel`).
+        body_map: Each world's local body list and each row's body slots (:func:`free_body_map_kernel`).
+        coordinates: Each row's bodies' first world coordinates (:func:`free_body_coordinates_kernel`).
+        meta: The factory of the row-word pack (:func:`free_body_meta_kernel`).
+        publish: The velocity change of a world's impulses (:func:`free_body_publish_kernel`).
+    """
+
+    inverse: wp.Kernel
+    rows: wp.Kernel
+    body_map: wp.Kernel
+    coordinates: wp.Kernel
+    meta: Callable[[int, str], wp.Kernel]
+    publish: wp.Kernel
+
+
+FREE_BODY6 = FreeBody6Build(
+    inverse=free_body_inverse_kernel,
+    rows=free_body_rows_kernel,
+    body_map=free_body_map_kernel,
+    coordinates=free_body_coordinates_kernel,
+    meta=free_body_meta_kernel,
+    publish=free_body_publish_kernel,
+)
+"""The free-body rows' build (:meth:`.FreeBody6.build`)."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Sparse-diagonal rows (SparsePairJY)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A sparse-diagonal row acts on a world's compact dense articulation (its dense part: ``J`` and ``Y = H^-1 J^T``
+# through the articulation's compact factor) and on at most two scalar coordinates of diagonal-mass articulations
+# (its sparse slots ``s``: a world coordinate, ``J_s`` and ``Y_s = J_s / m_s``). An endpoint has a slot when its
+# articulation has the sparse size and its body a single response coordinate; two slots on one coordinate merge
+# into the first. ``A_ii = (J Y + sum_s J_s Y_s) + cfm``.
+
+
+@wp.func
+def sparse_pair_slot(
+    art: int,
+    body: int,
+    negate: bool,
+    windowed: bool,
+    size: int,
+    response_dofs: wp.array[int],
+    single_dof: wp.array[int],
+    dof_start: wp.array[int],
+    dof_offset: wp.array[int],
+    inverse_mass: wp.array[float],
+    motion: wp.array[wp.spatial_vector],
+    origin: wp.array[wp.vec3],
+    direction: wp.vec3,
+    point: wp.vec3,
+):
+    """One endpoint's sparse slot: its world coordinate (-1 for none), Jacobian entry and response ``J / m``.
+
+    The entry of the second endpoint is negated (``negate``): a row pushes its endpoints apart. The response is
+    formed where the body has a single response coordinate, or (``windowed``) only where that coordinate also lies
+    in the articulation's window; the two forms differ only for a coordinate outside its articulation, which a
+    body's coordinate never is (the contact producers' and the compact producer's forms).
+    """
+    dof = int(-1)
+    coordinate = int(-1)
+    value = float(0.0)
+    response = float(0.0)
+    if art >= 0 and body >= 0 and response_dofs[art] == size:
+        dof = single_dof[body]
+        if dof >= 0:
+            local = dof - dof_start[art]
+            if local >= 0 and local < size:
+                coordinate = dof_offset[art] + local
+                value = jacobian_entry(motion[dof], direction, point, origin[art])
+                if negate:
+                    value = -value
+                if windowed:
+                    response = value * inverse_mass[dof]
+    if not windowed:
+        if dof >= 0:
+            response = value * inverse_mass[dof]
+    return coordinate, value, response
+
+
+@wp.func
+def sparse_pair_slots(
+    art_a: int,
+    body_a: int,
+    point_a: wp.vec3,
+    art_b: int,
+    body_b: int,
+    point_b: wp.vec3,
+    direction: wp.vec3,
+    windowed: bool,
+    size: int,
+    response_dofs: wp.array[int],
+    single_dof: wp.array[int],
+    dof_start: wp.array[int],
+    dof_offset: wp.array[int],
+    inverse_mass: wp.array[float],
+    motion: wp.array[wp.spatial_vector],
+    origin: wp.array[wp.vec3],
+):
+    """A row's two sparse slots (:func:`sparse_pair_slot`), merged into the first when they share a coordinate:
+    ``(coordinate, J, Y)`` of slot 0, then of slot 1."""
+    coord_a, value_a, response_a = sparse_pair_slot(
+        art_a,
+        body_a,
+        False,
+        windowed,
+        size,
+        response_dofs,
+        single_dof,
+        dof_start,
+        dof_offset,
+        inverse_mass,
+        motion,
+        origin,
+        direction,
+        point_a,
+    )
+    coord_b, value_b, response_b = sparse_pair_slot(
+        art_b,
+        body_b,
+        True,
+        windowed,
+        size,
+        response_dofs,
+        single_dof,
+        dof_start,
+        dof_offset,
+        inverse_mass,
+        motion,
+        origin,
+        direction,
+        point_b,
+    )
+    if coord_a >= 0 and coord_a == coord_b:
+        value_a += value_b
+        response_a += response_b
+        coord_b = -1
+        value_b = 0.0
+        response_b = 0.0
+    return coord_a, value_a, response_a, coord_b, value_b, response_b
+
+
+@wp.func
+def sparse_pair_diagonal(
+    coord_0: int, value_0: float, response_0: float, coord_1: int, value_1: float, response_1: float
+):
+    """The sparse slots' term of ``A_ii``: from zero, each present slot's ``J_s Y_s`` in slot order."""
+    diagonal = float(0.0)
+    if coord_0 >= 0:
+        diagonal += value_0 * response_0
+    if coord_1 >= 0:
+        diagonal += value_1 * response_1
+    return diagonal
+
+
+@wp.func
+def sparse_pair_dense(factor: wp.array3d[float], group: int, jacobian: _Vec6):
+    """The dense part's response ``Y = H^-1 J^T`` through the group's compact six-coordinate factor
+    (:func:`.compact_contact.solve_six`) and its term ``J Y`` of the diagonal, from zero in coordinate order."""
+    response = solve_six(factor, group, jacobian)
+    diagonal = float(0.0)
+    for dof in range(6):
+        diagonal += jacobian[dof] * response[dof]
+    return response, diagonal
+
+
+@wp.kernel(enable_backward=False)
+def sparse_pair_contact_rows_kernel(
+    data: ContactInput,
+    total_num_workers: int,
+    target_size: int,
+    articulation_world_dof_offset: wp.array[int],
+    body_single_response_dof: wp.array[int],
+    diagonal_inverse_mass: wp.array[float],
+    friction_patches: FrictionPatches,
+    # outputs
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
+):
+    """Write each contact row's sparse slots (:func:`sparse_pair_slots`); a worker strides over the contacts.
+
+    A row's geometry is the contact front end's (:mod:`.contact_laws`): tangent rows act at the patch anchors when
+    patch friction is on, as in the dense Jacobian builders.
+    """
+    worker = wp.tid()
+    total_contacts = data.count[0]
+    for c in range(worker, total_contacts, total_num_workers):
+        slot = data.slot[c]
+        if data.path[c] != 0 or slot < 0:
+            continue
+        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
+            c,
+            data.shape0,
+            data.shape1,
+            data.point0,
+            data.point1,
+            data.normal,
+            data.margin0,
+            data.margin1,
+            data.shape_body,
+            data.body_q,
+        )
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        friction_a, friction_b = contact_friction_points(
+            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
+        )
+        if friction_patches.enabled != 0:
+            friction_a, friction_b = patch_friction_location(friction_patches, c)
+        world = data.world[c]
+        art_a = data.art0[c]
+        art_b = data.art1[c]
+        rows = data.slots_needed[c]
+        for row in range(3):
+            if row >= rows:
+                continue
+            direction, p0, p1 = contact_row_frame(
+                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            coord_a, value_a, response_a, coord_b, value_b, response_b = sparse_pair_slots(
+                art_a,
+                body_a,
+                p0,
+                art_b,
+                body_b,
+                p1,
+                direction,
+                False,
+                target_size,
+                data.response_dofs,
+                body_single_response_dof,
+                data.dof_start,
+                articulation_world_dof_offset,
+                diagonal_inverse_mass,
+                data.motion,
+                data.origin,
+            )
+            output_row = slot + row
+            sparse_row_dof[world, output_row, 0] = coord_a
+            sparse_row_dof[world, output_row, 1] = coord_b
+            sparse_row_jy[world, output_row, 0] = value_a
+            sparse_row_jy[world, output_row, 1] = response_a
+            sparse_row_jy[world, output_row, 2] = value_b
+            sparse_row_jy[world, output_row, 3] = response_b
+
+
+@wp.kernel(enable_backward=False)
+def sparse_pair_diagonal_kernel(
+    world_constraint_count: wp.array[int],
+    max_constraints: int,
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
+    # in/out
+    world_diag: wp.array2d[float],
+):
+    """Add each row's sparse term (:func:`sparse_pair_diagonal`) to its diagonal, which holds the dense term."""
+    tid = wp.tid()
+    world = tid // max_constraints
+    row = tid - world * max_constraints
+    if row >= world_constraint_count[world]:
+        return
+    world_diag[world, row] += sparse_pair_diagonal(
+        sparse_row_dof[world, row, 0],
+        sparse_row_jy[world, row, 0],
+        sparse_row_jy[world, row, 1],
+        sparse_row_dof[world, row, 1],
+        sparse_row_jy[world, row, 2],
+        sparse_row_jy[world, row, 3],
+    )
+
+
+@wp.func
+def sparse_pair_row_response(
+    data: ContactInput,
+    boundary: CompactBoundary,
+    world: int,
+    output_row: int,
+    group: int,
+    has_dense: bool,
+    art0: int,
+    body0: int,
+    art1: int,
+    body1: int,
+    direction: wp.vec3,
+    p0: wp.vec3,
+    p1: wp.vec3,
+):
+    """Write one compact-boundary row's dense-six part, sparse slots and diagonal ``(dense + sparse) + cfm``.
+
+    The dense Jacobian sums both endpoints' entries per coordinate of the six-coordinate articulation (each where
+    the body's coordinate mask holds the coordinate).
+    """
+    diagonal = float(0.0)
+    if has_dense:
+        jacobian = _Vec6()
+        for dof in range(6):
+            value0 = float(0.0)
+            value1 = float(0.0)
+            bit = wp.uint32(1) << wp.uint32(dof)
+            if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
+                if (data.body_mask[body0] & bit) != wp.uint32(0):
+                    value0 = jacobian_entry(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
+            if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
+                if (data.body_mask[body1] & bit) != wp.uint32(0):
+                    value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
+            jacobian[dof] = value0 + value1
+        response, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
+        for dof in range(6):
+            boundary.J[group, output_row, dof] = jacobian[dof]
+            boundary.Y[group, output_row, dof] = response[dof]
+    coord0, value0, response0, coord1, value1, response1 = sparse_pair_slots(
+        art0,
+        body0,
+        p0,
+        art1,
+        body1,
+        p1,
+        direction,
+        True,
+        boundary.sparse_size,
+        data.response_dofs,
+        boundary.body_single_dof,
+        data.dof_start,
+        boundary.dof_offset,
+        boundary.inverse_mass,
+        data.motion,
+        data.origin,
+    )
+    boundary.sparse_dof[world, output_row, 0] = coord0
+    boundary.sparse_dof[world, output_row, 1] = coord1
+    boundary.sparse_jy[world, output_row, 0] = value0
+    boundary.sparse_jy[world, output_row, 1] = response0
+    boundary.sparse_jy[world, output_row, 2] = value1
+    boundary.sparse_jy[world, output_row, 3] = response1
+    sparse = sparse_pair_diagonal(coord0, value0, response0, coord1, value1, response1)
+    data.diag[world, output_row] = (diagonal + sparse) + data.cfm
+
+
+@wp.kernel(enable_backward=False)
+def sparse_pair_limit_kernel(
+    bounds: wp.array2d[int],
+    counts: wp.array[int],
+    groups: wp.array[int],
+    factor: wp.array3d[float],
+    J: wp.array3d[float],
+    Y: wp.array3d[float],
+    cfm: wp.array2d[float],
+    diag: wp.array2d[float],
+):
+    """Respond to the bounded dense-six position-limit prefix (:func:`sparse_pair_dense`): ``A_ii = J Y + cfm``."""
+    world, row = wp.tid()
+    if row >= wp.min(bounds[world, 1], counts[world]):
+        return
+    group = groups[world]
+    jacobian = _Vec6()
+    for dof in range(6):
+        jacobian[dof] = J[group, row, dof]
+    response, diagonal = sparse_pair_dense(factor, group, jacobian)
+    for dof in range(6):
+        Y[group, row, dof] = response[dof]
+    diag[world, row] = diagonal + cfm[world, row]
+
+
+@dataclasses.dataclass(frozen=True)
+class SparsePairBuild:
+    """The build of sparse-diagonal rows (:class:`.response_operator.SparsePairJY`).
+
+    Attributes:
+        contact_rows: Each contact row's sparse slots (:func:`sparse_pair_contact_rows_kernel`); the dense part is a
+            :class:`.response_operator.DenseJY` build of the dense group.
+        diagonal: Each row's sparse term added to its dense diagonal (:func:`sparse_pair_diagonal_kernel`).
+        row_response: One compact-boundary row's dense part, slots and diagonal (:func:`sparse_pair_row_response`),
+            the response of the compact contact producer.
+        limit_response: The dense-six limit prefix's responses and diagonals (:func:`sparse_pair_limit_kernel`).
+    """
+
+    contact_rows: wp.Kernel
+    diagonal: wp.Kernel
+    row_response: wp.Function
+    limit_response: wp.Kernel
+
+
+SPARSE_PAIR = SparsePairBuild(
+    contact_rows=sparse_pair_contact_rows_kernel,
+    diagonal=sparse_pair_diagonal_kernel,
+    row_response=sparse_pair_row_response,
+    limit_response=sparse_pair_limit_kernel,
+)
+"""The sparse-diagonal rows' build (:meth:`.SparsePairJY.build`)."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Bilateral pre-elimination: the Schur transform of a DenseJY build
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# An articulation's selected bilateral rows (mimic, connect) form a block ``B``. After the DenseJY build gives every
+# row ``J_i`` and ``Y_i = H^-1 J_i^T``, the transform factors ``S = J_B Y_B + R`` (``R`` relative to ``S``'s diagonal)
+# and replaces every other row's response by ``Y'_i = Y_i - Y_B S^-1 (J_B Y_i)``, so that ``J_B Y'_i ~ 0``: a sweep's
+# impulses keep the closures, and the diagonals formed from ``J`` and ``Y'`` are the closed-loop effective masses.
+# The velocity is projected once, ``v -= Y_B S^-1 (J_B v + b_B)``, in place of the eliminated rows' Baumgarte work.
+# The block's rows keep their responses. Rows are a size group's (``J_group``, ``Y_group``), one articulation each.
+
+
+@wp.func
+def bilateral_product(
+    J: wp.array3d[float], group: int, slot: int, x: wp.array3d[float], row: int, n_dofs: int, start: float
+) -> float:
+    """``start + J_slot . x_row`` over the group's ``n_dofs`` coordinates in order (``x`` a group's rows)."""
+    acc = start
+    for d in range(n_dofs):
+        acc += J[group, slot, d] * x[group, row, d]
+    return acc
+
+
+@wp.func
+def bilateral_velocity(
+    J: wp.array3d[float], group: int, slot: int, velocity: wp.array[float], first: int, n_dofs: int, start: float
+) -> float:
+    """``start + J_slot v`` over the articulation's ``n_dofs`` coordinates from ``first``, in order."""
+    acc = start
+    for d in range(n_dofs):
+        acc += J[group, slot, d] * velocity[first + d]
+    return acc
+
+
+@wp.func
+def bilateral_response(
+    Y: wp.array3d[float], group: int, slots: wp.array[int], base: int, m: int, z: _preelim_vec, d: int
+) -> float:
+    """``(Y_B z)_d``: from zero, each block row's response at coordinate ``d`` times its weight, in block order."""
+    acc = float(0.0)
+    for p in range(m):
+        acc += Y[group, slots[base + p], d] * z[p]
+    return acc
+
+
+@wp.func
+def bilateral_rows(
+    art: int,
+    base: int,
+    mimic_slot: wp.array[int],
+    mimic_art_start: wp.array[int],
+    mimic_art_list: wp.array[int],
+    n_mimic: int,
+    connect_slot: wp.array[int],
+    connect_art: wp.array[int],
+    n_connect: int,
+    J_group: wp.array3d[float],
+    group: int,
+    n_dofs: int,
+    preelim_slots: wp.array[int],
+) -> int:
+    """Select the articulation's block rows into ``preelim_slots[base:]`` and return their count.
+
+    The articulation's mimic rows, then its connect rows (three per closure), from the rows' own ownership tables
+    (not the world's row types, which would admit other articulations' zero rows); a row with ``|J|^2 <= 1e-10``
+    (a degenerate connect axis) is dropped; unused entries are -1.
+    """
+    n = int(0)
+    if n_mimic > 0:
+        for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
+            k = mimic_art_list[m]
+            if mimic_slot[k] >= 0 and n < PREELIM_MAX_ROWS:
+                preelim_slots[base + n] = mimic_slot[k]
+                n += 1
+    for k in range(n_connect):
+        if connect_art[k] == art and connect_slot[k] >= 0:
+            for a in range(3):
+                if n < PREELIM_MAX_ROWS:
+                    preelim_slots[base + n] = connect_slot[k] + a
+                    n += 1
+    count = int(0)
+    for p in range(n):
+        s = preelim_slots[base + p]
+        if bilateral_product(J_group, group, s, J_group, s, n_dofs, 0.0) > 1.0e-10:
+            preelim_slots[base + count] = s
+            count += 1
+    for p in range(count, PREELIM_MAX_ROWS):
+        preelim_slots[base + p] = -1
+    return count
+
+
+@wp.kernel(enable_backward=False)
+def bilateral_setup_kernel(
+    group_to_art: wp.array[int],
+    art_to_preelim: wp.array[int],
+    mimic_slot: wp.array[int],
+    mimic_art_start: wp.array[int],
+    mimic_art_list: wp.array[int],
+    n_mimic: int,
+    connect_slot: wp.array[int],
+    connect_art: wp.array[int],
+    n_connect: int,
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    n_dofs: int,
+    reg_rel: float,
+    reg_floor: float,
+    # outputs
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    S_scratch: wp.array[float],
+    reg: wp.array[float],
+    LS: wp.array[float],
+):
+    """Select an articulation's block (:func:`bilateral_rows`), form ``S = J_B Y_B`` and factor ``S + R``.
+
+    One thread per articulation of the size group, after the DenseJY build. ``R_pp = reg_rel S_pp + reg_floor``:
+    relative to the row's own diagonal, so that a near-redundant closure axis (float32 cancellation noise around a
+    zero pivot) stays positive at any mass scale; the redundant axis turns ``reg_rel`` soft.
+    """
+    group = wp.tid()
+    art = group_to_art[group]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    base = pe * PREELIM_MAX_ROWS
+    m = bilateral_rows(
+        art,
+        base,
+        mimic_slot,
+        mimic_art_start,
+        mimic_art_list,
+        n_mimic,
+        connect_slot,
+        connect_art,
+        n_connect,
+        J_group,
+        group,
+        n_dofs,
+        preelim_slots,
+    )
+    preelim_nB[pe] = m
+    if m == 0:
+        return
+    s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
+    for p in range(m):
+        sp = preelim_slots[base + p]
+        for q in range(m):
+            S_scratch[s_base + dense_index(m, p, q)] = bilateral_product(
+                J_group, group, sp, Y_group, preelim_slots[base + q], n_dofs, 0.0
+            )
+    for p in range(m):
+        reg[base + p] = reg_rel * S_scratch[s_base + dense_index(m, p, p)] + reg_floor
+    dense_cholesky(m, S_scratch, reg, s_base, base, LS)
+
+
+@wp.kernel(enable_backward=False)
+def bilateral_correct_kernel(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    art_to_preelim: wp.array[int],
+    constraint_count: wp.array[int],
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    LS: wp.array[float],
+    J_group: wp.array3d[float],
+    n_dofs: int,
+    max_constraints: int,
+    n_arts: int,
+    # outputs
+    Y_group: wp.array3d[float],
+):
+    """Correct every other row's response, ``Y_i -= Y_B S^-1 (J_B Y_i)``, one thread per (articulation, row).
+
+    A row the block does not see (``J_B Y_i`` exactly zero: another articulation's row) keeps its response; the
+    block's rows keep theirs for the projection.
+    """
+    idx = wp.tid()
+    group = idx // max_constraints
+    i = idx % max_constraints
+    if group >= n_arts:
+        return
+    art = group_to_art[group]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    world = art_to_world[art]
+    if i >= constraint_count[world]:
+        return
+    base = pe * PREELIM_MAX_ROWS
+    m = preelim_nB[pe]
+    if m == 0:
+        return
+    for p in range(m):
+        if preelim_slots[base + p] == i:
+            return
+    w = _preelim_vec()
+    nonzero = int(0)
+    for p in range(m):
+        acc = bilateral_product(J_group, group, preelim_slots[base + p], Y_group, i, n_dofs, 0.0)
+        w[p] = acc
+        if acc != 0.0:
+            nonzero = 1
+    if nonzero == 0:
+        return
+    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, w)
+    for d in range(n_dofs):
+        Y_group[group, i, d] -= bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
+
+
+@wp.kernel(enable_backward=False)
+def bilateral_project_kernel(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    art_to_preelim: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    LS: wp.array[float],
+    J_group: wp.array3d[float],
+    Y_group: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    n_dofs: int,
+    # outputs
+    v_out: wp.array[float],
+):
+    """Project the velocity once, ``v -= Y_B S^-1 (J_B v + b_B)``, one thread per articulation (its own window).
+
+    After it ``J_B v = -b_B``, which the sweeps keep: every corrected response has ``J_B Y'_i ~ 0``. A coordinate
+    whose correction is exactly zero is left as it is.
+    """
+    group = wp.tid()
+    art = group_to_art[group]
+    pe = art_to_preelim[art]
+    if pe < 0:
+        return
+    m = preelim_nB[pe]
+    if m == 0:
+        return
+    base = pe * PREELIM_MAX_ROWS
+    world = art_to_world[art]
+    dof_start = articulation_dof_start[art]
+    r = _preelim_vec()
+    for p in range(m):
+        sp = preelim_slots[base + p]
+        r[p] = bilateral_velocity(J_group, group, sp, v_out, dof_start, n_dofs, world_rhs[world, sp])
+    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
+    for d in range(n_dofs):
+        acc = bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
+        if acc != 0.0:
+            v_out[dof_start + d] -= acc
+
+
+@dataclasses.dataclass(frozen=True)
+class BilateralElimination:
+    """The Schur transform of a :class:`.response_operator.DenseJY` build by a bilateral block, and its projection.
+
+    Attributes:
+        setup: Select, form and factor each articulation's block (:func:`bilateral_setup_kernel`).
+        correct: Correct the other rows' responses (:func:`bilateral_correct_kernel`), before their diagonals.
+        project: Project the velocity onto the block's constraints (:func:`bilateral_project_kernel`), once after
+            the velocity is seeded with the predictor.
+    """
+
+    setup: wp.Kernel
+    correct: wp.Kernel
+    project: wp.Kernel
+
+
+ELIMINATION = BilateralElimination(
+    setup=bilateral_setup_kernel, correct=bilateral_correct_kernel, project=bilateral_project_kernel
+)
+"""The bilateral pre-elimination of a DenseJY build."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Factor rows (SparseFactor): publication
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def factor_transpose_column(
+    factor_lookup: wp.array2d[int],
+    inverse_factor: wp.array2d[float],
+    group: int,
+    column: int,
+    u: wp.array2d[float],
+    world: int,
+    first: int,
+) -> float:
+    """``(L^-T u)_column`` in factor coordinates: from zero, ``L^-1[row, column] u_row`` for the rows at and below
+    ``column`` in order, through the factor's lookup grid (``u_row`` at ``u[world, first + row]``)."""
+    delta = float(0.0)
+    for row in range(column, factor_lookup.shape[0]):
+        entry = factor_lookup[row, column]
+        if entry >= 0:
+            delta += inverse_factor[group, entry] * u[world, first + row]
+    return delta
+
+
+@wp.kernel(enable_backward=False)
+def factor_publish_kernel(
+    group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    permutation: wp.array[int],
+    factor_lookup: wp.array2d[int],
+    inverse_factor: wp.array2d[float],
+    factor_velocity_delta: wp.array2d[float],
+    v_hat: wp.array[float],
+    v_out: wp.array[float],
+):
+    """Publish ``v = v_hat + P^T L^-T u`` from a world's factor-coordinate velocity change ``u`` once after its
+    sweeps: one thread per (articulation, factor coordinate), written at its physical coordinate."""
+    group, column = wp.tid()
+    art = group_to_art[group]
+    world = art_to_world[art]
+    delta = factor_transpose_column(
+        factor_lookup,
+        inverse_factor,
+        group,
+        column,
+        factor_velocity_delta,
+        world,
+        articulation_world_dof_offset[art],
+    )
+    dof = articulation_dof_start[art] + permutation[column]
+    v_out[dof] = v_hat[dof] + delta
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Factor rows (SparseFactor): packed rows from their support
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A factor row ``Z = L^-1 P J^T`` is nonzero only on the factor coordinates of its support (the ancestors of the
+# row's coordinates). It is packed in support order: entry ``index`` is the row's value at the support's coordinate
+# of rank ``index`` (the count of support coordinates below it), padded to the row capacity with zero values and,
+# where rows carry explicit coordinates (no support table), coordinate -1; ``A_ii = |Z|^2`` (the row law adds
+# ``cfm``). One warp packs one row (or the rows that share one support), a lane per support coordinate, and sums the
+# squares with ``SUM``. An internal row's Jacobian is a signed unit vector or a difference of two (a mimic row), so
+# its ``Z`` is a signed column of ``L^-1``, or a combination of two, read through the factor's lookup grid.
+
+
+def store_entry(offset: str, index: str, coordinate: str, value: str, explicit: str) -> list[str]:
+    """Statements that store a packed factor row's entry ``index`` (from ``offset``): its value, and its coordinate
+    where the row carries explicit coordinates (the native condition ``explicit``; empty: always)."""
+    store = f"row_dof.data[{offset} + {index}] = {coordinate};"
+    return [f"if ({explicit}) {store}" if explicit else store, f"row_factor.data[{offset} + {index}] = {value};"]
+
+
+def pad_entries(offset: str, explicit: str) -> list[str]:
+    """Statements that pad entry ``index`` of a packed factor row (from ``offset``) past its support: value zero,
+    coordinate -1 where the row carries explicit coordinates."""
+    return store_entry(offset, "index", "-1", "0.0f", explicit)
+
+
+@dataclasses.dataclass(frozen=True)
+class FactorRow:
+    """One packed row a support walk writes.
+
+    Attributes:
+        offset: The row's first entry in ``row_dof``/``row_factor``.
+        value: An entry's stored value (native, in the walk's ``value`` and ``entry``).
+        coordinate: An entry's explicit coordinate (native, in ``node``).
+        guard: A condition for the row's presence (native), or empty.
+        explicit: The condition under which the row carries explicit coordinates (native; empty: always).
+    """
+
+    offset: str
+    value: str = "value"
+    coordinate: str = "articulation_world_dof_offset.data[art] + node"
+    guard: str = ""
+    explicit: str = "!support.enabled"
+
+
+def _guarded(guard: str, statements: list[str], indent: str) -> list[str]:
+    if not guard:
+        return [indent + line for line in statements]
+    return [f"{indent}if ({guard}) {{", *(f"{indent}    {line}" for line in statements), f"{indent}}}"]
+
+
+def factor_rows(support: str, value: str, rows: tuple[FactorRow, ...], indent: str) -> str:
+    """Pack ``rows`` over the support ``support`` (a mask of factor coordinates), lane-strided, and sum ``norm``.
+
+    ``value`` declares ``const float value`` (the row's ``Z`` at factor coordinate ``node``; with the lookup's
+    ``entry``); each row stores it at the coordinate's rank (:func:`store_entry`), then the walk pads each row past
+    the support (:func:`pad_entries`). Every lane ends holding ``norm = |Z|^2``, its entries' squares summed in walk
+    order and reduced with ``SUM``.
+    """
+    walk = [
+        "float norm = 0.0f;",
+        "for (int node = LANE; node < dofs; node += STRIDE) {",
+        "    const unsigned long long bit = 1ull << node;",
+        f"    if (({support} & bit) == 0) continue;",
+        f"    const int index = COUNT({support} & (bit - 1ull));",
+        *(f"    {line}" for line in value.split("\n")),
+    ]
+    for row in rows:
+        walk += _guarded(row.guard, store_entry(row.offset, "index", row.coordinate, row.value, row.explicit), "    ")
+    walk += [
+        "    norm += value * value;",
+        "}",
+        f"const int support_count = COUNT({support});",
+        "for (int index = support_count + LANE; index < support_capacity; index += STRIDE) {",
+    ]
+    for row in rows:
+        walk += _guarded(row.guard, pad_entries(row.offset, row.explicit), "    ")
+    walk += ["}", "SUM(norm);"]
+    return "\n".join(indent + line for line in walk)
+
+
+def _column_value(column: str, scale: str = "") -> str:
+    """``const float value``: column ``column`` of ``L^-1`` at factor coordinate ``node`` (times ``scale``)."""
+    factor = "inverse_factor.data[factor_base + entry]"
+    return (
+        f"const int entry = factor_lookup.data[node * dofs + {column}];\n"
+        f"const float value = entry >= 0 ? {f'{scale} * ' if scale else ''}{factor} : 0.0f;"
+    )
+
+
+_GROUP_ARTICULATION = """
+    const int group = tid >> 5;
+    if (group >= group_to_art.shape[0]) return;
+#if !defined(__CUDA_ARCH__)
+    if ((tid & 31) != 0) return;
+#endif
+    const int art = group_to_art.data[group];
+    const int world = art_to_world.data[art];
+    const int start = articulation_dof_start.data[art];
+    const int dofs = inverse_permutation.shape[0];
+    const int capacity = rows.row_type.shape[1];
+    const int support_capacity = row_factor.shape[2];
+    const int factor_base = group * inverse_factor.shape[1];"""
+"""A warp per articulation of the factor group (``tid >> 5``; the CPU runs a warp's work on its first thread), and
+the group's sizes: coordinates, row and support capacities, the articulation's factor."""
+
+
+def _record(row: str, fields: dict[str, str], indent: str) -> str:
+    """Write row ``row``'s dense record fields (``rows.<field>.data[row] = value``), in order."""
+    return "\n".join(f"{indent}rows.{name}.data[{row}] = {value};" for name, value in fields.items())
+
+
+_LIMIT_ROWS = """$ARTICULATION
+    for (int base = 0; base < 2 * dofs; base += STRIDE) {
+        const int candidate = base + LANE;
+        const int local_dof = candidate >> 1;
+        const int side = candidate & 1;
+        const int dof = start + local_dof;
+        const int q_index = candidate < 2 * dofs ? limit_q_index.data[dof] : -1;
+        float gap = 0.0f;
+        int active = 0;
+        if (q_index >= 0) {
+            const auto limit = RowLaw::joint_limit_side(joint_q.data[q_index], joint_limit_lower.data[dof],
+                                                        joint_limit_upper.data[dof], side, activation_gap);
+            active = limit.v0;
+            gap = limit.v1;
+        }
+        const unsigned active_mask = BALLOT(active != 0);
+        const int first_slot = RESERVE(&slot_counter.data[world], COUNT(active_mask));
+        // Visit the ballot in lane order, matching the existing lower/upper DOF order.
+        unsigned pending = active_mask;
+        int rank = 0;
+        while (pending != 0) {
+            const int row = first_slot + rank;
+            // The reservation above still counts every over-capacity row.
+            if (row >= capacity) break;
+            const int source = FIRST(pending);
+            const int selected_dof = READ(local_dof, source);
+            const int selected_side = READ(side, source);
+            const float selected_gap = READ(gap, source);
+            const float sign = selected_side == 0 ? 1.0f : -1.0f;
+            const int column = inverse_permutation.data[selected_dof];
+            const unsigned long long support_mask = dof_mask.data[selected_dof];
+            const int row_offset = world * capacity + row;
+            const int response_offset = row_offset * support_capacity;
+$WALK
+            if (LANE == 0) {
+                if (support.enabled)
+                    support.row_class.data[row_offset] = support.limit_class.data[selected_dof];
+                row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
+$RECORD
+            }
+            pending &= pending - 1;
+            ++rank;
+        }
+    }
+"""
+
+_VELOCITY_LIMIT_ROWS = """$ARTICULATION
+    for (int local_dof = 0; local_dof < dofs; ++local_dof) {
+        const int dof = start + local_dof;
+        const int lower = velocity_limit_slot.data[2 * dof];
+        const int upper = velocity_limit_slot.data[2 * dof + 1];
+        // The existing allocator owns eligibility, ordering and overflow demand.
+        const bool write_lower = lower >= 0 && lower < capacity;
+        const bool write_upper = upper >= 0 && upper < capacity;
+        if (!write_lower && !write_upper) continue;
+        const float lower_sign = write_lower ? velocity_limit_sign.data[2 * dof] : 0.0f;
+        const float upper_sign = write_upper ? velocity_limit_sign.data[2 * dof + 1] : 0.0f;
+        const int column = inverse_permutation.data[local_dof];
+        const unsigned long long support_mask = dof_mask.data[local_dof];
+        const int lower_offset = (world * capacity + lower) * support_capacity;
+        const int upper_offset = (world * capacity + upper) * support_capacity;
+        const int dof_offset = articulation_world_dof_offset.data[art];
+$WALK
+        if (LANE == 0) {
+            const float incident = v_hat.data[dof];
+            const float target = -joint_velocity_limit.data[dof];
+            for (int side = 0; side < 2; ++side) {
+                const int row = side == 0 ? lower : upper;
+                if (row < 0 || row >= capacity) continue;
+                const float sign = side == 0 ? lower_sign : upper_sign;
+                const int row_offset = world * capacity + row;
+                if (support.enabled)
+                    support.row_class.data[row_offset] = support.limit_class.data[local_dof];
+                row_incident.data[row_offset] = sign * incident;
+                // The prefix finalizer adds CFM and forms RHS from target_velocity.
+$RECORD
+            }
+        }
+    }
+"""
+
+_MIMIC_ROWS = """$ARTICULATION
+    for (int m = mimic_art_start.data[art]; m < mimic_art_start.data[art + 1]; ++m) {
+        const int k = mimic_art_list.data[m];
+        const int row = mimic_slot.data[k];
+        if (row < 0 || row >= capacity) continue;
+        const int dof0 = mimic_dof0.data[k];
+        const int dof1 = mimic_dof1.data[k];
+        const int local0 = dof0 - start;
+        const int local1 = dof1 - start;
+        const int column0 = inverse_permutation.data[local0];
+        const int column1 = inverse_permutation.data[local1];
+        const float coefficient = mimic_coef1.data[k];
+        // Keep both structural supports even when the live coefficient is zero.
+        const unsigned long long support_mask = dof_mask.data[local0] | dof_mask.data[local1];
+        const int row_offset = world * capacity + row;
+        const int response_offset = row_offset * support_capacity;
+$WALK
+        if (LANE == 0) {
+            row_incident.data[row_offset] = v_hat.data[dof0] - coefficient * v_hat.data[dof1];
+$RECORD
+        }
+    }
+"""
+
+_MIMIC_VALUE = """const int entry0 = factor_lookup.data[node * dofs + column0];
+const int entry1 = factor_lookup.data[node * dofs + column1];
+const float value0 = entry0 >= 0 ? inverse_factor.data[factor_base + entry0] : 0.0f;
+const float value1 = entry1 >= 0 ? inverse_factor.data[factor_base + entry1] : 0.0f;
+const float value = value0 - coefficient * value1;"""
+"""A mimic row's ``Z`` at factor coordinate ``node``: ``L^-1 (e_0 - c e_1)``."""
+
+
+def _internal_row_record(kind: int, beta: str, phi: str, target: str) -> dict[str, str]:
+    """An internal row's dense record: its ``|Z|^2`` as the diagonal, no parent or friction, the row's ``cfm``."""
+    return {
+        "diag": "norm",
+        "row_type": str(kind),
+        "row_parent": "-1",
+        "row_mu": "0.0f",
+        "row_beta": beta,
+        "row_cfm": "pgs_cfm",
+        "phi": phi,
+        "target": target,
+    }
+
+
+_LIMIT_ROWS_SOURCE = kernel_template.substitute(
+    _LIMIT_ROWS,
+    ARTICULATION=_GROUP_ARTICULATION,
+    WALK=factor_rows("support_mask", _column_value("column", "sign"), (FactorRow("response_offset"),), " " * 12),
+    RECORD=_record(
+        "row_offset",
+        _internal_row_record(PGS_CONSTRAINT_TYPE_JOINT_LIMIT, "pgs_beta", "selected_gap", "0.0f"),
+        " " * 16,
+    ),
+)
+
+_VELOCITY_LIMIT_ROWS_SOURCE = kernel_template.substitute(
+    _VELOCITY_LIMIT_ROWS,
+    ARTICULATION=_GROUP_ARTICULATION,
+    WALK=factor_rows(
+        "support_mask",
+        _column_value("column"),
+        tuple(
+            FactorRow(
+                f"{side}_offset", f"entry >= 0 ? {side}_sign * value : 0.0f", "dof_offset + node", f"write_{side}"
+            )
+            for side in ("lower", "upper")
+        ),
+        " " * 8,
+    ),
+    RECORD=_record(
+        "row_offset", _internal_row_record(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, "0.0f", "0.0f", "target"), " " * 16
+    ),
+)
+
+_MIMIC_ROWS_SOURCE = kernel_template.substitute(
+    _MIMIC_ROWS,
+    ARTICULATION=_GROUP_ARTICULATION,
+    WALK=factor_rows("support_mask", _MIMIC_VALUE, (FactorRow("response_offset", explicit=""),), " " * 8),
+    RECORD=_record(
+        "row_offset",
+        _internal_row_record(
+            PGS_CONSTRAINT_TYPE_MIMIC,
+            "pgs_beta",
+            "RowLaw::mimic_phi(joint_q.data[mimic_q0.data[k]], joint_q.data[mimic_q1.data[k]], mimic_coef0.data[k], "
+            "coefficient)",
+            "0.0f",
+        ),
+        " " * 12,
+    ),
+)
+
+
+_FACTOR_GROUP = kernel_template.params(
+    ("group_to_art", wp.array[int]),
+    ("art_to_world", wp.array[int]),
+    ("articulation_world_dof_offset", wp.array[int]),
+    ("articulation_dof_start", wp.array[int]),
+)
+_FACTOR_COLUMNS = kernel_template.params(
+    ("dof_mask", wp.array[wp.uint64]),
+    ("inverse_permutation", wp.array[int]),
+    ("factor_lookup", wp.array2d[int]),
+    ("inverse_factor", wp.array2d[float]),
+    ("v_hat", wp.array[float]),
+)
+_FACTOR_OUTPUTS = kernel_template.params(
+    ("rows", DenseRows),
+    ("row_dof", wp.array3d[int]),
+    ("row_factor", wp.array3d[float]),
+    ("row_incident", wp.array2d[float]),
+)
+
+
+def _internal_rows_kernel(name: str, params, source: str, preludes) -> wp.Kernel:
+    """A warp-per-articulation internal row builder: ``32 * group_count`` threads in blocks divisible by 32."""
+    return KernelTemplate(
+        name,
+        params,
+        source,
+        kernel_template.THREADS,
+        preludes=(lane_group(32), *preludes),
+        dual=True,
+        native_name=f"_{name}",
+        module=__name__,
+    ).kernel()
+
+
+factor_limit_rows_kernel = _internal_rows_kernel(
+    "factor_limit_rows",
+    _FACTOR_GROUP
+    + kernel_template.params(
+        ("limit_q_index", wp.array[int]),
+        ("joint_limit_lower", wp.array[float]),
+        ("joint_limit_upper", wp.array[float]),
+        ("joint_q", wp.array[float]),
+        ("activation_gap", float),
+        ("pgs_beta", float),
+        ("pgs_cfm", float),
+    )
+    + _FACTOR_COLUMNS
+    + kernel_template.params(("slot_counter", wp.array[int]))
+    + _FACTOR_OUTPUTS
+    + kernel_template.params(("support", _SparseRowSupport)),
+    _LIMIT_ROWS_SOURCE,
+    ROW_LAW.preludes(),
+)
+"""The position-limit rows of each articulation and their packed columns of ``L^-1``, signed by side.
+
+Active sides (:func:`.row_laws.joint_limit_side`) reserve their rows in the articulation's lower/upper coordinate
+order; a reservation past the row capacity still counts, and writes stay within it."""
+
+factor_velocity_limit_rows_kernel = _internal_rows_kernel(
+    "factor_velocity_limit_rows",
+    _FACTOR_GROUP
+    + kernel_template.params(
+        ("joint_velocity_limit", wp.array[float]),
+        ("velocity_limit_slot", wp.array[int]),
+        ("velocity_limit_sign", wp.array[float]),
+        ("pgs_cfm", float),
+    )
+    + _FACTOR_COLUMNS
+    + _FACTOR_OUTPUTS
+    + kernel_template.params(("support", _SparseRowSupport)),
+    _VELOCITY_LIMIT_ROWS_SOURCE,
+    (),
+)
+"""The allocated signed velocity-limit rows of each coordinate: the two sides share one column and its norm.
+
+The allocator owns the slots, activation and capacity; infinite limits are kept, and no position bias is added
+(:func:`.sparse_contact.finalize_sparse_joint_limit_rows` adds ``cfm`` and forms the ``rhs``)."""
+
+factor_mimic_rows_kernel = _internal_rows_kernel(
+    "factor_mimic_rows",
+    _FACTOR_GROUP
+    + kernel_template.params(
+        ("mimic_slot", wp.array[int]),
+        ("mimic_art_start", wp.array[int]),
+        ("mimic_art_list", wp.array[int]),
+        ("mimic_dof0", wp.array[int]),
+        ("mimic_dof1", wp.array[int]),
+        ("mimic_q0", wp.array[int]),
+        ("mimic_q1", wp.array[int]),
+        ("mimic_coef0", wp.array[float]),
+        ("mimic_coef1", wp.array[float]),
+        ("joint_q", wp.array[float]),
+        ("pgs_beta", float),
+        ("pgs_cfm", float),
+    )
+    + _FACTOR_COLUMNS
+    + _FACTOR_OUTPUTS,
+    _MIMIC_ROWS_SOURCE,
+    ROW_LAW.preludes(),
+)
+"""The allocated same-articulation mimic rows: ``Z = L^-1 (e_0 - c e_1)`` over the union of both supports (kept
+when the live coefficient is zero), with explicit coordinates."""
+
+
+# A contact's rows (its normal, then its tangents) share their endpoints' support. A lane group per contact evaluates
+# each endpoint's Jacobian once into shared scratch (``J = d . (S_lin + S_ang x (p - o))`` per coordinate, with the
+# row's angular wrench about the articulation origin), with the incident velocity ``J v_hat``, then packs the rows:
+# an articulation's coordinates as factor rows ``Z = L^-1 P J^T`` through the support's columns of ``L^-1``
+# (:func:`.sparse_row_projection._sparse_contact_projection_source`, the factor-product law), a free body's six as
+# its physical Jacobian with the response ``H^-1 J^T`` through its own inverse factor (the free body keeps its
+# mass metric). ``A_ii = |Z|^2 + J H^-1 J^T + cfm``. With contact records, a full triplet also writes its block
+# record for the single-stage sweep: the cross terms ``W_nt1, W_nt2, W_t1t2``, ``1 / W_nn`` and the friction pair's
+# tangent metric (``ProjectionLaw::friction_pair_metric``) of the diagonals as written.
+
+_TRIPLET_RECORD = """
+    if (row_count == 3) {
+        SUM(cross.c[0], cross.c[1], cross.c[2]);
+        if (LANE == 0) {
+            float* record = row_free_response.data
+                + (world * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
+            record[0] = cross.c[0];
+            record[1] = cross.c[1];
+            record[2] = cross.c[2];
+            record[3] = 1.0f / (norm.c[0] + cfm);
+            // The tangent pair's metric (ProjectionLaw::friction_pair_metric), which the triplet sweeps reuse.
+            const auto metric = ProjectionLaw::friction_pair_metric(norm.c[1] + cfm, cross.c[2], norm.c[2] + cfm);
+            record[4] = metric.v1;
+            record[5] = metric.v2;
+            record[6] = metric.v3[0];
+            record[7] = metric.v3[1];
+        }
+    }
+"""
+"""A full triplet's block record (:data:`.sparse_contact.CONTACT_RECORD_FLOATS` floats), from the lanes' cross terms
+reduced in one ladder and the diagonals as written."""
+
+_CONTACT_ROWS = """
+#if defined(__CUDA_ARCH__)
+    __shared__ float storage[$STORAGE];
+    float* jacobian = storage + SUB * $SCRATCH;
+    $GEOMETRY_CUDA
+#else
+    if ((tid & ($LANES - 1)) != 0) return;
+    float jacobian[$SCRATCH];
+    $GEOMETRY_CPU
+#endif
+    float* free_factor = jacobian + $JACOBIAN;
+    const auto jacobian_value = [&](const auto& motion, int side, int row) {
+        const auto linear = wp::vec3(motion.c[0], motion.c[1], motion.c[2]);
+        const auto angular = wp::vec3(motion.c[3], motion.c[4], motion.c[5]);
+        $GEOMETRY_DOT
+        return wp::dot(direction, linear) + wp::dot(angular_wrench, angular);
+    };
+    unsigned long long mask_a = 0, mask_b = 0;
+    if (body_a >= 0 && art_a >= 0) mask_a = body_dof_mask.data[body_a];
+    if (body_b >= 0 && art_b >= 0) mask_b = body_dof_mask.data[body_b];
+    const int row_offset = world * row_factor.shape[1] + slot;
+    const int support_capacity = row_factor.shape[2];
+    int count = 0;
+    auto norm = wp::vec3(0.0f);
+${CROSS_DECL}    auto incident = wp::vec3(0.0f);
+    // Physical blocks remain a short prefix; ordinary free/free contacts use
+    // native MF storage, so production rows have at most one such block.
+    int first_endpoint = 0;
+    if (art_b >= 0 && is_free_rigid.data[art_b] != 0
+        && (art_a < 0 || is_free_rigid.data[art_a] == 0)) first_endpoint = 1;
+    for (int endpoint = 0; endpoint < 2; ++endpoint) {
+        const int side = (first_endpoint + endpoint) % 2;
+        const int art = side == 0 ? art_a : art_b;
+        if (art < 0 || (side == 1 && art == art_a)
+            || articulation_response_dof_count.data[art] <= 0) continue;
+        const int group = art_group_idx.data[art];
+        const int start = articulation_dof_start.data[art];
+        const int offset = articulation_world_dof_offset.data[art];
+        if (is_free_rigid.data[art] != 0) {
+            for (int node = LANE; node < 6; node += STRIDE) {
+                const auto motion = joint_S_s.data[start + node];
+                const float velocity = v_hat.data[start + node];
+#pragma unroll
+                for (int row = 0; row < 3; ++row) {
+                    if (row >= row_count) continue;
+                    float value = 0.0f;
+                    if (art == art_a) value += jacobian_value(motion, 0, row);
+                    if (art == art_b) value -= jacobian_value(motion, 1, row);
+                    jacobian[row * $PLANE + node] = value;
+                    incident.c[row] += value * velocity;
+                }
+            }
+            SYNC();
+            const int factor_base = group * 36;
+            for (int node = LANE; node < 6; node += STRIDE) {
+                auto value = wp::vec3(0.0f);
+                for (int column = 0; column <= node; ++column) {
+                    const float factor = free_inverse_factor.data[factor_base + node * 6 + column];
+#pragma unroll
+                    for (int row = 0; row < 3; ++row) {
+                        if (row < row_count) value.c[row] += factor * jacobian[row * $PLANE + column];
+                    }
+                }
+#pragma unroll
+                for (int row = 0; row < 3; ++row) {
+                    if (row < row_count) free_factor[row * $PLANE + node] = value.c[row];
+                }
+            }
+            SYNC();
+            for (int node = LANE; node < 6; node += STRIDE) {
+                auto response = wp::vec3(0.0f);
+                for (int column = node; column < 6; ++column) {
+                    const float factor = free_inverse_factor.data[factor_base + column * 6 + node];
+#pragma unroll
+                    for (int row = 0; row < 3; ++row) {
+                        if (row < row_count) response.c[row] += factor * free_factor[row * $PLANE + column];
+                    }
+                }
+#pragma unroll
+                for (int row = 0; row < 3; ++row) {
+                    if (row >= row_count) continue;
+                    const int response_offset = (row_offset + row) * support_capacity;
+                    const float value = jacobian[row * $PLANE + node];
+$FREE_STORE
+${FREE_RESPONSE}                    norm.c[row] += value * response.c[row];
+                }
+${FREE_CROSS}            }
+            count += 6;
+        } else {
+            unsigned long long mask = 0;
+            if (art == art_a) mask |= mask_a;
+            if (art == art_b) mask |= mask_b;
+            for (int node = LANE; node < $N; node += STRIDE) {
+                const unsigned long long bit = 1ull << node;
+                if ((mask & bit) == 0) continue;
+                const int physical = permutation.data[node];
+                const auto motion = joint_S_s.data[start + physical];
+                const float velocity = v_hat.data[start + physical];
+#pragma unroll
+                for (int row = 0; row < 3; ++row) {
+                    if (row >= row_count) continue;
+                    float value = 0.0f;
+                    if (art == art_a && (mask_a & bit) != 0)
+                        value += jacobian_value(motion, 0, row);
+                    if (art == art_b && (mask_b & bit) != 0)
+                        value -= jacobian_value(motion, 1, row);
+                    jacobian[row * $PLANE + node] = value;
+                    incident.c[row] += value * velocity;
+                }
+            }
+            SYNC();
+            const int factor_base = group * inverse_factor.shape[1];
+            for (int node = LANE; node < $N; node += STRIDE) {
+                const unsigned long long bit = 1ull << node;
+                if ((mask & bit) == 0) continue;
+                $SPARSE_PROJECTION
+                const int index = count + COUNT(mask & (bit - 1ull));
+#pragma unroll
+                for (int row = 0; row < 3; ++row) {
+                    if (row >= row_count) continue;
+                    const int response_offset = (row_offset + row) * support_capacity;
+$FACTOR_STORE
+                    norm.c[row] += value.c[row] * value.c[row];
+                }
+${FACTOR_CROSS}            }
+            count += COUNT(mask);
+        }
+        // The next endpoint reuses the same group-local Jacobian storage.
+        SYNC();
+    }
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+        if (row >= row_count) continue;
+        const int response_offset = (row_offset + row) * support_capacity;
+        for (int index = count + LANE; index < support_capacity; index += STRIDE) {
+$PAD
+        }
+        SUM(norm.c[row], incident.c[row]);
+        if (LANE == 0) {
+            if ($SUPPORT_TABLE) {
+                const int class_a = mask_a != 0ull && art_a >= 0 && articulation_response_dof_count.data[art_a] > 0
+                    ? support.body_class.data[body_a] : 0;
+                const int class_b = mask_b != 0ull && art_b >= 0 && articulation_response_dof_count.data[art_b] > 0
+                    ? support.body_class.data[body_b] : 0;
+                support.row_class.data[row_offset + row] = support.pair_class.data[
+                    class_a * support.pair_class.shape[1] + class_b];
+            }
+            row_incident.data[row_offset + row] = incident.c[row];
+            diagonal.data[row_offset + row] = norm.c[row] + cfm;
+        }
+    }
+${RECORD}"""
+
+_GEOMETRY_CUDA = """
+    auto angular_a_shared = angular_a;
+    auto angular_b_shared = angular_b;
+    auto directions_shared = directions;
+#pragma unroll
+    for (int row = 0; row < 3; ++row) {
+        if (row >= row_count) continue;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            angular_a_shared.data[row][k] = READ(angular_a.data[row][k], 0);
+            angular_b_shared.data[row][k] = READ(angular_b.data[row][k], 0);
+            directions_shared.data[row][k] = READ(directions.data[row][k], 0);
+        }
+    }
+"""
+_GEOMETRY_CPU = """
+    const auto angular_a_shared = angular_a;
+    const auto angular_b_shared = angular_b;
+    const auto directions_shared = directions;
+"""
+_GEOMETRY_DOT = """
+        const auto& angular_wrenches = side == 0 ? angular_a_shared : angular_b_shared;
+        const auto direction = wp::vec3(directions_shared.data[row][0],
+            directions_shared.data[row][1], directions_shared.data[row][2]);
+        const auto angular_wrench = wp::vec3(angular_wrenches.data[row][0],
+            angular_wrenches.data[row][1], angular_wrenches.data[row][2]);
+"""
+# With prepared rows the geometry is shared by the contact, not live in every lane throughout the factor
+# contraction: volatile reads keep loop-invariant loads from restoring the matrix triplet to lane registers.
+_GEOMETRY_COPY = """
+#pragma unroll
+        for (int row = 0; row < 3; ++row) {
+            if (row >= row_count) continue;
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                geometry[row * 9 + k] = directions.data[row][k];
+                geometry[row * 9 + 3 + k] = angular_a.data[row][k];
+                geometry[row * 9 + 6 + k] = angular_b.data[row][k];
+            }
+        }
+"""
+_PREPARED_GEOMETRY_DOT = """
+        const int angular_offset = row * 9 + 3 + side * 3;
+        const auto direction = wp::vec3(geometry[row * 9], geometry[row * 9 + 1], geometry[row * 9 + 2]);
+        const auto angular_wrench = wp::vec3(geometry[angular_offset],
+            geometry[angular_offset + 1], geometry[angular_offset + 2]);
+"""
+
+
+def _contact_rows_source(n: int, lanes: int, warps: int, prepare_rows: bool, table: bool, records: bool) -> str:
+    """The native projection of one contact's rows (see the section's comment), for ``lanes`` lanes per contact."""
+    groups = warps * 32 // lanes
+    scratch = max(n, 6) + 6
+    geometry = 27 if prepare_rows else 0
+    explicit = f"!{str(table).lower()}"
+    free_store = store_entry("response_offset", "count + node", "offset + node", "value", explicit)
+    factor_store = store_entry("response_offset", "index", "offset + node", "value.c[row]", explicit)
+    cross = {
+        "CROSS_DECL": "",
+        "FREE_RESPONSE": "                    row_free_response.data[(row_offset + row) * row_free_response.shape[2]"
+        " + count + node] = response.c[row];\n",
+        "FREE_CROSS": "",
+        "FACTOR_CROSS": "",
+        "RECORD": "",
+    }
+    if records:
+        cross = {
+            "CROSS_DECL": "    auto cross = wp::vec3(0.0f);\n",
+            "FREE_RESPONSE": "",
+            "FREE_CROSS": f"""                if (row_count == 3) {{
+                    cross.c[0] += jacobian[node] * response.c[1];
+                    cross.c[1] += jacobian[node] * response.c[2];
+                    cross.c[2] += jacobian[{scratch} + node] * response.c[2];
+                }}
+""",
+            "FACTOR_CROSS": """                if (row_count == 3) {
+                    cross.c[0] += value.c[0] * value.c[1];
+                    cross.c[1] += value.c[0] * value.c[2];
+                    cross.c[2] += value.c[1] * value.c[2];
+                }
+""",
+            "RECORD": _TRIPLET_RECORD,
+        }
+    geometry_cuda, geometry_cpu, geometry_dot = _GEOMETRY_CUDA, _GEOMETRY_CPU, _GEOMETRY_DOT
+    if prepare_rows:
+        geometry_cuda = (
+            f"volatile float* geometry = jacobian + {3 * scratch};\nif (LANE == 0) {{\n"
+            + _GEOMETRY_COPY
+            + "}\nSYNC();\n"
+        )
+        geometry_cpu = "float geometry[27];\n" + _GEOMETRY_COPY
+        geometry_dot = _PREPARED_GEOMETRY_DOT
+    return kernel_template.substitute(
+        _CONTACT_ROWS,
+        SPARSE_PROJECTION=_sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=scratch),
+        GEOMETRY_CUDA=geometry_cuda,
+        GEOMETRY_CPU=geometry_cpu,
+        GEOMETRY_DOT=geometry_dot,
+        STORAGE=groups * (3 * scratch + geometry),
+        LANES=lanes,
+        SCRATCH=3 * scratch + geometry,
+        PLANE=scratch,
+        JACOBIAN=max(n, 6),
+        N=n,
+        SUPPORT_TABLE=str(table).lower(),
+        FREE_STORE="\n".join(" " * 20 + line for line in free_store),
+        FACTOR_STORE="\n".join(" " * 20 + line for line in factor_store),
+        PAD="\n".join(" " * 12 + line for line in pad_entries("response_offset", explicit)),
+        **cross,
+    )
+
+
+@cache
+def factor_contact_rows_kernel(
+    dof_count: int,
+    *,
+    lanes_per_contact: int = 8,
+    warps_per_block: int = 4,
+    prepare_rows: bool = False,
+    use_support_table: bool = False,
+    contact_records: bool = False,
+) -> wp.Kernel:
+    """Pack each contact's rows in factor coordinates (see the section's comment), a lane group per contact.
+
+    The contact front end (:mod:`.contact_laws`) gives each row its frame and each endpoint's angular wrench; with
+    ``prepare_rows`` it also writes the rows' records and right-hand sides by the row laws (bias, ``cfm`` and, after
+    the projection, a restitutive normal's rebound from its incident velocity). ``use_support_table`` publishes each
+    row's support class instead of its coordinates (one factored articulation per world, no free-body response);
+    ``contact_records`` writes each full triplet's block record into ``row_free_response`` (it needs both). A grid of
+    workers strides over the contacts: ``total_num_workers * lanes_per_contact`` threads in blocks of
+    ``warps_per_block * 32``; the CPU runs a contact's group on one thread. Arrays must be contiguous.
+    """
+    n, lanes, warps = int(dof_count), int(lanes_per_contact), int(warps_per_block)
+    if not 1 <= n <= 64 or lanes not in (8, 16, 32) or not 1 <= warps <= 32:
+        raise ValueError("Invalid sparse contact dimensions or lane group")
+    if contact_records and not (prepare_rows and use_support_table):
+        raise ValueError("Contact records require prepared rows and the row support table")
+    snippet = dual_native(
+        _contact_rows_source(n, lanes, warps, prepare_rows, use_support_table, contact_records),
+        preludes=(lane_group(lanes), *PROJECTION_LAW.preludes()),
+    )
+
+    @wp.func_native(snippet)
+    def project_native(
+        tid: int,
+        body_a: int,
+        body_b: int,
+        art_a: int,
+        art_b: int,
+        world: int,
+        slot: int,
+        row_count: int,
+        angular_a: wp.mat33,
+        angular_b: wp.mat33,
+        directions: wp.mat33,
+        art_group_idx: wp.array[int],
+        articulation_response_dof_count: wp.array[int],
+        is_free_rigid: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        body_dof_mask: wp.array[wp.uint64],
+        joint_S_s: wp.array[wp.spatial_vector],
+        permutation: wp.array[int],
+        factor_row_offsets: wp.array[int],
+        inverse_factor: wp.array2d[float],
+        free_inverse_factor: wp.array3d[float],
+        v_hat: wp.array[float],
+        cfm: float,
+        row_dof: wp.array3d[int],
+        row_factor: wp.array3d[float],
+        row_free_response: wp.array3d[float],
+        row_incident: wp.array2d[float],
+        diagonal: wp.array2d[float],
+        support: _SparseRowSupport,
+    ): ...
+
+    def contact_kernel(
+        data: ContactInput,
+        total_num_workers: int,
+        art_group_idx: wp.array[int],
+        is_free_rigid: wp.array[int],
+        articulation_world_dof_offset: wp.array[int],
+        body_dof_mask: wp.array[wp.uint64],
+        friction_patches: FrictionPatches,
+        permutation: wp.array[int],
+        factor_row_offsets: wp.array[int],
+        inverse_factor: wp.array2d[float],
+        free_inverse_factor: wp.array3d[float],
+        friction_anchor_beta: float,
+        row_dof: wp.array3d[int],
+        row_factor: wp.array3d[float],
+        row_free_response: wp.array3d[float],
+        row_incident: wp.array2d[float],
+        support: _SparseRowSupport,
+    ):
+        tid = wp.tid()
+        lane = tid % lanes
+        worker = tid // lanes
+        total_contacts = data.count[0]
+        for c in range(worker, total_contacts, total_num_workers):
+            row_count = wp.min(data.slots_needed[c], 3)
+            if data.path[c] != 0 or data.slot[c] < 0 or row_count <= 0:
+                continue
+            body_a, body_b = contact_bodies(data.shape0[c], data.shape1[c], data.shape_body)
+            art_a = data.art0[c]
+            art_b = data.art1[c]
+            normal = wp.vec3(0.0)
+            surface_a = wp.vec3(0.0)
+            surface_b = wp.vec3(0.0)
+            point_a = wp.vec3(0.0)
+            point_b = wp.vec3(0.0)
+            friction_point_a = wp.vec3(0.0)
+            friction_point_b = wp.vec3(0.0)
+            tangent0 = wp.vec3(0.0)
+            tangent1 = wp.vec3(0.0)
+            gap = float(0.0)
+            cfm = float(0.0)
+            if wp.static(prepare_rows):
+                cfm = data.cfm
+            if wp.static(prepare_rows) or lane == 0:
+                normal, surface_a, surface_b, gap = contact_points(
+                    data.normal[c],
+                    data.point0[c],
+                    data.point1[c],
+                    data.margin0[c],
+                    data.margin1[c],
+                    body_a,
+                    body_b,
+                    data.body_q,
+                )
+                friction_point_a, friction_point_b = contact_friction_points(
+                    surface_a, surface_b, data.shared_anchor, data.friction_shared_anchor
+                )
+                if row_count > 1:
+                    tangent0, tangent1 = contact_tangent_basis(normal)
+                    if friction_patches.enabled != 0:
+                        friction_point_a, friction_point_b = patch_friction_location(friction_patches, c)
+                # The normal row's endpoints.
+                _normal, point_a, point_b = contact_row_frame(
+                    0,
+                    data.shared_anchor,
+                    normal,
+                    tangent0,
+                    tangent1,
+                    surface_a,
+                    surface_b,
+                    friction_point_a,
+                    friction_point_b,
+                )
+            if wp.static(prepare_rows):
+                if lane < row_count:
+                    world = data.world[c]
+                    slot = data.slot[c] + lane
+                    direction, anchor_a, anchor_b = contact_row_frame(
+                        lane,
+                        data.shared_anchor,
+                        normal,
+                        tangent0,
+                        tangent1,
+                        surface_a,
+                        surface_b,
+                        friction_point_a,
+                        friction_point_b,
+                    )
+                    target = prescribed_target(
+                        body_a,
+                        art_a,
+                        body_b,
+                        art_b,
+                        anchor_a,
+                        anchor_b,
+                        direction,
+                        data.prescribed,
+                        data.origin,
+                        data.body_v,
+                    )
+                    mu = contact_friction(data.shape0[c], data.shape1[c], data.material_mu)
+                    beta = data.beta
+                    phi = gap
+                    row_type = PGS_CONSTRAINT_TYPE_CONTACT
+                    parent = int(-1)
+                    restitution = float(0.0)
+                    if lane == 0:
+                        restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
+                    else:
+                        beta = friction_anchor_beta
+                        phi = friction_patches.phi[c][lane - 1]
+                        mu *= data.friction_scale
+                        row_type = PGS_CONSTRAINT_TYPE_FRICTION
+                        parent = data.slot[c]
+                    # The position pass's row law (bias scale and contact weight 1).
+                    rhs, _row_w = row_rhs(
+                        row_type, phi, beta, target, 1.0 / data.dt, 1.0, data.speculative_scale, 0.0, 1.0
+                    )
+                    data.row_type[world, slot] = row_type
+                    data.row_parent[world, slot] = parent
+                    data.row_mu[world, slot] = mu
+                    # Bias and CFM are already applied; only normal restitution reads row records after the
+                    # response projection.
+                    if lane == 0:
+                        data.phi[world, slot] = phi
+                        data.target[world, slot] = target
+                        data.restitution[world, slot] = restitution
+                    data.rhs[world, slot] = rhs
+
+            # Fixed component constructors avoid materializing dynamically indexed matrices in local memory during
+            # geometry assembly.
+            angular_a = wp.mat33(0.0)
+            angular_b = wp.mat33(0.0)
+            directions = wp.mat33(0.0)
+            if lane == 0:
+                normal_a = wp.vec3(0.0)
+                normal_b = wp.vec3(0.0)
+                tangent0_a = wp.vec3(0.0)
+                tangent1_a = wp.vec3(0.0)
+                tangent0_b = wp.vec3(0.0)
+                tangent1_b = wp.vec3(0.0)
+                # Each row's wrench about an endpoint's articulation origin: the angular part of the free-body
+                # Jacobian [d, (p - o) x d], whose product with a motion column is that column's Jacobian entry.
+                if art_a >= 0 and data.response_dofs[art_a] > 0:
+                    origin_a = data.origin[art_a]
+                    normal_a = wp.spatial_bottom(free_body_jacobian(normal, point_a, origin_a))
+                    if row_count > 1:
+                        tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_a, origin_a))
+                        tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_a, origin_a))
+                if art_b >= 0 and data.response_dofs[art_b] > 0:
+                    origin_b = data.origin[art_b]
+                    normal_b = wp.spatial_bottom(free_body_jacobian(normal, point_b, origin_b))
+                    if row_count > 1:
+                        tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_b, origin_b))
+                        tangent1_b = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_b, origin_b))
+                angular_a = wp.matrix_from_rows(normal_a, tangent0_a, tangent1_a)
+                angular_b = wp.matrix_from_rows(normal_b, tangent0_b, tangent1_b)
+                directions = wp.matrix_from_rows(normal, tangent0, tangent1)
+            project_native(
+                tid,
+                body_a,
+                body_b,
+                art_a,
+                art_b,
+                data.world[c],
+                data.slot[c],
+                row_count,
+                angular_a,
+                angular_b,
+                directions,
+                art_group_idx,
+                data.response_dofs,
+                is_free_rigid,
+                articulation_world_dof_offset,
+                data.dof_start,
+                body_dof_mask,
+                data.motion,
+                permutation,
+                factor_row_offsets,
+                inverse_factor,
+                free_inverse_factor,
+                data.incident,
+                cfm,
+                row_dof,
+                row_factor,
+                row_free_response,
+                row_incident,
+                data.diag,
+                support,
+            )
+            if wp.static(prepare_rows):
+                if lane == 0:
+                    world = data.world[c]
+                    slot = data.slot[c]
+                    # Only a restitutive contact reads its row back for the rebound law.
+                    row_restitution = data.restitution[world, slot]
+                    if row_restitution > 0.0:
+                        target = data.target[world, slot]
+                        fires, bounce = contact_restitution_rhs(
+                            data.phi[world, slot],
+                            row_incident[world, slot] - target,
+                            target,
+                            row_restitution,
+                            data.dt,
+                            data.restitution_threshold,
+                        )
+                        if fires:
+                            data.rhs[world, slot] = bounce
+
+    name = f"factor_contact_rows_{n}_{lanes}_{warps}"
+    if prepare_rows:
+        name += "_prepared"
+    if use_support_table:
+        name += "_support_table"
+    if contact_records:
+        name += "_contact_records"
+    return python_kernel(contact_kernel, name)
+
+
+# The factor of an articulation's mass matrix: ``P H P^T = L L^T`` in packed ancestor-closed storage, then
+# ``L^-1`` in the same pattern. One warp per articulation (the CPU runs it on one thread): the mass entries are
+# assembled from the motion subspace and the composite inertias (or read from a held tree's geometric entries),
+# with the joint regularization and a fused drive's stiffness on the diagonal, then factored left-looking level by
+# level and inverted column by column along each column's ancestor chain, both with plain division. A nonpositive
+# or nonfinite pivot sets the articulation's status and publishes NaN in place of the inverse.
+
+
+def sparse_cholesky_source(dof_count: int, nonzero_count: int) -> str:
+    """Factor ``factor`` in place, left-looking by the topology's levels: each level's pivots (``sqrt`` of the
+    diagonal less its row's squares, in order), then its entries (less their prefix products, divided by the
+    pivot). The caller binds ``indices``, ``factor``, ``status``, ``group``, ``lane``/``stride`` and a lane group."""
+    if not 1 <= dof_count <= 64 or not dof_count <= nonzero_count <= dof_count * (dof_count + 1) // 2:
+        raise ValueError("Invalid packed sparse factor dimensions")
+    return r"""    for (int level = 0; level < indices.factor_level_count; ++level) {
+        const int level_begin = indices.factor_level_offsets.data[level];
+        const int level_end = indices.factor_level_offsets.data[level + 1];
+        for (int pivot = level_begin + lane; pivot < level_end; pivot += stride) {
+            const int col = indices.factor_level_columns.data[pivot];
+            const int begin = indices.row_offsets.data[col];
+            const int diagonal = indices.row_offsets.data[col + 1] - 1;
+            float value = factor[diagonal];
+            for (int entry = begin; entry < diagonal; ++entry) value -= factor[entry] * factor[entry];
+            if (!(value > 0.0f) || !wp::isfinite(value)) {
+#if defined(__CUDA_ARCH__)
+                atomicExch(status.data + group, 1);
+#else
+                status.data[group] = 1;
+#endif
+            }
+            factor[diagonal] = sqrtf(value);
+        }
+        SYNC();
+        const int entry_begin = indices.factor_level_entry_offsets.data[level];
+        const int entry_end = indices.factor_level_entry_offsets.data[level + 1];
+        for (int work = entry_begin + lane; work < entry_end; work += stride) {
+            const int target = indices.factor_level_entries.data[work];
+            const int row = indices.entry_rows.data[target];
+            const int col = indices.columns.data[target];
+            const int begin = indices.row_offsets.data[col];
+            const int diagonal = indices.row_offsets.data[col + 1] - 1;
+            // Ancestor closure makes the column's whole prefix present in this
+            // row. Both prefixes are contiguous under the reversed DFS order.
+            const int row_begin = target - (diagonal - begin);
+            float value = factor[target];
+            for (int entry = begin; entry < diagonal; ++entry) {
+                value -= factor[row_begin + entry - begin] * factor[entry];
+            }
+            factor[target] = value / factor[diagonal];
+        }
+        SYNC();
+    }
+"""
+
+
+def sparse_inverse_source(dof_count: int) -> str:
+    """Write ``inverse = L^-1`` column by column, each lane a column along its ancestor chain (the column's CSC
+    entries in order: ``(e_col - sum L x) / L_rr``). The caller binds ``indices``, ``factor``, ``inverse`` and
+    ``lane``/``stride``; synchronization and publication are its own."""
+    if not 1 <= dof_count <= 64:
+        raise ValueError("Sparse inverse dimensions must fit the topology's 64-coordinate bound")
+    return f"""
+    // Each inverse column follows only its ancestor chain.
+    for (int col = lane; col < {dof_count}; col += stride) {{
+        const int begin = indices.column_offsets.data[col];
+        const int end = indices.column_offsets.data[col + 1];
+        for (int position = begin; position < end; ++position) {{
+            const int target = indices.column_entries.data[position];
+            const int row = indices.entry_rows.data[target];
+            const int diagonal = indices.row_offsets.data[row + 1] - 1;
+            float value = row == col ? 1.0f : 0.0f;
+            for (int previous = begin; previous < position; ++previous) {{
+                const int other = indices.column_entries.data[previous];
+                const int factor_entry = diagonal - row + indices.entry_rows.data[other];
+                value -= factor[factor_entry] * inverse[other];
+            }}
+            value /= factor[diagonal];
+            inverse[target] = value;
+        }}
+    }}
+"""
+
+
+_FACTOR_ASSEMBLY = """
+    const int group = tid >> 5;
+    if (group >= group_to_art.shape[0]) return;
+    const int art = group_to_art.data[group];
+    if (mass_update_mask.data[art] == 0) return;
+    const int lane = LANE, stride = STRIDE;
+#if defined(__CUDA_ARCH__)
+    __shared__ float factors[$FACTORS];
+    __shared__ float inverses[$FACTORS];
+$FORCE_STORAGE_CUDA
+    float* factor = factors + SUB * $NNZ;
+    float* inverse = inverses + SUB * $NNZ;
+
+#else
+    if ((tid & 31) != 0) return;
+    float factor[$NNZ];
+    float inverse[$NNZ];
+$FORCE_STORAGE_CPU
+#endif
+    const int start = articulation_dof_start.data[art];
+$PREPARE_MASS
+    if (lane == 0) status.data[group] = 0;
+    SYNC();
+    for (int entry = lane; entry < $NNZ; entry += stride) {
+        const int row = indices.entry_rows.data[entry];
+        const int col = indices.columns.data[entry];
+        const int physical_row = indices.permutation.data[row];
+        const int physical_col = indices.permutation.data[col];
+$READ_MASS
+        if (row == col) {
+            value += R_group.data[group * $N + physical_row];
+            if (fused_augmented_drive != 0) {
+                const int drive = drive_row_by_dof.data[start + physical_row];
+                if (drive >= 0 && row_K.data[drive] > 0.0f) value += row_K.data[drive];
+            }
+        }
+        factor[entry] = value;
+    }
+    SYNC();
+    $FACTOR
+    $INVERSE
+    SYNC();
+    const bool valid = status.data[group] == 0;
+    for (int entry = lane; entry < $NNZ; entry += stride) {
+        Linv_group.data[group * $NNZ + entry] = valid ? inverse[entry] : NAN;
+    }
+"""
+
+
+@cache
+def sparse_factor_kernel(
+    dof_count: int, nonzero_count: int, *, warps_per_block: int = 4, geometric: bool = False
+) -> wp.Kernel:
+    """Assemble each articulation's mass matrix and publish its packed ``L^-1`` (see the section's comment).
+
+    ``dof_count * 32`` threads per group of articulations, ``warps_per_block * 32`` per block; value arrays must be
+    contiguous. ``geometric`` reads a held tree's packed geometric mass entries instead of assembling CRBA's. An
+    articulation without a mass update keeps its factor and status; ``status`` is 0 after a refresh and 1 for a
+    nonpositive or nonfinite pivot (no pivot floor).
+    """
+    n, nnz, warps = int(dof_count), int(nonzero_count), int(warps_per_block)
+    if not 1 <= n <= 64 or not n <= nnz <= n * (n + 1) // 2 or not 1 <= warps <= 32:
+        raise ValueError("Invalid sparse factor dimensions or warp count")
+    if geometric:
+        storage_cuda, storage_cpu, prepare = "", "", ""
+        read = f"        float value = body_I_c.data[group * {nnz}+entry];"
+    else:
+        storage_cuda = f"""    __shared__ float forces[{warps * n * 6}];
+    float* force = forces + SUB * {n * 6};"""
+        storage_cpu = f"""    float force[{n * 6}];"""
+        prepare = f"""    for (int physical = lane; physical < {n}; physical += stride) {{
+        const int joint = articulation_start.data[art] + indices.dof_joint.data[physical];
+        const auto value = InertiaRecord::apply(body_I_c.data[joint_child.data[joint]].c, joint_S_s.data[start + physical]);
+        for (int k = 0; k < 6; ++k) force[physical * 6 + k] = value.c[k];
+    }}
+"""
+        read = """        const auto motion = joint_S_s.data[start + physical_row];
+        float value = 0.0f;
+        for (int k = 0; k < 6; ++k) value += motion.c[k] * force[physical_col * 6 + k];
+"""
+    body = kernel_template.substitute(
+        _FACTOR_ASSEMBLY,
+        FACTORS=warps * nnz,
+        NNZ=nnz,
+        N=n,
+        FORCE_STORAGE_CUDA=storage_cuda,
+        FORCE_STORAGE_CPU=storage_cpu,
+        PREPARE_MASS=prepare,
+        READ_MASS=read,
+        FACTOR=sparse_cholesky_source(n, nnz),
+        INVERSE=sparse_inverse_source(n),
+    )
+    preludes = (lane_group(32),) if geometric else (lane_group(32), *SPATIAL.preludes(), INERTIA_RECORDS)
+    name = f"sparse_factor_{n}_{nnz}_{warps}" + ("_geometric" if geometric else "")
+    return KernelTemplate(
+        name,
+        (
+            ("group_to_art", wp.array[int]),
+            ("mass_update_mask", wp.array[int]),
+            ("articulation_start", wp.array[int]),
+            ("articulation_dof_start", wp.array[int]),
+            ("joint_child", wp.array[int]),
+            ("joint_S_s", wp.array[wp.spatial_vector]),
+            ("body_I_c", wp.array2d[float] if geometric else wp.array[inertia_record]),
+            ("R_group", wp.array2d[float]),
+            ("fused_augmented_drive", int),
+            ("drive_row_by_dof", wp.array[int]),
+            ("row_K", wp.array[float]),
+            ("indices", _SparseMassMatrixIndices),
+            ("Linv_group", wp.array2d[float]),
+            ("status", wp.array[int]),
+        ),
+        dual_native(body, preludes=preludes),
+        kernel_template.THREADS,
+        composed=True,
+        native_name="sparse_factor_native",
+    ).kernel()
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseFactorBuild:
+    """The build and publication of factor rows (:class:`.response_operator.SparseFactor`).
+
+    Attributes:
+        factor: The factory of the factor and its inverse (:func:`sparse_factor_kernel`).
+        contact_rows: The factory of the contact rows' build (:func:`factor_contact_rows_kernel`).
+        limit_rows: Position-limit rows (:data:`factor_limit_rows_kernel`).
+        velocity_limit_rows: Velocity-limit rows (:data:`factor_velocity_limit_rows_kernel`).
+        mimic_rows: Mimic rows (:data:`factor_mimic_rows_kernel`).
+        publish: ``v = v_hat + P^T L^-T u`` of a world's factor-coordinate velocity change (:func:`factor_publish_kernel`).
+    """
+
+    factor: Callable[..., wp.Kernel]
+    contact_rows: Callable[..., wp.Kernel]
+    limit_rows: wp.Kernel
+    velocity_limit_rows: wp.Kernel
+    mimic_rows: wp.Kernel
+    publish: wp.Kernel
+
+
+SPARSE_FACTOR = SparseFactorBuild(
+    factor=sparse_factor_kernel,
+    contact_rows=factor_contact_rows_kernel,
+    limit_rows=factor_limit_rows_kernel,
+    velocity_limit_rows=factor_velocity_limit_rows_kernel,
+    mimic_rows=factor_mimic_rows_kernel,
+    publish=factor_publish_kernel,
+)
+"""The factor rows' build (:meth:`.SparseFactor.build`)."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Paired factor rows (FactorRows)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
+# secondary group), each a diagonal block of ``H = L L^T`` with the inverse factor ``L^-1``. A row's Jacobian ``j``
+# spans both blocks, a lane per coordinate (the primary's lanes first). Its factor row is ``z = L^-1 j``
+# (:meth:`.FactorRows.forward`): a world without free-body rows sweeps in factor coordinates, with ``Y_world = z``
+# and ``A_ii = |z|^2 + cfm``; a world with free-body rows needs physical rows, ``y = L^-T z``
+# (:meth:`.FactorRows.transposed`) and ``A_ii = j y + cfm``. Physical rows are later moved into the held form
+# ``L^T y`` where a world qualifies as independent components (:func:`paired_components_kernel`).
+
+
+def _paired_blocks(primary: int, secondary: int, staged: bool) -> FactorRows:
+    """The pair's two diagonal blocks, a lane per coordinate (``lane``), their inverse factors staged in shared
+    arrays (``staged``) or read from the groups' arrays."""
+    if staged:
+        blocks = (
+            FactorComponent(primary, "0", "primary_lane", "", "s_primary_Linv", "0", staged=True),
+            FactorComponent(secondary, str(primary), "secondary_lane", "", "s_secondary_Linv", "0", staged=True),
+        )
+    else:
+        blocks = (
+            FactorComponent(primary, "0", "primary_lane", "", "primary_Linv", f"primary_group * {primary * primary}"),
+            FactorComponent(
+                secondary,
+                str(primary),
+                "secondary_lane",
+                "",
+                "secondary_Linv",
+                f"secondary_group * {secondary * secondary}",
+            ),
+        )
+    return FactorRows(primary + secondary, blocks, Lanes(32, "lane"))
+
+
+def _serial_product(
+    matrix: Callable[[str, str], str], source: str, out: str, offset: int, size: int, *, transposed: bool
+) -> str:
+    """One thread's ``out[offset + d] += M[d][k] x[offset + k]`` over ``k <= d`` (or ``M[k][d]`` over ``k >= d``
+    with ``transposed``), each coordinate's terms in increasing ``k``: the lanes' order of :class:`.FactorRows`."""
+    if transposed:
+        terms = f"for (int k = d; k < {size}; ++k)\n                {out}[{offset} + d] += {matrix('k', 'd')} * {source}[{offset} + k];"
+    else:
+        terms = f"for (int k = 0; k <= d; ++k)\n                {out}[{offset} + d] += {matrix('d', 'k')} * {source}[{offset} + k];"
+    return f"        for (int d = 0; d < {size}; ++d)\n            {terms}"
+
+
+@cache
+def paired_rows_kernel(
+    primary_dofs: int,
+    secondary_dofs: int,
+    max_constraints: int,
+    max_world_dofs: int,
+    device_arch: str,
+    warps_per_block: int = 4,
+    *,
+    factor_coordinates: bool = False,
+) -> wp.Kernel:
+    """Build a pair's rows in factor coordinates: a warp per row, one pair per block (the CPU runs the rows serially).
+
+    Each row's ``z = L^-1 j`` and, in a world with free-body rows, ``y = L^-T z``; ``J_world = j``, ``Y_world`` the
+    world's row (``z`` or ``y``) and ``A_ii`` its diagonal plus the row's ``cfm``. The physical response of a pair
+    (``factor_coordinates=False``: ``y = H^-1 j`` with the blocks' explicit inverses) is a DenseJY build.
+    """
+    if not factor_coordinates:
+        raise NotImplementedError("the physical paired response y = H^-1 j is a DenseJY build")
+    P, S, M, W = int(primary_dofs), int(secondary_dofs), int(max_constraints), int(max_world_dofs)
+    T = P + S
+    if T > 32:
+        raise ValueError("paired warp response requires at most 32 total DOFs")
+    if warps_per_block <= 0 or warps_per_block > 32:
+        raise ValueError("warps_per_block must be in [1, 32]")
+    cpu = str(device_arch) == "cpu"
+    rows = _paired_blocks(P, S, staged=True)
+
+    def primary(row, col):
+        return f"primary_Linv.data[primary_group * {P * P} + {row} * {P} + {col}]"
+
+    def secondary(row, col):
+        return f"secondary_Linv.data[secondary_group * {S * S} + {row} * {S} + {col}]"
+
+    source = f"""
+    __shared__ float s_primary_Linv[{P * P}];
+    __shared__ float s_secondary_Linv[{S * S}];
+    const int lane = LANE & 31;
+
+    const int secondary_group = secondary_group_by_primary.data[primary_group];
+    const int primary_art = primary_group_to_art.data[primary_group];
+    const int secondary_art = secondary_group_to_art.data[secondary_group];
+    const int world = art_to_world.data[primary_art];
+    const bool factor_world = world_mf_constraint_count.data[world] == 0;
+    int n_constraints = world_constraint_count.data[world];
+    if (n_constraints > {M}) n_constraints = {M};
+    if (n_constraints <= 0) return;
+    const int primary_offset = articulation_world_dof_offset.data[primary_art];
+    const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
+    for (int element = LANE; element < {P * P}; element += STRIDE)
+        s_primary_Linv[element] = primary_Linv.data[primary_group * {P * P} + element];
+    for (int element = LANE; element < {S * S}; element += STRIDE)
+        s_secondary_Linv[element] = secondary_Linv.data[secondary_group * {S * S} + element];
+    SYNC();
+{rows.lanes_of("    ")[0]}
+{rows.lanes_of("    ")[1]}
+
+    for (int constraint = WARP; constraint < n_constraints; constraint += WARPS) {{
+        const int world_row = (world * {M} + constraint) * {W};
+        float j = 0.0f;
+        if (lane < {P}) {{
+            const int row = (primary_group * {M} + constraint) * {P};
+            j = primary_J.data[row + lane];
+        }} else if (lane < {T}) {{
+            const int row = (secondary_group * {M} + constraint) * {S};
+            j = secondary_J.data[row + secondary_lane];
+        }}
+        float y = 0.0f;
+{rows.forward("Linv", "j", "z", "        ")}
+        if (!factor_world) {{
+{rows.transposed("Linv", "z", "y", "            ", declare=False)}
+        }}
+        if (lane < {P}) {{
+            J_world.data[world_row + primary_offset + lane] = j;
+            Y_world.data[world_row + primary_offset + lane] = factor_world ? z : y;
+        }} else if (lane < {T}) {{
+            J_world.data[world_row + secondary_offset + secondary_lane] = j;
+            Y_world.data[world_row + secondary_offset + secondary_lane] = factor_world ? z : y;
+        }}
+        float diagonal = lane < {T} ? (factor_world ? z * z : j * y) : 0.0f;
+        SUM(diagonal);
+        if (lane == 0) {{
+            const int diag_index = world * {M} + constraint;
+            world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
+        }}
+    }}
+#else
+    const int secondary_group = secondary_group_by_primary.data[primary_group];
+    const int primary_art = primary_group_to_art.data[primary_group];
+    const int secondary_art = secondary_group_to_art.data[secondary_group];
+    const int world = art_to_world.data[primary_art];
+    const int m = wp::min(world_constraint_count.data[world], {M});
+    const int po = articulation_world_dof_offset.data[primary_art];
+    const int so = articulation_world_dof_offset.data[secondary_art];
+    const bool factor_world = world_mf_constraint_count.data[world] == 0;
+    for (int row = 0; row < m; ++row) {{
+        float j[{T}], z[{T}], y[{T}];
+        for (int d = 0; d < {T}; ++d) {{
+            j[d] = d < {P} ? primary_J.data[(primary_group * {M} + row) * {P} + d]
+                : secondary_J.data[(secondary_group * {M} + row) * {S} + d - {P}];
+            z[d] = 0.0f;
+            y[d] = 0.0f;
+        }}
+{_serial_product(primary, "j", "z", 0, P, transposed=False)}
+{_serial_product(secondary, "j", "z", P, S, transposed=False)}
+        if (!factor_world) {{
+{_serial_product(primary, "z", "y", 0, P, transposed=True)}
+{_serial_product(secondary, "z", "y", P, S, transposed=True)}
+        }}
+        float diagonal = 0.0f;
+        for (int d = 0; d < {T}; ++d) {{
+            const int coord = d < {P} ? po + d : so + d - {P};
+            const int index = (world * {M} + row) * {W} + coord;
+            J_world.data[index] = j[d];
+            Y_world.data[index] = factor_world ? z[d] : y[d];
+            diagonal += factor_world ? z[d] * z[d] : j[d] * y[d];
+        }}
+        world_diag.data[world * {M} + row] = diagonal + world_row_cfm.data[world * {M} + row];
+    }}
+#endif
+"""
+    block_dim = 32 * warps_per_block
+    return KernelTemplate(
+        f"paired_factor_rows_{P}_{S}_{M}_bd{block_dim}",
+        kernel_template.params(
+            ("primary_Hinv", wp.array3d[float]),
+            ("primary_Linv", wp.array3d[float]),
+            ("primary_J", wp.array3d[float]),
+            ("primary_group_to_art", wp.array[int]),
+            ("secondary_Hinv", wp.array3d[float]),
+            ("secondary_Linv", wp.array3d[float]),
+            ("secondary_J", wp.array3d[float]),
+            ("secondary_group_to_art", wp.array[int]),
+            ("secondary_group_by_primary", wp.array[int]),
+            ("art_to_world", wp.array[int]),
+            ("articulation_world_dof_offset", wp.array[int]),
+            ("world_constraint_count", wp.array[int]),
+            ("world_mf_constraint_count", wp.array[int]),
+            ("world_row_cfm", wp.array2d[float]),
+            ("J_world", wp.array3d[float]),
+            ("Y_world", wp.array3d[float]),
+            ("world_diag", wp.array2d[float]),
+        ),
+        source,
+        dispatch=Dispatch(
+            "primary_group, lane = wp.tid()\nif wp.static(cpu):\n    if lane != 0:\n        return\n$CALL",
+            ("primary_group",),
+            (("primary_group", int),),
+            constants=(("cpu", cpu),),
+        ),
+        preludes=(lane_group(32 * warps_per_block),),
+        native_name="paired_factor_rows_native",
+    ).kernel()
+
+
+# A paired world's qualification as independent components: every current row of the world is valid and touches
+# only its own component (dense rows the articulation's coordinates, free-body rows the body's), its pair structure
+# intact; a qualified world's rows move into the held form (``$CONVERT``) and its selector turns negative (zero: no
+# free-body rows, positive: the mixed fallback).
+_PAIRED_COMPONENTS = r"""
+#if !defined(__CUDA_ARCH__)
+    if (logical_lane != 0) return;
+#endif
+    const int M = data.J.shape[1];
+    const int F = data.mf_meta.shape[1] / 4;
+    for (int world = worker; world < data.world_count; world += workers) {
+        const int m = data.counts.data[world];
+        const int mf = data.mf_counts.data[world];
+        if (LANE == 0) data.selector.data[world] = mf == 0 ? 0 : wp::max(mf, 1);
+        if (mf == 0) continue;
+        if (m < 0 || m > M || mf < 1 || mf > F) continue;
+        const int po = data.primary_offset.data[world];
+        const int so = data.secondary_offset.data[world];
+        const int group = data.primary_group.data[world];
+        if (!((po == 0 && so == $PRIMARY) || (po == $SECONDARY && so == 0))
+            || group < 0 || group >= data.L.shape[0]) continue;
+        int valid = 1;
+        for (int k = LANE; k < $PRIMARY * $PRIMARY; k += STRIDE) {
+            const float x = data.L.data[group * $PRIMARY * $PRIMARY + k];
+            valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
+        }
+        for (int row = LANE; row < m; row += STRIDE) {
+            const int r = world * M + row;
+            const int type = data.row_type.data[r];
+            const float diag = data.diag.data[r];
+            const float mu = data.mu.data[r];
+            valid &= (type == 0 || type == 2 || type == 3)
+                && wp::isfinite(diag) && diag > 0.0f
+                && wp::isfinite(mu) && mu >= 0.0f && wp::isfinite(data.rhs.data[r]);
+            if (type == 2) {
+                const int p = data.row_parent.data[r];
+                if (p < 0 || p + 2 >= m || (row != p + 1 && row != p + 2)) valid = 0;
+                else {
+                    const int base = world * M + p;
+                    valid &= data.row_type.data[base] == 0
+                        && data.row_type.data[base + 1] == 2 && data.row_type.data[base + 2] == 2
+                        && data.row_parent.data[base + 1] == p && data.row_parent.data[base + 2] == p;
+                }
+            }
+            for (int d = 0; d < $WORLD; ++d) {
+                const float j = data.J.data[r * $WORLD + d], y = data.Y.data[r * $WORLD + d];
+                valid &= wp::isfinite(j) && wp::isfinite(y) && wp::abs(y) <= 1.0e15f;
+                if (d >= so && d < so + $SECONDARY) valid &= j == 0.0f && y == 0.0f;
+            }
+        }
+        for (int row = LANE; row < mf; row += STRIDE) {
+            const int r = world * F + row;
+            const int packed = data.mf_meta.data[r * 4];
+            const int a = packed >> 16, b = static_cast<int>(static_cast<short>(packed & 65535));
+            const int tp = data.mf_meta.data[r * 4 + 3], type = tp & 65535;
+            union { int bits; float value; } diag, rhs;
+            diag.bits = data.mf_meta.data[r * 4 + 1];
+            rhs.bits = data.mf_meta.data[r * 4 + 2];
+            const float mu = data.mf_mu.data[r];
+            valid &= (a == -1 || a == so) && (b == -1 || b == so) && (a == so || b == so)
+                && (type == 0 || type == 2 || type == 4)
+                && wp::isfinite(diag.value) && diag.value > 0.0f && wp::isfinite(rhs.value)
+                && wp::isfinite(mu) && mu >= 0.0f;
+            if (type == 2) {
+                const int encoded_parent = static_cast<unsigned int>(tp) >> 16;
+                const int p = encoded_parent == 65535 ? -1 : encoded_parent;
+                if (p < 0 || p + 2 >= mf || (row != p + 1 && row != p + 2)) valid = 0;
+                else {
+                    const int base = (world * F + p) * 4 + 3;
+                    const int t1 = data.mf_meta.data[base + 4], t2 = data.mf_meta.data[base + 8];
+                    valid &= (data.mf_meta.data[base] & 65535) == 0
+                        && (t1 & 65535) == 2 && (t2 & 65535) == 2
+                        && static_cast<int>(static_cast<unsigned int>(t1) >> 16) == p
+                        && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;
+                }
+            }
+            for (int d = 0; d < $SECONDARY; ++d) {
+                valid &= wp::isfinite(data.mf_J_a.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_J_b.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_MiJt_a.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_MiJt_b.data[r * $SECONDARY + d]);
+            }
+        }
+        if (ALL(valid != 0)) {
+            for (int row = WARP; row < m; row += WARPS) {
+                const int base = (world * M + row) * $WORLD + po;
+$CONVERT
+            }
+            if (LANE == 0) data.selector.data[world] = -1;
+        }
+    }
+"""
+
+
+@cache
+def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS) -> wp.Kernel:
+    """Qualify each paired world's rows as independent components and move a qualified world's dense rows into the
+    held form ``z = L^T y`` (:meth:`.FactorRows.transposed` of the primary factor, a lane per coordinate of a warp
+    per row; the CPU converts serially). A block of :data:`.paired_components.PAIRED_COMPONENT_THREADS` threads per
+    worker strides over the worlds; the signed selector is the dispatch's private metadata."""
+    if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
+        raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
+    P = int(primary_size)
+    held = FactorRows(P, (FactorComponent(P, "0", "lane", "data.L", "", f"group * {P} * {P}"),), Lanes(32, "lane"))
+    convert = f"""#if defined(__CUDA_ARCH__)
+                const int lane = LANE & 31;
+                const float y = lane < {P} ? data.Y.data[base + lane] : 0.0f;
+{held.transposed("L", "y", "z", " " * 16)}
+                if (lane < {P}) data.Y.data[base + lane] = z;
+#else
+                float y[{P}];
+                for (int k = 0; k < {P}; ++k) y[k] = data.Y.data[base + k];
+                for (int d = 0; d < {P}; ++d) {{
+                    float z = 0.0f;
+                    for (int k = d; k < {P}; ++k)
+                        z += {held.components[0].element("L", "k", "d")} * y[k];
+                    data.Y.data[base + d] = z;
+                }}
+#endif"""
+    source = kernel_template.substitute(
+        _PAIRED_COMPONENTS, PRIMARY=P, SECONDARY=secondary_size, WORLD=P + secondary_size, CONVERT=convert
+    )
+    return KernelTemplate(
+        f"paired_components_held_{P}_{secondary_size}",
+        (("workers", int), ("data", PairedComponentData)),
+        source,
+        # A lane group per worker: its worker index and the thread's lane in it.
+        Dispatch("worker, lane = wp.tid()\n$CALL", ("worker", "lane"), (("worker", int), ("logical_lane", int))),
+        preludes=(lane_group(PAIRED_COMPONENT_THREADS),),
+        dual=True,
+        native_name="paired_components_native",
+    ).kernel()
+
+
+@dataclasses.dataclass(frozen=True)
+class FactorRowsBuild:
+    """The build of a pair's factor rows (:class:`.response_operator.FactorRows`).
+
+    Attributes:
+        paired: The factory of the rows' build in factor coordinates (:func:`paired_rows_kernel`).
+        components: The factory of the qualification and held-form conversion (:func:`paired_components_kernel`).
+    """
+
+    paired: Callable[..., wp.Kernel]
+    components: Callable[..., wp.Kernel]
+
+
+FACTOR_ROWS = FactorRowsBuild(paired=paired_rows_kernel, components=paired_components_kernel)
+"""The paired factor rows' build (:meth:`.FactorRows.build`)."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Drop-in table: the replaced module globals and the builds that take their place
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class DropIn:
+    """A module global a launch site reads (a kernel, a cached kernel factory or a Warp function) and the build of
+    this module that takes its parameters, in order, and its launch.
+
+    Attributes:
+        module: The module (in this package) whose global the launch site reads.
+        name: The global's name.
+        replacement: The name of the replacing kernel, factory or function in this module.
+        factory: The global is a factory of kernel variants: the replacement takes its arguments.
+    """
+
+    module: str
+    name: str
+    replacement: str
+    factory: bool = False
+
+
+DROP_INS = (
+    # Free-body rows.
+    DropIn("solver_feather_pgs", "compute_mf_body_Hinv", "free_body_inverse_kernel"),
+    DropIn("solver_feather_pgs", "compute_mf_effective_mass_and_rhs", "free_body_rows_kernel"),
+    DropIn("solver_feather_pgs", "build_mf_body_map", "free_body_map_kernel"),
+    DropIn("solver_feather_pgs", "compute_mf_world_dof_offsets", "free_body_coordinates_kernel"),
+    DropIn("solver_feather_pgs", "_get_pack_mf_meta_kernel", "free_body_meta_kernel", factory=True),
+    DropIn("solver_feather_pgs", "apply_mf_warmstart_impulses", "free_body_publish_kernel"),
+    # Sparse-diagonal rows.
+    DropIn("solver_feather_pgs", "populate_sparse_diagonal_contact_response", "sparse_pair_contact_rows_kernel"),
+    DropIn("solver_feather_pgs", "accumulate_sparse_diagonal_response_diag", "sparse_pair_diagonal_kernel"),
+    DropIn("compact_contact", "_publish_row_response", "sparse_pair_row_response"),
+    DropIn("compact_contact", "produce_limit_response", "sparse_pair_limit_kernel"),
+    # Bilateral pre-elimination.
+    DropIn("solver_feather_pgs", "preelim_setup_for_size", "bilateral_setup_kernel"),
+    DropIn("solver_feather_pgs", "preelim_correct_Y_for_size", "bilateral_correct_kernel"),
+    DropIn("solver_feather_pgs", "preelim_project_velocity_for_size", "bilateral_project_kernel"),
+    # Factor rows.
+    DropIn("solver_feather_pgs", "_get_crba_sparse_factor_kernel", "sparse_factor_kernel", factory=True),
+    DropIn("tree_kinetic_sparse", "_get_crba_sparse_factor_kernel", "sparse_factor_kernel", factory=True),
+    DropIn("solver_feather_pgs", "_get_sparse_contact_response_kernel", "factor_contact_rows_kernel", factory=True),
+    DropIn("solver_feather_pgs", "build_sparse_joint_limit_rows", "factor_limit_rows_kernel"),
+    DropIn("solver_feather_pgs", "build_sparse_joint_velocity_limit_rows", "factor_velocity_limit_rows_kernel"),
+    DropIn("solver_feather_pgs", "build_sparse_mimic_rows", "factor_mimic_rows_kernel"),
+    DropIn("solver_feather_pgs", "apply_sparse_factor_velocity", "factor_publish_kernel"),
+    # Paired factor rows.
+    DropIn("solver_feather_pgs", "_get_paired_hinv_jt_kernel", "paired_rows_kernel", factory=True),
+    DropIn("paired_components", "get_prepare_kernel", "paired_components_kernel", factory=True),
+)
+"""The equivalence harness's substitution table: each entry's replacement takes the replaced global's parameters,
+so the launch sites take either unchanged. A name imported into several modules has an entry per module."""
