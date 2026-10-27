@@ -26,6 +26,7 @@ from . import field_group
 from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
 from .field_group import Field, FieldGroup, SolverArrays
 from .row_laws import contact_depenetration_cap, contact_restitution_rhs, contact_rhs, joint_limit_side, limit_rhs
+from .step_plan import first_failed
 
 LANES = 32
 
@@ -644,8 +645,8 @@ def finalize_resolved_worlds_bounded(
     scratch.resolved[world] = value
 
 
-def supported(solver) -> bool:
-    """Whether the solver's rows follow the law the classifier evaluates.
+def decline(solver) -> str | None:
+    """Why the solver's rows do not follow the law the classifier evaluates, or ``None`` when they do.
 
     The dense route with point contacts, or with persistent patch friction,
     the plain matrix-free interleaved sweep,
@@ -656,8 +657,6 @@ def supported(solver) -> bool:
     connect, drives, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
-    if os.environ.get("FEATHER_PGS_RESOLVED_WORLDS", "1") != "1":
-        return False
     exact = {
         "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
@@ -670,8 +669,6 @@ def supported(solver) -> bool:
         "_keyed_rows": None,
         "drive_slot": None,
     }
-    if any(getattr(solver, name, object()) != value for name, value in exact.items()):
-        return False
     false = (
         "pgs_warmstart",
         "_mf_warmstart_enabled",
@@ -686,13 +683,6 @@ def supported(solver) -> bool:
         "pgs_debug",
         "_row_watermark",
     )
-    if any(getattr(solver, name, None) is not False for name in false):
-        return False
-    contact_law = getattr(solver, "_point_contact_paths", False) or getattr(solver, "_patch_dense_paths", False)
-    if not contact_law or getattr(solver.model, "requires_grad", True):
-        return False
-    if not solver.model.device.is_cuda or (getattr(solver, "max_world_dofs", 33) or 33) > 32:
-        return False
     required = (
         "world_dof_indices",
         "world_dof_count",
@@ -700,7 +690,39 @@ def supported(solver) -> bool:
         "body_has_response_dofs",
         "_joint_limit_q_index",
     )
-    return all(getattr(solver, name, None) is not None for name in required)
+    law = getattr(solver, "_point_contact_paths", False) or getattr(solver, "_patch_dense_paths", False)
+    return first_failed(
+        (
+            (
+                os.environ.get("FEATHER_PGS_RESOLVED_WORLDS", "1") == "1",
+                "FEATHER_PGS_RESOLVED_WORLDS disables the classifier.",
+            ),
+            (
+                getattr(solver, "pgs_mode", None) == "matrix_free" and solver.model.device.is_cuda,
+                "The classifier evaluates the CUDA matrix-free route only.",
+            ),
+            (
+                getattr(solver, "_law_agnostic_contact_paths", True),
+                "Contact torsion and compliance rows are outside the contact laws it classifies.",
+            ),
+            (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
+            (
+                all(getattr(solver, name, object()) == value for name, value in exact.items())
+                and all(getattr(solver, name, None) is False for name in false)
+                and law
+                and not getattr(solver.model, "requires_grad", True)
+                and (getattr(solver, "max_world_dofs", 33) or 33) <= 32
+                and all(getattr(solver, name, None) is not None for name in required),
+                "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
+                "regularization, device or world width).",
+            ),
+        )
+    )
+
+
+def supported(solver) -> bool:
+    """Whether the solver's rows follow the law the classifier evaluates (:func:`decline` names why not)."""
+    return decline(solver) is None
 
 
 class ResolvedWorlds:
@@ -712,7 +734,8 @@ class ResolvedWorlds:
 
     def __init__(self, solver, *, absolute_margin: float = 1.0e-5, relative_margin: float = 2.0**-20):
         self.solver = solver
-        self.enabled = bool(supported(solver))
+        declined = decline(solver)
+        self.enabled = declined is None
         if self.enabled and not getattr(solver, "_point_contact_paths", False):
             self.reason = (
                 "Admitted: interleaved matrix-free patch-friction rows whose kinds are all unilateral; a world "
@@ -720,19 +743,8 @@ class ResolvedWorlds:
             )
         elif self.enabled:
             self.reason = "Admitted: interleaved matrix-free point-contact rows whose kinds are all unilateral."
-        elif os.environ.get("FEATHER_PGS_RESOLVED_WORLDS", "1") != "1":
-            self.reason = "FEATHER_PGS_RESOLVED_WORLDS disables the classifier."
-        elif getattr(solver, "pgs_mode", None) != "matrix_free" or not solver.model.device.is_cuda:
-            self.reason = "The classifier evaluates the CUDA matrix-free route only."
-        elif not getattr(solver, "_law_agnostic_contact_paths", False):
-            self.reason = "Contact torsion and compliance rows are outside the contact laws it classifies."
-        elif getattr(solver, "_keyed_rows", None) is not None:
-            self.reason = "Keyed rows own the contact rows."
         else:
-            self.reason = (
-                "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
-                "regularization, device or world width)."
-            )
+            self.reason = declined
         self.absolute_margin = float(absolute_margin)
         self.relative_margin = float(relative_margin)
         if not all(math.isfinite(v) and v >= 0.0 for v in (self.absolute_margin, self.relative_margin)):

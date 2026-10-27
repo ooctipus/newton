@@ -561,7 +561,7 @@ class TestResolvedWorlds(unittest.TestCase):
                 # which the mocked decision launch never reads.
                 solver.world_dof_indices = wp.zeros((model.world_count, 1), dtype=int, device="cpu")
                 solver.world_dof_count = wp.zeros(model.world_count, dtype=int, device="cpu")
-                with patch.object(rw, "supported", return_value=True):
+                with patch.object(rw, "decline", return_value=None):
                     owner = rw.ResolvedWorlds(solver)
                 with patch.object(rw, "launch") as launch:
                     owner.classify(state, augmented, contacts, DT)

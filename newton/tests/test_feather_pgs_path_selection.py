@@ -460,8 +460,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         per_contact = {"method": "per_contact", "kernels": ["populate_world_J_for_size"], "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": per_contact, "1": per_contact})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
-        # Patch friction reaches the packet owner, which declines the CPU device.
-        self.assertIn("does not admit", routes["contact_rows"]["row_packets"]["reason"])
+        # Patch friction reaches the packet owner, which serves the local owners' worlds (CUDA only): none here.
+        self.assertIn("local owners' worlds; none is built", routes["contact_rows"]["row_packets"]["reason"])
+        self.assertIn("CUDA", routes["local_solve"]["reason"])
         self.assertFalse(routes["resolved_worlds"]["enabled"])
         self.assertIn("matrix-free route", routes["resolved_worlds"]["reason"])
         self.assertEqual(routes["publication"]["owner"], "ordinary")

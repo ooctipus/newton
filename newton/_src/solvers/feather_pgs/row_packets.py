@@ -59,6 +59,7 @@ from .kernels import (
 )
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
+from .step_plan import AdmissionFacts, first_failed
 
 WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
@@ -1040,44 +1041,53 @@ class LocalRowPackets:
         )
 
 
-def create_owner(solver):
-    """Admit the local packet law for a topology that fits it; unsupported solvers stay ordinary.
+def decline(solver) -> str | None:
+    """Why the local packet law does not admit the solver, or ``None`` when it may (its topology decides next).
 
     The owner writes the solver's friction law: point rows, or persistent patch rows when friction
     anchors are on. The solver admits neither contact torsion nor compliance here.
     """
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
-    if not (
-        solver._local_internal_fast_path
-        and solver._hinv_jt_writes_world
-        and solver.model.device.is_cuda
-        and not solver.model.requires_grad
-        and solver.dense_max_constraints >= solver._local_residual_max_rows
-        and solver.pgs_mode == "matrix_free"
-        and solver.drive_mode == "augmented"
-        and solver.pgs_schedule == "interleaved"
-        and not solver.enable_joint_velocity_limits
-        and solver.enable_joint_limits
-        and solver.pgs_velocity_iterations == 0
-        and not solver.pgs_warmstart
-        and not solver._mf_warmstart_enabled
-        and not solver._regularization_enabled
-        and not solver._preelim_active
-        and not solver.grouped_dynamics
-        and not solver._debug_buffers_enabled
-        and not solver._sparse_diagonal_contact_solve
-        and not source._COMPACT_CONTACT_BOUNDARY
-        and not solver._paired_factor_coordinates
-        and not solver._fused_diagonal_joint_limits
-        and all(
-            not solver._execution_plan.use_tiled_hinv_jt(size) and not solver._execution_plan.use_diagonal_mass(size)
-            for size in solver.size_groups
+    facts = solver._facts
+    return first_failed(
+        (
+            (solver._local_internal_fast_path, "Local packets serve the local owners' worlds; none is built."),
+            (solver._hinv_jt_writes_world, "Local packets need the response written in world layout."),
+            (facts.forward_cuda, "Local packets need CUDA without gradient recording."),
+            (
+                solver.dense_max_constraints >= solver._local_residual_max_rows,
+                "dense_max_constraints is below the local residual owner's rows.",
+            ),
+            (facts.matrix_free and facts.plain_sweep, f"Local packets need matrix-free {AdmissionFacts.PLAIN_SWEEP}."),
+            (not facts.velocity_limits, "Local packets write no joint velocity-limit rows."),
+            (solver.enable_joint_limits, "Local packets build the joint-limit prefix: enable_joint_limits is off."),
+            (not facts.regularized, "Local packets solve the unregularized law."),
+            (not solver.grouped_dynamics, "grouped_dynamics' response solve replaces the packets' response."),
+            (
+                not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
+                "The diagonal-mass contact owner and its fused limits own these worlds.",
+            ),
+            (
+                not source._COMPACT_CONTACT_BOUNDARY,
+                "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY selects the compact producer.",
+            ),
+            (not solver._paired_factor_coordinates, "The paired factor-coordinate sweep owns these worlds."),
+            (
+                all(
+                    not solver._execution_plan.use_tiled_hinv_jt(size)
+                    and not solver._execution_plan.use_diagonal_mass(size)
+                    for size in solver.size_groups
+                ),
+                "A size takes the tiled or diagonal response, which local packets do not write.",
+            ),
+            (not source._INK_ON, "FEATHER_PGS_INK builds the response in the parallel tiers."),
         )
-    ):
-        return None
-    if source._INK_ON:
-        return None
+    )
+
+
+def create_owner(solver):
+    """Admit the local packet law, which :func:`decline` admits, for a topology that fits it, else ``None``."""
     layout = plan(solver)
     if layout is None:
         return None

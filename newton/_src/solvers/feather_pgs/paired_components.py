@@ -22,6 +22,7 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
+from .step_plan import AdmissionFacts, first_failed
 
 PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),
@@ -56,24 +57,23 @@ FREE_BODY_DOFS = 6
 PAIRED_COMPONENT_THREADS = 128
 
 
-def supported(solver) -> bool:
-    """Whether the solver's paired worlds can be split: factor coordinates, one free body, plain sweeps."""
-    return bool(
-        solver.model.device.is_cuda
-        and not solver.model.requires_grad
-        and solver._paired_factor_coordinates
-        and solver._paired_response_secondary_size == FREE_BODY_DOFS
-        and 1 <= (solver._paired_response_primary_size or 0) <= 32
-        and solver.pgs_velocity_iterations == 0
-        and not solver.pgs_debug
-        and solver.pgs_schedule == "interleaved"
-        and not solver.pgs_warmstart
-        and not solver._mf_warmstart_enabled
-        and not solver._regularization_enabled
-        and not solver._preelim_active
-        and not solver.contact_compliance
-        and solver._mimic_count == 0
-        and solver._connect_count == 0
+def decline(solver) -> str | None:
+    """Why the solver's paired worlds cannot be split into components, or ``None`` when they can."""
+    facts = solver._facts
+    return first_failed(
+        (
+            (facts.forward_cuda, "Components need CUDA without gradient recording."),
+            (solver._paired_factor_coordinates, "Components need the paired factor-coordinate sweep."),
+            (
+                solver._paired_response_secondary_size == FREE_BODY_DOFS
+                and 1 <= (solver._paired_response_primary_size or 0) <= 32,
+                "Components pair an articulation of at most 32 DOFs with one free body per world.",
+            ),
+            (facts.plain_sweep, f"Components need {AdmissionFacts.PLAIN_SWEEP}."),
+            (not facts.regularized, "Components solve the unregularized law."),
+            (not solver.contact_compliance, "Components do not solve compliant contacts."),
+            (solver._mimic_count == 0 and solver._connect_count == 0, "Components do not split bilateral rows."),
+        )
     )
 
 

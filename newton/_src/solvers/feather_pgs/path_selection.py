@@ -531,23 +531,13 @@ def _contact_consumers(solver) -> dict:
 
 def _local_solve(solver) -> dict:
     enabled = bool(solver._local_internal_fast_path)
-    if enabled:
-        reason = "Worlds with one small non-free articulation (and at most one free body) solve in local shared memory."
-    elif solver._sparse_mass_matrix_size is not None:
-        reason = "Native sparse factors replace the local owners."
-    else:
-        reason = (
-            "Local owners need CUDA matrix-free immediate interleaved augmented-drive solving with free rigid "
-            "bodies present, one small articulation per world, and no velocity limits, velocity passes, warm "
-            "start, preelimination, debug or torsion."
-        )
     # The candidate counts predate sparse admission, which can retire the owners; report built owners only.
     return {
         "enabled": enabled,
         "internal_articulations_by_dof": _counts(solver._local_internal_art_counts) if enabled else {},
         "pair_articulations_by_dof": _counts(solver._local_pair_art_counts) if enabled else {},
         "residual_articulations_by_dof": _counts(solver._local_residual_art_counts) if enabled else {},
-        "reason": reason,
+        "reason": solver._local_solve_reason,
     }
 
 
@@ -568,6 +558,8 @@ def _paired_response(solver) -> dict:
         "primary_dofs": int(primary),
         "secondary_dofs": int(solver._paired_response_secondary_size),
         "factor_coordinates": factor,
+        # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
+        "factor_coordinates_reason": solver._factor_coordinates_reason,
         "contact_triples": bool(solver._factor_coordinate_contact_triples),
         "contact_units": bool(solver._factor_coordinate_contact_units),
         "components": solver._paired_components is not None,

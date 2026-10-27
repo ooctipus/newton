@@ -248,7 +248,7 @@ from .sparse_mass_matrix import (
     solve_sparse_mass_matrix,
 )
 from .staging import STATIC_SHARED_BYTES, arch_budget
-from .step_plan import StepPlan
+from .step_plan import AdmissionFacts, StepPlan, first_failed
 from .sweep_routes_sparse import (
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     CONTACT_TRANSACTION_BLOCKS,
@@ -2245,6 +2245,8 @@ class SolverFeatherPGS(SolverBase):
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
         self._build_preelimination_plan(model)
+        # The facts the owners' admissions test, computed once (step_plan.AdmissionFacts).
+        self._facts = facts = AdmissionFacts.build(self)
         self._setup_passive_joint_forces(model)
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
@@ -2335,24 +2337,19 @@ class SolverFeatherPGS(SolverBase):
         self._local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.dense_max_constraints)
         self._local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.mf_max_constraints)
         local_budget = arch_budget(model.device.arch) if model.device.is_cuda else 0
-        local_base_supported = bool(
-            model.device.is_cuda
-            and not model.requires_grad
-            and self._has_free_rigid_bodies
-            and self.pgs_mode == "matrix_free"
-            and self.pgs_schedule == "interleaved"
-            and self.drive_mode == "augmented"
-            and not self.enable_joint_velocity_limits
-            and self.pgs_velocity_iterations == 0
-            and not self.pgs_warmstart
-            and not self._mf_warmstart_enabled
-            and not self._preelim_active
-            and not self._debug_buffers_enabled
-            and self._local_solve_max_rows > 0
-            # The local owners do not solve the appended torsion row; torsion is configured later in
-            # construction, so gate on the requested radius here.
-            and float(contact_torsion_radius) <= 0.0
+        local_decline = first_failed(
+            (
+                (facts.forward_cuda, "Local owners need CUDA without gradient recording."),
+                (self._has_free_rigid_bodies, "Local owners serve worlds with free rigid bodies; there are none."),
+                (facts.matrix_free, "Local owners solve in matrix-free mode only."),
+                (facts.plain_sweep, f"Local owners need {AdmissionFacts.PLAIN_SWEEP}."),
+                (not facts.velocity_limits, "Local owners do not solve joint velocity-limit rows."),
+                (self._local_solve_max_rows > 0, "dense_max_constraints leaves the local owners no row."),
+                # Torsion is configured later in construction, so the requested radius decides here.
+                (float(contact_torsion_radius) <= 0.0, "Local owners do not solve the appended torsion row."),
+            )
         )
+        local_base_supported = local_decline is None
         local_primary_articulation = np.full(self.world_count, -1, dtype=np.int32)
         local_pair_articulation = np.full(self.world_count, -1, dtype=np.int32)
         local_residual_pair_articulation = np.full(self.world_count, -1, dtype=np.int32)
@@ -2520,6 +2517,12 @@ class SolverFeatherPGS(SolverBase):
         self._local_internal_fast_path = bool(
             local_base_supported and any(count > 0 for count in self._local_internal_art_counts.values())
         )
+        self._local_solve_reason = local_decline or (
+            "Worlds with one small non-free articulation (and at most one free body) solve in local shared memory."
+            if self._local_internal_fast_path
+            else "No world holds one non-free articulation of at most "
+            f"{_LOCAL_INTERNAL_MAX_DOF} DOFs whose local staging fits the device."
+        )
         response_dof_count = self._model_plan.response_dof_count
         response_articulations = response_dof_count > 0
         direct_body_inertia = np.isin(response_dof_count, tuple(self._free_body_inertia_sizes))
@@ -2641,21 +2644,18 @@ class SolverFeatherPGS(SolverBase):
         self._paired_response_secondary_groups = (
             wp.array(response_pair[2], dtype=wp.int32, device=model.device) if response_pair is not None else None
         )
-        self._paired_factor_coordinates = bool(
-            response_pair is not None
-            and not self._local_internal_fast_path
-            and not self._preelim_active
-            and not self._regularization_enabled
-            and not self.pgs_warmstart
-            and not self.pgs_debug
-            and self.pgs_iterations > 0
-            and self.pgs_velocity_iterations == 0
-            and self.pgs_schedule == "interleaved"
-            and self.drive_mode == "augmented"
-            and not self.enable_joint_velocity_limits
-            # The factor-coordinate owner does not solve the appended torsion row.
-            and not self._contact_torsion_enabled
+        self._factor_coordinates_reason = first_failed(
+            (
+                (response_pair is not None, "No paired response."),
+                (not self._local_internal_fast_path, "Local owners claim the paired worlds."),
+                (facts.plain_sweep, f"The factor-coordinate sweep needs {AdmissionFacts.PLAIN_SWEEP}."),
+                (not facts.regularized, "The factor-coordinate sweep solves the unregularized law."),
+                (self.pgs_iterations > 0, "The factor-coordinate sweep needs a positive iteration budget."),
+                (not facts.velocity_limits, "The factor-coordinate sweep solves no joint velocity-limit rows."),
+                (not self._contact_torsion_enabled, "The factor-coordinate owner does not solve the torsion row."),
+            )
         )
+        self._paired_factor_coordinates = self._factor_coordinates_reason is None
         # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
         # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
         # normal rows instead.
@@ -2748,23 +2748,28 @@ class SolverFeatherPGS(SolverBase):
         # owners (row_packets.py), with the point or the patch row law;
         # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below take patch
         # friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0.
-        self._row_packets = None
-        if self._sparse_mass_matrix_size is not None:
-            self._row_packets_reason = "Native sparse factors own the contact rows."
-        elif not self._law_agnostic_contact_paths:
-            self._row_packets_reason = (
-                "Local packets implement the point and patch row laws; torsion and compliance keep ordinary rows."
-            )
-        elif os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") != "1":
-            self._row_packets_reason = "FEATHER_PGS_ROW_PACKETS disables local packets."
-        else:
-            from .row_packets import create_owner as create_row_packets  # noqa: PLC0415
+        from . import row_packets  # noqa: PLC0415
 
-            self._row_packets = create_row_packets(self)
+        self._row_packets = None
+        self._row_packets_reason = first_failed(
+            (
+                (self._sparse_mass_matrix_size is None, "Native sparse factors own the contact rows."),
+                (
+                    self._law_agnostic_contact_paths,
+                    "Local packets implement the point and patch row laws; torsion and compliance keep ordinary rows.",
+                ),
+                (
+                    os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") == "1",
+                    "FEATHER_PGS_ROW_PACKETS disables local packets.",
+                ),
+            )
+        ) or row_packets.decline(self)
+        if self._row_packets_reason is None:
+            self._row_packets = row_packets.create_owner(self)
             self._row_packets_reason = (
                 "Admitted: worlds of one limited articulation and at most one other build packets in place."
                 if self._row_packets is not None
-                else "The local packet law does not admit this topology, policy or device."
+                else "The local packet law does not admit this topology."
             )
         # Keyed rows are on by policy wherever their producer admits the solver
         # (keyed_rows.create_owner); FEATHER_PGS_KEYED_ROWS=0 opts out.
@@ -4669,6 +4674,7 @@ class SolverFeatherPGS(SolverBase):
         # The sparse producers overwrite every live value and retain factors by the mass mask.
         self._double_buffer = False
         self._local_internal_fast_path = False
+        self._local_solve_reason = "Native sparse factors replace the local owners."
         self._sparse_mass_matrix_plan = plan
         self._sparse_mass_matrix_indices = factor_indices(plan, model.device)
         self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
@@ -5733,24 +5739,19 @@ class SolverFeatherPGS(SolverBase):
 
         self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
-        self._paired_components = None
-        if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1":
-            self._paired_components_reason = "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
-        else:
-            from .paired_components import PairedComponents  # noqa: PLC0415
-            from .paired_components import supported as components_supported  # noqa: PLC0415
+        from . import paired_components  # noqa: PLC0415
 
-            if components_supported(self):
-                self._paired_components = PairedComponents(self)
-                self._paired_components_reason = (
-                    "Admitted: each paired world splits into independent articulation and free-body components."
-                )
-            else:
-                self._paired_components_reason = (
-                    "Components need the paired factor-coordinate sweep with one free body per world and a plain "
-                    "interleaved policy without warm start, regularization, preelimination, compliance or "
-                    "bilateral rows."
-                )
+        self._paired_components = None
+        self._paired_components_reason = (
+            "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
+            if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1"
+            else paired_components.decline(self)
+        )
+        if self._paired_components_reason is None:
+            self._paired_components = paired_components.PairedComponents(self)
+            self._paired_components_reason = (
+                "Admitted: each paired world splits into independent articulation and free-body components."
+            )
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
