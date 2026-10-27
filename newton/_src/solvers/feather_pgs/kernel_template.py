@@ -188,6 +188,8 @@ class KernelTemplate:
         dual: Compose the body for both devices (``dual_native``) instead of CUDA only (``cuda_native``).
         native_name: The native function's name.
         launch_bounds: CUDA ``(threads, minimum blocks per SM)`` of the kernel, or ``None``.
+        cluster_dim: Blocks per thread-block cluster (sm_90 and later): a launch's consecutive blocks in groups of
+            this many share a cluster barrier and each other's shared memory; 1 for none.
         composed: ``source`` is a complete snippet whose preludes are already composed.
         module: The Python module whose Warp module holds the kernel (``__name__`` of a module-level kernel), or
             ``"unique"`` for a variant in a module of its own.
@@ -201,6 +203,7 @@ class KernelTemplate:
     dual: bool = False
     native_name: str = "native"
     launch_bounds: tuple[int, int] | None = None
+    cluster_dim: int = 1
     composed: bool = False
     module: str = "unique"
 
@@ -271,6 +274,8 @@ class KernelTemplate:
         function = namespace["kernel_template"]
         function.__name__ = function.__qualname__ = self.name
         options = {"launch_bounds": self.launch_bounds} if self.launch_bounds is not None else {}
+        if self.cluster_dim > 1:
+            options["cluster_dim"] = self.cluster_dim
         if self.module == "unique":
             options["module"] = "unique"
         return wp.kernel(enable_backward=False, **options)(function)
