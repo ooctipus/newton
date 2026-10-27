@@ -124,9 +124,16 @@ class StepPlan:
     delassus: Mapping[int, Route]
     """Stage 4, per size, split mode's Delassus assembly: ``tiles`` or ``entries``; empty where none is assembled."""
     solve: SolveRoute
+    gather_sizes: tuple[int, ...]
+    """Stage 5 of the matrix-free family: the sizes whose group-layout J and Y are gathered into world layout; none
+    where the response is written in world layout, aliases it, or a sparse owner keeps no dense response."""
     unread_mass_sizes: tuple[int, ...]
     """Sizes whose dense mass matrix no stage reads: under a held-tree owner, the sizes stage 2 factors without
     H. Their end-of-step clear is skipped."""
+    jacobian_clear_sizes: tuple[int, ...]
+    """End of a double-buffered step: the sizes whose active Jacobian rows are cleared for the buffer's next use;
+    none under owners that keep a private Jacobian (local row packets, keyed rows), and never the sparse-diagonal
+    response size (no dense J) or the compact producer's six-coordinate size (complete stores)."""
 
     @classmethod
     def build(cls, solver) -> StepPlan:
@@ -141,7 +148,24 @@ class StepPlan:
             response=MappingProxyType(response),
             delassus=MappingProxyType(_delassus(solver, solve, response)),
             solve=solve,
+            gather_sizes=tuple(solver.size_groups)
+            if solve.family == "matrix_free"
+            and not (
+                solver._jy_world_aliased
+                or solver._hinv_jt_writes_world
+                or solver._sparse_diagonal_contact_solve
+                or solver._sparse_mass_matrix_size is not None
+            )
+            else (),
             unread_mass_sizes=_unread_mass_sizes(factor, held=held),
+            jacobian_clear_sizes=()
+            if solver._row_packets is not None or solver._keyed_rows is not None
+            else tuple(
+                size
+                for size in solver.size_groups
+                if not (solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size)
+                and not (solver._compact_contact_boundary and size == 6)
+            ),
         )
 
     @property
@@ -165,7 +189,9 @@ class StepPlan:
             "response": table(self.response),
             "delassus": table(self.delassus) if self.delassus else None,
             "solve_family": self.solve.family,
+            "gather_dofs": [int(size) for size in self.gather_sizes],
             "unread_mass_dofs": sorted(int(size) for size in self.unread_mass_sizes),
+            "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
 
 

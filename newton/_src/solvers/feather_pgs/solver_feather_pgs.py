@@ -6504,7 +6504,8 @@ class SolverFeatherPGS(SolverBase):
             return
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-        if self._sparse_mass_matrix_size is not None:
+        route = self._plan.solve.route.name
+        if route == "sparse_pgs":
             if soft_relax:
                 raise RuntimeError("sparse factor response requires the interleaved augmented-drive solve")
             worlds_per_block = 64 // self._sparse_solve_lanes
@@ -6568,7 +6569,7 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             return
-        if self._sparse_diagonal_contact_solve:
+        if route == "sparse_diagonal":
             kernel = self._pgs_solve_sparse_diagonal_kernel
             if kernel is None:
                 raise RuntimeError("Sparse diagonal GS kernel is unavailable for this solver shape")
@@ -7291,35 +7292,27 @@ class SolverFeatherPGS(SolverBase):
             )
         elif solve.family == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
-                # Gather J/Y from per-size-group arrays into world-indexed arrays.
-                # Skipped when J_world/Y_world alias the group buffers (identity
-                # layout, see _detect_jy_world_identity).
+                # Gather J/Y from per-size-group arrays into world-indexed arrays (StepPlan.gather_sizes).
                 # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
-                if (
-                    not self._jy_world_aliased
-                    and not self._hinv_jt_writes_world
-                    and not self._sparse_diagonal_contact_solve
-                    and self._sparse_mass_matrix_size is None
-                ):
-                    for size in self.size_groups:
-                        n_arts = self.n_arts_by_size[size]
-                        wp.launch(
-                            response_builds_dense.gather_coordinates_kernel(),
-                            dim=int(n_arts * self.dense_max_constraints * size),
-                            inputs=[
-                                self.group_to_art[size],
-                                self.art_to_world,
-                                self.articulation_world_dof_offset,
-                                self.constraint_count,
-                                self.J_by_size[size],
-                                self.Y_by_size[size],
-                                size,
-                                self.dense_max_constraints,
-                                n_arts,
-                            ],
-                            outputs=[self.J_world, self.Y_world],
-                            device=self.model.device,
-                        )
+                for size in self._plan.gather_sizes:
+                    n_arts = self.n_arts_by_size[size]
+                    wp.launch(
+                        response_builds_dense.gather_coordinates_kernel(),
+                        dim=int(n_arts * self.dense_max_constraints * size),
+                        inputs=[
+                            self.group_to_art[size],
+                            self.art_to_world,
+                            self.articulation_world_dof_offset,
+                            self.constraint_count,
+                            self.J_by_size[size],
+                            self.Y_by_size[size],
+                            size,
+                            self.dense_max_constraints,
+                            n_arts,
+                        ],
+                        outputs=[self.J_world, self.Y_world],
+                        device=self.model.device,
+                    )
 
                 self._stage4_apply_world_contact_restitution(dt, matrix_free=True)
 
@@ -7642,19 +7635,15 @@ class SolverFeatherPGS(SolverBase):
         # reader at all (StepPlan.unread_mass_sizes) and are never cleared.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                if self._row_packets is None and self._keyed_rows is None:
+                clear = self._plan.jacobian_clear_sizes
+                if clear:
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
                         if self._mass_update_global_flag and size not in self._plan.unread_mass_sizes:
                             self._H_bufs[self._buf_idx][size].zero_()
-                        if self._row_packets is not None or self._keyed_rows is not None:
-                            continue  # Private J is current; general active rows are cleared before materialization.
-                        if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
-                            # Sparse response owns no dense J; its buffer is a one-float placeholder.
+                        if size not in clear:
                             continue
-                        if self._compact_contact_boundary and size == 6:
-                            continue  # Complete contact stores; the next step clears only its limit prefix.
                         wp.launch(
                             clear_grouped_jacobian_active_rows,
                             dim=self.n_arts_by_size[size] * 32,
