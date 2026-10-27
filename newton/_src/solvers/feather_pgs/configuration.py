@@ -1,7 +1,84 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Resolve existing FPGS implementation options before topology admission."""
+"""Check and resolve FPGS options before topology admission."""
+
+import math
+from collections.abc import Mapping
+from typing import Any
+
+from .solve_policy import SOLVE_READOUTS
+
+
+def _finite_nonnegative(value: float) -> bool:
+    return math.isfinite(value) and value >= 0.0
+
+
+# Each numeric option's type and admissible values: (name, type, admits, requirement, append the given value).
+_NUMBER_RULES = (
+    (
+        "contact_friction_position_iterations",
+        int,
+        lambda value: value >= -1,
+        "must be -1 for all position iterations, or a non-negative last-N iteration count",
+        False,
+    ),
+    ("contact_friction_scale", float, lambda value: not value < 0.0, "must be non-negative", False),
+    ("contact_friction_anchor_limit", int, lambda value: value >= 0, "must be non-negative", False),
+    ("contact_speculative_scale", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("same_articulation_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("articulation_pair_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("joint_limit_activation_gap", float, lambda value: value >= 0.0, "must be non-negative or inf", False),
+    # A finite fraction above 1 would leave speeds in (limit, fraction * limit) unclamped: a row allocates only at
+    # |qd| >= fraction * limit. inf is the explicit never-activate switch.
+    (
+        "velocity_limit_activation_fraction",
+        float,
+        lambda v: 0.0 <= v <= 1.0 or math.isinf(v),
+        "must be in [0, 1] or inf",
+        False,
+    ),
+    ("pgs_contact_regularization", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("pgs_change_tolerance", float, _finite_nonnegative, "must be finite and non-negative", True),
+    ("pgs_relative_change_tolerance", float, lambda value: 0.0 <= value < 1.0, "must be finite in [0, 1)", True),
+    ("pgs_velocity_change_tolerance", float, _finite_nonnegative, "must be finite and non-negative", True),
+    ("restitution_velocity_threshold", float, _finite_nonnegative, "must be finite and non-negative", False),
+    ("pgs_warmstart_decay", float, _finite_nonnegative, "must be finite and non-negative", True),
+    ("dense_max_constraints", int, lambda value: value >= 1, "must be positive", False),
+    ("tile_threads", int, lambda value: value in (32, 64, 128, 256), "must be one of (32, 64, 128, 256)", True),
+)
+# Each option with a fixed set of values.
+_CHOICE_RULES = (
+    ("pgs_solve_readout", SOLVE_READOUTS),
+    ("pgs_velocity_drive_mode", ("active", "freeze")),
+    ("pgs_mode", ("split", "matrix_free")),
+    ("pgs_schedule", ("interleaved", "contact_then_internal", "physx_grasp")),
+    ("drive_mode", ("augmented", "physx_pgs")),
+)
+
+
+def check_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the numeric options coerced to their types, after checking every option of the rule tables.
+
+    Raises:
+        ValueError: naming the first option, numbers first and in table order, that is not admissible.
+    """
+    checked = {}
+    for name, coerce, admits, requirement, given in _NUMBER_RULES:
+        value = options[name]
+        message = f"{name} {requirement}" + (f", got {value!r}" if given else "")
+        try:
+            checked[name] = coerce(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(message) from exc
+        if not admits(checked[name]):
+            raise ValueError(message)
+    for name, choices in _CHOICE_RULES:
+        if options[name] not in choices:
+            raise ValueError(f"{name} must be one of {choices}, got {options[name]!r}")
+    return checked
+
 
 _KERNEL_CHOICES = {
     "cholesky_kernel": ("auto", "tiled", "loop"),

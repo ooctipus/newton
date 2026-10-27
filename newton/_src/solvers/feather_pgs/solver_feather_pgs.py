@@ -68,7 +68,7 @@ from . import (
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .conditioning import ArmatureFloor, conditioning_armature
-from .configuration import resolve_kernel_choices
+from .configuration import check_options, resolve_kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
@@ -185,7 +185,7 @@ from .row_build import (
     populate_world_J_masked_patch,
 )
 from .row_laws import ROW_LAW
-from .solve_policy import SOLVE_READOUTS, SolvePolicy, SolveReadoutRecord
+from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
     ARTICULATION_ORIGIN,
     ARTICULATION_WORK,
@@ -1834,6 +1834,8 @@ class SolverFeatherPGS(SolverBase):
         if retired_warning is not None:
             warnings.warn(retired_warning, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         super().__init__(model)
+        # Every scalar option coerced and checked once (configuration.OPTION_RULES).
+        options = check_options(requested_options)
 
         if pgs_kernel in ("tiled_contact", "streaming"):
             warnings.warn(
@@ -1880,11 +1882,10 @@ class SolverFeatherPGS(SolverBase):
         self.update_mass_matrix_interval = update_mass_matrix_interval
         self.enable_contact_friction = enable_contact_friction
         self.contact_friction_gap_threshold = contact_friction_gap_threshold
-        self.contact_friction_position_iterations = int(contact_friction_position_iterations)
+        self.contact_friction_position_iterations = options["contact_friction_position_iterations"]
         self.contact_friction_shared_anchor = bool(contact_friction_shared_anchor)
-        self.contact_friction_anchor_limit = int(contact_friction_anchor_limit)
         self.contact_friction_articulation_pairs_only = bool(contact_friction_articulation_pairs_only)
-        self.contact_friction_scale = float(contact_friction_scale)
+        self.contact_friction_scale = options["contact_friction_scale"]
         # How friction_anchor_beta was resolved, for get_path_selection().
         self._friction_anchor_beta_source = "argument"
         if friction_anchor_beta is None:
@@ -1908,7 +1909,7 @@ class SolverFeatherPGS(SolverBase):
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
-        if self.contact_friction_anchor_limit > 0:
+        if options["contact_friction_anchor_limit"] > 0:
             warnings.warn(
                 "contact_friction_anchor_limit is deprecated and ignored. Patch friction is enabled by default; "
                 "use friction_anchor_beta to adjust it or explicitly set zero to disable it.",
@@ -1926,68 +1927,22 @@ class SolverFeatherPGS(SolverBase):
                 UserWarning,
                 stacklevel=_CONSTRUCTOR_CALLER,
             )
-        try:
-            self.contact_speculative_scale = float(contact_speculative_scale)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("contact_speculative_scale must be finite and non-negative") from exc
-        if not np.isfinite(self.contact_speculative_scale) or self.contact_speculative_scale < 0.0:
-            raise ValueError("contact_speculative_scale must be finite and non-negative")
-        try:
-            self.contact_gap_gate = float(contact_gap_gate)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("contact_gap_gate must be finite and non-negative") from exc
-        if not np.isfinite(self.contact_gap_gate) or self.contact_gap_gate < 0.0:
-            raise ValueError("contact_gap_gate must be finite and non-negative")
-        try:
-            self.same_articulation_contact_gap_gate = float(same_articulation_contact_gap_gate)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("same_articulation_contact_gap_gate must be finite and non-negative") from exc
-        if not np.isfinite(self.same_articulation_contact_gap_gate) or self.same_articulation_contact_gap_gate < 0.0:
-            raise ValueError("same_articulation_contact_gap_gate must be finite and non-negative")
-        try:
-            self.articulation_pair_contact_gap_gate = float(articulation_pair_contact_gap_gate)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative") from exc
-        if not np.isfinite(self.articulation_pair_contact_gap_gate) or self.articulation_pair_contact_gap_gate < 0.0:
-            raise ValueError("articulation_pair_contact_gap_gate must be finite and non-negative")
+        self.contact_speculative_scale = options["contact_speculative_scale"]
+        self.contact_gap_gate = options["contact_gap_gate"]
+        self.same_articulation_contact_gap_gate = options["same_articulation_contact_gap_gate"]
+        self.articulation_pair_contact_gap_gate = options["articulation_pair_contact_gap_gate"]
         self.contact_shared_anchor = bool(contact_shared_anchor)
-        if self.contact_friction_position_iterations < -1:
-            raise ValueError(
-                "contact_friction_position_iterations must be -1 for all position iterations, "
-                "or a non-negative last-N iteration count"
-            )
-        if self.contact_friction_scale < 0.0:
-            raise ValueError("contact_friction_scale must be non-negative")
-        if self.contact_friction_anchor_limit < 0:
-            raise ValueError("contact_friction_anchor_limit must be non-negative")
         # The deprecated input must not reach legacy point-row writers or scale their friction.
         self.contact_friction_anchor_limit = 0
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
-        try:
-            self.joint_limit_activation_gap = float(joint_limit_activation_gap)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("joint_limit_activation_gap must be non-negative or inf") from exc
-        if np.isnan(self.joint_limit_activation_gap) or self.joint_limit_activation_gap < 0.0:
-            raise ValueError("joint_limit_activation_gap must be non-negative or inf")
+        self.joint_limit_activation_gap = options["joint_limit_activation_gap"]
         self.enable_joint_velocity_limits = enable_joint_velocity_limits
-        try:
-            self.velocity_limit_activation_fraction = float(velocity_limit_activation_fraction)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("velocity_limit_activation_fraction must be non-negative") from exc
-        frac = self.velocity_limit_activation_fraction
-        if np.isnan(frac) or not (0.0 <= frac <= 1.0 or np.isinf(frac)):
-            # Finite values above 1 would leave speeds in
-            # (limit, fraction*limit) permanently unclamped: the row only
-            # allocates at |qd| >= fraction * limit. inf stays valid as an
-            # explicit never-activate kill-switch.
-            raise ValueError("velocity_limit_activation_fraction must be in [0, 1] or inf")
+        self.velocity_limit_activation_fraction = options["velocity_limit_activation_fraction"]
         self.pgs_iterations = pgs_iterations
         self.pgs_beta = pgs_beta
-        self.pgs_contact_regularization = float(pgs_contact_regularization)
-        if not math.isfinite(self.pgs_contact_regularization) or self.pgs_contact_regularization < 0.0:
-            raise ValueError("pgs_contact_regularization must be finite and non-negative")
+        self.pgs_contact_regularization = options["pgs_contact_regularization"]
         if self.pgs_contact_regularization > _MAX_CONTACT_REGULARIZATION:
             raise ValueError(
                 f"pgs_contact_regularization must be at most {_MAX_CONTACT_REGULARIZATION:g}; "
@@ -1999,22 +1954,10 @@ class SolverFeatherPGS(SolverBase):
         self._regularization_enabled = self._contact_w < 1.0
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
-        self.pgs_change_tolerance = float(pgs_change_tolerance)
-        if not (np.isfinite(self.pgs_change_tolerance) and self.pgs_change_tolerance >= 0.0):
-            raise ValueError(f"pgs_change_tolerance must be finite and non-negative, got {pgs_change_tolerance!r}")
-        self.pgs_relative_change_tolerance = float(pgs_relative_change_tolerance)
-        if not (np.isfinite(self.pgs_relative_change_tolerance) and 0.0 <= self.pgs_relative_change_tolerance < 1.0):
-            raise ValueError(
-                f"pgs_relative_change_tolerance must be finite in [0, 1), got {pgs_relative_change_tolerance!r}"
-            )
-        if pgs_solve_readout not in SOLVE_READOUTS:
-            raise ValueError(f"pgs_solve_readout must be one of {SOLVE_READOUTS}, got {pgs_solve_readout!r}")
+        self.pgs_change_tolerance = options["pgs_change_tolerance"]
+        self.pgs_relative_change_tolerance = options["pgs_relative_change_tolerance"]
         self.pgs_solve_readout = pgs_solve_readout
-        self.pgs_velocity_change_tolerance = float(pgs_velocity_change_tolerance)
-        if not (np.isfinite(self.pgs_velocity_change_tolerance) and self.pgs_velocity_change_tolerance >= 0.0):
-            raise ValueError(
-                f"pgs_velocity_change_tolerance must be finite and non-negative, got {pgs_velocity_change_tolerance!r}"
-            )
+        self.pgs_velocity_change_tolerance = options["pgs_velocity_change_tolerance"]
         # Every sweep compiles the policy: its exit law and readout.
         self._solve_policy = SolvePolicy(
             readout=pgs_solve_readout,
@@ -2027,20 +1970,12 @@ class SolverFeatherPGS(SolverBase):
         self._solve_policy_honored = {}
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
-        threshold_error = "restitution_velocity_threshold must be finite and non-negative"
-        try:
-            self.restitution_velocity_threshold = float(restitution_velocity_threshold)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(threshold_error) from exc
-        if not np.isfinite(self.restitution_velocity_threshold) or self.restitution_velocity_threshold < 0.0:
-            raise ValueError(threshold_error)
+        self.restitution_velocity_threshold = options["restitution_velocity_threshold"]
         self._effective_restitution_velocity_threshold = (
             self.restitution_velocity_threshold if self.enable_restitution else np.finfo(np.float32).max
         )
-        if pgs_velocity_drive_mode not in ("active", "freeze"):
-            raise ValueError(f"pgs_velocity_drive_mode must be 'active' or 'freeze', got {pgs_velocity_drive_mode!r}")
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
-        dense_max_constraints = int(dense_max_constraints)
+        dense_max_constraints = options["dense_max_constraints"]
         self.warn_constraint_overflow = bool(warn_constraint_overflow)
         if articulated_contact_response in ("propagation", "propagation-fused", "propagation-colored"):
             warnings.warn(
@@ -2082,9 +2017,7 @@ class SolverFeatherPGS(SolverBase):
         self._legacy_mf_warmstart = legacy_mf_warmstart
         self._legacy_mf_warmstart_decay = legacy_mf_decay
 
-        requested_pgs_decay = float(pgs_warmstart_decay)
-        if not math.isfinite(requested_pgs_decay) or requested_pgs_decay < 0.0:
-            raise ValueError(f"pgs_warmstart_decay must be finite and non-negative, got {pgs_warmstart_decay!r}")
+        requested_pgs_decay = options["pgs_warmstart_decay"]
         self.pgs_warmstart = bool(pgs_warmstart) or legacy_mf_warmstart
         self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
         # FEATHER_PGS_VELOCITY_LIMIT_LAW overrides the argument, so recipes select the law without code changes.
@@ -2165,31 +2098,24 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_slot_sorted = None
         self._ws_warned_no_match = False
 
-        if pgs_mode not in ("split", "matrix_free"):
-            raise ValueError(f"pgs_mode must be 'split' or 'matrix_free', got {pgs_mode!r}")
         self.pgs_mode = pgs_mode
         self.mf_max_constraints = int(mf_max_constraints)
         if self.pgs_mode == "matrix_free":
             _validate_mf_metadata_encoding(self.mf_max_constraints)
-        if self.enable_joint_velocity_limits and self.pgs_mode != "matrix_free":
+        # What only matrix-free mode (CUDA only) implements.
+        if self.enable_joint_velocity_limits and pgs_mode != "matrix_free":
             raise NotImplementedError("enable_joint_velocity_limits=True currently requires pgs_mode='matrix_free'")
-        if model.device.is_cpu and self.pgs_mode == "matrix_free":
+        if model.device.is_cpu and pgs_mode == "matrix_free":
             raise NotImplementedError(
                 "SolverFeatherPGS pgs_mode='matrix_free' requires CUDA; use pgs_mode='split' on CPU."
             )
-        if pgs_schedule not in ("interleaved", "contact_then_internal", "physx_grasp"):
-            raise ValueError(
-                f"pgs_schedule must be 'interleaved', 'contact_then_internal', or 'physx_grasp', got {pgs_schedule!r}"
-            )
-        if pgs_schedule != "interleaved" and self.pgs_mode != "matrix_free":
+        if pgs_schedule != "interleaved" and pgs_mode != "matrix_free":
             raise ValueError("pgs_schedule is currently only supported with pgs_mode='matrix_free'")
-        self.pgs_schedule = pgs_schedule
-        if self.pgs_velocity_iterations > 0 and self.pgs_mode != "matrix_free":
+        if self.pgs_velocity_iterations > 0 and pgs_mode != "matrix_free":
             raise ValueError("pgs_velocity_iterations is currently only supported with pgs_mode='matrix_free'")
-        if drive_mode not in ("augmented", "physx_pgs"):
-            raise ValueError(f"drive_mode must be 'augmented' or 'physx_pgs', got {drive_mode!r}")
-        if drive_mode == "physx_pgs" and self.pgs_mode != "matrix_free":
+        if drive_mode == "physx_pgs" and pgs_mode != "matrix_free":
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
+        self.pgs_schedule = pgs_schedule
         self.drive_mode = drive_mode
         # fuse_joint_velocity_limits is an engage-where-applicable request,
         # not a demand: the fused clamp only exists in the matrix_free +
@@ -2232,8 +2158,6 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
         )
 
-        if dense_max_constraints < 1:
-            raise ValueError("dense_max_constraints must be positive")
         self._double_buffer = double_buffer
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
@@ -2260,9 +2184,7 @@ class SolverFeatherPGS(SolverBase):
 
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
-        self.tile_threads = int(tile_threads)
-        if self.tile_threads not in (32, 64, 128, 256):
-            raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
+        self.tile_threads = options["tile_threads"]
         # Launches over the contact capacity (the force export, the warm-start snapshot
         # and gathers, the keyed-row key scatters) grid-stride over about one wave of blocks.
         self._contact_capacity_blocks = contact_capacity_blocks(model.device)
@@ -2908,8 +2830,10 @@ class SolverFeatherPGS(SolverBase):
             self._arrays.allocate(OVERFLOW_WARNING)
         else:
             self._arrays.release(OVERFLOW_WARNING)
+        # The telemetry words share one array, which constraint_row_watermarks() reads back once.
+        self._row_watermark_words = None
         if self._row_watermark:
-            self._arrays.allocate(ROW_WATERMARKS)
+            self._row_watermark_words = self._arrays.allocate_words(ROW_WATERMARKS)
         else:
             self._arrays.release(ROW_WATERMARKS)
 
@@ -7118,19 +7042,6 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
-        if self._sparse_mass_matrix_size is not None and (
-            self.pgs_mode != ("split" if self._sparse_split else "matrix_free")
-            or self.pgs_schedule != "interleaved"
-            or self.drive_mode != "augmented"
-            or (self.pgs_warmstart and self._has_free_rigid_bodies)
-            or self.pgs_debug
-            or self.pgs_velocity_iterations != 0
-            or self.enable_joint_velocity_limits != self._sparse_velocity_limits
-            or self._contact_torsion_enabled
-            or self.contact_compliance
-            or (self._sparse_split and self.pgs_kernel != "tiled_row")
-        ):
-            raise RuntimeError("Reconstruct the solver after changing options incompatible with sparse mass factors")
         if self._contact_torsion_enabled:
             validate_torsion_step(self)
             if getattr(self, "_device_torsion", None) is not None:
@@ -7934,8 +7845,8 @@ class SolverFeatherPGS(SolverBase):
         contact rows that allocators rolled back, peak over-capacity demand,
         and the number of overflowing world-steps. They are accumulated inside
         the captured :meth:`step` when
-        ``row_watermark`` is enabled. Reads ``.numpy()[0]`` from the device
-        buffers and so must be called OUTSIDE any captured/timed region (it
+        ``row_watermark`` is enabled. Reads the telemetry words back in one
+        copy and so must be called OUTSIDE any captured/timed region (it
         forces a device sync).
 
         Returns ``0`` for every field when the telemetry was not enabled; these
@@ -7944,36 +7855,24 @@ class SolverFeatherPGS(SolverBase):
         The ``propagation_*`` fields are deprecated and always ``0``: no route
         builds propagation rows.
         """
-        families = {
-            "dense": (
-                self._row_watermark_dense,
-                self._row_watermark_dense_raw,
-                self._row_dropped_dense_high_water,
-                self._row_overflow_dense_excess,
-                self._row_overflow_dense_world_steps,
-            ),
-            "mf": (
-                self._row_watermark_mf,
-                self._row_watermark_mf_raw,
-                self._row_dropped_mf_high_water,
-                self._row_overflow_mf_excess,
-                self._row_overflow_mf_world_steps,
-            ),
-            "propagation": (None,) * 5,
+        words = {}
+        if self._row_watermark_words is not None:
+            words = dict(
+                zip((field.name for field in ROW_WATERMARKS), self._row_watermark_words.numpy().tolist(), strict=True)
+            )
+        fields = {
+            "high_water": "_row_watermark_{}",
+            "raw_high_water": "_row_watermark_{}_raw",
+            "dropped_contact_rows_high_water": "_row_dropped_{}_high_water",
+            "overflow_excess_high_water": "_row_overflow_{}_excess",
+            "overflow_world_steps": "_row_overflow_{}_world_steps",
         }
-        fields = (
-            "high_water",
-            "raw_high_water",
-            "dropped_contact_rows_high_water",
-            "overflow_excess_high_water",
-            "overflow_world_steps",
-        )
-        result = {}
-        for family, arrays in families.items():
-            for field, array in zip(fields, arrays, strict=True):
-                result[f"{family}_{field}"] = int(array.numpy()[0]) if array is not None else 0
-        contacts = self._row_watermark_contact
-        result["contact_high_water"] = int(contacts.numpy()[0]) if contacts is not None else 0
+        result = {
+            f"{family}_{field}": int(words.get(name.format(family), 0))
+            for family in ("dense", "mf", "propagation")
+            for field, name in fields.items()
+        }
+        result["contact_high_water"] = int(words.get("_row_watermark_contact", 0))
         return result
 
     @override
@@ -11334,25 +11233,16 @@ class SolverFeatherPGS(SolverBase):
         iteration_offset: int = 0,
     ):
         """Dispatch the dense PGS kernel with a given iteration count."""
-        saved = self.pgs_iterations
-        saved_friction_start = getattr(self, "_pgs_friction_start_iteration", 0)
-        saved_iteration_offset = getattr(self, "_pgs_iteration_offset", 0)
-        self.pgs_iterations = iterations
-        self._pgs_friction_start_iteration = (
-            self._contact_friction_start_iteration(iterations)
-            if friction_start_iteration is None
-            else int(friction_start_iteration)
+        if friction_start_iteration is None:
+            friction_start_iteration = self._contact_friction_start_iteration(iterations)
+        sweep = (
+            self._stage5_pgs_solve_world_tiled_row
+            if self.pgs_kernel == "tiled_row"
+            else self._stage5_pgs_solve_world_loop
         )
-        self._pgs_iteration_offset = int(iteration_offset)
-        if self.pgs_kernel == "tiled_row":
-            self._stage5_pgs_solve_world_tiled_row()
-        else:
-            self._stage5_pgs_solve_world_loop()
-        self.pgs_iterations = saved
-        self._pgs_friction_start_iteration = saved_friction_start
-        self._pgs_iteration_offset = saved_iteration_offset
+        sweep(iterations, int(friction_start_iteration), int(iteration_offset))
 
-    def _stage5_pgs_solve_world_tiled_row(self):
+    def _stage5_pgs_solve_world_tiled_row(self, iterations: int, friction_start_iteration: int, iteration_offset: int):
         pgs_kernel = self._pgs_solve_tiled_row_kernel
         if pgs_kernel is None:
             raise RuntimeError("Tiled row PGS kernel is unavailable for this solver shape")
@@ -11366,22 +11256,22 @@ class SolverFeatherPGS(SolverBase):
                     self.C,
                     self.rhs,
                     self.impulses,
-                    self.pgs_iterations,
+                    iterations,
                     self.pgs_omega,
                     self.row_type,
                     self.row_parent,
                     self.row_mu,
                     self.row_w,
                     int(self._regularization_enabled),
-                    self._pgs_friction_start_iteration,
-                    self._pgs_iteration_offset,
+                    friction_start_iteration,
+                    iteration_offset,
                     *self._solve_readout.operands(kernel),
                 ],
                 block_dim=32,
                 device=self.model.device,
             )
 
-    def _stage5_pgs_solve_world_loop(self):
+    def _stage5_pgs_solve_world_loop(self, iterations: int, friction_start_iteration: int, iteration_offset: int):
         # The unit loop sweep (contact_update="unit") also reads the patch form and the per-world unit storage.
         units = []
         if self._dense_contact_unit:
@@ -11400,15 +11290,15 @@ class SolverFeatherPGS(SolverBase):
                 self.C,
                 self.rhs,
                 self.impulses,
-                self.pgs_iterations,
+                iterations,
                 self.pgs_omega,
                 self.row_type,
                 self.row_parent,
                 self.row_mu,
                 self.row_w,
                 int(self._regularization_enabled),
-                self._pgs_friction_start_iteration,
-                self._pgs_iteration_offset,
+                friction_start_iteration,
+                iteration_offset,
                 *units,
                 *self._solve_readout.operands(self._pgs_solve_loop_kernel),
             ],

@@ -152,6 +152,20 @@ class SolverArrays:
                 setattr(owner, MIRROR_PREFIX + field.name, mirror)
         return arrays
 
+    def allocate_words(self, group, /) -> wp.array:
+        """Allocate a group of one-word fields of one type as views of one zeroed array, and return that array.
+
+        Each field is the owner's attribute of its name, a one-element view at its position in ``group``, so kernels
+        take it as before while one readback of the returned array reads every field.
+        """
+        dtypes = {field.dtype for field in group}
+        if len(dtypes) != 1 or any(field.dims != (1,) for field in group):
+            raise ValueError("allocate_words takes one-word fields of one type")
+        words = wp.zeros(len(group.fields), dtype=dtypes.pop(), device=self.device)
+        for index, field in enumerate(group):
+            setattr(self.owner, field.name, words[index : index + 1])
+        return words
+
     def upload(self, group, /, *, owner=None, **values) -> dict[str, wp.array]:
         """Copy host values to the device, one per field of ``group`` (by field name), as the fields' arrays.
 

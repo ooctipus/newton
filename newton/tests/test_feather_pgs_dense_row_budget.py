@@ -82,10 +82,7 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
             _pgs_solve_tiled_row_budgets=(),
             world_count=17,
             model=SimpleNamespace(device="mock-device"),
-            pgs_iterations=8,
             pgs_omega=0.8,
-            _pgs_friction_start_iteration=2,
-            _pgs_iteration_offset=3,
             _regularization_enabled=True,
             _solve_readout=SimpleNamespace(operands=lambda kernel: []),
         )
@@ -110,7 +107,7 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
         for kernels in ((), (object(), object())):
             state._pgs_solve_tiled_row_budgets = kernels
             with patch("newton._src.solvers.feather_pgs.solver_feather_pgs.wp.launch_tiled") as launch:
-                SolverFeatherPGS._stage5_pgs_solve_world_tiled_row(state)
+                SolverFeatherPGS._stage5_pgs_solve_world_tiled_row(state, 8, 2, 3)
             self.assertEqual(launch.call_count, len(kernels) or 1)
             for call, kernel in zip(
                 launch.call_args_list, kernels or (state._pgs_solve_tiled_row_kernel,), strict=True

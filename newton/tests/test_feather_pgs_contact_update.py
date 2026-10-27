@@ -1003,15 +1003,12 @@ class TestContactUpdateSolver(unittest.TestCase):
                 C=world.w_C,
                 rhs=world.w["rhs"],
                 impulses=impulses,
-                pgs_iterations=8,
                 pgs_omega=1.0,
                 row_type=world.w_rtype,
                 row_parent=world.w_parent,
                 row_mu=world.w["mu"],
                 row_w=world.w["mu"],  # unread: no regularization
                 _regularization_enabled=False,
-                _pgs_friction_start_iteration=0,
-                _pgs_iteration_offset=0,
                 _contact_unit_patch="ring",
                 _dense_unit_state=world.state,
                 _dense_unit_rows=world.rows,
@@ -1019,7 +1016,7 @@ class TestContactUpdateSolver(unittest.TestCase):
                 model=SimpleNamespace(device=wp.get_device(_CPU)),
             )
             with launched_kernels() as keys:
-                SolverFeatherPGS._stage5_pgs_solve_world_loop(stub)
+                SolverFeatherPGS._stage5_pgs_solve_world_loop(stub, 8, 0, 0)
             self.assertEqual(keys, ["sweep_loop_unit" if unit else "sweep_loop"])
             out = impulses.numpy()
             for k, lam in enumerate(expected):
