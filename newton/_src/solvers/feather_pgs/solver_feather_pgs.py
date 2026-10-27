@@ -5094,6 +5094,8 @@ class SolverFeatherPGS(SolverBase):
 
     def _classify_free_rigid_bodies(self, model):
         """Materialize free-rigid execution metadata from the model plan."""
+        # Free rigid bodies per world: they bound a world's contact units per color (sweep_units.capable_worlds).
+        self._free_rigid_per_world = np.zeros(max(int(model.world_count), 1), dtype=np.int64)
         if not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
             self._has_mixed_contacts = False
@@ -5121,6 +5123,9 @@ class SolverFeatherPGS(SolverBase):
         # articulations when selecting the patch routes.
         self._has_non_free_articulations = bool(np.any(solve_mask & ~free_mask))
         self._n_free_rigid = int(np.sum(free_mask))
+        free_world = articulation_world[solve_mask & free_mask]
+        free_world = free_world[free_world >= 0]
+        self._free_rigid_per_world = np.bincount(free_world, minlength=self._free_rigid_per_world.size)
         self.is_free_rigid = wp.array(is_free_rigid, dtype=wp.int32, device=model.device)
         self.free_rigid_body_indices = wp.array(
             self._model_plan.response_free_rigid_body_indices, dtype=wp.int32, device=model.device
@@ -6139,13 +6144,16 @@ class SolverFeatherPGS(SolverBase):
                 )
                 parallel_rows -= parallel_rows % 4
                 incremental_rows = 0
-            # The colored mapping takes the worlds with many free-body contact rows (sweep_routes.COLORED_ROWS):
-            # built when the row capacity admits one such world, it runs beside the one-warp mapping.
-            colored_rows = (
-                sweep_routes.COLORED_ROWS
-                if model.device.is_cuda and self.mf_max_constraints >= sweep_routes.COLORED_ROWS
-                else 0
-            )
+            # The colored mapping takes the worlds the unit builder's rule picks at every pack
+            # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
+            # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
+            # device holds colored blocks run in waves, which scales the rule (ColoredRule.at_scale).
+            rule = sweep_units.COLORED_RULE
+            capable = sweep_units.capable_worlds(self._free_rigid_per_world, self.mf_max_constraints, rule)
+            if model.device.is_cuda and capable.size > 0:
+                rule = rule.at_scale(capable.size, model.device.sm_count)
+                capable = sweep_units.capable_worlds(self._free_rigid_per_world, self.mf_max_constraints, rule)
+            colored = model.device.is_cuda and capable.size > 0
             mf_gs_options = {
                 "has_drive_rows": has_drive_rows,
                 "has_dense_velocity_limit_rows": self.enable_joint_velocity_limits,
@@ -6159,7 +6167,7 @@ class SolverFeatherPGS(SolverBase):
                 "factor_coordinates": self._paired_factor_coordinates,
                 "skip_incremental_rows": max(incremental_rows, parallel_rows),
                 "independent_components": self._paired_components is not None,
-                "colored_rows": colored_rows,
+                "colored_worlds": colored,
             }
             mf_gs_shape = (self.dense_max_constraints, self.mf_max_constraints, self.max_world_dofs, device_arch)
             self._pgs_solve_mf_gs_kernel = self._sweep_kernel(
@@ -6169,13 +6177,14 @@ class SolverFeatherPGS(SolverBase):
                 velocity_limit_law=self._velocity_limit_kernel_law(),
                 **mf_gs_options,
             )
-            if colored_rows > 0:
+            if colored:
                 self._colored_units = sweep_units.ColoredUnits(
                     self.world_count,
                     self.mf_max_constraints,
                     self.max_world_dofs,
                     model.device,
-                    min_rows=colored_rows,
+                    worlds=capable,
+                    rule=rule,
                 )
                 self._pgs_solve_mf_colored_kernel = self._sweep_kernel(
                     "mf_colored",
@@ -6899,9 +6908,9 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
                 sweeps = list(getattr(self, "_mf_gs_tiers", ()))
-                if mf_gs_kernel is not None:
-                    sweeps.append(SweepTier(mf_gs_kernel))
                 colored_kernel = self._pgs_solve_mf_colored_kernel
+                if mf_gs_kernel is not None:
+                    sweeps.append(SweepTier(mf_gs_kernel, colored_worlds=colored_kernel is not None))
                 for sweep in sweeps:
                     inputs = mf_gs_inputs
                     dim = general_block_count
@@ -6919,6 +6928,8 @@ class SolverFeatherPGS(SolverBase):
                         inputs = inputs + self._inkernel_response_inputs()
                         if sweep.kinetic_rows:
                             inputs = [*inputs, *self._keyed_rows.parallel_arguments()]
+                    if sweep.colored_worlds:
+                        inputs = [*inputs, self._colored_units.world_colored]
                     wp.launch_tiled(
                         sweep.kernel,
                         dim=[dim],
@@ -6928,7 +6939,7 @@ class SolverFeatherPGS(SolverBase):
                         device=self.model.device,
                     )
                 if colored_kernel is not None:
-                    # The worlds with many free-body contact rows: a block each, a color's units at once.
+                    # The worlds the unit builder's rule picked: a block each, a color's units at once.
                     wp.launch_tiled(
                         colored_kernel,
                         dim=[general_block_count],

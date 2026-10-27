@@ -5,9 +5,9 @@
 
 A world's contacts become units (a normal row and its friction pair) and each unit's color is its level in row
 order (one past the latest color of an earlier unit on its bodies), so no two units of a color share a body and
-units that share one keep their row order. The solver gives the colored mapping the worlds of at least
-``sweep_routes.COLORED_ROWS`` free-body contact rows; the tests lower that bound to one so every world takes it.
-They check
+units that share one keep their row order. The unit builder gives the colored mapping the worlds its rule picks
+(``sweep_units.COLORED_RULE``); the tests relax the rule to one unit so every world with contacts takes it. They
+check
 
 - the unit builder against a host reference of the same rules (units, row-order levels, the slot records), that a
   color never shares a body or a patch, and that the colors keep the row order;
@@ -27,7 +27,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sweep_routes
+from newton._src.solvers.feather_pgs import sweep_units
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -62,8 +62,9 @@ def tray(*, mu: float = 0.6, grid: int = 3, layers: int = 2) -> scenes.Scene:
 
 
 @contextlib.contextmanager
-def colored(rows: int = 1, solvers: list | None = None):
-    """Every solver built inside gives the colored mapping the worlds of at least ``rows`` free-body contact rows."""
+def colored(units: int = 1, solvers: list | None = None, parallelism: float = 0.0):
+    """Every solver built inside gives the colored mapping the worlds of at least ``units`` contact units and
+    ``parallelism`` units per color."""
     original = SolverFeatherPGS.__init__
 
     def init(self, *args, **kwargs):
@@ -71,7 +72,8 @@ def colored(rows: int = 1, solvers: list | None = None):
         if solvers is not None:
             solvers.append(self)
 
-    with mock.patch.object(sweep_routes, "COLORED_ROWS", rows), mock.patch.object(SolverFeatherPGS, "__init__", init):
+    rule = sweep_units.ColoredRule(min_units=units, parallelism=parallelism)
+    with mock.patch.object(sweep_units, "COLORED_RULE", rule), mock.patch.object(SolverFeatherPGS, "__init__", init):
         yield
 
 
@@ -126,6 +128,32 @@ def _cuda():
     return wp.get_device("cuda:0") if wp.is_cuda_available() else None
 
 
+class TestCapableWorlds(unittest.TestCase):
+    """The worlds that hold colored storage, from the model at construction."""
+
+    def test_a_world_needs_the_rule_s_free_bodies_and_rows(self):
+        """Give storage to the worlds of at least the rule's units per color in free bodies, in world order."""
+        rule = sweep_units.ColoredRule(min_units=64, parallelism=4.0)
+        free = np.array([1, 4, 0, 520, 3])
+        np.testing.assert_array_equal(sweep_units.capable_worlds(free, 512, rule), [1, 3])
+        self.assertEqual(sweep_units.capable_worlds(free, 63, rule).size, 0)
+        self.assertEqual(sweep_units.capable_worlds(np.ones(16384), 512, rule).size, 0)
+
+    def test_waves_of_worlds_scale_the_units_per_color(self):
+        """Colored worlds past the device's blocks at once run in waves: each wave multiplies the units per color a
+        world needs, in the builder's condition and in the free bodies a capable world needs."""
+        rule = sweep_units.ColoredRule(min_units=32, parallelism=1.75)
+        self.assertEqual(rule.at_scale(64, 188), rule)
+        self.assertEqual(rule.at_scale(188, 188).waves, 1)
+        self.assertEqual(rule.at_scale(189, 188).units_per_color, 3.5)
+        scaled = rule.at_scale(1024, 188)
+        self.assertEqual((scaled.waves, scaled.units_per_color), (6, 10.5))
+        self.assertIn("10.5f * (float)(c)", scaled.condition("(u)", "(c)"))
+        self.assertNotEqual(scaled.name, rule.name)
+        # A 10-box pyramid holds no storage at that scale; a 36-box one still does.
+        np.testing.assert_array_equal(sweep_units.capable_worlds(np.array([10, 36]), 512, scaled), [1])
+
+
 class TestColoredSweep(unittest.TestCase):
     device = _cuda()
 
@@ -133,9 +161,9 @@ class TestColoredSweep(unittest.TestCase):
         if self.device is None:
             self.skipTest("No CUDA device")
 
-    def _simulate(self, scene, law: str, solvers: list | None = None, rows: int = 1):
+    def _simulate(self, scene, law: str, solvers: list | None = None, units: int = 1, parallelism: float = 0.0):
         physics = conf._physics(scene, law, 32)
-        with colored(rows, solvers):
+        with colored(units, solvers, parallelism):
             return conf.simulate(physics.scene, _ROUTE, self.device, options=physics.options(32))
 
     def _built(self, law: str = "patch") -> tuple:
@@ -154,26 +182,39 @@ class TestColoredSweep(unittest.TestCase):
         counts, ends = solver.mf_constraint_count.numpy(), solver.mf_contact_rows_end.numpy()
         for world in range(solver.world_count):
             want = reference_units(metas[world], int(counts[world]), int(ends[world]))
+            slot = int(host["world_slot"][world])
             units = int(host["unit_count"][world])
             self.assertGreater(units, 0)
             self.assertEqual(units, want["unit_count"])
-            np.testing.assert_array_equal(host["unit_color"][world, :units], want["unit_color"])
+            np.testing.assert_array_equal(host["unit_color"][slot, :units], want["unit_color"])
             colors = int(host["color_count"][world])
             self.assertEqual(colors, want["color_count"])
-            np.testing.assert_array_equal(host["color_offset"][world, : colors + 1], want["color_offset"])
-            np.testing.assert_array_equal(host["color_slot"][world, :units], want["color_slot"])
+            np.testing.assert_array_equal(host["color_offset"][slot, : colors + 1], want["color_offset"])
+            np.testing.assert_array_equal(host["color_slot"][slot, :units], want["color_slot"])
         stats = solver._colored_units.stats()
         self.assertEqual(len(stats), solver.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))
+
+    def test_the_route_record_reports_the_storage(self):
+        """The path selection records the colored kernel, its capable worlds and their storage's bytes."""
+        solver, _, _ = self._built()
+        record = solver.get_path_selection()["routes"]["sweep"]["mf_colored"]
+        units = solver._colored_units
+        self.assertEqual(record["capable_worlds"], solver.world_count)
+        self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
+        arrays = (*units.units.values(), *units.slots.values(), units.slot_world)
+        self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
+        self.assertGreater(record["storage_bytes"], 0)
 
     def test_a_color_never_shares_a_body_or_a_patch(self):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
         solver, host, metas = self._built()
         parents = metas[:, :, 3] >> 16
         for world in range(solver.world_count):
-            offsets = host["color_offset"][world]
+            slot = int(host["world_slot"][world])
+            offsets = host["color_offset"][slot]
             for color in range(int(host["color_count"][world])):
-                records = host["color_slot"][world, offsets[color] : offsets[color + 1]]
+                records = host["color_slot"][slot, offsets[color] : offsets[color + 1]]
                 bodies = [dof for record in records for dof in set(record[2:]) if dof >= 0]
                 self.assertEqual(len(bodies), len(set(bodies)), f"color {color} shares a body")
                 rows = {int(record[0]) for record in records}
@@ -187,10 +228,10 @@ class TestColoredSweep(unittest.TestCase):
         """Units that share a body run in row order: the earlier one takes the lower color."""
         solver, host, _ = self._built()
         for world in range(solver.world_count):
-            last = {}
+            slot, last = int(host["world_slot"][world]), {}
             for unit in range(int(host["unit_count"][world])):
-                color = int(host["unit_color"][world, unit])
-                dofs = int(host["unit_dofs"][world, unit])
+                color = int(host["unit_color"][slot, unit])
+                dofs = int(host["unit_dofs"][slot, unit])
                 for dof in {dofs >> 16, _signed(dofs, 16)}:
                     if dof < 0:
                         continue
@@ -199,13 +240,30 @@ class TestColoredSweep(unittest.TestCase):
                     last[dof] = color
 
     def test_repeats_bitwise_and_splits_the_worlds(self):
-        """A repeat gives the same trajectory bitwise; above the tray's rows every world keeps the warp mapping."""
+        """A repeat gives the same trajectory bitwise; a rule past the row capacity builds no colored mapping."""
         first, second = (self._simulate(tray(), "patch") for _ in range(2))
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(first, name), getattr(second, name), err_msg=name)
         solvers = []
-        self._simulate(tray(), "patch", solvers, rows=4096)
-        self.assertIsNone(solvers[-1]._colored_units, "no world's row capacity reaches 4096 contact rows")
+        self._simulate(tray(), "patch", solvers, units=4096)
+        self.assertIsNone(solvers[-1]._colored_units, "no world's row capacity holds 4096 contact units")
+
+    def test_the_rule_leaves_thin_worlds_to_the_warp(self):
+        """A world under the rule's units per color keeps the one-warp mapping beside a built colored one, bitwise."""
+        # Five units per color: the tray's 19 free bodies admit it, its 76 units in 44 colors do not take it.
+        solvers = []
+        thin = self._simulate(tray(), "patch", solvers, parallelism=5.0)
+        built = solvers[-1]._colored_units
+        self.assertIsNotNone(built)
+        stats = built.stats()
+        self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
+        # The plain one-warp sweep: a rule past the row capacity builds no colored mapping (the default rule takes
+        # the tray's worlds of 1.75 units per color and more).
+        plain = []
+        warp = self._simulate(tray(), "patch", plain, units=4096)
+        self.assertIsNone(plain[-1]._colored_units)
+        for name in ("body_q", "body_qd"):
+            np.testing.assert_array_equal(getattr(thin, name), getattr(warp, name), err_msg=name)
 
 
 def _conformance_tests():

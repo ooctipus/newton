@@ -313,6 +313,8 @@ class SweepTier:
         velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.
         velocity_limit_law: The law it gives joint velocity-limit rows.
         sweeps: Its sweep budget (0 for an incremental tier).
+        colored_worlds: It reads each world's mapping before ``v_out`` and leaves the colored worlds
+            (:data:`.sweep_routes.COLORED_WORLDS_ABI`).
     """
 
     kernel: wp.Kernel
@@ -324,3 +326,4 @@ class SweepTier:
     velocity_limit_pass: bool = False
     velocity_limit_law: str | None = None
     sweeps: int = 0
+    colored_worlds: bool = False

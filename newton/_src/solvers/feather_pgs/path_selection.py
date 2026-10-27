@@ -20,7 +20,7 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from . import response_builds_rows, sweep_routes
+from . import response_builds_rows
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 
@@ -748,12 +748,24 @@ def _mf_colored(solver) -> dict | None:
     kernel = solver._pgs_solve_mf_colored_kernel
     if kernel is None:
         return None
+    units = solver._colored_units
+    rule = units.rule
     return {
         "kernel": _key(kernel),
-        "min_rows": int(sweep_routes.COLORED_ROWS),
+        "min_units": int(rule.min_units),
+        "parallelism": json_value(rule.parallelism),
+        # The waves the capable worlds take on the device's SMs, which multiply the units per color a world needs.
+        "waves": int(rule.waves),
+        "units_per_color": json_value(rule.units_per_color),
+        # The worlds whose free bodies admit the rule, each with a storage slot, and that storage's bytes.
+        "capable_worlds": int(units.slot_count),
+        "storage_bytes": int(units.nbytes),
         "reason": (
-            f"Worlds of at least {sweep_routes.COLORED_ROWS} free-body contact rows sweep a color's units at once, a "
-            "block each; the others keep the one-warp mapping (the measured crossover of their solve times)."
+            f"At every pack the unit builder gives the colored mapping each capable world (at least "
+            f"{rule.units_per_color:g} free bodies: a world's units per color are at most its free bodies) of at least "
+            f"{rule.min_units} contact units and {rule.units_per_color:g} units per color: it sweeps a color's units "
+            "at once, a block each; the others keep the one-warp mapping (the measured crossover of their solve times, "
+            f"{rule.parallelism:g} units per color in one wave of colored worlds on the device, here {rule.waves})."
         ),
     }
 

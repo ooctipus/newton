@@ -123,10 +123,6 @@ MAPPINGS = ("warp", "colored")
 """The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
 visits their colors in order and each color's units at once (:mod:`.sweep_units`)."""
 
-COLORED_ROWS = 512
-"""Free-body contact rows from which a world takes the colored mapping: the measured crossover of the two mappings'
-solve times (the cost model, ``DESIGN_STEP4_SWEEPS``). A world with fewer rows keeps the one-warp mapping."""
-
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
 237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
@@ -134,8 +130,14 @@ COLORED_THREADS = 256
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
 
+COLORED_WORLDS_ABI = kernel_template.params(*MF_GS_ABI[:-1], ("world_colored", wp.array[int]), MF_GS_ABI[-1])
+"""The one-warp mapping's ABI beside the colored one: the matrix-free sweep's, then each world's mapping
+(:data:`.sweep_units.UNIT_FIELDS`' ``world_colored``) before ``v_out``."""
+
 COLORED_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
+    ("world_colored", wp.array[int]),
+    ("world_slot", wp.array[int]),
     ("color_count", wp.array[int]),
     ("color_offset", wp.array2d[int]),
     ("color_slot", wp.array3d[int]),
@@ -143,8 +145,9 @@ COLORED_ABI = kernel_template.params(
     ("slot_words", wp.array3d[int]),
     ("v_out", wp.array[float]),
 )
-"""The colored mapping's native ABI: the matrix-free sweep's, then the worlds' colors and staged units
-(:data:`.sweep_units.UNIT_FIELDS`, :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
+"""The colored mapping's native ABI: the matrix-free sweep's, then each world's mapping and storage slot, the worlds'
+color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
+:data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
 
 
 def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
@@ -193,10 +196,10 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
                 }}
                 const int end_unit = s_color_offset[chunk + 1];
                 for (int p = s_color_offset[chunk] + tid; p < end_unit; p += blockDim.x) {{
-                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_mf + p) * 4]));
+                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
-                    const int slot_base = world * {fields * M_MF} + p;
-                    const int word_base = world * {words * M_MF} + p;
+                    const int slot_base = unit_slot * {fields * M_MF} + p;
+                    const int word_base = unit_slot * {words * M_MF} + p;
                     // Every field of the slot at once: the first row's always, a friction pair's when the unit has one.
                     float E[{fields}];
                     int W[{words}];
@@ -271,7 +274,7 @@ def mf_gs_source(
     max_world_dofs: int,
     *,
     mapping: str = "warp",
-    colored_rows: int = 0,
+    colored_worlds: bool = False,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
@@ -291,17 +294,16 @@ def mf_gs_source(
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
-    once, the world's first warp running everything else. Both are the same row-order Gauss-Seidel sweep. With
-    ``colored_rows`` the worlds of at least that many free-body contact rows take the colored mapping and the
-    others the warp's: each mapping's kernel returns for the worlds of the other.
+    once, the world's first warp running everything else. Both are the same row-order Gauss-Seidel sweep. Each world's
+    mapping is the unit builder's (``world_colored``, :class:`.sweep_units.ColoredRule`): the colored kernel returns
+    for the warp's worlds and, with ``colored_worlds`` (the solver builds both), the warp's kernel for the colored
+    ones.
 
     Returns the body and its staging.
     """
     if mapping not in MAPPINGS:
         raise ValueError(f"mapping must be one of {MAPPINGS}, got {mapping!r}")
     colored = mapping == "colored"
-    if colored and colored_rows < 1:
-        raise ValueError("the colored mapping takes the worlds of at least colored_rows >= 1 contact rows")
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
     if fuse_vel_limits and not has_drive_rows:
@@ -369,9 +371,9 @@ def mf_gs_source(
     if skip_incremental_rows > 0:
         skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_incremental_rows)}) return;")
     mapped = ""
-    if colored_rows > 0:
-        # The worlds of the other mapping; the unit builder takes the colored ones by the same test.
-        mapped = f"\n    if (mf_contact_end {'<' if colored else '>='} {int(colored_rows)}) return;"
+    if colored or colored_worlds:
+        # The worlds of the other mapping, as the unit builder assigned them at the pack.
+        mapped = f"\n    if (world_colored.data[world] {'==' if colored else '!='} 0) return;"
     load_lo = "    int load_lo = (row_phase == 5) ? 0 : dense_lo;" if fuse_vel_limits else ""
     empty_limit_phase = (
         "" if fuse_vel_limits else "    if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"
@@ -422,7 +424,12 @@ def mf_gs_source(
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
-        offsets = f"\n    const int off_color = world * {M_MF + 1};"
+        # The world's storage slot (a colored world has one): its colors and staged units.
+        offsets = (
+            "\n    const int unit_slot = world_slot.data[world];"
+            f"\n    const int off_unit = unit_slot * {M_MF};"
+            f"\n    const int off_color = unit_slot * {M_MF + 1};"
+        )
     else:
         sweep_end = end_sweep(
             solve_policy,
@@ -530,7 +537,7 @@ def mf_gs_kernel(
     device_arch: str,
     *,
     mapping: str = "warp",
-    colored_rows: int = 0,
+    colored_worlds: bool = False,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
@@ -547,13 +554,14 @@ def mf_gs_kernel(
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches
-    32 threads per world item, the colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`."""
+    32 threads per world item and takes :data:`MF_GS_ABI` (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the
+    colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`."""
     snippet, staging = mf_gs_source(
         max_constraints,
         mf_max_constraints,
         max_world_dofs,
         mapping=mapping,
-        colored_rows=colored_rows,
+        colored_worlds=colored_worlds,
         shared_metadata=shared_metadata,
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
@@ -583,12 +591,12 @@ def mf_gs_kernel(
         + ("_factor" if factor_coordinates else "")
         + (f"_skipinc{int(skip_incremental_rows)}" if skip_incremental_rows > 0 else "")
         + ("_components" if independent_components else "")
-        + (f"_colored{int(colored_rows)}" if colored_rows > 0 else "")
+        + ("_cw" if colored_worlds and not colored else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(
         name,
-        COLORED_ABI if colored else MF_GS_ABI,
+        COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
         kernel_template.WORLD_QUEUE,
         extra=solve_policy.arguments,
