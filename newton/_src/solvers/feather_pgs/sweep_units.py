@@ -127,12 +127,22 @@ SLOT_MU, SLOT_WEIGHT = SLOT_ENTRIES, SLOT_ENTRIES + 1
 """The slot's scalars after its entries: the friction coefficient of its first tangent and its normal row's
 regularization weight."""
 
-SLOT_WORDS = 9
-"""Words a color slot stages per unit: for each row ``r``, at ``r * 3``, the bits of its stored inverse diagonal,
-of its right-hand side, and its type and parent word (``mf_meta``'s ``y``, ``z``, ``w``)."""
+RING_MEMBERS = 8
+"""Other normals of a patch ring a slot stages for its friction pair's pooled load; a larger ring walks its links."""
+
+SLOT_RING = 9
+"""The slot words of a friction unit's patch ring: from ``SLOT_RING``, the other normal rows of its ring in ring order
+(two 16-bit rows a word, 0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`)."""
+
+SLOT_WORDS = SLOT_RING + RING_MEMBERS // 2 + 1
+"""Words a color slot stages per unit: for each of its (up to three) rows ``r``, at ``r * 3``, the bits of its stored
+inverse diagonal, of its right-hand side, and its type and parent word (``mf_meta``'s ``y``, ``z``, ``w``); then its
+patch ring (:data:`SLOT_RING`)."""
 
 _SLOT_MU = wp.constant(SLOT_MU)
 _SLOT_WEIGHT = wp.constant(SLOT_WEIGHT)
+_SLOT_RING = wp.constant(SLOT_RING)
+_RING_MEMBERS = wp.constant(RING_MEMBERS)
 
 SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
@@ -178,6 +188,30 @@ def stage_slots(
             slot_words[slot, r * 3 + 2, p] = mf_meta[world, (row + r) * 4 + 3]
     slot_data[slot, _SLOT_MU, p] = wp.where(rows == 3, mf_row_mu[world, row + 1], 0.0)
     slot_data[slot, _SLOT_WEIGHT, p] = mf_row_w[world, row]
+    if rows == 3:
+        # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
+        words = wp.vec4i(-1, -1, -1, -1)
+        members = int(0)
+        hop = int(0)
+        rows_cap = mf_meta.shape[1] // 4
+        link = (mf_meta[world, row * 4 + 3] >> 16) & 0xFFFF
+        r = wp.where(link == 0xFFFF, -1, link)
+        while r >= 0 and r != row and hop < rows_cap:
+            if members == _RING_MEMBERS:
+                members = -1
+                break
+            # Two 16-bit rows a word, low half first; an unused half stays 0xFFFF.
+            if members % 2 == 0:
+                words[members // 2] = (r & 0xFFFF) | (-65536)
+            else:
+                words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
+            members += 1
+            hop += 1
+            link = (mf_meta[world, r * 4 + 3] >> 16) & 0xFFFF
+            r = wp.where(link == 0xFFFF, -1, link)
+        for k in range(_RING_MEMBERS // 2):
+            slot_words[slot, _SLOT_RING + k, p] = words[k]
+        slot_words[slot, _SLOT_RING + _RING_MEMBERS // 2, p] = members
 
 
 @dataclasses.dataclass(frozen=True)

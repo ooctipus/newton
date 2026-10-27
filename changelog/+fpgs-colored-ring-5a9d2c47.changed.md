@@ -1,0 +1,1 @@
+Stage each friction pair's patch-ring normals with the colored sweep's units of `SolverFeatherPGS` (up to 8, in ring order), so a pair's pooled normal load adds their impulses from shared memory instead of walking the ring's links through global memory; results are bitwise unchanged, and a larger ring keeps its walk.

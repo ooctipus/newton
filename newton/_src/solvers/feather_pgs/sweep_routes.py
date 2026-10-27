@@ -172,6 +172,14 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
         entry=lambda array, row, k: f"E[{unit_offset(row)} * 24 + {arrays[array] * 6} + {k}]",
         inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])",
     )
+    ring, members = sweep_units.SLOT_RING, sweep_units.RING_MEMBERS
+
+    def ring_load(parent: str) -> str:
+        # The staged ring's members in ring order (the walk's sum, without its chain of global loads), or the walk.
+        words = ", ".join(f"W[{ring + k}]" for k in range(members // 2))
+        count = f"W[{ring + members // 2}]"
+        return f"({count} < 0 ? {unit_rows.ring_load(parent)} : RING_SUM({unit_rows.load(parent)}, {words}, {count}))"
+
     unit_ctx = RowContext(
         row="i",
         kind="mf_rt",
@@ -182,13 +190,28 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
         mu=lambda row: f"E[{sweep_units.SLOT_MU}]",
         weight=lambda row: f"E[{sweep_units.SLOT_WEIGHT}]",
         parent="parent",
-        ring_load=unit_rows.ring_load,
+        ring_load=ring_load,
         lanes=Lanes(1),
         contact_kinds=(CONTACT,),
     )
+    lam = unit_rows.load
+    ring_sum = "\n".join(
+        [
+            "            // A staged patch ring's pooled load: its members' impulses added in ring order.",
+            "            const auto RING_SUM = [&](float load, int w0, int w1, int w2, int w3, int members) -> float {",
+            "                const int words[4] = {w0, w1, w2, w3};",
+            "                for (int k = 0; k < members; ++k) {",
+            "                    const int r = (int)(((unsigned)words[k >> 1] >> ((k & 1) * 16)) & 0xFFFFu);",
+            f"                    load += {lam('r')};",
+            "                }",
+            "                return load;",
+            "            };",
+        ]
+    )
     fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
     visit = row_visit(unit_ctx, laws, parent=unit_rows.parent_of("packed_tp"), check="mf_diag", pad=" " * 24)
-    return f"""            const int colors = color_count.data[world];
+    return f"""{ring_sum}
+            const int colors = color_count.data[world];
             for (int color = 0; color < colors; ++color) {{
                 // The offsets of the next chunk of colors (the barrier after the last color freed the previous one).
                 const int chunk = color % {COLOR_CHUNK};
