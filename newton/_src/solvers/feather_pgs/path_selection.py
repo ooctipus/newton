@@ -320,9 +320,8 @@ def _scalar_group(group) -> dict:
     (``trees_per_block``, ``block_dim``) are ``None``. Every repair launches,
     and none is classified or compares input banks (``input_validation`` is
     the group's, "identity"), so the comparison and classification kernels are
-    ``None``. ``kinds`` lists its leaf joint kinds; ``drive_dofs`` counts the
-    DOFs whose drives the drive kernel still prepares, since the group's
-    predict evaluates its own.
+    ``None``. ``drive_dofs`` counts the DOFs whose drives the drive kernel
+    still prepares, since the group's predict evaluates its own.
     """
     size = int(group.size)
     others = group.other_drive_dofs
@@ -347,7 +346,6 @@ def _scalar_group(group) -> dict:
         "captured_repairs": [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": False,
-        "kinds": list(group.plan.kinds),
         "drive_dofs": 0 if others is None else int(others.shape[0]),
         "kernels": {
             "repair": _key(group.repair_kernel),

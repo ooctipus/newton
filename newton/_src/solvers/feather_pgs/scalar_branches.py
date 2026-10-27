@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scalar branches: fixed-root articulations whose leaves each carry one coordinate.
+"""Scalar branches: fixed-root articulations whose leaves each carry one prismatic coordinate.
 
 A world-fixed root (a FIXED, or zero-coordinate D6, joint to the world) whose
-children are one-body prismatic or revolute leaves has a diagonal generalized
-inertia, and every leaf is a scalar system: on a fixed root the velocity
-product of a one-coordinate body projects to zero on its own axis, and the
-leaf's pose, motion axis and body velocity follow from its coordinate and the
-model frames alone. This module evaluates such a size group with one thread per
+children are one-body prismatic leaves has a diagonal generalized inertia, and
+every leaf is a scalar system: on a fixed root a prismatic body has no velocity
+product, and the leaf's pose, motion axis and body velocity follow from its
+coordinate and the model frames alone. This module evaluates such a size group with one thread per
 coordinate and no tree plan, so no body or coordinate cap applies. By default the
 held-tree owner composes it in place of a tree group (``held_tree.py``)
 wherever :func:`plan_scalar_branches` admits the group;
@@ -25,20 +24,16 @@ dynamics:
   state: coordinates, root and leaf poses, motion axes, body velocities and the
   articulation origin.
 
-Prismatic leaves follow the linear-state law of a one-body prismatic branch
-operation for operation (the scalar-branch tests keep that law as their
-oracle); revolute leaves follow ordinary dynamics without evaluating the
-velocity product, which is zero for them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
-``body_f_s``, ``body_I_s`` or the compact inertia terms of its bodies, which no
-consumer on its route reads.
+The leaves follow the linear-state law of a one-body prismatic branch operation
+for operation (the scalar-branch tests keep that law as their oracle). Revolute
+leaves, whose inertia depends on their axis and child frame, run in the held
+tree's diagonal-mass group. The family never writes ``body_q_com``,
+``body_v_s``, ``body_a_s``, ``body_f_s``, ``body_I_s`` or the compact inertia
+terms of its bodies, which no consumer on its route reads.
 
-A leaf's inverse mass, ``1 / (m |S|^2 + armature + K)`` for a prismatic leaf
-and ``1 / (S^T I S + armature + K)`` for a revolute one, depends on the inertial
-values, the armature and the drive's ``K = ke dt^2 + kd dt``, never on the
-pose, so a root re-pose leaves it unchanged. A revolute leaf's also depends on
-its axis, which the group's proof freezes, and on its child frame, which a
-notification may move; the new value then takes effect at the next refresh, as
-in a tree group's held factor. The inverse mass refreshes wherever the solver's
+A leaf's inverse mass, ``1 / (m |S|^2 + armature + K)``, depends on the
+inertial values, the armature and the drive's ``K = ke dt^2 + kd dt``, never on
+the pose, so a root re-pose leaves it unchanged. The inverse mass refreshes wherever the solver's
 mass mask selects (the update cadence plus the requests that resets and
 inertial, DOF and body notifications raise), as the linear-state law does:
 that keeps prismatic leaves bitwise with that law and follows a changed step
@@ -60,8 +55,6 @@ from . import cached_state_binding
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
-    inertia_apply,
-    inertia_at,
     joint_frame_pose,
     motion_axis,
     transform_compose,
@@ -194,7 +187,6 @@ def repair_scalar_branches(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
     current_valid: wp.array[int],
-    joint_type: wp.array[int],
     joint_child: wp.array[int],
     joint_q_start: wp.array[int],
     joint_X_p: wp.array[wp.transform],
@@ -233,12 +225,8 @@ def repair_scalar_branches(
         axis = joint_axis[dof]
         q = joint_q[coordinate_start + local]
         child = joint_child[joint]
-        if joint_type[joint] == JointType.PRISMATIC:
-            body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q, joint_X_c[joint])
-            joint_S_s[dof] = _leaf_motion(X_wpj, origin, False, axis)
-        else:
-            body_q[child] = _leaf_pose(X_root, joint_X_p[joint], True, axis, q, joint_X_c[joint])
-            joint_S_s[dof] = _leaf_motion(X_wpj, origin, True, axis)
+        body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q, joint_X_c[joint])
+        joint_S_s[dof] = _leaf_motion(X_wpj, origin, False, axis)
 
 
 @wp.kernel(enable_backward=False)
@@ -331,108 +319,6 @@ def predict_prismatic_branches(
 
 
 @wp.kernel(enable_backward=False)
-def predict_scalar_branches(
-    n: int,
-    group_to_art: wp.array[int],
-    dof_joint_offset: wp.array[int],
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    body_flags: wp.array[int],
-    body_f: wp.array[wp.spatial_vector],
-    gravity: wp.array[wp.vec3],
-    joint_f: wp.array[float],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    predictor_qd: wp.array[float],
-    spring_stiffness: wp.array[float],
-    spring_ref: wp.array[float],
-    damping: wp.array[float],
-    kinematic_dof_mask: wp.array[int],
-    mass_update_mask: wp.array[int],
-    armature: wp.array2d[float],
-    drive_row_by_dof: wp.array[int],
-    drive_target_index_by_dof: wp.array[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    dt: float,
-    # in/out
-    diagonal_inverse_mass: wp.array[float],
-    # outputs
-    joint_qdd: wp.array[float],
-    v_hat: wp.array[float],
-):
-    """Predict prismatic and revolute leaves; a revolute inverse mass projects the COM inertia on its axis."""
-    element = wp.tid()
-    group = element // n
-    local = element - group * n
-    art = group_to_art[group]
-    root_joint = articulation_start[art]
-    joint = root_joint + dof_joint_offset[local]
-    dof = articulation_dof_start[art] + local
-    child = joint_child[joint]
-    motion = joint_S_s[dof]
-    mass = body_mass[child]
-    pose = body_q[child]
-    com_relative = wp.transform_point(pose, body_com[child]) - articulation_origin[art]
-    force = mass * gravity[0]
-    body_force = -wp.spatial_vector(force, wp.cross(com_relative, force)) - _external_at_origin(
-        child, com_relative, body_f, body_flags
-    )
-    q = joint_q[joint_q_start[root_joint] + local]
-    qd = joint_qd[dof]
-    u0, stiffness = _drive_terms(
-        dof,
-        q,
-        qd,
-        dt,
-        drive_row_by_dof,
-        drive_target_index_by_dof,
-        joint_target_ke,
-        joint_target_kd,
-        joint_target_pos,
-        joint_target_vel,
-        joint_effort_limit,
-    )
-    value = _leaf_force(motion, body_force, dof, q, qd, joint_f, spring_stiffness, spring_ref, damping)
-    value += u0
-    inverse = float(0.0)
-    if mass_update_mask[art] != 0:
-        projected = float(0.0)
-        if joint_type[joint] == JointType.PRISMATIC:
-            linear = wp.spatial_top(motion)
-            projected = mass * wp.dot(linear, linear)
-        else:
-            mass_at, moment, rotational = inertia_at(
-                mass, body_inertia[child], wp.transform_get_rotation(pose), com_relative
-            )
-            projected = wp.dot(motion, inertia_apply(mass_at, moment, rotational, motion))
-        diagonal = projected + armature[group, local]
-        if stiffness > 0.0:
-            diagonal += stiffness
-        inverse = 1.0 / diagonal
-        diagonal_inverse_mass[dof] = inverse
-    else:
-        inverse = diagonal_inverse_mass[dof]
-    qdd = value * inverse
-    if kinematic_dof_mask[dof] != 0:
-        qdd = 0.0
-    joint_qdd[dof] = qdd
-    v_hat[dof] = predictor_qd[dof] + qdd * dt
-
-
-@wp.kernel(enable_backward=False)
 def finish_prismatic_branches(
     n: int,
     group_to_art: wp.array[int],
@@ -502,87 +388,6 @@ def finish_prismatic_branches(
 
 
 @wp.kernel(enable_backward=False)
-def finish_scalar_branches(
-    n: int,
-    group_to_art: wp.array[int],
-    dof_joint_offset: wp.array[int],
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    body_com: wp.array[wp.vec3],
-    kinematic_dof_mask: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    dt: float,
-    inv_dt: float,
-    # in/out
-    v_out: wp.array[float],
-    # outputs
-    joint_qdd: wp.array[float],
-    joint_q_new: wp.array[float],
-    joint_qd_new: wp.array[float],
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
-    current_valid: wp.array[int],
-):
-    """Convert, integrate and publish prismatic and revolute leaves and their root."""
-    element = wp.tid()
-    group = element // n
-    local = element - group * n
-    art = group_to_art[group]
-    root_joint = articulation_start[art]
-    joint = root_joint + dof_joint_offset[local]
-    dof = articulation_dof_start[art] + local
-    coordinate = joint_q_start[root_joint] + local
-    qd = joint_qd[dof]
-    qdd = float(0.0)
-    if kinematic_dof_mask[dof] != 0:
-        v_out[dof] = qd
-    else:
-        qdd = (v_out[dof] - qd) * inv_dt
-    joint_qdd[dof] = qdd
-    q = joint_q[coordinate]
-    q_new = q
-    qd_new = qd
-    if kinematic_joint_mask[joint] == 0:
-        qd_new = qd + qdd * dt
-        q_new = q + qd_new * dt
-    joint_q_new[coordinate] = q_new
-    joint_qd_new[dof] = qd_new
-    X_root = _root_pose(joint_X_p, joint_X_c, root_joint)
-    X_wpj = X_root * joint_X_p[joint]
-    axis = joint_axis[dof]
-    child = joint_child[joint]
-    if joint_type[joint] == JointType.PRISMATIC:
-        body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q_new, joint_X_c[joint])
-        motion = _leaf_motion(X_wpj, wp.vec3(), False, axis)
-        joint_S_s[dof] = motion
-        body_qd[child] = motion * qd_new
-    else:
-        origin = wp.transform_point(X_root, body_com[joint_child[root_joint]])
-        pose = _leaf_pose(X_root, joint_X_p[joint], True, axis, q_new, joint_X_c[joint])
-        body_q[child] = pose
-        motion = _leaf_motion(X_wpj, origin, True, axis)
-        joint_S_s[dof] = motion
-        velocity = motion * qd_new
-        com_relative = wp.transform_point(pose, body_com[child]) - origin
-        angular = wp.spatial_bottom(velocity)
-        body_qd[child] = wp.spatial_vector(wp.spatial_top(velocity) + wp.cross(angular, com_relative), angular)
-    if local == 0:
-        _publish_root(
-            art, root_joint, X_root, joint_child, body_com, body_q, body_qd, articulation_origin, current_valid
-        )
-
-
-@wp.kernel(enable_backward=False)
 def prepare_listed_augmented_drives(
     dofs: wp.array[int],
     drive_row_by_dof: wp.array[int],
@@ -624,13 +429,13 @@ def prepare_listed_augmented_drives(
 
 
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
-    """Check that every articulation is a world-fixed root over one-coordinate leaves.
+    """Check that every articulation is a world-fixed root over one-coordinate prismatic leaves.
 
     Every articulation must hold the same number ``n`` of leaves, laid out as
     joints ``start + 1 .. start + n`` whose coordinates and DOFs follow the
     root's in leaf order: a FIXED or zero-coordinate D6 root joint to the world,
-    and prismatic or revolute leaves of one coordinate whose parent is the root
-    body and whose body is no joint's parent.
+    and prismatic leaves of one coordinate whose parent is the root body and
+    whose body is no joint's parent.
 
     Returns:
         ``(kinds, reason)``: ``kinds`` is the ``(articulations, n)`` array of leaf
@@ -673,12 +478,11 @@ def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np
             "(chains and composite branches are not admitted)."
         )
     kinds = types[leaves]
-    prismatic = kinds == int(JointType.PRISMATIC)
-    revolute = kinds == int(JointType.REVOLUTE)
-    leaf_dims = dims[leaves]
-    one_axis = (prismatic & np.all(leaf_dims == (1, 0), axis=-1)) | (revolute & np.all(leaf_dims == (0, 1), axis=-1))
-    if not np.all(one_axis):
-        return None, "Scalar branches require one-coordinate prismatic or revolute leaves."
+    if not np.all((kinds == int(JointType.PRISMATIC)) & np.all(dims[leaves] == (1, 0), axis=-1)):
+        return None, (
+            "Scalar branches require one-coordinate prismatic leaves (revolute leaves run in the held tree's "
+            "diagonal-mass group)."
+        )
     owners = np.bincount(children[children >= 0], minlength=model.body_count)
     descendants = np.bincount(parents[parents >= 0], minlength=model.body_count)
     if np.any(owners[root_bodies] != 1) or np.any(owners[leaf_bodies] != 1) or np.any(descendants[leaf_bodies] != 0):
@@ -702,10 +506,6 @@ class ScalarBranchPlan:
     """Leaves (coordinates) per articulation."""
     group_count: int
     """Articulations in the group."""
-    prismatic: bool
-    """Every leaf is prismatic: the prismatic kernels apply."""
-    kinds: tuple[str, ...]
-    """Leaf joint kinds present, sorted."""
     dofs: np.ndarray
     """The group's DOFs, sorted."""
 
@@ -749,17 +549,13 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     # The kernels read a driven leaf's coordinate directly; the drive rows must address the same one.
     if np.any(solver._augmented_drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
         return None, "The augmented drives of the diagonal-mass group do not read its leaf coordinates."
-    names = {int(JointType.PRISMATIC): "prismatic", int(JointType.REVOLUTE): "revolute"}
-    present = tuple(sorted({names[int(kind)] for kind in np.unique(kinds)}))
     plan = ScalarBranchPlan(
         size=int(size),
         group_count=len(articulations),
-        prismatic=present == ("prismatic",),
-        kinds=present,
         dofs=np.sort(dofs.reshape(-1)).astype(np.int32),
     )
     reason = (
-        f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate {' and '.join(present)} "
+        f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate prismatic "
         "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)."
     )
     return plan, reason
@@ -799,8 +595,8 @@ class ScalarBranchState:
         # The family holds no geometry cache; invalidation clears this flag only.
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
         self.repair_kernel = repair_scalar_branches
-        self.predictor_kernel = predict_prismatic_branches if plan.prismatic else predict_scalar_branches
-        self.finish_kernel = finish_prismatic_branches if plan.prismatic else finish_scalar_branches
+        self.predictor_kernel = predict_prismatic_branches
+        self.finish_kernel = finish_prismatic_branches
         # The predict folds the branches' augmented drives, so the drive
         # preparation runs only over the other DOFs.
         other = np.ones(model.joint_dof_count, dtype=bool)
@@ -827,8 +623,7 @@ class ScalarBranchState:
         joint axes and the joint frames through its tree groups beside this
         one (Isaac Lab re-poses fixed roots through ``joint_X_p`` with
         ``JOINT_PROPERTIES`` on resets). A changed axis raises there, as for
-        the tree groups: a revolute leaf's inverse mass depends on it and
-        refreshes only at the mass cadence.
+        the tree groups.
 
         Returns:
             ``False`` for numeric notifications, which skip every proof (see
@@ -890,7 +685,6 @@ class ScalarBranchState:
                 model.articulation_start,
                 solver.articulation_dof_start,
                 solver._fk_id_cache_valid,
-                model.joint_type,
                 model.joint_child,
                 model.joint_q_start,
                 model.joint_X_p,
@@ -952,22 +746,11 @@ class ScalarBranchState:
             model.articulation_start,
             solver.articulation_dof_start,
         ]
-        if self.plan.prismatic:
-            inputs += [model.joint_child, model.joint_q_start, state_aug.joint_S_s]
-        else:
-            inputs += [
-                model.joint_type,
-                model.joint_child,
-                model.joint_q_start,
-                state_aug.joint_S_s,
-                solver.articulation_origin,
-                state_in.body_q,
-                model.body_com,
-            ]
-        inputs.append(model.body_mass)
-        if not self.plan.prismatic:
-            inputs.append(model.body_inertia)
         inputs += [
+            model.joint_child,
+            model.joint_q_start,
+            state_aug.joint_S_s,
+            model.body_mass,
             model.body_flags,
             state_in.body_f,
             model.gravity,
@@ -1014,8 +797,6 @@ class ScalarBranchState:
             model.articulation_start,
             solver.articulation_dof_start,
         ]
-        if not self.plan.prismatic:
-            inputs.append(model.joint_type)
         inputs += [
             model.joint_child,
             model.joint_q_start,

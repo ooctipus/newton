@@ -219,9 +219,7 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertEqual(rejected, {})
         names = (
             "finish_prismatic_branches",
-            "finish_scalar_branches",
             "predict_prismatic_branches",
-            "predict_scalar_branches",
             "prepare_listed_augmented_drives",
             "repair_scalar_branches",
         )

@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scalar branches: world-fixed roots over one-coordinate leaves (``scalar_branches.py``).
+"""Scalar branches: world-fixed roots over one-coordinate prismatic leaves (``scalar_branches.py``).
 
 The CPU tests compare the scalar kernels, bound through ``ScalarBranchState``,
 with reference chains launched on the same inputs: the linear-state law of
-one-body prismatic branches, kept here as the oracle of prismatic leaves
-(bitwise), and ordinary dynamics for revolute leaves. ``TestGripperContactBound``
+one-body prismatic branches, kept here as their oracle (bitwise). Stars with
+revolute leaves run in the held tree's diagonal-mass group. ``TestGripperContactBound``
 checks the CUDA arm-key press bound on ordinary dynamics, the law both CUDA
 routes integrate.
 """
@@ -734,132 +734,10 @@ class _PrismaticRoute:
         )
 
 
-class _OrdinaryRoute:
-    """Ordinary dynamics of the branch articulations: complete FK/ID, direct tau and inverse mass, finalize."""
-
-    def __init__(self, solver):
-        self.solver, model = solver, solver.model
-        self.model, self.device = model, model.device
-        self.size = solver._compact_diagonal_mass_size
-        self.group = solver.group_to_art[self.size]
-        self.offsets = solver._crba_dof_joint_offset_by_size[self.size]
-
-    def begin(self, state):
-        s, model = self.solver, self.model
-        s._fk_id_cache_valid.zero_()
-        wp.launch(
-            tree_passes.fk_id,
-            dim=model.articulation_count,
-            inputs=[s._dynamics(state, s, write_inertia_records=1, reuse_cached=1)],
-            device=self.device,
-        )
-
-    def predict(self, state, control, dt):
-        s, model, size = self.solver, self.model, self.size
-        count = self.group.shape[0] * size
-        wp.launch(
-            solver_module._prepare_augmented_joint_drives_by_dof,
-            dim=model.joint_dof_count,
-            inputs=[
-                s._augmented_drive_row_by_dof,
-                s._augmented_drive_q_index_by_dof,
-                s._augmented_drive_target_index_by_dof,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_effort_limit,
-                dt,
-            ],
-            outputs=[s.aug_row_K, s.joint_tau],
-            device=self.device,
-        )
-        wp.launch(
-            _direct_branch_tau,
-            dim=count,
-            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
-            device=self.device,
-        )
-        wp.launch(
-            tree_passes.diagonal_inverse_mass,
-            dim=count,
-            inputs=[
-                s._dynamics(None, s),
-                s._body_inertia_terms,
-                self.group,
-                self.offsets,
-                s.R_by_size[size],
-                size,
-            ],
-            outputs=[s._diagonal_inverse_mass],
-            device=self.device,
-        )
-        wp.launch(
-            fk.solve_compact_diagonal_mass,
-            dim=count,
-            inputs=[s._diagonal_inverse_mass, self.group, s.articulation_dof_start, size, s.joint_tau],
-            outputs=[s.joint_qdd],
-            device=self.device,
-        )
-        wp.launch(
-            fk.compute_velocity_predictor,
-            dim=model.joint_dof_count,
-            inputs=[state.joint_qd, s._kinematic_dof_mask, dt],
-            outputs=[s.joint_qdd, s.v_hat],
-            device=self.device,
-        )
-
-    def finish(self, state_in, state_out, dt):
-        s, model = self.solver, self.model
-        wp.launch(
-            fk.update_qdd_from_velocity,
-            dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, s._kinematic_dof_mask, 1.0 / dt],
-            outputs=[s.v_out, s.joint_qdd],
-            device=self.device,
-        )
-        wp.launch(
-            fk.integrate_generalized_joints,
-            dim=model.joint_count,
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                s._kinematic_joint_mask,
-                model.joint_dof_dim,
-                model.body_com,
-                model.joint_X_c,
-                state_in.joint_q,
-                state_in.joint_qd,
-                s.joint_qdd,
-                dt,
-                0.0,
-            ],
-            outputs=[state_out.joint_q, state_out.joint_qd],
-            device=self.device,
-        )
-        wp.launch(
-            tree_passes.fk_kinematics,
-            dim=model.articulation_count,
-            inputs=[s._dynamics(state_out, s)],
-            device=self.device,
-        )
-        wp.launch(
-            tree_passes.publish_body_dynamics,
-            dim=model.body_count,
-            inputs=[s._dynamics(state_out, s, write_inertia_records=1)],
-            device=self.device,
-        )
-
-
 class _Pair:
     """A head-route solver and a scalar-branch solver over one model, each with its own states and inputs."""
 
-    def __init__(self, model, route=_PrismaticRoute, *, poison=False, prismatic=None):
+    def __init__(self, model, route=_PrismaticRoute, *, poison=False):
         size = branch_size(model)
         self.model = model
         self.head = cpu_solver(model, size)
@@ -868,8 +746,6 @@ class _Pair:
         self.plan, self.reason = sb.plan_scalar_branches(self.mine, requested=True)
         if self.plan is None:
             raise AssertionError(self.reason)
-        if prismatic is not None:
-            self.plan = dataclasses.replace(self.plan, prismatic=prismatic)
         self.state = sb.ScalarBranchState(self.mine, self.plan)
         self.states = {name: [model.state(), model.state()] for name in ("head", "mine")}
         self.controls = {name: model.control() for name in ("head", "mine")}
@@ -905,7 +781,7 @@ class _Pair:
         for solver in (self.head, self.mine):
             solver.mass_update_mask.assign(values)
 
-    def step(self, test, *, exact_predict=True):
+    def step(self, test):
         """Advance both routes one substep and compare what each phase publishes.
 
         Both routes integrate the same solved velocity: the head's predictor
@@ -923,16 +799,7 @@ class _Pair:
         self.state.predict(mine_in, self.mine, self.controls["mine"], mine_in.joint_qd, DT)
         same(test, self.head._diagonal_inverse_mass, self.mine._diagonal_inverse_mass, self.dofs, f"{tag} inverse mass")
         for name in ("joint_qdd", "v_hat"):
-            if exact_predict:
-                same(test, getattr(self.head, name), getattr(self.mine, name), self.dofs, f"{tag} {name}")
-            else:
-                np.testing.assert_allclose(
-                    getattr(self.mine, name).numpy()[self.dofs],
-                    getattr(self.head, name).numpy()[self.dofs],
-                    rtol=2.0e-5,
-                    atol=1.0e-6,
-                    err_msg=f"{tag} {name}",
-                )
+            same(test, getattr(self.head, name), getattr(self.mine, name), self.dofs, f"{tag} {name}")
         solved = self.head.v_hat.numpy() + self.rng.uniform(-0.03, 0.03, self.model.joint_dof_count).astype(np.float32)
         for solver in (self.head, self.mine):
             solver.v_out.assign(solved)
@@ -973,9 +840,7 @@ def check_owner_launches(test, device):
     scalar_kernels = {
         sb.repair_scalar_branches: "repair",
         sb.predict_prismatic_branches: "predict",
-        sb.predict_scalar_branches: "predict",
         sb.finish_prismatic_branches: "finish",
-        sb.finish_scalar_branches: "finish",
         sb.prepare_listed_augmented_drives: "drives",
     }
     launched = []
@@ -1066,21 +931,19 @@ def check_owner_launches(test, device):
 
 class TestScalarBranchRule(unittest.TestCase):
     def test_world_fixed_one_coordinate_stars_are_admitted(self):
-        """Admit prismatic, revolute and mixed leaf stars on FIXED and zero-coordinate D6 roots."""
-        for kinds, root in (
-            (("prismatic",), "fixed"),
-            (("revolute",), "fixed"),
-            (("prismatic", "revolute"), "fixed"),
-            (("prismatic",), "d6"),
-        ):
-            with self.subTest(kinds=kinds, root=root):
-                model = build_branch_model(kinds=kinds, root=root)
+        """Admit prismatic leaf stars on FIXED and zero-coordinate D6 roots; leave revolute leaves to the held tree."""
+        for kinds in (("revolute",), ("prismatic", "revolute")):
+            with self.subTest(kinds=kinds):
+                plan, reason = sb.plan_scalar_branches(cpu_solver(build_branch_model(kinds=kinds), 7), requested=True)
+                self.assertIsNone(plan)
+                self.assertIn("revolute leaves run in the held tree's diagonal-mass group", reason)
+        for root in ("fixed", "d6"):
+            with self.subTest(root=root):
+                model = build_branch_model(root=root)
                 solver = cpu_solver(model, 7)
                 plan, reason = sb.plan_scalar_branches(solver, requested=True)
                 self.assertIsNotNone(plan, reason)
                 self.assertEqual((plan.size, plan.group_count), (7, model.world_count))
-                self.assertEqual(plan.kinds, tuple(sorted(kinds)))
-                self.assertEqual(plan.prismatic, kinds == ("prismatic",))
                 self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", reason)
                 starts = model.articulation_start.numpy()
                 expected = np.concatenate(
@@ -1302,7 +1165,7 @@ class TestScalarBranchRule(unittest.TestCase):
             owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
 
     def test_scalar_group_record_follows_the_tree_schema(self):
-        """Record the scalar group with every field of a tree group's record, plus its leaf kinds and drive DOFs.
+        """Record the scalar group with every field of a tree group's record, plus its drive DOFs.
 
         The owner is built directly on CPU and recorded as ``get_path_selection`` records it.
         """
@@ -1315,8 +1178,8 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertEqual(held["owner"], "mixed")
         self.assertTrue(held["scalar_branches"]["enabled"])
         tree, scalar = held["groups"]
-        self.assertEqual((set(scalar) - set(tree), set(tree) - set(scalar)), ({"kinds", "drive_dofs"}, set()))
-        self.assertEqual((scalar["operator"], scalar["dofs"], scalar["kinds"]), ("ScalarBranchState", 7, ["prismatic"]))
+        self.assertEqual((set(scalar) - set(tree), set(tree) - set(scalar)), ({"drive_dofs"}, set()))
+        self.assertEqual((scalar["operator"], scalar["dofs"]), ("ScalarBranchState", 7))
         self.assertEqual(scalar["drive_dofs"], model.joint_dof_count - 7 * model.world_count)
         self.assertEqual(scalar["kernels"]["finish"], sb.finish_prismatic_branches.key)
         # The tree layout's packing fields hold no value for a group without a tree layout.
@@ -1398,7 +1261,6 @@ class TestScalarBranchKernels(unittest.TestCase):
         the scalar solver hold NaN throughout, so no scalar kernel reads them.
         """
         pair = _Pair(build_branch_model(), poison=True)
-        self.assertTrue(pair.plan.prismatic)
         worlds = pair.model.world_count
         for step in range(8):
             pair.inputs()
@@ -1445,36 +1307,6 @@ class TestScalarBranchKernels(unittest.TestCase):
             pair.mass_mask(step == 0)
             pair.step(self)
         np.testing.assert_array_equal(pair.mine.joint_qdd.numpy()[kinematic], 0.0)
-
-    def test_general_kernels_match_the_linear_state_route(self):
-        """Run prismatic leaves through the general (revolute-capable) kernels with the linear state's bits."""
-        pair = _Pair(build_branch_model(worlds=2), prismatic=False)
-        self.assertIs(pair.state.predictor_kernel, sb.predict_scalar_branches)
-        self.assertIs(pair.state.finish_kernel, sb.finish_scalar_branches)
-        for step in range(3):
-            pair.inputs()
-            pair.mass_mask(step != 1)
-            pair.step(self)
-
-    def test_revolute_branches_follow_ordinary_dynamics(self):
-        """Publish revolute leaves as ordinary dynamics does, predicting within the velocity-product rounding.
-
-        Poses, motion axes, origins, inverse masses, integration and body
-        velocities are bitwise. On a fixed root a one-coordinate body's
-        velocity product projects to zero on its own axis; ordinary dynamics
-        evaluates it, so its torques carry that rounding and the scalar
-        family's do not.
-        """
-        model = build_branch_model(kinds=("revolute",), worlds=2)
-        pair = _Pair(model, route=_OrdinaryRoute)
-        self.assertFalse(pair.plan.prismatic)
-        self.assertEqual(pair.plan.kinds, ("revolute",))
-        for step in range(4):
-            pair.inputs()
-            pair.mass_mask(step % 2 == 0)
-            pair.step(self, exact_predict=False)
-        # The leaves turned: the published body velocities carry angular parts.
-        self.assertGreater(float(np.abs(pair.states["mine"][0].body_qd.numpy()[pair.bodies, 3:]).max()), 1.0e-4)
 
     def test_other_drives_match_the_drive_kernel(self):
         """Prepare the drives outside the branches as the full drive kernel does and leave the branches' alone.
@@ -2271,93 +2103,17 @@ class TestScalarBranchOwner(unittest.TestCase):
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
 
-    def test_mixed_leaves_follow_ordinary_dynamics(self):
-        """Own a star of prismatic and revolute leaves end to end and track ordinary dynamics.
-
-        The reference is ordinary dynamics (cached_dynamics='off'); the scalar
-        family runs its general kernels: revolute motion axes about the published
-        origin, their inverse mass from the COM inertia and their COM velocities. Floor
-        contacts on both leaf kinds read those axes and the origin, and a root
-        re-pose must republish them. Revolute torques differ by the velocity
-        product's rounding, which ordinary dynamics evaluates and the family
-        does not (it is zero on the leaf's own axis), so leaves compare at a
-        physics tolerance; the held arm at the held-solve floor.
-        """
+    def test_revolute_leaves_run_in_the_held_diagonal_group(self):
+        """A star with revolute leaves stays out of scalar branches: the held tree's diagonal-mass group owns it."""
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), shapes=True)
-        layout = _Layout(model)
-        starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
-        # Even leaves are prismatic and odd ones revolute.
-        floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 3, 6, 9)]
-        solvers = [
-            recipe_solver(model, scalar=False, cached_dynamics="off"),
-            recipe_solver(model, scalar=True),
-        ]
-        self.assertIsNone(solvers[0]._tree_kinetic_state)
-        owner = solvers[1]._tree_kinetic_state
-        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
-        self.assertEqual(owner.scalar.plan.kinds, ("prismatic", "revolute"))
-        self.assertIs(owner.scalar.predictor_kernel, sb.predict_scalar_branches)
-        self.assertIs(owner.scalar.finish_kernel, sb.finish_scalar_branches)
-        states = [[model.state(), model.state()] for _ in solvers]
-        controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(len(floors), 0, device=device) for _ in solvers]
-        for index, pair in enumerate(states):
-            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
-            install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
-        # A resting leaf's velocity is its contact's residual after the sweeps (about 1e-6 m/s here), which the
-        # rounding of its pose moves by about as much.
-        leaves = {"rtol": 1.0e-4, "atol": 3.0e-6}
-        for step in range(12):
-            force = np.zeros((model.body_count, 6), dtype=np.float32)
-            force[floors[1::2], 2] = -0.2 * (step + 1)
-            for index, pair in enumerate(states):
-                pair[0].body_f.assign(force)
-                controls[index].joint_target_q.fill_(-0.0003 * (step + 1))
-            if step == 6:
-                frames = model.joint_X_p.numpy()
-                frames[starts[layout.branches], :3] += (0.002, -0.001, 0.001)
-                frames[starts[layout.branches], 3:] = np.asarray(wp.quat_rpy(0.32, -0.18, 0.41))
-                model.joint_X_p.assign(frames)
-                for solver in solvers:
-                    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
-            for index, solver in enumerate(solvers):
-                current, following = states[index]
-                solver.step(current, following, controls[index], contacts[index], DT)
-                states[index] = [following, current]
-            tag = f"step {step}"
-            for name, index in (("joint_q", layout.key_coordinates), ("joint_qd", layout.key_dofs)):
-                _close(self, getattr(states[0][0], name), getattr(states[1][0], name), index, f"{tag} {name}", **leaves)
-            for name in ("body_q", "body_qd"):
-                _close(
-                    self,
-                    getattr(states[0][0], name),
-                    getattr(states[1][0], name),
-                    layout.key_bodies,
-                    f"{tag} {name}",
-                    **leaves,
-                )
-                _arm_within(
-                    self,
-                    getattr(states[0][0], name),
-                    getattr(states[1][0], name),
-                    layout.arm_bodies,
-                    f"{tag} arm {name}",
-                )
-            # Same motion axes and origins: the contact producer reads both.
-            _close(self, solvers[0].joint_S_s, solvers[1].joint_S_s, layout.key_dofs, f"{tag} joint_S_s", **leaves)
-            _close(
-                self,
-                solvers[0].articulation_origin,
-                solvers[1].articulation_origin,
-                layout.branches,
-                f"{tag} origin",
-                rtol=1.0e-6,
-                atol=1.0e-7,
-            )
-            for solver in solvers:
-                solver.check_constraint_capacity()
-        self.assertGreater(float(np.abs(states[1][0].body_qd.numpy()[layout.key_leaves, 3:]).max()), 1.0e-4)
+        solver = recipe_solver(model, scalar=True)
+        self.assertIsNone(solver._scalar_branches)
+        self.assertIn("revolute leaves run in the held tree's diagonal-mass group", solver._scalar_branches_reason)
+        owner = solver._tree_kinetic_state
+        self.assertIsNone(owner.scalar)
+        responses = sorted(group._response for group in owner.groups)
+        self.assertEqual(responses, ["cholesky", "diagonal"])
 
     def test_route_record_names_the_scalar_group(self):
         """Record the scalar group, the request that opts out of it, and its decline without an owner."""
@@ -2371,9 +2127,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", held["scalar_branches"]["reason"])
         groups = {group["operator"]: group for group in held["groups"]}
         self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
-        self.assertEqual(
-            (groups["ScalarBranchState"]["dofs"], groups["ScalarBranchState"]["kinds"]), (STAR_LEAVES, ["prismatic"])
-        )
+        self.assertEqual(groups["ScalarBranchState"]["dofs"], STAR_LEAVES)
         self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
         self.assertEqual(groups["TreeHeldOperator"]["dofs"], ARM_DOFS)
         # The scalar group holds no bank stamps, so the arm group beside it validates a changed input
