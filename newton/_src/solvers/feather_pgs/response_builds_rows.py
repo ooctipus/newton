@@ -88,6 +88,7 @@ from .response_builds_dense import _Vec6, solve_six
 from .response_operator import FactorComponent, FactorRows, FreeBody6, Lanes
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
 from .row_metadata import _validate_mf_metadata_encoding
+from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseMassMatrixIndices, _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
 from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_record
@@ -1065,8 +1066,8 @@ def bilateral_rows(
 
 @wp.kernel(enable_backward=False)
 def bilateral_setup_kernel(
+    preelim: Preelim,
     group_to_art: wp.array[int],
-    art_to_preelim: wp.array[int],
     mimic_slot: wp.array[int],
     mimic_art_start: wp.array[int],
     mimic_art_list: wp.array[int],
@@ -1077,14 +1078,6 @@ def bilateral_setup_kernel(
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
     n_dofs: int,
-    reg_rel: float,
-    reg_floor: float,
-    # outputs
-    preelim_slots: wp.array[int],
-    preelim_nB: wp.array[int],
-    S_scratch: wp.array[float],
-    reg: wp.array[float],
-    LS: wp.array[float],
 ):
     """Select an articulation's block (:func:`bilateral_rows`), form ``S = J_B Y_B`` and factor ``S + R``.
 
@@ -1094,7 +1087,7 @@ def bilateral_setup_kernel(
     """
     group = wp.tid()
     art = group_to_art[group]
-    pe = art_to_preelim[art]
+    pe = preelim.art_to_preelim[art]
     if pe < 0:
         return
     base = pe * PREELIM_MAX_ROWS
@@ -1111,32 +1104,29 @@ def bilateral_setup_kernel(
         J_group,
         group,
         n_dofs,
-        preelim_slots,
+        preelim.slots,
     )
-    preelim_nB[pe] = m
+    preelim.nB[pe] = m
     if m == 0:
         return
     s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
     for p in range(m):
-        sp = preelim_slots[base + p]
+        sp = preelim.slots[base + p]
         for q in range(m):
-            S_scratch[s_base + dense_index(m, p, q)] = bilateral_product(
-                J_group, group, sp, Y_group, preelim_slots[base + q], n_dofs, 0.0
+            preelim.S[s_base + dense_index(m, p, q)] = bilateral_product(
+                J_group, group, sp, Y_group, preelim.slots[base + q], n_dofs, 0.0
             )
     for p in range(m):
-        reg[base + p] = reg_rel * S_scratch[s_base + dense_index(m, p, p)] + reg_floor
-    dense_cholesky(m, S_scratch, reg, s_base, base, LS)
+        preelim.reg[base + p] = preelim.reg_rel * preelim.S[s_base + dense_index(m, p, p)] + preelim.reg_floor
+    dense_cholesky(m, preelim.S, preelim.reg, s_base, base, preelim.LS)
 
 
 @wp.kernel(enable_backward=False)
 def bilateral_correct_kernel(
+    preelim: Preelim,
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
-    art_to_preelim: wp.array[int],
     constraint_count: wp.array[int],
-    preelim_slots: wp.array[int],
-    preelim_nB: wp.array[int],
-    LS: wp.array[float],
     J_group: wp.array3d[float],
     n_dofs: int,
     max_constraints: int,
@@ -1155,42 +1145,39 @@ def bilateral_correct_kernel(
     if group >= n_arts:
         return
     art = group_to_art[group]
-    pe = art_to_preelim[art]
+    pe = preelim.art_to_preelim[art]
     if pe < 0:
         return
     world = art_to_world[art]
     if i >= constraint_count[world]:
         return
     base = pe * PREELIM_MAX_ROWS
-    m = preelim_nB[pe]
+    m = preelim.nB[pe]
     if m == 0:
         return
     for p in range(m):
-        if preelim_slots[base + p] == i:
+        if preelim.slots[base + p] == i:
             return
     w = _preelim_vec()
     nonzero = int(0)
     for p in range(m):
-        acc = bilateral_product(J_group, group, preelim_slots[base + p], Y_group, i, n_dofs, 0.0)
+        acc = bilateral_product(J_group, group, preelim.slots[base + p], Y_group, i, n_dofs, 0.0)
         w[p] = acc
         if acc != 0.0:
             nonzero = 1
     if nonzero == 0:
         return
-    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, w)
+    z = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, w)
     for d in range(n_dofs):
-        Y_group[group, i, d] -= bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
+        Y_group[group, i, d] -= bilateral_response(Y_group, group, preelim.slots, base, m, z, d)
 
 
 @wp.kernel(enable_backward=False)
 def bilateral_project_kernel(
+    preelim: Preelim,
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
-    art_to_preelim: wp.array[int],
     articulation_dof_start: wp.array[int],
-    preelim_slots: wp.array[int],
-    preelim_nB: wp.array[int],
-    LS: wp.array[float],
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
     world_rhs: wp.array2d[float],
@@ -1205,10 +1192,10 @@ def bilateral_project_kernel(
     """
     group = wp.tid()
     art = group_to_art[group]
-    pe = art_to_preelim[art]
+    pe = preelim.art_to_preelim[art]
     if pe < 0:
         return
-    m = preelim_nB[pe]
+    m = preelim.nB[pe]
     if m == 0:
         return
     base = pe * PREELIM_MAX_ROWS
@@ -1216,11 +1203,11 @@ def bilateral_project_kernel(
     dof_start = articulation_dof_start[art]
     r = _preelim_vec()
     for p in range(m):
-        sp = preelim_slots[base + p]
+        sp = preelim.slots[base + p]
         r[p] = bilateral_velocity(J_group, group, sp, v_out, dof_start, n_dofs, world_rhs[world, sp])
-    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
+    z = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
     for d in range(n_dofs):
-        acc = bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
+        acc = bilateral_response(Y_group, group, preelim.slots, base, m, z, d)
         if acc != 0.0:
             v_out[dof_start + d] -= acc
 

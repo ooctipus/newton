@@ -240,6 +240,7 @@ from .solver_fields import (
     WORLD_RESPONSE,
     WORLD_ROW_STATE,
     LocalOwners,
+    Preelim,
 )
 from .sparse_contact import (
     CONTACT_RECORD_FLOATS,
@@ -3731,8 +3732,8 @@ class SolverFeatherPGS(SolverBase):
             response_builds_rows.bilateral_setup_kernel,
             dim=n_arts,
             inputs=[
+                field_group.bind(Preelim, solver=self),
                 self.group_to_art[size],
-                self._preelim_art_to_idx,
                 self.mimic_slot if self.mimic_slot is not None else self._dummy_is_free_rigid,
                 self._mimic_art_start if self._mimic_count else self._dummy_is_free_rigid,
                 self._mimic_art_list if self._mimic_count else self._dummy_is_free_rigid,
@@ -3743,15 +3744,6 @@ class SolverFeatherPGS(SolverBase):
                 self.J_by_size[size],
                 self.Y_by_size[size],
                 size,
-                self._preelim_reg_rel,
-                self._preelim_reg_floor,
-            ],
-            outputs=[
-                self._preelim_slots,
-                self._preelim_nB,
-                self._preelim_S,
-                self._preelim_reg,
-                self._preelim_LS,
             ],
             device=self.model.device,
         )
@@ -3759,13 +3751,10 @@ class SolverFeatherPGS(SolverBase):
             response_builds_rows.bilateral_correct_kernel,
             dim=n_arts * self.dense_max_constraints,
             inputs=[
+                field_group.bind(Preelim, solver=self),
                 self.group_to_art[size],
                 self.art_to_world,
-                self._preelim_art_to_idx,
                 self.constraint_count,
-                self._preelim_slots,
-                self._preelim_nB,
-                self._preelim_LS,
                 self.J_by_size[size],
                 size,
                 self.dense_max_constraints,
@@ -3782,13 +3771,10 @@ class SolverFeatherPGS(SolverBase):
                 response_builds_rows.bilateral_project_kernel,
                 dim=self.n_arts_by_size[size],
                 inputs=[
+                    field_group.bind(Preelim, solver=self),
                     self.group_to_art[size],
                     self.art_to_world,
-                    self._preelim_art_to_idx,
                     self.articulation_dof_start,
-                    self._preelim_slots,
-                    self._preelim_nB,
-                    self._preelim_LS,
                     self.J_by_size[size],
                     self.Y_by_size[size],
                     self.rhs,

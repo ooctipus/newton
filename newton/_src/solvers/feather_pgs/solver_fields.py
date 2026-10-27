@@ -11,6 +11,8 @@ that a feature does not use is allocated at the sizes of its placeholder (one
 row, one world) or not at all, as each allocation site says.
 """
 
+import dataclasses
+
 import warp as wp
 
 from . import field_group
@@ -224,6 +226,22 @@ PREELIMINATION = FieldGroup(
     Field("_preelim_reg", wp.float32, ("preelim_row",), grad=False),
 )
 """Fixed-capacity bilateral pre-elimination buffers, ``PREELIM_MAX_ROWS`` rows per eliminating articulation."""
+
+Preelim = field_group.struct(
+    "Preelim",
+    (
+        Field("art_to_preelim", wp.int32, ("articulation",), attr="_preelim_art_to_idx"),
+        *(
+            dataclasses.replace(PREELIMINATION[attr], name=attr.removeprefix("_preelim_"), attr=attr)
+            for attr in ("_preelim_slots", "_preelim_nB", "_preelim_S", "_preelim_LS", "_preelim_reg")
+        ),
+        Field("reg_rel", wp.float32, attr="_preelim_reg_rel"),
+        Field("reg_floor", wp.float32, attr="_preelim_reg_floor"),
+    ),
+    __name__,
+)
+"""The pre-elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows and their
+count, its Schur complement, factor and regularization, and the regularization's relative scale and floor."""
 
 SPARSE_FACTOR = FieldGroup(
     Field("_sparse_Linv", wp.float32, ("group", "nonzero"), grad=False),
