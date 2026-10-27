@@ -9,6 +9,7 @@ budget of the device it is built for (:func:`.staging.arch_budget`).
 
 from __future__ import annotations
 
+import dataclasses
 from functools import cache
 
 import warp as wp
@@ -146,11 +147,34 @@ COLORED_ABI = kernel_template.params(
     ("color_slot", wp.array3d[int]),
     ("slot_data", wp.array3d[float]),
     ("slot_words", wp.array3d[int]),
+    ("slot_metric", wp.array3d[float]),
     ("v_out", wp.array[float]),
 )
 """The colored mapping's native ABI: the matrix-free sweep's, then each world's mapping and storage slot, the worlds'
 color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
 :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _CachedPairBody6(FreeBody6):
+    """The colored unit's operator: a friction pair's coupling feeds only its metric, which the unit's metric cache
+    holds (:func:`_colored_metrics`), so the visit forms none."""
+
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
+
+
+def _colored_pair_metric(op: FreeBody6, pad: str) -> str:
+    """Native statements, after a unit's ``E`` and ``W`` and ``dof_a``, ``dof_b`` are declared: its friction pair's
+    metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
+    second tangent's diagonal), formed exactly as the visit's pair law forms it."""
+    lines = [
+        "const int r = 1;",
+        "const float mf_diag = __int_as_float(W[3]);",
+        op.coupling("cross", "i", "sib", ""),
+        f"const auto metric = ProjectionLaw::friction_pair_metric({op.value('i')}, cross, {op.value('sib')});",
+    ]
+    return indent("\n".join(lines), pad)
 
 
 def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
@@ -166,7 +190,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             raise ValueError(f"the colored unit reads rows i and sib, not {row!r}")
         return offsets[row]
 
-    unit_op = FreeBody6(
+    unit_op = _CachedPairBody6(
         Lanes(1),
         velocity=Velocity("s_v"),
         entry=lambda array, row, k: f"E[{unit_offset(row)} * 24 + {arrays[array] * 6} + {k}]",
@@ -193,6 +217,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
         ring_load=ring_load,
         lanes=Lanes(1),
         contact_kinds=(CONTACT,),
+        pair_law="FRICTION_PAIR_CACHED(p, ",
     )
     lam = unit_rows.load
     ring_sum = "\n".join(
@@ -205,6 +230,15 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             f"                    load += {lam('r')};",
             "                }",
             "                return load;",
+            "            };",
+            "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps).",
+            "            const auto FRICTION_PAIR_CACHED = [&](int position, float, float, float, wp::vec2 residual,",
+            "                                                  wp::vec2 old, float radius, float relaxation) -> wp::vec2 {",
+            f"                const int at = unit_slot * {5 * M_MF} + position;",
+            f"                return ProjectionLaw::friction_pair_from_metric(slot_metric.data[at], slot_metric.data[at + {M_MF}],",
+            f"                    slot_metric.data[at + {2 * M_MF}],",
+            f"                    wp::vec2(slot_metric.data[at + {3 * M_MF}], slot_metric.data[at + {4 * M_MF}]),",
+            "                    residual, old, radius, relaxation);",
             "            };",
         ]
     )
@@ -256,6 +290,44 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
                 }}
                 __syncthreads();
             }}"""
+
+
+def _colored_metrics(M_MF: int) -> str:
+    """Before the sweeps, every thread forms the friction pair metric of the world's staged friction units (a unit of
+    three rows) at block stride and stores it in its slot's metric cache (``slot_metric``: scale, the two
+    eigenvalues and the larger's axis, field by field across the units), which the pair law reads at every visit."""
+    fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
+    arrays = {"mf_J_a": 0, "mf_J_b": 1, "mf_MiJt_a": 2, "mf_MiJt_b": 3}
+    op = FreeBody6(
+        Lanes(1),
+        velocity=Velocity("s_v"),
+        entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row]} * 24 + {arrays[array] * 6} + {k}]",
+        inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
+    )
+    return f"""    {{
+        const int staged = color_offset.data[off_color + color_count.data[world]];
+        for (int p = tid; p < staged; p += blockDim.x) {{
+            const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
+            if ((slot.y & 3) != 3) continue;
+            const int dof_a = slot.z, dof_b = slot.w;
+            const int slot_base = unit_slot * {fields * M_MF} + p;
+            const int word_base = unit_slot * {words * M_MF} + p;
+            float E[{fields}];
+            int W[{words}];
+#pragma unroll
+            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {M_MF}];
+#pragma unroll
+            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
+{_colored_pair_metric(op, " " * 12)}
+            const int at = unit_slot * {5 * M_MF} + p;
+            slot_metric.data[at] = metric.v0;
+            slot_metric.data[at + {M_MF}] = metric.v1;
+            slot_metric.data[at + {2 * M_MF}] = metric.v2;
+            slot_metric.data[at + {3 * M_MF}] = metric.v3[0];
+            slot_metric.data[at + {4 * M_MF}] = metric.v3[1];
+        }}
+    }}
+    __syncthreads();"""
 
 
 def mf_gs_staging(
@@ -491,6 +563,7 @@ def mf_gs_source(
         lane="lane",
         sync="__syncthreads();" if colored else "SYNC();",
     )
+    metric_build = _colored_metrics(M_MF) if colored else ""
     body = f"""{head}
 
     {dense_count}
@@ -541,6 +614,7 @@ def mf_gs_source(
     }}
 {end_first_warp}    {barrier}
 {support_build}
+{metric_build}
 {dense_op.pipeline_registers("    ")}
 
     for (int iter = 0; iter < iterations; iter++) {{

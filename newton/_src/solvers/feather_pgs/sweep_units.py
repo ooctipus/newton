@@ -148,6 +148,9 @@ SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
     Field("slot_data", wp.float32, ("slot", SLOT_ENTRIES + 2, "unit")),
     Field("slot_words", wp.int32, ("slot", SLOT_WORDS, "unit")),
+    # The friction pair metric of each staged friction unit (scale, eigenvalues, axis), formed by the colored sweep
+    # once per launch.
+    Field("slot_metric", wp.float32, ("slot", 5, "unit")),
 )
 """A world's units' rows as the colored sweep reads them: by color slot, field by field (:func:`stage_slots`)."""
 
@@ -593,6 +596,7 @@ class ColoredUnits:
             self.units["color_slot"],
             self.slots["slot_data"],
             self.slots["slot_words"],
+            self.slots["slot_metric"],
         ]
 
     def stats(self) -> list[dict]:
