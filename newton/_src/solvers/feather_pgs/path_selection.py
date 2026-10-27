@@ -40,36 +40,6 @@ _BETA_REASONS = {
     "argument": "friction_anchor_beta passed explicitly.",
 }
 
-# Which claim wins where two patch routes could serve the same world: the order of the
-# declines in _setup_sparse_mass_matrix, the paired factor sweep's exclusions (keyed_rows,
-# row_packets and the tier gate of _init_tiled_kernels) and the order of the row producers
-# in contact_row_plan (which _stage4_build_rows dispatches on); and which native sparse
-# sweeps fuse patch anchor triplets (_admit_sparse_contact_triplets). It governs
-# law-agnostic solvers only.
-_PATCH_ROUTE_PRECEDENCE = (
-    " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests (unless"
-    " FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines native sparse factors, worlds with free rigid bodies then keep the"
-    " dense route, and native sparse factors take the worlds whose topology"
-    " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
-    " FEATHER_PGS_PATCH_ACTIVE_ROWS). Where native sparse factors admit contact triplets"
-    " (sparse_mass_matrix.contact_triplets, FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1), they fuse patch anchor units,"
-    " pooling each ring's normal loads, in the linked active scan and in the full ordered sweep, by default in the"
-    " single-stage transaction (sparse_mass_matrix.contact_transaction, FEATHER_PGS_SPARSE_TRANSACTION)."
-    " On the dense route an admitted paired factor sweep"
-    " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
-    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units)."
-    " The row producer (contact_rows.producer) is the first admitted of"
-    " local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact and sparse producers and"
-    " general, whose masked rows take the patch row law;"
-    " contact_rows.builder_by_dof names each size's builder kernels and the law they write."
-)
-# Contact torsion (patch friction does not admit compliance) takes none of those routes.
-_ORDINARY_PATCH_ROUTES = (
-    " Contact torsion and compliance keep ordinary factors, rows and serial sweeps, so"
-    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_PARALLEL_ROWS and"
-    " FEATHER_PGS_SPARSE_CONTACT_TRIPLETS select no route."
-)
-
 
 def json_value(value):
     """Return a JSON-compliant host copy of a scalar, sequence or mapping without reading device memory."""
@@ -476,20 +446,6 @@ def _contact_rows(solver, source) -> dict:
     methods = None
     if plan.producer == "general":
         methods = {str(int(size)): method for size, method in plan.methods.items()}
-    if solver._compact_contact_boundary:
-        compact_reason = (
-            "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
-        )
-    elif not source._COMPACT_CONTACT_BOUNDARY:
-        compact_reason = "Off: FEATHER_PGS_COMPACT_CONTACT_BOUNDARY is an import-time opt-in."
-    elif not solver._law_agnostic_contact_paths:
-        compact_reason = (
-            "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows."
-        )
-    else:
-        compact_reason = (
-            "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
-        )
     packets = solver._row_packets
     return {
         "producer": plan.producer,
@@ -510,7 +466,7 @@ def _contact_rows(solver, source) -> dict:
         "keyed_rows": {"enabled": solver._keyed_rows is not None, "reason": solver._keyed_rows_reason},
         "compact_contact": {
             "boundary": bool(solver._compact_contact_boundary),
-            "reason": compact_reason,
+            "reason": solver._compact_contact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),
     }
@@ -544,13 +500,7 @@ def _local_solve(solver) -> dict:
 def _paired_response(solver) -> dict:
     primary = solver._paired_response_primary_size
     if primary is None:
-        if solver._sparse_diagonal_contact_solve or solver._sparse_mass_matrix_size is not None:
-            reason = "A sparse response owner owns response."
-        elif solver._explicit_dense_kernels:
-            reason = "An explicit dense kernel choice owns response."
-        else:
-            reason = "No world pairs one tiled-response articulation with exactly one free body."
-        return {"enabled": False, "reason": reason}
+        return {"enabled": False, "reason": solver._paired_response_reason}
     factor = bool(solver._paired_factor_coordinates)
     overlap = solver._paired_general_solve_stream is not None
     return {
@@ -575,22 +525,15 @@ def _paired_response(solver) -> dict:
 
 
 def _sparse_diagonal(solver) -> dict:
-    enabled = bool(solver._sparse_diagonal_contact_solve)
-    if enabled:
-        reason = "One diagonal-mass articulation and one compact dense articulation per world share one owner."
-    elif solver._contact_torsion_radius > 0.0 or solver._explicit_dense_kernels:
-        reason = "Contact torsion or an explicit dense kernel choice keeps the general response."
-    else:
-        reason = "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
     return {
-        "enabled": enabled,
+        "enabled": bool(solver._sparse_diagonal_contact_solve),
         "response_dofs": json_value(solver._sparse_diagonal_response_size),
         "dense_dofs": int(solver._sparse_diagonal_dense_size),
         "contact_triples": bool(solver._sparse_diagonal_contact_triples),
         "contact_units": bool(solver._sparse_diagonal_contact_units),
         "speculative_contact_batches": bool(solver._sparse_diagonal_speculative_contact_batches),
         "fused_joint_limits": bool(solver._fused_diagonal_joint_limits),
-        "reason": reason,
+        "reason": solver._sparse_diagonal_reason,
     }
 
 
@@ -1067,7 +1010,6 @@ def _friction(solver) -> dict:
             owners.append("sparse active rows")
         if owners:
             reason += f" Point-contact owners ({', '.join(owners)}) need point friction."
-        reason += _PATCH_ROUTE_PRECEDENCE if solver._law_agnostic_contact_paths else _ORDINARY_PATCH_ROUTES
     return {
         "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.friction_anchor_beta),
@@ -1089,20 +1031,8 @@ def _friction(solver) -> dict:
     }
 
 
-def _grouped(solver) -> dict | None:
-    if not solver._grouped_response:
-        return None
-    return {
-        "hinv_jt_by_dof": {
-            str(int(size)): {"grouped": route.name == "grouped", "reason": route.reason}
-            for size, route in solver._plan.response.items()
-        },
-    }
-
-
 def _dynamics(solver) -> dict:
     return {
-        "grouped": _grouped(solver),
         "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),

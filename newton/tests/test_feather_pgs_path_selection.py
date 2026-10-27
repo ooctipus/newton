@@ -285,10 +285,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             selected = solver.get_path_selection()
         self.assertIn("CPU", selected["reasons"]["sparse_mass_matrix"])
         self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
-        self.assertIn("CPU", selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
+        self.assertIn("CPU", selected["routes"]["stages"]["factor"]["1"]["reason"])
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
         json.dumps(selected, allow_nan=False)
-        selected["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"] = "edited"
+        selected["reasons"]["cached_dynamics"] = "edited"
         selected["routes"]["friction"]["law"] = "edited"
         selected["options"]["pgs_iterations"]["applied"] = -1
         again = solver.get_path_selection()
@@ -347,7 +347,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
         )
         self.assertIsNone(selected["routes"]["sweep"]["tiers"])
-        self.assertIsNone(selected["routes"]["dynamics"]["grouped"])
+        self.assertNotIn("grouped", {r["route"] for r in selected["routes"]["stages"]["response"].values()})
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
@@ -479,8 +479,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
         self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
-        self.assertIsNone(routes["dynamics"]["grouped"])
-        self.assertEqual({plan["hinv_jt_kernel"] for plan in selected["kernel_plan_by_dof"].values()}, {"par_row"})
+        self.assertEqual({entry["route"] for entry in routes["stages"]["response"].values()}, {"rows"})
         self.assertEqual(selected["measurements"], {})
         separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
         self.assertFalse(separate["free_rigid_bodies"]["mixed_worlds"])
@@ -489,33 +488,21 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         debug = SolverFeatherPGS(_cpu_model(), pgs_debug=True).get_path_selection()["routes"]
         self.assertEqual(debug["sweep"]["driver"], "debug_loop")
 
-    def test_cpu_patch_record_states_the_route_precedence(self):
-        """State the patch route precedence where it governs the solver, and the torsion exception where it does not.
+    def test_cpu_patch_record_names_the_point_only_owners(self):
+        """Name the owners patch friction cannot use, and route the masked rows and the classifier to the patch law.
 
-        A law-agnostic patch solver's record names the claims in the order the solver tries them, and its
-        CPU decisions follow it: masked rows take the patch row law and the classifier serves patch friction.
-        The route claims are decided in test_patch_route_claims_follow_the_recorded_precedence (sparse
-        admission) and the paired factor sweep's exclusions in
-        test_paired_factor_sweep_excludes_a_requested_patch_tier (CUDA). Contact torsion takes none of these
-        routes whatever the flags say, and its record says that instead.
+        Which owner claims a world is recorded where it is decided (routes.stages, each owner's reason); the
+        friction record names only the owners that need point friction. Contact torsion takes none of the patch
+        routes whatever the flags say.
         """
         model = _cpu_free_body_model()
-        claims = ("parallel tier", "free rigid bodies", "native sparse factors take", "paired factor sweep", "producer")
         masked = {**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}
         with patch.multiple(solver_module, **masked):
             routes = SolverFeatherPGS(model).get_path_selection()["routes"]
         friction = routes["friction"]
         self.assertEqual(friction["law"], "patch")
-        owners, _, precedence = friction["reason"].rpartition(" need point friction.")
         # The resolved-world classifier serves patch friction.
-        self.assertNotIn("resolved-world classifier", owners)
-        # Route claims, the paired factor sweep's exclusions, then row producers, in the solver's order.
-        positions = [precedence.find(claim) for claim in claims]
-        self.assertNotIn(-1, positions)
-        self.assertEqual(positions, sorted(positions))
-        self.assertIn("excludes the parallel tiers, keyed_rows and local_packets", precedence)
-        self.assertIn("local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)", precedence)
-        self.assertIn("contact_rows.builder_by_dof names each size's builder kernels", precedence)
+        self.assertNotIn("resolved-world classifier", friction["reason"])
         # The general builder's masked rows take the patch row law.
         method = "masked_combined"
         self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
@@ -534,8 +521,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 routes = SolverFeatherPGS(model, contact_torsion_radius=0.01).get_path_selection()["routes"]
                 friction = routes["friction"]
                 self.assertEqual((friction["law"], friction["torsion"]), ("patch", True))
-                self.assertNotIn("first claim", friction["reason"])
-                self.assertTrue(friction["reason"].endswith(" select no route."), friction["reason"])
+                self.assertIn("need point friction", friction["reason"])
                 self.assertFalse(friction["parallel_rows"]["admitted"])
                 self.assertEqual(
                     routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"}
@@ -557,16 +543,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver._plan = StepPlan.build(solver)
         selected = solver.get_path_selection()
         json.dumps(selected, allow_nan=False)
-        grouped = selected["routes"]["dynamics"]["grouped"]
-        self.assertEqual(set(grouped), {"hinv_jt_by_dof"})
-        by_dof = grouped["hinv_jt_by_dof"]
-        self.assertTrue(by_dof["1"]["grouped"])
-        self.assertEqual(selected["kernel_plan_by_dof"][1]["hinv_jt_kernel"], "grouped")
-        self.assertIn("routes.dynamics.grouped", selected["reasons"]["kernel_plan_by_dof"][1]["hinv_jt_kernel"])
+        response = selected["routes"]["stages"]["response"]
+        self.assertEqual(response["1"]["route"], "grouped")
+        self.assertIn("Grouped", response["1"]["reason"])
         # The free box's six-coordinate size keeps its planned kernel.
-        self.assertFalse(by_dof["6"]["grouped"])
-        self.assertIn("Free-body sizes keep the per-row kernel", by_dof["6"]["reason"])
-        self.assertEqual(selected["kernel_plan_by_dof"][6]["hinv_jt_kernel"], "par_row")
+        self.assertEqual(response["6"]["route"], "rows")
+        self.assertIn("Free-body sizes keep the per-row kernel", response["6"]["reason"])
 
     def test_cpu_route_record_matches_launched_kernels(self):
         """Tie the record's sweep driver, row builders and root clamp to the kernels one CPU step launches."""
@@ -1051,16 +1033,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     # Every tier sweeps the automatic budget, at least mf_gs_parallel_sweeps.
                     self.assertEqual(tiers["sweeps_rule"], "auto")
                     self.assertTrue(all(t["sweeps"] >= applied["mf_gs_parallel_sweeps"] for t in tiers["tiers"]))
-                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped"] is not None)
+                self.assertEqual(applied["grouped_dynamics"], solver._grouped_response)
                 self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
-                # A size whose response the grouped kernel solves is labeled so in the kernel plan.
-                grouped = routes["dynamics"]["grouped"]
-                self.assertEqual(grouped is None, not solver._grouped_response)
-                for size, plan in selected["kernel_plan_by_dof"].items():
-                    is_grouped = grouped is not None and grouped["hinv_jt_by_dof"][str(size)]["grouped"]
-                    self.assertEqual(plan["hinv_jt_kernel"] == "grouped", is_grouped, size)
+                # Only grouped dynamics routes a size's response to the grouped kernel.
+                if not solver._grouped_response:
+                    self.assertNotIn("grouped", {entry["route"] for entry in routes["stages"]["response"].values()})
         self.assertGreaterEqual(built, 8)
         self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
         self.assertGreaterEqual(
@@ -1074,11 +1053,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cholesky_kernel"):
                 SolverFeatherPGS(model)
             explicit = SolverFeatherPGS(model, cholesky_kernel="loop").get_path_selection()
-            self.assertIn("Explicit", explicit["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"])
+            self.assertIn("Explicit", explicit["routes"]["stages"]["factor"]["1"]["reason"])
         with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "tiled"}):
             solver = SolverFeatherPGS(model)
             self.assertEqual(solver.cholesky_kernel, "loop")
-            reason = solver.get_path_selection()["reasons"]["kernel_plan_by_dof"][1]["cholesky_kernel"]
+            reason = solver.get_path_selection()["routes"]["stages"]["factor"]["1"]["reason"]
             self.assertIn("CPU", reason)
             self.assertIn("override", reason)
 
@@ -1585,7 +1564,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual(solver.pgs_kernel, "loop")
                 self.assertTrue(solver._friction_anchors_enabled)
                 selected = solver.get_path_selection()
-                for key in ("routes", "kernel_plan_by_dof", "pgs_kernel"):
+                for key in ("routes", "pgs_kernel"):
                     self.assertEqual(selected[key], reference[key], key)
                 self.assertEqual(
                     selected["options"]["pgs_kernel"],
@@ -1622,7 +1601,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         )
                     self.assertEqual(solver.pgs_kernel, "tiled_row")
                     selected = solver.get_path_selection()
-                    for key in ("routes", "kernel_plan_by_dof", "pgs_kernel", "sparse_mass_matrix", "cached_dynamics"):
+                    for key in ("routes", "pgs_kernel", "sparse_mass_matrix", "cached_dynamics"):
                         self.assertEqual(selected[key], reference[key], key)
                     self.assertEqual(selected["requested"], {**reference["requested"], "pgs_kernel": kernel})
                     self.assertEqual(
@@ -1642,7 +1621,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = SolverFeatherPGS(model, pgs_mode="matrix_free", trisolve_kernel="loop")
         selected = solver.get_path_selection()
         self.assertEqual(selected["sparse_mass_matrix"], "off")
-        self.assertEqual(selected["kernel_plan_by_dof"][9]["trisolve_kernel"], "loop")
+        self.assertEqual(selected["routes"]["stages"]["trisolve"]["9"]["route"], "loop")
         self.assertEqual(selected["requested"]["hinv_jt_kernel"], "auto")
         split = SolverFeatherPGS(model, pgs_mode="split", delassus_kernel="par_row_col")
         self.assertFalse(split._execution_plan.hinv_jt_fused_sizes)

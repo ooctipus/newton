@@ -195,30 +195,35 @@ class StepPlan:
         }
 
 
+def _route(solver, size: int, kernel: str, name: str, reason: str) -> Route:
+    """A route whose reason leads with the kernel choice (explicit, automatic, private override, CPU) and the size's
+    resource rule (execution_plan) for ``kernel``."""
+    resource = solver._execution_plan.selection_reasons(size).get(kernel, "")
+    return Route(name, " ".join(part for part in (solver._kernel_choice_reasons[kernel], resource, reason) if part))
+
+
 def _factor(solver) -> dict[int, Route]:
     plan = solver._execution_plan
     routes = {}
     for size in solver.size_groups:
         if size == solver._compact_diagonal_mass_size:
-            route = Route("none", "The compact diagonal size stores its inverse mass directly; no dense factor.")
+            route = "none", "The compact diagonal size stores its inverse mass directly; no dense factor."
         elif size == solver._sparse_mass_matrix_size:
-            route = Route("none", "Native sparse factors refresh with the mass matrix; no dense factor.")
+            route = "none", solver._sparse_selection_reason
         elif plan.use_diagonal_mass(size):
-            route = Route("diagonal", "Independent coordinates: the factor is the diagonal.")
+            route = "diagonal", ""
         elif plan.use_tiled_cholesky(size):
             if solver._crba_cholesky_kernels_by_size[size] is not None:
-                route = Route(
-                    "crba_tiles", "Stage 1 assembles and factors the mass matrix in one tile per articulation."
-                )
+                route = "crba_tiles", "Stage 1 assembles and factors the mass matrix in one tile per articulation."
             elif size == solver._paired_response_primary_size and not solver._paired_factor_coordinates:
-                route = Route("tiles_inverse", "The paired response's primary factor also materializes its inverse.")
+                route = "tiles_inverse", "The paired response's primary factor also materializes its inverse."
             else:
-                route = Route("tiles", "Tiled factor (the execution plan's resource choice).")
+                route = "tiles", ""
         elif solver._crba_cholesky_warp_kernels_by_size[size] is not None:
-            route = Route("crba_warps", "Stage 1 assembles and factors the mass matrix in one warp per articulation.")
+            route = "crba_warps", "Stage 1 assembles and factors the mass matrix in one warp per articulation."
         else:
-            route = Route("loop", "Loop factor, a thread per articulation (the execution plan's resource choice).")
-        routes[size] = route
+            route = "loop", ""
+        routes[size] = _route(solver, size, "cholesky_kernel", *route)
     return routes
 
 
@@ -231,19 +236,20 @@ def _unread_mass_sizes(factor: Mapping[int, Route], *, held: bool) -> tuple[int,
 def _trisolve(solver) -> dict[int, Route]:
     plan = solver._execution_plan
     choice = solver.trisolve_kernel
+    threshold = f"Automatic DOF threshold {solver.small_dof_threshold}."
     routes = {}
     for size in solver.size_groups:
         if size == solver._sparse_mass_matrix_size:
-            route = Route("sparse", "Native sparse factors solve in factor coordinates.")
+            route = "sparse", "Native sparse factors solve in factor coordinates."
         elif size == solver._compact_diagonal_mass_size:
-            route = Route("compact_diagonal", "The compact diagonal size applies its stored inverse mass.")
+            route = "compact_diagonal", "The compact diagonal size applies its stored inverse mass."
         elif plan.use_diagonal_mass(size):
-            route = Route("diagonal", "Independent coordinates apply the diagonal inverse.")
+            route = "diagonal", "Independent coordinates apply the diagonal inverse."
         elif choice == "tiled" or (choice == "auto" and size > solver.small_dof_threshold):
-            route = Route("tiles", f"Tiled solve: trisolve_kernel={choice!r}, threshold {solver.small_dof_threshold}.")
+            route = "tiles", threshold
         else:
-            route = Route("loop", f"Loop solve: trisolve_kernel={choice!r}, threshold {solver.small_dof_threshold}.")
-        routes[size] = route
+            route = "loop", threshold
+        routes[size] = _route(solver, size, "trisolve_kernel", *route)
     return routes
 
 
@@ -272,21 +278,20 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
             elif size == solver._paired_response_primary_size:
                 route = Route("paired", "One articulation and one free body per world share one response.")
         if route is None and plan.use_diagonal_mass(size):
-            route = Route("diagonal", "Independent coordinates apply the diagonal inverse.")
+            route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
         if route is None:
             grouped, reason = _grouped(solver, size) if solver._grouped_response else (False, "")
             if grouped:
-                route = Route("grouped", reason)
+                name = "grouped"
             elif plan.use_tiled_hinv_jt(size):
-                route = Route("tiles", "Tiled response (the execution plan's resource choice).")
+                name = "tiles"
             elif solver._row_packets is not None:
-                route = Route("packets", "Local row packets solve their worlds' response; the rest per row.")
+                name, reason = "packets", f"{reason} Local row packets solve their worlds' response; the rest per row."
             elif solver._local_internal_fast_path:
-                route = Route("lanes", "A warp per articulation, skipping the worlds local owners solve.")
+                name, reason = "lanes", f"{reason} A warp per articulation, skipping the worlds local owners solve."
             else:
-                route = Route("rows", "A thread per row (the execution plan's resource choice).")
-            if reason and not grouped:
-                route = Route(route.name, f"{reason} {route.reason}")
+                name = "rows"
+            route = _route(solver, size, "hinv_jt_kernel", name, reason.strip())
         routes[size] = route
     return routes
 
@@ -309,10 +314,11 @@ def _grouped(solver, size: int) -> tuple[bool, str]:
 def _delassus(solver, solve: SolveRoute, response: Mapping[int, Route]) -> dict[int, Route]:
     if not solve.assembles_delassus or any(route.name == "fused" for route in response.values()):
         return {}
+    reason = solver._kernel_choice_reasons["delassus_kernel"]
     if solver.delassus_kernel == "par_row_col":
-        route = Route("entries", "delassus_kernel='par_row_col': a thread per entry.")
+        route = Route("entries", f"{reason} A thread per entry.")
     else:
-        route = Route("tiles", "A block per articulation streams row chunks of J and Y.")
+        route = Route("tiles", f"{reason} A block per articulation streams row chunks of J and Y.")
     return dict.fromkeys(solver.size_groups, route)
 
 

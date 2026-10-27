@@ -974,77 +974,12 @@ class SolverFeatherPGS(SolverBase):
     first-order; accurate rotational trajectories still require a suitable
     simulation timestep.
 
-    CUDA ``tiled_row`` batches with 128-row capacity and at least 1024 worlds
-    use smaller temporary row storage for eligible worlds, retaining the full
-    capacity for all other worlds. Set ``FEATHER_PGS_DENSE_ROW_BUDGETS=0`` before
-    construction to disable this selection, or ``=1`` to select it for smaller
-    CUDA batches with 64- or 128-row capacity.
-
-    Eligible CUDA worlds use leaf-first sparse mass factors and contact rows
-    in ``matrix_free`` mode. Articulations retain separate coordinate blocks;
-    independent free bodies keep their physical response, and prescribed
-    motion enters the existing contact targets. Branches reduce factor storage
-    and typical row support without changing PGS budgets. The current sparse
-    layout requires a common articulated topology with at most 64 DOFs per
-    articulation. Dense-factor chains and unsupported features retain the
-    existing representation. Selection uses topology and resources, not task names.
-    Without split, velocity-limit or free-body rows, the sparse sweep selects
-    its normal and limit rows at sweep entry: a zero-impulse row that the
-    sweep's earlier updates violate waits for the next sweep. Under persistent
-    patch friction a friction pair is visited while any normal of its patch
-    ring is selected or the pair holds impulse, and small worlds keep their
-    packed full sweep; set ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` before
-    construction to keep patch friction on the full ordered sweep. With
-    ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` that sweep still fuses anchor
-    triplets, bitwise equal to its ordinary updates; the previous sweep kernel
-    needs both flags off.
-
-    Automatic sparse selection includes factor-coordinate velocity-limit
-    responses for compatible ``matrix_free`` CUDA models,
-    including serial chains and same-articulation mimic couplings. It preserves
-    ordered PGS sweeps and the final, stateless speed-limit projection in each
-    sweep. It requires augmented drives and current friction; warm starts,
-    independent free bodies, prescribed motion and loop-closure constraints
-    retain the existing representation. Selection also follows the
-    topology and resource limits above. Compatible split sweeps and grouped
-    dynamics also compose with automatic sparse factors. Set
-    ``sparse_mass_matrix="off"`` to retain ordinary factors. Legacy
-    ``FEATHER_PGS_SPARSE_VELOCITY_LIMITS=0``, ``FEATHER_PGS_SPARSE_SPLIT=0`` and
-    ``FEATHER_PGS_SPARSE_GROUPED_DYNAMICS=0`` disable their respective automatic
-    compositions; explicit ``sparse_mass_matrix="on"`` overrides those optional
-    gates while retaining physical and resource admission. This feature is
-    experimental and may change without notice.
-
-    The experimental sparse contact-triplet mode is disabled by default. Set
-    ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1`` before construction to cache tangent
-    metrics within each solve and retain admitted normal/tangent updates in
-    registers. It requires one articulated coordinate block per world, support
-    tables, and no physical free-body response. Point friction fuses its
-    contacts in the active sparse sweep only. Persistent patch friction fuses
-    each patch's anchor units in whichever sweep it runs, the active sweep or
-    the full ordered sweep (``FEATHER_PGS_PATCH_ACTIVE_ROWS=0``), pooling the
-    ring's normal loads as the ordinary update does; split, velocity-limit and
-    packed small-world sweeps keep ordinary updates. Shared memory limits
-    retain the ordinary sparse owner; unsupported row metadata, delayed
-    friction, and negative relaxation in the active sweep retain ordinary row
-    updates. At most twelve used tangent pairs per world retain metrics;
-    additional pairs recompute their metrics without limiting solved rows.
-    The mode preserves the selected ordered sweeps and friction law: patch
-    results are bitwise unchanged, and so are point results unless
-    ``pgs_relative_change_tolerance > 0``, where the point early exit bounds
-    tangent changes by the new normal impulse. This feature is experimental
-    and may change without notice.
-
-    The per-substep snapshots of the velocity predictor are off by default.
-    Set ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` before construction to keep, for
-    external NaN dumpers, the predictor's input joint velocity [m/s or rad/s],
-    unconstrained joint acceleration [m/s² or rad/s²] and predicted joint
-    velocity [m/s or rad/s] in ``_debug_stage3_qd_work``,
-    ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, each shaped like
-    ``joint_qd`` and copied on every substep. ``pgs_debug=True`` keeps them
-    too. Otherwise the three attributes are ``None`` and no copy runs. The
-    snapshots hold no gradient, so physics and a :class:`warp.Tape`'s record
-    are the same either way.
+    Construction chooses each world's owners, factors, rows and sweeps from the
+    model's topology, the options and the device's resources (never by timing);
+    :meth:`get_path_selection` records every choice with its reason. The
+    ``FEATHER_PGS_*`` environment switches it reads are declared, each with its
+    meaning, in ``environment_flags.FLAGS`` of this package, and the record lists
+    those present at construction (``environment``).
 
     """
 
@@ -2259,6 +2194,18 @@ class SolverFeatherPGS(SolverBase):
             else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
+        if float(contact_torsion_radius) > 0.0 or self._explicit_dense_kernels:
+            self._sparse_diagonal_reason = (
+                "Contact torsion or an explicit dense kernel choice keeps the general response."
+            )
+        elif sparse_diagonal_pair is None:
+            self._sparse_diagonal_reason = (
+                "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
+            )
+        else:
+            self._sparse_diagonal_reason = (
+                "One diagonal-mass articulation and one compact dense articulation per world share one owner."
+            )
         if sparse_diagonal_pair is None:
             # Limit rows belong to this specialized owner. If the complete
             # response composition is unavailable, retain the ordinary rows.
@@ -2437,72 +2384,42 @@ class SolverFeatherPGS(SolverBase):
         self._local_general_solver_blocks = min(
             self.world_count, max(1, int(model.device.sm_count) * _LOCAL_GENERAL_BLOCKS_PER_SM)
         )
-        self._local_internal_candidates = {
-            size: wp.array(arts, dtype=wp.int32, device=model.device) for size, arts in local_candidates.items() if arts
-        }
-        self._local_pair_candidates = {
-            size: wp.array(arts, dtype=wp.int32, device=model.device)
-            for size, arts in local_pair_candidates.items()
-            if arts
-        }
-        self._local_pair_secondaries = {
-            size: wp.array(arts, dtype=wp.int32, device=model.device)
-            for size, arts in local_pair_secondaries.items()
-            if arts
-        }
-        self._local_residual_candidates = {
-            size: wp.array(arts, dtype=wp.int32, device=model.device)
-            for size, arts in local_residual_candidates.items()
-            if arts
-        }
-        self._local_residual_secondaries = {
-            size: wp.array(arts, dtype=wp.int32, device=model.device)
-            for size, arts in local_residual_secondaries.items()
-            if arts
-        }
+
+        def arrays(lists):
+            """Each size's non-empty articulation list as a device array."""
+            return {size: wp.array(arts, dtype=wp.int32, device=model.device) for size, arts in lists.items() if arts}
+
+        def per_size(counts, make):
+            """One buffer per size with candidates, made from its candidate count."""
+            return {size: make(count) for size, count in counts.items() if count > 0}
+
+        def counter(count):
+            return wp.zeros(1, dtype=wp.int32, device=model.device)
+
+        def slots(count):
+            return wp.empty(count, dtype=wp.int32, device=model.device)
+
+        self._local_internal_candidates = arrays(local_candidates)
+        self._local_pair_candidates = arrays(local_pair_candidates)
+        self._local_pair_secondaries = arrays(local_pair_secondaries)
+        self._local_residual_candidates = arrays(local_residual_candidates)
+        self._local_residual_secondaries = arrays(local_residual_secondaries)
         self._local_internal_art_counts = {size: len(arts) for size, arts in local_candidates.items()}
         self._local_pair_art_counts = {size: len(arts) for size, arts in local_pair_candidates.items()}
         self._local_residual_art_counts = {size: len(arts) for size, arts in local_residual_candidates.items()}
-        self._local_pair_active_counts = {
-            size: wp.zeros(1, dtype=wp.int32, device=model.device)
-            for size, count in self._local_pair_art_counts.items()
-            if count > 0
-        }
-        self._local_pair_active_candidates = {
-            size: wp.empty(count, dtype=wp.int32, device=model.device)
-            for size, count in self._local_pair_art_counts.items()
-            if count > 0
-        }
-        self._local_pair_active_secondaries = {
-            size: wp.empty(count, dtype=wp.int32, device=model.device)
-            for size, count in self._local_pair_art_counts.items()
-            if count > 0
-        }
-        self._local_residual_active_counts = {
-            size: wp.zeros(1, dtype=wp.int32, device=model.device)
-            for size, count in self._local_residual_art_counts.items()
-            if count > 0
-        }
-        self._local_residual_active_candidates = {
-            size: wp.empty(count, dtype=wp.int32, device=model.device)
-            for size, count in self._local_residual_art_counts.items()
-            if count > 0
-        }
-        self._local_residual_active_secondaries = {
-            size: wp.empty(count, dtype=wp.int32, device=model.device)
-            for size, count in self._local_residual_art_counts.items()
-            if count > 0
-        }
-        self._local_pair_solver_blocks = {
-            size: min(count, max(1, int(model.device.sm_count) * _LOCAL_PAIR_BLOCKS_PER_SM))
-            for size, count in self._local_pair_art_counts.items()
-            if count > 0
-        }
-        self._local_residual_solver_warps = {
-            size: min(count, max(1, int(model.device.sm_count)))
-            for size, count in self._local_residual_art_counts.items()
-            if count > 0
-        }
+        self._local_pair_active_counts = per_size(self._local_pair_art_counts, counter)
+        self._local_pair_active_candidates = per_size(self._local_pair_art_counts, slots)
+        self._local_pair_active_secondaries = per_size(self._local_pair_art_counts, slots)
+        self._local_residual_active_counts = per_size(self._local_residual_art_counts, counter)
+        self._local_residual_active_candidates = per_size(self._local_residual_art_counts, slots)
+        self._local_residual_active_secondaries = per_size(self._local_residual_art_counts, slots)
+        sm_count = int(model.device.sm_count)
+        self._local_pair_solver_blocks = per_size(
+            self._local_pair_art_counts, lambda count: min(count, max(1, sm_count * _LOCAL_PAIR_BLOCKS_PER_SM))
+        )
+        self._local_residual_solver_warps = per_size(
+            self._local_residual_art_counts, lambda count: min(count, max(1, sm_count))
+        )
         self._local_residual_warps_per_block = {
             size: (
                 2
@@ -2634,11 +2551,18 @@ class SolverFeatherPGS(SolverBase):
             and self._sparse_mass_matrix_size is None
         )
         self._hinv_jt_tiled_writes_group = not self._hinv_jt_writes_world or self.pgs_warmstart
-        response_pair = (
-            None
-            if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None
-            else self._select_paired_response()
+        self._paired_response_reason = first_failed(
+            (
+                (
+                    not (self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None),
+                    "A sparse response owner owns response.",
+                ),
+                (not self._explicit_dense_kernels, "An explicit dense kernel choice owns response."),
+            )
         )
+        response_pair = None if self._paired_response_reason else self._select_paired_response()
+        if response_pair is None and self._paired_response_reason is None:
+            self._paired_response_reason = "No world pairs one tiled-response articulation with exactly one free body."
         self._paired_response_primary_size = response_pair[0] if response_pair is not None else None
         self._paired_response_secondary_size = response_pair[1] if response_pair is not None else None
         self._paired_response_secondary_groups = (
@@ -2888,12 +2812,27 @@ class SolverFeatherPGS(SolverBase):
             self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         )
 
-        self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
-        if self._law_agnostic_contact_paths and _COMPACT_CONTACT_BOUNDARY:
+        declined = first_failed(
+            (
+                (_COMPACT_CONTACT_BOUNDARY, "Off: FEATHER_PGS_COMPACT_CONTACT_BOUNDARY is an import-time opt-in."),
+                (
+                    self._law_agnostic_contact_paths,
+                    "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows.",
+                ),
+            )
+        )
+        if declined is None:
             from .compact_contact import supported  # noqa: PLC0415
 
-            self._compact_contact_boundary = supported(self)
+            if not supported(self):
+                declined = (
+                    "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
+                )
+        self._compact_contact_boundary = declined is None
+        self._compact_contact_reason = declined or (
+            "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
+        )
 
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
@@ -2994,23 +2933,21 @@ class SolverFeatherPGS(SolverBase):
         The record is read on the host without device synchronization, except
         under ``pgs_solve_readout``: reading its counters synchronizes once.
 
-        Kernel plans describe ordinary stages per articulation DOF count. Cached
-        prediction can replace these stages; its owner is reported separately.
         Automatic choices use topology and resource rules, never timing.
         Recreate the solver to change them. The ``reasons`` mapping explains construction-time admission and
-        fallbacks; it does not predict dynamic per-world branches. Ordinary
-        kernel plans can be superseded by a cache.
+        fallbacks; it does not predict dynamic per-world branches.
 
         ``routes`` records every construction-time owner and variant that decides
-        which kernels run: the held-tree owner and its lane layouts, the contact-row
+        which kernels run: ``routes.stages`` the step plan's per-size stage routes
+        (factor, predictor solve, response, Delassus) that ``step()`` launches,
+        each with its reason (the kernel choice, the size's resource rule), the
+        held-tree owner and its lane layouts, the contact-row
         producer with each DOF size's row-builder kernels and friction law (from
         the plan the row build dispatches on), local, paired and sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits and the lane width of their prescale, free
-        bodies, the friction law and the grouped response solve, each with a
-        reason; a size whose response the grouped kernel solves reports
-        ``hinv_jt_kernel`` ``"grouped"``; ``routes.sweep.readout`` names the
+        bodies and the friction law, each with a reason; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
         of worlds without rows as skipped and the owners of the worlds no counter
         counts, and ``routes.sweep.exit_law`` the sweeps that honor, decline or
@@ -3046,74 +2983,13 @@ class SolverFeatherPGS(SolverBase):
         host-only, detached from solver state and JSON-compliant (non-finite
         floats are strings).
         """
-        kernels = {}
-        kernel_reasons = {}
         cached = self._tree_kinetic_state is not None
-        for size in self.size_groups:
-            sparse = size == self._sparse_mass_matrix_size
-            diagonal = self._execution_plan.use_diagonal_mass(size)
-            grouped = self._plan.response[size].name == "grouped"
-            kernels[size] = {
-                "cholesky_kernel": "sparse"
-                if sparse
-                else "diagonal"
-                if diagonal
-                else "tiled"
-                if self._execution_plan.use_tiled_cholesky(size)
-                else "loop",
-                "trisolve_kernel": "sparse"
-                if sparse
-                else "diagonal"
-                if diagonal
-                else "tiled"
-                if self.trisolve_kernel == "tiled"
-                or (self.trisolve_kernel == "auto" and size > self.small_dof_threshold)
-                else "loop",
-                "hinv_jt_kernel": "sparse"
-                if sparse
-                else "diagonal"
-                if diagonal
-                else "grouped"
-                if grouped
-                else "tiled"
-                if self._execution_plan.use_tiled_hinv_jt(size)
-                else "par_row",
-                "delassus_kernel": None
-                if self.pgs_mode == "matrix_free"
-                else "par_row_col"
-                if self.delassus_kernel == "par_row_col"
-                else "tiled",
-            }
-            reasons = self._execution_plan.selection_reasons(size)
-            reasons["trisolve_kernel"] = (
-                f"Automatic DOF threshold is {self.small_dof_threshold}; selected {kernels[size]['trisolve_kernel']}."
-                if self.trisolve_kernel == "auto"
-                else f"Selected {kernels[size]['trisolve_kernel']}."
-            )
-            reasons["delassus_kernel"] = (
-                "Matrix-free mode does not materialize the Delassus operator."
-                if self.pgs_mode == "matrix_free"
-                else f"Selected {kernels[size]['delassus_kernel']} Delassus construction."
-            )
-            for name in ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel"):
-                if sparse:
-                    reasons[name] = self._sparse_selection_reason
-                elif diagonal:
-                    reasons[name] = "Independent-coordinate topology uses diagonal generalized inertia."
-            if grouped:
-                reasons["hinv_jt_kernel"] = (
-                    "Grouped dynamics replaces the planned response launch; see routes.dynamics.grouped."
-                )
-            kernel_reasons[size] = {
-                name: f"{self._kernel_choice_reasons[name]} {reason}" for name, reason in reasons.items()
-            }
         selection = {
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
             "cached_dynamics": "on" if cached else "off",
             "publication": "cached" if cached else "ordinary",
             "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
-            "kernel_plan_by_dof": kernels,
             "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
             "reasons": {
                 "sparse_mass_matrix": self._sparse_selection_reason,
@@ -3129,7 +3005,6 @@ class SolverFeatherPGS(SolverBase):
                 )
                 if self.pgs_mode == "matrix_free"
                 else self._kernel_choice_reasons["pgs_kernel"],
-                "kernel_plan_by_dof": kernel_reasons,
             },
         }
         selection["routes"] = route_selection(self)
@@ -5106,8 +4981,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _select_paired_response(self) -> tuple[int, int, np.ndarray] | None:
         """Select one complete robot/free-body response pair per world."""
-        if self._explicit_dense_kernels:
-            return None
         if not self._hinv_jt_writes_world or self._hinv_jt_tiled_writes_group or 6 not in self.size_groups:
             return None
         if self._execution_plan.use_tiled_hinv_jt(6):

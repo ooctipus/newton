@@ -1771,8 +1771,12 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             _compact_diagonal_mass_size=2,
             _sparse_mass_matrix_size=None,
             _execution_plan=SimpleNamespace(
-                use_diagonal_mass=lambda size: size == 4, use_tiled_cholesky=lambda size: size >= 20
+                use_diagonal_mass=lambda size: size == 4,
+                use_tiled_cholesky=lambda size: size >= 20,
+                selection_reasons=lambda size: {},
             ),
+            _kernel_choice_reasons={"cholesky_kernel": "Automatic selection."},
+            _sparse_selection_reason="No sparse factors.",
             _crba_cholesky_kernels_by_size={size: object() if size in fused_tiled else None for size in sizes},
             _crba_cholesky_warp_kernels_by_size={size: object() if size in fused_warp else None for size in sizes},
             _cholesky_kernels_by_size=opaque(),

@@ -1762,7 +1762,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertEqual(actual["routes"][name], expected["routes"][name], name)
         # Held-tree lane widths are timed at construction; the owner is the route.
         self.assertEqual(actual["routes"]["held_tree"]["owner"], expected["routes"]["held_tree"]["owner"])
-        self.assertEqual(actual["kernel_plan_by_dof"], expected["kernel_plan_by_dof"])
+        self.assertEqual(actual["routes"]["stages"], expected["routes"]["stages"])
         self.assertFalse(actual["routes"]["friction"]["parallel_rows"]["admitted"])
         self.assertIn(f"{_SWITCH}=0", actual["routes"]["friction"]["parallel_rows"]["reason"])
         # With the incremental tier requested too, the opt-out keeps it; otherwise the linked tiers replace it.
