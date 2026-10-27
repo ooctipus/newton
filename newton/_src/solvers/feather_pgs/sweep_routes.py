@@ -287,7 +287,8 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
                             meta.z = W[r * 3 + 1];
                             meta.w = W[r * 3 + 2];
                             const int packed_tp = meta.w;
-                            const int mf_rt = packed_tp & 0xFFFF;
+                            // The unit builder's rows: a contact, then its friction pair (each copy knows its kind).
+                            const int mf_rt = r == 0 ? {CONTACT} : {FRICTION};
                             const float mf_diag = __int_as_float(meta.y);
 {visit}
                         }}
