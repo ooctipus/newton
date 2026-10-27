@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     build_mf_contact_rows,
@@ -17,7 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.row_build import contact_row_prelude, populate_world_J_masked
-from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_law_harness import bind_struct, contact_input
 
 # Normal +X gives tangents +Z and -Y: against three unit translation dofs, these are the
 # Jacobian rows of a contact's normal and its two tangents.
@@ -99,9 +100,10 @@ def translation_dofs(device):
 
 
 def launch(kernel, values, threads, device):
-    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input."""
+    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input and
+    ``mf`` the matrix-free rows."""
     data, _arrays = contact_input(values, device)
-    arguments = {**values, "data": data}
+    arguments = {**values, "data": data, "mf": bind_struct(MfRows, values, device)[0]}
     wp.launch(
         kernel,
         dim=threads,

@@ -9,6 +9,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -72,6 +74,13 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
             gather_mf_warmstart,
             dim=1,
             inputs=[
+                field_group.upload(
+                    MfRows,
+                    device,
+                    row_type=current_types,
+                    row_parent=current_parents,
+                    row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32),
+                ),
                 wp.array([1], dtype=wp.int32),  # contact_count
                 wp.array([1], dtype=wp.int32),  # MF contact_path
                 wp.array([2], dtype=wp.int32),  # current base slot
@@ -82,11 +91,8 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                 wp.array(prev_types, dtype=wp.int32),
                 wp.array(prev_parents, dtype=wp.int32),
                 wp.array([5], dtype=wp.int32),
-                wp.array(current_types, dtype=wp.int32),
-                wp.array(current_parents, dtype=wp.int32),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
                 wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3),
-                wp.full((1, max_c), 100.0, dtype=wp.float32),
                 0.75,
                 4.0,
                 max_c,

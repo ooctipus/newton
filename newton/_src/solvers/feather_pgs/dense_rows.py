@@ -1,16 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The dense row records every row producer writes, declared once as fields (:mod:`.field_group`).
+"""The row records every row producer writes, declared once as fields (:mod:`.field_group`).
 
-:data:`DenseRows` is their Warp struct; the contact producers' input
-(:data:`.contact_input.ContactInput`) carries the same fields.
+:data:`DenseRows` is the Warp struct of the dense rows; the contact producers' input
+(:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` is the struct of the
+matrix-free (free-body) rows, under the same record names.
 """
+
+import dataclasses
 
 import warp as wp
 
 from . import field_group
 from .field_group import Field
+from .solver_fields import MF_ROWS
 
 RECORDS = (
     Field("row_type", wp.int32, ("world", "row")),
@@ -28,6 +32,37 @@ RECORDS = (
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs, by world and row."""
 
 DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
+
+
+MF_RECORDS = (
+    *(
+        dataclasses.replace(MF_ROWS[attr], name=name, attr=attr)
+        for name, attr in (
+            ("body_a", "mf_body_a"),
+            ("body_b", "mf_body_b"),
+            ("dof_a", "mf_dof_a"),
+            ("dof_b", "mf_dof_b"),
+            ("J_a", "mf_J_a"),
+            ("J_b", "mf_J_b"),
+            ("row_type", "mf_row_type"),
+            ("row_parent", "mf_row_parent"),
+            ("row_mu", "mf_row_mu"),
+            ("phi", "mf_phi"),
+            ("restitution", "mf_row_restitution"),
+            ("rhs", "mf_rhs"),
+        )
+    ),
+    Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity"),
+)
+"""Each matrix-free row's bodies, coordinates and Jacobian blocks, and the dense records' kind, friction parent,
+coefficient, gap, restitution, rhs and target, by world and row."""
+
+MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
+
+
+def bind_mf(solver, **records):
+    """Bind the solver's matrix-free row records into an :data:`MfRows` (``records`` replace records by name)."""
+    return field_group.bind(MfRows, solver=solver, **records)
 
 
 def bind(solver, data=None, **records):

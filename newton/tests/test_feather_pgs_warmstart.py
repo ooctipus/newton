@@ -10,6 +10,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -108,6 +110,13 @@ def _gather_dense_rows(
         gather_dense_warmstart,
         dim=n,
         inputs=[
+            field_group.upload(
+                DenseRows,
+                "cpu",
+                row_type=[current_types],
+                row_parent=[current_parents],
+                row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
+            ),
             wp.array([n], dtype=wp.int32, device="cpu"),
             wp.array([0] * n, dtype=wp.int32, device="cpu"),
             wp.array(current_slots, dtype=wp.int32, device="cpu"),
@@ -118,11 +127,8 @@ def _gather_dense_rows(
             wp.array([prev_types], dtype=wp.int32, device="cpu"),
             wp.array([prev_parents], dtype=wp.int32, device="cpu"),
             wp.array([count], dtype=wp.int32, device="cpu"),
-            wp.array([current_types], dtype=wp.int32, device="cpu"),
-            wp.array([current_parents], dtype=wp.int32, device="cpu"),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
-            wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
             decay,
             dt_scale,
             max_c,
@@ -222,6 +228,13 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             gather_mf_warmstart,
             dim=2,
             inputs=[
+                field_group.upload(
+                    MfRows,
+                    "cpu",
+                    row_type=current_types,
+                    row_parent=current_parents,
+                    row_mu=wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
+                ),
                 contact_count,
                 wp.array([1, 1], dtype=wp.int32, device="cpu"),
                 contact_slots,
@@ -232,11 +245,8 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 prev_types,
                 prev_parents,
                 constraint_count,
-                current_types,
-                current_parents,
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
-                wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
                 1.0,
                 1.0,
                 4,

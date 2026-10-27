@@ -20,7 +20,7 @@ import warp as wp
 from newton._src.sim import JointType
 from newton._src.solvers.feather_pgs import contact_laws, field_group, kernels, law_source, projection_laws, row_laws
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -558,7 +558,15 @@ DENSE_ROW_ARGUMENTS = {
 JOINT_TABLE_ARGUMENTS = {field.name: field.name for field in field_group.fields_of(JointTable)}
 """The scenes' names of the :data:`JointTable` fields: the fields' own."""
 
-STRUCT_ARGUMENTS = {ContactInput: CONTACT_ARGUMENTS, DenseRows: DENSE_ROW_ARGUMENTS, JointTable: JOINT_TABLE_ARGUMENTS}
+MF_ROW_ARGUMENTS = {field.name: field.attr for field in field_group.fields_of(MfRows)}
+"""The scenes' names of the :data:`MfRows` fields: the solver's attributes."""
+
+STRUCT_ARGUMENTS = {
+    ContactInput: CONTACT_ARGUMENTS,
+    DenseRows: DENSE_ROW_ARGUMENTS,
+    JointTable: JOINT_TABLE_ARGUMENTS,
+    MfRows: MF_ROW_ARGUMENTS,
+}
 """The scenes' field names of each struct a kernel takes in place of separate arguments."""
 
 
