@@ -1622,12 +1622,10 @@ class SolverFeatherPGS(SolverBase):
             grouped_dynamics (bool, optional): Solve the contact response ``H^-1 J^T`` of articulations with
                 up to 32 DOFs with one warp per articulation and one lane per row, instead of the planned
                 response kernel (``FEATHER_PGS_GROUPED_HINV=0`` keeps the planned kernel). The request also
-                keeps the resolved-world classifier, the local row packets and the compact contact producer
-                off. Kinematics and inverse dynamics keep their kernels. Experimental CUDA option. Defaults
-                to False.
+                keeps the local row packets and the compact contact producer off. Kinematics and inverse
+                dynamics keep their kernels. Experimental CUDA option. Defaults to False.
             lazy_kinematics (bool, optional): Experimental. Every substep publishes the body state, so this
-                option defers no publication and :meth:`publish_kinematics` has no effect; ``True`` keeps the
-                resolved-world classifier off. Defaults to False.
+                option selects nothing and :meth:`publish_kinematics` has no effect. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where

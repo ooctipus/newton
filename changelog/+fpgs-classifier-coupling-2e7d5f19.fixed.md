@@ -1,0 +1,1 @@
+Stop `grouped_dynamics` and `lazy_kinematics` of `SolverFeatherPGS` from turning off the resolved-world classifier: `grouped_dynamics` selects only the grouped response solve, and `lazy_kinematics` selects nothing, since every substep publishes the body state.

@@ -532,6 +532,14 @@ class TestResolvedWorlds(unittest.TestCase):
         solver._sparse_mass_matrix_size = 23
         self.assertFalse(rw.supported(solver))
 
+    def test_unrelated_options_keep_the_classifier(self):
+        """Admit the classifier whatever grouped_dynamics and lazy_kinematics request: neither changes its rows."""
+        for grouped, lazy in ((True, False), (False, True), (True, True)):
+            with self.subTest(grouped_dynamics=grouped, lazy_kinematics=lazy):
+                solver = _admissible_solver()
+                solver.grouped_dynamics, solver.lazy_kinematics = grouped, lazy
+                self.assertTrue(rw.supported(solver))
+
     def test_classify_bounds_patch_worlds_by_the_solver_capacities(self):
         """Under patch friction the decision gets the solver's dense and matrix-free row capacities; point gets none."""
         model = _build("cpu", worlds=2)
@@ -606,8 +614,6 @@ def _admissible_solver():
         "_compact_contact_boundary",
         "pgs_debug",
         "_row_watermark",
-        "grouped_dynamics",
-        "lazy_kinematics",
     ):
         setattr(solver, name, False)
     return solver

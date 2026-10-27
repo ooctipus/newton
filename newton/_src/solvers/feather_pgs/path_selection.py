@@ -132,7 +132,7 @@ _EFFECTIVE = {
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     "parallel_tree": lambda solver: solver._tree_plan is not None,
     "grouped_dynamics": lambda solver: solver._grouped_response,
-    # Nothing defers publication: the request only declines the resolved-world classifier.
+    # Every substep publishes: the request selects nothing.
     "lazy_kinematics": lambda solver: False,
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
@@ -174,7 +174,7 @@ def applied_options(solver, init, arguments: dict) -> dict:
     not built reports its off value (``False``, ``0`` or ``"off"``), and a row
     budget reports the rows the built tier serves. ``requested`` keeps the
     request, which can still decline other owners when its own mechanism does
-    not engage (for example ``grouped_dynamics`` and ``lazy_kinematics``);
+    not engage (for example ``grouped_dynamics``);
     ``routes`` names the owners. ``source`` is ``"environment"`` when an
     ``IL_NEWTON_FPGS_*`` legacy alias or a ``FEATHER_PGS_*`` override changed
     the applied value, ``"argument"`` when the requested value differs from the
