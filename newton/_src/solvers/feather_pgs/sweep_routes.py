@@ -22,7 +22,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, DenseJY, FreeBody6, Lanes, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
-from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit
+from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -258,7 +258,7 @@ def mf_gs_staging(
         warps = COLORED_THREADS // 32
         colored = (Buffer("s_color_offset", "int", COLOR_CHUNK + 1),)
         if traces:
-            colored += (Buffer("s_trace_max", "float", warps), Buffer("s_trace_kind", "int", warps))
+            colored += block_argmax(warps, warp="warp", lane="lane")[1]
     return Staging(
         (Buffer("s_v", "float", max_world_dofs), *dense.buffers(), *free.buffers(), *colored),
         threads=COLORED_THREADS if mapping == "colored" else 32,
@@ -312,10 +312,6 @@ def mf_gs_source(
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
-    if (not solve_policy.exact or solve_policy.traces) and contact_torsion:
-        raise SolvePolicyUnsupported(
-            "The velocity exit law and trace cover the current-friction physical sweep without torsion"
-        )
     _validate_dense_metadata_encoding(max_constraints)
     accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
@@ -338,7 +334,6 @@ def mf_gs_source(
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
     dense_op = DenseJY(D, lanes)
     free_op = FreeBody6(lanes)
-    warps = COLORED_THREADS // 32
     staging = mf_gs_staging(
         M_D,
         M_MF,
@@ -404,7 +399,7 @@ def mf_gs_source(
         + "\n        }"
     )
     if contact_torsion:
-        passes.append(torque_sweep_source(D))
+        passes.append(torque_sweep_source(D, solve_policy))
 
     if colored:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
@@ -426,20 +421,7 @@ def mf_gs_source(
         free_phase = _colored_units(free, laws, M_MF)
         trace_reduction = ""
         if solve_policy.traces:
-            trace_reduction = f"""
-    // The trace's largest change over the block: each warp's, then the first warp's over them.
-    const auto BLOCK_ARGMAX = [&](float& value, int& kind) {{
-        ARGMAX(value, kind);
-        if (lane == 0) {{
-            s_trace_max[warp] = value;
-            s_trace_kind[warp] = kind;
-        }}
-        __syncthreads();
-        value = lane < {warps} ? s_trace_max[lane] : 0.0f;
-        kind = lane < {warps} ? s_trace_kind[lane] : -1;
-        ARGMAX(value, kind);
-        __syncthreads();
-    }};"""
+            trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
         offsets = f"\n    const int off_color = world * {M_MF + 1};"
     else:
         sweep_end = end_sweep(

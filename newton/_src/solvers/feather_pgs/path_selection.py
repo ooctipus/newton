@@ -20,7 +20,7 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from . import response_builds_rows, sweep_routes, sweep_routes_split
+from . import response_builds_rows, sweep_routes
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 
@@ -693,22 +693,11 @@ def _sweep(solver, source) -> dict:
                 "staging_reason": solver._tiled_row_staging_reason,
             }
         else:
-            loop = (
-                sweep_routes_split.loop_unit_kernel if solver._dense_contact_unit else sweep_routes_split.loop_kernel
-            )()
-            dense = {"kernels": [_key(loop)]}
+            dense = {"kernels": [_key(solver._pgs_solve_loop_kernel)]}
     free_body = None
     if dense_split and solver._has_free_rigid_bodies:
-        if solver.model.device.is_cuda:
-            free_body = _key(solver._pgs_solve_mf_kernel)
-        else:
-            free_body = _key(
-                (
-                    sweep_routes_split.mf_loop_unit_kernel
-                    if solver._free_body_contact_unit
-                    else sweep_routes_split.mf_loop_kernel
-                )()
-            )
+        kernel = solver._pgs_solve_mf_kernel if solver.model.device.is_cuda else solver._pgs_solve_mf_loop_kernel
+        free_body = _key(kernel)
     mf_meta_pack = None
     if solver.pgs_mode == "matrix_free":
         # Mirrors _pack_mf_meta: only free rigid bodies produce matrix-free rows.
@@ -781,57 +770,24 @@ def _sweep_kernels(solver, record) -> set:
     return keys
 
 
-def _uncounted_worlds(record) -> dict:
-    """Owners whose sweeps solve rows without counters, with the worlds or rows each one solves.
-
-    A world one owns whole holds rows, so the skip counter leaves it out, and the counted sweeps do
-    not enter it: its solves are in no slot and not skipped. The incremental tiers count their own
-    worlds.
-    """
-    owners = {}
-    tiers = record["tiers"] or {}
-    if tiers.get("family") in ("parallel", "keyed_parallel"):
-        rows = max(int(tier["rows"]) for tier in tiers["tiers"])
-        owners["parallel_tiers"] = (
-            f"Worlds without matrix-free rows and with 1 to {rows} dense rows that no local owner claims: the "
-            "parallel (Jacobi) tiers solve them under their own sweep budget and mf_gs_parallel_tol, and the "
-            "matrix-free sweep returns before its first sweep."
-        )
-    return owners
-
-
 def _readout(solver, record) -> dict:
-    """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
+    """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and how a solve counts."""
     counted = solver._solve_readout.kernels
-    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys())
-    uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
-    elif not counted:
-        reason = "No sweep of this route carries counters: fixed-iteration and Jacobi-tier sweeps do not."
     elif record["driver"] == "direct":
-        reason = "Each launch of a counted kernel solves its worlds; uncounted sweeps carry no counters."
-    elif record["driver"] == "contact_then_internal":
-        reason = "Contact and internal rows sweep in separate launches, so a solve counts once per launch."
+        reason = "Each launch of a counted kernel solves its worlds."
+    elif record["driver"] in ("contact_then_internal", "dense_split"):
+        reason = "Two row sets sweep in separate launches, so a solve counts once per launch."
     else:
         reason = (
             f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch; a launch "
             "whose row phase holds none of a world's rows can return before its first sweep, which counts that "
             "world in no slot and not as skipped."
         )
-    if uncounted_worlds:
-        reason += (
-            " The owners in uncounted_worlds sweep their rows without counters: the solves of a world one owns "
-            "whole are in no slot and not skipped."
-        )
     return {
         "mode": solver.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
-        "uncounted": uncounted if counted else [],
-        # Owners of whole worlds whose solves neither a slot nor the skip counter counts, with those worlds.
-        "uncounted_worlds": uncounted_worlds,
-        # Variants that could not compile the requested trace count their sweeps without it.
-        "declined": dict(sorted(solver._solve_policy_declined.items())) if solver.pgs_solve_readout == "trace" else {},
         # Passes whose solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
         "skipped_passes": list(solver._solve_readout.skipped_passes) if counted else [],
         "reason": reason,
@@ -839,32 +795,29 @@ def _readout(solver, record) -> dict:
 
 
 def _exit_law(solver, record) -> dict:
-    """Which sweep kernels of the route stop under the velocity law (``pgs_velocity_change_tolerance``), and why not."""
-    tolerance = float(solver.pgs_velocity_change_tolerance)
-    honored = dict(sorted(solver._solve_policy_honored.items()))
-    declined = dict(sorted(solver._solve_policy_declined.items())) if tolerance > 0.0 else {}
-    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys())
-    driver_honors = record["driver"] in ("direct", "contact_then_internal")
-    if tolerance == 0.0:
-        reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
-    elif not honored:
-        reason = "No sweep of this route compiles the velocity law; every sweep keeps the exact law."
+    """The sweeps' exit law (``pgs_velocity_change_tolerance`` and the impulse slack), and whether its driver honors it."""
+    policy = solver._solve_policy
+    # Drivers whose launches each sweep all iterations of their rows, so a sweep's exit ends that launch's solve.
+    driver_honors = record["driver"] in ("direct", "contact_then_internal", "dense_split")
+    if policy.exact:
+        reason = "Every sweep keeps the exact stationary-sweep law: a world stops once a sweep changes no impulse."
     elif not driver_honors:
         reason = (
             f"The {record['driver']} driver runs part of a solve per launch, so a sweep's exit cannot end the solve."
         )
     else:
         reason = (
-            "Honored sweeps stop a world once every velocity-scaled change of a sweep is within the tolerance; "
-            "declined sweeps keep the exact law, ignored ones their fixed iteration count or own tolerance."
+            "Every sweep stops a world once each row's change of a sweep is within the impulse slack or, under a "
+            "velocity tolerance, its velocity-scaled change within the tolerance plus the scaled slack."
         )
+    law = "velocity" if policy.velocity else "impulse_slack" if policy.slack else "exact"
     return {
-        "law": "velocity" if tolerance > 0.0 and honored else "exact",
-        "velocity_change_tolerance": json_value(tolerance),
-        "honored": honored,
-        # Variants that could not compile the requested law keep the exact law.
-        "declined": declined,
-        "ignored": ignored if tolerance > 0.0 else [],
+        "law": law,
+        "velocity_change_tolerance": json_value(policy.velocity_change_tolerance),
+        "change_tolerance": json_value(policy.change_tolerance),
+        "relative_change_tolerance": json_value(policy.relative_change_tolerance),
+        # The sweep kernels that compile the law, with their routes (none under the exact law).
+        "honored": dict(sorted(solver._solve_policy_honored.items())),
         "driver_honors": driver_honors,
         "reason": reason,
     }
@@ -921,24 +874,15 @@ def contact_update_warnings(sweep) -> list[str]:
 
 
 def policy_warnings(sweep) -> list[str]:
-    """Return a warning per requested solve policy that some sweeps of a sweep record do not apply.
+    """Return a warning when the requested exit law cannot end the solves of a sweep record's driver.
 
     Args:
         sweep: The ``routes.sweep`` record of :func:`route_selection`.
     """
-    messages = []
     law = sweep["exit_law"]
-    if law["velocity_change_tolerance"] > 0.0 and (law["declined"] or law["ignored"] or not law["driver_honors"]):
-        messages.append(
-            f"pgs_velocity_change_tolerance applies only to some sweeps of this solver: {law['reason']} "
-            f"Declined: {sorted(law['declined'])}; ignored: {law['ignored']}."
-        )
-    if sweep["readout"]["declined"]:
-        messages.append(
-            "pgs_solve_readout='trace' applies only to some sweeps of this solver; these count their sweeps "
-            f"without the trace: {sorted(sweep['readout']['declined'])}."
-        )
-    return messages
+    if law["law"] == "exact" or law["driver_honors"]:
+        return []
+    return [f"The sweeps' exit law stops no world early under this solver's driver: {law['reason']}"]
 
 
 def _mf_gs_storage(solver) -> dict | None:
@@ -981,7 +925,6 @@ def _tiers(solver) -> dict | None:
             "sweeps": max(tier.sweeps for tier in tiers),
             "sweeps_rule": solver._par_sweeps_rule,
             "sweeps_reason": solver._par_sweeps_reason,
-            "tolerance": json_value(solver.mf_gs_parallel_tol),
             "tiers": [
                 {
                     "rows": int(rows),

@@ -186,12 +186,7 @@ from .row_build import (
     populate_world_J_masked_patch,
 )
 from .row_laws import ROW_LAW
-from .solve_policy import (
-    SOLVE_READOUTS,
-    SolvePolicy,
-    SolvePolicyUnsupported,
-    SolveReadoutRecord,
-)
+from .solve_policy import SOLVE_READOUTS, SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
     ARTICULATION_ORIGIN,
     ARTICULATION_WORK,
@@ -1219,7 +1214,6 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_sweeps: int = 24,
         mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = "auto",
         mf_gs_parallel_nesterov: bool = True,
-        mf_gs_parallel_tol: float = 0.0,
         mf_gs_parallel_matrix_free: bool = False,
         mf_gs_parallel_linked_velocity_limit_pass: bool = False,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
@@ -1609,7 +1603,8 @@ class SolverFeatherPGS(SolverBase):
                 larger, from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the
                 accuracy to match. The factor is fit, by interpolating each world's error between measured sweep
                 caps, so that each evaluated row bucket of contact-rich point- and patch-friction workloads reaches
-                the serial sweep's accuracy. A world stops earlier only where ``mf_gs_parallel_tol`` lets it.
+                the serial sweep's accuracy. A world stops earlier under the sweeps' exit law
+                (``pgs_change_tolerance``, ``pgs_relative_change_tolerance``, ``pgs_velocity_change_tolerance``).
                 ``get_path_selection()`` reports each tier's budget and its rule under ``routes.sweep.tiers``.
                 Defaults to 24.
             mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Deprecated: the tiers that serve
@@ -1618,12 +1613,6 @@ class SolverFeatherPGS(SolverBase):
                 budget, with a :class:`DeprecationWarning`, and so does the environment variable
                 ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``; omit both. Defaults to ``"auto"``.
             mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
-            mf_gs_parallel_tol (float, optional): Relative impulse change below which a parallel tier's world stops
-                sweeping before its budget. ``0`` keeps the serial sweeps' exact stationary-sweep law: a world stops
-                early only once a sweep changes no impulse, so the budget alone sets the accuracy. A positive
-                tolerance trades accuracy for speed and stops small worlds short of the serial sweep's accuracy
-                whatever their budget (at ``1e-4`` the 32-row point tier of a contact-rich hand stalls near its
-                serial error). Defaults to ``0``.
             mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
                 ``Y^T y`` and ``J . dv`` from staged rows; row-sum-bound step scale). With ``m`` rows and ``D`` DOFs,
                 the block costs ``O(m^2 D)`` to build plus ``O(m^2)`` per sweep; matrix-free costs ``O(m D)`` per
@@ -1657,9 +1646,11 @@ class SolverFeatherPGS(SolverBase):
                 mimic and connect rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
-            pgs_change_tolerance (float, optional): Native sparse sweeps stop early once no impulse in a
-                world changes by more than this absolute amount in a sweep. Zero keeps the exact
-                stationary-sweep exit. Defaults to 0.0.
+            pgs_change_tolerance (float, optional): Impulse slack of every sweep's exit law: a sweep
+                stops a world early once no impulse changes by more than this absolute amount (plus
+                the relative slack). Zero keeps the exact stationary-sweep exit. A positive slack
+                trades accuracy for speed and stops small Jacobi-tier worlds short of the serial
+                sweep's accuracy whatever their budget. Defaults to 0.0.
             pgs_relative_change_tolerance (float, optional): Unit-free companion of
                 ``pgs_change_tolerance``: a row's change is also small when it is within this
                 fraction of the row's (normal) impulse after the update. Velocity-limit rows use
@@ -1674,29 +1665,21 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``, so its stops predict
                 runs with both at zero. ``get_path_selection()`` summarizes them under
                 ``measurements["solve_readout"]``, which synchronizes the device once. Neither
-                readout changes a computed value. The sparse, sparse-diagonal, matrix-free
-                Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
-                without counters (``routes.sweep.readout``), and a sweep variant that cannot trace
-                counts without the trace (``routes.sweep.readout.declined``, with a warning). The
+                readout changes a computed value. Every sweep counts (``routes.sweep.readout``). The
                 matrix-free sweeps enter no world without rows (such as one the resolved-world
-                classifier left without rows); the readout counts those solves as ``skipped``. Worlds
-                with rows that a sweep without counters owns, such as those of the parallel tiers of
-                ``mf_gs_parallel_rows``, are counted by neither; ``routes.sweep.readout.uncounted_worlds``
-                names their owners. Defaults to ``"off"``.
-            pgs_velocity_change_tolerance (float, optional): Velocity exit law of the native
-                Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
-                times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own
-                velocity), exceeds the tolerance; sweeps that visit only the rows selected at sweep
+                classifier left without rows); the readout counts those solves as ``skipped``.
+                Defaults to ``"off"``.
+            pgs_velocity_change_tolerance (float, optional): Velocity exit law of every sweep
+                [m/s or rad/s]. A sweep stops a world once no row's impulse change times its
+                effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own velocity),
+                exceeds the tolerance plus its scaled impulse slack (``pgs_change_tolerance``,
+                ``pgs_relative_change_tolerance``); sweeps that visit only the rows selected at sweep
                 entry also require the change a visit would make to every zero-impulse unilateral row,
-                its violation times ``pgs_omega``, to be at most the tolerance. On native sparse sweeps
-                it adds to ``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``. With both of
-                those at zero, a solve runs the exact law's sweeps and stops at or before the sweep
-                where the exact law stops; with either positive, the unvisited-row bound has no impulse
-                slack and can add sweeps. Zero keeps the exact stationary-sweep exit. The
-                sweeps that ``pgs_solve_readout`` counts honor it, except the matrix-free sweep under
-                non-default friction modes or contact torsion; fixed-iteration and parallel sweeps
-                and launch-per-iteration drivers do not (``routes.sweep.exit_law``, with a warning).
-                Experimental. Defaults to 0.0.
+                its violation times ``pgs_omega``, to be at most the tolerance. Without slack, a solve
+                runs the exact law's sweeps and stops at or before the sweep where the exact law
+                stops; with slack, the unvisited-row bound has none and can add sweeps. Zero keeps the
+                exact stationary-sweep exit. Drivers that launch part of a solve at a time stop no
+                world early (``routes.sweep.exit_law``, with a warning). Experimental. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free and dense). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -2037,13 +2020,16 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(
                 f"pgs_velocity_change_tolerance must be finite and non-negative, got {pgs_velocity_change_tolerance!r}"
             )
+        # Every sweep compiles the policy: its exit law and readout.
         self._solve_policy = SolvePolicy(
-            readout=pgs_solve_readout, velocity_change_tolerance=self.pgs_velocity_change_tolerance
+            readout=pgs_solve_readout,
+            velocity_change_tolerance=self.pgs_velocity_change_tolerance,
+            change_tolerance=self.pgs_change_tolerance,
+            relative_change_tolerance=self.pgs_relative_change_tolerance,
         )
         self._solve_readout = SolveReadoutRecord(self._solve_policy)
-        # Sweep kernels built under the velocity law, and those whose variant kept the exact law, with why.
+        # Sweep kernels built under a policy other than the exact law, with their routes.
         self._solve_policy_honored = {}
-        self._solve_policy_declined = {}
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
@@ -2231,7 +2217,6 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_parallel_rows = int(mf_gs_parallel_rows)
         self.mf_gs_parallel_sweeps = int(mf_gs_parallel_sweeps)
         self.mf_gs_parallel_nesterov = bool(mf_gs_parallel_nesterov)
-        self.mf_gs_parallel_tol = float(mf_gs_parallel_tol)
         self.mf_gs_parallel_matrix_free = bool(mf_gs_parallel_matrix_free)
         self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
         self.grouped_dynamics = bool(grouped_dynamics)
@@ -3030,7 +3015,7 @@ class SolverFeatherPGS(SolverBase):
         self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
-        if self.pgs_velocity_change_tolerance > 0.0 or self.pgs_solve_readout == "trace":
+        if not self._solve_policy.exact:
             for message in policy_warnings(route_selection(self)["sweep"]):
                 warnings.warn(message, stacklevel=2)
         if self.contact_update != "sequential":
@@ -3038,7 +3023,7 @@ class SolverFeatherPGS(SolverBase):
                 warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
 
     def _setup_contact_update(self, model):
-        """Select the sweeps that solve contact units exactly and allocate their per-world unit storage.
+        """Select the sweeps that solve contact units exactly, allocate their unit storage and build the loop sweeps.
 
         ``contact_update="unit"`` reaches the loop sweeps only: the dense loop sweep of split mode on
         any device and, on CPU, the split free-body loop sweep (CUDA builds a native free-body sweep).
@@ -3063,6 +3048,21 @@ class SolverFeatherPGS(SolverBase):
             self._arrays.allocate(MF_CONTACT_UNITS, mf_row=self.mf_max_constraints, **units)
         else:
             self._arrays.release(MF_CONTACT_UNITS)
+        # Split mode's loop sweeps, one thread per world, under the law chosen above: the dense rows' and, on the
+        # CPU, the free-body rows'.
+        self._pgs_solve_loop_kernel = self._pgs_solve_mf_loop_kernel = None
+        if self.pgs_mode == "split" and self.pgs_kernel != "tiled_row":
+            self._pgs_solve_loop_kernel = self._sweep_kernel(
+                "dense_loop",
+                sweep_routes_split.loop_unit_kernel if self._dense_contact_unit else sweep_routes_split.loop_kernel,
+            )
+        if self._has_free_rigid_bodies and model.device.is_cpu:
+            self._pgs_solve_mf_loop_kernel = self._sweep_kernel(
+                "free_body_loop",
+                sweep_routes_split.mf_loop_unit_kernel
+                if self._free_body_contact_unit
+                else sweep_routes_split.mf_loop_kernel,
+            )
 
     def get_path_selection(self) -> dict:
         """Return requested choices, active plans and selection reasons.
@@ -4867,40 +4867,36 @@ class SolverFeatherPGS(SolverBase):
             **transaction_options,
         )
 
-    def _sweep_kernel(self, route: str, factory, *args, **kwargs):
-        """Build a Gauss-Seidel sweep under the solve policy and allocate its readout counters.
-
-        A sweep variant that cannot compile the policy's velocity law or trace
-        keeps the exact law, with the plain sweep count when a readout was
-        requested; ``routes.sweep.exit_law`` and ``routes.sweep.readout`` record
-        it. Counters are allocated here, outside any graph capture.
+    def _sweep_kernel(self, route: str, factory, *args, readout_budget: int | None = None, **kwargs):
+        """Build a sweep under the solve policy and allocate its readout counters, outside any graph capture.
 
         Args:
             route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
-            factory: The sweep factory, which takes the policy as ``solve_policy``.
+            factory: The sweep factory, which takes the policy as ``solve_policy`` and returns a kernel or a
+                :class:`SweepTier`.
             *args: Positional arguments of the factory.
+            readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
+                solver's iteration counts.
             **kwargs: Keyword arguments of the factory.
         """
         policy = self._solve_policy
-        try:
-            kernel = factory(*args, solve_policy=policy, **kwargs)
-        except SolvePolicyUnsupported as error:
-            policy = SolvePolicy(readout="sweeps" if policy.counts else "off")
-            kernel = factory(*args, solve_policy=policy, **kwargs)
-            self._solve_policy_declined[kernel.key] = f"{route}: {error}"
-        else:
-            if not policy.exact:
-                self._solve_policy_honored[kernel.key] = route
+        built = factory(*args, solve_policy=policy, **kwargs)
+        kernel = built.kernel if isinstance(built, SweepTier) else built
+        if not policy.exact:
+            self._solve_policy_honored[kernel.key] = route
+        budget, velocity_budget = int(self.pgs_iterations), int(self.pgs_velocity_iterations)
+        if readout_budget is not None:
+            budget, velocity_budget = int(readout_budget), int(readout_budget) if velocity_budget > 0 else 0
         self._solve_readout.register(
             kernel,
             route,
             readout=policy.readout if policy.counts else None,
             world_count=int(self.world_count),
-            budget=max(int(self.pgs_iterations), 1),
+            budget=max(budget, 1),
             device=self.model.device,
-            velocity_budget=int(self.pgs_velocity_iterations),
+            velocity_budget=velocity_budget,
         )
-        return kernel
+        return built
 
     def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
@@ -5924,8 +5920,12 @@ class SolverFeatherPGS(SolverBase):
                 self._tiled_row_staging, self._tiled_row_staging_reason = sweep_routes_diag.tiled_row_staging(
                     self.dense_max_constraints, arch_budget(device_arch)
                 )
-                self._pgs_solve_tiled_row_kernel = sweep_routes_diag.tiled_row_kernel(
-                    self.dense_max_constraints, device_arch, staging=self._tiled_row_staging
+                self._pgs_solve_tiled_row_kernel = self._sweep_kernel(
+                    "tiled_row",
+                    sweep_routes_diag.tiled_row_kernel,
+                    self.dense_max_constraints,
+                    device_arch,
+                    staging=self._tiled_row_staging,
                 )
                 # Large C128 batches benefit from small-world storage without
                 # reducing capacity. Avoid extra launches for small batches.
@@ -5939,8 +5939,13 @@ class SolverFeatherPGS(SolverBase):
                     )
                 ):
                     self._pgs_solve_tiled_row_budgets = tuple(
-                        sweep_routes_diag.tiled_row_kernel(
-                            self.dense_max_constraints, device_arch, row_budget=budget, min_rows=minimum
+                        self._sweep_kernel(
+                            "tiled_row",
+                            sweep_routes_diag.tiled_row_kernel,
+                            self.dense_max_constraints,
+                            device_arch,
+                            row_budget=budget,
+                            min_rows=minimum,
                         )
                         for budget, minimum in ((32, 0), (self.dense_max_constraints, 32))
                     )
@@ -6211,16 +6216,18 @@ class SolverFeatherPGS(SolverBase):
                     self._tier_blocks = int(min(self.world_count, _TIER_BLOCKS))
                 tier_sweeps, self._par_sweeps_rule, self._par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
-                    tier = parallel_factory(
+                    tier = self._sweep_kernel(
+                        "parallel_tier",
+                        parallel_factory,
                         self.dense_max_constraints,
                         self.mf_max_constraints,
                         self.max_world_dofs,
                         device_arch,
+                        readout_budget=sweeps_,
                         rows=rows_,
                         sweeps=sweeps_,
                         nesterov=self.mf_gs_parallel_nesterov,
                         min_rows=min_rows_,
-                        tol=self.mf_gs_parallel_tol,
                         matrix_free=self.mf_gs_parallel_matrix_free,
                         skip_local_internal_worlds=self._local_internal_fast_path,
                         inkernel_response=self._ink_sizes,
@@ -6271,7 +6278,9 @@ class SolverFeatherPGS(SolverBase):
         )
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
-            self._pgs_solve_mf_kernel = sweep_routes_diag.mf_split_kernel(
+            self._pgs_solve_mf_kernel = self._sweep_kernel(
+                "free_body_split",
+                sweep_routes_diag.mf_split_kernel,
                 self.mf_max_constraints,
                 self.max_mf_bodies,
                 device_arch,
@@ -6638,8 +6647,6 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_row_mu,
                     iterations,
                     omega,
-                    self.pgs_change_tolerance,
-                    self.pgs_relative_change_tolerance,
                     int(friction_start_iteration),
                     int(iteration_offset),
                     # The single-stage transaction reads the triplets' block records.
@@ -10816,7 +10823,7 @@ class SolverFeatherPGS(SolverBase):
         ``mf_gs_parallel_sweeps``. The deprecated ``mf_gs_parallel_linked_sweeps`` (or
         ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``) still sets the linked (patch) tiers' budget
         where given: a count, or ``mf_gs_parallel_sweeps`` for ``None``. A world stops
-        earlier only where ``mf_gs_parallel_tol`` lets it.
+        earlier under the sweeps' exit law.
         """
         sweeps = int(self.mf_gs_parallel_sweeps)
         linked = self.mf_gs_parallel_linked_sweeps
@@ -10828,15 +10835,15 @@ class SolverFeatherPGS(SolverBase):
             )
             budget = sweeps if linked is None else int(linked)
             reason = (
-                f"{source}={linked} (deprecated): every linked tier sweeps {budget} times; a world stops earlier "
-                "only at mf_gs_parallel_tol."
+                f"{source}={linked} (deprecated): every linked tier sweeps at most {budget} times; a world stops "
+                "earlier under the sweeps' exit law."
             )
             return [budget] * len(tiers), "mf_gs_parallel_linked_sweeps", reason
         reason = (
             f"auto: a tier serving up to R rows sweeps ceil({sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION} * pgs_iterations * "
             f"sqrt(R / 32)) times with pgs_iterations={int(self.pgs_iterations)}, at least "
             f"mf_gs_parallel_sweeps={sweeps} and at most {sweep_routes_tiers.TIER_SWEEPS_CAP} unless mf_gs_parallel_sweeps is larger; "
-            "a world stops earlier only at mf_gs_parallel_tol."
+            "a world stops earlier under the sweeps' exit law."
         )
         return [sweep_routes_tiers.tier_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
 
@@ -11396,42 +11403,24 @@ class SolverFeatherPGS(SolverBase):
                     int(self._regularization_enabled),
                     self._pgs_friction_start_iteration,
                     self._pgs_iteration_offset,
+                    *self._solve_readout.operands(kernel),
                 ],
                 block_dim=32,
                 device=self.model.device,
             )
 
     def _stage5_pgs_solve_world_loop(self):
+        # The unit loop sweep (contact_update="unit") also reads the patch form and the per-world unit storage.
+        units = []
         if self._dense_contact_unit:
-            wp.launch(
-                sweep_routes_split.loop_unit_kernel(),
-                dim=self.world_count,
-                inputs=[
-                    self.constraint_count,
-                    self.dense_max_constraints,
-                    self.diag,
-                    self.C,
-                    self.rhs,
-                    self.impulses,
-                    self.pgs_iterations,
-                    self.pgs_omega,
-                    self.row_type,
-                    self.row_parent,
-                    self.row_mu,
-                    self.row_w,
-                    int(self._regularization_enabled),
-                    self._pgs_friction_start_iteration,
-                    self._pgs_iteration_offset,
-                    int(self._contact_unit_patch == "ring"),
-                    self._dense_unit_state,
-                    self._dense_unit_rows,
-                    self._dense_unit_block,
-                ],
-                device=self.model.device,
-            )
-            return
+            units = [
+                int(self._contact_unit_patch == "ring"),
+                self._dense_unit_state,
+                self._dense_unit_rows,
+                self._dense_unit_block,
+            ]
         wp.launch(
-            sweep_routes_split.loop_kernel(),
+            self._pgs_solve_loop_kernel,
             dim=self.world_count,
             inputs=[
                 self.constraint_count,
@@ -11449,6 +11438,8 @@ class SolverFeatherPGS(SolverBase):
                 int(self._regularization_enabled),
                 self._pgs_friction_start_iteration,
                 self._pgs_iteration_offset,
+                *units,
+                *self._solve_readout.operands(self._pgs_solve_loop_kernel),
             ],
             device=self.model.device,
         )
@@ -11724,50 +11715,23 @@ class SolverFeatherPGS(SolverBase):
                     int(self._regularization_enabled),
                     int(friction_start_iteration),
                     int(iteration_offset),
+                    *self._solve_readout.operands(mf_pgs_kernel),
                 ],
                 block_dim=32,
                 device=model.device,
             )
-        elif self._free_body_contact_unit:
-            wp.launch(
-                sweep_routes_split.mf_loop_unit_kernel(),
-                dim=self.world_count,
-                inputs=[
-                    self.mf_constraint_count,
-                    self.mf_body_a,
-                    self.mf_body_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_eff_mass_inv,
-                    self.mf_rhs,
-                    self.mf_row_type,
-                    self.mf_row_parent,
-                    self.mf_row_mu,
-                    self.mf_row_w,
-                    self.body_to_articulation,
-                    self.articulation_dof_start,
-                    iterations,
-                    self.pgs_omega,
-                    int(self._regularization_enabled),
-                    int(friction_start_iteration),
-                    int(iteration_offset),
+        else:
+            # The CPU's free-body rows: the loop sweep, whose unit variant also reads the patch form and unit storage.
+            units = []
+            if self._free_body_contact_unit:
+                units = [
                     int(self._contact_unit_patch == "ring"),
                     self._mf_unit_state,
                     self._mf_unit_rows,
                     self._mf_unit_block,
-                ],
-                outputs=[
-                    self.mf_impulses,
-                    self.v_out,
-                ],
-                device=model.device,
-            )
-        else:
-            # CPU fallback: use the loop kernel
+                ]
             wp.launch(
-                sweep_routes_split.mf_loop_kernel(),
+                self._pgs_solve_mf_loop_kernel,
                 dim=self.world_count,
                 inputs=[
                     self.mf_constraint_count,
@@ -11790,10 +11754,12 @@ class SolverFeatherPGS(SolverBase):
                     int(self._regularization_enabled),
                     int(friction_start_iteration),
                     int(iteration_offset),
+                    *units,
                 ],
                 outputs=[
                     self.mf_impulses,
                     self.v_out,
+                    *self._solve_readout.operands(self._pgs_solve_mf_loop_kernel),
                 ],
                 device=model.device,
             )

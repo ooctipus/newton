@@ -21,7 +21,7 @@ from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import Block, CholeskySolve, Lanes
-from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, SolvePolicyUnsupported
+from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sweep import (
     EXACT_EXIT,
     JacobiRows,
@@ -46,8 +46,8 @@ _INK = {"matrix_free": True, "inkernel_response": (12, 6, 0, 12)}
 
 CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
-    ("block", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, "tol": 0.0}),
-    ("block_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, "tol": 0.0, "linked_rows": True}),
+    ("block", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112}),
+    ("block_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, "linked_rows": True}),
     (
         "matrix_free_exact",
         (64, 32, 18, "120"),
@@ -176,10 +176,24 @@ class TestParallelTier(unittest.TestCase):
 class TestJacobiLaw(unittest.TestCase):
     """The core's Jacobi law: its vote, its exit and its policy."""
 
-    def test_the_jacobi_vote_is_relative(self):
-        laws = RowLaws(jacobi_tolerance=1e-4)
-        vote = change_vote(laws, (("x_new - x_old", "A_ii", "s_kind[i]"),), "", new="x_new")
-        self.assertEqual(vote, "if (fabsf(x_new - x_old) > 0.0001f * (fabsf(x_new) + 0.0001f)) iteration_changed = 1;")
+    def test_the_jacobi_vote_follows_the_policy(self):
+        """A row votes every change under the exact law and changes beyond the policy's slack or velocity bound."""
+        rows = JacobiRows(32, 32)
+        op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
+        exact = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
+        self.assertIn("if (x_new != x_old) {\n", exact)
+        self.assertIn("iteration_changed = 1;", exact)
+        slack = RowLaws(policy=SolvePolicy(relative_change_tolerance=1.0e-4))
+        self.assertIn(
+            "if (!(fabsf(x_new - x_old) <= 0.0001f * fabsf(x_new))) iteration_changed = 1;",
+            jacobi_sweeps(rows, op, slack, sweeps=1, momentum=True, pooled=False),
+        )
+        scaled = JacobiRows(32, 32, scales=True)
+        traced = RowLaws(policy=SolvePolicy(readout="trace", velocity_change_tolerance=1.0e-3))
+        text = jacobi_sweeps(scaled, op, traced, sweeps=7, momentum=True, pooled=False)
+        self.assertIn("solve_trace_change(fabsf(x_new - x_old) * (s_diag[i]), s_type[i]);", text)
+        self.assertIn("!(fabsf(x_new - x_old) * (s_diag[i]) <= 0.001f)", text)
+        self.assertIn("sweep + 1 == 7", text)
 
     def test_the_default_exit_and_votes_are_unchanged(self):
         self.assertEqual(end_sweep(SolvePolicy(), iteration="iter"), EXACT_EXIT)
@@ -191,14 +205,16 @@ class TestJacobiLaw(unittest.TestCase):
             "            if (!ANY(iteration_changed != 0)) break;\n        }\n",
         )
 
-    def test_the_sweeps_need_a_tolerance_and_the_exact_law(self):
+    def test_the_velocity_law_and_trace_need_staged_scales(self):
         rows = JacobiRows(32, 32)
         op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
-        with self.assertRaisesRegex(ValueError, "jacobi_tolerance"):
-            jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
-        with self.assertRaises(SolvePolicyUnsupported):
-            laws = RowLaws(jacobi_tolerance=0.0, policy=SolvePolicy(readout="sweeps"))
-            jacobi_sweeps(rows, op, laws, sweeps=1, momentum=True, pooled=False)
+        for policy in (SolvePolicy(readout="trace"), SolvePolicy(velocity_change_tolerance=1.0e-3)):
+            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "staged diagonals"):
+                jacobi_sweeps(rows, op, RowLaws(policy=policy), sweeps=1, momentum=True, pooled=False)
+        counted = jacobi_sweeps(
+            rows, op, RowLaws(policy=SolvePolicy(readout="sweeps")), sweeps=3, momentum=True, pooled=False
+        )
+        self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 
     def test_a_pooled_pair_reads_its_ring_from_the_staged_impulses(self):
         source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, "linked_rows": True})

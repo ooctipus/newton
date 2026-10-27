@@ -31,6 +31,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
+from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax
 from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
@@ -65,7 +66,7 @@ a tier builds none) before ``v_out``; keyed rows insert theirs after ``world_row
 # four contact-rich workloads, allegro (12 iterations) and anymal-D flat (8) under point and patch friction, to the
 # serial sweep's accuracy: per bucket, the p90 energy-norm velocity error against a converged serial reference over the
 # serial route's, 95% world-bootstrap CI upper bound at most 1, each world's error interpolated log-linearly between
-# measured sweep caps under the default exit law (mf_gs_parallel_tol=0). The point workload's sparse 97-128-row tier
+# measured sweep caps under the exact exit law. The point workload's sparse 97-128-row tier
 # sets it: 27/8 left its worlds at 0.95x (CI upper 1.06), 7/2 gives 0.87x (0.99); its other tiers reach 0.23x, 0.50x and
 # 0.70x, the patch tiers 0.23x, 0.49x and 0.65x, and at 8 iterations every tier stays below 0.62x. The exit law sets the
 # small tiers' floor: at a tolerance of 1e-4 the 32-row point tier stalls near 0.87x the serial error whatever its
@@ -149,7 +150,6 @@ def parallel_source(
     sweeps: int,
     nesterov: bool = True,
     min_rows: int = 0,
-    tol: float = 1e-4,
     matrix_free: bool = False,
     has_drive_rows: bool = False,
     skip_local_internal_worlds: bool = False,
@@ -158,6 +158,7 @@ def parallel_source(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row.
@@ -167,9 +168,9 @@ def parallel_source(
     ``Y^T`` staged, its step scale bounded by the exact row sums (``exact_row_sums``) or the column sums. With
     ``inkernel_response = (NA, NB, OA, OB)`` the rows are whitened in the kernel (:class:`.WhitenedRows`), from the
     group Jacobians or the keyed rows' operands (``row_inputs``: their metadata, physical rows and arguments). It
-    runs ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: momentum with ``nesterov``, pairs projected on their
-    patch ring's pooled load with ``linked_rows``, a quiet change within ``tol``), with ``velocity_limit_pass`` the
-    velocity limits' last word, then publishes the velocity and the impulses.
+    runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: momentum with ``nesterov``, pairs projected on
+    their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
+    ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses.
 
     Returns the body and its staging.
     """
@@ -188,15 +189,14 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(
-        drive=has_drive_rows, velocity_limit_law="accumulated", regularize=False, jacobi_tolerance=float(tol)
-    )
+    laws = RowLaws(drive=has_drive_rows, velocity_limit_law="accumulated", regularize=False, policy=solve_policy)
     store = JacobiRows(
         AM,
         NT,
         drive=has_drive_rows,
         limits=velocity_limit_pass,
         diagonal=None if inkernel_response is not None else "world_diag.data[off_dense + i]",
+        scales=solve_policy.velocity or solve_policy.traces,
     )
     whitened = None
     if inkernel_response is not None:
@@ -218,8 +218,13 @@ def parallel_source(
         schedule = "rows" if whitened is not None or D > 32 else "pairs"
         op = Block(D, AM + 1, lanes, rows="n_rows", layout="row", schedule=schedule, whitened=whitened)
     dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 and nesterov else ()
+    # A block of several warps reduces the trace's largest change over its warps.
+    trace_reduction, trace = "", ()
+    if solve_policy.traces and NT > 32:
+        trace_reduction, trace = block_argmax(NT // 32, warp="WARP", lane="(int)(threadIdx.x & 31)")
     staging = Staging(
-        (Buffer("s_v", "float", D), *store.buffers(), *op.buffers(AM), *dot, *store.drive_buffers()), threads=NT
+        (Buffer("s_v", "float", D), *store.buffers(), *op.buffers(AM), *dot, *store.drive_buffers(), *trace),
+        threads=NT,
     )
     metadata = {
         "rhs": "rhs_bias.data[off_dense + i]",
@@ -237,13 +242,13 @@ def parallel_source(
     cfm = "world_row_cfm.data[off_dense + i]" if whitened is not None else None
 
     def scale(aii, bound, pad):
-        return jacobi_scale(aii, bound, cfm=cfm, pad=pad)
+        return jacobi_scale(aii, bound, cfm=cfm, pad=pad, scales=store.scales)
 
     last_word = jacobi_limit_pass(store, op, laws) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
 {dense_tier_world(AM, int(min_rows), D, M_D, local=skip_local_internal_worlds, rows="n_rows")}
 
-{staging.declarations("    ")}
+{staging.declarations("    ")}{trace_reduction}
 {op.registers("    ")}
 
 {loads}
@@ -266,7 +271,7 @@ def parallel_source(
 """
     row_preludes = operands.preludes if operands is not None else ()
     preludes = (lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes, *law_preludes(PROJECTION_LAW))
-    return cuda_native(body, preludes=preludes), staging
+    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes)), staging
 
 
 @cache
@@ -280,7 +285,6 @@ def parallel_kernel(
     sweeps: int,
     nesterov: bool = True,
     min_rows: int = 0,
-    tol: float = 1e-4,
     matrix_free: bool = False,
     has_drive_rows: bool = False,
     has_dense_velocity_limit_rows: bool = False,
@@ -290,6 +294,7 @@ def parallel_kernel(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> SweepTier:
     """A parallel tier (the arguments, ABI and tier descriptor of the factory it replaces).
 
@@ -313,10 +318,10 @@ def parallel_kernel(
         **options,
         sweeps=sweeps,
         nesterov=nesterov,
-        tol=tol,
         skip_local_internal_worlds=skip_local_internal_worlds,
         linked_rows=linked_rows,
         velocity_limit_pass=velocity_limit_pass,
+        solve_policy=solve_policy,
     )
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
     AM = int(rows)
@@ -325,19 +330,20 @@ def parallel_kernel(
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nes{int(bool(nesterov))}"
-        f"_tol{float(tol):g}_nt{NT}_mf{int(bool(matrix_free))}"
+        f"_nt{NT}_mf{int(bool(matrix_free))}"
         + (f"_ink{NA}_{NB}_o{OA}_{OB}" if ink else "")
         + f"_hd{int(bool(has_drive_rows))}_z{int(ink and not matrix_free)}_ex{int(bool(matrix_free and exact_row_sums))}"
         + ("_local_fallback" if skip_local_internal_worlds else "")
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
+        + solve_policy.suffix
     )
     kernel = KernelTemplate.from_abi(
         name,
         PARALLEL_ABI,
         snippet,
         kernel_template.WORLD_QUEUE,
-        extra=operands.arguments if operands is not None else (),
+        extra=(*(operands.arguments if operands is not None else ()), *solve_policy.arguments),
         composed=True,
         native_name="sweep_parallel_native",
     ).kernel()

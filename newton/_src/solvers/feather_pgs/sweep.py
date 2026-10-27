@@ -48,7 +48,7 @@ from .kernels import (
 )
 from .response_operator import Lanes, ResponseOperator
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
-from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit, vote
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 from .staging import Buffer
 
 CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
@@ -292,11 +292,6 @@ class RowLaws:
         regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
         torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
         policy: The solve policy: the change votes and the stop.
-        impulse_tolerance: A change within the run-time impulse tolerance is quiet: within ``change_tolerance +
-            relative_change_tolerance * |new|`` of its update's reference impulse (a row's own new impulse; a friction
-            pair's first tangent's), within ``change_tolerance`` for a velocity-limit correction.
-        jacobi_tolerance: The Jacobi sweeps' quiet change, compiled in: a change of at most ``tolerance (|new| +
-            tolerance)`` is quiet, a test that a NaN change also passes; ``None`` for the Gauss-Seidel sweeps' votes.
     """
 
     drive: bool = False
@@ -304,8 +299,6 @@ class RowLaws:
     regularize: bool = True
     torsion: bool = False
     policy: SolvePolicy = EXACT_POLICY
-    impulse_tolerance: bool = False
-    jacobi_tolerance: float | None = None
 
     @property
     def accumulated(self) -> int:
@@ -313,38 +306,14 @@ class RowLaws:
 
 
 def change_vote(laws: RowLaws, terms: tuple[tuple[str, str, str], ...], pad: str, *, new=None) -> str:
-    """The change vote of one update's ``terms`` (``(change, A_ii, kind)`` each), in a block entered on a change.
+    """The change vote of one update's ``terms`` (``(change, A_ii, kind)`` each) under the laws' solve policy
+    (:func:`.solve_policy.vote`), in a block entered on a change.
 
-    Without the laws' impulse tolerance any change votes. With it, a change within ``change_tolerance +
-    relative_change_tolerance * |new|`` is quiet (``new``: the reference impulse of every term, or one per term;
-    ``None`` bounds by ``change_tolerance`` alone). The Jacobi law votes outside such a block, every change against
-    its relative tolerance (:attr:`RowLaws.jacobi_tolerance`).
+    ``new`` is the reference impulse of every term, or one per term, which the policy's relative slack scales: a
+    row's own new impulse, a friction pair's first tangent's; ``None`` bounds by the absolute slack alone (a
+    velocity-limit correction).
     """
-    if laws.jacobi_tolerance is not None:
-        references = new if isinstance(new, tuple) else (new,) * len(terms)
-        tolerance = f"{float(laws.jacobi_tolerance)}f"
-        moved = " || ".join(
-            f"fabsf({change}) > {tolerance} * (fabsf({reference}) + {tolerance})"
-            for (change, _, _), reference in zip(terms, references, strict=True)
-        )
-        return vote(laws.policy, f"{pad}if ({moved}) iteration_changed = 1;", flag="iteration_changed", terms=terms)
-    if not laws.impulse_tolerance:
-        return vote(laws.policy, f"{pad}iteration_changed = 1;", flag="iteration_changed", terms=terms)
-    references = new if isinstance(new, tuple) else (new,) * len(terms)
-    slack = tuple(
-        "change_tolerance"
-        if reference is None
-        else f"change_tolerance + relative_change_tolerance * fabsf({reference})"
-        for reference in references
-    )
-    within = " && ".join(f"fabsf({change}) <= {bound}" for (change, _, _), bound in zip(terms, slack, strict=True))
-    return vote(
-        laws.policy,
-        f"{pad}if (!({within})) iteration_changed = 1;",
-        flag="iteration_changed",
-        terms=terms,
-        slack=slack,
-    )
+    return vote(laws.policy, f"{pad}iteration_changed = 1;", flag="iteration_changed", terms=terms, references=new)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -722,13 +691,16 @@ def end_sweep(
     exact: str | None = None,
     violation: tuple[str, str, str] | None = None,
     block: bool = False,
+    iterations: str = "iterations",
+    argmax: str | None = "ARGMAX",
 ) -> str:
     """The end of a sweep under the solve policy (:func:`.solve_policy.sweep_exit`): stop once no row voted a change.
 
     A ``gated`` sweep stops only once friction is active (delayed friction is a change to come). ``exact`` is the
     sweep's text under the exact law (:data:`EXACT_EXIT` by default, or the ungated test of :data:`QUIET`);
     ``violation`` bounds the rows a sweep of selected rows leaves unvisited. A ``block`` group spans several warps:
-    its quiet test is the block's vote (:data:`BLOCK_QUIET`).
+    its quiet test is the block's vote (:data:`BLOCK_QUIET`) and ``argmax`` its trace reduction
+    (:func:`.solve_policy.block_argmax`). ``iterations`` is the sweep budget.
     """
     gate = "global_iter >= friction_start_iteration" if gated else None
     quiet = BLOCK_QUIET if block else QUIET
@@ -738,7 +710,16 @@ def end_sweep(
             exact = f"        if ({gate}) {{\n            {stop}\n        }}\n" if gated else f"        {stop}\n"
         else:
             exact = EXACT_EXIT if gated else f"        if ({QUIET}) break;\n"
-    return sweep_exit(policy, exact, gate=gate, quiet=quiet, violation=violation, iteration=iteration)
+    return sweep_exit(
+        policy,
+        exact,
+        gate=gate,
+        quiet=quiet,
+        violation=violation,
+        iteration=iteration,
+        iterations=iterations,
+        argmax=argmax,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1064,7 +1045,10 @@ class JacobiRows:
     A row is admitted on its stored ``diagonal`` (native, at row ``i``) or,
     for ``None``, provisionally: the operator forms the diagonal from the
     staged rows, and a row whose formed diagonal is not positive is frozen
-    once every lane has read the staged kinds (its lane's ``frozen``).
+    once every lane has read the staged kinds (its lane's ``frozen``). With
+    ``scales`` each row's diagonal (``s_diag``) and constraint type
+    (``s_type``) are staged too, which the velocity law and the trace scale and
+    name its changes by.
     """
 
     capacity: int
@@ -1073,6 +1057,7 @@ class JacobiRows:
     limits: bool = False
     diagonal: str | None = "world_diag.data[off_dense + i]"
     rows: str = "n_rows"
+    scales: bool = False
 
     @property
     def formed(self) -> bool:
@@ -1083,9 +1068,10 @@ class JacobiRows:
         """The rows' state and metadata."""
         AM = self.capacity
         state = (Buffer("s_x", "float", AM, align=16), Buffer("s_y", "float", AM, align=16))
-        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu"))
-        ints = (Buffer(name, "int", AM) for name in ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ())))
-        return (*state, *floats, *ints)
+        scales = ("s_diag",) if self.scales else ()
+        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu", *scales))
+        ints = ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ()), *(("s_type",) if self.scales else ()))
+        return (*state, *floats, *(Buffer(name, "int", AM) for name in ints))
 
     def drive_buffers(self) -> tuple[Buffer, ...]:
         """The PhysX drive rows' right-hand side and data (none without drive rows)."""
@@ -1134,6 +1120,8 @@ class JacobiRows:
             f"    if (freeze_drive_rows != 0 && row_type == {DRIVE}) admit = 0;" if drive else "",
             f"    s_kind[i] = admit ? kind : {JACOBI_FROZEN};",
             "    s_step[i] = admit ? 1.0f / diag : 0.0f;",
+            "    s_type[i] = row_type;" if self.scales else "",
+            "    s_diag[i] = diag;" if self.scales and not self.formed else "",
         ]
         if drive:
             lines.append("    s_drive_rhs[i] = s_rhs[i];")
@@ -1172,7 +1160,7 @@ class JacobiRows:
         )
 
 
-def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
+def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str, scales: bool = False) -> str:
     """Set admitted row ``i``'s Jacobi step: ``omega w_i / A_ii`` with ``w_i = min(A_ii / bound, 1)`` (zero for a zero
     bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
 
@@ -1180,7 +1168,8 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
     the simultaneous steps from diverging where many rows couple through one body. With ``cfm`` (the row's
     compliance) the diagonal ``A_ii + cfm`` is formed here and a row without a positive one is marked for freezing
     (``frozen``, :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds); otherwise ``s_step``
-    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it.
+    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it. With ``scales`` the
+    formed diagonal is staged (``s_diag``, :attr:`JacobiRows.scales`).
     """
     lines = [f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;"]
     if cfm is None:
@@ -1188,6 +1177,7 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
     else:
         lines += [
             f"const float diag_i = {aii} + {cfm};",
+            *(["s_diag[i] = diag_i;"] if scales else []),
             "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
         ]
     return indent("\n".join(lines), pad)
@@ -1365,16 +1355,17 @@ def jacobi_sweeps(
     ``y_i - s_step_i r`` clamped at zero for a unilateral row, zero for a friction row while friction is delayed, or
     the PhysX drive law on ``y_i`` and the row's ``J v = r - rhs``. Each friction row is then projected radially onto
     its pair's disk (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
-    momentum and adaptive restart (``momentum``), each row votes its change against the laws' Jacobi tolerance, and
-    the sweep ends under the laws' policy (:func:`end_sweep`). Uncounted: the policy is the exact law's.
+    momentum and adaptive restart (``momentum``), each row votes its change under the laws' solve policy
+    (:func:`change_vote`; the velocity law and the trace scale it by the row's staged diagonal,
+    :attr:`JacobiRows.scales`), and the sweep ends under the policy (:func:`end_sweep`, the budget ``sweeps``; a block
+    of several warps reduces the trace with ``BLOCK_ARGMAX``, :func:`.solve_policy.block_argmax`).
     """
-    if laws.jacobi_tolerance is None:
-        raise ValueError("the Jacobi sweeps vote against the laws' jacobi_tolerance")
-    if not laws.policy.exact or laws.policy.counts:
-        raise SolvePolicyUnsupported("the Jacobi sweeps run under the exact law without readout")
+    policy = laws.policy
+    if (policy.velocity or policy.traces) and not rows.scales:
+        raise ValueError("the velocity law and the trace scale the Jacobi rows' changes by their staged diagonals")
     inner = pad + "    "
-    # The exact law reads no scale; a velocity-scaled policy would need the row's A_ii, which the rows do not keep.
-    term = (("x_new - x_old", "A_ii", "s_kind[i]"),)
+    term = (("x_new - x_old", "s_diag[i]", "s_type[i]"),)
+    block = rows.threads > 32
     lines = [
         rows.freeze(pad) if rows.formed else "",
         isotropic_pair_step(rows, pad),
@@ -1391,11 +1382,19 @@ def jacobi_sweeps(
         f"{inner}    if (i < {rows.rows}) {{",
         f"{inner}        s_x[i] = x_new;",
         f"{inner}        s_y[i] = x_new + beta * (x_new - x_old);",
-        change_vote(laws, term, inner + "        ", new="x_new"),
+        f"{inner}        if (x_new != x_old) {{",
+        change_vote(laws, term, inner + "            ", new="x_new"),
+        f"{inner}        }}",
         f"{inner}    }}",
         f"{inner}}}",
         f"{inner}SYNC();",
-        end_sweep(laws.policy, iteration="sweep", block=rows.threads > 32).rstrip("\n"),
+        end_sweep(
+            policy,
+            iteration="sweep",
+            block=block,
+            iterations=str(int(sweeps)),
+            argmax="BLOCK_ARGMAX" if block else "ARGMAX",
+        ).rstrip("\n"),
         f"{pad}}}",
     ]
     return "\n".join(line for line in lines if line)

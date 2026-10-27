@@ -993,6 +993,10 @@ class TestContactUpdateSolver(unittest.TestCase):
             unit = update == "unit"
             stub = SimpleNamespace(
                 _dense_contact_unit=unit,
+                _pgs_solve_loop_kernel=(
+                    sweep_routes_split.loop_unit_kernel if unit else sweep_routes_split.loop_kernel
+                )(),
+                _solve_readout=SimpleNamespace(operands=lambda kernel: []),
                 world_count=len(systems),
                 constraint_count=world.w_count,
                 dense_max_constraints=world.D,

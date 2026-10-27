@@ -572,7 +572,7 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         # Unconstrained step velocities (0.05, 0.33, -1.42, -0.45, 2.07, -0.46, 0.62) rad/s: three limits bind at
         # the solution, and the coupling keeps four joints inside theirs.
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
-        converged = {"pgs_iterations": 2000, "mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        converged = {"pgs_iterations": 2000, "mf_gs_parallel_sweeps": 2000}
         velocities = {}
         for name, law, options in (
             ("serial_stateless", "stateless", {"mf_gs_incremental_rows": 0}),

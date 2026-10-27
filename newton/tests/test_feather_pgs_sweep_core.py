@@ -10,6 +10,7 @@ import dataclasses
 import unittest
 
 from newton._src.solvers.feather_pgs.response_operator import Block, DenseJY, Lanes, ResponseOperator
+from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
     RowContext,
@@ -184,15 +185,12 @@ class TestRowTail(unittest.TestCase):
         update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"), fenced=False)
         self.assertEqual(update.count("SYNC();"), 2)
 
-    def test_the_impulse_tolerance_quiets_small_changes(self):
-        laws = RowLaws(regularize=False, impulse_tolerance=True)
+    def test_the_impulse_slack_quiets_small_changes(self):
+        laws = RowLaws(regularize=False, policy=SolvePolicy(change_tolerance=1.0e-6, relative_change_tolerance=0.01))
         vote = change_vote(laws, (("d", "A", "0"),), "", new="n")
-        self.assertEqual(
-            vote,
-            "if (!(fabsf(d) <= change_tolerance + relative_change_tolerance * fabsf(n))) iteration_changed = 1;",
-        )
+        self.assertEqual(vote, "if (!(fabsf(d) <= 1e-06f + 0.01f * fabsf(n))) iteration_changed = 1;")
         update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"), laws)
-        self.assertIn("relative_change_tolerance * fabsf(new_impulse)", update)
+        self.assertIn("0.01f * fabsf(new_impulse)", update)
         self.assertEqual(change_vote(RowLaws(), (("d", "A", "0"),), "  "), "  iteration_changed = 1;")
 
 

@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION as FRICTION,
 )
+from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
@@ -32,8 +33,11 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 TRANSACTIONS = ("staged", "single")
 
 
-def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16):
-    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request."""
+def factory(
+    capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16, relative=0.0
+):
+    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request, ``relative``
+    the policy's relative impulse slack."""
     options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
     if candidate and blocks != 16:
         options["transaction_blocks"] = blocks
@@ -44,6 +48,7 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False,
         active_rows=active,
         use_support_table=True,
         linked_rows=linked,
+        solve_policy=SolvePolicy(relative_change_tolerance=relative),
         **options,
     )
 
@@ -185,6 +190,7 @@ class DeviceSolve:
             linked=linked,
             transaction=transaction,
             blocks=blocks,
+            relative=float(data.get("relative_change_tolerance", 0.0)),
         )
         self.records = None
 
@@ -224,8 +230,6 @@ class DeviceSolve:
             zeros((self.worlds, 1)),
             int(data["iterations"]),
             float(data["omega"]),
-            0.0,
-            float(data.get("relative_change_tolerance", 0.0)),
             int(data["friction_start_iteration"]),
             int(data["iteration_offset"]),
         ]

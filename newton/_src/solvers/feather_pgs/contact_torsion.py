@@ -29,6 +29,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
 )
 from .row_laws import CONTACT_END_GAP_SLOP
+from .solve_policy import EXACT_POLICY, SolvePolicy, vote
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
@@ -482,8 +483,27 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._contact_torsion_group.assign(membership)
 
 
-def torque_sweep_source(dofs):
-    """Return the coupled residual-budget angular solve inside each PGS sweep."""
+def torque_sweep_source(dofs, policy: SolvePolicy = EXACT_POLICY):
+    """Return the coupled residual-budget angular solve inside each PGS sweep, voting its changes under ``policy``.
+
+    A friction pair's rescale votes both tangents' changes and the torsion row its own, each scaled by its row's
+    diagonal (:func:`.solve_policy.vote`: a torsion row's velocity change is angular, in rad/s).
+    """
+    rescale_vote = vote(
+        policy,
+        "                            iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(
+            ("delta1", "world_diag.data[off_dense + n + 1]", str(PGS_CONSTRAINT_TYPE_FRICTION)),
+            ("delta2", "world_diag.data[off_dense + n + 2]", str(PGS_CONSTRAINT_TYPE_FRICTION)),
+        ),
+    )
+    torsion_vote = vote(
+        policy,
+        "                    iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta", "diagonal", str(PGS_CONSTRAINT_TYPE_TORSION)),),
+    )
     return f"""
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
             for (int spin = 0; spin < m_dense; ++spin) {{
@@ -532,7 +552,7 @@ def torque_sweep_source(dofs):
                         float delta1 = t1 - s_lam_dense[n + 1];
                         float delta2 = t2 - s_lam_dense[n + 2];
                         if (delta1 != 0.0f || delta2 != 0.0f) {{
-                            iteration_changed = 1;
+{rescale_vote}
                             if (lane == 0) {{
                                 s_lam_dense[n + 1] = t1;
                                 s_lam_dense[n + 2] = t2;
@@ -560,7 +580,7 @@ def torque_sweep_source(dofs):
                 float next = ProjectionLaw::box(trial, -bound, bound);
                 float delta = next - old;
                 if (delta != 0.0f) {{
-                    iteration_changed = 1;
+{torsion_vote}
                     if (lane == 0) s_lam_dense[spin] = next;
                     for (int d = lane; d < {dofs}; d += 32)
                         s_v[d] += Y_world.data[jy_world_base + spin * {dofs} + d] * delta;

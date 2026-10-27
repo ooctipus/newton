@@ -15,6 +15,7 @@ import itertools
 import json
 import re
 import unittest
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,7 +41,6 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     TRACE_GRID,
     TRACE_KINDS,
     SolvePolicy,
-    SolvePolicyUnsupported,
     SolveReadout,
     SolveReadoutRecord,
     SolveTrace,
@@ -405,12 +405,15 @@ class TestVelocityExitLaw(unittest.TestCase):
         terms = (("delta", "diag[i]", "row_type"), ("other", "diag[j]", "2"))
         self.assertIs(vote(EXACT_POLICY, exact, flag="changed", terms=terms), exact)
         self.assertIs(vote(SWEEPS, exact, flag="changed", terms=terms), exact)
-        scaled = vote(VELOCITY, exact, flag="changed", terms=terms, slack=("tol", "tol"))
+        slack = SolvePolicy(velocity_change_tolerance=1.0e-3, change_tolerance=1.0e-6, relative_change_tolerance=0.01)
+        scaled = vote(slack, exact, flag="changed", terms=terms, references=("n", None))
         self.assertEqual(
             scaled,
-            "            if ((delta != 0.0f && !(fabsf(delta) * (diag[i]) <= 0.001f + (diag[i]) * (tol)))"
-            " || (other != 0.0f && !(fabsf(other) * (diag[j]) <= 0.001f + (diag[j]) * (tol)))) changed = 1;\n",
+            "            if ((delta != 0.0f && !(fabsf(delta) * (diag[i]) <= 0.001f + (diag[i]) * (1e-06f + 0.01f * fabsf(n))))"
+            " || (other != 0.0f && !(fabsf(other) * (diag[j]) <= 0.001f + (diag[j]) * (1e-06f)))) changed = 1;\n",
         )
+        impulse = vote(SolvePolicy(change_tolerance=1.0e-6), exact, flag="changed", terms=terms)
+        self.assertEqual(impulse, "            if (!(fabsf(delta) <= 1e-06f && fabsf(other) <= 1e-06f)) changed = 1;\n")
         traced = vote(TRACE, exact, flag="changed", terms=terms).splitlines()
         self.assertEqual(
             traced,
@@ -530,14 +533,22 @@ class TestVelocityExitLaw(unittest.TestCase):
             records, [f"if (delta_fvl != 0.0f) solve_trace_change(fabsf(delta_fvl) * (denom_fvl), {velocity_limit});"]
         )
 
-    def test_variants_without_the_law_refuse_it(self):
-        """Refuse the velocity law and trace where the matrix-free sweep keeps uncovered votes."""
-        for options in ({"contact_torsion": True},):
-            for policy in (VELOCITY, TRACE):
-                with self.subTest(options=options, policy=policy), self.assertRaises(SolvePolicyUnsupported):
-                    sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=policy, **options)
-            kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
-            self.assertIs(kernel.adj.args[-1].type, SolveReadout)
+    def test_torsion_votes_under_every_policy(self):
+        """Vote the torsion pass's changes under the velocity law and the trace, each scaled by its row's diagonal."""
+        torsion, friction = int(kernels.PGS_CONSTRAINT_TYPE_TORSION), int(kernels.PGS_CONSTRAINT_TYPE_FRICTION)
+        options = {"contact_torsion": True}
+        traced = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=TRACE, **options)
+        snippet = _policy_snippet(self, traced, "solve_trace_sweep(")
+        self.assertIn(f"if (delta != 0.0f) solve_trace_change(fabsf(delta) * (diagonal), {torsion});", snippet)
+        self.assertIn(
+            f"if (delta2 != 0.0f) solve_trace_change(fabsf(delta2) * (world_diag.data[off_dense + n + 2]), {friction});",
+            snippet,
+        )
+        loose = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=VELOCITY, **options)
+        snippet = _policy_snippet(self, loose, "0.001f")
+        self.assertIn("if ((delta != 0.0f && !(fabsf(delta) * (diagonal) <= 0.001f))) iteration_changed = 1;", snippet)
+        kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
+        self.assertIs(kernel.adj.args[-1].type, SolveReadout)
 
     def test_active_rows_wait_for_violated_rows_under_a_tolerance(self):
         """Stop an active-row sparse sweep under a tolerance only after a scan bounds every unvisited violation.
@@ -761,13 +772,14 @@ class TestSolveReadoutRecord(unittest.TestCase):
 
 
 class TestSolverReadoutOption(unittest.TestCase):
-    """The solver option and its records on a CPU model, where no native sweep is built."""
+    """The solver option and its records on a CPU model, whose split-mode loop sweep compiles every policy."""
 
     @staticmethod
     def _model():
         builder = newton.ModelBuilder()
         body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-        builder.add_articulation([builder.add_joint_revolute(-1, body)])
+        builder.add_articulation([builder.add_joint_revolute(-1, body, limit_lower=-0.1, limit_upper=0.1)])
+        builder.joint_q[-1] = 0.2
         return builder.finalize(device="cpu")
 
     def test_invalid_readout_raises(self):
@@ -778,34 +790,43 @@ class TestSolverReadoutOption(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "pgs_velocity_change_tolerance"):
                 SolverFeatherPGS(self._model(), pgs_velocity_change_tolerance=value)
 
-    def test_unhonored_tolerance_warns_and_records_the_exact_law(self):
-        """Warn when no sweep compiles the velocity law, and record the exact law it keeps."""
-        with self.assertWarnsRegex(UserWarning, "pgs_velocity_change_tolerance"):
+    def test_loop_sweep_honors_the_tolerance(self):
+        """Compile the velocity law into the loop sweep and record it, without a warning."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             selection = SolverFeatherPGS(self._model(), pgs_velocity_change_tolerance=1.0e-3).get_path_selection()
         json.dumps(selection, allow_nan=False)
         option = selection["options"]["pgs_velocity_change_tolerance"]
-        self.assertEqual((option["requested"], option["applied"], option["source"]), (1.0e-3, 0.0, "argument"))
+        self.assertEqual((option["requested"], option["applied"], option["source"]), (1.0e-3, 1.0e-3, "argument"))
         law = selection["routes"]["sweep"]["exit_law"]
-        self.assertEqual((law["law"], law["velocity_change_tolerance"], law["honored"]), ("exact", 1.0e-3, {}))
-        self.assertIn("No sweep", law["reason"])
+        self.assertEqual((law["law"], law["velocity_change_tolerance"]), ("velocity", 1.0e-3))
+        self.assertEqual(list(law["honored"].values()), ["dense_loop"])
 
     def test_records_name_the_readout_and_its_kernels(self):
-        """Record the requested readout, an off applied value without counted sweeps, and no measurement."""
+        """Record the requested readout, the loop sweep's counters and, after a step, its counted solve."""
         model = self._model()
-        for requested in ("off", "sweeps"):
+        for requested in ("off", "sweeps", "trace"):
             with self.subTest(requested=requested):
-                selection = SolverFeatherPGS(model, pgs_solve_readout=requested).get_path_selection()
+                solver = SolverFeatherPGS(model, pgs_solve_readout=requested, enable_joint_limits=True)
+                selection = solver.get_path_selection()
                 json.dumps(selection, allow_nan=False)
                 option = selection["options"]["pgs_solve_readout"]
-                self.assertEqual((option["requested"], option["applied"], option["default"]), (requested, "off", "off"))
+                self.assertEqual((option["requested"], option["applied"]), (requested, requested))
                 readout = selection["routes"]["sweep"]["readout"]
-                self.assertEqual((readout["mode"], readout["counted"], readout["uncounted"]), ("off", {}, []))
-                self.assertEqual(readout["skipped_passes"], [])
-                self.assertIn("off" if requested == "off" else "No sweep", readout["reason"])
-                self.assertNotIn("solve_readout", selection["measurements"])
+                self.assertEqual(readout["mode"], requested)
+                self.assertEqual(list(readout["counted"].values()), [] if requested == "off" else ["dense_loop"])
                 law = selection["routes"]["sweep"]["exit_law"]
-                self.assertEqual((law["law"], law["honored"], law["declined"], law["ignored"]), ("exact", {}, {}, []))
-                self.assertEqual(readout["declined"], {})
+                self.assertEqual((law["law"], law["honored"]), ("exact", {}))
+                state_0, state_1, control = model.state(), model.state(), model.control()
+                solver.step(state_0, state_1, control, None, 1.0 / 60.0)
+                measurements = solver.get_path_selection()["measurements"]
+                if requested == "off":
+                    self.assertNotIn("solve_readout", measurements)
+                    continue
+                # The violated limit is the world's one row: one solve, stopped once a sweep changes nothing.
+                (slot,) = measurements["solve_readout"]["slots"]
+                self.assertEqual((slot["solves"], slot["exhausted"]), (1, 0))
+                self.assertGreaterEqual(slot["mean_sweeps"], 2.0)
 
 
 def _sweep_record(**fields):
@@ -827,13 +848,13 @@ def _sweep_record(**fields):
     return record
 
 
-def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), skipped=("position",), **attributes):
+def _policy_solver(*, readout="sweeps", tolerance=0.0, honored=(), skipped=("position",), **attributes):
     """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
     return SimpleNamespace(
         pgs_solve_readout=readout,
         pgs_velocity_change_tolerance=tolerance,
+        _solve_policy=SolvePolicy(readout=readout, velocity_change_tolerance=tolerance),
         _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, skipped_passes=tuple(skipped)),
-        _solve_policy_declined=dict.fromkeys(declined, "mf_gs: the variant keeps the exact law"),
         _solve_policy_honored=dict.fromkeys(honored, "mf_gs"),
         **attributes,
     )
@@ -842,25 +863,23 @@ def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), 
 class TestSweepPolicyRecords(unittest.TestCase):
     """The readout and exit-law records of a route's sweeps and the warnings they raise."""
 
-    def test_declined_trace_is_recorded_and_warned_apart_from_the_law(self):
-        """Record and warn a declined trace under the readout, and a declined tolerance under the exit law."""
-        for readout, tolerance in (("trace", 0.0), ("sweeps", 1.0e-3), ("trace", 1.0e-3)):
-            with self.subTest(readout=readout, tolerance=tolerance):
-                solver = _policy_solver(readout=readout, tolerance=tolerance, declined=("mf_gs_kernel",))
-                record = _sweep_record()
+    def test_a_driver_that_cannot_end_a_solve_is_warned(self):
+        """Warn a non-exact law only where the driver launches part of a solve at a time."""
+        for driver, tolerance, warned in (
+            ("direct", 1.0e-3, False),
+            ("dense_split", 1.0e-3, False),
+            ("physx_grasp", 1.0e-3, True),
+            ("physx_grasp", 0.0, False),
+        ):
+            with self.subTest(driver=driver, tolerance=tolerance):
+                solver = _policy_solver(tolerance=tolerance, honored=("mf_gs_kernel",) if tolerance else ())
+                record = _sweep_record(driver=driver)
                 sweep = {
                     "readout": path_selection._readout(solver, record),
                     "exit_law": path_selection._exit_law(solver, record),
                 }
-                self.assertEqual(sweep["readout"]["mode"], readout)
-                self.assertEqual(list(sweep["readout"]["declined"]), ["mf_gs_kernel"] if readout == "trace" else [])
-                self.assertEqual(list(sweep["exit_law"]["declined"]), ["mf_gs_kernel"] if tolerance else [])
-                messages = path_selection.policy_warnings(sweep)
-                self.assertEqual(
-                    [message.split(" ", 1)[0] for message in messages],
-                    ["pgs_velocity_change_tolerance"] * bool(tolerance)
-                    + ["pgs_solve_readout='trace'"] * (readout == "trace"),
-                )
+                self.assertEqual(sweep["exit_law"]["law"], "velocity" if tolerance else "exact")
+                self.assertEqual(len(path_selection.policy_warnings(sweep)), int(warned))
                 json.dumps(sweep, allow_nan=False)
 
     def test_phase_launches_count_once_each(self):
@@ -880,35 +899,6 @@ class TestSweepPolicyRecords(unittest.TestCase):
                 reason = path_selection._readout(_policy_solver(), _sweep_record(driver=driver))["reason"]
                 self.assertIn("counts are per launch", reason)
                 self.assertIn("in no slot and not as skipped", reason)
-
-    def test_records_name_the_worlds_no_counter_counts(self):
-        """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
-
-        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers own.
-        Those worlds hold rows, so the skip counter leaves them out too: without a record their
-        solves would vanish from the summary. The incremental tiers count their own worlds.
-        """
-        parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
-        incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
-        for fields, owners in (
-            ({}, []),
-            ({"tiers": incremental}, []),
-            ({"tiers": parallel}, ["parallel_tiers"]),
-            ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
-        ):
-            with self.subTest(fields=sorted(fields)):
-                readout = path_selection._readout(_policy_solver(), _sweep_record(**fields))
-                self.assertEqual(sorted(readout["uncounted_worlds"]), owners)
-                if owners:
-                    self.assertIn("uncounted_worlds", readout["reason"])
-                json.dumps(readout, allow_nan=False)
-        # The tiers' worlds are bounded by the largest tier's rows.
-        readout = path_selection._readout(_policy_solver(), _sweep_record(tiers=parallel))
-        self.assertIn("1 to 48 dense rows", readout["uncounted_worlds"]["parallel_tiers"])
-        # Without counted sweeps nothing is counted, so no owner is named.
-        solver = _policy_solver(readout="off")
-        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
-        self.assertEqual(path_selection._readout(solver, _sweep_record(tiers=parallel))["uncounted_worlds"], {})
 
     def test_records_name_the_passes_that_count_skipped_solves(self):
         """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""

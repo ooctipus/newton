@@ -1,31 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compile-time stopping rule of the Gauss-Seidel sweeps and their opt-in readout.
+"""Compile-time stopping rule of the native sweeps and their opt-in readout.
 
-Every native Gauss-Seidel sweep stops a world after a sweep in which no
-impulse changed (the exact law). A :class:`SolvePolicy` is compiled into the
-sweeps that admit one and keys their kernel caches: equal policies share
-kernels, and the default policy emits exactly the kernels built before
-policies existed.
+Every native sweep stops a world after a sweep in which no row voted a
+change. A :class:`SolvePolicy` is compiled into every sweep (Gauss-Seidel and
+Jacobi alike) and keys their kernel caches: equal policies share kernels, and
+the default policy emits exactly the kernels built before policies existed.
 
-``velocity_change_tolerance`` replaces the exact law by a velocity-scaled
-one: a row is quiet when its impulse change times its effective-mass
-diagonal, ``|dlambda| * A_ii`` (the change of the row's own velocity), is at
-most the tolerance. Sweeps that visit only rows selected at sweep entry also
-require the change a visit would make to every zero-impulse unilateral row,
-its violation times the relaxation factor, to be at most the tolerance. At
-zero tolerance the emitters return each sweep's own exact text.
+Under the exact law (the default) every nonzero impulse change votes. The
+impulse slack (``change_tolerance`` and ``relative_change_tolerance``) makes a
+change within ``change_tolerance + relative_change_tolerance * |lambda|`` of
+its update's reference impulse quiet. ``velocity_change_tolerance`` replaces
+the impulse test by a velocity-scaled one: a row is quiet when its impulse
+change times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of
+the row's own velocity), is at most the tolerance plus its scaled slack.
+Sweeps that visit only rows selected at sweep entry also require, under the
+velocity law, the change a visit would make to every zero-impulse unilateral
+row, its violation times the relaxation factor, to be at most the tolerance.
+Under the exact law without readout the emitters return each sweep's own
+exact text.
 
-Without the native sparse sweeps' run-time impulse tolerances
-(``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``) a solve
-under the velocity law runs the exact law's sweeps and stops at or before the
-sweep where the exact law stops, so its outputs are the exact law's at that
-sweep, and the trace of an exact solve predicts that sweep for every
-tolerance of its grid. The impulse tolerances let the exact law stop with
-nonzero changes: the trace records changes without that slack, so it no
-longer predicts the stop, and the unvisited-row bound, which has no slack,
-can add sweeps.
+Without slack a solve under the velocity law runs the exact law's sweeps and
+stops at or before the sweep where the exact law stops, so its outputs are
+the exact law's at that sweep, and the trace of an exact solve predicts that
+sweep for every tolerance of its grid. The slack lets a solve stop with
+nonzero changes: the trace records changes without it, so it no longer
+predicts the stop, and the unvisited-row bound, which has no slack, can add
+sweeps.
 
 With ``readout="sweeps"`` each sweep also counts, per world, how many sweeps
 every solve executed; ``readout="trace"`` adds, per solve, the sweep at which
@@ -39,6 +41,7 @@ launch of its own. Neither readout changes a computed value.
 """
 
 import math
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
@@ -49,6 +52,7 @@ from . import field_group
 from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup, SolverArrays
 from .row_inputs import RowArgument
+from .staging import Buffer
 
 SOLVE_READOUTS = ("off", "sweeps", "trace")
 """Accepted readouts: no counter, executed sweeps, or executed sweeps with the exit-law trace."""
@@ -67,10 +71,6 @@ TRACE_KINDS = ("contact", "drive", "friction", "joint_limit", "velocity_limit", 
 
 TRACE_BINS = 26
 """Magnitude bins of the final-sweep change: 0 for exactly zero, then half decades from 1e-9 to 1e3."""
-
-
-class SolvePolicyUnsupported(ValueError):
-    """A sweep variant cannot compile the requested stopping rule or readout."""
 
 
 READOUT_COUNTERS = FieldGroup(
@@ -114,22 +114,25 @@ def count_skipped_solves(
         skipped[world] = skipped[world] + 1
 
 
-SWEEP_READOUT = DevicePrelude(
-    "sweep_readout",
-    """    const auto solve_readout_sweeps = [&](int readout_world, int executed, bool stopped) {
+def _serial(source: str) -> str:
+    """The CPU twin of a readout prelude: one thread counts, so its atomic increments are plain ones."""
+    source = re.sub(r"atomicAdd\(reinterpret_cast<unsigned long long\*>\(&([^;]*?\])\), 1ull\)", r"\1 += 1", source)
+    return re.sub(r"atomicAdd\(&([^;]*?\]), 1\)", r"\1 += 1", source)
+
+
+_SWEEP_READOUT = """    const auto solve_readout_sweeps = [&](int readout_world, int executed, bool stopped) {
         const int rows = readout.sweeps.shape[0];
         const int row = executed < rows ? executed : rows - 1;
         atomicAdd(&readout.sweeps.data[row * readout.sweeps.shape[1] + readout_world], 1);
         if (!stopped) atomicAdd(&readout.exhausted.data[readout_world], 1);
-    };""",
-)
+    };"""
+
+SWEEP_READOUT = DevicePrelude("sweep_readout", _SWEEP_READOUT, _serial(_SWEEP_READOUT))
 """Device helper that records one solve; ``readout`` is the kernel's :class:`SolveReadout` operand."""
 
 _GRID_LITERALS = ", ".join(f"{value:.9e}f" for value in TRACE_GRID)
 
-SWEEP_TRACE = DevicePrelude(
-    "sweep_trace",
-    f"""    float solve_trace_max = 0.0f;
+_SWEEP_TRACE = f"""    float solve_trace_max = 0.0f;
     int solve_trace_kind = -1;
     unsigned solve_trace_open = {(1 << len(TRACE_GRID)) - 1:#x}u;
     const auto solve_trace_change = [&](float change, int kind) {{
@@ -167,8 +170,9 @@ SWEEP_TRACE = DevicePrelude(
         for (int point = 0; point < {len(TRACE_GRID)}; ++point)
             if (((solve_trace_open >> point) & 1u) != 0u)
                 atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + columns - 1]), 1ull);
-    }};""",
-)
+    }};"""
+
+SWEEP_TRACE = DevicePrelude("sweep_trace", _SWEEP_TRACE, _serial(_SWEEP_TRACE))
 """Device state and helpers of the trace; ``readout`` is the kernel's :class:`SolveTrace` operand."""
 
 
@@ -184,15 +188,22 @@ class SolvePolicy:
     readout: str = "off"
     """``"off"``, ``"sweeps"`` to count the sweeps every solve executes, or ``"trace"`` to add the exit-law trace."""
     velocity_change_tolerance: float = 0.0
-    """Largest velocity-scaled change of a quiet row [m/s or rad/s]; zero keeps the exact stationary-sweep law."""
+    """Largest velocity-scaled change of a quiet row [m/s or rad/s]; zero votes every change beyond the slack."""
+    change_tolerance: float = 0.0
+    """Impulse slack of a quiet row [N s, or N m s for an angular row]: a change within it does not vote."""
+    relative_change_tolerance: float = 0.0
+    """Slack relative to the update's reference impulse, added to ``change_tolerance``; in ``[0, 1)``."""
 
     def __post_init__(self):
         if self.readout not in SOLVE_READOUTS:
             raise ValueError(f"readout must be one of {SOLVE_READOUTS}, got {self.readout!r}")
-        tolerance = float(self.velocity_change_tolerance)
-        if not (math.isfinite(tolerance) and tolerance >= 0.0):
-            raise ValueError(f"velocity_change_tolerance must be finite and non-negative, got {tolerance!r}")
-        object.__setattr__(self, "velocity_change_tolerance", tolerance)
+        for name in ("velocity_change_tolerance", "change_tolerance", "relative_change_tolerance"):
+            tolerance = float(getattr(self, name))
+            if not (math.isfinite(tolerance) and tolerance >= 0.0):
+                raise ValueError(f"{name} must be finite and non-negative, got {tolerance!r}")
+            object.__setattr__(self, name, tolerance)
+        if self.relative_change_tolerance >= 1.0:
+            raise ValueError(f"relative_change_tolerance must be below 1, got {self.relative_change_tolerance!r}")
 
     def __repr__(self) -> str:
         changed = (
@@ -214,21 +225,41 @@ class SolvePolicy:
 
     @property
     def exact(self) -> bool:
-        """Whether the sweep keeps the exact stationary-sweep law."""
-        return self.velocity_change_tolerance == 0.0
+        """Whether the sweep keeps the exact stationary-sweep law: every change votes."""
+        return not (self.velocity or self.slack)
+
+    @property
+    def velocity(self) -> bool:
+        """Whether a row votes its velocity-scaled change against ``velocity_change_tolerance``."""
+        return self.velocity_change_tolerance > 0.0
+
+    @property
+    def slack(self) -> bool:
+        """Whether a change within the impulse slack does not vote."""
+        return self.change_tolerance > 0.0 or self.relative_change_tolerance > 0.0
 
     @property
     def tolerance_literal(self) -> str:
         """The velocity tolerance as a CUDA ``float`` literal."""
         return f"{self.velocity_change_tolerance!r}f"
 
+    def slack_bound(self, reference: str | None) -> str:
+        """The impulse slack of a change whose update's reference impulse is ``reference`` (``None``: the absolute
+        slack alone), as a CUDA expression."""
+        terms = [f"{self.change_tolerance!r}f"] if self.change_tolerance > 0.0 or reference is None else []
+        if reference is not None and self.relative_change_tolerance > 0.0:
+            terms.append(f"{self.relative_change_tolerance!r}f * fabsf({reference})")
+        return " + ".join(terms)
+
     @property
     def suffix(self) -> str:
         """Kernel-name suffix of this policy's variant; empty for the exact policy without readout."""
-        tolerance = ""
-        if not self.exact:
-            tolerance = "_vtol" + repr(self.velocity_change_tolerance).replace(".", "p").replace("-", "m")
-        return tolerance + (f"_{self.readout}" if self.counts else "")
+        tolerances = (("vtol", self.velocity_change_tolerance), ("ctol", self.change_tolerance))
+        tolerances += (("rtol", self.relative_change_tolerance),)
+        named = "".join(
+            f"_{name}" + repr(value).replace(".", "p").replace("-", "m") for name, value in tolerances if value > 0.0
+        )
+        return named + (f"_{self.readout}" if self.counts else "")
 
     @property
     def preludes(self) -> tuple[DevicePrelude, ...]:
@@ -256,15 +287,18 @@ def vote(
     *,
     flag: str,
     terms: tuple[tuple[str, str, str], ...],
-    slack: tuple[str, ...] | None = None,
+    references: tuple[str | None, ...] | str | None = None,
 ) -> str:
     """Return a row update's change vote under the policy's exit law.
 
-    Under the exact law without trace the sweep's own vote is returned
-    unchanged. A positive tolerance votes when some term's velocity-scaled
-    change exceeds it; the sweep keeps applying every nonzero change to the
-    velocity. The trace records each term's velocity-scaled change, without
-    the term's slack.
+    Under the exact law without trace the update's own vote, ``exact``, is
+    returned unchanged. The impulse slack makes a term quiet within
+    ``change_tolerance + relative_change_tolerance * |reference|``; a positive
+    velocity tolerance votes when some term's velocity-scaled change exceeds
+    the tolerance plus its scaled slack. The sweep keeps applying every nonzero
+    change to the velocity. The trace records each term's velocity-scaled
+    change, without the slack. Every form leaves a zero change quiet, so the
+    vote may stand outside a block entered on a change.
 
     Args:
         policy: The sweep's solve policy.
@@ -272,12 +306,15 @@ def vote(
         flag: The sweep's change flag.
         terms: ``(change, scale, kind)`` per row the update changed: its impulse
             change, its effective-mass diagonal ``A_ii`` and its constraint type.
-        slack: Per-term impulse slack a quiet row may also change by (the native
-            sparse sweeps' run-time impulse tolerances), or ``None``.
+        references: The reference impulse of every term (one expression) or one per term, which the relative slack
+            scales; ``None`` bounds a term by the absolute slack alone.
     """
     if policy.exact and not policy.traces:
         return exact
     indent = exact[: len(exact) - len(exact.lstrip())]
+    if not isinstance(references, tuple):
+        references = (references,) * len(terms)
+    slack = tuple(policy.slack_bound(reference) for reference in references) if policy.slack else None
     statements = []
     if policy.traces:
         statements += [
@@ -286,6 +323,9 @@ def vote(
         ]
     if policy.exact:
         statements.append(exact.strip())
+    elif not policy.velocity:
+        within = " && ".join(f"fabsf({change}) <= {bound}" for (change, _, _), bound in zip(terms, slack, strict=True))
+        statements.append(f"if (!({within})) {flag} = 1;")
     else:
         bounds = []
         for index, (change, scale, _) in enumerate(terms):
@@ -309,7 +349,7 @@ def sweep_exit(
     iteration: str = "iteration",
     iterations: str = "iterations",
     lane: str = "lane",
-    argmax: str = "ARGMAX",
+    argmax: str | None = "ARGMAX",
     indent: str = "        ",
 ) -> str:
     """Return the end-of-sweep exit of a native Gauss-Seidel sweep.
@@ -336,10 +376,11 @@ def sweep_exit(
         iterations: Sweep budget of this launch.
         lane: Lane index within the world's lanes; the trace reduces over the sweep's lane group.
         argmax: The reduction that takes the trace's largest change and its row kind over the world's lanes
-            (``ARGMAX(value, kind)``; a block of several warps names its own).
+            (``ARGMAX(value, kind)``; a block of several warps names its own), or ``None`` for a world one thread
+            sweeps.
         indent: Indentation of the emitted statements.
     """
-    if policy.exact and not policy.counts:
+    if not policy.velocity and not policy.counts:
         return exact
     stop = quiet if gate is None else f"{gate} && {quiet}"
     inner = indent + "    "
@@ -350,7 +391,7 @@ def sweep_exit(
 
     lines = [f"{indent}{{"]
     if not policy.traces:
-        if policy.exact or violation is None:
+        if not policy.velocity or violation is None:
             lines.append(f"{inner}const bool sweep_stop = {stop};")
         else:
             code, value, _ = violation
@@ -366,7 +407,7 @@ def sweep_exit(
     lines += [
         f"{inner}float sweep_change = solve_trace_max;",
         f"{inner}int sweep_kind = solve_trace_kind;",
-        f"{inner}{argmax}(sweep_change, sweep_kind);",
+        *([f"{inner}{argmax}(sweep_change, sweep_kind);"] if argmax else []),
         f"{inner}solve_trace_max = 0.0f;",
         f"{inner}solve_trace_kind = -1;",
     ]
@@ -375,7 +416,7 @@ def sweep_exit(
         code, value, kind = violation
         lines += [block(code), f"{inner}if ({value} > sweep_change) {{"]
         lines += [f"{inner}    sweep_change = {value};", f"{inner}    sweep_kind = {kind};", f"{inner}}}"]
-        if not policy.exact:
+        if policy.velocity:
             stop_line = f"{inner}const bool sweep_stop = {stop} && {value} <= {tolerance};"
     lines += [
         stop_line,
@@ -386,6 +427,30 @@ def sweep_exit(
         f"{indent}}}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def block_argmax(warps: int, *, warp: str, lane: str) -> tuple[str, tuple[Buffer, ...]]:
+    """The trace's reduction over a block of ``warps`` warps, ``BLOCK_ARGMAX(value, kind)`` (two barriers): each
+    warp's largest change and its kind (``ARGMAX``), then every warp's over all of theirs, so every thread holds the
+    block's. ``warp`` and ``lane`` are the thread's warp and its lane in that warp.
+
+    Returns its declaration, after the block's shared arrays, and those arrays.
+    """
+    text = f"""
+    // The trace's largest change over the block: each warp's, then every warp's over all of theirs.
+    const auto BLOCK_ARGMAX = [&](float& value, int& kind) {{
+        ARGMAX(value, kind);
+        if ({lane} == 0) {{
+            s_trace_max[{warp}] = value;
+            s_trace_kind[{warp}] = kind;
+        }}
+        __syncthreads();
+        value = {lane} < {warps} ? s_trace_max[{lane}] : 0.0f;
+        kind = {lane} < {warps} ? s_trace_kind[{lane}] : -1;
+        ARGMAX(value, kind);
+        __syncthreads();
+    }};"""
+    return text, (Buffer("s_trace_max", "float", warps), Buffer("s_trace_kind", "int", warps))
 
 
 @dataclass
@@ -414,11 +479,9 @@ class SolveReadoutRecord:
     rows: the route that launches them registers skip counters
     (:meth:`register_skipped`) and counts, at each launch
     (:meth:`count_skipped`), the worlds without rows of any family, so a
-    world's solves are its slots' solves plus its skipped ones. Sweeps
-    without counters can own whole worlds that hold rows: the parallel
-    (Jacobi) tiers the worlds they claim from the matrix-free sweep. Neither a
-    slot nor the skip counter counts those solves. The route record names
-    these owners (``routes.sweep.readout.uncounted_worlds``).
+    world's solves are its slots' solves plus its skipped ones. Every sweep
+    carries counters, the parallel (Jacobi) tiers against their own sweep
+    budget, so every world-solve that a sweep enters lands in a slot.
     """
 
     def __init__(self, policy: SolvePolicy):
@@ -556,9 +619,7 @@ class SolveReadoutRecord:
         contact-then-internal driver once per launch. Drivers that launch one
         row phase at a time count per launch, and a launch whose phase holds
         none of a world's rows can return before its first sweep, which counts
-        that world nowhere. The worlds that sweeps without counters own, which
-        hold rows, are counted by neither
-        (``routes.sweep.readout.uncounted_worlds``).
+        that world nowhere.
         """
         slots = []
         for (key, _), slot in self._slots.items():

@@ -50,6 +50,7 @@ from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Assembled, FreeBody6, Lanes, ResponseOperator, Velocity
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .staging import Staging
 from .sweep import (
     CONTACT,
@@ -59,6 +60,7 @@ from .sweep import (
     VELOCITY_LIMIT,
     RowContext,
     RowLaws,
+    change_vote,
     indent,
     row_update,
     row_visit,
@@ -332,7 +334,11 @@ def _free_body() -> LoopSweep:
     )
 
 
-_LAWS = RowLaws(drive=False, regularize=True)
+def _laws(solve_policy: SolvePolicy) -> RowLaws:
+    """The loop sweeps' row laws under ``solve_policy``."""
+    return RowLaws(drive=False, regularize=True, policy=solve_policy)
+
+
 """The loop sweeps' row laws: no drive rows; a contact's step takes its regularization weight when ``regularize``."""
 
 
@@ -352,7 +358,7 @@ def _lambda(head: str, body: str) -> str:
     return f"    const auto {head} {{\n{indent(body, '        ')}\n    }};"
 
 
-def contact_units(sweep: LoopSweep) -> tuple[str, str]:
+def contact_units(sweep: LoopSweep, laws: RowLaws) -> tuple[str, str]:
     """The contact units of a loop sweep: their visits, declared once per world, and the row loop's admission.
 
     Once friction is active, a contact normal whose patch ring has several normals or an anchor (a normal its
@@ -361,7 +367,9 @@ def contact_units(sweep: LoopSweep) -> tuple[str, str]:
     impulses removed, a ring unit its normals and up to two anchors' pairs together (``ContactUnit::ring``), and a
     ring member without a pair takes the contact row's update. Each unit's alternation latch (``ContactUnit::latch``)
     relaxes the move; a unit that holds nothing and does not approach stays at zero. The operator binds the units'
-    arithmetic: a row's whole residual, the block's entries and the apply of a row's change.
+    arithmetic: a row's whole residual, the block's entries and the apply of a row's change. A unit votes its rows'
+    changes under the solve policy, and under the exact law any change of its state too: a sweep that changes
+    nothing leaves a fixed point.
 
     Returns the declarations (after the world's operands, before the sweeps) and the admission (after the row's type
     is read; ``friction`` is set per sweep).
@@ -378,7 +386,7 @@ def contact_units(sweep: LoopSweep) -> tuple[str, str]:
             sweep.declare,
             f"if ({sweep.check} <= 0.0f) return;",
             residual,
-            row_update(scalar_ctx, _LAWS, residual="jv", pad=""),
+            row_update(scalar_ctx, laws, residual="jv", pad=""),
         )
         if line
     )
@@ -388,6 +396,31 @@ def contact_units(sweep: LoopSweep) -> tuple[str, str]:
             return ""
         return "\n".join(f"UNIT_APPLY({row}, {change});" for row, change in changes)
 
+    point_vote = (
+        "if (new_n != o_n || new_t0 != o_t0 || new_t1 != o_t1) {\n"
+        + change_vote(
+            laws,
+            (
+                ("new_n - o_n", "w_n", str(CONTACT)),
+                ("new_t0 - o_t0", "w_t0", str(FRICTION)),
+                ("new_t1 - o_t1", "w_t1", str(FRICTION)),
+            ),
+            "    ",
+        )
+        + "\n}"
+    )
+    ring_vote = indent(
+        "if (updated != old) {\n"
+        + change_vote(
+            laws,
+            (("updated - old", "ring_W[a * rows + a]", f"(a < normals ? {CONTACT} : {FRICTION})"),),
+            "    ",
+        )
+        + "\n}",
+        "    ",
+    )
+    # A unit's state change keeps the world sweeping under the exact law; a tolerance stops on the impulses alone.
+    keep = "if (slot != value) iteration_changed = 1;\n" if laws.policy.exact else ""
     point = f"""const int t0 = n + 1, t1 = n + 2;
 const float r_n = UNIT_RESIDUAL(n);
 const float o_n = lam[n], o_t0 = lam[t0], o_t1 = lam[t1];
@@ -396,7 +429,7 @@ if (o_n == 0.0f && o_t0 == 0.0f && o_t1 == 0.0f && ring_load == 0.0f && r_n >= 0
     lam[n] = 0.0f;
     lam[t0] = 0.0f;
     lam[t1] = 0.0f;
-    STATE(n, LOAD_CHANGE) = 0.0f;
+    UNIT_KEEP(n, LOAD_CHANGE, 0.0f);
     return;
 }}
 const float w_n = UNIT_DIAGONAL(n);
@@ -417,16 +450,17 @@ const float w_nt1 = anchor != 0 ? w_t1_n : w_n_t1;
 const ContactUnitSolution solution = ContactUnit::solve(
     ProjectionLaw::regularized_diagonal(w_n, CONTACT_WEIGHT(n)), w_t0, w_t0_t1, w_t1, w_nt0, w_nt1, b_n, b_t0, b_t1,
     {rows.mu("t0")}, ring_load, STATE(n, SLIDE_ROOT), {CONTACT_UNIT_NEWTON_CAP}, o_n, o_t0, o_t1);
-if (solution.alpha > 0.0f) STATE(n, SLIDE_ROOT) = solution.alpha;
+if (solution.alpha > 0.0f) UNIT_KEEP(n, SLIDE_ROOT, solution.alpha);
 const ContactUnitLatch latch = ContactUnit::latch(STATE(n, LATCH_FACTOR), STATE(n, LOAD_CHANGE), o_n, solution.normal);
-STATE(n, LATCH_FACTOR) = latch.factor;
-STATE(n, LOAD_CHANGE) = latch.change;
+UNIT_KEEP(n, LATCH_FACTOR, latch.factor);
+UNIT_KEEP(n, LOAD_CHANGE, latch.change);
 const float new_n = o_n + latch.weight * (solution.normal - o_n);
 const float new_t0 = o_t0 + latch.weight * (solution.friction0 - o_t0);
 const float new_t1 = o_t1 + latch.weight * (solution.friction1 - o_t1);
 lam[n] = new_n;
 lam[t0] = new_t0;
 lam[t1] = new_t1;
+{point_vote}
 {applies(("n", "new_n - o_n"), ("t0", "new_t0 - o_t0"), ("t1", "new_t1 - o_t1"))}"""
 
     ring = f"""const int first = ring_rows[0];
@@ -452,7 +486,7 @@ for (int a = normals; a < rows; ++a) {{
 if (held == 0 && approaching == 0) {{
     // Separated: the exact solution is zero, and so is the latch's load change.
     for (int a = 0; a < rows; ++a) lam[ring_rows[a]] = 0.0f;
-    STATE(first, LOAD_CHANGE) = 0.0f;
+    UNIT_KEEP(first, LOAD_CHANGE, 0.0f);
     return;
 }}
 for (int a = normals; a < rows; ++a) ring_b[a] = UNIT_RESIDUAL(ring_rows[a]);
@@ -482,8 +516,8 @@ if (anchors >= 2) {{
 }}
 ContactUnit::ring(ring_W, ring_b, ring_old, ring_x, ring_alpha, normals, anchors, mu0, mu1, {CONTACT_UNIT_RING_PASSES},
                   {CONTACT_UNIT_NEWTON_CAP}, {_float(CONTACT_UNIT_PROXIMAL)});
-if (anchors >= 1) STATE(ring_rows[normals] - 1, SLIDE_ROOT) = ring_alpha[0];
-if (anchors >= 2) STATE(ring_rows[normals + 2] - 1, SLIDE_ROOT) = ring_alpha[1];
+if (anchors >= 1) UNIT_KEEP(ring_rows[normals] - 1, SLIDE_ROOT, ring_alpha[0]);
+if (anchors >= 2) UNIT_KEEP(ring_rows[normals + 2] - 1, SLIDE_ROOT, ring_alpha[1]);
 float old_load = 0.0f;
 float new_load = 0.0f;
 for (int a = 0; a < normals; ++a) {{
@@ -492,12 +526,13 @@ for (int a = 0; a < normals; ++a) {{
 }}
 const ContactUnitLatch latch = ContactUnit::latch(STATE(first, LATCH_FACTOR), STATE(first, LOAD_CHANGE), old_load,
                                                   new_load);
-STATE(first, LATCH_FACTOR) = latch.factor;
-STATE(first, LOAD_CHANGE) = latch.change;
+UNIT_KEEP(first, LATCH_FACTOR, latch.factor);
+UNIT_KEEP(first, LOAD_CHANGE, latch.change);
 for (int a = 0; a < rows; ++a) {{
     const float old = ring_old[a];
     const float updated = old + latch.weight * (ring_x[a] - old);
     lam[ring_rows[a]] = updated;
+{ring_vote}
 {indent(applies(("ring_rows[a]", "updated - old")), "    ")}
 }}"""
 
@@ -553,6 +588,10 @@ for (int a = 0; a < normals; ++a) {
     }
 }"""
     lambdas = [
+        (
+            "UNIT_KEEP = [&](const int row, const int field, const float value)",
+            f"float& slot = STATE(row, field);\n{keep}slot = value;",
+        ),
         ("HAS_PAIR = [&](const int n) -> bool", has_pair),
         ("UNIT_SHAPE = [&](const int n, int& normals, int& anchors, int& first)", shape),
         ("SORT_RING = [&](const int first)", sort),
@@ -621,13 +660,13 @@ if (friction && {sweep.kind} == {CONTACT}) {{
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _speed_rows(sweep: LoopSweep, pad: str) -> str:
+def _speed_rows(sweep: LoopSweep, pad: str, laws: RowLaws) -> str:
     """A free body's speed row (a velocity-limit row), in row order: the stateless clamp of its linear (``J = e_0``)
     or angular (``J = e_3``) speed along the velocity (:func:`.sweep.speed_row`); the row keeps its correction."""
     rows, op = sweep.rows, sweep.operator
     speed = speed_row_update(
         op,
-        _LAWS,
+        laws,
         load=rows.load("i"),
         store=rows.store("i", "speed_row[0]"),
         lanes=Lanes(1),
@@ -648,28 +687,40 @@ def _speed_rows(sweep: LoopSweep, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool) -> str:
-    """The native body of a loop sweep: one thread sweeps a world's rows in order, its whole budget."""
+def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool, solve_policy: SolvePolicy) -> str:
+    """The native body of a loop sweep: one thread sweeps a world's rows in order; the world stops under the solve
+    policy (the thread's own vote is the world's)."""
+    laws = _laws(solve_policy)
     pad = "            "
     ctx = sweep.context()
     row = row_visit(
         ctx,
-        _LAWS,
+        laws,
         parent=sweep.rows.parent("i"),
         check=sweep.check,
         declare=sweep.declare,
         entries=sweep.entries(),
         pad=pad,
     )
-    declarations, admission = contact_units(sweep) if units else ("", "")
+    declarations, admission = contact_units(sweep, laws) if units else ("", "")
     declarations = f"{declarations}\n" if declarations else ""
     visit = [
         f"{pad}const int {sweep.kind} = {sweep.rows.kind('i')};",
         indent(admission, pad) if admission else "",
-        _speed_rows(sweep, pad) if speed_rows else "",
+        _speed_rows(sweep, pad, laws) if speed_rows else "",
         row,
     ]
     friction = "        const bool friction = global_iter >= friction_start_iteration;\n" if units else ""
+    quiet = "iteration_changed == 0"
+    sweep_end = sweep_exit(
+        solve_policy,
+        f"        if (global_iter >= friction_start_iteration && {quiet}) break;\n",
+        quiet=quiet,
+        gate="global_iter >= friction_start_iteration",
+        iteration="it",
+        lane="0",
+        argmax=None,
+    )
     body = "\n".join(line for line in visit if line)
     return f"""    const int world = tid;
     const int m = {sweep.count}.data[world];
@@ -679,18 +730,19 @@ def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool) -> str:
     const int {sweep.rows.offset} = world * capacity;
 {indent(sweep.setup, "    ")}
     float* lam = {sweep.impulses}.data + {sweep.rows.offset};
-    // The rows' change votes: the sweeps run their whole budget, so nothing reads them.
+    // The rows' change votes (the units' lambdas vote into it too).
     int iteration_changed = 0;
 {declarations}    for (int it = 0; it < iterations; it++) {{
         const int global_iter = iteration_offset + it;
+        iteration_changed = 0;
 {friction}        for (int i = 0; i < m; i++) {{
 {body}
         }}
-    }}
+{sweep_end}    }}
 """
 
 
-def loop_source(*, contact_units: bool = False) -> tuple[str, Staging]:
+def loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXACT_POLICY) -> tuple[str, Staging]:
     """The native body of split mode's loop sweep over a world's assembled Delassus rows: one thread per world.
 
     The rows' impulses are updated in place; ``C``, the right-hand sides and the diagonals are read where they are
@@ -698,15 +750,15 @@ def loop_source(*, contact_units: bool = False) -> tuple[str, Staging]:
     column order). Contact, position-limit and velocity-limit rows are unilateral, a friction pair is solved at its
     first tangent on its patch ring's pooled load, every other row is bilateral; a contact's step takes its
     regularization weight when ``regularize`` is set. With ``contact_units`` a contact unit is solved exactly at its
-    first row once friction is active (:func:`contact_units`). The sweep runs its whole budget.
+    first row once friction is active (:func:`contact_units`). A world stops under the solve policy.
 
     Returns the body (its preludes: the row law's CPU math, the patch ring, the projection laws and, with units, the
     contact-unit law) and its staging (none: the sweep runs in place).
     """
-    return _source(_dense(), units=contact_units, speed_rows=False), Staging()
+    return _source(_dense(), units=contact_units, speed_rows=False, solve_policy=solve_policy), Staging()
 
 
-def mf_loop_source(*, contact_units: bool = False) -> tuple[str, Staging]:
+def mf_loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXACT_POLICY) -> tuple[str, Staging]:
     """The native body of split mode's loop sweep over a world's free-body rows: one thread per world.
 
     The rows' impulses and the bodies' velocities are updated in place (:class:`.FreeBody6` with one thread in the
@@ -714,44 +766,46 @@ def mf_loop_source(*, contact_units: bool = False) -> tuple[str, Staging]:
     solved at its first tangent on its patch ring's pooled load, on the residuals and coupling it reduces itself (the
     loop's friction step); a velocity-limit row is its body's speed row; every other row is bilateral. A contact's
     step takes its regularization weight when ``regularize`` is set. With ``contact_units`` a contact unit is solved
-    exactly at its first row once friction is active (:func:`contact_units`). The sweep runs its whole budget.
+    exactly at its first row once friction is active (:func:`contact_units`). A world stops under the solve policy.
 
     Returns the body and its staging (none: the sweep runs in place).
     """
-    return _source(_free_body(), units=contact_units, speed_rows=True), Staging()
+    return _source(_free_body(), units=contact_units, speed_rows=True, solve_policy=solve_policy), Staging()
 
 
-def _kernel(name: str, abi, body: str, preludes) -> wp.Kernel:
+def _kernel(name: str, abi, body: str, preludes, solve_policy: SolvePolicy) -> wp.Kernel:
     return KernelTemplate(
-        name,
-        abi,
+        name + solve_policy.suffix,
+        kernel_template.operands(abi, solve_policy.arguments),
         body,
         dispatch=kernel_template.THREADS,
-        preludes=preludes,
+        preludes=(*preludes, *solve_policy.preludes),
         dual=True,
         native_name=f"{name}_native",
     ).kernel()
 
 
 @functools.cache
-def loop_kernel() -> wp.Kernel:
-    """The assembled loop sweep kernel: the parameters and launch of ``kernels.pgs_solve_loop``."""
-    return _kernel("sweep_loop", LOOP_ABI, loop_source()[0], _PRELUDES)
+def loop_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+    """The assembled loop sweep kernel (:func:`loop_source`); a readout's operand follows the rows' operands."""
+    return _kernel("sweep_loop", LOOP_ABI, loop_source(solve_policy=solve_policy)[0], _PRELUDES, solve_policy)
 
 
 @functools.cache
-def loop_unit_kernel() -> wp.Kernel:
-    """The assembled loop sweep kernel with contact units: those of ``contact_unit_sweeps.pgs_solve_loop_unit``."""
-    return _kernel("sweep_loop_unit", LOOP_UNIT_ABI, loop_source(contact_units=True)[0], _UNIT_PRELUDES)
+def loop_unit_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+    """The assembled loop sweep kernel with contact units (:func:`loop_source`)."""
+    source = loop_source(contact_units=True, solve_policy=solve_policy)[0]
+    return _kernel("sweep_loop_unit", LOOP_UNIT_ABI, source, _UNIT_PRELUDES, solve_policy)
 
 
 @functools.cache
-def mf_loop_kernel() -> wp.Kernel:
-    """The free-body loop sweep kernel: the parameters and launch of ``kernels.pgs_solve_mf_loop``."""
-    return _kernel("sweep_mf_loop", MF_LOOP_ABI, mf_loop_source()[0], _PRELUDES)
+def mf_loop_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+    """The free-body loop sweep kernel (:func:`mf_loop_source`)."""
+    return _kernel("sweep_mf_loop", MF_LOOP_ABI, mf_loop_source(solve_policy=solve_policy)[0], _PRELUDES, solve_policy)
 
 
 @functools.cache
-def mf_loop_unit_kernel() -> wp.Kernel:
-    """The free-body loop sweep kernel with contact units: those of ``contact_unit_sweeps.pgs_solve_mf_loop_unit``."""
-    return _kernel("sweep_mf_loop_unit", MF_LOOP_UNIT_ABI, mf_loop_source(contact_units=True)[0], _UNIT_PRELUDES)
+def mf_loop_unit_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+    """The free-body loop sweep kernel with contact units (:func:`mf_loop_source`)."""
+    source = mf_loop_source(contact_units=True, solve_policy=solve_policy)[0]
+    return _kernel("sweep_mf_loop_unit", MF_LOOP_UNIT_ABI, source, _UNIT_PRELUDES, solve_policy)

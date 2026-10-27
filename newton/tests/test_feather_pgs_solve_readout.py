@@ -11,9 +11,8 @@ after ``s`` sweeps. The kernel tests replay a solve at every sweep budget and
 check the counts against that rule; the solver tests check that every route's
 readout leaves the trajectory bitwise unchanged and counts each world-solve
 once: in the slot of the sweep that solved it, or, for a world without rows
-that the matrix-free sweeps do not enter, as skipped. The parallel tiers, which
-carry no counters, solve their worlds uncounted, and the route record names
-them.
+that the matrix-free sweeps do not enter, as skipped. The parallel tiers count
+their own worlds, against their own sweep budget.
 
 ``pgs_velocity_change_tolerance`` stops a solve earlier, after the first sweep
 whose velocity-scaled changes fit the tolerance. Before that sweep it runs
@@ -42,7 +41,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_ROW_TYPE_MASK
@@ -729,22 +727,11 @@ def _velocity_limit_route():
     return route
 
 
-def _tier_worlds(solver):
-    """Worlds of the solver's last step that its parallel tiers own.
-
-    A tier owns a world without matrix-free rows, with 1 to the tiers' bound of dense rows, that no
-    local owner claims; the direct driver defers no dense response.
-    """
-    dense, free = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
-    general = solver._local_solve_owner.numpy() == PGS_LOCAL_SOLVE_OWNER_GENERAL
-    return int(np.count_nonzero((free == 0) & (dense > 0) & (dense <= solver._ink_rows) & general))
-
-
 def _tier_route():
     """A tripod world beside a free-body world, with the parallel tiers of ``mf_gs_parallel_rows`` built.
 
     The tripod's world holds only dense rows (24 while its feet touch the ground: six contacts and
-    six joint-limit rows), within the tiers' bound, so the tiers solve it without counters and the
+    six joint-limit rows), within the tiers' bound, so the tiers solve and count it and the
     matrix-free sweep returns before its first sweep there; the free body's matrix-free rows keep
     its world on the counted matrix-free sweep. The tiled response keeps the local owners out: the
     automatic choice gives the tripod's 9 DOFs the parallel-row response, which makes a world with
@@ -765,10 +752,9 @@ def _tier_route():
             "mf_gs_parallel_rows": 32,
         },
         "overrides": {"hinv_jt_kernel": "tiled"},
-        "labels": {"mf_gs"},
-        "owners": ({"mf_gs"},),
-        "solving": {"mf_gs"},
-        "uncounted": _tier_worlds,
+        "labels": {"mf_gs", "parallel_tier"},
+        "owners": ({"mf_gs", "parallel_tier"},),
+        "solving": {"mf_gs", "parallel_tier"},
     }
 
 
@@ -854,11 +840,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         counted = solvers[-1]
         self.assertTrue(set(counted._solve_readout.kernels.values()) & route["labels"], counted._solve_readout.kernels)
         self.assertEqual(solvers[0]._solve_readout.kernels, {})
-        rowless = uncounted = 0
+        rowless = 0
         for step, states in self._steps(route, solvers, steps):
             rowless += _rowless(counted)
-            if "uncounted" in route:
-                uncounted += route["uncounted"](counted)
             for name in STATE_FIELDS:
                 reference, control_run, actual = (getattr(state, name).numpy() for state in states)
                 if np.array_equal(control_run, reference):
@@ -876,23 +860,25 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         # The route record names the passes whose skipped solves the summary holds.
         self.assertEqual(counts["skipped_passes"], [] if route.get("enters_rowless_worlds") else ["position"])
         self.assertEqual([entry["pass"] for entry in summary["skipped"]], counts["skipped_passes"])
+        # A parallel tier counts against its own compiled budget, every other sweep against the solver's.
+        budgets = {tier.kernel.key: tier.sweeps for tier in counted._mf_gs_tiers if tier.sweeps}
         for slot in summary["slots"]:
             with self.subTest(kernel=slot["kernel"]):
-                self.assertEqual(slot["budget"], BUDGET)
+                budget = budgets.get(slot["kernel"], BUDGET)
+                self.assertEqual(slot["budget"], budget)
                 self.assertEqual(slot["solves"], sum(slot["sweeps"]))
                 self.assertEqual(slot["sweeps"][0], 0)
-                self.assertLessEqual(slot["exhausted"], slot["sweeps"][BUDGET])
+                self.assertLessEqual(slot["exhausted"], slot["sweeps"][budget])
                 self.assertLessEqual(slot["worlds"], model.world_count)
-        self._assert_owned(route, summary, steps, rowless, uncounted)
+        self._assert_owned(route, summary, steps, rowless)
         return counted, summary, model
 
-    def _assert_owned(self, route, summary, steps, rowless, uncounted=0):
+    def _assert_owned(self, route, summary, steps, rowless):
         """Check that each owner group's kernels and the skipped record cover every world at every step once.
 
         The sparse and diagonal-mass sweeps enter every world; the matrix-free sweeps enter no world
-        without rows, whose ``rowless`` world-steps the readout must count as skipped. The
-        ``uncounted`` world-steps, solved by an owner without counters, are counted by neither. Each
-        solving label must also have run.
+        without rows, whose ``rowless`` world-steps the readout must count as skipped. Each solving
+        label must also have run.
         """
         world_count = route["model"].world_count
         skipped = _skipped(summary)
@@ -904,7 +890,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                     for slot in summary["slots"]
                     if slot["route"] in owners and slot["pass"] == "position"
                 )
-                self.assertEqual(solves + skipped + uncounted, steps * world_count)
+                self.assertEqual(solves + skipped, steps * world_count)
         for label in route["solving"]:
             with self.subTest(solving=label):
                 self.assertGreater(sum(slot["solves"] for slot in summary["slots"] if slot["route"] == label), 0)
@@ -985,49 +971,43 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         _, summary, _ = self._lockstep(route)
         self.assertGreater(sum(slot["solves"] for slot in summary["slots"]), 0)
 
-    def test_parallel_tier_worlds_are_named_not_counted(self):
-        """Name the parallel tiers' worlds as uncounted and count every other world-solve once, none twice.
+    def test_parallel_tiers_count_their_worlds(self):
+        """Count the parallel tiers' world-solves in their own slots, every world-solve once, none twice.
 
-        The tiers solve the tripod's world without counters, so neither the matrix-free slot nor the
-        skip counter may count it: the slot's solves, the skipped ones and the tiers' world-solves,
-        found from each step's row counts, must add up to every world at every step. The tiers keep
-        their own exit under a velocity tolerance, which the exit law records and warns about; the
-        matrix-free sweep is then the route's only sweep that honors it, as no local owner is built.
+        The tiers solve the tripod's world, the matrix-free sweep the free body's: their slots and the
+        skip counter must add up to every world at every step. Under a velocity tolerance every sweep,
+        the tiers' included, compiles the law, without a warning.
         """
         route, steps = _tier_route(), 4
-        solver, summary, model = self._lockstep(route, steps=steps)
+        solver, summary, _ = self._lockstep(route, steps=steps)
         # The route's premise: no local owner claims the tripod's world, so the tiers own it.
         self.assertFalse(solver._local_internal_fast_path)
         sweep = solver.get_path_selection()["routes"]["sweep"]
         tier_kernels = {tier["kernel"] for tier in sweep["tiers"]["tiers"]}
         self.assertEqual(sweep["tiers"]["family"], "parallel")
-        self.assertLessEqual(tier_kernels, set(sweep["readout"]["uncounted"]))
-        self.assertEqual(list(sweep["readout"]["uncounted_worlds"]), ["parallel_tiers"])
-        # Some world-solves went to the tiers: _lockstep found them in the row counts and in no counter.
-        counted = sum(slot["solves"] for slot in summary["slots"] if slot["pass"] == "position")
-        self.assertGreater(counted, 0)
-        self.assertLess(counted + _skipped(summary), steps * model.world_count)
-        with self.assertWarnsRegex(UserWarning, "pgs_velocity_change_tolerance"):
+        self.assertLessEqual(tier_kernels, set(sweep["readout"]["counted"]))
+        tiers = sum(slot["solves"] for slot in summary["slots"] if slot["route"] == "parallel_tier")
+        self.assertGreater(tiers, 0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             (loose,) = self._solvers(route, [{"pgs_velocity_change_tolerance": 1.0e-3}])
         law = loose.get_path_selection()["routes"]["sweep"]["exit_law"]
-        self.assertEqual(set(law["honored"]), {loose._pgs_solve_mf_gs_kernel.key})
-        self.assertLessEqual(tier_kernels, set(law["ignored"]))
+        self.assertEqual(law["law"], "velocity")
+        self.assertLessEqual(
+            {loose._pgs_solve_mf_gs_kernel.key, *(tier.kernel.key for tier in loose._mf_gs_tiers)}, set(law["honored"])
+        )
 
-    def test_declined_trace_counts_without_it_and_warns(self):
-        """Warn about, record and count without the trace a sweep variant that cannot trace.
-
-        The matrix-free sweep does not trace its contact torsion; with torsion it keeps the plain
-        count, which a trace request records under the readout, not the exit law.
-        """
+    def test_torsion_traces_its_changes(self):
+        """Trace the matrix-free sweep with contact torsion, without a warning: every sweep compiles the trace."""
         route = _matrix_free_route()
-        with self.assertWarnsRegex(UserWarning, "pgs_solve_readout='trace'"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             (solver,) = self._solvers(
                 route, [{"pgs_solve_readout": "trace", "contact_torsion_radius": 0.01, "dense_max_constraints": 256}]
             )
         key = solver._pgs_solve_mf_gs_kernel.key
-        sweep = solver.get_path_selection()["routes"]["sweep"]
-        self.assertIn(key, sweep["readout"]["declined"])
-        self.assertEqual((sweep["readout"]["mode"], sweep["exit_law"]["declined"]), ("trace", {}))
+        self.assertIn("_torsion", key)
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["readout"]["mode"], "trace")
         for _ in self._steps(route, [solver], 2):
             pass
         (slot,) = [
@@ -1035,8 +1015,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
             for slot in solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
             if slot["kernel"] == key
         ]
-        self.assertNotIn("trace", slot)
+        self.assertIn("trace", slot)
         self.assertGreater(slot["solves"], 0)
+        self.assertEqual(sum(slot["trace"]["reasons"].values()), slot["solves"])
 
     def test_velocity_pass_counts_in_its_own_slots(self):
         """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
@@ -1066,8 +1047,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""
         for route in _policy_routes():
             with self.subTest(route=_route_name(route)):
-                solver, summary, _ = self._lockstep(route, readout="trace")
-                self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["readout"]["declined"], {})
+                _, summary, _ = self._lockstep(route, readout="trace")
                 for slot in summary["slots"]:
                     with self.subTest(kernel=slot["kernel"]):
                         trace = slot["trace"]
@@ -1099,7 +1079,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 counted = loose._solve_readout.kernels
                 self.assertTrue(set(counted.values()) & route["labels"], counted)
                 law = loose.get_path_selection()["routes"]["sweep"]["exit_law"]
-                self.assertEqual((law["law"], law["declined"]), ("velocity", {}))
+                self.assertEqual(law["law"], "velocity")
                 self.assertEqual(set(law["honored"]), set(counted))
                 deviation = 0.0
                 # The two trajectories differ slightly, so each solver's worlds may lack rows at other steps.

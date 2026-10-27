@@ -17,8 +17,8 @@ caller decodes it. A configuration chooses:
   ``"staged"`` (the normal's reduction, then the pair's, with a cache of pair metrics) or ``"single"`` (one load
   group and one reduction, from the triplet's block record);
 - the **laws**: the shared row visit and law (:func:`.sweep.row_visit`) for every other row, the last-word
-  velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit with
-  the run-time impulse tolerances (``change_tolerance``, ``relative_change_tolerance``) under the solve policy.
+  velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit under
+  the solve policy.
 
 :func:`sparse_kernel` takes the arguments of the factory it replaces (``sweep_routes_sparse.sparse_kernel``)
 and builds a kernel of its ABI, dispatch and launch bounds, so a launch site can take either kernel unchanged.
@@ -105,8 +105,6 @@ SPARSE_ABI = kernel_template.params(
     ("mf_row_mu", wp.array2d[float]),
     ("iterations", int),
     ("omega", float),
-    ("change_tolerance", float),
-    ("relative_change_tolerance", float),
     ("friction_start_iteration", int),
     ("iteration_offset", int),
     ("factor_velocity_delta", wp.array2d[float]),
@@ -919,7 +917,6 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         velocity_limit_law="accumulated" if sweep.accumulated else "stateless",
         regularize=False,
         policy=sweep.policy,
-        impulse_tolerance=True,
     )
     staging = _staging(sweep, rows, op)
 

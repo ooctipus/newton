@@ -1201,7 +1201,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 mf_gs_parallel_nesterov=True,
                 mf_gs_parallel_matrix_free=True,
                 mf_gs_parallel_sweeps=24,
-                mf_gs_parallel_tol=0.0,
             )
             with self.subTest(anchors=anchors, linked=linked, limits=limits):
                 tiers = path_selection._tiers(probe)
@@ -1497,7 +1496,6 @@ class TestParallelPatchKernel(unittest.TestCase):
                         min_rows=min_rows,
                         sweeps=24,
                         nesterov=nesterov,
-                        tol=0.0,
                         matrix_free=matrix_free,
                         inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
                         linked_rows=linked,
@@ -1536,7 +1534,6 @@ class TestParallelPatchKernel(unittest.TestCase):
                     arch,
                     rows=32,
                     sweeps=2000,
-                    tol=0.0,
                     matrix_free=matrix_free,
                     inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
                     linked_rows=True,
@@ -1576,7 +1573,6 @@ class TestParallelPatchKernel(unittest.TestCase):
                         arch,
                         rows=32,
                         sweeps=sweeps,
-                        tol=0.0,
                         matrix_free=matrix_free,
                         inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
                         linked_rows=True,
@@ -1946,9 +1942,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         limit rows two steps carry it past twice the limit. A sphere that starts past
         its limit cannot show the pass, because the pre-solve prescale puts it on the
         limit and its limit rows never bind. Only the pass promises the limit: a tier
-        without it stops where its budget or tolerance leaves it (24 sweeps to 1e-4:
-        1.9e-5 past after the first step in the float64 reference), while the pass
-        holds it to 1e-5. Truncated to two sweeps (tolerance 0), the tier without the
+        without it stops where its budget leaves it, while the pass holds it to 1e-5.
+        Truncated to two sweeps, the tier without the
         pass must leave the sphere at least 5 % past its limit, or the fixture cannot
         show what the pass does, and the pass must hold it to 1e-5 (the reference on
         the CPU rows of test_last_word_holds_a_pushed_sphere_at_its_limit: 43.5 % and
@@ -1959,7 +1954,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         limit = 0.5
         model = _pushed_sphere("cuda:0", limit=limit)
         built = {}
-        # The pass is under test, not the budget: every tier sweeps exactly 24 times to 1e-4.
+        # The pass is under test, not the budget: every tier sweeps at most 24 times.
         with patch.dict(os.environ, {_SWITCH: "1"}), _exact_budget():
             for limits, requested in itertools.product((False, True), repeat=2):
                 built[limits, requested] = _matrix_free_solver(
@@ -1968,7 +1963,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     parallel_rows=32,
                     enable_joint_velocity_limits=limits,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
-                    mf_gs_parallel_tol=1.0e-4,
                 )
             budgets = {
                 (sweeps, requested): _matrix_free_solver(
@@ -1978,7 +1972,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     enable_joint_velocity_limits=True,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
                     mf_gs_parallel_sweeps=sweeps,
-                    mf_gs_parallel_tol=0.0,
                 )
                 for sweeps, requested in itertools.product((2, 2000), (False, True))
             }
@@ -2178,7 +2171,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         axes, masses = (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0)
         tangent_mass = np.array((sum(masses), sum(masses[1:])))
         model = _sliding_sphere("cuda:0", axes, masses, (1.0, 1.0))
-        converged = {"mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        converged = {"mf_gs_parallel_sweeps": 2000}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             routes = {
                 "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000),
@@ -2226,7 +2219,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         poses that the position correction amplifies.
         """
         model = sliding_stance("cuda:0")
-        truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0}
+        truncated = {"mf_gs_parallel_sweeps": 2}
         budgeted = {**truncated, "mf_gs_parallel_sweeps": 2000}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             routes = {"serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)}
@@ -2256,7 +2249,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         Jacobian of the frozen tangent must not stop the live one.
         """
         model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Z), (3.0, 1.0), (1.0,))
-        converged = {"mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        converged = {"mf_gs_parallel_sweeps": 2000}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)
             tier = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged)
@@ -2293,7 +2286,6 @@ class TestPatchParallelPhysics(unittest.TestCase):
             "cached_dynamics": "off",
             "pgs_iterations": 2000,
             "mf_gs_parallel_sweeps": 2000,
-            "mf_gs_parallel_tol": 0.0,
         }
         with patch.dict(os.environ):
             # The defaults, whatever the exported environment says: tiers admitted, the stateless law.

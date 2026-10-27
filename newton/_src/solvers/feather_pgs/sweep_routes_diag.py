@@ -28,7 +28,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Assembled, FreeBody6, Lanes, SparsePairJY, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import EXACT_POLICY, SolvePolicy
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -512,7 +512,12 @@ TILED_ROW_ABI = kernel_template.params(
 
 
 def tiled_row_source(
-    max_constraints: int, *, row_budget: int | None = None, min_rows: int = 0, staging: str = "shared"
+    max_constraints: int,
+    *,
+    row_budget: int | None = None,
+    min_rows: int = 0,
+    staging: str = "shared",
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of split mode's Gauss-Seidel sweep over a world's assembled Delassus rows: one warp per world.
 
@@ -520,7 +525,7 @@ def tiled_row_source(
     as ``staging`` names (:class:`.Assembled`); every lane runs every row's law on its own copy of the impulses.
     Contact, position-limit and velocity-limit rows are unilateral, a friction pair is solved at its first tangent on
     its patch ring's pooled load, every other row is bilateral; a contact's step takes its regularization weight
-    when ``regularize`` is set. The sweep runs its whole budget.
+    when ``regularize`` is set. A world stops under the solve policy (:func:`.sweep.end_sweep`).
 
     A row budget (C64 or C128 only, 16, 32 or the capacity rows) stages that many rows of the capacity's strides; a
     small budget owns the worlds of ``min_rows < m <= row_budget`` rows whose friction metadata stays in their rows,
@@ -557,7 +562,7 @@ def tiled_row_source(
         ),
         threads=32,
     )
-    laws = RowLaws(drive=False, regularize=True)
+    laws = RowLaws(drive=False, regularize=True, policy=solve_policy)
     ctx = RowContext(
         row="i",
         kind="row_type",
@@ -635,14 +640,14 @@ def tiled_row_source(
             const int row_type = s_rtype[i];
 {row}
         }}
-    }}
+{end_sweep(solve_policy, iteration="iter")}    }}
 
     {staged}
         world_impulses.data[off1 + {r}] = s_lam[{r}];
     }}
 #endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW))
+    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), stage
 
 
@@ -686,21 +691,24 @@ def tiled_row_kernel(
     row_budget: int | None = None,
     min_rows: int = 0,
     staging: str = "shared",
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """The tiled-row sweep kernel (the arguments and ABI of the factory it replaces).
+    """The tiled-row sweep kernel; a readout's operand follows the rows' operands.
 
     Raises:
         ValueError: If the staging's static shared memory exceeds the device's budget
             (:func:`.staging.arch_budget`), which the solver's staging choice never asks for.
     """
-    snippet, declared = tiled_row_source(max_constraints, row_budget=row_budget, min_rows=min_rows, staging=staging)
+    snippet, declared = tiled_row_source(
+        max_constraints, row_budget=row_budget, min_rows=min_rows, staging=staging, solve_policy=solve_policy
+    )
     declared.check(f"the tiled-row sweep of {max_constraints} rows with {staging} staging", arch_budget(device_arch))
     suffix = "" if row_budget is None else f"_b{row_budget}_m{min_rows}"
     if staging == "global":
         suffix += "_global"
     return KernelTemplate(
-        f"sweep_tiled_row_{max_constraints}{suffix}",
-        TILED_ROW_ABI,
+        f"sweep_tiled_row_{max_constraints}{suffix}{solve_policy.suffix}",
+        kernel_template.operands(TILED_ROW_ABI, solve_policy.arguments),
         snippet,
         dispatch=kernel_template.WORLDS,
         composed=True,
@@ -740,7 +748,11 @@ MF_SPLIT_ABI = kernel_template.params(
 
 
 def mf_split_source(
-    mf_max_constraints: int, max_mf_bodies: int, *, has_velocity_limit_rows: bool = False
+    mf_max_constraints: int,
+    max_mf_bodies: int,
+    *,
+    has_velocity_limit_rows: bool = False,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of split mode's free-body Gauss-Seidel sweep: one warp per world, its first lane solving.
 
@@ -749,14 +761,14 @@ def mf_split_source(
     :class:`.FreeBody6`'s one-thread layout, each row's bodies at their local slots (``mf_local_body_a``/``_b``).
     Contact and limit rows are unilateral, a friction pair is solved at its first tangent, every other row is
     bilateral. With ``has_velocity_limit_rows``, a velocity-limit row is its body's speed row
-    (:func:`.sweep.speed_row`, stateless), in row order: the rows occupy the tail of the world's rows. The sweep runs
-    its whole budget.
+    (:func:`.sweep.speed_row`, stateless), in row order: the rows occupy the tail of the world's rows. A world stops
+    under the solve policy, lane 0 voting alone.
 
     Returns the body and its staging.
     """
     M, B = int(mf_max_constraints), int(max_mf_bodies)
     serial = Lanes(1)
-    laws = RowLaws(drive=False, regularize=True)
+    laws = RowLaws(drive=False, regularize=True, policy=solve_policy)
     op = FreeBody6(
         serial,
         velocity=Velocity("s_vel"),
@@ -807,6 +819,18 @@ def mf_split_source(
         ),
         pad=pad,
     )
+    # Lane 0 sweeps alone: its own vote is the world's.
+    quiet = "iteration_changed == 0"
+    sweep_end = sweep_exit(
+        solve_policy,
+        f"""            if (global_iter >= friction_start_iteration && {quiet}) break;
+""",
+        quiet=quiet,
+        gate="global_iter >= friction_start_iteration",
+        iteration="iter",
+        argmax=None,
+        indent="            ",
+    )
     body = f"""    const int lane = LANE;
 
     int m = mf_constraint_count.data[world];
@@ -837,7 +861,7 @@ def mf_split_source(
 {speed_rows}
 {row}
             }}
-        }}
+{sweep_end}        }}
     }}
     SYNC();
 
@@ -848,22 +872,31 @@ def mf_split_source(
     for (int i = lane; i < m; i += 32) mf_impulses.data[c_off + i] = s_impulse[i];
 #endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW))
+    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), stage
 
 
 @cache
 def mf_split_kernel(
-    mf_max_constraints: int, max_mf_bodies: int, device_arch: str, *, has_velocity_limit_rows: bool = False
+    mf_max_constraints: int,
+    max_mf_bodies: int,
+    device_arch: str,
+    *,
+    has_velocity_limit_rows: bool = False,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
     """The split free-body sweep kernel (the arguments and ABI of the factory it replaces)."""
     snippet, _staging = mf_split_source(
-        mf_max_constraints, max_mf_bodies, has_velocity_limit_rows=has_velocity_limit_rows
+        mf_max_constraints, max_mf_bodies, has_velocity_limit_rows=has_velocity_limit_rows, solve_policy=solve_policy
     )
-    name = f"sweep_mf_split_{mf_max_constraints}_{max_mf_bodies}" + ("_vlim" if has_velocity_limit_rows else "")
+    name = (
+        f"sweep_mf_split_{mf_max_constraints}_{max_mf_bodies}"
+        + ("_vlim" if has_velocity_limit_rows else "")
+        + solve_policy.suffix
+    )
     return KernelTemplate(
         name,
-        MF_SPLIT_ABI,
+        kernel_template.operands(MF_SPLIT_ABI, solve_policy.arguments),
         snippet,
         dispatch=kernel_template.WORLDS,
         composed=True,
