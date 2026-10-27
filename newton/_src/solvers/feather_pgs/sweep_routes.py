@@ -231,14 +231,13 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             "                }",
             "                return load;",
             "            };",
-            "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps).",
-            "            const auto FRICTION_PAIR_CACHED = [&](int position, float, float, float, wp::vec2 residual,",
-            "                                                  wp::vec2 old, float radius, float relaxation) -> wp::vec2 {",
-            f"                const int at = unit_slot * {5 * M_MF} + position;",
-            f"                return ProjectionLaw::friction_pair_from_metric(slot_metric.data[at], slot_metric.data[at + {M_MF}],",
-            f"                    slot_metric.data[at + {2 * M_MF}],",
-            f"                    wp::vec2(slot_metric.data[at + {3 * M_MF}], slot_metric.data[at + {4 * M_MF}]),",
-            "                    residual, old, radius, relaxation);",
+            "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
+            "            // the unit loads with its fields.",
+            "            float metric[5];",
+            "            const auto FRICTION_PAIR_CACHED = [&](int, float, float, float, wp::vec2 residual, wp::vec2 old,",
+            "                                                  float radius, float relaxation) -> wp::vec2 {",
+            "                return ProjectionLaw::friction_pair_from_metric(metric[0], metric[1], metric[2],",
+            "                    wp::vec2(metric[3], metric[4]), residual, old, radius, relaxation);",
             "            };",
         ]
     )
@@ -260,16 +259,16 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
                     const int slot_base = unit_slot * {fields * M_MF} + p;
                     const int word_base = unit_slot * {words * M_MF} + p;
-                    // Every field of the slot at once: the first row's always, a friction pair's when the unit has one.
+                    // Every field of the slot and its metric at once, beside the slot's own load: one round of
+                    // memory latency per unit. A unit without a friction pair never reads its pair's fields.
                     float E[{fields}];
                     int W[{words}];
 #pragma unroll
-                    for (int f = 0; f < {fields}; ++f)
-                        E[f] = (f < 24 || f >= {sweep_units.SLOT_ENTRIES} || rows == 3)
-                            ? slot_data.data[slot_base + f * {M_MF}] : 0.0f;
+                    for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {M_MF}];
 #pragma unroll
-                    for (int f = 0; f < {words}; ++f)
-                        W[f] = (f < 3 || rows == 3) ? slot_words.data[word_base + f * {M_MF}] : 0;
+                    for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
+#pragma unroll
+                    for (int f = 0; f < 5; ++f) metric[f] = slot_metric.data[unit_slot * {5 * M_MF} + p + f * {M_MF}];
 #pragma unroll
                     for (int r = 0; r < 3; ++r) {{
                         if (r >= rows) break;
