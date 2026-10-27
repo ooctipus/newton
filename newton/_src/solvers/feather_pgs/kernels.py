@@ -63,7 +63,7 @@ from .row_laws import (
     row_rhs,
     velocity_limit_active,
 )
-from .solver_fields import LocalOwners
+from .solver_fields import Connects, LocalOwners, Mimics
 from .spatial_laws import free_root_transport, point_velocity, transform_compose, twist_compose
 from .tree_passes import (
     DynamicsData,
@@ -1574,12 +1574,9 @@ def build_joint_limit_rows_for_size(
 
 @wp.kernel
 def allocate_mimic_slots(
-    mimic_valid: wp.array[int],
-    mimic_enabled: wp.array[wp.bool],
-    mimic_world: wp.array[int],
+    mimics: Mimics,
     max_constraints: int,
     # outputs
-    mimic_slot: wp.array[int],
     world_slot_counter: wp.array[int],
     first_rejected_slot: wp.array[int],
 ):
@@ -1589,27 +1586,19 @@ def allocate_mimic_slots(
     get ``mimic_slot = -1`` and consume no slot.
     """
     k = wp.tid()
-    mimic_slot[k] = -1
-    if mimic_valid[k] == 0:
+    mimics.slot[k] = -1
+    if mimics.valid[k] == 0:
         return
-    if not mimic_enabled[k]:
+    if not mimics.enabled[k]:
         return
-    mimic_slot[k] = reserve(world_slot_counter, mimic_world[k], 1, max_constraints, first_rejected_slot)
+    mimics.slot[k] = reserve(world_slot_counter, mimics.world[k], 1, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
 def populate_mimic_J_for_size(
+    mimics: Mimics,
     joints: JointTable,
     group_to_art: wp.array[int],
-    mimic_slot: wp.array[int],
-    mimic_art_start: wp.array[int],
-    mimic_art_list: wp.array[int],
-    mimic_dof0: wp.array[int],
-    mimic_dof1: wp.array[int],
-    mimic_q0: wp.array[int],
-    mimic_q1: wp.array[int],
-    mimic_coef0: wp.array[float],
-    mimic_coef1: wp.array[float],
     joint_q: wp.array[float],
     pgs_beta: float,
     pgs_cfm: float,
@@ -1631,26 +1620,26 @@ def populate_mimic_J_for_size(
     world = joints.art_to_world[art]
     dof_start = joints.articulation_dof_start[art]
 
-    for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
-        k = mimic_art_list[m]
-        slot = mimic_slot[k]
+    for m in range(mimics.art_start[art], mimics.art_start[art + 1]):
+        k = mimics.art_list[m]
+        slot = mimics.slot[k]
         if slot < 0:
             continue
 
-        c0 = mimic_coef0[k]
-        c1 = mimic_coef1[k]
+        c0 = mimics.coef0[k]
+        c1 = mimics.coef1[k]
 
         # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
         # DOFs are guaranteed distinct by the host-side validity mask.
-        J_group[group_idx, slot, mimic_dof0[k] - dof_start] = 1.0
-        J_group[group_idx, slot, mimic_dof1[k] - dof_start] = -c1
+        J_group[group_idx, slot, mimics.dof0[k] - dof_start] = 1.0
+        J_group[group_idx, slot, mimics.dof1[k] - dof_start] = -c1
 
         rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
         rows.row_parent[world, slot] = -1
         rows.row_mu[world, slot] = 0.0
         rows.row_beta[world, slot] = pgs_beta
         rows.row_cfm[world, slot] = pgs_cfm
-        rows.phi[world, slot] = mimic_phi(joint_q[mimic_q0[k]], joint_q[mimic_q1[k]], c0, c1)
+        rows.phi[world, slot] = mimic_phi(joint_q[mimics.q0[k]], joint_q[mimics.q1[k]], c0, c1)
         rows.target[world, slot] = 0.0
 
 
@@ -1679,12 +1668,9 @@ def invalidate_fk_id_cache_for_articulations(
 
 @wp.kernel
 def allocate_connect_slots(
-    connect_valid: wp.array[int],
-    connect_enabled: wp.array[int],
-    connect_world: wp.array[int],
+    connects: Connects,
     max_constraints: int,
     # outputs
-    connect_slot: wp.array[int],
     world_slot_counter: wp.array[int],
     first_rejected_slot: wp.array[int],
 ):
@@ -1694,32 +1680,24 @@ def allocate_connect_slots(
     closure is dropped whole (``connect_slot = -1``) rather than partially enforced.
     """
     k = wp.tid()
-    connect_slot[k] = -1
-    if connect_valid[k] == 0 or connect_enabled[k] == 0:
+    connects.slot[k] = -1
+    if connects.valid[k] == 0 or connects.enabled[k] == 0:
         return
-    connect_slot[k] = reserve(world_slot_counter, connect_world[k], 3, max_constraints, first_rejected_slot)
+    connects.slot[k] = reserve(world_slot_counter, connects.world[k], 3, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
 def populate_connect_J_for_size(
-    articulation_dof_start: wp.array[int],
-    art_to_world: wp.array[int],
+    joints: JointTable,
+    connects: Connects,
     group_to_art: wp.array[int],
     n_dofs: int,
-    connect_slot: wp.array[int],
-    connect_art: wp.array[int],
-    connect_body_p: wp.array[int],
-    connect_body_c: wp.array[int],
-    connect_anchor_p: wp.array[wp.vec3],
-    connect_anchor_c: wp.array[wp.vec3],
-    connect_parent_prescribed: wp.array[int],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_com: wp.array[wp.vec3],
     body_to_joint: wp.array[int],
     body_to_articulation: wp.array[int],
     joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
     articulation_origin: wp.array[wp.vec3],
     pgs_beta: float,
@@ -1745,30 +1723,30 @@ def populate_connect_J_for_size(
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
-    world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
+    world = joints.art_to_world[art]
+    dof_start = joints.articulation_dof_start[art]
 
-    n_connect = connect_art.shape[0]
+    n_connect = connects.art.shape[0]
     for k in range(n_connect):
-        if connect_art[k] != art:
+        if connects.art[k] != art:
             continue
-        base_slot = connect_slot[k]
+        base_slot = connects.slot[k]
         if base_slot < 0:
             continue
 
-        body_p = connect_body_p[k]
-        body_c = connect_body_c[k]
-        prescribed = connect_parent_prescribed[k] != 0
-        p_a = connect_anchor_p[k]
+        body_p = connects.body_p[k]
+        body_c = connects.body_c[k]
+        prescribed = connects.parent_prescribed[k] != 0
+        p_a = connects.anchor_p[k]
         v_a = wp.vec3(0.0, 0.0, 0.0)
         if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], connect_anchor_p[k])
+            p_a = wp.transform_point(body_q[body_p], connects.anchor_p[k])
             if prescribed:
                 # Prescribed parent: the anchor velocity comes from the body twist
                 # (v_com_world, omega_world) rather than from tree DOFs.
                 x_com = wp.transform_point(body_q[body_p], body_com[body_p])
                 v_a = point_velocity(body_qd[body_p], p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
+        p_b = wp.transform_point(body_q[body_c], connects.anchor_c[k])
         origin = articulation_origin[art]
         delta = p_a - p_b
 
@@ -1795,7 +1773,7 @@ def populate_connect_J_for_size(
                     e,
                     body_to_joint,
                     joint_ancestor,
-                    joint_qd_start,
+                    joints.joint_qd_start,
                     joint_S_s,
                     dof_start,
                     n_dofs,
@@ -1811,7 +1789,7 @@ def populate_connect_J_for_size(
                 e,
                 body_to_joint,
                 joint_ancestor,
-                joint_qd_start,
+                joints.joint_qd_start,
                 joint_S_s,
                 dof_start,
                 n_dofs,

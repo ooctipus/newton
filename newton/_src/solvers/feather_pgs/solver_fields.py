@@ -392,6 +392,32 @@ CONNECT_PLAN = FieldGroup(
 
 CONNECT_SLOTS = FieldGroup(Field("connect_slot", wp.int32, ("closure",), fill=-1, grad=False))
 
+Mimics = field_group.struct(
+    "Mimics",
+    (
+        dataclasses.replace(MIMIC_SLOTS["mimic_slot"], name="slot", attr="mimic_slot"),
+        *(dataclasses.replace(field, name=field.name.removeprefix("_mimic_"), attr=field.name) for field in MIMIC_PLAN),
+        Field("enabled", wp.bool, ("mimic",), owner="model", attr="constraint_mimic_enabled"),
+        Field("coef0", wp.float32, ("mimic",), owner="model", attr="constraint_mimic_coef0"),
+        Field("coef1", wp.float32, ("mimic",), owner="model", attr="constraint_mimic_coef1"),
+    ),
+    __name__,
+)
+"""The mimic rows' tables (:data:`MIMIC_PLAN`), their dense slots and the model's enable flags and coefficients."""
+
+Connects = field_group.struct(
+    "Connects",
+    (
+        dataclasses.replace(CONNECT_SLOTS["connect_slot"], name="slot", attr="connect_slot"),
+        *(
+            dataclasses.replace(field, name=field.name.removeprefix("_connect_"), attr=field.name)
+            for field in CONNECT_PLAN
+        ),
+    ),
+    __name__,
+)
+"""The enforced loop closures' tables (:data:`CONNECT_PLAN`) and their dense slots."""
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Sparse-diagonal contact schedule
 # ---------------------------------------------------------------------------------------------------------------------

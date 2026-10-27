@@ -23,6 +23,7 @@ from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton._src.solvers.feather_pgs.joint_table import JointTable
+from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW)
@@ -561,11 +562,15 @@ JOINT_TABLE_ARGUMENTS = {field.name: field.name for field in field_group.fields_
 MF_ROW_ARGUMENTS = {field.name: field.attr for field in field_group.fields_of(MfRows)}
 """The scenes' names of the :data:`MfRows` fields: the solver's attributes."""
 
+MIMIC_ARGUMENTS = {field.name: f"mimic_{field.name}" for field in field_group.fields_of(Mimics)}
+"""The scenes' names of the :data:`Mimics` fields: ``mimic_`` and the field's name."""
+
 STRUCT_ARGUMENTS = {
     ContactInput: CONTACT_ARGUMENTS,
     DenseRows: DENSE_ROW_ARGUMENTS,
     JointTable: JOINT_TABLE_ARGUMENTS,
     MfRows: MF_ROW_ARGUMENTS,
+    Mimics: MIMIC_ARGUMENTS,
 }
 """The scenes' field names of each struct a kernel takes in place of separate arguments."""
 
