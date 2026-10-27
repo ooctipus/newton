@@ -63,6 +63,7 @@ from .row_laws import (
     row_rhs,
     velocity_limit_active,
 )
+from .solver_fields import LocalOwners
 from .spatial_laws import free_root_transport, point_velocity, transform_compose, twist_compose
 from .tree_passes import (
     DynamicsData,
@@ -4367,69 +4368,58 @@ def classify_parallel_sweep_tiers(
 
 @wp.kernel
 def classify_local_solve_worlds(
+    mf: MfRows,
+    owners: LocalOwners,
     world_constraint_count: wp.array[int],
     dense_phase_bounds: wp.array2d[int],
     mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_row_type: wp.array2d[int],
     body_to_articulation: wp.array[int],
     articulation_dof_count: wp.array[int],
-    local_primary_articulation: wp.array[int],
-    local_pair_articulation: wp.array[int],
-    local_residual_pair_articulation: wp.array[int],
-    local_max_constraints: int,
-    local_residual_max_constraints: int,
-    local_residual_mf_max_constraints: int,
-    # outputs
-    local_solve_owner: wp.array[int],
-    general_world_count: wp.array[int],
-    general_worlds: wp.array[int],
 ):
     """Assign exact solver ownership and compact active general worlds."""
     world = wp.tid()
     row_count = world_constraint_count[world]
     mf_count = mf_constraint_count[world]
-    primary_articulation = local_primary_articulation[world]
-    pair_articulation = local_pair_articulation[world]
-    residual_pair_articulation = local_residual_pair_articulation[world]
+    primary_articulation = owners.primary_articulation[world]
+    pair_articulation = owners.pair_articulation[world]
+    residual_pair_articulation = owners.residual_pair_articulation[world]
     single_phase = dense_phase_bounds[world, 1] == row_count
 
-    local_mf = mf_count > 0 and mf_count <= local_residual_mf_max_constraints and residual_pair_articulation >= 0
+    local_mf = mf_count > 0 and mf_count <= owners.residual_mf_max_rows and residual_pair_articulation >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        body_a = mf_body_a[world, mf_row]
-        body_b = mf_body_b[world, mf_row]
+        body_a = mf.body_a[world, mf_row]
+        body_b = mf.body_b[world, mf_row]
         if body_a >= 0 and body_to_articulation[body_a] != residual_pair_articulation:
             local_mf = False
         if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
             local_mf = False
         # Free-body velocity-limit rows follow the general owner's stateless unilateral law, which the
         # residual local loop does not implement: keep such worlds on the general owner.
-        if mf_row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        if mf.row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             local_mf = False
         mf_row += 1
 
     owner = PGS_LOCAL_SOLVE_OWNER_GENERAL
     single_row_capacity = int(0)
     if primary_articulation >= 0:
-        single_row_capacity = wp.min(local_max_constraints, articulation_dof_count[primary_articulation])
+        single_row_capacity = wp.min(owners.max_rows, articulation_dof_count[primary_articulation])
     if row_count > 0 and mf_count == 0:
         if single_phase and row_count <= single_row_capacity:
             owner = PGS_LOCAL_SOLVE_OWNER_SINGLE
-        elif not single_phase and row_count <= local_max_constraints and pair_articulation >= 0:
+        elif not single_phase and row_count <= owners.max_rows and pair_articulation >= 0:
             owner = PGS_LOCAL_SOLVE_OWNER_PAIR
     if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (
         row_count > 0
-        and row_count <= local_residual_max_constraints
+        and row_count <= owners.residual_max_rows
         and residual_pair_articulation >= 0
         and ((mf_count == 0 and not single_phase) or local_mf)
     ):
         owner = PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL
-    local_solve_owner[world] = owner
+    owners.owner[world] = owner
     if owner == PGS_LOCAL_SOLVE_OWNER_GENERAL and (row_count > 0 or mf_count > 0):
-        general_index = wp.atomic_add(general_world_count, 0, 1)
-        general_worlds[general_index] = world
+        general_index = wp.atomic_add(owners.general_world_count, 0, 1)
+        owners.general_worlds[general_index] = world
 
 
 @wp.kernel

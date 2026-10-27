@@ -239,6 +239,7 @@ from .solver_fields import (
     VELOCITY_LIMIT_SLOTS,
     WORLD_RESPONSE,
     WORLD_ROW_STATE,
+    LocalOwners,
 )
 from .sparse_contact import (
     CONTACT_RECORD_FLOATS,
@@ -9967,25 +9968,13 @@ class SolverFeatherPGS(SolverBase):
                 classify_local_solve_worlds,
                 dim=self.world_count,
                 inputs=[
+                    bind_mf_rows(self),
+                    field_group.bind(LocalOwners, solver=self),
                     self.constraint_count,
                     self.dense_phase_bounds,
                     self.mf_constraint_count,
-                    self.mf_body_a,
-                    self.mf_body_b,
-                    self.mf_row_type,
                     self.body_to_articulation,
                     self.articulation_H_rows,
-                    self._local_primary_articulation,
-                    self._local_pair_articulation,
-                    self._local_residual_pair_articulation,
-                    self._local_solve_max_rows,
-                    self._local_residual_max_rows,
-                    self._local_residual_mf_max_rows,
-                ],
-                outputs=[
-                    self._local_solve_owner,
-                    self._local_general_world_count,
-                    self._local_general_worlds,
                 ],
                 device=model.device,
             )

@@ -6,7 +6,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import row_packets
+from newton._src.solvers.feather_pgs import field_group, row_packets
+from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -19,6 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     classify_local_solve_worlds,
     compact_local_pair_candidates,
 )
+from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
 from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
 
 
@@ -66,22 +68,26 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             classify_local_solve_worlds,
             dim=8,
             inputs=[
+                field_group.upload(MfRows, device, body_a=mf_body_a, body_b=mf_body_b, row_type=mf_row_type),
+                field_group.upload(
+                    LocalOwners,
+                    device,
+                    primary_articulation=primary,
+                    pair_articulation=pair,
+                    residual_pair_articulation=residual_pair,
+                    max_rows=20,
+                    residual_max_rows=40,
+                    residual_mf_max_rows=12,
+                    owner=owner,
+                    general_world_count=general_count,
+                    general_worlds=general_worlds,
+                ),
                 constraint_count,
                 phase_bounds,
                 mf_count,
-                mf_body_a,
-                mf_body_b,
-                mf_row_type,
                 body_to_articulation,
                 articulation_dof_count,
-                primary,
-                pair,
-                residual_pair,
-                20,
-                40,
-                12,
             ],
-            outputs=[owner, general_count, general_worlds],
             device=device,
         )
 
