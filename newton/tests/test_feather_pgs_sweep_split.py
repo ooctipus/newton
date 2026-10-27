@@ -21,20 +21,12 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_unit_sweeps, kernels
 from newton._src.solvers.feather_pgs import sweep_routes_split as routes
 from newton._src.solvers.feather_pgs.contact_unit import RING_BLOCK_SIZE
 from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBody6, Lanes, Velocity
 from newton._src.solvers.feather_pgs.sweep import FRICTION, RowContext, RowLaws, row_update
 
 CONTACT, DRIVE, LIMIT, VLIMIT, MIMIC, CONNECT, TORSION = 0, 1, 3, 4, 5, 6, 7
-
-_PAIRS = {
-    "loop": (kernels.pgs_solve_loop, routes.loop_kernel),
-    "loop_unit": (contact_unit_sweeps.pgs_solve_loop_unit, routes.loop_unit_kernel),
-    "mf_loop": (kernels.pgs_solve_mf_loop, routes.mf_loop_kernel),
-    "mf_loop_unit": (contact_unit_sweeps.pgs_solve_mf_loop_unit, routes.mf_loop_unit_kernel),
-}
 
 
 def _signature(kernel):
@@ -48,17 +40,14 @@ def _balanced(test, text):
 
 
 class TestSweepRoutesSplitABI(unittest.TestCase):
-    """The kernels take the replaced kernels' parameters, in order; the free-body loop solves the current friction."""
+    """The loop kernels' operands."""
 
-    def test_signatures_are_the_legacy_signatures(self):
-        for name, (old, new) in _PAIRS.items():
-            with self.subTest(sweep=name):
-                self.assertEqual(_signature(new()), _signature(old))
-
-    def test_research_friction_modes_are_not_implemented(self):
-        for mode in ("bisection", "bisection_desaxce", "coulomb_newton"):
-            with self.subTest(mode=mode), self.assertRaisesRegex(NotImplementedError, "matrix_free"):
-                routes.mf_loop_kernel(mode)
+    def test_unit_kernels_add_the_unit_operands(self):
+        plain, unit = _signature(routes.loop_kernel()), _signature(routes.loop_unit_kernel())
+        self.assertLess(len(plain), len(unit))
+        self.assertEqual([name for name, _ in plain if name not in dict(unit)], [])
+        mf, mf_unit = _signature(routes.mf_loop_kernel()), _signature(routes.mf_loop_unit_kernel())
+        self.assertEqual([name for name, _ in mf if name not in dict(mf_unit)], [])
 
 
 class TestSweepRoutesSplitSources(unittest.TestCase):
@@ -354,26 +343,35 @@ def _free_body_case(rng, unit):
             storage = _units(rng, worlds, capacity, options["offset"] > 0)
             inputs += [options["friction_start"], options["offset"], options["ring_units"], *storage]
         else:
-            inputs += [0, options["friction_start"], options["offset"]]
+            inputs += [options["friction_start"], options["offset"]]
         wp.launch(kernel, dim=worlds, inputs=inputs, outputs=[a["lam"], v], device="cpu")
         return [a["lam"].numpy(), v.numpy(), *(array.numpy() for array in storage)]
 
     return launch
 
 
-class TestSweepRoutesSplitEquivalence(unittest.TestCase):
-    """On the CPU every configuration reproduces the kernel it replaces, bit for bit."""
+_KERNELS = {
+    "loop": routes.loop_kernel,
+    "loop_unit": routes.loop_unit_kernel,
+    "mf_loop": routes.mf_loop_kernel,
+    "mf_loop_unit": routes.mf_loop_unit_kernel,
+}
+
+
+class TestSweepRoutesSplitRuns(unittest.TestCase):
+    """On the CPU every configuration sweeps random problems deterministically to finite impulses and velocities."""
 
     CASES = 6
 
     def _check(self, name, case):
-        old, new = _PAIRS[name]
         rng = np.random.default_rng(7)
         for index in range(self.CASES):
             launch = case(rng, name.endswith("_unit"))
             with self.subTest(sweep=name, case=index):
-                for reference, result in zip(launch(old), launch(new()), strict=True):
-                    self.assertEqual(reference.tobytes(), result.tobytes())
+                first, second = launch(_KERNELS[name]()), launch(_KERNELS[name]())
+                for a, b in zip(first, second, strict=True):
+                    self.assertEqual(a.tobytes(), b.tobytes())
+                    self.assertTrue(np.isfinite(a).all())
 
     def test_assembled_loop(self):
         self._check("loop", _dense_case)
@@ -414,9 +412,9 @@ class TestSweepRoutesSplitAssembly(unittest.TestCase):
     """The one source assembles for CUDA too."""
 
     def test_kernels_assemble(self):
-        for name, (_old, new) in _PAIRS.items():
+        for name, factory in _KERNELS.items():
             with self.subTest(sweep=name):
-                self.assertGreater(_assemble(new())["registers"], 0)
+                self.assertGreater(_assemble(factory())["registers"], 0)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,6 @@ def _validate_torsion_mode(solver):
         not solver.model.device.is_cuda
         or solver.model.requires_grad
         or solver.pgs_mode != "matrix_free"
-        or solver.friction_mode != "current"
         or solver.pgs_schedule != "interleaved"
         or solver.pgs_warmstart
         or solver.pgs_debug

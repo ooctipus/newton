@@ -9,8 +9,8 @@ from functools import cache
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sparse_factorization
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, lane_group
+from newton._src.solvers.feather_pgs.response_builds_rows import sparse_cholesky_source
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixIndices, factor_indices
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
@@ -24,7 +24,7 @@ def _factor_kernel(dofs, nonzeros):
     if(lane==0) status.data[0]=0;
     for(int entry=lane;entry<{nonzeros};entry+=stride)factor[entry]=matrix.data[entry];
     SYNC();
-    {sparse_factorization._sparse_cholesky_source(dofs, nonzeros)}
+    {sparse_cholesky_source(dofs, nonzeros)}
     SYNC();
     for(int entry=lane;entry<{nonzeros};entry+=stride)result.data[entry]=factor[entry];
 #endif
@@ -48,7 +48,7 @@ def _factor_kernel(dofs, nonzeros):
 class TestSparseFactorization(unittest.TestCase):
     def test_reject_invalid_mapping_contract(self):
         """Reject dimensions that cannot describe the emitted work."""
-        emit = sparse_factorization._sparse_cholesky_source
+        emit = sparse_cholesky_source
         for n, nz in [(0, 0), (65, 65), (4, 3), (4, 11)]:
             with self.subTest(n=n, nz=nz), self.assertRaises(ValueError):
                 emit(n, nz)

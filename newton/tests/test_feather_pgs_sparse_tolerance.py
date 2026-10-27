@@ -11,7 +11,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION, pgs_solve_loop
+from newton._src.solvers.feather_pgs import sweep_routes_split
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION
 from newton._src.solvers.feather_pgs.solve_policy import TRACE_GRID
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
@@ -120,7 +121,7 @@ def _first_solve_sweeps(model, contacts, sweeps, dt=0.005):
     history = [impulses.numpy().copy()]
     for sweep in range(sweeps):
         wp.launch(
-            pgs_solve_loop,
+            sweep_routes_split.loop_kernel(),
             dim=solver.world_count,
             inputs=[
                 solver.constraint_count,

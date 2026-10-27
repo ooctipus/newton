@@ -28,7 +28,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from . import field_group
+from . import field_group, sweep_routes_local
 from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
@@ -251,8 +251,6 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
 @cache
 def get_local_factory(primary: int, secondary: int, packets: int):
     """Bind the packet layout to the shared local row-input interface."""
-    from . import solver_feather_pgs as solver  # noqa: PLC0415 - avoid constructor import cycles
-
     inputs = CompactLocalRows(
         primary,
         secondary,
@@ -261,7 +259,7 @@ def get_local_factory(primary: int, secondary: int, packets: int):
         PREFIX_WIDTH,
         (RowArgument("prefix", PrefixData), RowArgument("packets", ContactPacketData)),
     )
-    return partial(solver._get_pgs_solve_local_owned_kernel, row_inputs=inputs)
+    return partial(sweep_routes_local.local_owned_kernel, row_inputs=inputs)
 
 
 def validate_prefix_topology(
@@ -388,67 +386,6 @@ def materialize_general_prefix(
                         if prefix.dofs[world, row, component] == dof:
                             value += prefix.weights[world, row, component]
                 J[group, row, dof] = value
-
-
-@wp.kernel
-def general_response(
-    workers: int,
-    queue: QueueData,
-    group_start: wp.array[int],
-    group_art: wp.array[int],
-    art_group: wp.array[int],
-    world_offset: wp.array[int],
-    size: int,
-    L: wp.array3d[float],
-    J: wp.array3d[float],
-    Y: wp.array3d[float],
-    J_world: wp.array3d[float],
-    Y_world: wp.array3d[float],
-):
-    """Retain the ordinary per-row triangular response for the complete fallback."""
-    worker, lane = wp.tid()
-    for entry in range(worker, queue.general_count[0], workers):
-        world = queue.general[entry]
-        for item in range(group_start[world], group_start[world + 1]):
-            art = group_art[item]
-            group = art_group[art]
-            for row in range(lane, queue.count[world], warp_stride()):
-                for i in range(size):
-                    value = J[group, row, i]
-                    for k in range(i):
-                        value -= L[group, i, k] * Y[group, row, k]
-                    diagonal = L[group, i, i]
-                    Y[group, row, i] = value / diagonal if diagonal != 0.0 else 0.0
-                for reverse in range(size):
-                    i = size - 1 - reverse
-                    value = Y[group, row, i]
-                    for k in range(i + 1, size):
-                        value -= L[group, k, i] * Y[group, row, k]
-                    diagonal = L[group, i, i]
-                    Y[group, row, i] = value / diagonal if diagonal != 0.0 else 0.0
-                for i in range(size):
-                    J_world[world, row, world_offset[art] + i] = J[group, row, i]
-                    Y_world[world, row, world_offset[art] + i] = Y[group, row, i]
-
-
-@wp.kernel
-def general_diag(
-    workers: int,
-    prefix: PrefixData,
-    queue: QueueData,
-    world_dofs: wp.array[int],
-    J: wp.array3d[float],
-    Y: wp.array3d[float],
-):
-    """Publish the general response diagonal plus CFM; private diagonals stay seeded."""
-    worker, lane = wp.tid()
-    for entry in range(worker, queue.general_count[0], workers):
-        world = queue.general[entry]
-        for row in range(lane, queue.count[world], warp_stride()):
-            value = float(0.0)
-            for dof in range(world_dofs[world]):
-                value += J[world, row, dof] * Y[world, row, dof]
-            prefix.diag[world, row] = value + prefix.row_cfm[world, row]
 
 
 @wp.func
@@ -1065,9 +1002,11 @@ class LocalRowPackets:
 
     def response(self, size):
         """Run the held-L response on the compact general-world queue."""
+        from .response_builds_dense import response_queue_kernel  # noqa: PLC0415 - the build reads this module
+
         solver = self.solver
         wp.launch_tiled(
-            general_response,
+            response_queue_kernel(),
             dim=[self.workers],
             inputs=[
                 self.workers,
@@ -1089,9 +1028,11 @@ class LocalRowPackets:
 
     def diagonal(self):
         """Keep private CFM seeds and finalize only complete general response diagonals."""
+        from .response_builds_dense import diagonal_queue_kernel  # noqa: PLC0415 - the build reads this module
+
         solver = self.solver
         wp.launch_tiled(
-            general_diag,
+            diagonal_queue_kernel(),
             dim=[self.workers],
             inputs=[self.workers, self.prefix, self.queue, solver.world_dof_count, solver.J_world, solver.Y_world],
             block_dim=32,
@@ -1116,7 +1057,6 @@ def create_owner(solver):
         and solver.pgs_mode == "matrix_free"
         and solver.drive_mode == "augmented"
         and solver.pgs_schedule == "interleaved"
-        and solver.friction_mode == "current"
         and not solver.enable_joint_velocity_limits
         and solver.enable_joint_limits
         and solver.pgs_velocity_iterations == 0

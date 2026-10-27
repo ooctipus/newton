@@ -15,16 +15,16 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     apply_world_contact_restitution_matrix_free,
     compute_world_contact_bias,
-    finalize_world_diag_cfm,
     populate_world_J_for_compact_size,
     prepare_world_contact_rows,
 )
-from newton._src.solvers.feather_pgs.sparse_contact import (
-    _get_sparse_contact_response_kernel,
-    apply_sparse_factor_velocity,
-    build_sparse_joint_limit_rows,
-    finalize_sparse_joint_limit_rows,
+from newton._src.solvers.feather_pgs.response_builds_dense import cfm_worlds_kernel
+from newton._src.solvers.feather_pgs.response_builds_rows import (
+    factor_contact_rows_kernel,
+    factor_limit_rows_kernel,
+    factor_publish_kernel,
 )
+from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
@@ -222,7 +222,7 @@ class TestSparseContacts(unittest.TestCase):
             diag=diagonal,
         )
         wp.launch(
-            _get_sparse_contact_response_kernel(dofs, lanes_per_contact=lanes),
+            factor_contact_rows_kernel(dofs, lanes_per_contact=lanes),
             dim=workers * lanes,
             inputs=[
                 data,
@@ -434,7 +434,7 @@ class TestSparseContacts(unittest.TestCase):
                     **law,
                 )
                 wp.launch(
-                    _get_sparse_contact_response_kernel(
+                    factor_contact_rows_kernel(
                         6, lanes_per_contact=lanes, prepare_rows=prepare_rows, use_support_table=use_support_table
                     ),
                     dim=workers * lanes,
@@ -515,7 +515,7 @@ class TestSparseContacts(unittest.TestCase):
                         np.pad(np.sum(expected**2, axis=1)[None], ((0, 0), (0, 2)), constant_values=-9)
                     )
                     wp.launch(
-                        finalize_world_diag_cfm,
+                        cfm_worlds_kernel(),
                         dim=1,
                         inputs=[count, reference[4], array([0], int), 0],
                         outputs=[reference_diag],
@@ -646,7 +646,7 @@ class TestSparseContacts(unittest.TestCase):
             device=device,
         )
         wp.launch(
-            finalize_world_diag_cfm,
+            cfm_worlds_kernel(),
             dim=3,
             inputs=[prefix_count, rows.row_cfm, array([0, 0, 0], int), 0],
             outputs=[reference_diag],
@@ -687,7 +687,7 @@ class TestSparseContacts(unittest.TestCase):
                 dof = _full((1, capacity, 6), -9, int)
                 factor = _full((1, capacity, 6), -9.0)
                 wp.launch(
-                    build_sparse_joint_limit_rows,
+                    factor_limit_rows_kernel,
                     dim=32,
                     inputs=[
                         f["group"],
@@ -794,7 +794,7 @@ class TestSparseContacts(unittest.TestCase):
             support.row_class.fill_(-9)
         outputs = [counter, row_type, parent, mu, beta, cfm, phi, target, row_dof, row_factor, incident, diagonal]
         wp.launch(
-            build_sparse_joint_limit_rows,
+            factor_limit_rows_kernel,
             dim=worlds * 32,
             inputs=[
                 array(group_to_art, int),
@@ -940,7 +940,7 @@ class TestSparseContacts(unittest.TestCase):
         delta = np.arange(6, dtype=np.float32) * 0.17 - 0.4
         out = _full(6, -9.0)
         wp.launch(
-            apply_sparse_factor_velocity,
+            factor_publish_kernel,
             dim=(1, 6),
             inputs=[
                 f["group"],

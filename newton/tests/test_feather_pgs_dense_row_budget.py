@@ -12,10 +12,8 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     SolverFeatherPGS,
-    _get_pgs_solve_tiled_row_kernel,
-    _tiled_row_shared_bytes,
-    _tiled_row_staging,
 )
+from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel, tiled_row_source, tiled_row_staging
 
 
 class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
@@ -23,9 +21,9 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
         """Create three disjoint storage budgets without changing the launch signature."""
         for capacity in (64, 128):
             with self.subTest(capacity=capacity):
-                baseline = _get_pgs_solve_tiled_row_kernel(capacity, 120)
+                baseline = tiled_row_kernel(capacity, 120)
                 kernels = [
-                    _get_pgs_solve_tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
+                    tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
                     for budget, minimum in ((16, 0), (32, 16), (capacity, 32))
                 ]
                 self.assertEqual(len({kernel.key for kernel in [baseline, *kernels]}), 4)
@@ -45,40 +43,37 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
         ):
             with self.subTest(capacity=capacity, budget=budget, minimum=minimum):
                 with self.assertRaises(ValueError):
-                    _get_pgs_solve_tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
+                    tiled_row_kernel(capacity, 120, row_budget=budget, min_rows=minimum)
 
     def test_default_capacity_names(self):
         """Retain the default kernel identity for previously supported capacities."""
         for capacity in (32, 64, 96, 128):
-            self.assertEqual(_get_pgs_solve_tiled_row_kernel(capacity, 120).key, f"pgs_solve_tiled_row_{capacity}")
+            self.assertEqual(tiled_row_kernel(capacity, 120).key, f"sweep_tiled_row_{capacity}")
 
     def test_staging_follows_device_shared_memory(self):
-        """Stage the Delassus triangle in shared memory only while it fits a block's shared memory on the device.
+        """Stage the Delassus triangle in shared memory only while it fits a block's static budget on the device.
 
-        The opt-in limits are the RTX PRO 6000's (sm_120) and the GB300's; ptxas reports the shared-staging
-        blocks of 224 and 384 rows at 0x19f40 and 0x4a780 bytes.
+        The budgets are the RTX PRO 6000's (sm_120) and the GB300's static shared memory per block; ptxas reports the
+        shared-staging blocks of 224 and 384 rows at 0x19f40 and 0x4a780 bytes.
         """
-        self.assertEqual(_tiled_row_shared_bytes(224, "shared"), 0x19F40)
-        self.assertEqual(_tiled_row_shared_bytes(384, "shared"), 0x4A780)
-        rtx_pro_6000 = SimpleNamespace(max_shared_memory_per_block=101376)
-        gb300 = SimpleNamespace(max_shared_memory_per_block=232448)
-        for capacity, device, staging in (
+        self.assertEqual(tiled_row_source(224, staging="shared")[1].bytes, 0x19F40)
+        self.assertEqual(tiled_row_source(384, staging="shared")[1].bytes, 0x4A780)
+        rtx_pro_6000, gb300 = 100352, 231424
+        for capacity, limit, staging in (
             (192, rtx_pro_6000, "shared"),
             (224, rtx_pro_6000, "global"),
             (256, gb300, "shared"),
             (384, gb300, "global"),
         ):
-            with self.subTest(capacity=capacity, limit=device.max_shared_memory_per_block):
-                selected, reason = _tiled_row_staging(capacity, device)
+            with self.subTest(capacity=capacity, limit=limit):
+                selected, reason = tiled_row_staging(capacity, limit)
                 self.assertEqual(selected, staging)
-                self.assertIn(str(device.max_shared_memory_per_block), reason)
+                self.assertIn(str(limit), reason)
         with self.assertRaisesRegex(ValueError, "pgs_kernel='loop'"):
-            _tiled_row_staging(8192, rtx_pro_6000)
-        self.assertEqual(
-            _get_pgs_solve_tiled_row_kernel(384, 120, staging="global").key, "pgs_solve_tiled_row_384_global"
-        )
+            tiled_row_staging(8192, rtx_pro_6000)
+        self.assertEqual(tiled_row_kernel(384, 120, staging="global").key, "sweep_tiled_row_384_global")
         with self.assertRaises(ValueError):
-            _get_pgs_solve_tiled_row_kernel(64, 120, row_budget=32, staging="global")
+            tiled_row_kernel(64, 120, row_budget=32, staging="global")
 
     def test_dispatch_preserves_arguments(self):
         """Keep one default launch or two partition launches with the original arguments."""
@@ -191,7 +186,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
         values = [wp.array(value, device=device) for value in arrays]
         snapshots = [value.numpy() for value in values]
         counts, diag, matrix, rhs, initial, types, parents, mu, weights = values
-        original = _get_pgs_solve_tiled_row_kernel(capacity, device.arch)
+        original = tiled_row_kernel(capacity, device.arch)
         reference = wp.clone(initial)
 
         def launch(kernel, impulses):
@@ -224,7 +219,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
             with self.subTest(partition=partition, graph=graph):
                 result = wp.clone(initial)
                 kernels = [
-                    _get_pgs_solve_tiled_row_kernel(capacity, device.arch, row_budget=budget, min_rows=minimum)
+                    tiled_row_kernel(capacity, device.arch, row_budget=budget, min_rows=minimum)
                     for budget, minimum in partition
                 ]
                 # Compile before capture, then restore the original warm impulses.
@@ -278,7 +273,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                 for staging in ("shared", "global"):
                     impulses = wp.clone(initial)
                     wp.launch_tiled(
-                        _get_pgs_solve_tiled_row_kernel(capacity, device.arch, staging=staging),
+                        tiled_row_kernel(capacity, device.arch, staging=staging),
                         dim=[len(arrays[0])],
                         inputs=[counts, diag, matrix, rhs, impulses, 8, 1.0, types, parents, mu, weights, 0, 2, 0],
                         block_dim=32,
@@ -358,9 +353,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     counts, diag, matrix, rhs, initial, types, parents, mu, weights = values
                     for budget, minimum in ((16, 0), (32, 0), (32, 16)):
                         result = wp.clone(initial)
-                        kernel = _get_pgs_solve_tiled_row_kernel(
-                            capacity, device.arch, row_budget=budget, min_rows=minimum
-                        )
+                        kernel = tiled_row_kernel(capacity, device.arch, row_budget=budget, min_rows=minimum)
                         wp.launch_tiled(
                             kernel,
                             dim=[len(arrays[0])],
@@ -375,10 +368,10 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     expected = wp.clone(initial)
                     result = wp.clone(initial)
                     for target, kernel in (
-                        (expected, _get_pgs_solve_tiled_row_kernel(capacity, device.arch)),
+                        (expected, tiled_row_kernel(capacity, device.arch)),
                         (
                             result,
-                            _get_pgs_solve_tiled_row_kernel(capacity, device.arch, row_budget=capacity, min_rows=32),
+                            tiled_row_kernel(capacity, device.arch, row_budget=capacity, min_rows=32),
                         ),
                     ):
                         wp.launch_tiled(

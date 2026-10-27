@@ -6,10 +6,10 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import response_builds_rows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
     compute_world_contact_bias,
 )
@@ -376,7 +376,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
         )
     elif family == "mf_setup":
         wp.launch(
-            compute_mf_effective_mass_and_rhs,
+            response_builds_rows.free_body_rows_kernel,
             dim=3,
             inputs=[
                 count,

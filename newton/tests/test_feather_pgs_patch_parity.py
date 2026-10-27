@@ -12,11 +12,11 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes_split
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    pgs_solve_loop,
 )
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_split as split
@@ -182,7 +182,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         diag = wp.ones((1, capacity), dtype=float, device="cpu")
         matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device="cpu")
         inputs = [count, capacity, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, mu, 0, 0, 0]
-        wp.launch(pgs_solve_loop, dim=1, inputs=inputs, device="cpu")
+        wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=inputs, device="cpu")
         solved = impulses.numpy()
         np.testing.assert_allclose(solved[0, :7], [0, 1, 0, 4, 0, 1, 0], atol=1.0e-6)
         stand_in = SimpleNamespace(

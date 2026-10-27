@@ -14,8 +14,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_LIMIT as LIMIT
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
@@ -125,7 +125,6 @@ def _solver(model, enabled, **overrides):
         "pgs_schedule": "interleaved",
         "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
-        "friction_mode": "current",
         "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,
         "pgs_velocity_iterations": 0,
@@ -432,9 +431,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 data["iterations"] = np.array(iterations)
 
                 def full_order(capacity, dofs, width, **_kwargs):
-                    return _get_pgs_solve_sparse_kernel(
-                        capacity, dofs, width, active_rows=False, use_support_table=True
-                    )
+                    return sparse_kernel(capacity, dofs, width, active_rows=False, use_support_table=True)
 
                 with mock.patch.object(triplet_tests, "factory", full_order):
                     solve = triplet_tests.DeviceSolve(data, candidate=False)
@@ -459,7 +456,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 dense_c = np.zeros((3, 32, 32), np.float32)
                 dense_c[:, :count, :count] = j @ response.T
                 dense_impulses = wp.array(data["initial_impulses"], device="cuda:0")
-                kernel = _get_pgs_solve_tiled_row_kernel(32, str(wp.get_device("cuda:0").arch))
+                kernel = tiled_row_kernel(32, str(wp.get_device("cuda:0").arch))
                 wp.launch_tiled(
                     kernel,
                     dim=[3],

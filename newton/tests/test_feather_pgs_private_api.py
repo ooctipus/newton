@@ -5,25 +5,44 @@ import ast
 import unittest
 from pathlib import Path
 
-_TILED_KERNEL_HELPERS = (
-    "_get_pack_mf_meta_kernel",
-    "_get_pgs_solve_mf_gs_kernel",
-    "_get_cholesky_kernel",
-    "_get_triangular_solve_kernel",
-    "_get_hinv_jt_kernel",
-    "_get_hinv_jt_plain_kernel",
-    "_get_hinv_jt_fused_kernel",
-    "_get_delassus_kernel",
-    "_get_pgs_solve_tiled_row_kernel",
-    "_get_pgs_solve_mf_kernel",
+_FEATHER_PGS = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
+
+# Kernel factories: cached, so that a variant is built once per process.
+_KERNEL_FACTORIES = {
+    "solver_feather_pgs.py": ("_get_triangular_solve_kernel",),
+    "response_builds_dense.py": (
+        "factor_warps_kernel",
+        "factor_tiles_kernel",
+        "inverse_lanes_kernel",
+        "response_warps_kernel",
+        "response_tiles_kernel",
+        "response_pairs_kernel",
+        "delassus_stream_kernel",
+        "delassus_tiles_kernel",
+    ),
+    "response_builds_rows.py": (
+        "free_body_meta_kernel",
+        "factor_contact_rows_kernel",
+        "sparse_factor_kernel",
+        "paired_components_kernel",
+    ),
+}
+# The factories whose kernel depends on the device it is built for: the CPU's serial form, the device's budget.
+_DEVICE_KERNEL_FACTORIES = (
+    ("response_builds_dense.py", "response_pairs_kernel"),
+    ("response_builds_dense.py", "delassus_stream_kernel"),
 )
+
+
+def _top_level_functions(module: str) -> dict:
+    tree = ast.parse((_FEATHER_PGS / module).read_text())
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
 
 
 class TestFeatherPGSPrivateApi(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        solver_path = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs" / "solver_feather_pgs.py"
-        cls.solver_module = ast.parse(solver_path.read_text())
+        cls.solver_module = ast.parse((_FEATHER_PGS / "solver_feather_pgs.py").read_text())
         cls.top_level_functions = {
             node.name: node for node in cls.solver_module.body if isinstance(node, ast.FunctionDef)
         }
@@ -46,33 +65,42 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         class_names = {node.name for node in self.solver_module.body if isinstance(node, ast.ClassDef)}
         self.assertNotIn("TiledKernelFactory", class_names)
 
-    def test_tiled_kernel_helpers_are_private_cached_functions(self):
-        for helper_name in _TILED_KERNEL_HELPERS:
-            with self.subTest(helper_name=helper_name):
-                self.assertIn(helper_name, self.top_level_functions)
-                helper = self.top_level_functions[helper_name]
-                decorator_names = {
-                    decorator.id for decorator in helper.decorator_list if isinstance(decorator, ast.Name)
+    def test_kernel_factories_are_cached(self):
+        for module, names in _KERNEL_FACTORIES.items():
+            functions = _top_level_functions(module)
+            for name in names:
+                with self.subTest(module=module, factory=name):
+                    self.assertIn(name, functions)
+                    decorators = {ast.unparse(decorator) for decorator in functions[name].decorator_list}
+                    self.assertTrue(decorators & {"cache", "functools.cache"}, decorators)
+
+    def test_device_dependent_factories_take_the_device(self):
+        for module, name in _DEVICE_KERNEL_FACTORIES:
+            with self.subTest(module=module, factory=name):
+                factory = _top_level_functions(module)[name]
+                parameters = {
+                    arg.arg for arg in [*factory.args.posonlyargs, *factory.args.args, *factory.args.kwonlyargs]
                 }
-                parameters = {arg.arg for arg in [*helper.args.posonlyargs, *helper.args.args, *helper.args.kwonlyargs]}
-                self.assertIn("cache", decorator_names)
                 self.assertIn("device_arch", parameters)
 
-    def test_plain_hinv_jt_kernel_omits_diagonal_output(self):
-        plain_factory = self.top_level_functions["_get_hinv_jt_plain_kernel"]
-        diagonal_factory = self.top_level_functions["_get_hinv_jt_kernel"]
-        plain_template = next(node for node in plain_factory.body if isinstance(node, ast.FunctionDef))
-        diagonal_template = next(node for node in diagonal_factory.body if isinstance(node, ast.FunctionDef))
+    def test_plain_response_tiles_kernel_omits_diagonal_output(self):
+        factory = _top_level_functions("response_builds_dense.py")["response_tiles_kernel"]
+        templates = {node.name: node for node in factory.body if isinstance(node, ast.FunctionDef)}
+        diagonal_branch = next(
+            node for node in factory.body if isinstance(node, ast.If) and ast.unparse(node.test) == "compute_diag"
+        )
+        diagonal_template = next(node for node in diagonal_branch.body if isinstance(node, ast.FunctionDef))
+        plain_template = templates["hinv_jt_plain_template"]
 
-        diagonal_factory_parameters = {argument.arg for argument in diagonal_factory.args.args}
+        factory_parameters = {argument.arg for argument in factory.args.args}
         plain_parameters = {argument.arg for argument in plain_template.args.args}
         diagonal_parameters = {argument.arg for argument in diagonal_template.args.args}
         plain_names = {node.id for node in ast.walk(plain_template) if isinstance(node, ast.Name)}
-        diagonal_names = {node.id for node in ast.walk(diagonal_factory) if isinstance(node, ast.Name)}
+        diagonal_names = {node.id for node in ast.walk(diagonal_branch) if isinstance(node, ast.Name)}
 
         self.assertNotIn("diag_group", plain_parameters)
         self.assertNotIn("diag_tile", plain_names)
-        self.assertIn("compute_diag", diagonal_factory_parameters)
+        self.assertIn("compute_diag", factory_parameters)
         self.assertIn("COMPUTE_DIAG", diagonal_names)
         self.assertIn("diag_group", diagonal_parameters)
         self.assertIn("diag_tile", diagonal_names)
@@ -82,7 +110,7 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         size_group_loop = self._find_size_group_loop(init_method)
         first_dense_continue = self._first_dense_guard_continue_line(size_group_loop)
 
-        for helper_name in ("_get_cholesky_kernel", "_get_triangular_solve_kernel"):
+        for helper_name in ("factor_tiles_kernel", "_get_triangular_solve_kernel"):
             with self.subTest(helper_name=helper_name):
                 call_line = self._first_call_line(size_group_loop, helper_name)
                 if first_dense_continue is not None:
@@ -122,7 +150,12 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         call_lines = [
             child.lineno
             for child in ast.walk(node)
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == function_name
+            if isinstance(child, ast.Call)
+            and function_name
+            in (
+                getattr(child.func, "id", None),  # a module-level helper
+                getattr(child.func, "attr", None),  # a build module's factory
+            )
         ]
         if not call_lines:
             raise AssertionError(f"{function_name} is not called while initializing tiled kernels")

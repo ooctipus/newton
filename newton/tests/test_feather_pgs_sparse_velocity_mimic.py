@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import dense_rows, field_group, sparse_contact
+from newton._src.solvers.feather_pgs import dense_rows, field_group, response_builds_rows, sparse_contact
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as MIMIC
@@ -71,7 +71,7 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
                 row_dof = full((2, 2, dofs), -9, int)
                 factors = full((2, 2, dofs), -9.0)
                 wp.launch(
-                    sparse_contact.build_sparse_mimic_rows,
+                    response_builds_rows.factor_mimic_rows_kernel,
                     dim=64,
                     block_dim=128,
                     device=device,

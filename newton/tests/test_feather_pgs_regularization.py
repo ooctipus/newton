@@ -10,10 +10,10 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes_split
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     compute_world_contact_bias,
-    pgs_solve_mf_loop,
 )
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
@@ -93,7 +93,7 @@ def _solve_rows(device, n_rows, g, iterations=300):
     mf_impulses = wp.zeros((1, m), dtype=wp.float32)
     v_out = wp.zeros(6, dtype=wp.float32)
     wp.launch(
-        pgs_solve_mf_loop,
+        sweep_routes_split.mf_loop_kernel(),
         dim=1,
         inputs=[
             wp.array([n_rows], dtype=wp.int32),
@@ -114,7 +114,6 @@ def _solve_rows(device, n_rows, g, iterations=300):
             iterations,
             1.0,  # omega
             1,  # regularize
-            0,  # friction_mode
             iterations,  # friction_start_iteration (no friction rows)
             0,  # iteration_offset
             mf_impulses,

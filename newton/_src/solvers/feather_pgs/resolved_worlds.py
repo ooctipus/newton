@@ -662,7 +662,6 @@ def supported(solver) -> bool:
         "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
         "pgs_schedule": "interleaved",
-        "friction_mode": "current",
         "pgs_velocity_iterations": 0,
         "_mimic_count": 0,
         "_connect_count": 0,

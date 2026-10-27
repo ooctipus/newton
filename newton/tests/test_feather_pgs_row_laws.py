@@ -13,7 +13,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels, row_laws
+from newton._src.solvers.feather_pgs import kernels, response_builds_rows, row_laws
 from newton.tests.feather_pgs_law_harness import (
     call,
     joint_type,
@@ -234,7 +234,8 @@ def _law_mf_position_rhs(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal ``compute_mf_effective_mass_and_rhs``: the contact law with its bodies' depenetration cap and weights."""
+    """Equal the free-body rows' build (``free_body_rows_kernel``): the contact law with its bodies' depenetration cap
+    and weights."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
@@ -257,7 +258,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     }
     hinv = np.tile(np.eye(6, dtype=np.float32), (2 * worlds, 1, 1))
     out = call(
-        kernels.compute_mf_effective_mass_and_rhs,
+        response_builds_rows.free_body_rows_kernel,
         worlds * rows,
         device,
         mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
@@ -283,9 +284,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
     test.assertLessEqual(
-        unified(
-            "mf rhs (compute_mf_effective_mass_and_rhs)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0
-        ),
+        unified("mf rhs (free_body_rows_kernel)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
         2.0,
     )
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.

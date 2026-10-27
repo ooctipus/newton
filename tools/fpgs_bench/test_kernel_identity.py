@@ -174,16 +174,16 @@ class TestKernelIdentity(unittest.TestCase):
 
     def test_census_hashes_admitted_combinations_and_summarizes_rejections(self):
         """Hash every admitted flag combination of a factory, labeled by its non-default flags; count rejections."""
-        rows, rejected = identity.census(("_get_pgs_solve_paired_factor_kernel",))
+        rows, rejected = identity.census(("sweep_routes_local.paired_factor_kernel",))
         self.assertEqual(len(rows), 6)
-        self.assertIn("solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120')", rows)
+        self.assertIn("sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120')", rows)
         self.assertTrue(
             all(set(row) == {"family", "key", "hash"} and row["family"] == "census" for row in rows.values())
         )
-        self.assertEqual(list(rejected), ["solver_feather_pgs._get_pgs_solve_paired_factor_kernel [census]"])
+        self.assertEqual(list(rejected), ["sweep_routes_local.paired_factor_kernel [census]"])
         self.assertRegex(next(iter(rejected.values())), r"^2 rejected, labels [0-9a-f]{16}: 2 x ValueError: ")
         # A call another family records keeps its code digests there.
-        skipped, _ = identity.census(("_get_pgs_solve_paired_factor_kernel",), skip=rows.keys())
+        skipped, _ = identity.census(("sweep_routes_local.paired_factor_kernel",), skip=rows.keys())
         self.assertEqual(skipped, {})
 
     def test_census_crosses_the_velocity_limit_laws(self):
@@ -193,7 +193,7 @@ class TestKernelIdentity(unittest.TestCase):
         its row loads, so a refactor can be exact under the default and change the other variant.
         Labels omit a keyword at its default, so the default variants keep their labels.
         """
-        factories = ("_get_pgs_solve_mf_gs_incremental_kernel",)
+        factories = ("sweep_routes.incremental_kernel",)
         rows, _ = identity.census(factories)
         for factory in factories:
             with self.subTest(factory=factory):
@@ -202,9 +202,7 @@ class TestKernelIdentity(unittest.TestCase):
                 self.assertTrue(accumulated)
                 self.assertEqual(2 * len(accumulated), len(labels))
                 self.assertFalse([key for key in labels if "velocity_limit_law='stateless'" in key])
-        calls = [
-            kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("_get_pgs_solve_mf_gs_kernel")
-        ]
+        calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.mf_gs_kernel")]
         self.assertTrue(any(kwargs["resident_row_metadata"] and not kwargs["shared_metadata"] for kwargs in calls))
         self.assertEqual({kwargs["velocity_limit_law"] for kwargs in calls}, {"stateless", "accumulated"})
 

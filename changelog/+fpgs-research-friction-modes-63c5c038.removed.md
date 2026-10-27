@@ -1,0 +1,1 @@
+Remove the research friction laws of `SolverFeatherPGS` and its `friction_mode` parameter: `"bisection"`, `"bisection_desaxce"` and `"coulomb_newton"` are gone, and the default `"current"` friction step is the only law. Omit `friction_mode`.

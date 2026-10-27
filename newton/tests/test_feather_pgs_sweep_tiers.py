@@ -11,7 +11,6 @@ compiles offline next to the legacy kernel.
 import contextlib
 import functools
 import importlib.util
-import itertools
 import shutil
 import sys
 import unittest
@@ -19,7 +18,6 @@ from pathlib import Path
 from unittest import mock
 
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep_routes_tiers
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import Block, CholeskySolve, Lanes
@@ -34,7 +32,6 @@ from newton._src.solvers.feather_pgs.sweep import (
     jacobi_sweeps,
 )
 
-_LEGACY = solver._get_pgs_solve_parallel_kernel
 _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
 
 _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
@@ -117,21 +114,9 @@ def _source(args, kwargs) -> str:
 
 
 class TestParallelTier(unittest.TestCase):
-    """The emitter's tier against the legacy factory: arguments, ABI, dispatch, descriptor and errors."""
+    """The tier's options, sources and votes."""
 
-    def test_abi_dispatch_and_descriptor_match_the_legacy_factory(self):
-        for label, args, kwargs in CALLS:
-            with self.subTest(label):
-                legacy, tier = _tier(_LEGACY, args, kwargs), _tier(_TIER, args, kwargs)
-                self.assertEqual(tier.kernel.native_params, legacy.kernel.native_params)
-                self.assertEqual(tier.kernel.signature, legacy.kernel.signature)
-                self.assertEqual(tier.kernel.dispatch, legacy.kernel.dispatch)
-                for field in ("block_dim", "tier", "response_inputs", "kinetic_rows", "linked_rows"):
-                    self.assertEqual(getattr(tier, field), getattr(legacy, field), field)
-                for field in ("velocity_limit_pass", "velocity_limit_law", "sweeps"):
-                    self.assertEqual(getattr(tier, field), getattr(legacy, field), field)
-
-    def test_options_raise_like_the_legacy_factory(self):
+    def test_invalid_options_raise(self):
         args = (64, 32, 18, "120")
         invalid = (
             {"rows": 0, "sweeps": 1},
@@ -146,20 +131,10 @@ class TestParallelTier(unittest.TestCase):
         )
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs):
-                with self.assertRaises(ValueError) as legacy:
-                    _tier(_LEGACY, args, kwargs)
-                with self.assertRaises(ValueError) as emitter:
+                with self.assertRaises(ValueError):
                     _tier(_TIER, args, kwargs)
-                self.assertEqual(str(emitter.exception), str(legacy.exception))
         with self.assertRaisesRegex(ValueError, "rows above 96 need the matrix-free variant"):
             _tier(_TIER, (128, 32, 18, "120"), {"rows": 100, "sweeps": 1})
-
-    def test_tier_sweeps_is_the_solver_budget(self):
-        for rows, iterations, sweeps in itertools.product((32, 64, 96, 128), (1, 8, 12, 32, 64), (0, 24, 200)):
-            self.assertEqual(
-                sweep_routes_tiers.tier_sweeps(rows, iterations, sweeps),
-                solver._auto_tier_sweeps(rows, iterations, sweeps),
-            )
 
     def test_worlds_are_entered_as_the_incremental_tier_enters_them(self):
         incremental, _ = sweep_routes.incremental_source(64, 18, incremental_rows=32, skip_local_internal_worlds=True)
@@ -288,18 +263,15 @@ def _kernel_sass():
 
 @unittest.skipIf(_kernel_sass() is None, "the CUDA toolkit (ptxas, cuobjdump) is not on PATH")
 class TestOfflineCompile(unittest.TestCase):
-    """Legacy and emitter tiers compile for the RTX PRO 6000 (sm_120) without stack or local memory, the emitter's
-    shared memory at most the legacy's (whose factors take a spare float each)."""
+    """The tiers compile for the RTX PRO 6000 (sm_120) without stack or local memory."""
 
     def test_tiers_compile(self):
         sass = _kernel_sass()
         for label, args, kwargs in CALLS[:5]:
             with self.subTest(label):
-                legacy, tier = _LEGACY(*args, **kwargs), sweep_routes_tiers.parallel_kernel(*args, **kwargs)
-                old = sass.compile_kernel(legacy.kernel, arch=120, block_dim=legacy.block_dim)
+                tier = sweep_routes_tiers.parallel_kernel(*args, **kwargs)
                 new = sass.compile_kernel(tier.kernel, arch=120, block_dim=tier.block_dim)
-                self.assertLessEqual(new["shared"], old["shared"])
-                self.assertEqual(new["stack"], old["stack"])
+                self.assertEqual(new["stack"], 0)
                 self.assertEqual(new["local"], 0)
 
 

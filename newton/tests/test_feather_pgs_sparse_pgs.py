@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 
 _SWEEP_CASES = ((0, 0, 1.0), (3, 1, 0.7), (3, 4, 1.2))
 
@@ -247,14 +247,14 @@ def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
 class TestFeatherPGSSparsePGS(unittest.TestCase):
     def test_support_table_factory(self):
         """Build the same ordered solver with shared topology indices."""
-        kernel = _get_pgs_solve_sparse_kernel(16, 6, 4, active_rows=True, use_support_table=True)
+        kernel = sparse_kernel(16, 6, 4, active_rows=True, use_support_table=True)
         self.assertIn("support_table", kernel.key)
 
     def test_factory_rejects_free_body_rows(self):
         """Reject physical free-body rows, which native sparse factors never hold."""
         for options in ({"mf_max_constraints": 1}, {"free_row_dofs": 1}):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, "free-body rows"):
-                _get_pgs_solve_sparse_kernel(16, 6, 4, **options)
+                sparse_kernel(16, 6, 4, **options)
 
     def test_factor_coordinate_residual_and_cross_term(self):
         """Preserve physical residuals and paired-tangent effective mass."""
@@ -524,7 +524,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         row_support.class_dof = wp.array(unique, dtype=int, device=device)
                         row_support.row_class = wp.array(row_class.reshape(worlds, capacity), dtype=int, device=device)
                         packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
-                    kernel = _get_pgs_solve_sparse_kernel(
+                    kernel = sparse_kernel(
                         capacity,
                         dofs,
                         support,
@@ -583,7 +583,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         )
                     if linked_rows and not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)):
                         # Without a linked normal the ring walk selects as the point scan does.
-                        point_kernel = _get_pgs_solve_sparse_kernel(
+                        point_kernel = sparse_kernel(
                             capacity,
                             dofs,
                             support,
@@ -598,7 +598,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         np.testing.assert_array_equal(delta.numpy(), actual)
                         np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
                     if use_support_table:
-                        packed_kernel = _get_pgs_solve_sparse_kernel(
+                        packed_kernel = sparse_kernel(
                             capacity,
                             dofs,
                             support,

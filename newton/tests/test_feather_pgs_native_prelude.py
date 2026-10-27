@@ -27,12 +27,12 @@ from newton._src.solvers.feather_pgs.device_preludes import (
     lane_group,
 )
 from newton._src.solvers.feather_pgs.law_source import LawFamily
-from newton._src.solvers.feather_pgs.projection_laws import COULOMB_LAW, PROJECTION_LAW
+from newton._src.solvers.feather_pgs.projection_laws import PROJECTION_LAW
 from newton._src.solvers.feather_pgs.row_laws import ROW_LAW
 
 _PACKAGE = "newton._src.solvers.feather_pgs"
 # Law families whose structs native sweeps call (``Family::law(...)``).
-_FAMILIES = (CONTACT_LAW, ROW_LAW, PROJECTION_LAW, COULOMB_LAW)
+_FAMILIES = (CONTACT_LAW, ROW_LAW, PROJECTION_LAW)
 # Helper names a body may call only after declaring the prelude that defines them.
 _HELPERS = {
     **{f"{family.name}::": family.name for family in _FAMILIES},

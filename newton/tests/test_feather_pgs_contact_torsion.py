@@ -538,7 +538,6 @@ class TestContactTorsion(unittest.TestCase):
             {"contact_torsion_shape_indices": (), "contact_torsion_shape_patterns": ()},
             {"pgs_warmstart": True},
             {"pgs_velocity_iterations": 1, "enable_bilateral_preelimination": True},
-            {"friction_mode": "bisection"},
             {"pgs_debug": True},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):

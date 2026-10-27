@@ -155,7 +155,6 @@ def _make_solver(model, sparse, **overrides):
         "pgs_mode": "matrix_free",
         "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
-        "friction_mode": "current",
         "pgs_iterations": 32,
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,

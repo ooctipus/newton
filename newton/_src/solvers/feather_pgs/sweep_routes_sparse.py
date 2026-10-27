@@ -20,7 +20,7 @@ caller decodes it. A configuration chooses:
   velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit with
   the run-time impulse tolerances (``change_tolerance``, ``relative_change_tolerance``) under the solve policy.
 
-:func:`sparse_kernel` takes the arguments of the factory it replaces (``sparse_pgs._get_pgs_solve_sparse_kernel``)
+:func:`sparse_kernel` takes the arguments of the factory it replaces (``sweep_routes_sparse.sparse_kernel``)
 and builds a kernel of its ABI, dispatch and launch bounds, so a launch site can take either kernel unchanged.
 """
 
@@ -41,7 +41,6 @@ from .row_inputs import RowArgument
 from .solve_policy import EXACT_POLICY, SolvePolicy
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .sparse_pgs import _SPARSE_CONTACT_METRIC_CACHE_SIZE, CONTACT_TRANSACTIONS, contact_transaction_launch_bounds
 from .staging import Buffer, Staging
 from .sweep import (
     CONTACT,
@@ -57,6 +56,30 @@ from .sweep import (
     velocity_limit_pass,
 )
 from .velocity_limit_law import check_velocity_limit_law
+
+_SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
+_SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
+CONTACT_TRANSACTIONS = ("auto", "single", "staged")
+"""Triplet transactions of the sparse sweep; ``auto`` is ``single`` for linked rows, else ``staged``."""
+CONTACT_TRANSACTION_BLOCKS = (16, 14)
+"""Minimum resident blocks a single-stage sweep of at most 128 rows may request; 16 is the default."""
+
+
+def contact_transaction_launch_bounds(max_constraints: int, *, transaction_blocks: int = 16) -> tuple[int, int]:
+    """Return the launch bounds of a single-stage triplet sweep: 64 threads, minimum blocks per SM.
+
+    Above 128 rows, shared memory admits 12 blocks of two worlds; at or below,
+    ``transaction_blocks`` (one of :data:`CONTACT_TRANSACTION_BLOCKS`) sets the
+    register budget.
+
+    Args:
+        max_constraints: Row capacity per world.
+        transaction_blocks: Minimum resident blocks requested at or below 128 rows.
+    """
+    if transaction_blocks not in CONTACT_TRANSACTION_BLOCKS:
+        raise ValueError(f"transaction_blocks must be one of {CONTACT_TRANSACTION_BLOCKS}")
+    return 64, 12 if int(max_constraints) > 128 else int(transaction_blocks)
+
 
 SPARSE_ABI = kernel_template.params(
     ("world", int),

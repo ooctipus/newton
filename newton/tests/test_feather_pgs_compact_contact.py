@@ -14,7 +14,13 @@ import warp as wp
 import newton
 from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
-from newton._src.solvers.feather_pgs import contact_input, field_group, kernels
+from newton._src.solvers.feather_pgs import (
+    contact_input,
+    field_group,
+    kernels,
+    response_builds_dense,
+    response_builds_rows,
+)
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
@@ -27,7 +33,7 @@ from newton.tests.feather_pgs_patch_parity import (
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 
-_FIELDS = (*CONTACT_INPUT, *compact.COMPACT_BOUNDARY)
+_FIELDS = (*CONTACT_INPUT, *response_builds_rows.COMPACT_BOUNDARY)
 """The fields of the compact producer's two structs."""
 
 
@@ -35,7 +41,7 @@ def structs(data):
     """The producer's contact input and compact boundary, bound from the fixture's fields."""
     return tuple(
         field_group.bind(struct, **{field.name: getattr(data, field.name) for field in field_group.fields_of(struct)})
-        for struct in (ContactInput, compact.CompactBoundary)
+        for struct in (ContactInput, response_builds_rows.CompactBoundary)
     )
 
 
@@ -265,12 +271,12 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
     launch(kernels.prepare_world_contact_rows, 16)
     launch(kernels.populate_world_J_for_compact_size, (16, 32))
     values["target_size"] = 108
-    launch(kernels.populate_sparse_diagonal_contact_response, 16)
-    launch(kernels.hinv_jt_par_row, 80)
+    launch(response_builds_rows.sparse_pair_contact_rows_kernel, 16)
+    launch(response_builds_dense.response_rows_kernel(), 80)
     data.diag.zero_()
-    launch(kernels.diag_from_JY_par_art, 80)
-    launch(kernels.accumulate_sparse_diagonal_response_diag, 80)
-    launch(kernels.finalize_world_diag_cfm, 2)
+    launch(response_builds_dense.diagonal_rows_kernel(), 80)
+    launch(response_builds_rows.sparse_pair_diagonal_kernel, 80)
+    launch(response_builds_dense.cfm_worlds_kernel(), 2)
 
 
 def run_candidate(data, aux, law=None):
@@ -291,7 +297,7 @@ def run_candidate(data, aux, law=None):
     else:
         wp.launch(compact.produce_patch_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
     wp.launch(
-        compact.produce_limit_response,
+        response_builds_rows.sparse_pair_limit_kernel,
         dim=(2, 12),
         inputs=[
             aux.bounds,
@@ -604,7 +610,7 @@ def check_compact_records(test, solvers, law):
         if arm == "sparse_diagonal":
             metadata = "prepare_world_contact_rows"
             expected = {
-                "108": ("sparse_diagonal", [metadata, "populate_sparse_diagonal_contact_response", marker]),
+                "108": ("sparse_diagonal", [metadata, "sparse_pair_contact_rows_kernel", marker]),
                 "6": ("compact_jacobian", [metadata, "populate_world_J_for_compact_size"]),
             }
         else:
@@ -1061,7 +1067,7 @@ class TestCompactContact(unittest.TestCase):
                     )
                     wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(candidate)], device=device)
                     wp.launch(
-                        compact.produce_limit_response,
+                        response_builds_rows.sparse_pair_limit_kernel,
                         dim=(2, 12),
                         inputs=[
                             aux.bounds,

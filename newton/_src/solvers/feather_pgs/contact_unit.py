@@ -89,6 +89,28 @@ import warp as wp
 
 from .device_preludes import DevicePrelude, substitute
 
+CONTACT_UPDATES = ("sequential", "unit")
+"""The contact updates a sweep can apply (``SolverFeatherPGS(contact_update=...)``)."""
+
+CONTACT_UNIT_STATE_FIELDS = 3
+"""Per-row unit state: slide root, last applied load change, latch factor."""
+
+
+def check_contact_update(update: str, *, source: str = "contact_update") -> str:
+    """Return ``update`` when it names a contact update.
+
+    Args:
+        update: The requested contact update.
+        source: The argument or environment variable that supplied ``update``, named in the error.
+
+    Raises:
+        ValueError: If ``update`` is not one of :data:`CONTACT_UPDATES`.
+    """
+    if update not in CONTACT_UPDATES:
+        raise ValueError(f"{source} must be one of {CONTACT_UPDATES}, got {update!r}")
+    return update
+
+
 CONTACT_UNIT_RING_NORMALS = 8
 """Most normal rows of a ring unit; a larger ring solves its anchors as anchor units."""
 CONTACT_UNIT_RING_ANCHORS = 2

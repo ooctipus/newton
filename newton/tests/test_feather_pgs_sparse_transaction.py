@@ -22,13 +22,10 @@ from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
-from newton._src.solvers.feather_pgs.sparse_contact import (
-    CONTACT_RECORD_FLOATS,
-    CONTACT_RING_FLOATS,
-    _get_sparse_contact_response_kernel,
-)
+from newton._src.solvers.feather_pgs.response_builds_rows import factor_contact_rows_kernel
+from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import row_supports
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel, contact_transaction_launch_bounds
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import contact_transaction_launch_bounds, sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.feather_pgs_patch_parity import standing_model
@@ -179,7 +176,7 @@ class TestContactRecordBuilder(unittest.TestCase):
             **law,
         )
         wp.launch(
-            _get_sparse_contact_response_kernel(6, lanes_per_contact=lanes, **options),
+            factor_contact_rows_kernel(6, lanes_per_contact=lanes, **options),
             dim=workers * lanes,
             inputs=[
                 data,
@@ -272,8 +269,8 @@ class TestContactRecordBuilder(unittest.TestCase):
         """Build records only beside prepared rows with the support table, whose routes leave the slot free."""
         for options in ({"use_support_table": True}, {"prepare_rows": True}, {}):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, "records"):
-                _get_sparse_contact_response_kernel(6, contact_records=True, **options)
-        kernel = _get_sparse_contact_response_kernel(6, prepare_rows=True, use_support_table=True, contact_records=True)
+                factor_contact_rows_kernel(6, contact_records=True, **options)
+        kernel = factor_contact_rows_kernel(6, prepare_rows=True, use_support_table=True, contact_records=True)
         self.assertTrue(kernel.key.endswith("_prepared_support_table_contact_records"))
 
 
@@ -290,7 +287,7 @@ class TestSingleStageTransaction(unittest.TestCase):
             self.assertEqual(bounds, (64, 12 if capacity > 128 else blocks))
             with self.subTest(capacity=capacity, blocks=blocks):
                 kernels = {
-                    (law, transaction): _get_pgs_solve_sparse_kernel(
+                    (law, transaction): sparse_kernel(
                         capacity,
                         18,
                         12,
@@ -315,7 +312,7 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertIs(kernels[("patch", "auto")], kernels[("patch", "auto")])
         for options in ({"contact_transaction": "fused"}, {"transaction_blocks": 12}):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                _get_pgs_solve_sparse_kernel(64, 18, 12, **TRIPLETS, **options)
+                sparse_kernel(64, 18, 12, **TRIPLETS, **options)
         # The block request is an option, so it is keyword-only.
         with self.assertRaises(TypeError):
             contact_transaction_launch_bounds(96, 14)
@@ -330,17 +327,12 @@ class TestSingleStageTransaction(unittest.TestCase):
         for linked in (False, True):
             with self.subTest(linked=linked):
                 single = _snippet(
-                    _get_pgs_solve_sparse_kernel(
-                        256, 18, 12, linked_rows=linked, contact_transaction="single", **TRIPLETS
-                    )
+                    sparse_kernel(256, 18, 12, linked_rows=linked, contact_transaction="single", **TRIPLETS)
                 )
                 staged = _snippet(
-                    _get_pgs_solve_sparse_kernel(
-                        256, 18, 12, linked_rows=linked, contact_transaction="staged", **TRIPLETS
-                    )
+                    sparse_kernel(256, 18, 12, linked_rows=linked, contact_transaction="staged", **TRIPLETS)
                 )
                 for text in (
-                    "metric_storage",
                     "metric_map",
                     "metric_count",
                     "friction_pair_cached(",
@@ -349,8 +341,8 @@ class TestSingleStageTransaction(unittest.TestCase):
                     self.assertIn(text, staged)
                     self.assertNotIn(text, single)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked
-                self.assertIn(f"normal / 3) * {width}" if linked else f"row / 3) * {width}", single)
-                start = single.index("if (row == consumed_tangent) continue;")
+                self.assertRegex(single, rf"(normal|i) / 3\) \* {width}")
+                start = single.index("const int tangent_parent = world_row_parent.data[offset + tangent];")
                 transaction = single[start : single.index("consumed_tangent = tangent;", start)]
                 # One reduction of the three residuals together, and no other.
                 self.assertEqual(transaction.count("SUM("), 1)
@@ -370,9 +362,9 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertIn("SYNC();", transaction)
                 reduction = transaction.index("SUM(")
                 barrier = transaction.index("SYNC();")
-                self.assertLess(transaction.index("old_tangent = impulse[tangent]"), reduction)
-                self.assertLess(transaction.index("old_normal = impulse[row]"), reduction)
-                self.assertLess(barrier, transaction.index("if (lane == 0) impulse[row] = new_normal;"))
+                self.assertLess(transaction.index("old_tangent = s_impulse[tangent]"), reduction)
+                self.assertLess(transaction.index("old_normal = s_impulse[i]"), reduction)
+                self.assertLess(barrier, transaction.index("if (lane == 0) s_impulse[i] = new_normal;"))
                 self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", transaction[barrier:]), [])
 
     def test_request_follows_the_law_and_the_flag_cpu(self):

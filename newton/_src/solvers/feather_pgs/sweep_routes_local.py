@@ -109,6 +109,52 @@ def _check_local_options(
         raise ValueError("subwarp local solve groups require a contactless world with at most 16 DoFs")
 
 
+def local_staging(
+    local_max_constraints: int,
+    dof_count: int,
+    paired_dof_count: int = 0,
+    *,
+    warps_per_block: int = 1,
+    lanes_per_world: int = 32,
+    contact_capable: bool = True,
+    local_mf_max_constraints: int = 0,
+) -> Staging:
+    """The shared working set of a local owner's block: per lane group the factors, the rows' Jacobians, responses,
+    impulses and metadata, the velocity, the paired free body's impulses and the packed response block.
+
+    The solver admits an owner, and sizes its blocks, from it (:meth:`.Staging.fits` against
+    :func:`.staging.arch_budget`).
+    """
+    R, P, S, MFR, L = (
+        int(local_max_constraints),
+        int(dof_count),
+        int(paired_dof_count),
+        int(local_mf_max_constraints),
+        int(lanes_per_world),
+    )
+    T, block_rows = P + S, R + MFR
+    return Staging(
+        (
+            Buffer("s_L", "float", P * P),
+            *((Buffer("s_L_secondary", "float", S * S),) if S else ()),
+            Buffer("s_J", "float", R * T),
+            Buffer("s_Y", "float", R * T),
+            Buffer("s_v", "float", T),
+            *(Buffer(name, "float", R) for name in ("s_lam", "s_rhs", "s_inv_diag")),
+            Buffer("s_type", "int", R),
+            Buffer("s_active", "int", R),
+            *((Buffer("s_parent", "int", R), Buffer("s_mu", "float", R)) if contact_capable else ()),
+            *((Buffer("s_mf_lam", "float", MFR),) if MFR else ()),
+            Buffer("s_A", "float", block_rows * (block_rows + 1) // 2),
+            Buffer("s_res", "float", block_rows),
+            Buffer("s_app", "float", block_rows),
+        ),
+        groups=int(warps_per_block) * 32 // L,
+        threads=32 * int(warps_per_block),
+        name="LocalScratch",
+    )
+
+
 def local_owned_source(
     max_constraints: int,
     local_max_constraints: int,
@@ -120,7 +166,6 @@ def local_owned_source(
     contact_capable: bool = True,
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
-    dense_response_matrix: bool = False,
     row_inputs=None,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, Staging]:
@@ -138,12 +183,6 @@ def local_owned_source(
     M, R, P, S = int(max_constraints), int(local_max_constraints), int(dof_count), int(paired_dof_count)
     T, MFS, MFR, L = P + S, int(mf_max_constraints), int(local_mf_max_constraints), int(lanes_per_world)
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
-    if not dense_response_matrix:
-        raise NotImplementedError(
-            "the local owners solve over the in-kernel response block (dense_response_matrix=True); the per-row "
-            "velocity form (dense_response_matrix=False) is test-only and a phase-(b) deletion"
-        )
-    groups = warps_per_block * 32 // L
     lanes = Lanes(L)
     free = FreeBody6(lanes) if MFR else None
     laws = RowLaws(regularize=contact_capable, policy=solve_policy)
@@ -158,26 +197,14 @@ def local_owned_source(
         free=free,
         inverse=lambda row: "inverse_diagonal" if row == "i" else f"s_inv_diag[{row}]",
     )
-    block_rows = R + MFR
-    staging = Staging(
-        (
-            Buffer("s_L", "float", P * P),
-            *((Buffer("s_L_secondary", "float", S * S),) if S else ()),
-            Buffer("s_J", "float", R * T),
-            Buffer("s_Y", "float", R * T),
-            Buffer("s_v", "float", T),
-            *(Buffer(name, "float", R) for name in ("s_lam", "s_rhs", "s_inv_diag")),
-            Buffer("s_type", "int", R),
-            Buffer("s_active", "int", R),
-            *((Buffer("s_parent", "int", R), Buffer("s_mu", "float", R)) if contact_capable else ()),
-            *((Buffer("s_mf_lam", "float", MFR),) if MFR else ()),
-            Buffer("s_A", "float", block_rows * (block_rows + 1) // 2),
-            Buffer("s_res", "float", block_rows),
-            Buffer("s_app", "float", block_rows),
-        ),
-        groups=groups,
-        threads=32 * warps_per_block,
-        name="LocalScratch",
+    staging = local_staging(
+        R,
+        P,
+        S,
+        warps_per_block=warps_per_block,
+        lanes_per_world=L,
+        contact_capable=contact_capable,
+        local_mf_max_constraints=MFR,
     )
 
     primary_read = f"J_group.data[group_j_base + row * {P} + i]"
@@ -385,7 +412,6 @@ def local_owned_kernel(
     contact_capable: bool = True,
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
-    dense_response_matrix: bool = False,
     row_inputs=None,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
@@ -404,7 +430,6 @@ def local_owned_kernel(
         contact_capable=contact_capable,
         mf_max_constraints=mf_max_constraints,
         local_mf_max_constraints=local_mf_max_constraints,
-        dense_response_matrix=dense_response_matrix,
         row_inputs=row_inputs,
         solve_policy=solve_policy,
     )

@@ -17,30 +17,27 @@ applied into velocities outside the sweeps. This module holds the builds and pub
 - :class:`.response_operator.SparseFactor` (rows ``Z = L^-1 P J^T`` packed by support): the internal rows' unit
   columns of ``L^-1`` (position limits, velocity limits, mimic), and the publication ``v = v_hat + P^T L^-T u`` of a
   world's factor-coordinate velocity change;
-- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): ``Z = L^-1
-  J^T`` with ``A_ii = |Z|^2 + cfm`` in a world without free-body rows, ``Y = L^-T Z`` with ``A_ii = J Y + cfm``
-  otherwise, and the held form ``L^T Y`` of physical rows;
+- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the held form
+  ``L^T Y`` of physical rows (the rows themselves are the DenseJY pairs build,
+  :func:`.response_builds_dense.response_pairs_kernel`);
 
 and :class:`BilateralElimination`, the Schur transform of a :class:`.response_operator.DenseJY` build that folds a
 world's bilateral block into the responses of its other rows.
 
 **API.** Each operator class returns its build from ``build()`` (``FreeBody6.build()``, ``SparsePairJY.build()``,
 ``SparseFactor.build()``, ``FactorRows.build()``): a frozen descriptor whose members are the Warp kernels (or cached
-factories of kernel variants, or a Warp function) of each step of the build and of the publication. A member keeps
-the parameters, order and dispatch of the kernel or factory it replaces, so a launch site takes either unchanged;
-:data:`DROP_INS` maps each replaced module global to its member. The arithmetic of a step is one function per
-representation and mapping, called by every kernel that runs the step:
+factories of kernel variants, or a Warp function) of each step of the build and of the publication; the solver's
+launch sites call them directly. The arithmetic of a step is one function per representation and mapping, called by
+every kernel that runs the step:
 
-- the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``bilateral_product``...):
-  a Warp kernel keeps the expression tree of the code it replaces, bit for bit on both devices, and its adjoint;
+- the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``bilateral_product``...),
+  one expression tree on both devices, with its adjoint;
 - the native kernels call the operator's emitters (:meth:`.FreeBody6.pack` writes the row word that
   :meth:`.FreeBody6.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
-  :class:`.SparseFactor` reads; :meth:`.FactorRows.forward` and :meth:`.FactorRows.transposed` are the factor
-  products of a lane per coordinate).
+  :class:`.SparseFactor` reads; :meth:`.FactorRows.transposed` is the factor product of a lane per coordinate).
 
-Where two sites of a step differ only by accident (the order of an operation, a guard), the step keeps each site's
-form, chosen by a compile-time argument, and its documentation names the difference: the forms are unified when the
-replaced sites are removed.
+Where two forms of a step differ only by accident (the order of an operation, a guard), the step keeps each form,
+chosen by a compile-time argument, and its documentation names the difference for their unification.
 """
 
 from __future__ import annotations
@@ -52,8 +49,7 @@ from functools import cache
 import warp as wp
 
 from ...sim import BodyFlags
-from . import kernel_template
-from .compact_contact import CompactBoundary, _Vec6, solve_six
+from . import field_group, kernel_template
 from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
@@ -70,6 +66,7 @@ from .contact_laws import (
 )
 from .dense_rows import DenseRows
 from .device_preludes import cuda_native, dual_native, lane_group
+from .field_group import Field
 from .friction_patches import FrictionPatches, patch_friction_location
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .kernels import (
@@ -87,6 +84,7 @@ from .kernels import (
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .projection_laws import PROJECTION_LAW
+from .response_builds_dense import _Vec6, solve_six
 from .response_operator import FactorComponent, FactorRows, FreeBody6, Lanes
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
 from .row_metadata import _validate_mf_metadata_encoding
@@ -535,7 +533,7 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
 
     A warp per world (``wp.launch_tiled`` over the worlds, 32 threads), a lane per row; the word holds the rows'
     world coordinates, stored inverse diagonal, right-hand side, type and parent. CUDA only. ``device_arch`` keys
-    the variant as the replaced factory's does.
+    the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBody6().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
@@ -616,6 +614,24 @@ FREE_BODY6 = FreeBody6Build(
 # (its sparse slots ``s``: a world coordinate, ``J_s`` and ``Y_s = J_s / m_s``). An endpoint has a slot when its
 # articulation has the sparse size and its body a single response coordinate; two slots on one coordinate merge
 # into the first. ``A_ii = (J Y + sum_s J_s Y_s) + cfm``.
+
+
+COMPACT_BOUNDARY = (
+    Field("body_single_dof", wp.int32, ("body",), attr="body_single_response_dof"),
+    Field("dof_offset", wp.int32, ("articulation",), attr="articulation_world_dof_offset"),
+    Field("inverse_mass", wp.float32, ("dof",), attr="_diagonal_inverse_mass"),
+    Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
+    Field("factor", wp.float32, ("group", 6, 6), owner="six"),
+    Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),
+    Field("J", wp.float32, ("group", "row", 6), owner="six"),
+    Field("Y", wp.float32, ("group", "row", 6), owner="six"),
+    Field("sparse_dof", wp.int32, ("world", "row", 2), attr="_sparse_diagonal_row_dof"),
+    Field("sparse_jy", wp.float32, ("world", "row", 4), attr="_sparse_diagonal_row_jy"),
+)
+"""What the compact boundary producer writes besides the contact input's row records: each row's dense-six
+Jacobian and response (by the six-DOF size group's factor) and its two sparse response coordinates."""
+
+CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name__)
 
 
 @wp.func
@@ -741,7 +757,7 @@ def sparse_pair_diagonal(
 @wp.func
 def sparse_pair_dense(factor: wp.array3d[float], group: int, jacobian: _Vec6):
     """The dense part's response ``Y = H^-1 J^T`` through the group's compact six-coordinate factor
-    (:func:`.compact_contact.solve_six`) and its term ``J Y`` of the diagonal, from zero in coordinate order."""
+    (:func:`.response_builds_dense.solve_six`) and its term ``J Y`` of the diagonal, from zero in coordinate order."""
     response = solve_six(factor, group, jacobian)
     diagonal = float(0.0)
     for dof in range(6):
@@ -2515,204 +2531,12 @@ SPARSE_FACTOR = SparseFactorBuild(
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
-# secondary group), each a diagonal block of ``H = L L^T`` with the inverse factor ``L^-1``. A row's Jacobian ``j``
-# spans both blocks, a lane per coordinate (the primary's lanes first). Its factor row is ``z = L^-1 j``
-# (:meth:`.FactorRows.forward`): a world without free-body rows sweeps in factor coordinates, with ``Y_world = z``
-# and ``A_ii = |z|^2 + cfm``; a world with free-body rows needs physical rows, ``y = L^-T z``
-# (:meth:`.FactorRows.transposed`) and ``A_ii = j y + cfm``. Physical rows are later moved into the held form
-# ``L^T y`` where a world qualifies as independent components (:func:`paired_components_kernel`).
-
-
-def _paired_blocks(primary: int, secondary: int, staged: bool) -> FactorRows:
-    """The pair's two diagonal blocks, a lane per coordinate (``lane``), their inverse factors staged in shared
-    arrays (``staged``) or read from the groups' arrays."""
-    if staged:
-        blocks = (
-            FactorComponent(primary, "0", "primary_lane", "", "s_primary_Linv", "0", staged=True),
-            FactorComponent(secondary, str(primary), "secondary_lane", "", "s_secondary_Linv", "0", staged=True),
-        )
-    else:
-        blocks = (
-            FactorComponent(primary, "0", "primary_lane", "", "primary_Linv", f"primary_group * {primary * primary}"),
-            FactorComponent(
-                secondary,
-                str(primary),
-                "secondary_lane",
-                "",
-                "secondary_Linv",
-                f"secondary_group * {secondary * secondary}",
-            ),
-        )
-    return FactorRows(primary + secondary, blocks, Lanes(32, "lane"))
-
-
-def _serial_product(
-    matrix: Callable[[str, str], str], source: str, out: str, offset: int, size: int, *, transposed: bool
-) -> str:
-    """One thread's ``out[offset + d] += M[d][k] x[offset + k]`` over ``k <= d`` (or ``M[k][d]`` over ``k >= d``
-    with ``transposed``), each coordinate's terms in increasing ``k``: the lanes' order of :class:`.FactorRows`."""
-    if transposed:
-        terms = f"for (int k = d; k < {size}; ++k)\n                {out}[{offset} + d] += {matrix('k', 'd')} * {source}[{offset} + k];"
-    else:
-        terms = f"for (int k = 0; k <= d; ++k)\n                {out}[{offset} + d] += {matrix('d', 'k')} * {source}[{offset} + k];"
-    return f"        for (int d = 0; d < {size}; ++d)\n            {terms}"
-
-
-@cache
-def paired_rows_kernel(
-    primary_dofs: int,
-    secondary_dofs: int,
-    max_constraints: int,
-    max_world_dofs: int,
-    device_arch: str,
-    warps_per_block: int = 4,
-    *,
-    factor_coordinates: bool = False,
-) -> wp.Kernel:
-    """Build a pair's rows in factor coordinates: a warp per row, one pair per block (the CPU runs the rows serially).
-
-    Each row's ``z = L^-1 j`` and, in a world with free-body rows, ``y = L^-T z``; ``J_world = j``, ``Y_world`` the
-    world's row (``z`` or ``y``) and ``A_ii`` its diagonal plus the row's ``cfm``. The physical response of a pair
-    (``factor_coordinates=False``: ``y = H^-1 j`` with the blocks' explicit inverses) is a DenseJY build.
-    """
-    if not factor_coordinates:
-        raise NotImplementedError("the physical paired response y = H^-1 j is a DenseJY build")
-    P, S, M, W = int(primary_dofs), int(secondary_dofs), int(max_constraints), int(max_world_dofs)
-    T = P + S
-    if T > 32:
-        raise ValueError("paired warp response requires at most 32 total DOFs")
-    if warps_per_block <= 0 or warps_per_block > 32:
-        raise ValueError("warps_per_block must be in [1, 32]")
-    cpu = str(device_arch) == "cpu"
-    rows = _paired_blocks(P, S, staged=True)
-
-    def primary(row, col):
-        return f"primary_Linv.data[primary_group * {P * P} + {row} * {P} + {col}]"
-
-    def secondary(row, col):
-        return f"secondary_Linv.data[secondary_group * {S * S} + {row} * {S} + {col}]"
-
-    source = f"""
-    __shared__ float s_primary_Linv[{P * P}];
-    __shared__ float s_secondary_Linv[{S * S}];
-    const int lane = LANE & 31;
-
-    const int secondary_group = secondary_group_by_primary.data[primary_group];
-    const int primary_art = primary_group_to_art.data[primary_group];
-    const int secondary_art = secondary_group_to_art.data[secondary_group];
-    const int world = art_to_world.data[primary_art];
-    const bool factor_world = world_mf_constraint_count.data[world] == 0;
-    int n_constraints = world_constraint_count.data[world];
-    if (n_constraints > {M}) n_constraints = {M};
-    if (n_constraints <= 0) return;
-    const int primary_offset = articulation_world_dof_offset.data[primary_art];
-    const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
-    for (int element = LANE; element < {P * P}; element += STRIDE)
-        s_primary_Linv[element] = primary_Linv.data[primary_group * {P * P} + element];
-    for (int element = LANE; element < {S * S}; element += STRIDE)
-        s_secondary_Linv[element] = secondary_Linv.data[secondary_group * {S * S} + element];
-    SYNC();
-{rows.lanes_of("    ")[0]}
-{rows.lanes_of("    ")[1]}
-
-    for (int constraint = WARP; constraint < n_constraints; constraint += WARPS) {{
-        const int world_row = (world * {M} + constraint) * {W};
-        float j = 0.0f;
-        if (lane < {P}) {{
-            const int row = (primary_group * {M} + constraint) * {P};
-            j = primary_J.data[row + lane];
-        }} else if (lane < {T}) {{
-            const int row = (secondary_group * {M} + constraint) * {S};
-            j = secondary_J.data[row + secondary_lane];
-        }}
-        float y = 0.0f;
-{rows.forward("Linv", "j", "z", "        ")}
-        if (!factor_world) {{
-{rows.transposed("Linv", "z", "y", "            ", declare=False)}
-        }}
-        if (lane < {P}) {{
-            J_world.data[world_row + primary_offset + lane] = j;
-            Y_world.data[world_row + primary_offset + lane] = factor_world ? z : y;
-        }} else if (lane < {T}) {{
-            J_world.data[world_row + secondary_offset + secondary_lane] = j;
-            Y_world.data[world_row + secondary_offset + secondary_lane] = factor_world ? z : y;
-        }}
-        float diagonal = lane < {T} ? (factor_world ? z * z : j * y) : 0.0f;
-        SUM(diagonal);
-        if (lane == 0) {{
-            const int diag_index = world * {M} + constraint;
-            world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
-        }}
-    }}
-#else
-    const int secondary_group = secondary_group_by_primary.data[primary_group];
-    const int primary_art = primary_group_to_art.data[primary_group];
-    const int secondary_art = secondary_group_to_art.data[secondary_group];
-    const int world = art_to_world.data[primary_art];
-    const int m = wp::min(world_constraint_count.data[world], {M});
-    const int po = articulation_world_dof_offset.data[primary_art];
-    const int so = articulation_world_dof_offset.data[secondary_art];
-    const bool factor_world = world_mf_constraint_count.data[world] == 0;
-    for (int row = 0; row < m; ++row) {{
-        float j[{T}], z[{T}], y[{T}];
-        for (int d = 0; d < {T}; ++d) {{
-            j[d] = d < {P} ? primary_J.data[(primary_group * {M} + row) * {P} + d]
-                : secondary_J.data[(secondary_group * {M} + row) * {S} + d - {P}];
-            z[d] = 0.0f;
-            y[d] = 0.0f;
-        }}
-{_serial_product(primary, "j", "z", 0, P, transposed=False)}
-{_serial_product(secondary, "j", "z", P, S, transposed=False)}
-        if (!factor_world) {{
-{_serial_product(primary, "z", "y", 0, P, transposed=True)}
-{_serial_product(secondary, "z", "y", P, S, transposed=True)}
-        }}
-        float diagonal = 0.0f;
-        for (int d = 0; d < {T}; ++d) {{
-            const int coord = d < {P} ? po + d : so + d - {P};
-            const int index = (world * {M} + row) * {W} + coord;
-            J_world.data[index] = j[d];
-            Y_world.data[index] = factor_world ? z[d] : y[d];
-            diagonal += factor_world ? z[d] * z[d] : j[d] * y[d];
-        }}
-        world_diag.data[world * {M} + row] = diagonal + world_row_cfm.data[world * {M} + row];
-    }}
-#endif
-"""
-    block_dim = 32 * warps_per_block
-    return KernelTemplate(
-        f"paired_factor_rows_{P}_{S}_{M}_bd{block_dim}",
-        kernel_template.params(
-            ("primary_Hinv", wp.array3d[float]),
-            ("primary_Linv", wp.array3d[float]),
-            ("primary_J", wp.array3d[float]),
-            ("primary_group_to_art", wp.array[int]),
-            ("secondary_Hinv", wp.array3d[float]),
-            ("secondary_Linv", wp.array3d[float]),
-            ("secondary_J", wp.array3d[float]),
-            ("secondary_group_to_art", wp.array[int]),
-            ("secondary_group_by_primary", wp.array[int]),
-            ("art_to_world", wp.array[int]),
-            ("articulation_world_dof_offset", wp.array[int]),
-            ("world_constraint_count", wp.array[int]),
-            ("world_mf_constraint_count", wp.array[int]),
-            ("world_row_cfm", wp.array2d[float]),
-            ("J_world", wp.array3d[float]),
-            ("Y_world", wp.array3d[float]),
-            ("world_diag", wp.array2d[float]),
-        ),
-        source,
-        dispatch=Dispatch(
-            "primary_group, lane = wp.tid()\nif wp.static(cpu):\n    if lane != 0:\n        return\n$CALL",
-            ("primary_group",),
-            (("primary_group", int),),
-            constants=(("cpu", cpu),),
-        ),
-        preludes=(lane_group(32 * warps_per_block),),
-        native_name="paired_factor_rows_native",
-    ).kernel()
-
-
+# secondary group), each a diagonal block of ``H = L L^T`` with the inverse factor ``L^-1``. Its rows' factor rows
+# ``z = L^-1 j`` (``Y_world = z``, ``A_ii = |z|^2 + cfm`` in a world without free-body rows) or physical rows
+# ``y = L^-T z`` (``A_ii = j y + cfm`` otherwise) are the DenseJY ``("response", "pairs")`` build
+# (:func:`.response_builds_dense.response_pairs_kernel`). Physical rows move into the held form ``L^T y`` where a
+# world qualifies as independent components (:func:`paired_components_kernel`).
+#
 # A paired world's qualification as independent components: every current row of the world is valid and touches
 # only its own component (dense rows the articulation's coordinates, free-body rows the body's), its pair structure
 # intact; a qualified world's rows move into the held form (``$CONVERT``) and its selector turns negative (zero: no
@@ -2849,72 +2673,15 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
 
 @dataclasses.dataclass(frozen=True)
 class FactorRowsBuild:
-    """The build of a pair's factor rows (:class:`.response_operator.FactorRows`).
+    """The build of a pair's held rows (:class:`.response_operator.FactorRows`); the rows themselves are the
+    DenseJY ``("response", "pairs")`` build (:func:`.response_builds_dense.response_pairs_kernel`).
 
     Attributes:
-        paired: The factory of the rows' build in factor coordinates (:func:`paired_rows_kernel`).
         components: The factory of the qualification and held-form conversion (:func:`paired_components_kernel`).
     """
 
-    paired: Callable[..., wp.Kernel]
     components: Callable[..., wp.Kernel]
 
 
-FACTOR_ROWS = FactorRowsBuild(paired=paired_rows_kernel, components=paired_components_kernel)
+FACTOR_ROWS = FactorRowsBuild(components=paired_components_kernel)
 """The paired factor rows' build (:meth:`.FactorRows.build`)."""
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Drop-in table: the replaced module globals and the builds that take their place
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class DropIn:
-    """A module global a launch site reads (a kernel, a cached kernel factory or a Warp function) and the build of
-    this module that takes its parameters, in order, and its launch.
-
-    Attributes:
-        module: The module (in this package) whose global the launch site reads.
-        name: The global's name.
-        replacement: The name of the replacing kernel, factory or function in this module.
-        factory: The global is a factory of kernel variants: the replacement takes its arguments.
-    """
-
-    module: str
-    name: str
-    replacement: str
-    factory: bool = False
-
-
-DROP_INS = (
-    # Free-body rows.
-    DropIn("solver_feather_pgs", "compute_mf_body_Hinv", "free_body_inverse_kernel"),
-    DropIn("solver_feather_pgs", "compute_mf_effective_mass_and_rhs", "free_body_rows_kernel"),
-    DropIn("solver_feather_pgs", "build_mf_body_map", "free_body_map_kernel"),
-    DropIn("solver_feather_pgs", "compute_mf_world_dof_offsets", "free_body_coordinates_kernel"),
-    DropIn("solver_feather_pgs", "_get_pack_mf_meta_kernel", "free_body_meta_kernel", factory=True),
-    DropIn("solver_feather_pgs", "apply_mf_warmstart_impulses", "free_body_publish_kernel"),
-    # Sparse-diagonal rows.
-    DropIn("solver_feather_pgs", "populate_sparse_diagonal_contact_response", "sparse_pair_contact_rows_kernel"),
-    DropIn("solver_feather_pgs", "accumulate_sparse_diagonal_response_diag", "sparse_pair_diagonal_kernel"),
-    DropIn("compact_contact", "_publish_row_response", "sparse_pair_row_response"),
-    DropIn("compact_contact", "produce_limit_response", "sparse_pair_limit_kernel"),
-    # Bilateral pre-elimination.
-    DropIn("solver_feather_pgs", "preelim_setup_for_size", "bilateral_setup_kernel"),
-    DropIn("solver_feather_pgs", "preelim_correct_Y_for_size", "bilateral_correct_kernel"),
-    DropIn("solver_feather_pgs", "preelim_project_velocity_for_size", "bilateral_project_kernel"),
-    # Factor rows.
-    DropIn("solver_feather_pgs", "_get_crba_sparse_factor_kernel", "sparse_factor_kernel", factory=True),
-    DropIn("tree_kinetic_sparse", "_get_crba_sparse_factor_kernel", "sparse_factor_kernel", factory=True),
-    DropIn("solver_feather_pgs", "_get_sparse_contact_response_kernel", "factor_contact_rows_kernel", factory=True),
-    DropIn("solver_feather_pgs", "build_sparse_joint_limit_rows", "factor_limit_rows_kernel"),
-    DropIn("solver_feather_pgs", "build_sparse_joint_velocity_limit_rows", "factor_velocity_limit_rows_kernel"),
-    DropIn("solver_feather_pgs", "build_sparse_mimic_rows", "factor_mimic_rows_kernel"),
-    DropIn("solver_feather_pgs", "apply_sparse_factor_velocity", "factor_publish_kernel"),
-    # Paired factor rows.
-    DropIn("solver_feather_pgs", "_get_paired_hinv_jt_kernel", "paired_rows_kernel", factory=True),
-    DropIn("paired_components", "get_prepare_kernel", "paired_components_kernel", factory=True),
-)
-"""The equivalence harness's substitution table: each entry's replacement takes the replaced global's parameters,
-so the launch sites take either unchanged. A name imported into several modules has an entry per module."""

@@ -24,12 +24,12 @@ import newton
 from newton._src.solvers.feather_pgs import (
     kernel_template,
     kernels,
-    mf_gs_source,
-    paired_factor_source,
     path_selection,
     row_packets,
+    sweep_routes,
+    sweep_routes_diag,
+    sweep_routes_local,
 )
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate
 from newton._src.solvers.feather_pgs.solve_policy import (
@@ -47,7 +47,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     sweep_exit,
     vote,
 )
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -61,13 +61,14 @@ TRACED_VELOCITY = SolvePolicy(readout="trace", velocity_change_tolerance=1.0e-3)
 # Velocity-scaled votes each factory call must emit at a positive tolerance: every vote site with its own A_ii.
 _SCALED_VOTES = {
     "sparse": (
-        "fabsf(change) * (denominator)",
-        "fabsf(sibling_change) * (diagonal[sibling])",
-        "fabsf(normal_change) * (diagonal[row])",
-        "fabsf(tangent_change) * (diagonal[tangent])",
+        "fabsf(delta_impulse) * (denom)",
+        "fabsf(sib_delta) * (s_diag[sib])",
+        "fabsf(normal_change) * (s_diag[i])",
+        "fabsf(tangent_change) * (s_diag[tangent])",
+        "fabsf(sibling_change) * (s_diag[sibling])",
         "sweep_violation <= 0.001f",
     ),
-    "sparse_lanes": ("fabsf(change) * (denominator)",),
+    "sparse_lanes": ("fabsf(delta_impulse) * (denom)", "fabsf(sib_delta) * (s_diag[sib])"),
     "mf_gs": (
         "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (s_diag_dense[sib])",
@@ -76,20 +77,19 @@ _SCALED_VOTES = {
         "fabsf(speed_row[1]) * (1.0f / mf_diag)",
     ),
     "paired": (
-        "fabsf(delta_impulse) * (denom)",
-        "fabsf(tangent1_delta) * (s_diag[tangent1])",
-        "fabsf(tangent2_delta) * (s_diag[tangent2])",
+        "fabsf(delta_impulse) * (s_diag[i])",
+        "fabsf(delta_impulse) * (s_diag[tangent1])",
+        "fabsf(sib_delta) * (s_diag[sib])",
     ),
-    "local": ("fabsf(delta_impulse) * (1.0f / inverse_diagonal)",),
+    "local": ("fabsf(delta_impulse) * (inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f)",),
     "packets": (
-        "fabsf(delta_impulse) * (1.0f / inverse_diagonal)",
-        "fabsf(sibling_delta) * (sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f)",
+        "fabsf(delta_impulse) * (inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f)",
+        "fabsf(sib_delta) * (s_inv_diag[sib] > 0.0f ? 1.0f / s_inv_diag[sib] : 0.0f)",
     ),
     "sparse_diagonal": (
-        "fabsf(delta_impulse) * (denominator)",
-        "fabsf(sibling_delta) * (s_diag[sibling])",
-        "fabsf(delta_impulse) * (normal_denom)",
-        "fabsf(tangent1_delta) * (s_diag[tangent1])",
+        "fabsf(delta_impulse) * (denom)",
+        "fabsf(sib_delta) * (s_diag_dense[sib])",
+        "fabsf(delta_lambda) * (limit_denom)",
     ),
     "incremental": (
         "fabsf(delta_impulse) * (s_diag[i])",
@@ -105,44 +105,44 @@ def _factory_calls():
     return (
         (
             "sparse",
-            _get_pgs_solve_sparse_kernel.__wrapped__,
+            sparse_kernel.__wrapped__,
             (48, 18, 12),
             {"active_rows": True, "use_support_table": True, "contact_triplets": True},
         ),
-        ("sparse_lanes", _get_pgs_solve_sparse_kernel.__wrapped__, (16, 6, 6), {"lanes_per_world": 8}),
+        ("sparse_lanes", sparse_kernel.__wrapped__, (16, 6, 6), {"lanes_per_world": 8}),
         (
             "mf_gs",
-            solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
+            sweep_routes.mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
             {"has_drive_rows": False},
         ),
         (
             "paired",
-            solver._get_pgs_solve_paired_factor_kernel.__wrapped__,
+            sweep_routes_local.paired_factor_kernel.__wrapped__,
             (192, 29, 23, 6, "120", False, True),
             {"contact_units": True},
         ),
         (
             "local",
-            solver._get_pgs_solve_local_owned_kernel.__wrapped__,
+            sweep_routes_local.local_owned_kernel.__wrapped__,
             (192, 9, 9, "120"),
-            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2, "dense_response_matrix": True},
+            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
         ),
         (
             "packets",
             packets,
             (192, 20, 9, "120"),
-            {"paired_dof_count": 6, "persistent_queue": True, "dense_response_matrix": True},
+            {"paired_dof_count": 6, "persistent_queue": True},
         ),
         (
             "sparse_diagonal",
-            solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__,
+            sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
             {"speculative_contact_batches": True, "contact_units": True},
         ),
         (
             "incremental",
-            solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
+            sweep_routes.incremental_kernel.__wrapped__,
             (64, 32, 12, "120"),
             {"incremental_rows": 32},
         ),
@@ -176,12 +176,11 @@ def _vote_census():
         _axis("lanes_per_world", (32, 16, 8)),
         _axis("contact_capable"),
         ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
-        _axis("dense_response_matrix"),
     )
     specs = (
         (
             "sparse",
-            _get_pgs_solve_sparse_kernel.__wrapped__,
+            sparse_kernel.__wrapped__,
             (48, 18, 12),
             (
                 _axis("active_rows"),
@@ -197,7 +196,7 @@ def _vote_census():
         ),
         (
             "sparse_lanes",
-            _get_pgs_solve_sparse_kernel.__wrapped__,
+            sparse_kernel.__wrapped__,
             (32, 8, 8),
             (
                 _axis("lanes_per_world", (16, 8)),
@@ -209,7 +208,7 @@ def _vote_census():
         ),
         (
             "mf_gs",
-            solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
+            sweep_routes.mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
             (
                 _axis("shared_metadata"),
@@ -227,21 +226,21 @@ def _vote_census():
         ),
         (
             "paired",
-            solver._get_pgs_solve_paired_factor_kernel.__wrapped__,
+            sweep_routes_local.paired_factor_kernel.__wrapped__,
             (192, 29, 23, 6, "120"),
             (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
         ),
-        ("local", solver._get_pgs_solve_local_owned_kernel.__wrapped__, (192, 20, 9, "120"), local),
+        ("local", sweep_routes_local.local_owned_kernel.__wrapped__, (192, 20, 9, "120"), local),
         ("packets", row_packets.get_local_factory.__wrapped__(9, 6, 40), (192, 20, 9, "120"), local),
         (
             "sparse_diagonal",
-            solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__,
+            sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
             (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
         ),
         (
             "incremental",
-            solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
+            sweep_routes.incremental_kernel.__wrapped__,
             (64, 32, 12, "120"),
             (
                 ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
@@ -282,10 +281,10 @@ class TestSolvePolicy(unittest.TestCase):
 
     def test_equal_policies_share_cached_kernels(self):
         """Return one cached kernel for equal policies, and another for a different policy."""
-        first = _get_pgs_solve_sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
-        second = _get_pgs_solve_sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
+        first = sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
+        second = sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
         self.assertIs(first, second)
-        self.assertIsNot(first, _get_pgs_solve_sparse_kernel(16, 6, 4))
+        self.assertIsNot(first, sparse_kernel(16, 6, 4))
 
     def test_policy_and_readout_options_are_keyword_only(self):
         """Take the policy and the solver's readout and tolerance options by keyword only, defaulting to the exact law."""
@@ -296,7 +295,10 @@ class TestSolvePolicy(unittest.TestCase):
                     (parameters[option].kind, parameters[option].default), (inspect.Parameter.KEYWORD_ONLY, default)
                 )
         factories = [(name, factory) for name, factory, _, _ in _factory_calls()]
-        factories += [("mf_gs_source", mf_gs_source.get_source), ("paired_source", paired_factor_source.get_source)]
+        factories += [
+            ("mf_gs_source", sweep_routes.mf_gs_source),
+            ("paired_source", sweep_routes_local.paired_factor_source),
+        ]
         for name, factory in factories:
             with self.subTest(factory=name):
                 parameter = inspect.signature(factory).parameters["solve_policy"]
@@ -360,7 +362,7 @@ class TestSolvePolicy(unittest.TestCase):
 
         def template(policy):
             return KernelTemplate.from_abi(
-                "mf_gs", solver._MF_GS_ABI, "", kernel_template.WORLD_QUEUE, extra=policy.arguments, composed=True
+                "mf_gs", sweep_routes.MF_GS_ABI, "", kernel_template.WORLD_QUEUE, extra=policy.arguments, composed=True
             )
 
         counted, plain = template(SWEEPS), template(EXACT_POLICY)
@@ -495,8 +497,8 @@ class TestVelocityExitLaw(unittest.TestCase):
                 "sparse_lanes": 32,
                 "mf_gs": 336,
                 "paired": 6,
-                "local": 48,
-                "packets": 48,
+                "local": 24,
+                "packets": 24,
                 "sparse_diagonal": 5,
                 "incremental": 32,
             },
@@ -517,7 +519,7 @@ class TestVelocityExitLaw(unittest.TestCase):
 
     def test_trace_names_the_fused_drive_clamp_a_velocity_limit(self):
         """Trace the matrix-free sweep's fused drive velocity clamp under the velocity-limit kind, not the drive's."""
-        kernel = solver._get_pgs_solve_mf_gs_kernel.__wrapped__(
+        kernel = sweep_routes.mf_gs_kernel.__wrapped__(
             64, 32, 12, "120", has_drive_rows=True, fuse_vel_limits=True, solve_policy=TRACE
         )
         snippet = _policy_snippet(self, kernel, "solve_trace_sweep(")
@@ -530,11 +532,11 @@ class TestVelocityExitLaw(unittest.TestCase):
 
     def test_variants_without_the_law_refuse_it(self):
         """Refuse the velocity law and trace where the matrix-free sweep keeps uncovered votes."""
-        for options in ({"friction_mode": "bisection"}, {"contact_torsion": True}):
+        for options in ({"contact_torsion": True},):
             for policy in (VELOCITY, TRACE):
                 with self.subTest(options=options, policy=policy), self.assertRaises(SolvePolicyUnsupported):
-                    solver._get_pgs_solve_mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=policy, **options)
-            kernel = solver._get_pgs_solve_mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
+                    sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=policy, **options)
+            kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
             self.assertIs(kernel.adj.args[-1].type, SolveReadout)
 
     def test_active_rows_wait_for_violated_rows_under_a_tolerance(self):
@@ -543,16 +545,16 @@ class TestVelocityExitLaw(unittest.TestCase):
         The bound is the velocity change a visit would make, the violation times the relaxation factor, in
         the law and in the trace alike.
         """
-        kernel = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=VELOCITY)
+        kernel = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=VELOCITY)
         snippet = _policy_snippet(self, kernel, "0.001f")
         self.assertIn("if (sweep_stop) {", snippet)
         self.assertIn("sweep_stop = sweep_violation <= 0.001f;", snippet)
-        traced = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=TRACE)
+        traced = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=TRACE)
         for text in (snippet, _policy_snippet(self, traced, "solve_trace_sweep(")):
             self.assertTrue("? omega * fmaxf(-residual, 0.0f) :" in text, "the unvisited-row bound ignores omega")
-        full = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, solve_policy=VELOCITY)
+        full = sparse_kernel.__wrapped__(48, 18, 12, solve_policy=VELOCITY)
         self.assertNotIn("sweep_violation", _policy_snippet(self, full, "0.001f"))
-        exact = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=SWEEPS)
+        exact = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=SWEEPS)
         self.assertNotIn("sweep_violation", _policy_snippet(self, exact, "solve_readout_sweeps("))
 
 

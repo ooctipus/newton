@@ -123,7 +123,6 @@ def mf_gs_source(
     max_constraints: int,
     mf_max_constraints: int,
     max_world_dofs: int,
-    friction_mode: str = "current",
     *,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
@@ -146,8 +145,6 @@ def mf_gs_source(
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
-    if friction_mode != "current":
-        raise NotImplementedError(f"friction_mode={friction_mode!r} is not an emitter law")
     if fuse_vel_limits and not has_drive_rows:
         raise ValueError("fuse_vel_limits requires has_drive_rows")
     if factor_coordinates and (
@@ -332,7 +329,6 @@ def mf_gs_kernel(
     mf_max_constraints: int,
     max_world_dofs: int,
     device_arch: str,
-    friction_mode: str = "current",
     *,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
@@ -354,7 +350,6 @@ def mf_gs_kernel(
         max_constraints,
         mf_max_constraints,
         max_world_dofs,
-        friction_mode,
         shared_metadata=shared_metadata,
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
@@ -370,7 +365,7 @@ def mf_gs_kernel(
         solve_policy=solve_policy,
     )
     name = (
-        f"sweep_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
+        f"sweep_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
         + velocity_limit_law_suffix(velocity_limit_law)
         + ("_fvl" if fuse_vel_limits else "")

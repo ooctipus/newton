@@ -9,8 +9,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import pgs_solve_loop
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
+from newton._src.solvers.feather_pgs import sweep_routes_split
+from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel
 
 
 def _slide(device, mode, beta, mesh, angle, articulated=False, *, locked_tangent=False):
@@ -153,9 +153,14 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             0,
                         ]
                         if device == "cpu":
-                            wp.launch(pgs_solve_loop, dim=1, inputs=[args[0], capacity, *args[1:]], device=device)
+                            wp.launch(
+                                sweep_routes_split.loop_kernel(),
+                                dim=1,
+                                inputs=[args[0], capacity, *args[1:]],
+                                device=device,
+                            )
                         else:
-                            kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
+                            kernel = tiled_row_kernel(capacity, str(wp.get_device(device).arch))
                             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
                         actual = impulses.numpy()[0, :3]
                         if regime in ("fixed", "sliding_fixed"):

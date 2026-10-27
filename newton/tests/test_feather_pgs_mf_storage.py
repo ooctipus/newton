@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import execution_plan
+from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -24,7 +24,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.mf_gs_source import get_source
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
@@ -36,7 +35,6 @@ _LARGE_STREAMED_SHAPE = {
     "max_constraints": 2304,
     "mf_max_constraints": 2304,
     "max_world_dofs": 75,
-    "device_arch": "120",
     "has_drive_rows": False,
     "has_dense_velocity_limit_rows": False,
     "skip_incremental_rows": 32,
@@ -48,9 +46,6 @@ _STREAMED_OPTIONS = (
     {"has_drive_rows": True, "fuse_vel_limits": True},
     {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True},
     {"skip_incremental_rows": 0, "contact_torsion": True},
-    {"friction_mode": "bisection"},
-    {"friction_mode": "bisection_desaxce"},
-    {"friction_mode": "coulomb_newton"},
     {"stream_mf_impulses": True},
     {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
     {
@@ -68,7 +63,8 @@ _STREAMED_OPTIONS = (
 
 def _streamed_source(**options):
     """Generate a streamed-metadata MF-GS source for the large shape with ``options`` applied."""
-    return get_source(**{**_LARGE_STREAMED_SHAPE, "shared_metadata": False, **options})
+    options = {key: value for key, value in options.items() if key != "local_internal_max_constraints"}
+    return sweep_routes.mf_gs_source(**{**_LARGE_STREAMED_SHAPE, "shared_metadata": False, **options})[0]
 
 
 def _row_metadata_read_globally(source):
@@ -78,7 +74,7 @@ def _row_metadata_read_globally(source):
     ``s_meta_dense[r] & mask`` reads ``world_row_type[r]`` and ``(s_meta_dense[r] >> bits) - 1``
     reads ``world_row_parent[r]``. The declaration and the load-time packing then go.
     """
-    source = re.sub(r"\s*// Low 3 bits[^\n]*\n\s*__shared__ int   s_meta_dense\[\d+\];\n", "\n", source)
+    source = re.sub(r"\n\s*__shared__ int s_meta_dense\[\d+\];\n", "\n", source)
     source = re.sub(
         r"\s*int row_type = world_row_type\.data\[off_dense \+ i\];"
         r"\s*int row_parent = world_row_parent\.data\[off_dense \+ i\];"
@@ -95,7 +91,7 @@ def _row_metadata_codec(source):
     """Compile the source's own packing and decoding of the resident row metadata for the CPU."""
     pack = re.search(r"s_meta_dense\[i\] = ([^;]+);", source).group(1)
     row_type = re.search(r"int row_type = (s_meta_dense\[i\] & \d+);", source).group(1)
-    parent = re.search(r"int parent_idx = (\(s_meta_dense\[i\] >> \d+\) - 1);", source).group(1)
+    parent = re.search(r"parent = (\(s_meta_dense\[i\] >> \d+\) - 1);", source).group(1)
     ring = re.search(r"return (\(\(s_meta_dense\[patch_row\] >> \d+\) - 1\));", source).group(1)
 
     @wp.func_native(f"int s_meta_dense[1]; const int i = 0; s_meta_dense[i] = {pack}; return s_meta_dense[i];")
@@ -315,7 +311,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 resident = _streamed_source(**options, resident_row_metadata=True)
                 rows = options.get("max_constraints", _LARGE_STREAMED_SHAPE["max_constraints"])
                 self.assertNotIn("s_meta_dense", streamed)
-                self.assertEqual(resident.count(f"__shared__ int   s_meta_dense[{rows}];"), 1)
+                self.assertEqual(resident.count(f"__shared__ int s_meta_dense[{rows}];"), 1)
                 self.assertIn("int row_type = s_meta_dense[i] &", resident)
                 # The limit scans' row-type reads stay global, as in the streamed source.
                 self.assertNotIn("(s_meta_dense[i] &", resident)
@@ -330,7 +326,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         # Patch rings walk the resident array.
         self.assertIn("return ((s_meta_dense[patch_row] >> 3) - 1);", _streamed_source(resident_row_metadata=True))
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
-            get_source(**_LARGE_STREAMED_SHAPE, resident_row_metadata=True)
+            sweep_routes.mf_gs_source(**_LARGE_STREAMED_SHAPE, resident_row_metadata=True)
 
     def test_packed_row_metadata_decodes_row_types_and_parents(self):
         """Run the source's own packing and decoding on the CPU: row types and parents come back exactly.
@@ -358,14 +354,14 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
     def test_resident_row_metadata_kernel_names_its_storage(self):
         """Name the resident variant apart from the streamed kernel, whose name stays as it was."""
-        factory = fpgs._get_pgs_solve_mf_gs_kernel.__wrapped__
+        factory = sweep_routes.mf_gs_kernel.__wrapped__
         shape = (2304, 2304, 75, "120")
         options = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_incremental_rows": 32}
         streamed = factory(*shape, shared_metadata=False, **options)
         resident = factory(*shape, shared_metadata=False, resident_row_metadata=True, **options)
-        self.assertEqual(streamed.key, "pgs_solve_mf_gs_2304_2304_75_current_drive0_densevlim0_gmeta_skipinc32")
-        self.assertEqual(resident.key, "pgs_solve_mf_gs_2304_2304_75_current_drive0_densevlim0_gmeta_smeta_skipinc32")
-        self.assertEqual(max(_native_snippets(resident), key=len).count("__shared__ int   s_meta_dense[2304];"), 1)
+        self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_drive0_densevlim0_gmeta_skipinc32")
+        self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_drive0_densevlim0_gmeta_smeta_skipinc32")
+        self.assertEqual(max(_native_snippets(resident), key=len).count("__shared__ int s_meta_dense[2304];"), 1)
         self.assertEqual(
             list(inspect.signature(resident.func).parameters), list(inspect.signature(streamed.func).parameters)
         )
@@ -404,79 +400,57 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 np.testing.assert_array_equal(source.numpy(), [21.0, 29.0, 37.0, 45.0])
 
     def test_streaming_factory_owns_global_impulses_on_one_lane(self):
-        """Stream the uniform paired projection; reject single-lane nonlinear paths."""
-        for friction in ("current", "bisection", "bisection_desaxce", "coulomb_newton"):
-            for shared_metadata in (False, True):
-                with self.subTest(friction=friction, shared_metadata=shared_metadata):
-                    if friction != "current":
-                        with self.assertRaisesRegex(ValueError, "warp-uniform current-friction"):
-                            fpgs._get_pgs_solve_mf_gs_kernel(
-                                16,
-                                64,
-                                12,
-                                "cpu",
-                                friction_mode=friction,
-                                shared_metadata=shared_metadata,
-                                stream_mf_impulses=True,
-                            )
-                        continue
-                    kernel = fpgs._get_pgs_solve_mf_gs_kernel(
-                        16,
-                        64,
-                        12,
-                        "cpu",
-                        friction_mode=friction,
-                        shared_metadata=shared_metadata,
-                        stream_mf_impulses=True,
-                    )
-                    source = max(_native_snippets(kernel), key=len)
-                    self.assertIn("_glambda", kernel.key)
-                    self.assertNotIn("__shared__ float s_lam_mf", source)
-                    self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
-                    self.assertIn("READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
-                    self.assertIn(
-                        "if (mf_friction_radius == 0.0f && "
-                        "READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0) == 0.0f && "
-                        "READ(lane == 0 ? g_lam_mf[i + 1] : 0.0f, 0) == 0.0f)",
-                        source,
-                    )
-                    for line in source.splitlines():
-                        if re.search(r"g_lam_mf\[[^]]+\]\s*=(?!=)", line):
-                            self.assertIn("if (lane == 0)", line)
+        """Stream the uniform paired projection."""
+        for shared_metadata in (False, True):
+            with self.subTest(shared_metadata=shared_metadata):
+                kernel = sweep_routes.mf_gs_kernel(
+                    16,
+                    64,
+                    12,
+                    "cpu",
+                    shared_metadata=shared_metadata,
+                    stream_mf_impulses=True,
+                )
+                source = max(_native_snippets(kernel), key=len)
+                self.assertIn("_glambda", kernel.key)
+                self.assertNotIn("__shared__ float s_lam_mf", source)
+                self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
+                self.assertIn("READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
+                for line in source.splitlines():
+                    if re.search(r"g_lam_mf\[[^]]+\]\s*=(?!=)", line):
+                        self.assertIn("if (lane == 0)", line)
 
     def test_paired_dense_impulses_have_one_owner(self):
-        """Keep the paired tangent law and fenced publication in the dense projector of either friction law."""
-        for friction in ("current", "coulomb_newton"):
-            with self.subTest(friction=friction):
-                kernel = fpgs._get_pgs_solve_mf_gs_kernel(
+        """Keep the paired tangent law and fenced publication in the dense projector."""
+        for stream in (False, True):
+            with self.subTest(stream_mf_impulses=stream):
+                kernel = sweep_routes.mf_gs_kernel(
                     256,
                     15984,
                     3135,
                     "cpu",
-                    friction_mode=friction,
                     has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
-                    stream_mf_impulses=friction == "current",
+                    stream_mf_impulses=stream,
                 )
                 snippet = max(_native_snippets(kernel), key=len)
                 self.assertIn("READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
-                self.assertIn("if (lane == 0) s_lam_dense[i] = new_impulse;", snippet)
-                start = snippet.index("const float sibling_impulse = s_lam_dense[sib];")
-                end = snippet.index("if (sib_delta != 0.0f) iteration_changed = 1;", start)
+                start = snippet.index("const float sibling_impulse = READ(lane == 0 ? s_lam_dense[sib] : 0.0f, 0);")
+                end = snippet.index("if (sib_delta != 0.0f) {", start)
                 owner = snippet[start:end]
                 self.assertIn("ProjectionLaw::friction_pair(denom, cross, s_diag_dense[sib]", owner)
-                self.assertIn("float sib_delta = pair[1] - sibling_impulse;", owner)
-                self.assertIn(
-                    "SYNC();\n                    if (lane == 0) s_lam_dense[sib] = pair[1];\n"
-                    "                    SYNC();",
-                    owner,
-                )
+                self.assertIn("sib_delta = sib_new - sibling_impulse;", owner)
+                # Every lane read the impulses before the first lane stores the pair, and stored before any reads.
+                stores = owner[owner.index("SYNC();") :]
+                self.assertIn("if (lane == 0) s_lam_dense[i] = new_impulse;", stores)
+                self.assertIn("if (lane == 0) s_lam_dense[sib] = sib_new;", stores)
+                self.assertTrue(stores.rstrip().endswith("SYNC();"))
 
     def test_limit_only_phase_does_not_stage_contact_prefix(self):
         """Keep contacts untouched and retain work for empty-segment fused clamps."""
         for fused in (False, True):
-            kernel = fpgs._get_pgs_solve_mf_gs_kernel(16, 4096, 128, "cpu", fuse_vel_limits=fused)
+            kernel = sweep_routes.mf_gs_kernel(16, 4096, 128, "cpu", fuse_vel_limits=fused)
             source = max(_native_snippets(kernel), key=len)
             self.assertIn("int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;", source)
             self.assertEqual(source.count("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"), 2)
@@ -485,7 +459,8 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 self.assertNotIn(guard, source)
             else:
                 self.assertIn(guard, source)
-                self.assertLess(source.index(guard), source.index("// LOAD PHASE"))
+                # The guard returns before the world stages its free-body rows.
+                self.assertLess(source.index(guard), source.index("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"))
 
 
 def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives, velocity_limits, rings):
@@ -679,7 +654,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
                 (5, 9),
             ),
-            ("bisection", (48, 12, 29), {"friction_mode": "bisection", "has_drive_rows": False}, (5, 9)),
             ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True, "has_drive_rows": False}, (5, 9)),
         )
         settings = (
@@ -707,7 +681,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             )
             values = _bind_rows(host, device)
             kernels = [
-                fpgs._get_pgs_solve_mf_gs_kernel(
+                sweep_routes.mf_gs_kernel(
                     dense_capacity,
                     mf_capacity,
                     dofs,
@@ -776,14 +750,14 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
 
         Returns the solver and the replay records (see :class:`_LaunchReplay`).
         """
-        factory, calls = fpgs._get_pgs_solve_mf_gs_kernel, []
+        factory, calls = sweep_routes.mf_gs_kernel, []
 
         def recording(*args, **kwargs):
             kernel = factory(*args, **kwargs)
             calls.append((args, kwargs, kernel))
             return kernel
 
-        with mock.patch.object(fpgs, "_get_pgs_solve_mf_gs_kernel", recording):
+        with mock.patch.object(sweep_routes, "mf_gs_kernel", recording):
             solver = fpgs.SolverFeatherPGS(model, **options)
         production = solver._pgs_solve_mf_gs_kernel
         self.assertIn("_gmeta_smeta", production.key)
@@ -927,58 +901,56 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             freeze_drive_rows=0,
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
-        for friction in ("current",):
-            for shared_metadata in (False, True):
-                with self.subTest(friction=friction, shared_metadata=shared_metadata):
-                    variants = []
-                    for stream in (False, True):
-                        kernel = fpgs._get_pgs_solve_mf_gs_kernel(
-                            8,
-                            6,
-                            29,
-                            str(device.arch),
-                            friction_mode=friction,
-                            has_drive_rows=False,
-                            has_dense_velocity_limit_rows=False,
-                            shared_metadata=shared_metadata,
-                            stream_mf_impulses=stream,
+        for shared_metadata in (False, True):
+            with self.subTest(shared_metadata=shared_metadata):
+                variants = []
+                for stream in (False, True):
+                    kernel = sweep_routes.mf_gs_kernel(
+                        8,
+                        6,
+                        29,
+                        str(device.arch),
+                        has_drive_rows=False,
+                        has_dense_velocity_limit_rows=False,
+                        shared_metadata=shared_metadata,
+                        stream_mf_impulses=stream,
+                    )
+                    bound = dict(values)
+                    bound.update({name: wp.clone(values[name]) for name in outputs})
+                    variants.append((kernel, bound))
+
+                def run(variants=variants):
+                    for kernel, bound in variants:
+                        for name in outputs:
+                            wp.copy(bound[name], values[name])
+                        wp.launch_tiled(
+                            kernel,
+                            dim=[5],
+                            block_dim=32,
+                            device=device,
+                            inputs=[bound[name] for name in inspect.signature(kernel.func).parameters],
                         )
-                        bound = dict(values)
-                        bound.update({name: wp.clone(values[name]) for name in outputs})
-                        variants.append((kernel, bound))
 
-                    def run(variants=variants):
-                        for kernel, bound in variants:
-                            for name in outputs:
-                                wp.copy(bound[name], values[name])
-                            wp.launch_tiled(
-                                kernel,
-                                dim=[5],
-                                block_dim=32,
-                                device=device,
-                                inputs=[bound[name] for name in inspect.signature(kernel.func).parameters],
-                            )
-
-                    for phase in (0, 1, 2, 3, 4, 5):
-                        for _, bound in variants:
-                            bound["row_phase"] = phase
-                        run()
-                        for name in outputs:
-                            np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
-                        if phase == 0:
-                            eager = [{name: _host(bound[name]) for name in outputs} for _, bound in variants]
+                for phase in (0, 1, 2, 3, 4, 5):
                     for _, bound in variants:
-                        bound["row_phase"] = 0
-                    with wp.ScopedCapture(device=device) as capture:
-                        run()
-                    # NaN in both variants: a graph that replayed nothing cannot give the eager bits.
-                    for _, bound in variants:
-                        for name in outputs:
-                            bound[name].fill_(float("nan"))
-                    wp.capture_launch(capture.graph)
-                    for (_, bound), expected in zip(variants, eager, strict=True):
-                        for name in outputs:
-                            np.testing.assert_array_equal(_bits(_host(bound[name])), _bits(expected[name]), name)
+                        bound["row_phase"] = phase
+                    run()
+                    for name in outputs:
+                        np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
+                    if phase == 0:
+                        eager = [{name: _host(bound[name]) for name in outputs} for _, bound in variants]
+                for _, bound in variants:
+                    bound["row_phase"] = 0
+                with wp.ScopedCapture(device=device) as capture:
+                    run()
+                # NaN in both variants: a graph that replayed nothing cannot give the eager bits.
+                for _, bound in variants:
+                    for name in outputs:
+                        bound[name].fill_(float("nan"))
+                wp.capture_launch(capture.graph)
+                for (_, bound), expected in zip(variants, eager, strict=True):
+                    for name in outputs:
+                        np.testing.assert_array_equal(_bits(_host(bound[name])), _bits(expected[name]), name)
 
 
 if __name__ == "__main__":

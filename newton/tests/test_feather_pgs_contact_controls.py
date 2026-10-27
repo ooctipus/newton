@@ -10,14 +10,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs import field_group, response_builds_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
     apply_world_contact_restitution_accumulated,
     compute_contact_linear_force_from_impulses,
-    compute_mf_effective_mass_and_rhs,
     compute_world_contact_bias,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
@@ -233,7 +232,7 @@ def _mf_speculative_rhs(scale: float) -> float:
     """Return the MF setup RHS for a requested speculative scale."""
     rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
     wp.launch(
-        compute_mf_effective_mass_and_rhs,
+        response_builds_rows.free_body_rows_kernel,
         dim=1,
         inputs=[
             wp.array([1], dtype=wp.int32, device="cpu"),

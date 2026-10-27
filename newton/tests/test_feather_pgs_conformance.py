@@ -42,8 +42,7 @@ Scenes and features
     scenes hold two worlds that differ, so a world mix-up shows. Variants: PhysX
     drives, velocity iterations, warm start, contact compliance, contact
     torsion, ``contact_update="unit"``, restitution, bilateral pre-elimination,
-    joint and rigid-body velocity limits and the research ``friction_mode``
-    values.
+    joint and rigid-body velocity limits.
 
 Metrics
     Computed on the host from the model, the states before and after each
@@ -99,8 +98,8 @@ Reference and tolerances
     CUDA and CPU references agree.
 
 Findings
-    Routes that fail a check at the gate's baseline (584eae97) are expected
-    failures that name the finding: the research friction modes.
+    Routes that fail a check at the gate's baseline are expected failures
+    that name the finding.
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
@@ -1144,13 +1143,13 @@ SPLIT_LOOP = Route(
     "split_loop",
     "cuda",
     options={"pgs_mode": "split", "pgs_kernel": "loop"},
-    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["pgs_solve_loop"]},
+    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop"]},
 )
 SPLIT_LOOP_UNIT = Route(
     "split_loop_unit",
     "cuda",
     options={"pgs_mode": "split", "pgs_kernel": "loop", "contact_update": "unit"},
-    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["pgs_solve_loop_unit"]},
+    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop_unit"]},
 )
 SPLIT_TILED = Route(
     "split_tiled_row",
@@ -1561,35 +1560,6 @@ def cuda_groups() -> list:
     return groups
 
 
-_RESEARCH_FINDINGS = {
-    ("bisection", "incline"): "The sliding box accelerates 4% off g (sin a - mu cos a): friction leaves the cone's "
-    "maximum-dissipation point (friction residual 3e-3 m/s against the current law's 4e-6).",
-    (
-        "bisection",
-        "box_drop",
-    ): "The tilted box lands 0.8 rad/s off the converged current law (friction residual 8e-3 m/s).",
-    ("bisection_desaxce", "incline"): "As bisection, and the de Saxce bias lifts sliding contacts (normal residual "
-    "1e-2 m/s).",
-    ("bisection_desaxce", "box_drop"): "As bisection, and the de Saxce bias lifts sliding contacts (normal residual "
-    "3e-2 m/s).",
-    ("coulomb_newton", "incline"): "The sliding box ends 2e-5 m off the converged current law (2.3 times the "
-    "reference's convergence band) and its friction exceeds the cone by 2e-5 of the weight.",
-}
-"""Measured deviations of the deprecated research friction modes from the current law at 584eae97."""
-
-
-def research_groups() -> list:
-    """The deprecated research friction modes on the incline and the drop, measured against the current law."""
-    groups = []
-    for mode in ("bisection", "bisection_desaxce", "coulomb_newton"):
-        route = MF_DEFAULT.but(f"mf_{mode}", options={"friction_mode": mode}, expect={"friction.friction_mode": mode})
-        for scene in (scenes.incline(), scenes.box_drop()):
-            finding = _RESEARCH_FINDINGS.get((mode, scene.name))
-            findings = ((route.name, finding),) if finding else ()
-            groups.append(Group(_physics(scene, "point", 32), REFERENCE_CUDA, (route,), tag=mode, findings=findings))
-    return groups
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1797,15 +1767,8 @@ class TestFeatherPGSConformanceCUDA(_ConformanceCase):
     device = _cuda_device()
 
 
-class TestFeatherPGSResearchFrictionModes(_ConformanceCase):
-    """The deprecated research friction modes against the current friction law (a measurement)."""
-
-    device = _cuda_device()
-
-
 _add_group_tests(TestFeatherPGSConformanceCPU, cpu_groups())
 _add_group_tests(TestFeatherPGSConformanceCUDA, cuda_groups())
-_add_group_tests(TestFeatherPGSResearchFrictionModes, research_groups())
 
 
 OWNERSHIP = (

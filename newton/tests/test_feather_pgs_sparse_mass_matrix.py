@@ -6,11 +6,8 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
-    _get_crba_sparse_factor_kernel,
-    factor_indices,
-    solve_sparse_mass_matrix,
-)
+from newton._src.solvers.feather_pgs.response_builds_rows import sparse_factor_kernel
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices, solve_sparse_mass_matrix
 from newton._src.solvers.feather_pgs.spatial_laws import INERTIA_CHANNELS, inertia_record
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
@@ -207,7 +204,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             indices,
         ]
         wp.launch(
-            _get_crba_sparse_factor_kernel(n, plan.nonzero_count),
+            sparse_factor_kernel(n, plan.nonzero_count),
             dim=64,
             inputs=inputs,
             outputs=[inverse, status],

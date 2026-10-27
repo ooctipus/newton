@@ -11,7 +11,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _tiled_row_shared_bytes
+from newton._src.solvers.feather_pgs.staging import arch_budget
+from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_source
 
 
 def _small_worlds(device, world_count=3):
@@ -124,9 +125,9 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         if not devices:
             self.skipTest("CUDA constructor selection requires a CUDA device")
         device = devices[0]
-        limit = device.max_shared_memory_per_block
+        limit = arch_budget(device.arch)
         capacity = 64
-        while _tiled_row_shared_bytes(capacity, "shared") <= limit:
+        while tiled_row_source(capacity, staging="shared")[1].bytes <= limit:
             capacity += 32
         model = _small_worlds(device)
         solver = newton.solvers.SolverFeatherPGS(

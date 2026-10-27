@@ -36,6 +36,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
@@ -54,13 +55,8 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveReadout,
     SolveTrace,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import (
-    _get_pgs_solve_local_owned_kernel,
-    _get_pgs_solve_mf_gs_incremental_kernel,
-    _get_pgs_solve_mf_gs_kernel,
-)
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 
@@ -229,7 +225,7 @@ class _SparseCase:
 
     def kernel(self, policy=None):
         options = self.options if policy is None else {**self.options, "solve_policy": policy}
-        return _get_pgs_solve_sparse_kernel(*self.shape, **options)
+        return sparse_kernel(*self.shape, **options)
 
     def run(self, kernel, iterations, *extra):
         """Restore the initial impulses and sweep; capturable."""
@@ -306,7 +302,7 @@ class _LocalCase:
 
     def kernel(self, policy=None):
         options = {} if policy is None else {"solve_policy": policy}
-        return _get_pgs_solve_local_owned_kernel(*self.shape, self.device.arch, **options)
+        return sweep_routes_local.local_owned_kernel(*self.shape, self.device.arch, **options)
 
     def run(self, kernel, iterations, *extra):
         """Restore the initial diagonal, impulses and velocities and solve."""
@@ -483,9 +479,9 @@ class TestSolveReadoutKernels(unittest.TestCase):
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
         factories = {
-            "mf_gs": partial(_get_pgs_solve_mf_gs_kernel, 4, 1, 2, arch, has_drive_rows=False),
+            "mf_gs": partial(sweep_routes.mf_gs_kernel, 4, 1, 2, arch, has_drive_rows=False),
             "incremental": partial(
-                _get_pgs_solve_mf_gs_incremental_kernel, 4, 1, 2, arch, incremental_rows=4, has_drive_rows=False
+                sweep_routes.incremental_kernel, 4, 1, 2, arch, incremental_rows=4, has_drive_rows=False
             ),
         }
         for (name, factory), law, row_phase in itertools.product(factories.items(), VELOCITY_LIMIT_LAWS, (0, 5)):
@@ -814,10 +810,11 @@ class TestSolveReadoutRoutes(unittest.TestCase):
 
     @staticmethod
     def _solvers(route, variants):
-        """Build one solver per option set of ``variants`` on the route's model, with the route's overrides."""
+        """Build one solver per option set of ``variants`` on the route's model, with the route's overrides; a
+        variant's options override the route's."""
         options = {**route["options"], "double_buffer": False, "pgs_iterations": BUDGET}
         with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", route.get("overrides", {})):
-            return [SolverFeatherPGS(route["model"], **options, **variant) for variant in variants]
+            return [SolverFeatherPGS(route["model"], **{**options, **variant}) for variant in variants]
 
     @staticmethod
     def _steps(route, solvers, steps, dt=1.0 / 240.0):
@@ -1019,12 +1016,14 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_declined_trace_counts_without_it_and_warns(self):
         """Warn about, record and count without the trace a sweep variant that cannot trace.
 
-        The matrix-free sweep traces only the current friction law; under bisection friction it
-        keeps the plain count, which a trace request records under the readout, not the exit law.
+        The matrix-free sweep does not trace its contact torsion; with torsion it keeps the plain
+        count, which a trace request records under the readout, not the exit law.
         """
         route = _matrix_free_route()
         with self.assertWarnsRegex(UserWarning, "pgs_solve_readout='trace'"):
-            (solver,) = self._solvers(route, [{"pgs_solve_readout": "trace", "friction_mode": "bisection"}])
+            (solver,) = self._solvers(
+                route, [{"pgs_solve_readout": "trace", "contact_torsion_radius": 0.01, "dense_max_constraints": 256}]
+            )
         key = solver._pgs_solve_mf_gs_kernel.key
         sweep = solver.get_path_selection()["routes"]["sweep"]
         self.assertIn(key, sweep["readout"]["declined"])

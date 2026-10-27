@@ -17,16 +17,15 @@ dense kit:
   response); a diagonal factor divides twice, unguarded (Zdiv, :func:`diagonal_solve`);
 * :func:`dot`: a sum of products in ascending order from zero (every diagonal, every Delassus entry, the apply);
 * the tile primitives (``tile_cholesky``, ``tile_lower_solve``, ``tile_upper_solve``, ``tile_cholesky_solve``,
-  ``tile_matmul``) for the tiled mappings, called with the shapes the sites they replace call them with: their
-  rounding is the primitives' (MathDx's where it is on), so nothing re-derives it.
+  ``tile_matmul``) for the tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
+  re-derives it.
 
 Where two mappings of a stage differ in the order they round in, each keeps its own order (the lane layout, a
-register or a global scratch, a staged reciprocal); where a site differs from its stage only by accident, the build
-keeps the site's order and the difference is listed for the unification of phase (b) (see the stage's builder).
+register or a global scratch, a staged reciprocal); where two builds of a stage differ only by accident, each keeps
+its order and the difference is listed for their unification (see the stage's builder).
 
-A build is a :class:`Build`: its kernel, the stage and mapping it implements, and its grid. Every kernel takes the
-parameters of the legacy kernel or factory it replaces, in order, so a launch site takes either unchanged:
-:data:`DROP_IN` maps each legacy global (module and name) to its replacement.
+A build is a :class:`Build`: its kernel, the stage and mapping it implements, and its grid. The solver's launch sites
+call the kernels and kernel factories directly.
 """
 
 from __future__ import annotations
@@ -50,10 +49,8 @@ from .staging import Buffer, Staging, static_budget
 __all__ = [
     "ASSEMBLED_BUILDS",
     "DENSE_JY_BUILDS",
-    "DROP_IN",
     "STAGES",
     "Build",
-    "DropIn",
     "diagonal_solve",
     "dot",
     "solve_six",
@@ -203,7 +200,7 @@ def _group_factor() -> CholeskyFactor:
 @functools.cache
 def factor_articulations_kernel() -> wp.Kernel:
     """The factor, one thread per articulation (``dim = articulations``), with the kit's column Cholesky in global
-    memory: replaces ``kernels.cholesky_loop`` (F1)."""
+    memory."""
     body = (
         "    const int group = tid;\n"
         "    if (mass_update_mask.data[group_to_art.data[group]] == 0) return;\n"
@@ -215,7 +212,7 @@ def factor_articulations_kernel() -> wp.Kernel:
 @functools.cache
 def factor_coordinates_kernel() -> wp.Kernel:
     """The factor of a structurally diagonal ``H``, one thread per articulation coordinate (``dim = articulations *
-    n_dofs``): the kit's pivot, ``L_jj = sqrt(H_jj + R_j)``. Replaces ``kernels.factor_diagonal_mass`` (F5)."""
+    n_dofs``): the kit's pivot, ``L_jj = sqrt(H_jj + R_j)``."""
     body = (
         "    const int group = tid / n_dofs;\n"
         "    const int dof = tid - group * n_dofs;\n"
@@ -327,8 +324,7 @@ def factor_warps_kernel(
     kernel: the composite-body products ``S F`` of the packed lower schedule, or held physical geometry
     (``geometric``, a lookup of each entry with ``geometric_index``, rows of ``geometric_stride``, groups mapped to
     geometry rows with ``geometric_group``), then ``R`` and the augmented drives' ``K`` on the diagonal; lane 0
-    factors with the kit (:class:`.CholeskyFactor`, unrolled), the lanes store the lower triangle. Replaces
-    ``small_cholesky.get_kernel`` (F2), with its parameters.
+    factors with the kit (:class:`.CholeskyFactor`, unrolled), the lanes store the lower triangle.
     """
     size, warps_per_block = int(size), int(warps_per_block)
     limit = 32 if geometric_index else 16
@@ -400,10 +396,8 @@ def factor_tiles_kernel(
     ``tile_cholesky(tile_diag_add(H, R))``, the primitive's rounding.
 
     ``assembly`` ``"mass"`` loads ``H``; ``"crba"`` assembles it in a shared tile from the composite inertia, each
-    entry ``S_p . F_s`` and the drives' ``K`` on the diagonal, ``(S F + K) + R`` (replaces
-    ``_get_crba_cholesky_kernel``, F3). With ``inverse`` the factor also materializes ``H^-1 =
-    tile_cholesky_solve(L, I)`` (replaces ``_get_cholesky_inverse_tiled_kernel``, F6); otherwise it replaces
-    ``_get_cholesky_kernel`` (F4). Bound to these, it takes their parameters.
+    entry ``S_p . F_s`` and the drives' ``K`` on the diagonal, ``(S F + K) + R``. With ``inverse`` the factor also
+    materializes ``H^-1 = tile_cholesky_solve(L, I)``.
     """
     del device_arch
     if assembly not in ASSEMBLIES:
@@ -536,7 +530,7 @@ def factor_tiles_kernel(
 def inverse_lanes_kernel(n_dofs: int, device_arch, *, lower_only: bool = False) -> wp.Kernel:
     """An explicit inverse, one lane per column (``dim = articulations * 32``): lane ``l`` solves ``L x = e_l``
     (``lower_only``: ``L^-1``) and then ``L^T y = x`` (``H^-1``) in registers with the kit's solves (unrolled, Z0)
-    and stores column ``l``. CUDA only. Replaces ``_get_inverse_cholesky_register_kernel`` (F7)."""
+    and stores column ``l``. CUDA only."""
     del device_arch
     n = int(n_dofs)
     solve = CholeskySolve(
@@ -604,7 +598,7 @@ the switch that also writes the rows to the world layout (``J_world``, ``Y_world
 @functools.cache
 def response_rows_kernel() -> wp.Kernel:
     """The response, one thread per articulation row (``dim = articulations * max_constraints``), solved in place in
-    ``Y`` (:func:`_respond_in_place`, Z0). Replaces ``kernels.hinv_jt_par_row`` (S4)."""
+    ``Y`` (:func:`_respond_in_place`, Z0)."""
     publish = _publish_row("J_world", "Y_world", "J_group", "Y_group", "idx", "world", "c", "dof_offset", "n_dofs")
     body = f"""    const int c = tid % max_constraints;
     const int idx = tid / max_constraints;
@@ -627,8 +621,7 @@ def response_rows_kernel() -> wp.Kernel:
 def response_lanes_kernel() -> wp.Kernel:
     """The response of the worlds the general solver owns, 32 threads per articulation, rows lane-strided (``dim =
     articulations * 32``), each solved in place (Z0). In a world a local owner solves, only the impact rows
-    (restitution above zero) copy their Jacobian to the world layout, for the restitution target pass. Replaces
-    ``kernels.hinv_jt_par_row_contact_fallback`` (S5)."""
+    (restitution above zero) copy their Jacobian to the world layout, for the restitution target pass."""
     impact = _publish_row(
         "J_world", None, "J_group", "Y_group", "group_index", "world", "constraint", "dof_offset", "n_dofs"
     )
@@ -695,7 +688,7 @@ _QUEUE = (
 def response_queue_kernel() -> wp.Kernel:
     """The response of the general worlds of the local owners' queue, a warp per worker over the queue's worlds,
     each world's rows lane-strided (``launch_tiled(dim=[workers], block_dim=32)``), solved in place (Z0) and
-    published to the world layout. Replaces ``row_packets.general_response`` (S6)."""
+    published to the world layout."""
     publish = _publish_row("J_world", "Y_world", "J", "Y", "group", "world", "row", "dof_offset", "size")
     body = f"""    const int general_end = queue_general_count.data[0];
     for (int entry = worker; entry < general_end; entry += workers) {{
@@ -759,7 +752,7 @@ def _solve_six_snippet() -> str:
 @wp.func_native(_solve_six_snippet())
 def solve_six(factor: wp.array3d[float], group: int, jacobian: _Vec6) -> _Vec6:
     """The response of one row of the six-coordinate group in registers: ``H^-1 J^T`` by the kit's solves (Z0), zero
-    for a zero row. Replaces ``compact_contact.solve_six`` (S7) in the compact boundary producers."""
+    for a zero row: the dense part of a compact boundary row (:func:`.response_builds_rows.sparse_pair_dense`)."""
 
 
 @functools.cache
@@ -767,7 +760,7 @@ def response_diagonal_kernel() -> wp.Kernel:
     """The response of a structurally diagonal ``H``, one thread per articulation row (``dim = articulations *
     max_constraints``): ``y = (j / l) / l`` per coordinate (:func:`diagonal_solve`, Zdiv), written to the group
     (``write_group``) and the world layout (``write_world``), with the row's diagonal ``sum j y`` in coordinate
-    order (``compute_diag``). Replaces ``kernels.hinv_jt_diagonal`` (S8)."""
+    order (``compute_diag``)."""
     J = _element("J_group", "group", "constraint", "dof")
     body = f"""    const int constraint = tid % max_constraints;
     const int group = tid / max_constraints;
@@ -811,8 +804,7 @@ def response_warps_kernel(
     diagonal, each row solved in registers by the kit's solves (unrolled, Zr-inf: the steps multiply by the
     unguarded ``1 / L_ii``), every row of a touched 32-row chunk written (inactive rows carry zero Jacobians); the
     group copy, the diagonal ``sum j y`` and the world layout as asked. The parallel tiers' worlds are skipped.
-    The staging holds four warps' factors, as the site's does: ``warps_per_block`` must be 4. CUDA only. Replaces
-    ``grouped_dynamics.get_grouped_hinv_jt_kernel`` (S9), with its parameters."""
+    The staging holds four warps' factors: ``warps_per_block`` must be 4. CUDA only."""
     N, M = int(n_dofs), int(max_constraints)
     solve = CholeskySolve(N, "L", inverse="Dinv", unroll=True)
     staging = Staging((Buffer("L", "float", N * N), Buffer("Dinv", "float", N)), groups=4, layout="arrays")
@@ -906,8 +898,7 @@ def response_tiles_kernel(
     block_dim=tile_threads)``): ``tile_lower_solve(L, J^T)`` then ``tile_upper_solve(L^T, Z)``, the primitives'
     rounding; the group copy, the world layout and, with ``compute_diag``, the diagonal ``tile_sum(J * Y, axis=1)``
     (the kernel then takes ``diag_group``, which a plain kernel does not declare at all: Warp keeps an unused
-    output's work). Replaces ``_get_hinv_jt_plain_kernel`` (S1) and ``_get_hinv_jt_kernel`` (S2) with their
-    parameters (``_get_hinv_jt_kernel`` with ``compute_diag=False``, never built, is the plain kernel).
+    output's work).
     """
     del device_arch
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
@@ -1185,8 +1176,7 @@ def response_pairs_kernel(
     with the explicit inverses ``y = H^-1 j`` per component (physical coordinates), or with ``factor_coordinates``
     ``z = L^-1 j`` and, in a world with free-body rows, ``y = L^-T z`` (factor coordinates where a world has none,
     its response ``Z`` and diagonal ``|z|^2``). The products sum in column order; the diagonal ``sum j y + cfm``
-    reduces over the lanes (``SUM``), on the CPU in coordinate order. Replaces ``_get_paired_hinv_jt_kernel``
-    (S11, S12) with its parameters.
+    reduces over the lanes (``SUM``), on the CPU in coordinate order.
     """
     cpu = str(device_arch) == "cpu"
     P, S = int(primary_dofs), int(secondary_dofs)
@@ -1262,7 +1252,7 @@ def response_pairs_kernel(
 @functools.cache
 def gather_coordinates_kernel() -> wp.Kernel:
     """The world layout of a size group's rows, one thread per articulation row coordinate (``dim = articulations *
-    max_constraints * n_dofs``), zeros included. Replaces ``kernels.gather_JY_to_world`` (S13)."""
+    max_constraints * n_dofs``), zeros included."""
     world = "articulation_world_dof_offset.data[art] + d"
     body = f"""    const int d = tid % n_dofs;
     const int remainder = tid / n_dofs;
@@ -1301,7 +1291,7 @@ def diagonal_rows_kernel() -> wp.Kernel:
     """The diagonal from a size group's rows, one thread per articulation row (``dim = articulations *
     max_constraints``): ``sum_k J Y`` in coordinate order, added atomically to the world's diagonal when nonzero (a
     row spans at most two articulations: two adds onto a zeroed diagonal, deterministic). The parallel tiers' worlds
-    are skipped. Replaces ``kernels.diag_from_JY_par_art`` (S19)."""
+    are skipped."""
 
     def J(k):
         return _element("J_group", "idx", "c", k)
@@ -1340,8 +1330,7 @@ def diagonal_rows_kernel() -> wp.Kernel:
 def diagonal_groups_kernel() -> wp.Kernel:
     """The diagonal from the size group's per-row diagonals (the tiled, warp and diagonal responses' ``diag_group``),
     one thread per world row (``dim = worlds * max_constraints``): the world's articulations' entries summed in their
-    order, added atomically when nonzero. The parallel tiers' worlds are skipped. Replaces
-    ``kernels.accumulate_group_diag_worlds`` (S20)."""
+    order, added atomically when nonzero. The parallel tiers' worlds are skipped."""
     body = f"""    const int c = tid % max_constraints;
     const int world = tid / max_constraints;
     const int m = world_constraint_count.data[world];
@@ -1372,8 +1361,7 @@ def diagonal_groups_kernel() -> wp.Kernel:
 @functools.cache
 def diagonal_world_rows_kernel() -> wp.Kernel:
     """The diagonal from the world layout, one thread per world row (``dim = worlds * max_constraints``): ``sum J Y``
-    over the world's coordinates in order, stored (no ``cfm``), in the worlds the general solver owns. Replaces
-    ``kernels.diag_from_JY_world`` (S21)."""
+    over the world's coordinates in order, stored (no ``cfm``), in the worlds the general solver owns."""
 
     def J(k):
         return _element("J_world", "world", "row", k)
@@ -1404,7 +1392,7 @@ def diagonal_world_rows_kernel() -> wp.Kernel:
 def diagonal_queue_kernel() -> wp.Kernel:
     """The diagonal of the general worlds of the local owners' queue, a warp per worker, rows lane-strided
     (``launch_tiled(dim=[workers], block_dim=32)``): ``sum J Y`` over the world's coordinates in order, plus the
-    row's ``cfm``, stored (the owners' private diagonals stay). Replaces ``row_packets.general_diag`` (S22)."""
+    row's ``cfm``, stored (the owners' private diagonals stay)."""
 
     def J(k):
         return _element("J", "world", "row", k)
@@ -1438,8 +1426,7 @@ def diagonal_queue_kernel() -> wp.Kernel:
 @functools.cache
 def cfm_worlds_kernel() -> wp.Kernel:
     """The diagonals' ``cfm``, one thread per world (``dim = worlds``): each row's added atomically, after the
-    Delassus or response diagonal. The parallel tiers' worlds are skipped. Replaces
-    ``kernels.finalize_world_diag_cfm`` (S18)."""
+    Delassus or response diagonal. The parallel tiers' worlds are skipped."""
     body = f"""    const int world = tid;
     const int m = world_constraint_count.data[world];
     if ({_skips("m", "world")}) return;
@@ -1497,8 +1484,7 @@ def delassus_stream_kernel(n_dofs: int, max_constraints: int, device_arch, chunk
 
     The chunk is the largest the staging declaration (:func:`delassus_stream_staging`) fits in the static budget of
     the device the kernel is built for (:func:`.staging.static_budget` of ``device_arch``), at most the row
-    capacity; ``chunk_size`` overrides it. Replaces ``_get_delassus_kernel`` (S15) with its parameters, without its
-    45,000-byte constant (whose 64-row chunk outgrew 48 KiB from 97 DOFs and could exceed the capacity).
+    capacity; ``chunk_size`` overrides it.
     """
     D, M = int(n_dofs), int(max_constraints)
     chunk = int(chunk_size) if chunk_size is not None else delassus_stream_chunk(D, M, static_budget(int(device_arch)))
@@ -1575,8 +1561,7 @@ for (int ci = 0; ci < num_chunks; ci++) {{
 @functools.cache
 def delassus_entries_kernel() -> wp.Kernel:
     """The Delassus of a size group, one thread per articulation entry (``dim = articulations * max_constraints^2``):
-    ``C_ij = sum_k J_ik Y_jk`` in coordinate order, added atomically when nonzero (and to the diagonal). Replaces
-    ``kernels.delassus_par_row_col`` (S16)."""
+    ``C_ij = sum_k J_ik Y_jk`` in coordinate order, added atomically when nonzero (and to the diagonal)."""
 
     def J(k):
         return _element("J_group", "idx", "i", k)
@@ -1616,7 +1601,7 @@ def delassus_tiles_kernel(n_dofs: int, max_constraints: int, device_arch, tile_t
     """The response and the Delassus fused, one tile per articulation (``launch_tiled(dim=[articulations],
     block_dim=tile_threads)``), rows in chunks (:func:`.execution_plan._fused_response_chunk_size`): per chunk
     ``Y_i`` by the tile solves, then ``C_ji = tile_matmul(J_j, X_i)`` stored, the diagonal ``C_tt + cfm`` stored
-    (the primitives' rounding). Replaces ``_get_hinv_jt_fused_kernel`` (S3) with its parameters."""
+    (the primitives' rounding)."""
     del device_arch
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
     chunk = _fused_response_chunk_size(max_constraints)
@@ -1687,8 +1672,7 @@ def delassus_tiles_kernel(n_dofs: int, max_constraints: int, device_arch, tile_t
 @functools.cache
 def apply_coordinates_kernel() -> wp.Kernel:
     """The velocity of a size group's impulses, one thread per articulation coordinate (``dim = articulations *
-    n_dofs``): ``v_out = v_hat + sum_c Y_c lambda_c`` over the world's rows in order, zero impulses included.
-    Replaces ``kernels.apply_impulses_world_par_dof`` (A1)."""
+    n_dofs``): ``v_out = v_hat + sum_c Y_c lambda_c`` over the world's rows in order, zero impulses included."""
 
     def Y(c):
         return _element("Y_group", "idx", c, "local_dof")
@@ -1811,71 +1795,3 @@ ASSEMBLED_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
 accumulated onto a zeroed ``C`` and diagonal (``stream``: a block per articulation streaming row chunks through
 shared memory; ``entries``: a thread per entry), or with the response fused (``tiles``, which stores ``C`` and the
 diagonal with its ``cfm``), then the diagonals' ``cfm``. The response itself is a :data:`DENSE_JY_BUILDS` build."""
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# The legacy globals the builds replace
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class DropIn:
-    """A legacy global that launch sites read, and the build that replaces it with the same parameters.
-
-    Args:
-        module: The module of this package whose global the launch sites read (where it is bound, not defined).
-        name: The global's name.
-        site: The response site's label in the site catalogue (``F1``-``F7``, ``S1``-``S22``, ``A1``).
-        replacement: The replacing factory (with the legacy factory's parameters), or the replacing device function.
-        call: The global is a kernel: ``replacement`` builds it, called without arguments.
-    """
-
-    module: str
-    name: str
-    site: str
-    replacement: Callable
-    call: bool = False
-
-    def resolve(self):
-        """The object to bind to the global."""
-        return self.replacement() if self.call else self.replacement
-
-
-DROP_IN: tuple[DropIn, ...] = (
-    DropIn("solver_feather_pgs", "cholesky_loop", "F1", factor_articulations_kernel, call=True),
-    DropIn("small_cholesky", "get_kernel", "F2", factor_warps_kernel),
-    DropIn(
-        "solver_feather_pgs", "_get_crba_cholesky_kernel", "F3", functools.partial(factor_tiles_kernel, assembly="crba")
-    ),
-    DropIn("solver_feather_pgs", "_get_cholesky_kernel", "F4", factor_tiles_kernel),
-    DropIn("solver_feather_pgs", "factor_diagonal_mass", "F5", factor_coordinates_kernel, call=True),
-    DropIn(
-        "solver_feather_pgs",
-        "_get_cholesky_inverse_tiled_kernel",
-        "F6",
-        functools.partial(factor_tiles_kernel, inverse=True),
-    ),
-    DropIn("solver_feather_pgs", "_get_inverse_cholesky_register_kernel", "F7", inverse_lanes_kernel),
-    DropIn("solver_feather_pgs", "_get_hinv_jt_plain_kernel", "S1", response_tiles_kernel),
-    DropIn("solver_feather_pgs", "_get_hinv_jt_kernel", "S2", response_tiles_kernel),
-    DropIn("solver_feather_pgs", "_get_hinv_jt_fused_kernel", "S3", delassus_tiles_kernel),
-    DropIn("solver_feather_pgs", "hinv_jt_par_row", "S4", response_rows_kernel, call=True),
-    DropIn("solver_feather_pgs", "hinv_jt_par_row_contact_fallback", "S5", response_lanes_kernel, call=True),
-    DropIn("row_packets", "general_response", "S6", response_queue_kernel, call=True),
-    DropIn("compact_contact", "solve_six", "S7", solve_six),
-    DropIn("solver_feather_pgs", "hinv_jt_diagonal", "S8", response_diagonal_kernel, call=True),
-    DropIn("solver_feather_pgs", "get_grouped_hinv_jt_kernel", "S9", response_warps_kernel),
-    DropIn("solver_feather_pgs", "_get_paired_hinv_jt_kernel", "S11,S12", response_pairs_kernel),
-    DropIn("solver_feather_pgs", "gather_JY_to_world", "S13", gather_coordinates_kernel, call=True),
-    DropIn("solver_feather_pgs", "_get_delassus_kernel", "S15", delassus_stream_kernel),
-    DropIn("solver_feather_pgs", "delassus_par_row_col", "S16", delassus_entries_kernel, call=True),
-    DropIn("solver_feather_pgs", "finalize_world_diag_cfm", "S18", cfm_worlds_kernel, call=True),
-    DropIn("solver_feather_pgs", "diag_from_JY_par_art", "S19", diagonal_rows_kernel, call=True),
-    DropIn("solver_feather_pgs", "accumulate_group_diag_worlds", "S20", diagonal_groups_kernel, call=True),
-    DropIn("solver_feather_pgs", "diag_from_JY_world", "S21", diagonal_world_rows_kernel, call=True),
-    DropIn("row_packets", "general_diag", "S22", diagonal_queue_kernel, call=True),
-    DropIn("solver_feather_pgs", "apply_impulses_world_par_dof", "A1", apply_coordinates_kernel, call=True),
-)
-"""Each legacy kernel or factory a launch site reads as a module global, and its replacement: binding
-``entry.resolve()`` to ``entry.module.entry.name`` swaps the build without a call-site edit (the bitwise harness's
-``builds_dense`` route). S17 (``C.zero_()``, ``diag.zero_()``) is an array clear, not a kernel."""

@@ -357,16 +357,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 53 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 54th
+        declaration order, so a positional call over the 52 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 53rd
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:54]}
-        self.assertEqual((parameters[1].name, parameters[53].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:53]}
+        self.assertEqual((parameters[1].name, parameters[52].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -392,9 +392,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[54].name, "pgs_change_tolerance")
-        with self.assertRaisesRegex(TypeError, r"takes at most 55 positional arguments but 56 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[54].default)
+        self.assertEqual(parameters[53].name, "pgs_change_tolerance")
+        with self.assertRaisesRegex(TypeError, r"takes at most 54 positional arguments but 55 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[53].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
@@ -443,8 +443,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # The arm and the free box share a world: split mode interleaves the dense and free-body sweeps.
         self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
         self.assertEqual(routes["sweep"]["driver"], "split_interleaved")
-        self.assertEqual(routes["sweep"]["dense"], {"kernels": ["pgs_solve_loop"]})
-        self.assertEqual(routes["sweep"]["free_body_matrix_free"], "pgs_solve_mf_loop")
+        self.assertEqual(routes["sweep"]["dense"], {"kernels": ["sweep_loop"]})
+        self.assertEqual(routes["sweep"]["free_body_matrix_free"], "sweep_mf_loop")
         # Only the matrix-free step packs row metadata, and only its GS kernel chooses a storage.
         self.assertIsNone(routes["sweep"]["mf_meta_pack"])
         self.assertIsNone(routes["sweep"]["mf_gs_storage"])
@@ -658,7 +658,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
-        response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
+        response = SimpleNamespace(key="factor_contact_rows_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
         per_contact = ["populate_world_J_for_size"]
         named, methods = set(), set()
@@ -722,7 +722,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (108, 6),
                     "sparse_diagonal",
                     {
-                        108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response", marker.key]),
+                        108: ("sparse_diagonal", [prepare, "sparse_pair_contact_rows_kernel", marker.key]),
                         6: ("compact_jacobian", [prepare, compact]),
                     },
                 ),
@@ -732,7 +732,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (108, 6),
                     "sparse_diagonal",
                     {
-                        108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response"]),
+                        108: ("sparse_diagonal", [prepare, "sparse_pair_contact_rows_kernel"]),
                         6: ("compact_jacobian", [prepare, compact]),
                     },
                 ),
@@ -1043,7 +1043,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(tiers["linked_rows"], patch_law)
                     # Every tier steps each friction pair isotropically; linked tiers also pool the ring.
                     for tier in tiers["tiers"]:
-                        self.assertTrue(tier["kernel"].endswith("_linked_iso" if patch_law else "_iso"), tier)
+                        self.assertEqual(tier["kernel"].endswith("_linked"), bool(patch_law), tier)
                         self.assertEqual("_linked" in tier["kernel"], patch_law, tier)
                     # Every tier sweeps the automatic budget, at least mf_gs_parallel_sweeps.
                     self.assertEqual(tiers["sweeps_rule"], "auto")
@@ -1114,7 +1114,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     # Contact warm start carries impulses by matched contact identity.
                     keys = _launched_kernel_keys(model, solver, contact_matching="latest")
                     self.assertIn(routes["sweep"]["sparse"], keys)
-                    self.assertNotIn("apply_impulses_world_par_dof", keys)
+                    self.assertNotIn("dense_apply_coordinates", keys)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cache_selection_reports_environment_and_explicit_precedence(self):

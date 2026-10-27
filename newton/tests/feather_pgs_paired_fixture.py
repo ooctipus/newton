@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import paired_components as components
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
+from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 
 
 def pack_endpoints(a, b):
@@ -91,16 +91,20 @@ def launch_components(data, device="cpu"):
     """Run the production worker-stride qualification launch (native CPU branch on CPU)."""
     workers = min(data.world_count, 512)
     wp.launch_tiled(
-        components.get_prepare_kernel(23, 6), dim=[workers], inputs=[workers, data], block_dim=128, device=device
+        response_builds_rows.paired_components_kernel(23, 6),
+        dim=[workers],
+        inputs=[workers, data],
+        block_dim=128,
+        device=device,
     )
 
 
 def solve_kernels(enabled, arch="120", *, contact_triples=False):
     """Construct the two production sweep kernels, plain or with independent components."""
-    paired = solver._get_pgs_solve_paired_factor_kernel(
+    paired = sweep_routes_local.paired_factor_kernel(
         8, 29, 23, 6, arch, contact_triples=contact_triples, independent_components=enabled
     )
-    mixed = solver._get_pgs_solve_mf_gs_kernel(
+    mixed = sweep_routes.mf_gs_kernel(
         8,
         6,
         29,

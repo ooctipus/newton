@@ -16,7 +16,7 @@ from newton import JointType
 from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs.kernels import compute_world_contact_bias
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_parallel_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_tiers import parallel_kernel
 
 CAPTURE_ROOT = Path("/tmp/fpgs-ten-hour-20260911-gc5FsH")
 CAPTURE_HASHES = (
@@ -177,11 +177,7 @@ def rhs_reference(solver, owner):
 def bind_parallel(snapshot, solver, owner, device, *, kinetic):
     """Bind the unchanged original parallel law and its direct-Z input successor."""
 
-    factory = (
-        rows.get_parallel_factory(_get_pgs_solve_parallel_kernel, owner.layout)
-        if kinetic
-        else _get_pgs_solve_parallel_kernel
-    )
+    factory = rows.get_parallel_factory(parallel_kernel, owner.layout) if kinetic else parallel_kernel
 
     def array(value, dtype=float):
         return wp.array(value, dtype=dtype, device=device)
@@ -358,9 +354,9 @@ class TestKeyedRowsCPU(unittest.TestCase):
         """Create an isolated kinetic successor without modifying ordinary signatures."""
         with np.load(next(captures())) as snapshot:
             owner = fixture(snapshot, "cpu")[-1]
-        factory = rows.get_parallel_factory(_get_pgs_solve_parallel_kernel, owner.layout)
+        factory = rows.get_parallel_factory(parallel_kernel, owner.layout)
         kwargs = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
-        ordinary = _get_pgs_solve_parallel_kernel(192, 64, 22, "cuda", **kwargs)
+        ordinary = parallel_kernel(192, 64, 22, "cuda", **kwargs)
         candidate = factory(192, 64, 22, "cuda", **kwargs)
         self.assertFalse(getattr(ordinary, "_fpgs_kinetic_rows", False))
         self.assertTrue(candidate._fpgs_kinetic_rows)

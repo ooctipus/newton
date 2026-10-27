@@ -13,7 +13,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs import response_builds_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.tests.feather_pgs_law_harness import contact_input
@@ -27,8 +27,8 @@ def _launch_workers(capacity, enabled):
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and node.args
-        and isinstance(node.args[0], ast.Name)
-        and node.args[0].id == "populate_sparse_diagonal_contact_response"
+        and isinstance(node.args[0], ast.Attribute)
+        and node.args[0].attr == "sparse_pair_contact_rows_kernel"
     )
     # A launch through the contact pool takes its dimension as the second positional argument.
     dimension = next((item.value for item in call.keywords if item.arg == "dim"), None) or call.args[1]
@@ -120,7 +120,7 @@ def _launch(values, workers, device):
     """Launch the unchanged source kernel with the selected complete-prefix owner."""
     data, _arrays = contact_input(values, device)
     values = {**values, "data": data, "total_num_workers": workers}
-    kernel = kernels.populate_sparse_diagonal_contact_response
+    kernel = response_builds_rows.sparse_pair_contact_rows_kernel
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
     wp.launch(kernel, dim=workers, inputs=arguments, device=device)
 

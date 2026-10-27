@@ -56,7 +56,6 @@ def _eligible_solver():
         pgs_schedule="interleaved",
         drive_mode="augmented",
         _parallel_augmented_drive_topology=True,
-        friction_mode="current",
         pgs_iterations=8,
         pgs_velocity_iterations=0,
         enable_joint_velocity_limits=False,

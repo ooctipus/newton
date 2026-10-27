@@ -9,7 +9,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.tests import test_feather_pgs_sparse_contact_triplets as fixtures
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity
 
@@ -41,7 +41,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                     data["reference_factor_delta"] = np.zeros((worlds, lanes), np.float32)
 
                     def factory(capacity, dofs, width, *, _table=table, _lanes=lanes, _local=local_factors, **_kwargs):
-                        return _get_pgs_solve_sparse_kernel(
+                        return sparse_kernel(
                             capacity,
                             dofs,
                             width,

@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check shared factor inputs against independent dense matrix construction."""
+"""Check the warp-mapped factor build (``factor_warps_kernel``) against independent dense matrix construction."""
 
 import unittest
 
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import small_cholesky
+from newton._src.solvers.feather_pgs.response_builds_dense import factor_warps_kernel
 from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _random_inertia
 
@@ -26,7 +26,7 @@ class TestSmallCholesky(unittest.TestCase):
             (2, {"geometric": True, "geometric_index": (0, 1, -2, 3)}),
         ):
             with self.subTest(size=size, options=options), self.assertRaises(ValueError):
-                small_cholesky.get_kernel(size, **options)
+                factor_warps_kernel(size, **options)
 
     def _compare(self, size, warps, mode, augmented):
         rng = np.random.default_rng(19 + size)
@@ -61,9 +61,7 @@ class TestSmallCholesky(unittest.TestCase):
                 rows = drive[articulation * size : (articulation + 1) * size]
                 diagonal += np.where(rows >= 0, np.maximum(drive_k[np.maximum(rows, 0)], 0), 0)
             expected[group] += np.diag(diagonal)
-        kernel = small_cholesky.get_kernel(
-            size, warps_per_block=warps, geometric=mode != "ordinary", geometric_index=lookup
-        )
+        kernel = factor_warps_kernel(size, warps_per_block=warps, geometric=mode != "ordinary", geometric_index=lookup)
 
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device="cuda:0")

@@ -19,19 +19,17 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
-    accumulate_group_diag_worlds,
 )
-from newton._src.solvers.feather_pgs.paired_factor_source import get_source as get_paired_factor_source
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
+from newton._src.solvers.feather_pgs.response_builds_dense import diagonal_groups_kernel, response_tiles_kernel
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
     _get_build_independent_sparse_contact_groups_kernel,
-    _get_hinv_jt_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
-    _get_pgs_solve_paired_factor_kernel,
-    _get_pgs_solve_sparse_diagonal_kernel,
 )
 from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
+from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
 from newton._src.solvers.feather_pgs.tree_passes import (
     DynamicsData,
     diagonal_inverse_mass,
@@ -738,27 +736,27 @@ def _launch_paired_factor_solve(
 
 class TestPairedFactorUnitSource(unittest.TestCase):
     def test_unit_walk_replaces_the_runtime_layout_test(self):
-        """Walk units from each row's type and parent; keep the triple and general sources as they were."""
-        units = get_paired_factor_source(192, 29, 23, 6, contact_units=True, independent_components=True)
-        general = get_paired_factor_source(192, 29, 23, 6, independent_components=True)
-        triples = get_paired_factor_source(192, 29, 23, 6, contact_triples=True, independent_components=True)
+        """Walk units from each row's type and parent; the triple schedule tests its layout, the general none."""
+        units = paired_factor_source(192, 29, 23, 6, contact_units=True, independent_components=True)[0]
+        general = paired_factor_source(192, 29, 23, 6, independent_components=True)[0]
+        triples = paired_factor_source(192, 29, 23, 6, contact_triples=True, independent_components=True)[0]
         # A unit owns tangent rows only when the next row is a tangent naming it as parent; three
         # normal-only units must not read as one triple, so the walk needs no stride-3 layout test.
         self.assertIn("world_row_parent.data[off + tangent1] == i", units)
         self.assertIn("world_row_mu.data[off + tangent1]", units)
         for text in ("triple_layout", "s_contact_mu", "% 3"):
             self.assertNotIn(text, units)
-        self.assertIn("triple_layout", general)
-        self.assertIn("const bool triple_layout = true", triples)
+        self.assertNotIn("triple_layout", general)
+        self.assertIn("const bool triple_layout = dense_phase_bounds.data[world * 2] == contact_start", triples)
         with self.assertRaises(ValueError):
-            get_paired_factor_source(192, 29, 23, 6, contact_triples=True, contact_units=True)
-        factory = _get_pgs_solve_paired_factor_kernel.__wrapped__
+            paired_factor_source(192, 29, 23, 6, contact_triples=True, contact_units=True)[0]
+        factory = paired_factor_kernel.__wrapped__
         self.assertEqual(
             factory(192, 29, 23, 6, "120", False, True, contact_units=True).key,
-            "pgs_solve_paired_factor_192_29_23_6_w2_units_components",
+            "sweep_paired_factor_192_29_23_6_units_components",
         )
         self.assertEqual(
-            factory(192, 29, 23, 6, "120", True, True).key, "pgs_solve_paired_factor_192_29_23_6_w2_contact3_components"
+            factory(192, 29, 23, 6, "120", True, True).key, "sweep_paired_factor_192_29_23_6_contact3_components"
         )
 
 
@@ -780,7 +778,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             self.assertGreater(rows["loaded_rings"], 0)
             dofs = primary + secondary
             kernels = [
-                _get_pgs_solve_paired_factor_kernel(
+                paired_factor_kernel(
                     capacity, dofs, primary, secondary, str(device.arch), independent_components=components, **kwargs
                 )
                 for kwargs in ({}, {"contact_units": True})
@@ -883,9 +881,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         lower_lambda = wp.zeros((1, world_dofs), dtype=wp.float32, device=device)
         upper_lambda = wp.zeros_like(lower_lambda)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_sparse_diagonal_kernel(
-            max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True
-        )
+        kernel = sparse_diagonal_kernel(max_constraints, world_dofs, dense_dofs, str(device.arch), contact_triples=True)
         wp.launch_tiled(
             kernel,
             dim=[1],
@@ -978,7 +974,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_sparse_diagonal_kernel(
+        kernel = sparse_diagonal_kernel(
             max_constraints,
             world_dofs,
             dense_dofs,
@@ -1253,15 +1249,13 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     def test_unit_schedule_factories_name_and_reject_layouts(self):
         """Name the unit variants and keep speculative batches within sixteen response lanes."""
-        solve = _get_pgs_solve_sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
-        batched = _get_pgs_solve_sparse_diagonal_kernel(
-            24, 12, 9, "120", contact_units=True, speculative_contact_batches=True
-        )
+        solve = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True)
+        batched = sparse_diagonal_kernel(24, 12, 9, "120", contact_units=True, speculative_contact_batches=True)
         builder = _get_build_independent_sparse_contact_groups_kernel(
             24, 12, "120", build_serial_contacts=True, units=True
         )
-        self.assertEqual(solve.key, "pgs_solve_sparse_diagonal_24_12_9_units")
-        self.assertEqual(batched.key, "pgs_solve_sparse_diagonal_24_12_9_speculative_batches_units")
+        self.assertEqual(solve.key, "sweep_sparse_diagonal_24_12_9_units")
+        self.assertEqual(batched.key, "sweep_sparse_diagonal_24_12_9_speculative_batches_units")
         self.assertEqual(builder.key, "build_independent_sparse_contact_groups_24_12_serial_contacts_units")
         for kwargs in (
             {"contact_triples": True, "contact_units": True},
@@ -1269,7 +1263,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         ):
             dense_dofs = kwargs.pop("dense_dofs", 9)
             with self.subTest(**kwargs), self.assertRaises(ValueError):
-                _get_pgs_solve_sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
+                sparse_diagonal_kernel(24, dense_dofs + 3, dense_dofs, "120", **kwargs)
 
     def test_unit_schedule_reorders_only_commuting_rows(self):
         """Keep GS order on every coordinate when sweeping in the unit schedule's order.
@@ -1378,7 +1372,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     lower = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
                     upper = wp.zeros((worlds, dofs), dtype=wp.float32, device=device)
                     velocity = wp.array(rows["velocity"], device=device)
-                    kernel = _get_pgs_solve_sparse_diagonal_kernel(
+                    kernel = sparse_diagonal_kernel(
                         capacity,
                         dofs,
                         dense,
@@ -1903,7 +1897,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         world_response = wp.zeros_like(world_jacobian)
         group_diag = wp.zeros((num_articulations, max_constraints), dtype=wp.float32, device=device)
 
-        kernel = _get_hinv_jt_kernel(
+        kernel = response_tiles_kernel(
             num_dofs,
             max_constraints,
             str(device.arch),
@@ -1930,7 +1924,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         world_diag = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
         wp.launch(
-            accumulate_group_diag_worlds,
+            diagonal_groups_kernel(),
             dim=2 * max_constraints,
             inputs=[
                 group_diag,

@@ -148,17 +148,19 @@ def factory_calls():
     (:func:`held_factor_calls`) follow. Calls a factory rejects are recorded as
     rejected.
     """
-    from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        keyed_rows,
+        response_builds_dense,
+        sweep_routes,
+        sweep_routes_tiers,
+    )
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
     name = "solver_feather_pgs."
-    mf_gs = _unwrapped(solver._get_pgs_solve_mf_gs_kernel)
+    mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     toggles = (
         {},
-        {"friction_mode": "bisection"},
-        {"friction_mode": "bisection_desaxce"},
-        {"friction_mode": "coulomb_newton"},
         {"shared_metadata": False},
         {"stream_mf_impulses": True},
         {"fuse_vel_limits": True},
@@ -170,10 +172,10 @@ def factory_calls():
     )
     for base in ({}, {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}):
         for change in toggles:
-            yield name + "_get_pgs_solve_mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
+            yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
 
     def parallel(layout, *args, **kwargs):
-        factory = keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)
+        factory = keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)
         return factory(*args, **kwargs)
 
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
@@ -191,29 +193,26 @@ def factory_calls():
         }
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
 
+    dense = "response_builds_dense."
+    warps = _unwrapped(response_builds_dense.factor_warps_kernel)
+    tiles = _unwrapped(response_builds_dense.factor_tiles_kernel)
+    lanes = _unwrapped(response_builds_dense.inverse_lanes_kernel)
     for size in (6, 9, 16):
         index = Named(f"range({size * size})", tuple(range(size * size)))
-        small = _unwrapped(small_cholesky.get_kernel)
-        yield "small_cholesky.get_kernel", small, (size,), {}
-        yield "small_cholesky.get_kernel", small, (size,), {"geometric": True}
-        yield "small_cholesky.get_kernel", small, (size,), {"geometric": True, "geometric_index": index}
+        yield dense + "factor_warps_kernel", warps, (size,), {}
+        yield dense + "factor_warps_kernel", warps, (size,), {"geometric": True}
+        yield dense + "factor_warps_kernel", warps, (size,), {"geometric": True, "geometric_index": index}
         yield (
-            "small_cholesky.get_kernel",
-            small,
+            dense + "factor_warps_kernel",
+            warps,
             (size,),
             {"geometric": True, "geometric_index": index, "geometric_stride": size * size + 1, "geometric_group": True},
         )
-        for factory in (
-            "_get_crba_cholesky_warp_kernel",
-            "_get_crba_cholesky_kernel",
-            "_get_cholesky_kernel",
-            "_get_cholesky_inverse_tiled_kernel",
-            "_get_inverse_cholesky_register_kernel",
-            "_get_triangular_solve_kernel",
-        ):
-            yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), {}
-        factory = _unwrapped(solver._get_inverse_cholesky_register_kernel)
-        yield name + "_get_inverse_cholesky_register_kernel", factory, (size, ARCH), {"lower_only": True}
+        for kwargs in ({}, {"assembly": "crba"}, {"inverse": True}):
+            yield dense + "factor_tiles_kernel", tiles, (size, ARCH), kwargs
+        yield dense + "inverse_lanes_kernel", lanes, (size, ARCH), {}
+        yield dense + "inverse_lanes_kernel", lanes, (size, ARCH), {"lower_only": True}
+        yield name + "_get_triangular_solve_kernel", _unwrapped(solver._get_triangular_solve_kernel), (size, ARCH), {}
     yield from held_factor_calls()
 
 
@@ -230,7 +229,7 @@ def held_factor_calls():
     """
     import numpy as np  # noqa: PLC0415
 
-    from newton._src.solvers.feather_pgs import small_cholesky  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import response_builds_dense  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.tree_plan import TreePlan  # noqa: PLC0415
 
     def chains(count, length, *, base=()):
@@ -247,7 +246,7 @@ def held_factor_calls():
     free_body = [(-1, 6)]
     arm = chains(1, 7)
     leaves = [*arm, (len(arm) - 1, 1), (len(arm) - 1, 1)]
-    small = _unwrapped(small_cholesky.get_kernel)
+    warps = _unwrapped(response_builds_dense.factor_warps_kernel)
     for name, trees, families in (
         ("four_chains", (chains(4, 4),), None),
         ("free_body", (free_body,), None),
@@ -263,7 +262,12 @@ def held_factor_calls():
         physical = mass.physical_lookup
         if families is None:
             index = Named(f"{name}.index", tuple(map(int, physical.ravel())))
-            yield "small_cholesky.get_kernel", small, (mass.dof_count,), {"geometric": True, "geometric_index": index}
+            yield (
+                "response_builds_dense.factor_warps_kernel",
+                warps,
+                (mass.dof_count,),
+                {"geometric": True, "geometric_index": index},
+            )
             continue
         offsets = np.cumsum([0, *(sum(count for _, count in tree) for tree in trees[:-1])])
         for root, (family, offset) in enumerate(zip(families, offsets, strict=True)):
@@ -275,7 +279,7 @@ def held_factor_calls():
                     "geometric_stride": mass.nonzero_count,
                     "geometric_group": True,
                 }
-                yield "small_cholesky.get_kernel", small, (family,), kwargs
+                yield "response_builds_dense.factor_warps_kernel", warps, (family,), kwargs
 
 
 def _schedules(layout, chain, reference=False):
@@ -483,16 +487,20 @@ def census_calls():
     law is crossed with both laws, and the matrix-free Gauss-Seidel sweep with
     resident row metadata.
     """
-    from newton._src.solvers.feather_pgs import keyed_rows, row_packets  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        keyed_rows,
+        row_packets,
+        sweep_routes,
+        sweep_routes_diag,
+        sweep_routes_local,
+        sweep_routes_tiers,
+    )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS  # noqa: PLC0415
 
-    name = "solver_feather_pgs."
     laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     mf_gs = (
-        _axis("friction_mode", ("current", "bisection", "bisection_desaxce", "coulomb_newton")),
         _axis("shared_metadata", (True, False)),
         _axis("stream_mf_impulses"),
         _axis("has_drive_rows", (True, False)),
@@ -513,19 +521,18 @@ def census_calls():
         _axis("lanes_per_world", (32, 16, 8)),
         _axis("contact_capable", (True, False)),
         ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
-        _axis("dense_response_matrix"),
     )
     keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
     specs = (
         (
-            name + "_get_pgs_solve_mf_gs_kernel",
-            solver._get_pgs_solve_mf_gs_kernel,
+            "sweep_routes.mf_gs_kernel",
+            sweep_routes.mf_gs_kernel,
             ((64, 32, 12, ARCH), (192, 64, 40, ARCH)),
             mf_gs,
         ),
         (
-            "sparse_pgs._get_pgs_solve_sparse_kernel",
-            _get_pgs_solve_sparse_kernel,
+            "sweep_routes_sparse.sparse_kernel",
+            sparse_kernel,
             ((48, 18, 12), (32, 8, 8)),
             (
                 _axis("active_rows"),
@@ -540,14 +547,14 @@ def census_calls():
             ),
         ),
         (
-            name + "_get_pgs_solve_paired_factor_kernel",
-            solver._get_pgs_solve_paired_factor_kernel,
+            "sweep_routes_local.paired_factor_kernel",
+            sweep_routes_local.paired_factor_kernel,
             ((192, 29, 23, 6, ARCH),),
             (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
         ),
         (
-            name + "_get_pgs_solve_local_owned_kernel",
-            solver._get_pgs_solve_local_owned_kernel,
+            "sweep_routes_local.local_owned_kernel",
+            sweep_routes_local.local_owned_kernel,
             ((192, 20, 9, ARCH),),
             local,
         ),
@@ -558,14 +565,14 @@ def census_calls():
             local,
         ),
         (
-            name + "_get_pgs_solve_sparse_diagonal_kernel",
-            solver._get_pgs_solve_sparse_diagonal_kernel,
+            "sweep_routes_diag.sparse_diagonal_kernel",
+            sweep_routes_diag.sparse_diagonal_kernel,
             ((64, 10, 9, ARCH),),
             (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
         ),
         (
-            name + "_get_pgs_solve_mf_gs_incremental_kernel",
-            solver._get_pgs_solve_mf_gs_incremental_kernel,
+            "sweep_routes.incremental_kernel",
+            sweep_routes.incremental_kernel,
             ((64, 32, 12, ARCH),),
             (
                 ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
@@ -576,8 +583,8 @@ def census_calls():
             ),
         ),
         (
-            name + "_get_pgs_solve_parallel_kernel",
-            solver._get_pgs_solve_parallel_kernel,
+            "sweep_routes_tiers.parallel_kernel",
+            sweep_routes_tiers.parallel_kernel,
             ((192, 32, 18, ARCH),),
             (
                 tuple({"rows": rows, "min_rows": low, "sweeps": 24} for rows, low in ((32, 0), (48, 32), (128, 96))),
@@ -593,7 +600,7 @@ def census_calls():
         ),
         (
             f"keyed_rows.get_parallel_factory({keyed!r})",
-            keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, keyed),
+            keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, keyed),
             ((128, 32, 22, ARCH),),
             (
                 tuple(

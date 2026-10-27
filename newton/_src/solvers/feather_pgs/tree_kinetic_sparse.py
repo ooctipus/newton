@@ -6,8 +6,8 @@
 import numpy as np
 import warp as wp
 
+from .response_builds_rows import sparse_factor_kernel
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
-from .sparse_mass_matrix import _get_crba_sparse_factor_kernel
 from .tree_kinetic_owner import TreeKineticState
 
 
@@ -54,7 +54,7 @@ class TreeSparseOperator:
         # Initial and reset mass requests are consumed before any prediction.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = solver._sparse_mass_matrix_status
-        self.refresh_kernel = _get_crba_sparse_factor_kernel(
+        self.refresh_kernel = sparse_factor_kernel(
             n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block, geometric=True
         )
         self.kinetic_state = None

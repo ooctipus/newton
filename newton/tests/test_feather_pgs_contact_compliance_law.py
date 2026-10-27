@@ -44,7 +44,6 @@ class TestContactComplianceLaw(unittest.TestCase):
             ("pgs_contact_regularization", 0.01),
             ("pgs_warmstart", True),
             ("enable_restitution", True),
-            ("friction_mode", "coulomb_newton"),
             ("contact_friction_shared_anchor", True),
         ):
             kwargs = {"pgs_mode": "matrix_free", "enable_restitution": False, key: value}

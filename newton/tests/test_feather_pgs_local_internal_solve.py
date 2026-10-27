@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     classify_local_solve_worlds,
     compact_local_pair_candidates,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_local_owned_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
 
 
 class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
@@ -150,7 +150,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         candidate_articulations = wp.array([0, 1], dtype=wp.int32, device=device)
         lower_group = wp.array(np.stack([lower, np.eye(dof_count, dtype=np.float32)]), dtype=wp.float32, device=device)
         jacobian_group = wp.array(jacobian, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_local_owned_kernel(max_constraints, local_max_constraints, dof_count, device.arch)
+        kernel = local_owned_kernel(max_constraints, local_max_constraints, dof_count, device.arch)
         wp.launch_tiled(
             kernel,
             dim=[2],
@@ -211,12 +211,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             contact_capable: bool = True,
             persistent_queue: bool = False,
             active_count: int = 2,
-            dense_response_matrix: bool = False,
         ):
             variant_diagonal = wp.array(cfm, dtype=wp.float32, device=device)
             variant_impulses = wp.zeros((2, max_constraints), dtype=wp.float32, device=device)
             variant_velocity = wp.array(velocity, dtype=wp.float32, device=device)
-            variant_kernel = _get_pgs_solve_local_owned_kernel(
+            variant_kernel = local_owned_kernel(
                 max_constraints,
                 local_max_constraints,
                 dof_count,
@@ -225,7 +224,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 warps_per_block=warps_per_block,
                 lanes_per_world=lanes_per_world,
                 contact_capable=contact_capable,
-                dense_response_matrix=dense_response_matrix,
             )
             inputs = [candidate_articulations, candidate_articulations]
             if persistent_queue:
@@ -274,26 +272,14 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             launch_variant(1, contact_capable=False),
             launch_variant(2, contact_capable=False),
         ]
-        matrix_variants = [
-            launch_variant(1, contact_capable=False, dense_response_matrix=True),
-            launch_variant(
-                1,
-                lanes_per_world=16,
-                contact_capable=False,
-                dense_response_matrix=True,
-            ),
-            launch_variant(
-                1,
-                lanes_per_world=8,
-                contact_capable=False,
-                persistent_queue=True,
-                dense_response_matrix=True,
-            ),
+        subwarp_variants = [
+            launch_variant(1, lanes_per_world=16, contact_capable=False),
+            launch_variant(1, lanes_per_world=8, contact_capable=False, persistent_queue=True),
         ]
         for variant_outputs in exact_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_array_equal(variant, one_warp)
-        for variant_outputs in numerical_variants + matrix_variants:
+        for variant_outputs in numerical_variants + subwarp_variants:
             for one_warp, variant in zip(one_warp_outputs, variant_outputs, strict=True):
                 np.testing.assert_allclose(variant, one_warp, rtol=0.0, atol=2.0e-6)
 
@@ -313,7 +299,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         impulses = wp.array([[1.0, 0.0, 0.0]], dtype=wp.float32, device=device)
         diagonal = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         velocity = wp.array([0.0, 1.0, 0.0], dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_local_owned_kernel(max_constraints, max_constraints, dof_count, device.arch)
+        kernel = local_owned_kernel(max_constraints, max_constraints, dof_count, device.arch)
         wp.launch_tiled(
             kernel,
             dim=[1],
@@ -370,12 +356,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         diagonal = wp.array([[1.0, 0.0, 0.0, 1.0]], dtype=wp.float32, device=device)
         impulses = wp.array([[0.0, 0.0, 0.0, 4.0]], dtype=wp.float32, device=device)
         velocity = wp.zeros(dof_count, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_local_owned_kernel(
+        kernel = local_owned_kernel(
             max_constraints,
             max_constraints,
             dof_count,
             device.arch,
-            dense_response_matrix=True,
         )
         wp.launch_tiled(
             kernel,
@@ -494,7 +479,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         mf_impulses = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
         diagonal = wp.array(dense_cfm, dtype=wp.float32, device=device)
         velocity = wp.array(initial_velocity, dtype=wp.float32, device=device)
-        kernel = _get_pgs_solve_local_owned_kernel(
+        kernel = local_owned_kernel(
             max_constraints,
             2,
             primary_dofs,
@@ -504,7 +489,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             warps_per_block=2,
             mf_max_constraints=max_constraints,
             local_mf_max_constraints=max_constraints,
-            dense_response_matrix=True,
         )
         wp.launch_tiled(
             kernel,
@@ -606,14 +590,12 @@ def _patch_ring_solves(device, load):
     arch = wp.get_device(device).arch
     kernels = {
         "group": (
-            _get_pgs_solve_local_owned_kernel(
-                max_constraints, max_constraints, dof_count, arch, dense_response_matrix=True
-            ),
+            local_owned_kernel(max_constraints, max_constraints, dof_count, arch),
             [],
         ),
         "packets": (
             row_packets.get_local_factory(dof_count, 0, max_constraints)(
-                max_constraints, max_constraints, dof_count, arch, dense_response_matrix=True
+                max_constraints, max_constraints, dof_count, arch
             ),
             [prefix, packets],
         ),

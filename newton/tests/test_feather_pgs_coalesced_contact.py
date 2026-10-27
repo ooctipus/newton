@@ -12,7 +12,7 @@ import warp as wp
 
 from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
-from newton._src.solvers.feather_pgs import contact_input
+from newton._src.solvers.feather_pgs import contact_input, response_builds_rows
 from newton.tests import test_feather_pgs_compact_contact as baseline
 from newton.tests.test_feather_pgs_compact_contact import (
     _LAUNCH_FIELDS,
@@ -40,7 +40,7 @@ def publish(data, aux):
     clear(data, aux)
     wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
     wp.launch(
-        compact.produce_limit_response,
+        response_builds_rows.sparse_pair_limit_kernel,
         dim=(2, 12),
         inputs=[aux.bounds, aux.counts, data.dense_group, data.factor, data.J, data.Y, data.row_cfm, data.diag],
         device=aux.device,

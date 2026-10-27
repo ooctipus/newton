@@ -20,6 +20,7 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
+from . import response_builds_rows, sweep_routes_split
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 
@@ -35,7 +36,6 @@ _APPLIED_ATTRIBUTES = {
 
 _BETA_REASONS = {
     "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
-    "default_point_solver": "friction_anchor_beta omitted with a coupled friction_mode: point friction.",
     "default_compliance": "friction_anchor_beta omitted with contact_compliance: point friction.",
     "argument": "friction_anchor_beta passed explicitly.",
 }
@@ -453,7 +453,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "sparse_response":
         kernels = (*prepare, solver._sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
-        kernels = (*prepare, source.populate_sparse_diagonal_contact_response)
+        kernels = (*prepare, response_builds_rows.sparse_pair_contact_rows_kernel)
         if solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units:
             kernels = (*kernels, solver._mark_independent_sparse_contact_candidates_kernel)
     elif method == "compact_jacobian":
@@ -693,7 +693,9 @@ def _sweep(solver, source) -> dict:
                 "staging_reason": solver._tiled_row_staging_reason,
             }
         else:
-            loop = source.pgs_solve_loop_unit if solver._dense_contact_unit else source.pgs_solve_loop
+            loop = (
+                sweep_routes_split.loop_unit_kernel if solver._dense_contact_unit else sweep_routes_split.loop_kernel
+            )()
             dense = {"kernels": [_key(loop)]}
     free_body = None
     if dense_split and solver._has_free_rigid_bodies:
@@ -701,7 +703,11 @@ def _sweep(solver, source) -> dict:
             free_body = _key(solver._pgs_solve_mf_kernel)
         else:
             free_body = _key(
-                source.pgs_solve_mf_loop_unit if solver._free_body_contact_unit else source.pgs_solve_mf_loop
+                (
+                    sweep_routes_split.mf_loop_unit_kernel
+                    if solver._free_body_contact_unit
+                    else sweep_routes_split.mf_loop_kernel
+                )()
             )
     mf_meta_pack = None
     if solver.pgs_mode == "matrix_free":
@@ -1144,7 +1150,6 @@ def _friction(solver) -> dict:
         "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.friction_anchor_beta),
         "anchor_beta_source": solver._friction_anchor_beta_source,
-        "friction_mode": solver.friction_mode,
         "torsion": bool(solver._contact_torsion_enabled),
         "compliance": bool(solver.contact_compliance),
         # Whether the parallel tiers and keyed rows may serve this law; routes.sweep.tiers and

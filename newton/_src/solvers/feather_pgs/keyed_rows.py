@@ -537,7 +537,6 @@ def create_owner(solver):
         and not solver.model.requires_grad
         and solver.pgs_mode == "matrix_free"
         and solver.drive_mode == "augmented"
-        and solver.friction_mode == "current"
         and solver.pgs_schedule == "interleaved"
         and solver.enable_joint_limits
         and 0 < solver.mf_gs_parallel_rows <= 128

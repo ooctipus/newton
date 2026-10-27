@@ -3,9 +3,9 @@
 
 """The sparse-diagonal, tiled-row and split free-body sweeps as configurations of the sweep emitter (CPU checks).
 
-Each configuration replaces a legacy factory of ``solver_feather_pgs``: it takes the same arguments, builds a kernel
-of the same signature and raises for the same options. The operators' lane layouts emit the arithmetic order of the
-sweeps they replace; with ``ptxas`` on ``PATH`` the legacy and emitter kernels are also assembled offline.
+Each configuration raises for the options it does not admit, declares its staging and generates a balanced body; the
+operators' lane layouts emit the arithmetic order of the sweeps. With ``ptxas`` on ``PATH`` the kernels are also
+assembled offline.
 """
 
 import itertools
@@ -18,7 +18,6 @@ from pathlib import Path
 
 import warp as wp
 
-from newton._src.solvers.feather_pgs import solver_feather_pgs as legacy
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
 from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBody6, Lanes, SparsePairJY, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
@@ -34,93 +33,38 @@ _SCHEDULES = (
 )
 
 
-def _signature(kernel):
-    return [(argument.label, wp.types.type_repr(argument.type)) for argument in kernel.adj.args]
-
-
 def _balanced(test, text):
     test.assertEqual(text.count("{"), text.count("}"))
     test.assertEqual(text.count("("), text.count(")"))
     test.assertNotIn("$", text)
 
 
-class TestSweepRoutesDiagABI(unittest.TestCase):
-    """The configurations' kernels take the legacy factories' arguments and keep their signatures."""
+class TestSweepRoutesDiagOptions(unittest.TestCase):
+    """The configurations refuse the options they do not admit."""
 
-    def test_sparse_diagonal_operands_are_the_legacy_operands(self):
-        self.assertEqual(routes.SPARSE_DIAGONAL_ABI, legacy._SPARSE_DIAGONAL_SWEEP_PARAMS)
-
-    def test_sparse_diagonal_signatures(self):
-        for schedule, policy in itertools.product(_SCHEDULES, (*_POLICIES, SolvePolicy(readout="trace"))):
-            with self.subTest(schedule=schedule, policy=policy):
-                args = (32, 14, 6, "sm_120")
-                old = legacy._get_pgs_solve_sparse_diagonal_kernel(*args, solve_policy=policy, **schedule)
-                new = routes.sparse_diagonal_kernel(*args, solve_policy=policy, **schedule)
-                self.assertEqual(_signature(new), _signature(old))
-
-    def test_tiled_row_signatures(self):
-        cases = [((32, "sm_120"), {}), ((64, "sm_120"), {"staging": "global"})]
-        cases += [((128, "sm_120"), {"row_budget": 32}), ((128, "sm_120"), {"row_budget": 128, "min_rows": 32})]
-        for args, kwargs in cases:
-            with self.subTest(args=args, kwargs=kwargs):
-                old = legacy._get_pgs_solve_tiled_row_kernel(*args, **kwargs)
-                new = routes.tiled_row_kernel(*args, **kwargs)
-                self.assertEqual(_signature(new), _signature(old))
-
-    def test_mf_split_signatures(self):
-        for vlim in (False, True):
-            with self.subTest(has_velocity_limit_rows=vlim):
-                old = legacy._get_pgs_solve_mf_kernel(512, 64, "sm_120", has_velocity_limit_rows=vlim)
-                new = routes.mf_split_kernel(512, 64, "sm_120", has_velocity_limit_rows=vlim)
-                self.assertEqual(_signature(new), _signature(old))
-
-    def test_options_raise_like_the_legacy_factories(self):
+    def test_invalid_options_raise(self):
         cases = [
+            (routes.sparse_diagonal_kernel, (32, 14, 6, "sm_120"), {"contact_triples": True, "contact_units": True}),
+            (routes.sparse_diagonal_kernel, (32, 14, 6, "sm_120"), {"speculative_contact_batches": True}),
             (
-                legacy._get_pgs_solve_sparse_diagonal_kernel,
-                routes.sparse_diagonal_kernel,
-                (32, 14, 6, "sm_120"),
-                {"contact_triples": True, "contact_units": True},
-            ),
-            (
-                legacy._get_pgs_solve_sparse_diagonal_kernel,
-                routes.sparse_diagonal_kernel,
-                (32, 14, 6, "sm_120"),
-                {"speculative_contact_batches": True},
-            ),
-            (
-                legacy._get_pgs_solve_sparse_diagonal_kernel,
                 routes.sparse_diagonal_kernel,
                 (32, 30, 15, "sm_120"),
                 {"contact_triples": True, "speculative_contact_batches": True},
             ),
-            (legacy._get_pgs_solve_tiled_row_kernel, routes.tiled_row_kernel, (32, "sm_120"), {"staging": "dense"}),
-            (legacy._get_pgs_solve_tiled_row_kernel, routes.tiled_row_kernel, (32, "sm_120"), {"row_budget": 16}),
-            (legacy._get_pgs_solve_tiled_row_kernel, routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 24}),
-            (
-                legacy._get_pgs_solve_tiled_row_kernel,
-                routes.tiled_row_kernel,
-                (64, "sm_120"),
-                {"row_budget": 32, "min_rows": 32},
-            ),
-            (
-                legacy._get_pgs_solve_tiled_row_kernel,
-                routes.tiled_row_kernel,
-                (64, "sm_120"),
-                {"row_budget": 32, "staging": "global"},
-            ),
-            (legacy._get_pgs_solve_tiled_row_kernel, routes.tiled_row_kernel, (64, "sm_120"), {"min_rows": 8}),
+            (routes.tiled_row_kernel, (32, "sm_120"), {"staging": "dense"}),
+            (routes.tiled_row_kernel, (32, "sm_120"), {"row_budget": 16}),
+            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 24}),
+            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 32, "min_rows": 32}),
+            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 32, "staging": "global"}),
+            (routes.tiled_row_kernel, (64, "sm_120"), {"min_rows": 8}),
         ]
-        for old, new, args, kwargs in cases:
-            with self.subTest(factory=new.__name__, kwargs=kwargs):
-                with self.assertRaises(ValueError) as expected:
-                    old(*args, **kwargs)
-                with self.assertRaisesRegex(ValueError, re.escape(str(expected.exception))):
-                    new(*args, **kwargs)
+        for factory, args, kwargs in cases:
+            with self.subTest(factory=factory.__name__, kwargs=kwargs), self.assertRaises(ValueError):
+                factory(*args, **kwargs)
 
 
 class TestSweepRoutesDiagSources(unittest.TestCase):
-    """Every option combination generates a body; the stagings are the legacy working sets."""
+    """Every option combination generates a body; the stagings are the declared working sets."""
 
     def test_sparse_diagonal_sources(self):
         for schedule, policy, (rows, dofs, dense) in itertools.product(
@@ -149,12 +93,14 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # Independent contacts: one product rounded alone, as the warp's sum of it rounds.
         self.assertIn("float jv = __fmul_rn(jacobian, s_v[scalar_coord]);", triples)
 
-    def test_tiled_row_stagings_are_the_legacy_bytes(self):
+    def test_tiled_row_stagings(self):
         for rows, staging in itertools.product((32, 64, 128), ("shared", "global")):
             with self.subTest(rows=rows, staging=staging):
                 text, declared = routes.tiled_row_source(rows, staging=staging)
                 _balanced(self, text)
-                self.assertEqual(declared.bytes, legacy._tiled_row_shared_bytes(rows, staging))
+                # Six row vectors, the packed triangle when shared, and Warp's tile storage of a warp.
+                triangle = rows * (rows + 1) // 2 if staging == "shared" else 0
+                self.assertEqual(declared.bytes, 4 * (6 * rows + triangle + 32))
                 self.assertEqual("s_Ctri" in declared, staging == "shared")
                 # Impulse space: every lane keeps its own impulses, nothing is synchronized in the sweeps.
                 sweeps = text[text.index("for (int iter = 0;") :]
@@ -270,29 +216,21 @@ def _assemble(kernel, arch: int = 120) -> dict:
 
 @unittest.skipUnless(shutil.which("ptxas"), "ptxas is not on PATH")
 class TestSweepRoutesDiagAssembly(unittest.TestCase):
-    """Legacy and emitter kernels assemble offline with the same shared memory and no spills."""
+    """The kernels assemble offline without spills."""
 
     def test_kernels_assemble(self):
         cases = [
             (
-                legacy._get_pgs_solve_sparse_diagonal_kernel,
                 routes.sparse_diagonal_kernel,
                 (32, 14, 6, "sm_120"),
                 {"contact_triples": True, "speculative_contact_batches": True},
             ),
-            (legacy._get_pgs_solve_tiled_row_kernel, routes.tiled_row_kernel, (64, "sm_120"), {"staging": "global"}),
-            (
-                legacy._get_pgs_solve_mf_kernel,
-                routes.mf_split_kernel,
-                (512, 64, "sm_120"),
-                {"has_velocity_limit_rows": True},
-            ),
+            (routes.tiled_row_kernel, (64, "sm_120"), {"staging": "global"}),
+            (routes.mf_split_kernel, (512, 64, "sm_120"), {"has_velocity_limit_rows": True}),
         ]
-        for old, new, args, kwargs in cases:
-            with self.subTest(factory=new.__name__, kwargs=kwargs):
-                reference, assembled = _assemble(old(*args, **kwargs)), _assemble(new(*args, **kwargs))
-                self.assertEqual(assembled["shared"], reference["shared"])
-                self.assertEqual(assembled["spills"], 0)
+        for factory, args, kwargs in cases:
+            with self.subTest(factory=factory.__name__, kwargs=kwargs):
+                self.assertEqual(_assemble(factory(*args, **kwargs))["spills"], 0)
 
 
 if __name__ == "__main__":

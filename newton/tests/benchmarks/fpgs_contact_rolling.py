@@ -62,7 +62,7 @@ def measure(
         wp.atomic_max(metrics, 4, wp.length(angular))
 
 
-def run(worlds, objects, kind, warm, reduced, iterations, friction):
+def run(worlds, objects, kind, warm, reduced, iterations):
     """Advance one loaded scene and return timing and physical measurements."""
     template = newton.ModelBuilder()
     template.default_shape_cfg.mu = 0.6
@@ -85,7 +85,6 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
         pgs_mode="matrix_free",
         pgs_warmstart=warm,
         pgs_iterations=iterations,
-        friction_mode=friction,
         mf_max_constraints=max(128, objects * 128),
     )
     pipeline = newton.CollisionPipeline(
@@ -140,7 +139,6 @@ def run(worlds, objects, kind, warm, reduced, iterations, friction):
         "warm": warm,
         "reduced": reduced,
         "iterations": iterations,
-        "friction": friction,
         "median_ms": statistics.median(samples),
         "samples_ms": samples,
         "metrics": dict(
@@ -205,7 +203,7 @@ def main():
         "results": [],
     }
     for repeat in range(args.repeats):
-        result = run(args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations, "current")
+        result = run(args.worlds, args.objects, args.kind, args.warm_start, args.reduced, args.iterations)
         result["repeat"] = repeat
         report["results"].append(result)
         if args.output:

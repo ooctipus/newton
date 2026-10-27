@@ -61,9 +61,9 @@ _PATCH_ONLY = frozenset(
         "row_packets.materialize_patch_fallback",
         "row_packets.produce_patch_contacts",
         # Sparse-diagonal schedules over patch contact units.
-        "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
+        "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
         "speculative_contact_batches=False)",
-        "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
+        "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
         "speculative_contact_batches=True)",
         "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
         "build_serial_contacts=False, units=True)",
@@ -72,37 +72,35 @@ _PATCH_ONLY = frozenset(
         "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
         "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
         # Native sparse sweeps that select patch rings at sweep entry.
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=False, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=False, warm_start=True)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=True, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=True, warm_start=True)",
         # Their ring-pooled contact triplets, in the active and the full sweep.
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
         # The same triplets in the staged transaction (FEATHER_PGS_SPARSE_TRANSACTION=staged).
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
         "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
         "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
         "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
-        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
         "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
         # Paired factor sweeps over patch contact units.
-        "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, "
-        "contact_units=True)",
-        "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, True, "
-        "contact_units=True)",
+        "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, False, contact_units=True)",
+        "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, True, contact_units=True)",
     )
 )
 
@@ -132,7 +130,7 @@ def _linked_tier_calls():
         }
         if last_word:
             kwargs["velocity_limit_pass"] = True
-        yield "solver_feather_pgs._get_pgs_solve_parallel_kernel", (64, 32, 18, _ARCH), kwargs
+        yield "sweep_routes_tiers.parallel_kernel", (64, 32, 18, _ARCH), kwargs
 
 
 def _keyed_layout(*, velocity_limits=False):
@@ -231,18 +229,22 @@ def _readout_calls():
     ``pgs_solve_readout="sweeps"`` builds these variants of the sparse, sparse-diagonal,
     matrix-free Gauss-Seidel, paired factor, local-packet and incremental sweeps.
     """
-    from newton._src.solvers.feather_pgs import row_packets, sparse_pgs  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        row_packets,
+        sweep_routes,
+        sweep_routes_diag,
+        sweep_routes_local,
+        sweep_routes_sparse,
+    )
     from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy  # noqa: PLC0415
 
     readout = {"solve_policy": SolvePolicy(readout="sweeps")}
-    name = "solver_feather_pgs."
     triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
-    factory = sparse_pgs._get_pgs_solve_sparse_kernel.__wrapped__
+    factory = sweep_routes_sparse.sparse_kernel.__wrapped__
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, {**triplets, **readout}, False
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, {**triplets, **readout}, False
         yield (
-            "sparse_pgs._get_pgs_solve_sparse_kernel",
+            "sweep_routes_sparse.sparse_kernel",
             factory,
             size,
             {**triplets, "linked_rows": True, **readout},
@@ -250,39 +252,39 @@ def _readout_calls():
         )
         # Point friction's single-stage opt-in and patch friction's staged one count their sweeps too.
         single = {**triplets, "contact_transaction": "single", **readout}
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, single, False
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, single, False
         staged = {**triplets, "linked_rows": True, "contact_transaction": "staged", **readout}
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, staged, True
-    factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, staged, True
+    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
     for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
         kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
-        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs, patch_only
-    factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs, patch_only
+    factory = sweep_routes.mf_gs_kernel.__wrapped__
     no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
         ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
         ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
     ):
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, args, {**kwargs, **readout}, False
-    factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}, False
+    factory = sweep_routes_local.paired_factor_kernel.__wrapped__
     for units in (False, True):
         kwargs = {"contact_units": True, **readout} if units else readout
-        yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
+        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
     packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
-    pair = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2, "dense_response_matrix": True}
+    pair = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
     for args, kwargs in (
         (
             (192, 9, 9, _ARCH),
-            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2, "dense_response_matrix": True},
+            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
         ),
         ((192, 20, 9, _ARCH), pair),
         ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
     ):
         yield "row_packets.get_local_factory(9, 6, 40)", packets, args, {**kwargs, **readout}, False
-    factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
+    factory = sweep_routes.incremental_kernel.__wrapped__
     yield (
-        name + "_get_pgs_solve_mf_gs_incremental_kernel",
+        "sweep_routes.incremental_kernel",
         factory,
         (64, 32, 12, _ARCH),
         {"incremental_rows": 32, **readout},
@@ -299,10 +301,10 @@ def _patch_only_factory_labels():
         yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
     for size, kwargs, patch_only in _suite_sparse_sweeps():
         if patch_only:
-            yield _label("sparse_pgs._get_pgs_solve_sparse_kernel", size, kwargs)
+            yield _label("sweep_routes_sparse.sparse_kernel", size, kwargs)
     for args, kwargs, patch_only in _suite_diagonal_sweeps():
         if patch_only:
-            yield _label("solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel", args, kwargs)
+            yield _label("sweep_routes_diag.sparse_diagonal_kernel", args, kwargs)
     for args, kwargs in _keyed_last_word_calls():
         yield _label("keyed_rows.get_parallel_factory", args, kwargs)
     for name, _, args, kwargs, patch_only in _readout_calls():
@@ -328,10 +330,10 @@ def _module_kernels():
 
 
 def _sparse_sweep_calls():
-    """Native sparse sweeps over the flags point friction selects (sparse_pgs.py)."""
-    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+    """Native sparse sweeps over the flags point friction selects (sweep_routes_sparse.py)."""
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
-    factory = _get_pgs_solve_sparse_kernel.__wrapped__
+    factory = sparse_kernel.__wrapped__
     for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=6)):
         active, table, triplets, velocity, local, warm = flags
         # The factory folds unsatisfiable requests into another variant; pin each variant once.
@@ -350,14 +352,14 @@ def _sparse_sweep_calls():
                 "local_factors": local,
                 "warm_start": warm,
             }
-            yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
+            yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
 
 
 def _accumulated_sparse_calls():
     """Native sparse sweeps whose velocity-limit rows accumulate (``velocity_limit_law="accumulated"``)."""
-    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
-    factory = _get_pgs_solve_sparse_kernel.__wrapped__
+    factory = sparse_kernel.__wrapped__
     # The final pass of articulated limits; the pins name the free-body capacities, always zero.
     for size in ((32, 8, 8), (48, 18, 12)):
         kwargs = {
@@ -366,17 +368,17 @@ def _accumulated_sparse_calls():
             "velocity_limits": True,
             "velocity_limit_law": "accumulated",
         }
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
 
 
 def _linked_sweep_calls():
-    """Patch-only native sparse sweeps over linked rows (sparse_pgs.py)."""
-    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+    """Patch-only native sparse sweeps over linked rows (sweep_routes_sparse.py)."""
+    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
 
-    factory = _get_pgs_solve_sparse_kernel.__wrapped__
+    factory = sparse_kernel.__wrapped__
     for table, warm in itertools.product((False, True), repeat=2):
         kwargs = {"active_rows": True, "use_support_table": table, "warm_start": warm, "linked_rows": True}
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
+        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
     for active, warm in itertools.product((False, True), repeat=2):
         kwargs = {
             "active_rows": active,
@@ -385,33 +387,57 @@ def _linked_sweep_calls():
             "warm_start": warm,
             "linked_rows": True,
         }
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
+        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
         # Patch friction's default is the single-stage transaction; pin the staged one beside it.
         staged = {**kwargs, "contact_transaction": "staged"}
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), staged
+        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), staged
 
 
 def _sparse_contact_calls():
-    from newton._src.solvers.feather_pgs.sparse_contact import _get_sparse_contact_response_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.response_builds_rows import factor_contact_rows_kernel  # noqa: PLC0415
 
-    factory = _get_sparse_contact_response_kernel.__wrapped__
+    factory = factor_contact_rows_kernel.__wrapped__
     for dofs, prepare, table in itertools.product((8, 18), (False, True), (False, True)):
         kwargs = {"prepare_rows": prepare, "use_support_table": table}
-        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
     # The triplet records of the single-stage transaction, which both laws can select.
     for dofs in (8, 18, 25):
         kwargs = {"prepare_rows": True, "use_support_table": True, "contact_records": True}
-        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
+
+
+def _dense_build_calls():
+    """The dense response builds without variants (response_builds_dense.py): every stage the dense routes run."""
+    from newton._src.solvers.feather_pgs import response_builds_dense  # noqa: PLC0415
+
+    for name in (
+        "factor_articulations_kernel",
+        "factor_coordinates_kernel",
+        "response_rows_kernel",
+        "response_lanes_kernel",
+        "response_queue_kernel",
+        "response_diagonal_kernel",
+        "gather_coordinates_kernel",
+        "diagonal_rows_kernel",
+        "diagonal_groups_kernel",
+        "diagonal_world_rows_kernel",
+        "diagonal_queue_kernel",
+        "cfm_worlds_kernel",
+        "delassus_entries_kernel",
+        "apply_coordinates_kernel",
+    ):
+        yield f"response_builds_dense.{name}", getattr(response_builds_dense, name).__wrapped__, (), {}
 
 
 def _solver_factory_calls():
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_diag, sweep_routes_local, sweep_routes_tiers  # noqa: PLC0415
 
     name = "solver_feather_pgs."
     for triples, batches in itertools.product((False, True), repeat=2):
         kwargs = {"contact_triples": triples, "speculative_contact_batches": batches}
-        factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
-        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+        factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
     for serial in (False, True):
         factory = solver._get_build_independent_sparse_contact_groups_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial}
@@ -422,8 +448,8 @@ def _solver_factory_calls():
     # Patch-only unit schedules of the same factories.
     for batches in (False, True):
         kwargs = {"contact_units": True, "speculative_contact_batches": batches}
-        factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
-        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
+        factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
+        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
     for serial in (False, True):
         factory = solver._get_build_independent_sparse_contact_groups_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial, "units": True}
@@ -439,8 +465,8 @@ def _solver_factory_calls():
             "has_dense_velocity_limit_rows": velocity,
             "skip_local_internal_worlds": local,
         }
-        factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.incremental_kernel.__wrapped__
+        yield "sweep_routes.incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for skip_rows, drives, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
             "skip_incremental_rows": skip_rows,
@@ -448,8 +474,8 @@ def _solver_factory_calls():
             "factor_coordinates": coordinates,
             "independent_components": components,
         }
-        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.mf_gs_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # Streamed metadata with the packed row types and parents resident, which single-wave launches
     # of large dense capacities select under either law; drives add the limit scans' global reads.
     for drives in (False, True):
@@ -460,13 +486,13 @@ def _solver_factory_calls():
             "has_dense_velocity_limit_rows": drives,
             "skip_incremental_rows": 0 if drives else 32,
         }
-        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.mf_gs_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The accumulated velocity-limit law of the serial sweeps; the stateless law keeps the pins above.
     for skip_rows, drives in itertools.product((0, 32), (False, True)):
         kwargs = {"skip_incremental_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
-        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.mf_gs_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The resident row metadata cases above, under the accumulated law.
     for drives in (False, True):
         kwargs = {
@@ -477,8 +503,8 @@ def _solver_factory_calls():
             "skip_incremental_rows": 0 if drives else 32,
             "velocity_limit_law": "accumulated",
         }
-        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.mf_gs_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for tier, drives, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 2)):
         kwargs = {
             "incremental_rows": tier[0],
@@ -488,25 +514,25 @@ def _solver_factory_calls():
             "skip_local_internal_worlds": local,
             "velocity_limit_law": "accumulated",
         }
-        factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
-        yield name + "_get_pgs_solve_mf_gs_incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
+        factory = sweep_routes.incremental_kernel.__wrapped__
+        yield "sweep_routes.incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
-        factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
-        yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
+        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
+        yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
     # Patch-only unit walks of the same factory.
     for components in (False, True):
-        factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
+        factory = sweep_routes_local.paired_factor_kernel.__wrapped__
         args = (192, 29, 23, 6, _ARCH, False, components)
-        yield name + "_get_pgs_solve_paired_factor_kernel", factory, args, {"contact_units": True}
+        yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True}
     # The split free-body sweep: the plain call (the variant without the free-body velocity-limit law, under
     # the factory's default label) and the variant with the law.
-    factory = solver._get_pgs_solve_mf_kernel.__wrapped__
+    factory = sweep_routes_diag.mf_split_kernel.__wrapped__
     for kwargs in ({}, {"has_velocity_limit_rows": True}):
-        yield name + "_get_pgs_solve_mf_kernel", factory, (32, 8, _ARCH), kwargs
+        yield "sweep_routes_diag.mf_split_kernel", factory, (32, 8, _ARCH), kwargs
 
     def tier_without_world_rows(*args, world_rows, **kwargs):
         # These pins were recorded with world_rows=False in their labels, before the in-sweep world rows went.
-        return solver._get_pgs_solve_parallel_kernel(*args, **kwargs)
+        return sweep_routes_tiers.parallel_kernel(*args, **kwargs)
 
     # Parallel tiers: one articulation per world with in-kernel response, and the response-block variants
     # without it.
@@ -520,9 +546,9 @@ def _solver_factory_calls():
             "world_rows": False,
             "exact_row_sums": matrix_free,
         }
-        yield (name + "_get_pgs_solve_parallel_kernel", tier_without_world_rows, (64, 32, 18, _ARCH), kwargs)
+        yield ("sweep_routes_tiers.parallel_kernel", tier_without_world_rows, (64, 32, 18, _ARCH), kwargs)
     for label, args, kwargs in _linked_tier_calls():
-        yield label, solver._get_pgs_solve_parallel_kernel, args, kwargs
+        yield label, sweep_routes_tiers.parallel_kernel, args, kwargs
 
 
 def _spliced_sweep_calls():
@@ -530,15 +556,11 @@ def _spliced_sweep_calls():
 
     Local owners, plain and over packet rows: a contactless subwarp articulation,
     an articulation pair and the pair's residual with matrix-free rows. Then the
-    tiled-row sweep with and without row budgets, the legacy matrix-free sweep and
-    the matrix-free Gauss-Seidel sweeps of the research friction modes, which call
-    the Coulomb laws.
+    tiled-row sweep with and without row budgets and the legacy matrix-free sweep.
     """
-    from newton._src.solvers.feather_pgs import row_packets  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import row_packets, sweep_routes_diag, sweep_routes_local  # noqa: PLC0415
 
-    name = "solver_feather_pgs."
-    local = solver._get_pgs_solve_local_owned_kernel.__wrapped__
+    local = sweep_routes_local.local_owned_kernel.__wrapped__
     packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
     pair = {"paired_dof_count": 6, "persistent_queue": True}
     for args, options in (
@@ -546,19 +568,16 @@ def _spliced_sweep_calls():
         ((192, 20, 9, _ARCH), pair),
         ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
     ):
-        kwargs = {**options, "warps_per_block": 2, "dense_response_matrix": True}
-        yield name + "_get_pgs_solve_local_owned_kernel", local, args, kwargs
+        kwargs = {**options, "warps_per_block": 2}
+        yield "sweep_routes_local.local_owned_kernel", local, args, kwargs
         yield "row_packets.get_local_factory(9, 6, 40)", packets, args, kwargs
-    tiled = solver._get_pgs_solve_tiled_row_kernel.__wrapped__
+    tiled = sweep_routes_diag.tiled_row_kernel.__wrapped__
     for capacity in (64, 128):
-        yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), {}
+        yield "sweep_routes_diag.tiled_row_kernel", tiled, (capacity, _ARCH), {}
         for budget, minimum in ((32, 0), (capacity, 32)):
             kwargs = {"row_budget": budget, "min_rows": minimum}
-            yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
-    yield name + "_get_pgs_solve_mf_kernel", solver._get_pgs_solve_mf_kernel.__wrapped__, (32, 8, _ARCH), {}
-    mf_gs = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
-    for friction in ("bisection", "bisection_desaxce", "coulomb_newton"):
-        yield name + "_get_pgs_solve_mf_gs_kernel", mf_gs, (64, 32, 12, _ARCH), {"friction_mode": friction}
+            yield "sweep_routes_diag.tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
+    yield "sweep_routes_diag.mf_split_kernel", sweep_routes_diag.mf_split_kernel.__wrapped__, (32, 8, _ARCH), {}
 
 
 def _suite_shape_calls():
@@ -574,18 +593,17 @@ def _suite_shape_calls():
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_row_layout,
         keyed_rows,
-        paired_components,
+        response_builds_rows,
         row_packets,
-        sparse_contact,
-        sparse_mass_matrix,
-        sparse_pgs,
+        sweep_routes,
+        sweep_routes_diag,
+        sweep_routes_sparse,
+        sweep_routes_tiers,
     )
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
-    name = "solver_feather_pgs."
     no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
-    factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+    factory = sweep_routes.mf_gs_kernel.__wrapped__
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
         ((192, 64, 22, _ARCH), {"has_drive_rows": False, "skip_incremental_rows": 128}),
@@ -593,18 +611,16 @@ def _suite_shape_calls():
         ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
         ((72, 32, 18, _ARCH), {**no_drives, "skip_incremental_rows": 48}),
     ):
-        yield name + "_get_pgs_solve_mf_gs_kernel", factory, args, kwargs
-    factory = sparse_pgs._get_pgs_solve_sparse_kernel.__wrapped__
+        yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
+    factory = sweep_routes_sparse.sparse_kernel.__wrapped__
     for size, kwargs, _ in _suite_sparse_sweeps():
-        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
-    factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
+        yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
+    factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
     for args, kwargs, _ in _suite_diagonal_sweeps():
-        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, args, kwargs
+        yield "sweep_routes_diag.sparse_diagonal_kernel", factory, args, kwargs
 
     def parallel(layout, *args, **kwargs):
-        return keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)(
-            *args, **kwargs
-        )
+        return keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)(*args, **kwargs)
 
     def limit_prefix(layout):
         return keyed_row_layout.prefix_kernel.__wrapped__(layout, keyed_rows.PrefixInput, keyed_rows.KineticRows)
@@ -629,28 +645,26 @@ def _suite_shape_calls():
                 kwargs["exact_row_sums"] = True
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
-    factory = sparse_mass_matrix._get_crba_sparse_factor_kernel.__wrapped__
+    factory = response_builds_rows.sparse_factor_kernel.__wrapped__
     for size in ((6, 21), (9, 44), (14, 81), (18, 117), (18, 135), (25, 194), (27, 243), (43, 434)):
-        yield "sparse_mass_matrix._get_crba_sparse_factor_kernel", factory, size, {}
-        yield "sparse_mass_matrix._get_crba_sparse_factor_kernel", factory, size, {"geometric": True}
+        yield "response_builds_rows.sparse_factor_kernel", factory, size, {}
+        yield "response_builds_rows.sparse_factor_kernel", factory, size, {"geometric": True}
     # 18 coordinates with a support table are pinned with the patch-varied factories.
-    factory = sparse_contact._get_sparse_contact_response_kernel.__wrapped__
+    factory = response_builds_rows.factor_contact_rows_kernel.__wrapped__
     for dofs, table in ((6, True), (9, False), (14, True), (25, True), (27, True), (43, False)):
         kwargs = {"prepare_rows": True, "use_support_table": table}
-        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
     yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
-    yield "paired_components.get_prepare_kernel", paired_components.get_prepare_kernel.__wrapped__, (23, 6), {}
+    components = response_builds_rows.paired_components_kernel.__wrapped__
+    yield "response_builds_rows.paired_components_kernel", components, (23, 6), {}
 
 
 def _keyed_row_calls():
     """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
-    from newton._src.solvers.feather_pgs import keyed_rows  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import keyed_rows, sweep_routes_tiers  # noqa: PLC0415
 
     def parallel(layout, *args, **kwargs):
-        return keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)(
-            *args, **kwargs
-        )
+        return keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)(*args, **kwargs)
 
     layout = _keyed_layout()
     yield "keyed_rows.get_fallback_kernel", keyed_rows.get_fallback_kernel.__wrapped__, (layout,), {}
@@ -664,6 +678,14 @@ def _keyed_row_calls():
         yield "keyed_rows.get_parallel_factory", parallel, args, kwargs
 
 
+def _split_loop_calls():
+    """Split mode's loop sweeps (sweep_routes_split.py): assembled and free-body rows, with and without units."""
+    from newton._src.solvers.feather_pgs import sweep_routes_split  # noqa: PLC0415
+
+    for name in ("loop_kernel", "loop_unit_kernel", "mf_loop_kernel", "mf_loop_unit_kernel"):
+        yield f"sweep_routes_split.{name}", getattr(sweep_routes_split, name).__wrapped__, (), {}
+
+
 def _factory_kernels():
     """Kernels of the factories patch integration varies, built with point arguments."""
     kernels = {}
@@ -672,10 +694,12 @@ def _factory_kernels():
         _accumulated_sparse_calls(),
         _linked_sweep_calls(),
         _sparse_contact_calls(),
+        _dense_build_calls(),
         _solver_factory_calls(),
         _spliced_sweep_calls(),
         _suite_shape_calls(),
         _keyed_row_calls(),
+        _split_loop_calls(),
         ((name, factory, args, kwargs) for name, factory, args, kwargs, _ in _readout_calls()),
     ):
         try:
@@ -812,14 +836,14 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         """Reach every factory and variant family that patch integration extends."""
         families = {name.split("(", 1)[0] for name in self.current}
         for family in (
-            "sparse_pgs._get_pgs_solve_sparse_kernel",
-            "sparse_contact._get_sparse_contact_response_kernel",
-            "solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel",
+            "sweep_routes_sparse.sparse_kernel",
+            "response_builds_rows.factor_contact_rows_kernel",
+            "sweep_routes_diag.sparse_diagonal_kernel",
             "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel",
             "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel",
-            "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
-            "solver_feather_pgs._get_pgs_solve_parallel_kernel",
-            "solver_feather_pgs._get_pgs_solve_paired_factor_kernel",
+            "sweep_routes.incremental_kernel",
+            "sweep_routes_tiers.parallel_kernel",
+            "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_fallback_kernel",
             "keyed_rows.get_parallel_factory",
             "kernels.allocate_world_contact_slots",
@@ -830,7 +854,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)
-        sparse = [name for name in self.current if name.startswith("sparse_pgs.")]
+        sparse = [name for name in self.current if name.startswith("sweep_routes_sparse.")]
         for flag in (
             "active_rows=True",
             "contact_triplets=True",
@@ -848,9 +872,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         self.assertEqual(
             accumulated,
             {
-                "sparse_pgs._get_pgs_solve_sparse_kernel",
-                "solver_feather_pgs._get_pgs_solve_mf_gs_kernel",
-                "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
+                "sweep_routes_sparse.sparse_kernel",
+                "sweep_routes.mf_gs_kernel",
+                "sweep_routes.incremental_kernel",
             },
         )
         # The MF-GS kernels that keep row metadata resident are pinned under both laws.
@@ -862,18 +886,16 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         self.assertTrue(set(linked) <= _PATCH_ONLY)
         # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
         last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
-        self.assertEqual(
-            last_word, {"solver_feather_pgs._get_pgs_solve_parallel_kernel", "keyed_rows.get_parallel_factory"}
-        )
+        self.assertEqual(last_word, {"sweep_routes_tiers.parallel_kernel", "keyed_rows.get_parallel_factory"})
 
     def test_inventory_covers_the_spliced_sweeps(self):
         """Reach the sweeps that splice the friction law or vote an exit, beyond the patch-varied factories."""
         families = {name.split("(", 1)[0] for name in self.current}
         for family in (
-            "solver_feather_pgs._get_pgs_solve_local_owned_kernel",
+            "sweep_routes_local.local_owned_kernel",
             "row_packets.get_local_factory",
-            "solver_feather_pgs._get_pgs_solve_tiled_row_kernel",
-            "solver_feather_pgs._get_pgs_solve_mf_kernel",
+            "sweep_routes_diag.tiled_row_kernel",
+            "sweep_routes_diag.mf_split_kernel",
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)

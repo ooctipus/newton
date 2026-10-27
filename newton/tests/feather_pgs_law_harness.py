@@ -24,7 +24,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.COULOMB_LAW)
+FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW)
 PACKAGE = Path(kernels.__file__).parent
 
 
@@ -245,14 +245,13 @@ TWIN_SAMPLES = 4096
 TWIN_TOLERANCES = {
     "friction_pair": ("radius", 1.0e-5),
     "friction_pair_from_metric": ("radius", 1.0e-5),
-    "coulomb_bisection": (None, 1.0e-5),
 }
 """Laws whose two renderings agree to their solve's tolerance rather than bitwise: ``(input that scales the
-results, or None for the largest result, bound)``. They iterate (Newton and bisection steps) and test convergence
-and sticking against tolerances, and the CUDA compiler fuses their multiply-adds differently in Warp's lowering
-(branches merged with ``wp::where``) and in the plain C++ rendering, so a rare sample takes the other branch of a
-test: :data:`TWIN_AGREEING` of the samples agree within the bound, every sample within a thousand times it.
-Today's Warp code and hand-written CUDA text of the pair law differ the same way."""
+results, or None for the largest result, bound)``. They test convergence and sticking against tolerances, and the
+CUDA compiler fuses their multiply-adds differently in Warp's lowering (branches merged with ``wp::where``) and in
+the plain C++ rendering, so a rare sample takes the other branch of a test: :data:`TWIN_AGREEING` of the samples
+agree within the bound, every sample within a thousand times it. Today's Warp code and hand-written CUDA text of the
+pair law differ the same way."""
 
 TWIN_AGREEING = 0.995
 """Fraction of an iterative law's samples whose renderings agree within its :data:`TWIN_TOLERANCES` bound."""
@@ -412,35 +411,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "smallest": np.maximum((a * d - c * c) / largest, 0.0).astype(np.float32),
             "axis": axis.astype(np.float32),
             **pair,
-        }
-    if name in ("coulomb_bisection", "coulomb_newton"):
-        return {
-            "W": spd3(rng, n),
-            "u": vec(),
-            "old": np.abs(vec(0.5)),
-            "mu": rng.uniform(0.0, 1.2, n).astype(np.float32),
-            "target_n": scalars(rng, n),
-        }
-    if name == "coulomb_row":
-        w = spd3(rng, n)
-        w[::13] = np.eye(3)  # no degenerate blocks: the root solve divides by W_NN
-        b = vec()
-        b[:, 0] = -np.abs(b[:, 0]) - 0.01
-        return {"W": w, "b": b, "mu": rng.uniform(0.05, 1.2, n).astype(np.float32)}
-    if name == "coulomb_root":
-        return {
-            "AT": (np.eye(2) + 0.2 * rng.normal(size=(n, 2, 2))).astype(np.float32),
-            "cT": rng.normal(size=(n, 2)).astype(np.float32),
-            "wNT": rng.normal(size=(n, 2)).astype(np.float32),
-            "bN": -np.abs(scalars(rng, n)) - 0.01,
-            "WN": rng.uniform(0.5, 2.0, n).astype(np.float32),
-            "mu": rng.uniform(0.05, 1.2, n).astype(np.float32),
-            "alpha": rng.uniform(0.0, 4.0, n).astype(np.float32),
-        }
-    if name == "mat22_solve":
-        return {
-            "M": (np.eye(2) + 0.3 * rng.normal(size=(n, 2, 2))).astype(np.float32),
-            "rhs": rng.normal(size=(n, 2)).astype(np.float32),
         }
     if name == "speed_row":
         return {

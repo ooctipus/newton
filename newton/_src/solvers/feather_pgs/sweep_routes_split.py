@@ -125,9 +125,8 @@ _MF_ROWS = kernel_template.params(
 _MF_SCHEDULE = kernel_template.params(("friction_start_iteration", int), ("iteration_offset", int))
 _MF_STATE = kernel_template.params(("mf_impulses", wp.array2d[float]), ("v_out", wp.array[float]))
 
-MF_LOOP_ABI = _MF_ROWS + kernel_template.params(("friction_mode", int)) + _MF_SCHEDULE + _MF_STATE
-"""The free-body loop sweep's operands (one world per thread). ``friction_mode`` is the ``"current"`` friction step's
-id: the research modes need ``pgs_mode="matrix_free"``, so the sweep never reads it."""
+MF_LOOP_ABI = _MF_ROWS + _MF_SCHEDULE + _MF_STATE
+"""The free-body loop sweep's operands (one world per thread)."""
 
 MF_LOOP_UNIT_ABI = _MF_ROWS + _MF_SCHEDULE + UNIT_ABI + _MF_STATE
 """The free-body loop sweep's operands with contact units."""
@@ -747,17 +746,8 @@ def loop_unit_kernel() -> wp.Kernel:
 
 
 @functools.cache
-def mf_loop_kernel(friction_mode: str = "current") -> wp.Kernel:
-    """The free-body loop sweep kernel: the parameters and launch of ``kernels.pgs_solve_mf_loop``.
-
-    Raises:
-        NotImplementedError: For a research friction mode, which only ``pgs_mode="matrix_free"`` admits.
-    """
-    if friction_mode != "current":
-        raise NotImplementedError(
-            f"the free-body loop sweep solves the 'current' friction step only, got {friction_mode!r}; "
-            "the research friction modes need pgs_mode='matrix_free'"
-        )
+def mf_loop_kernel() -> wp.Kernel:
+    """The free-body loop sweep kernel: the parameters and launch of ``kernels.pgs_solve_mf_loop``."""
     return _kernel("sweep_mf_loop", MF_LOOP_ABI, mf_loop_source()[0], _PRELUDES)
 
 

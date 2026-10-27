@@ -11,7 +11,7 @@ import warp as wp
 from ...sim import JointType
 from . import host_index
 from .device_proof import DeviceProof
-from .small_cholesky import geometric_kernel
+from .response_builds_dense import factor_warps_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan
@@ -188,7 +188,9 @@ class TreeHeldOperator:
         else:
             self.data.lower = solver.L_by_size[size]
             self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
-            self.refresh_kernel = geometric_kernel(size=size, geometric_index=tuple(map(int, physical_index.ravel())))
+            self.refresh_kernel = factor_warps_kernel(
+                size, geometric=True, geometric_index=tuple(map(int, physical_index.ravel()))
+            )
             self.factor_offsets = wp.zeros(size, dtype=int, device=device)
             self.factor_schedule = wp.array(
                 [row * size + col for row in range(size) for col in range(row + 1)], dtype=int, device=device
@@ -430,8 +432,9 @@ class ForestHeldOperator:
                 (
                     r,
                     family,
-                    geometric_kernel(
-                        size=family,
+                    factor_warps_kernel(
+                        family,
+                        geometric=True,
                         geometric_index=tuple(map(int, block.ravel())),
                         geometric_stride=self.layout.entries,
                         geometric_group=True,

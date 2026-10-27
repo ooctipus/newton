@@ -21,32 +21,11 @@ from .contact_laws import (
     contact_materials,
     contact_row_frame,
     contact_tangent_basis,
-    jacobian_entry,
     prescribed_target,
 )
-from .field_group import Field
 from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law, patch_tangent_row
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-
-_Vec6 = wp.types.vector(length=6, dtype=wp.float32)
-
-
-COMPACT_BOUNDARY = (
-    Field("body_single_dof", wp.int32, ("body",), attr="body_single_response_dof"),
-    Field("dof_offset", wp.int32, ("articulation",), attr="articulation_world_dof_offset"),
-    Field("inverse_mass", wp.float32, ("dof",), attr="_diagonal_inverse_mass"),
-    Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
-    Field("factor", wp.float32, ("group", 6, 6), owner="six"),
-    Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),
-    Field("J", wp.float32, ("group", "row", 6), owner="six"),
-    Field("Y", wp.float32, ("group", "row", 6), owner="six"),
-    Field("sparse_dof", wp.int32, ("world", "row", 2), attr="_sparse_diagonal_row_dof"),
-    Field("sparse_jy", wp.float32, ("world", "row", 4), attr="_sparse_diagonal_row_jy"),
-)
-"""What the compact boundary producer writes besides the contact input's row records: each row's dense-six
-Jacobian and response (by the six-DOF size group's factor) and its two sparse response coordinates."""
-
-CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name__)
+from .response_builds_rows import CompactBoundary, sparse_pair_row_response
 
 
 def supported(solver) -> bool:
@@ -72,35 +51,6 @@ def supported(solver) -> bool:
         and not solver._debug_buffers_enabled
         and not solver._preelim_active
     )
-
-
-@wp.func
-def solve_six(factor: wp.array3d[float], group: int, jacobian: _Vec6):
-    response = _Vec6()
-    nonzero = False
-    for i in range(6):
-        nonzero = nonzero or jacobian[i] != 0.0
-    if nonzero:
-        for i in range(6):
-            value = jacobian[i]
-            for k in range(i):
-                value -= factor[group, i, k] * response[k]
-            diagonal = factor[group, i, i]
-            if diagonal != 0.0:
-                response[i] = value / diagonal
-            else:
-                response[i] = 0.0
-        for reverse in range(6):
-            i = 5 - reverse
-            value = response[i]
-            for k in range(i + 1, 6):
-                value -= factor[group, k, i] * response[k]
-            diagonal = factor[group, i, i]
-            if diagonal != 0.0:
-                response[i] = value / diagonal
-            else:
-                response[i] = 0.0
-    return response
 
 
 @wp.kernel
@@ -195,87 +145,9 @@ def _produce_contact(data: ContactInput, boundary: CompactBoundary, contact: int
             data.row_beta[world, output_row] = 0.0
             data.phi[world, output_row] = 0.0
             data.restitution[world, output_row] = 0.0
-        _publish_row_response(
+        sparse_pair_row_response(
             data, boundary, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
         )
-
-
-@wp.func
-def _publish_row_response(
-    data: ContactInput,
-    boundary: CompactBoundary,
-    world: int,
-    output_row: int,
-    group: int,
-    has_dense: bool,
-    art0: int,
-    body0: int,
-    art1: int,
-    body1: int,
-    direction: wp.vec3,
-    p0: wp.vec3,
-    p1: wp.vec3,
-):
-    """Write one row's dense-six and sparse response and its diagonal."""
-    diagonal = float(0.0)
-    if has_dense:
-        jacobian = _Vec6()
-        for dof in range(6):
-            value0 = float(0.0)
-            value1 = float(0.0)
-            bit = wp.uint32(1) << wp.uint32(dof)
-            if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
-                if (data.body_mask[body0] & bit) != wp.uint32(0):
-                    value0 = jacobian_entry(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
-            if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
-                if (data.body_mask[body1] & bit) != wp.uint32(0):
-                    value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
-            jacobian[dof] = value0 + value1
-        response = solve_six(boundary.factor, group, jacobian)
-        for dof in range(6):
-            boundary.J[group, output_row, dof] = jacobian[dof]
-            boundary.Y[group, output_row, dof] = response[dof]
-            diagonal += jacobian[dof] * response[dof]
-    coord0 = -1
-    coord1 = -1
-    value0 = float(0.0)
-    value1 = float(0.0)
-    response0 = float(0.0)
-    response1 = float(0.0)
-    if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == boundary.sparse_size:
-        dof0 = boundary.body_single_dof[body0]
-        if dof0 >= 0:
-            local0 = dof0 - data.dof_start[art0]
-            if local0 >= 0 and local0 < boundary.sparse_size:
-                coord0 = boundary.dof_offset[art0] + local0
-                value0 = jacobian_entry(data.motion[dof0], direction, p0, data.origin[art0])
-                response0 = value0 * boundary.inverse_mass[dof0]
-    if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == boundary.sparse_size:
-        dof1 = boundary.body_single_dof[body1]
-        if dof1 >= 0:
-            local1 = dof1 - data.dof_start[art1]
-            if local1 >= 0 and local1 < boundary.sparse_size:
-                coord1 = boundary.dof_offset[art1] + local1
-                value1 = -jacobian_entry(data.motion[dof1], direction, p1, data.origin[art1])
-                response1 = value1 * boundary.inverse_mass[dof1]
-    if coord0 >= 0 and coord0 == coord1:
-        value0 += value1
-        response0 += response1
-        coord1 = -1
-        value1 = 0.0
-        response1 = 0.0
-    boundary.sparse_dof[world, output_row, 0] = coord0
-    boundary.sparse_dof[world, output_row, 1] = coord1
-    boundary.sparse_jy[world, output_row, 0] = value0
-    boundary.sparse_jy[world, output_row, 1] = response0
-    boundary.sparse_jy[world, output_row, 2] = value1
-    boundary.sparse_jy[world, output_row, 3] = response1
-    sparse_diagonal = float(0.0)
-    if coord0 >= 0:
-        sparse_diagonal += value0 * response0
-    if coord1 >= 0:
-        sparse_diagonal += value1 * response1
-    data.diag[world, output_row] = (diagonal + sparse_diagonal) + data.cfm
 
 
 @wp.func
@@ -343,7 +215,7 @@ def _produce_patch_contact(data: ContactInput, boundary: CompactBoundary, law: P
             data.row_beta[world, output_row] = beta
             data.phi[world, output_row] = tangent_phi
             data.restitution[world, output_row] = 0.0
-        _publish_row_response(
+        sparse_pair_row_response(
             data, boundary, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
         )
 
@@ -358,33 +230,6 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary):
 def produce_patch_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
     """Publish contacts with the patch friction law in their original collision order."""
     _produce_patch_contact(data, boundary, law, wp.tid())
-
-
-@wp.kernel
-def produce_limit_response(
-    bounds: wp.array2d[int],
-    counts: wp.array[int],
-    groups: wp.array[int],
-    factor: wp.array3d[float],
-    J: wp.array3d[float],
-    Y: wp.array3d[float],
-    cfm: wp.array2d[float],
-    diag: wp.array2d[float],
-):
-    """Respond only to the bounded active dense-six position-limit prefix."""
-    world, row = wp.tid()
-    if row >= wp.min(bounds[world, 1], counts[world]):
-        return
-    group = groups[world]
-    jacobian = _Vec6()
-    for dof in range(6):
-        jacobian[dof] = J[group, row, dof]
-    response = solve_six(factor, group, jacobian)
-    diagonal = float(0.0)
-    for dof in range(6):
-        Y[group, row, dof] = response[dof]
-        diagonal += jacobian[dof] * response[dof]
-    diag[world, row] = diagonal + cfm[world, row]
 
 
 def launch_contacts(solver, data, workers):

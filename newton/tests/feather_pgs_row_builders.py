@@ -37,7 +37,7 @@ ROW_BUILDER_KERNELS = frozenset(
         "populate_world_J_masked_patch",
         "prepare_world_contact_rows",
         "populate_world_J_for_compact_size",
-        "populate_sparse_diagonal_contact_response",
+        "sparse_pair_contact_rows_kernel",
         "clear_contact_response",
         "produce_contacts",
         "produce_patch_contacts",
@@ -49,7 +49,7 @@ ROW_BUILDER_KERNELS = frozenset(
 )
 # Kernels their factories name: the sparse response, the sparse-diagonal schedule marker and the
 # keyed-row fallbacks.
-_GENERATED_PREFIXES = ("populate_sparse_contact_response_", "mark_independent_sparse_contact_candidates")
+_GENERATED_PREFIXES = ("factor_contact_rows_", "mark_independent_sparse_contact_candidates")
 _GENERATED_SUFFIXES = ("keyed_rows_fallback", "keyed_rows_patch_fallback")
 # Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
 # the sizes that name it in one launch per step (the row metadata, a producer's contact kernels, a combined

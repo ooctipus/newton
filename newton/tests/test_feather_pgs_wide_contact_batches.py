@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_sparse_diagonal_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "contact batch screening requires CUDA")
@@ -21,7 +21,7 @@ class TestWideContactBatches(unittest.TestCase):
         """Reject response widths beyond sixteen lanes and nontriple row schedules."""
         for width, triples in ((15, True), (9, False)):
             with self.subTest(dense_dofs=width, contact_triples=triples), self.assertRaises(ValueError):
-                _get_pgs_solve_sparse_diagonal_kernel(
+                sparse_diagonal_kernel(
                     24, width + 2, width, "120", contact_triples=triples, speculative_contact_batches=True
                 )
 
@@ -113,7 +113,7 @@ class TestWideContactBatches(unittest.TestCase):
                 else value
                 for value in host
             ]
-            kernel = _get_pgs_solve_sparse_diagonal_kernel(
+            kernel = sparse_diagonal_kernel(
                 capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
             )
             wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:28], outputs=arrays[28:], block_dim=32, device=device)

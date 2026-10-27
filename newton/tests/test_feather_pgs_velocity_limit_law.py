@@ -29,10 +29,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import mf_gs_source
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
+from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 
 _LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
@@ -45,32 +45,32 @@ _DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, res
 _SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim, 1)"
 _GENERATORS = {
     "mf_gs": (
-        solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
+        sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True},
         # Dense rows of a velocity-limit row phase, the end-of-iteration dense pass and free-body speed pass.
         (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_without_dense_limits": (
-        solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
+        sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": False, "has_dense_velocity_limit_rows": False},
         (_DENSE_PHASE, _SPEED_PASS),
     ),
     "mf_gs_streamed": (
-        solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
+        sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True, "stream_mf_impulses": True},
         (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_global_metadata": (
-        solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
+        sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True, "shared_metadata": False, "fuse_vel_limits": True},
         (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "incremental": (
-        solver_source._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
+        sweep_routes.incremental_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"incremental_rows": 32},
         (
@@ -79,10 +79,10 @@ _GENERATORS = {
         ),
     ),
     "sparse_limits": (
-        _get_pgs_solve_sparse_kernel.__wrapped__,
+        sparse_kernel.__wrapped__,
         (48, 18, 12),
         {"velocity_limits": True},
-        ("ProjectionLaw::velocity_limit_update(impulse[row], residual, residual / denominator, 1)",),
+        ("ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, residual_vlim / denom, 1)",),
     ),
 }
 
@@ -120,8 +120,8 @@ class TestVelocityLimitLawSources(unittest.TestCase):
                 self.assertEqual(stateless_sources, sources)
                 self.assertNotIn("_vacc", kernel.key)
         self.assertEqual(
-            mf_gs_source.get_source(64, 32, 12, "120", velocity_limit_law="stateless"),
-            mf_gs_source.get_source(64, 32, 12, "120"),
+            sweep_routes.mf_gs_source(64, 32, 12, velocity_limit_law="stateless"),
+            sweep_routes.mf_gs_source(64, 32, 12),
         )
 
     def test_accumulated_law_reaches_every_velocity_limit_visit(self):
@@ -138,7 +138,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
     def test_streamed_impulses_read_the_total_once(self):
         """Read a streamed free-body total through one lane-0 broadcast, never a broadcast inside a broadcast."""
         _, sources = _native_sources(
-            solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
+            sweep_routes.mf_gs_kernel.__wrapped__,
             64,
             32,
             12,
@@ -152,7 +152,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
 
     def test_sparse_sweeps_without_limit_rows_ignore_the_law(self):
         """Fold the law away where a sparse sweep holds no velocity-limit row."""
-        factory = _get_pgs_solve_sparse_kernel.__wrapped__
+        factory = sparse_kernel.__wrapped__
         kernel, sources = _native_sources(factory, 48, 18, 12)
         accumulated, accumulated_sources = _native_sources(factory, 48, 18, 12, velocity_limit_law="accumulated")
         self.assertEqual(accumulated.key, kernel.key)
@@ -167,31 +167,32 @@ class TestVelocityLimitLawSources(unittest.TestCase):
         policy, is a call of its factory.
         """
         factories = set()
-        for name, value in vars(solver_source).items():
-            if callable(value) and not isinstance(value, type):
-                try:
-                    parameters = inspect.signature(value).parameters
-                except (TypeError, ValueError):
-                    continue
-                if "velocity_limit_law" in parameters:
-                    factories.add(name)
+        for module_name, module in vars(solver_source).items():
+            if not inspect.ismodule(module) or not module_name.startswith("sweep_routes"):
+                continue
+            for name, value in vars(module).items():
+                if inspect.isfunction(getattr(value, "__wrapped__", value)) and "velocity_limit_law" in (
+                    inspect.signature(value).parameters
+                ):
+                    factories.add(f"{module_name}.{name}")
         self.assertLessEqual(
-            {
-                "_get_pgs_solve_mf_gs_kernel",
-                "_get_pgs_solve_mf_gs_incremental_kernel",
-                "_get_pgs_solve_sparse_kernel",
-            },
+            {"sweep_routes.mf_gs_kernel", "sweep_routes.incremental_kernel", "sweep_routes_sparse.sparse_kernel"},
             factories,
         )
+
+        def dotted(node):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                return f"{node.value.id}.{node.attr}"
+            return node.id if isinstance(node, ast.Name) else None
+
         calls, missing = 0, []
         for node in ast.walk(ast.parse(inspect.getsource(solver_source))):
             if not isinstance(node, ast.Call):
                 continue
-            function = node.func
-            name = function.id if isinstance(function, ast.Name) else getattr(function, "attr", None)
-            if name == "_sweep_kernel" and len(node.args) > 1 and isinstance(node.args[1], ast.Name):
+            name = dotted(node.func)
+            if name == "self._sweep_kernel" and len(node.args) > 1:
                 # _sweep_kernel(route, factory, *args, **kwargs) calls the factory under the solve policy.
-                name = node.args[1].id
+                name = dotted(node.args[1])
             if name not in factories:
                 continue
             calls += 1
@@ -206,7 +207,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             with self.subTest(generator=name), self.assertRaisesRegex(ValueError, "velocity_limit_law"):
                 factory(*args, velocity_limit_law="clamped", **options)
         with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
-            mf_gs_source.get_source(64, 32, 12, "120", velocity_limit_law="clamped")
+            sweep_routes.mf_gs_source(64, 32, 12, velocity_limit_law="clamped")
 
 
 def _cpu_arm():
@@ -472,10 +473,8 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
         factories = {
-            "mf_gs": lambda law: solver_source._get_pgs_solve_mf_gs_kernel(
-                4, 1, 2, arch, has_drive_rows=False, velocity_limit_law=law
-            ),
-            "incremental": lambda law: solver_source._get_pgs_solve_mf_gs_incremental_kernel(
+            "mf_gs": lambda law: sweep_routes.mf_gs_kernel(4, 1, 2, arch, has_drive_rows=False, velocity_limit_law=law),
+            "incremental": lambda law: sweep_routes.incremental_kernel(
                 4, 1, 2, arch, incremental_rows=4, has_drive_rows=False, velocity_limit_law=law
             ),
         }

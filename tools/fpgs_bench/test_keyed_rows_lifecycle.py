@@ -108,7 +108,6 @@ def make_solver(model, enabled, **overrides):
         "friction_anchor_beta": 0.0,
         "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
-        "friction_mode": "current",
         "pgs_schedule": "interleaved",
         "pgs_iterations": 12,
         "pgs_velocity_iterations": 0,

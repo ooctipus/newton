@@ -2466,9 +2466,9 @@ class FactorRows(ResponseOperator):
 
     @staticmethod
     def build():
-        """The rows' build (:data:`.response_builds_rows.FACTOR_ROWS`): ``Z = L^-1 J^T`` with ``A_ii = |Z|^2 + cfm``
-        (:meth:`forward`) in a world without free-body rows, ``Y = L^-T Z`` with ``A_ii = J Y + cfm``
-        (:meth:`transposed`) otherwise, and the held form ``L^T Y`` of physical rows."""
+        """The rows' build (:data:`.response_builds_rows.FACTOR_ROWS`): the held form ``L^T Y`` of physical rows
+        (:meth:`transposed`). The rows ``Z = L^-1 J^T`` (``A_ii = |Z|^2 + cfm``) in a world without free-body rows,
+        ``Y = L^-T Z`` (``A_ii = J Y + cfm``) otherwise, are the DenseJY ``("response", "pairs")`` build."""
         from .response_builds_rows import FACTOR_ROWS  # noqa: PLC0415
 
         return FACTOR_ROWS

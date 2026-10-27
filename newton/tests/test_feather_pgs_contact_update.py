@@ -33,7 +33,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import contact_unit, contact_unit_sweeps, environment_flags, path_selection
+from newton._src.solvers.feather_pgs import contact_unit, environment_flags, path_selection, sweep_routes_split
 from newton._src.solvers.feather_pgs import kernels as K
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_row_builders import launched_kernels
@@ -298,7 +298,7 @@ class World:
         self.w = {k: wp.array(v, dtype=float, device=device) for k, v in arrays.items()}
         self.w_rtype = wp.array(rtype, dtype=int, device=device)
         self.w_parent = wp.array(parent, dtype=int, device=device)
-        self.state = wp.zeros((W, D, contact_unit_sweeps.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=device)
+        self.state = wp.zeros((W, D, contact_unit.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=device)
         self.rows = wp.zeros((W, D), dtype=int, device=device)
         self.block = wp.zeros(W * contact_unit.RING_BLOCK_SIZE, dtype=float, device=device)
 
@@ -338,13 +338,13 @@ class World:
             ]
             if update == "unit":
                 wp.launch(
-                    contact_unit_sweeps.pgs_solve_loop_unit,
+                    sweep_routes_split.loop_unit_kernel(),
                     dim=len(self.systems),
                     inputs=[*common, ring_units, self.state, self.rows, self.block],
                     device=self.device,
                 )
             else:
-                wp.launch(K.pgs_solve_loop, dim=len(self.systems), inputs=common, device=self.device)
+                wp.launch(sweep_routes_split.loop_kernel(), dim=len(self.systems), inputs=common, device=self.device)
             if snapshots:
                 history.append(impulses.numpy().astype(np.float64))
         if snapshots:
@@ -384,7 +384,7 @@ class FreeBody:
             wp.array(system["parent"][None], dtype=int, device=_CPU),
             wp.array(system["mu"][None].astype(np.float32), dtype=float, device=_CPU),
         ]
-        self.state = wp.zeros((1, m, contact_unit_sweeps.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=_CPU)
+        self.state = wp.zeros((1, m, contact_unit.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=_CPU)
         self.rows = wp.zeros((1, m), dtype=int, device=_CPU)
         self.block = wp.zeros(contact_unit.RING_BLOCK_SIZE, dtype=float, device=_CPU)
 
@@ -412,10 +412,10 @@ class FreeBody:
         for count, offset in launches:
             if update == "unit":
                 inputs = [*arrays, count, 1.0, regularize, 0, offset, ring_units, self.state, self.rows, self.block]
-                kernel = contact_unit_sweeps.pgs_solve_mf_loop_unit
+                kernel = sweep_routes_split.mf_loop_unit_kernel()
             else:
-                inputs = [*arrays, count, 1.0, regularize, int(K.FRICTION_MODE_CURRENT), 0, offset]
-                kernel = K.pgs_solve_mf_loop
+                inputs = [*arrays, count, 1.0, regularize, 0, offset]
+                kernel = sweep_routes_split.mf_loop_kernel()
             wp.launch(kernel, dim=1, inputs=inputs, outputs=[impulses, velocity], device=_CPU)
         return impulses.numpy()[0].astype(np.float64)
 
@@ -972,20 +972,20 @@ class TestContactUpdateSolver(unittest.TestCase):
                     model = _free_box_model()
                     solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
                 sweep = solver.get_path_selection()["routes"]["sweep"]
-                self.assertEqual(sweep["dense"], {"kernels": ["pgs_solve_loop"]})
-                self.assertEqual(sweep["free_body_matrix_free"], "pgs_solve_mf_loop")
+                self.assertEqual(sweep["dense"], {"kernels": ["sweep_loop"]})
+                self.assertEqual(sweep["free_body_matrix_free"], "sweep_mf_loop")
                 self.assertEqual(sweep["contact_update"]["law"], "sequential")
                 with launched_kernels() as keys:
                     states.append(_step(solver, model, 20))
-                self.assertIn("pgs_solve_loop", keys)
-                self.assertNotIn("pgs_solve_loop_unit", keys)
-                self.assertNotIn("pgs_solve_mf_loop_unit", keys)
+                self.assertIn("sweep_loop", keys)
+                self.assertNotIn("sweep_loop_unit", keys)
+                self.assertNotIn("sweep_mf_loop_unit", keys)
         for state in states[1:]:
             for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
                 np.testing.assert_array_equal(getattr(state, name).numpy(), getattr(states[0], name).numpy())
 
     def test_sequential_dispatch_runs_the_unchanged_kernel_on_stored_systems(self):
-        """Dispatch "sequential" to pgs_solve_loop, bitwise, and "unit" to pgs_solve_loop_unit on stored systems."""
+        """Dispatch "sequential" to the loop sweep, bitwise, and "unit" to the unit loop sweep on stored systems."""
         systems = replica_systems("point") + replica_systems("patch")
         world = World(systems)
         for update, expected in (("sequential", world.sweep(8, "sequential")), ("unit", world.sweep(8, "unit"))):
@@ -1017,7 +1017,7 @@ class TestContactUpdateSolver(unittest.TestCase):
             )
             with launched_kernels() as keys:
                 SolverFeatherPGS._stage5_pgs_solve_world_loop(stub)
-            self.assertEqual(keys, ["pgs_solve_loop_unit" if unit else "pgs_solve_loop"])
+            self.assertEqual(keys, ["sweep_loop_unit" if unit else "sweep_loop"])
             out = impulses.numpy()
             for k, lam in enumerate(expected):
                 with self.subTest(update=update, system=k):
@@ -1037,14 +1037,14 @@ class TestContactUpdateSolver(unittest.TestCase):
                         solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
                     selected = solver.get_path_selection()
                     sweep = selected["routes"]["sweep"]
-                    self.assertEqual(sweep["dense"], {"kernels": ["pgs_solve_loop_unit"]})
-                    self.assertEqual(sweep["free_body_matrix_free"], "pgs_solve_mf_loop_unit")
+                    self.assertEqual(sweep["dense"], {"kernels": ["sweep_loop_unit"]})
+                    self.assertEqual(sweep["free_body_matrix_free"], "sweep_mf_loop_unit")
                     self.assertEqual(
                         sweep["contact_update"],
                         {
                             "requested": "unit",
                             "law": "unit",
-                            "unit": ["pgs_solve_loop_unit", "pgs_solve_mf_loop_unit"],
+                            "unit": ["sweep_loop_unit", "sweep_mf_loop_unit"],
                             "sequential": [],
                             "patch_units": "ring",
                             "reason": sweep["contact_update"]["reason"],
@@ -1056,9 +1056,9 @@ class TestContactUpdateSolver(unittest.TestCase):
                     with launched_kernels() as keys:
                         state = _step(solver, model, 20)
                     # The arm and the box share a world: one-iteration dense and free-body launches interleave.
-                    self.assertEqual(keys.count("pgs_solve_loop_unit"), 20 * 8)
-                    self.assertEqual(keys.count("pgs_solve_mf_loop_unit"), 20 * 8)
-                    self.assertNotIn("pgs_solve_loop", keys)
+                    self.assertEqual(keys.count("sweep_loop_unit"), 20 * 8)
+                    self.assertEqual(keys.count("sweep_mf_loop_unit"), 20 * 8)
+                    self.assertNotIn("sweep_loop", keys)
                     self.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
                     # The box rests on the ground.
                     self.assertAlmostEqual(float(state.body_q.numpy()[1, 2]), 0.1, delta=2.0e-3)
@@ -1078,7 +1078,7 @@ class TestContactUpdateSolver(unittest.TestCase):
             "contact_update": {
                 "requested": "unit",
                 "law": "unit",
-                "unit": ["pgs_solve_loop_unit"],
+                "unit": ["sweep_loop_unit"],
                 "sequential": ["pgs_solve_mf_cuda"],
                 "patch_units": "ring",
                 "reason": "Only the loop sweeps solve contact units.",
@@ -1103,7 +1103,7 @@ class TestContactUpdateSolver(unittest.TestCase):
         launch = wp.launch
 
         def record(kernel, *args, **kwargs):
-            if getattr(kernel, "key", None) in ("pgs_solve_loop_unit", "pgs_solve_mf_loop_unit"):
+            if getattr(kernel, "key", None) in ("sweep_loop_unit", "sweep_mf_loop_unit"):
                 launches.append(kwargs["inputs"][-4])
             return launch(kernel, *args, **kwargs)
 
@@ -1190,7 +1190,7 @@ class TestContactUpdateCuda(unittest.TestCase):
                 loop = SolverFeatherPGS(model, contact_update="unit", pgs_kernel="loop")
             self.assertFalse([w for w in recorded if "contact_update" in str(w.message)])
             update = loop.get_path_selection()["routes"]["sweep"]["contact_update"]
-            self.assertEqual(update["unit"], ["pgs_solve_loop_unit"])
+            self.assertEqual(update["unit"], ["sweep_loop_unit"])
             self.assertEqual(update["sequential"], [])
 
 

@@ -11,9 +11,9 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_gs_incremental_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
@@ -94,7 +94,7 @@ class TestFeatherPGSIncremental(unittest.TestCase):
         }
         for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
             values[f"world_drive_{name}"] = zero_float
-        kernel = _get_pgs_solve_mf_gs_incremental_kernel(
+        kernel = sweep_routes.incremental_kernel(
             2, 1, 2, str(device.arch), incremental_rows=2, has_drive_rows=False, has_dense_velocity_limit_rows=False
         )
         for omega in (1.0, 0.65):

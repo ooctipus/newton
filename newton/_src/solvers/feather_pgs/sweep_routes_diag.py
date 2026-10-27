@@ -646,6 +646,38 @@ def tiled_row_source(
     return cuda_native(body, preludes=preludes), stage
 
 
+def tiled_row_staging(max_constraints: int, limit: int) -> tuple[str, str]:
+    """Choose where a tiled-row sweep of ``max_constraints`` rows reads the Delassus operator under a static budget.
+
+    The packed triangle stays in shared memory while the declared staging (:func:`tiled_row_source`) fits ``limit``,
+    the device's static shared memory per block [B] (:func:`.staging.arch_budget`); past it, the warp reads each
+    Delassus row from global memory and stages only the row vectors.
+
+    Returns:
+        The staging, one of :attr:`.Assembled.STAGINGS`, and the reason.
+
+    Raises:
+        ValueError: If even the row vectors exceed the budget.
+    """
+    shared = tiled_row_source(max_constraints, staging="shared")[1].bytes
+    if shared <= limit:
+        return "shared", (
+            f"The packed Delassus triangle of {max_constraints} rows and the row vectors take {shared} of the "
+            f"device's {limit} bytes of static shared memory per block."
+        )
+    rows = tiled_row_source(max_constraints, staging="global")[1].bytes
+    if rows <= limit:
+        return "global", (
+            f"The packed Delassus triangle of {max_constraints} rows would take {shared} bytes of static shared "
+            f"memory per block, more than the device's {limit}: the sweep reads Delassus rows from global memory and "
+            f"stages only the row vectors ({rows} bytes)."
+        )
+    raise ValueError(
+        f"dense_max_constraints={max_constraints} needs {rows} bytes of shared memory per block for the tiled_row "
+        f"sweep's row vectors, more than the device's {limit}; use pgs_kernel='loop' or fewer dense rows"
+    )
+
+
 @cache
 def tiled_row_kernel(
     max_constraints: int,

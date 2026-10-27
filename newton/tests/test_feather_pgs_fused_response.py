@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_hinv_jt_fused_kernel
+from newton._src.solvers.feather_pgs.response_builds_dense import delassus_tiles_kernel
 
 
 class TestFeatherPGSFusedResponse(unittest.TestCase):
@@ -72,7 +72,7 @@ class TestFeatherPGSFusedResponse(unittest.TestCase):
             expected_c[world, :stop, :stop] = c
             expected_diag[world, :count] = np.diag(c)[:count] + cfm[world, :count]
         values = (factors, jacobians, group_to_art, art_to_world, counts, cfm, initial_c, initial_diag, initial_y)
-        kernel = _get_hinv_jt_fused_kernel(dofs, capacity, str(device.arch), threads)
+        kernel = delassus_tiles_kernel(dofs, capacity, str(device.arch), threads)
         stream = wp.Stream(device)
         with wp.ScopedStream(stream):
             arrays = [

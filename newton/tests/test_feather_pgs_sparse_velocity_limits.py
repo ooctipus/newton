@@ -13,13 +13,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, sparse_contact
+from newton._src.solvers.feather_pgs import field_group, response_builds_rows
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
@@ -138,7 +138,7 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                     row_dof = full((1, 1, 1) if table else (2, capacity, width), -9, int)
                     factors = full((2, capacity, width), -9.0)
                     wp.launch(
-                        sparse_contact.build_sparse_joint_velocity_limit_rows,
+                        response_builds_rows.factor_velocity_limit_rows_kernel,
                         dim=64,
                         block_dim=128,
                         device=device,
@@ -429,7 +429,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     data, physical, factor = _solve_data(sign, contact=contact, iterations=iterations, omega=0.4)
 
                     def factory(capacity, dofs, width, **_kwargs):
-                        return _get_pgs_solve_sparse_kernel(
+                        return sparse_kernel(
                             capacity, dofs, width, active_rows=False, use_support_table=True, velocity_limits=True
                         )
 
@@ -466,7 +466,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     physical = (*physical[:-1], np.zeros_like(physical[-1]))
 
                     def factory(capacity, dofs, width, **_kwargs):
-                        return _get_pgs_solve_sparse_kernel(
+                        return sparse_kernel(
                             capacity,
                             dofs,
                             width,

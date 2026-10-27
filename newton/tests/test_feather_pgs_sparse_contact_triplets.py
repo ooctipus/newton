@@ -21,7 +21,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
@@ -37,7 +37,7 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False,
     options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
     if candidate and blocks != 16:
         options["transaction_blocks"] = blocks
-    return _get_pgs_solve_sparse_kernel(
+    return sparse_kernel(
         capacity,
         dofs,
         width,
@@ -666,19 +666,19 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         Patch friction takes the single-stage transaction by default; the staged one stays reachable.
         """
         options = {"use_support_table": True, "contact_triplets": True}
-        active = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
-        full = _get_pgs_solve_sparse_kernel(192, 12, 12, linked_rows=True, **options)
-        point = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, **options)
+        active = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
+        full = sparse_kernel(192, 12, 12, linked_rows=True, **options)
+        point = sparse_kernel(192, 12, 12, active_rows=True, **options)
         self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single12_linked"))
         self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_single12_linked"))
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
         options["contact_transaction"] = "staged"
-        staged = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
+        staged = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
         self.assertTrue(staged.key.endswith("_active_support_table_contact_triplets_linked"))
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):
-                kernel = _get_pgs_solve_sparse_kernel(192, 12, 12, contact_triplets=True, **unfused)
+                kernel = sparse_kernel(192, 12, 12, contact_triplets=True, **unfused)
                 self.assertNotIn("contact_triplets", kernel.key)
 
     def test_patch_triplet_admission_cpu(self):

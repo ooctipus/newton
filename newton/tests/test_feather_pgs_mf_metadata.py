@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -50,9 +51,11 @@ def _build_pendulums(device, worlds=5):
     return builder.finalize(device=device)
 
 
-def _parent_decoder(source, *, name="mf_par", packed="packed_tp"):
-    """Compile the actual generated GS parent expression on the CPU."""
-    expression = re.search(rf"int {name}\s*=\s*([^;]+);", source).group(1).replace(packed, "value")
+def _parent_decoder(source, *, name="parent", packed="packed_tp"):
+    """Compile the actual generated GS parent expression on the CPU: the first one that decodes ``packed``."""
+    expression = (
+        re.search(rf"\b{name}\s*=\s*([^;]*{re.escape(packed)}[^;]*);", source).group(1).replace(packed, "value")
+    )
 
     @wp.func_native(f"return {expression};")
     def decode(value: int) -> int: ...
@@ -139,7 +142,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         """Preserve the existing word layout using defined unsigned shift arithmetic."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         expected = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
-        kernel = fpgs._get_pack_mf_meta_kernel(65535, "cpu")
+        kernel = response_builds_rows.free_body_meta_kernel(65535, "cpu")
         source = max(_native_snippets(kernel), key=len)
         result = wp.zeros(len(parents), dtype=int, device="cpu")
         wp.launch(
@@ -155,18 +158,17 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         """Decode actual native GS expressions at signed and unsigned boundaries."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         packed = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
-        for friction in ("current", "bisection", "bisection_desaxce", "coulomb_newton"):
-            with self.subTest(friction=friction):
-                kernel = fpgs._get_pgs_solve_mf_gs_kernel(
+        for stream in (False, True):
+            with self.subTest(stream_mf_impulses=stream):
+                kernel = sweep_routes.mf_gs_kernel(
                     4,
                     65535,
                     6,
                     "cpu",
-                    friction_mode=friction,
                     has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
                     shared_metadata=False,
-                    stream_mf_impulses=friction == "current",
+                    stream_mf_impulses=stream,
                 )
                 result = wp.zeros(len(parents), dtype=int, device="cpu")
                 wp.launch(
@@ -184,7 +186,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         packed = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
         kernels = (
             (
-                fpgs._get_pgs_solve_local_owned_kernel(
+                sweep_routes_local.local_owned_kernel(
                     8,
                     8,
                     23,
@@ -193,9 +195,9 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     mf_max_constraints=65535,
                     local_mf_max_constraints=3,
                 ),
-                "native",
-                "parent_mf",
-                "packed_type_parent",
+                "sweep_local_native",
+                "parent",
+                "packed_tp",
             ),
         )
         for kernel, native_name, name, word in kernels:
@@ -215,11 +217,11 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
     def test_capacity_guard_does_not_alias_the_parent_sentinel(self):
         """Reject unsupported packed capacity before allocating solver row buffers."""
         for capacity in (65535, 0):
-            fpgs._get_pack_mf_meta_kernel(capacity, "cpu")
+            response_builds_rows.free_body_meta_kernel(capacity, "cpu")
         for capacity in (65536, 100000):
             with self.subTest(capacity=capacity):
                 with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
-                    fpgs._get_pack_mf_meta_kernel(capacity, "cpu")
+                    response_builds_rows.free_body_meta_kernel(capacity, "cpu")
                 with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
                     fpgs.SolverFeatherPGS(
                         newton.ModelBuilder().finalize(device="cpu"),
@@ -233,16 +235,16 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         packed = ((parents.astype(np.int64) & 65535) << 16).astype(np.uint32).view(np.int32)
         cases = (
             (
-                fpgs._get_pgs_solve_mf_gs_kernel(8, 65535, 29, "cpu"),
-                "pgs_solve_mf_gs_native",
+                sweep_routes.mf_gs_kernel(8, 65535, 29, "cpu"),
+                "sweep_mf_gs_native",
                 "mf_meta.data[off_meta + patch_row * 4 + 3]",
             ),
             (
-                fpgs._get_pgs_solve_local_owned_kernel(
+                sweep_routes_local.local_owned_kernel(
                     8, 8, 23, "cpu", paired_dof_count=6, mf_max_constraints=65535, local_mf_max_constraints=3
                 ),
-                "native",
-                "mf_meta.data[mf_meta_offset + patch_row * 4 + 3]",
+                "sweep_local_native",
+                "mf_meta.data[off_meta + patch_row * 4 + 3]",
             ),
         )
         for kernel, native_name, word in cases:
@@ -266,7 +268,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 np.testing.assert_array_equal(result.numpy(), parents)
 
 
-def _solve_parent_rows(device, friction, parents):
+def _solve_parent_rows(device, parents):
     """Place identical active contact triples at different MF storage offsets."""
     _, values = solve_fixture(device)
     worlds, capacity = len(parents), max(parents) + 3
@@ -311,12 +313,11 @@ def _solve_parent_rows(device, friction, parents):
         iteration_offset=0,
         freeze_drive_rows=0,
     )
-    kernel = fpgs._get_pgs_solve_mf_gs_kernel(
+    kernel = sweep_routes.mf_gs_kernel(
         8,
         capacity,
         29,
         str(device.arch),
-        friction_mode=friction,
         has_drive_rows=False,
         has_dense_velocity_limit_rows=False,
         shared_metadata=False,
@@ -340,16 +341,14 @@ class TestFeatherPGSMFMetadataCUDA(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("Select a CUDA device for native MF-GS execution")
-        for friction in ("current",):
-            with self.subTest(friction=friction):
-                low = _solve_parent_rows(device, friction, [0] * 5)
-                high = _solve_parent_rows(device, friction, [0, 32767, 32768, 37247, 65532])
-                for expected, actual in zip(low, high, strict=True):
-                    self.assertTrue(np.isfinite(actual).all())
-                    np.testing.assert_array_equal(actual, expected)
-                self.assertTrue(np.all(high[1][:, 0] > 0))
-                self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) > 0))
-                self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) <= 0.4 * high[1][:, 0] + 1e-6))
+        low = _solve_parent_rows(device, [0] * 5)
+        high = _solve_parent_rows(device, [0, 32767, 32768, 37247, 65532])
+        for expected, actual in zip(low, high, strict=True):
+            self.assertTrue(np.isfinite(actual).all())
+            np.testing.assert_array_equal(actual, expected)
+        self.assertTrue(np.all(high[1][:, 0] > 0))
+        self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) > 0))
+        self.assertTrue(np.all(np.linalg.norm(high[1][:, 1:], axis=1) <= 0.4 * high[1][:, 0] + 1e-6))
 
 
 def _record_pack_launches(solver):

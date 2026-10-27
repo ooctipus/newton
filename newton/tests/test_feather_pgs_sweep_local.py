@@ -3,22 +3,18 @@
 
 """Source checks of the local owners' and the paired factor sweeps as configurations of the sweep emitter.
 
-No GPU is needed: each emitter kernel takes its legacy factory's arguments and declares the same ABI and dispatch,
-rejects the same options, and, with the CUDA toolkit on ``PATH``, compiles offline next to the legacy kernel with the
-same shared memory and stack.
+No GPU is needed: each kernel rejects the options it does not admit, declares its staging and, with the CUDA toolkit
+on ``PATH``, compiles offline without local memory.
 """
 
-import contextlib
 import importlib.util
 import itertools
 import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from newton._src.solvers.feather_pgs import kernel_template, row_packets, sweep_routes_local
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
+from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local
 from newton._src.solvers.feather_pgs.response_operator import (
     CholeskySolve,
     FactorComponent,
@@ -29,26 +25,23 @@ from newton._src.solvers.feather_pgs.response_operator import (
 )
 from newton._src.solvers.feather_pgs.solve_policy import EXACT_POLICY, SolvePolicy
 
-_LEGACY_LOCAL = solver._get_pgs_solve_local_owned_kernel.__wrapped__
-_LEGACY_PAIRED = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
 _LOCAL = sweep_routes_local.local_owned_kernel.__wrapped__
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
 
-_DENSE = {"dense_response_matrix": True}
-_PAIR = {**_DENSE, "paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
+_PAIR = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2}
 
 LOCAL_CALLS = (
     # The single, pair and residual owners as the solver builds them (the gripper scenes' sizes), and the other lane
     # layouts of the single owner.
-    ("single", (64, 3, 3, "120"), {**_DENSE, "lanes_per_world": 16, "contact_capable": False}),
+    ("single", (64, 3, 3, "120"), {"lanes_per_world": 16, "contact_capable": False}),
     (
         "single_l8_w2",
         (192, 9, 9, "120"),
-        {**_DENSE, "lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
+        {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2},
     ),
-    ("single_l32", (64, 16, 16, "120"), {**_DENSE, "contact_capable": False}),
+    ("single_l32", (64, 16, 16, "120"), {"contact_capable": False}),
     ("pair", (64, 20, 3, "120"), _PAIR),
-    ("pair_w1", (64, 20, 3, "120"), {**_DENSE, "paired_dof_count": 6}),
+    ("pair_w1", (64, 20, 3, "120"), {"paired_dof_count": 6}),
     ("residual", (64, 40, 3, "120"), {**_PAIR, "mf_max_constraints": 512, "local_mf_max_constraints": 12}),
 )
 """``(label, arguments, options)`` of the local owners' live configurations."""
@@ -59,26 +52,6 @@ PAIRED_SCHEDULES = ({}, {"contact_triples": True}, {"contact_units": True})
 def _row_inputs(primary: int):
     """The row packets' row inputs for a primary articulation of ``primary`` coordinates and a free body."""
     return row_packets.get_local_factory.__wrapped__(primary, 6, 40).keywords["row_inputs"]
-
-
-@contextlib.contextmanager
-def _templates():
-    """Record the kernel templates built inside the context."""
-    seen = []
-    original = kernel_template.KernelTemplate.kernel
-
-    def kernel(self):
-        seen.append(self)
-        return original(self)
-
-    with mock.patch.object(kernel_template.KernelTemplate, "kernel", kernel):
-        yield seen
-
-
-def _template(factory, *args, **kwargs):
-    with _templates() as seen:
-        factory(*args, **kwargs)
-    return seen[-1]
 
 
 def _local_variants():
@@ -113,16 +86,13 @@ def _block(body: str, head: str) -> str:
 class TestLocalOwnedRoute(unittest.TestCase):
     """The local owners' sweeps (``sweep_routes_local.local_owned_kernel``)."""
 
-    def test_abi_and_dispatch_match_the_legacy_factory(self):
+    def test_variants_build(self):
+        """Every live configuration builds, over packet rows too and with a counted readout."""
         for label, args, kwargs in _local_variants():
             with self.subTest(label):
-                legacy = _template(_LEGACY_LOCAL, *args, **kwargs)
-                emitter = _template(_LOCAL, *args, **kwargs)
-                self.assertEqual(emitter.signature, legacy.signature)
-                self.assertEqual(emitter.native_params, legacy.native_params)
-                self.assertEqual(emitter.dispatch, legacy.dispatch)
+                self.assertTrue(_LOCAL(*args, **kwargs).key.startswith("sweep_local"))
 
-    def test_options_raise_like_the_legacy_factory(self):
+    def test_invalid_options_raise(self):
         invalid = (
             {"warps_per_block": 3},
             {"lanes_per_world": 4},
@@ -133,17 +103,9 @@ class TestLocalOwnedRoute(unittest.TestCase):
             {"lanes_per_world": 16, "contact_capable": False, "paired_dof_count": 0, "warps_per_block": 1},
         )
         for options in invalid:
-            kwargs = {**_DENSE, **options}
             args = (64, 20, 3 if options.get("lanes_per_world") != 16 else 17, "120")
-            with self.subTest(options):
-                with self.assertRaises(ValueError):
-                    _LEGACY_LOCAL(*args, **kwargs)
-                with self.assertRaises(ValueError):
-                    _LOCAL(*args, **kwargs)
-
-    def test_per_row_velocity_form_is_not_emitted(self):
-        with self.assertRaisesRegex(NotImplementedError, "phase-\\(b\\)"):
-            _LOCAL(64, 20, 3, "120", paired_dof_count=6)
+            with self.subTest(options), self.assertRaises(ValueError):
+                _LOCAL(*args, **options)
 
     def test_every_row_ends_with_a_barrier(self):
         """Lanes read residuals other lanes updated: every row's update ends with the group's barrier."""
@@ -160,11 +122,11 @@ class TestLocalOwnedRoute(unittest.TestCase):
 
     def test_staging_declares_one_struct_per_group(self):
         _, staging = sweep_routes_local.local_owned_source(
-            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2, dense_response_matrix=True
+            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2
         )
         self.assertEqual(staging.groups, 8)
         body, _ = sweep_routes_local.local_owned_source(
-            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2, dense_response_matrix=True
+            192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2
         )
         self.assertIn("__shared__ LocalScratch localscratch[8];", body)
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
@@ -174,16 +136,13 @@ class TestLocalOwnedRoute(unittest.TestCase):
 class TestPairedFactorRoute(unittest.TestCase):
     """The paired factor sweep (``sweep_routes_local.paired_factor_kernel``)."""
 
-    def test_abi_and_dispatch_match_the_legacy_factory(self):
+    def test_variants_build(self):
+        """Every schedule builds, with and without independent components and with a counted readout."""
         for label, args, kwargs in _paired_variants():
             with self.subTest(label):
-                legacy = _template(_LEGACY_PAIRED, *args, **kwargs)
-                emitter = _template(_PAIRED, *args, **kwargs)
-                self.assertEqual(emitter.signature, legacy.signature)
-                self.assertEqual(emitter.native_params, legacy.native_params)
-                self.assertEqual(emitter.dispatch, legacy.dispatch)
+                self.assertTrue(_PAIRED(*args, **kwargs).key)
 
-    def test_options_raise_like_the_legacy_factory(self):
+    def test_invalid_options_raise(self):
         invalid = (
             ((0, 23, 17, 6, "120"), {}),
             ((64, 24, 17, 6, "120"), {}),
@@ -192,11 +151,8 @@ class TestPairedFactorRoute(unittest.TestCase):
             ((64, 23, 17, 6, "120"), {"contact_triples": True, "contact_units": True}),
         )
         for args, kwargs in invalid:
-            with self.subTest(args=args, kwargs=kwargs):
-                with self.assertRaises(ValueError):
-                    _LEGACY_PAIRED(*args, **kwargs)
-                with self.assertRaises(ValueError):
-                    _PAIRED(*args, **kwargs)
+            with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
+                _PAIRED(*args, **kwargs)
 
     def test_unit_schedules_reduce_a_pair_in_one_ladder(self):
         for schedule in PAIRED_SCHEDULES[1:]:
@@ -272,29 +228,22 @@ def _kernel_sass():
 
 @unittest.skipIf(_kernel_sass() is None, "the CUDA toolkit (ptxas, cuobjdump) is not on PATH")
 class TestOfflineCompile(unittest.TestCase):
-    """Legacy and emitter kernels compile for the RTX PRO 6000 (sm_120) with the same shared memory and stack."""
+    """The kernels compile for the RTX PRO 6000 (sm_120) without local memory."""
 
-    def _compare(self, legacy, emitter, block):
-        sass = _kernel_sass()
-        old = sass.compile_kernel(legacy, arch=120, block_dim=block)
-        new = sass.compile_kernel(emitter, arch=120, block_dim=block)
-        self.assertEqual(new["shared"], old["shared"])
-        self.assertEqual(new["stack"], old["stack"])
-        self.assertEqual(new["local"], 0)
+    def _compile(self, kernel, block):
+        self.assertEqual(_kernel_sass().compile_kernel(kernel, arch=120, block_dim=block)["local"], 0)
 
     def test_local_owners_compile(self):
         for label, args, kwargs in LOCAL_CALLS[3:]:
             with self.subTest(label):
-                self._compare(
-                    _LEGACY_LOCAL(*args, **kwargs), _LOCAL(*args, **kwargs), 32 * kwargs.get("warps_per_block", 1)
-                )
+                self._compile(_LOCAL(*args, **kwargs), 32 * kwargs.get("warps_per_block", 1))
 
     def test_paired_schedules_compile(self):
         for schedule in PAIRED_SCHEDULES:
             with self.subTest(schedule):
                 args = (64, 23, 17, 6, "120")
                 kwargs = {**schedule, "independent_components": True}
-                self._compare(_LEGACY_PAIRED(*args, **kwargs), _PAIRED(*args, **kwargs), 64)
+                self._compile(_PAIRED(*args, **kwargs), 64)
 
 
 if __name__ == "__main__":

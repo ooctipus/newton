@@ -58,6 +58,19 @@ PARALLEL_ABI = kernel_template.params(
 """The parallel tiers' native ABI: the matrix-free sweep's, then the in-kernel response's operands (placeholders when
 a tier builds none) before ``v_out``; keyed rows insert theirs after ``world_row_cfm``."""
 
+# The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
+# every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
+# where more rows couple through one body. One factor serves both friction laws, since every tier steps each friction
+# pair isotropically. It is the smallest, in eighths, that brings each evaluated row bucket (>= 100 world-samples) of
+# four contact-rich workloads, allegro (12 iterations) and anymal-D flat (8) under point and patch friction, to the
+# serial sweep's accuracy: per bucket, the p90 energy-norm velocity error against a converged serial reference over the
+# serial route's, 95% world-bootstrap CI upper bound at most 1, each world's error interpolated log-linearly between
+# measured sweep caps under the default exit law (mf_gs_parallel_tol=0). The point workload's sparse 97-128-row tier
+# sets it: 27/8 left its worlds at 0.95x (CI upper 1.06), 7/2 gives 0.87x (0.99); its other tiers reach 0.23x, 0.50x and
+# 0.70x, the patch tiers 0.23x, 0.49x and 0.65x, and at 8 iterations every tier stays below 0.62x. The exit law sets the
+# small tiers' floor: at a tolerance of 1e-4 the 32-row point tier stalls near 0.87x the serial error whatever its
+# budget, which had made the patch factor 15/4. The cap bounds the cost at high iteration counts; the conformance gate's
+# 64-iteration scenes pass at it. A fraction keeps the budget in exact integer arithmetic.
 TIER_SWEEPS_PER_ITERATION = Fraction(7, 2)
 """Sweeps of a 32-row tier per serial iteration (:func:`tier_sweeps`)."""
 TIER_SWEEPS_CAP = 128

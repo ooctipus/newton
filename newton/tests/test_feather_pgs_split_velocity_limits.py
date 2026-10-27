@@ -3,8 +3,8 @@
 
 """Hold split-mode free rigid bodies to the stateless speed law on every device.
 
-Split mode sweeps free-body rows after the dense rows: on the CPU in ``pgs_solve_mf_loop``, on CUDA in the
-shared-memory sweep of ``_get_pgs_solve_mf_kernel``. Each finite speed limit of a body owns a speed row at
+Split mode sweeps free-body rows after the dense rows: on the CPU in ``sweep_routes_split.mf_loop_kernel()``, on CUDA in the
+shared-memory sweep of ``mf_split_kernel``. Each finite speed limit of a body owns a speed row at
 the tail of its world's rows: it bounds the magnitude of the body's linear or angular velocity, as PhysX's
 ``maxLinearVelocity`` and ``maxAngularVelocity`` do, with ``J = e_0`` or ``e_3`` naming which and
 ``rhs = limit``. The stateless law pushes a row only while its speed exceeds the limit, along the velocity,
@@ -32,7 +32,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_diag import mf_split_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 
@@ -524,7 +524,7 @@ class _SplitVelocityLimitChecks:
                 self.assertIn(words, routes["velocity_limits"]["free_body_sweep_law_reason"])
                 key = routes["sweep"]["free_body_matrix_free"]
                 if self.device == "cpu":
-                    self.assertEqual(key, "pgs_solve_mf_loop")
+                    self.assertEqual(key, "sweep_mf_loop")
                 else:
                     suffix = "_vlim" if law else ""
                     self.assertEqual(key, f"pgs_solve_mf_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
@@ -602,9 +602,7 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
         """
         solver = run.solver
         law_sweep = solver._pgs_solve_mf_kernel
-        plain_sweep = _get_pgs_solve_mf_kernel(
-            solver.mf_max_constraints, solver.max_mf_bodies, solver.model.device.arch
-        )
+        plain_sweep = mf_split_kernel(solver.mf_max_constraints, solver.max_mf_bodies, solver.model.device.arch)
         solve = solver._mf_pgs_solve
         row_types = set()
 
