@@ -1,0 +1,1440 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""The sweep emitter: FeatherPGS's projected Gauss-Seidel and Jacobi sweeps from one generator.
+
+A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit, publication)``:
+
+- the **mapping** says which threads own a problem (a world, or a lane group per world) and how many lanes update
+  one row together (:class:`.response_operator.Lanes`);
+- the **staging** declares the block's shared working set (:class:`.staging.Staging`);
+- each **row block** pairs a row store (where a row's impulse, type, parent, friction coefficient, right-hand side
+  and diagonal live: :class:`WorldRows`, :class:`FreeBodyRows`) with a response operator
+  (:mod:`.response_operator`) and the row kinds it visits;
+- the **row visit** admits a row of a row loop (:func:`row_visit`): the delayed-friction gate (:func:`friction_gate`),
+  a friction pair at its first tangent (:func:`admit_pair`), the diagonal check and the pair's disk on the patch
+  ring's pooled load (:func:`friction_radius`), then the operator's residual;
+- the **row law** is one function, :func:`row_update`: step, regularization, the projection of each row kind
+  (unilateral, friction pair, PhysX drive, velocity limit, bilateral), the change vote (:func:`change_vote`) and the
+  apply. Every block of every sweep runs it; a friction pair solved as one unit runs its pair law and tail
+  (:func:`pair_update`);
+- the **Jacobi law** steps every row of a world at once instead, a lane each (:class:`JacobiRows`,
+  :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, the radial projection of each friction
+  pair, Nesterov's momentum with adaptive restart and the relative change vote, the operator forming each row's
+  residual from the impulses;
+- the **exit** is the solve policy (:mod:`.solve_policy`): the change votes and the end-of-sweep stop
+  (:func:`end_sweep`);
+- the **publication** writes the impulses and velocities back.
+
+Only the response operator and the lane layout fix a row's floating-point order, so a configuration that keeps a
+sweep's operator and layout reproduces its results.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Callable
+from typing import ClassVar
+
+from .device_preludes import DevicePrelude
+from .kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    PGS_CONSTRAINT_TYPE_TORSION,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
+)
+from .response_operator import Lanes, ResponseOperator
+from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
+from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit, vote
+from .staging import Buffer
+
+CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
+DRIVE = int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)
+FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
+JOINT_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
+VELOCITY_LIMIT = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
+
+
+def indent(text: str, prefix: str) -> str:
+    """Prefix every non-empty line of ``text``."""
+    return "\n".join(prefix + line if line.strip() else line for line in text.split("\n"))
+
+
+DRIVE_DATA = {
+    "target": ("s_drive_target", "world_drive_target_vel_bias"),
+    "vel": ("s_drive_vel_mul", "world_drive_vel_multiplier"),
+    "imp": ("s_drive_imp_mul", "world_drive_impulse_multiplier"),
+    "max": ("s_drive_max_imp", "world_drive_max_impulse"),
+}
+"""The PhysX drive law's per-row data (:func:`.projection_laws.physx_drive`), by the name the row law reads it under
+(:attr:`RowContext.drive_data`): the array a sweep stages it in and the global array it stages."""
+
+CPU_MATH = DevicePrelude(
+    "cpu_math",
+    "    // The CUDA math the row law calls: the device's own.",
+    "    // The CUDA math the row law calls, on the CPU: Warp's own maximum (its CPU build declares no fmaxf).\n"
+    "    const auto fmaxf = [](float a, float b) -> float { return wp::max(a, b); };",
+)
+"""The CUDA math intrinsics the row law calls, for a body that also runs on the CPU
+(:func:`.device_preludes.dual_native`): ``fmaxf`` is Warp's ``wp::max`` there, the same maximum up to the sign of a
+zero one; CUDA has its own."""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Row stores: where a row's state and metadata live
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldRows:
+    """A world's dense rows (``world_*`` arrays, ``capacity`` slots per world at ``off_dense``).
+
+    Impulses are staged in ``s_lam_dense`` and owned by the row's first lane.
+    With ``shared_metadata`` the right-hand side, diagonal and friction
+    coefficient (and the drive data with ``drive``) are staged too; otherwise
+    they stream from their global arrays. ``packed_types`` keeps the row types
+    and parents resident as one packed word per row (``s_meta_dense``: the type
+    in the low bits, the parent plus one above); the end-of-sweep scans
+    (:meth:`kind` with ``scan``) read the global types whenever the metadata
+    streams. Staged and streamed reads hold identical values.
+    """
+
+    capacity: int
+    shared_metadata: bool = True
+    packed_types: bool = True
+    drive: bool = False
+    fused_limits: bool = False
+    rhs: str = "rhs_bias"
+    lanes: Lanes = dataclasses.field(default_factory=Lanes)
+
+    STAGED: ClassVar[dict[str, str]] = {
+        "s_rhs_dense": "rhs",
+        "s_diag_dense": "world_diag",
+        "s_mu_dense": "world_row_mu",
+        **{f"{name}_dense": source for name, source in DRIVE_DATA.values()},
+        "s_drive_vel_limit_dense": "world_drive_vel_limit",
+    }
+
+    def _source(self, name: str) -> str:
+        source = self.STAGED[name]
+        return self.rhs if source == "rhs" else source
+
+    def staged(self, name: str, row: str) -> str:
+        """Row ``row``'s value of the staged array ``name`` (staged or streamed)."""
+        if self.shared_metadata:
+            return f"{name}[{row}]"
+        return f"{self._source(name)}.data[off_dense + ({row})]"
+
+    def rhs_of(self, row: str) -> str:
+        return self.staged("s_rhs_dense", row)
+
+    def diag(self, row: str) -> str:
+        return self.staged("s_diag_dense", row)
+
+    def mu(self, row: str) -> str:
+        return self.staged("s_mu_dense", row)
+
+    def drive_data(self, name: str, row: str) -> str:
+        """Row ``row``'s PhysX drive datum ``name`` (:data:`DRIVE_DATA`)."""
+        return self.staged(f"{DRIVE_DATA[name][0]}_dense", row)
+
+    def weight(self, row: str) -> str:
+        return f"world_row_w.data[off_dense + {row}]"
+
+    def kind(self, row: str, *, scan: bool = False) -> str:
+        if self.shared_metadata or (self.packed_types and not scan):
+            return f"s_meta_dense[{row}] & {_DENSE_META_ROW_TYPE_MASK}"
+        return f"world_row_type.data[off_dense + {row}]"
+
+    def parent(self, row: str, *, enclosed: bool = False) -> str:
+        if not self.packed_types:
+            return f"world_row_parent.data[off_dense + {row}]"
+        decoded = f"(s_meta_dense[{row}] >> {_DENSE_META_ROW_TYPE_BITS}) - 1"
+        return f"({decoded})" if enclosed else decoded
+
+    def load(self, row: str) -> str:
+        """Row ``row``'s impulse on every lane (read by the first lane, which owns it)."""
+        return self.lanes.broadcast(f"s_lam_dense[{row}]")
+
+    def peek(self, row: str) -> str:
+        """Row ``row``'s impulse read directly (every lane reads the staged value)."""
+        return f"s_lam_dense[{row}]"
+
+    def store(self, row: str, value: str) -> str:
+        return self.lanes.first(f"s_lam_dense[{row}] = {value};")
+
+    def ring_load(self, parent: str) -> str:
+        """The pooled normal load of the patch ring of normal row ``parent``."""
+        return (
+            f"RING_LOAD(s_lam_dense[{parent}], {parent}, {self.capacity},\n"
+            f"    [&](int patch_row) {{ return {self.parent('patch_row', enclosed=True)}; }},\n"
+            f"    [&](int patch_row) {{ return s_lam_dense[patch_row]; }})"
+        )
+
+    # -- staging ---------------------------------------------------------------------------------------------------
+
+    def staged_names(self) -> tuple[list[str], list[str], list[str]]:
+        head, tail = (["s_rhs_dense", "s_diag_dense"], ["s_mu_dense"]) if self.shared_metadata else ([], [])
+        drive = []
+        if self.drive and self.shared_metadata:
+            drive = [f"{name}_dense" for name, _ in DRIVE_DATA.values()]
+            if self.fused_limits:
+                drive.append("s_drive_vel_limit_dense")
+        return head, tail, drive
+
+    def buffers(self) -> tuple[Buffer, ...]:
+        head, tail, drive = self.staged_names()
+        packed = [Buffer("s_meta_dense", "int", self.capacity)] if self.packed_types else []
+        return (
+            Buffer("s_lam_dense", "float", self.capacity),
+            *(Buffer(name, "float", self.capacity) for name in head),
+            *packed,
+            *(Buffer(name, "float", self.capacity) for name in tail),
+            *(Buffer(name, "float", self.capacity) for name in drive),
+        )
+
+    def loads(self, row: str = "i") -> str:
+        head, tail, drive = self.staged_names()
+        lines = [f"s_lam_dense[{row}] = world_impulses.data[off_dense + {row}];"]
+        lines += [f"{name}[{row}] = {self._source(name)}.data[off_dense + {row}];" for name in head]
+        if self.packed_types:
+            lines += [
+                f"int row_type = world_row_type.data[off_dense + {row}];",
+                f"int row_parent = world_row_parent.data[off_dense + {row}];",
+                f"s_meta_dense[{row}] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
+                f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
+            ]
+        lines += [f"{name}[{row}] = {self._source(name)}.data[off_dense + {row}];" for name in tail]
+        lines += [f"{name}[{row}] = {self._source(name)}.data[off_dense + {row}];" for name in drive]
+        return "\n".join(lines)
+
+
+@dataclasses.dataclass(frozen=True)
+class FreeBodyRows:
+    """A world's matrix-free (free-body) rows: one packed ``int4`` per row and the impulses.
+
+    ``mf_meta`` holds, per row, the bodies' first coordinates (``dof_a << 16 |
+    dof_b``), the stored inverse diagonal, the right-hand side and the type
+    and parent (``type | parent << 16``). Impulses are staged in ``s_lam_mf``
+    or, with ``stream``, read and written in place by the first lane
+    (``g_lam_mf``), whose reads every lane takes by broadcast.
+    """
+
+    capacity: int
+    stream: bool = False
+    lanes: Lanes = dataclasses.field(default_factory=Lanes)
+
+    def parent_of(self, packed: str) -> str:
+        return _mf_parent_expression(packed, self.capacity)
+
+    def load(self, row: str) -> str:
+        if self.stream:
+            return self.lanes.broadcast(f"g_lam_mf[{row}]")
+        return f"s_lam_mf[{row}]"
+
+    def store(self, row: str, value: str) -> str:
+        if self.stream:
+            return self.lanes.first(f"g_lam_mf[{row}] = {value};")
+        return f"s_lam_mf[{row}] = {value};"
+
+    def ring_load(self, parent: str) -> str:
+        meta_parent = self.parent_of("mf_meta.data[off_meta + patch_row * 4 + 3]")
+        return (
+            f"RING_LOAD({self.load(parent)}, {parent}, {self.capacity},\n"
+            f"    [&](int patch_row) {{ return {meta_parent}; }},\n"
+            f"    [&](int patch_row) {{ return {self.load('patch_row')}; }})"
+        )
+
+    def rhs_meta(self, row: str) -> str:
+        return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 2])"
+
+    def inverse_meta(self, row: str) -> str:
+        return f"__int_as_float(mf_meta.data[off_meta + {row} * 4 + 1])"
+
+    def mu(self, row: str) -> str:
+        return f"mf_row_mu.data[off_mf + {row}]"
+
+    def weight(self, row: str) -> str:
+        return f"mf_row_w.data[off_mf + {row}]"
+
+    def buffers(self) -> tuple[Buffer, ...]:
+        return () if self.stream else (Buffer("s_lam_mf", "float", self.capacity),)
+
+    def declaration(self) -> str:
+        if self.stream:
+            return "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);"
+        return ""
+
+    def load_line(self, row: str = "i") -> str:
+        return "" if self.stream else f"s_lam_mf[{row}] = mf_impulses.data[off_mf + {row}];"
+
+    def store_line(self, row: str = "i") -> str:
+        return "" if self.stream else f"mf_impulses.data[off_mf + {row}] = s_lam_mf[{row}];"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The row law
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RowLaws:
+    """The physics a sweep's rows obey, beyond each row kind's projection.
+
+    Args:
+        drive: Drive rows (``JOINT_TARGET``) are PhysX drive rows (:func:`physx_drive`); otherwise none exist and
+            a drive row is skipped.
+        velocity_limit_law: ``"stateless"`` or ``"accumulated"`` (:mod:`.velocity_limit_law`).
+        regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
+        torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
+        policy: The solve policy: the change votes and the stop.
+        impulse_tolerance: A change within the run-time impulse tolerance is quiet: within ``change_tolerance +
+            relative_change_tolerance * |new|`` of its update's reference impulse (a row's own new impulse; a friction
+            pair's first tangent's), within ``change_tolerance`` for a velocity-limit correction.
+        jacobi_tolerance: The Jacobi sweeps' quiet change, compiled in: a change of at most ``tolerance (|new| +
+            tolerance)`` is quiet, a test that a NaN change also passes; ``None`` for the Gauss-Seidel sweeps' votes.
+    """
+
+    drive: bool = False
+    velocity_limit_law: str = "stateless"
+    regularize: bool = True
+    torsion: bool = False
+    policy: SolvePolicy = EXACT_POLICY
+    impulse_tolerance: bool = False
+    jacobi_tolerance: float | None = None
+
+    @property
+    def accumulated(self) -> int:
+        return int(self.velocity_limit_law == "accumulated")
+
+
+def change_vote(laws: RowLaws, terms: tuple[tuple[str, str, str], ...], pad: str, *, new=None) -> str:
+    """The change vote of one update's ``terms`` (``(change, A_ii, kind)`` each), in a block entered on a change.
+
+    Without the laws' impulse tolerance any change votes. With it, a change within ``change_tolerance +
+    relative_change_tolerance * |new|`` is quiet (``new``: the reference impulse of every term, or one per term;
+    ``None`` bounds by ``change_tolerance`` alone). The Jacobi law votes outside such a block, every change against
+    its relative tolerance (:attr:`RowLaws.jacobi_tolerance`).
+    """
+    if laws.jacobi_tolerance is not None:
+        references = new if isinstance(new, tuple) else (new,) * len(terms)
+        tolerance = f"{float(laws.jacobi_tolerance)}f"
+        moved = " || ".join(
+            f"fabsf({change}) > {tolerance} * (fabsf({reference}) + {tolerance})"
+            for (change, _, _), reference in zip(terms, references, strict=True)
+        )
+        return vote(laws.policy, f"{pad}if ({moved}) iteration_changed = 1;", flag="iteration_changed", terms=terms)
+    if not laws.impulse_tolerance:
+        return vote(laws.policy, f"{pad}iteration_changed = 1;", flag="iteration_changed", terms=terms)
+    references = new if isinstance(new, tuple) else (new,) * len(terms)
+    slack = tuple(
+        "change_tolerance"
+        if reference is None
+        else f"change_tolerance + relative_change_tolerance * fabsf({reference})"
+        for reference in references
+    )
+    within = " && ".join(f"fabsf({change}) <= {bound}" for (change, _, _), bound in zip(terms, slack, strict=True))
+    return vote(
+        laws.policy,
+        f"{pad}if (!({within})) iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=terms,
+        slack=slack,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RowContext:
+    """What :func:`row_update` reads of a row: its kind, impulse, metadata and response operator.
+
+    The expressions are native code at the row index ``row``; ``kind`` is a
+    local the block has already declared, and the operator reads the row's
+    diagonal (:class:`.response_operator.ResponseOperator`).
+    """
+
+    row: str
+    kind: str
+    operator: ResponseOperator
+    load: Callable[[str], str]
+    store: Callable[[str, str], str]
+    rhs: Callable[[str], str]
+    mu: Callable[[str], str]
+    weight: Callable[[str], str]
+    parent: str
+    ring_load: Callable[[str], str]
+    lanes: Lanes
+    contact_kinds: tuple[int, ...] = (CONTACT, JOINT_LIMIT)
+    drive_data: Callable[[str, str], str] | None = None
+    """The drive row data (``target``, ``vel``, ``imp``, ``max``) of a block with PhysX drive rows."""
+    inline_velocity_limit: bool = False
+    """Velocity-limit rows the row loop visits take the velocity-limit law in place (a velocity-limit row phase)."""
+    record: Callable[[str, str], str] | None = None
+    """An impulse-space operator's record of the impulse a row applied (``s_app[row] += delta``)."""
+    friction: bool = True
+    """The rows include friction pairs; a block whose rows never do (no contacts) omits the pair's admission,
+    projection, store and apply."""
+    pair_law: str = "ProjectionLaw::friction_pair("
+    """The friction pair's law, up to its first argument: :func:`.projection_laws.friction_pair`, or a law of the same
+    arguments after leading ones of its own (a cache of the pair's metric)."""
+    owned: bool = True
+    """The row's first lane owns the stored impulses: the lanes synchronize before the stores (every lane has read
+    the impulses the first lane overwrites) and, with :attr:`fenced`, after them. Otherwise every lane stores what it
+    computed, as every other lane does, and reads only its own stores."""
+    fenced: bool = True
+    """The lanes also synchronize between the first lane's stores and the applies, which read no impulse."""
+    pair_residual: bool = False
+    """A friction pair reduces its first tangent's residual again with the pair's terms
+    (:meth:`.ResponseOperator.pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
+    friction step."""
+
+    def sync(self) -> str:
+        """The barrier after a row's stores and apply: needed when the lanes share them (the first lane's impulses, or
+        an apply to the velocity or a maintained residual); nothing for one thread."""
+        return self.lanes.sync() if self.owned or self.operator.applies else ""
+
+
+def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> str:
+    """The projected Gauss-Seidel update of one row, after its residual's velocity term ``residual`` is reduced.
+
+    The row's kind selects its projection (PhysX drive, velocity limit,
+    unilateral, friction pair, bilateral); a first tangent solves its pair on
+    the disk of ``radius`` (declared by the block). Then one tail for every
+    kind: the impulses are stored (the row's first lane owns them), an
+    impulse-space operator records what it applied, and the changes are voted
+    and applied, the second tangent's before the row's own.
+    """
+    op, row, kind = ctx.operator, ctx.row, ctx.kind
+    full = residual if op.residual_includes_rhs else f"{residual} + {ctx.rhs(row)}"
+    lines = [
+        f"float old_impulse = {ctx.load(row)};",
+        f"float residual = {full};",
+    ]
+    step = op.step("residual", row)
+    if laws.regularize:
+        lines += [
+            f"float delta = {step};",
+            f"if ({kind} == {CONTACT} && regularize)",
+            f"    delta = ProjectionLaw::regularized_delta(delta, {ctx.weight(row)}, old_impulse);",
+            "float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);",
+        ]
+    else:
+        lines.append(f"float new_impulse = ProjectionLaw::relaxed_step(old_impulse, {step}, omega);")
+    lines.append("float delta_impulse = 0.0f;")
+    if ctx.friction:
+        lines += ["int sib = -1;", "float sib_new = 0.0f, sib_delta = 0.0f;"]
+    branches = []
+    if laws.drive and ctx.drive_data is not None:
+        target, vel_mul, imp_mul, max_imp = (ctx.drive_data(name, row) for name in DRIVE_DATA)
+        jv = op.velocity_term("residual", ctx.rhs(row), residual)
+        branches.append(
+            (
+                f"{kind} == {DRIVE}",
+                f"new_impulse = ProjectionLaw::physx_drive(old_impulse, {jv}, {imp_mul},\n"
+                f"    {vel_mul}, {target}, {max_imp});\n"
+                "delta_impulse = new_impulse - old_impulse;",
+            )
+        )
+    if ctx.inline_velocity_limit:
+        branches.append(
+            (
+                f"{kind} == {VELOCITY_LIMIT}",
+                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, "
+                f"{op.scale('residual', row)}, {laws.accumulated});\n"
+                "new_impulse = vlim.v0;\n"
+                "delta_impulse = vlim.v1;",
+            )
+        )
+    unilateral = " || ".join(f"{kind} == {k}" for k in ctx.contact_kinds)
+    branches.append(
+        (
+            unilateral,
+            "new_impulse = ProjectionLaw::unilateral(new_impulse);\ndelta_impulse = new_impulse - old_impulse;",
+        )
+    )
+    if ctx.friction:
+        pair = friction_pair(ctx, own=ctx.pair_residual)
+        if _sibling_in_pair(ctx):
+            # Impulses that need no barrier: the pair stores, votes and applies its second tangent in its branch, so
+            # the rows without a pair carry no sibling test.
+            sib_term = ("sib_delta", op.value("sib"), str(FRICTION))
+            pair += "\n" + "\n".join(
+                line
+                for line in (
+                    ctx.store("sib", "sib_new"),
+                    ctx.record("sib", "sib_delta") if ctx.record is not None else "",
+                    "if (sib_delta != 0.0f) {",
+                    change_vote(laws, (sib_term,), "    ", new="new_impulse"),
+                    indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
+                    "}",
+                )
+                if line
+            )
+        branches.append((f"{kind} == {FRICTION}", pair + "\ndelta_impulse = new_impulse - old_impulse;"))
+    for index, (condition, body) in enumerate(branches):
+        head = "if" if index == 0 else "} else if"
+        lines.append(f"{head} ({condition}) {{")
+        lines.append(indent(body, "    "))
+    lines += ["} else {", "    delta_impulse = new_impulse - old_impulse;", "}"]
+    lines += _row_tail(ctx, laws)
+    return indent("\n".join(line for line in lines if line != ""), pad)
+
+
+def _sibling_in_pair(ctx: RowContext) -> bool:
+    """Whether a friction pair finishes its second tangent in its own branch (store, vote, apply): rows whose
+    impulses need no barrier and whose operator applies the tangents one at a time."""
+    return ctx.friction and not ctx.owned and not ctx.operator.fused_pair_apply
+
+
+def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
+    """Store the row's (and its sibling's) impulse, record and vote the changes, apply the sibling's then the row's.
+
+    An operator that applies a pair in one pass (``fused_pair_apply``) votes both changes together and adds the
+    sibling's and then the row's change to each of its entries, written back once.
+    """
+    op, row, kind = ctx.operator, ctx.row, ctx.kind
+    lines = [ctx.lanes.sync() if ctx.owned else ""]
+    lines.append(ctx.store(row, "new_impulse"))
+    if ctx.record is not None:
+        lines.append(ctx.record(row, "delta_impulse"))
+    if ctx.friction and not _sibling_in_pair(ctx):
+        lines += [
+            "if (sib >= 0) {",
+            "    " + ctx.store("sib", "sib_new"),
+            ("    " + ctx.record("sib", "sib_delta")) if ctx.record is not None else "",
+            "}",
+        ]
+    lines.append(ctx.lanes.sync() if ctx.owned and ctx.fenced else "")
+    row_term = ("delta_impulse", op.value(row), kind)
+    sib_term = ("sib_delta", op.value("sib"), str(FRICTION))
+    if ctx.friction and op.fused_pair_apply:
+        lines += [
+            "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
+            change_vote(laws, (row_term, sib_term), "    ", new="new_impulse"),
+            indent(op.apply_pair("sib_delta", "delta_impulse", "").lstrip("\n"), "    "),
+            "}",
+        ]
+    else:
+        if ctx.friction and not _sibling_in_pair(ctx):
+            lines += [
+                "if (sib_delta != 0.0f) {",
+                change_vote(laws, (sib_term,), "    ", new="new_impulse"),
+                indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
+                "}",
+            ]
+        lines += [
+            "if (delta_impulse != 0.0f) {",
+            change_vote(laws, (row_term,), "    ", new="new_impulse"),
+            indent(op.apply("delta_impulse", "").lstrip("\n"), "    "),
+            "}",
+        ]
+    lines.append(ctx.sync())
+    return lines
+
+
+def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
+    """The Gauss-Seidel update of a friction pair visited as one unit, at its first tangent ``ctx.row``.
+
+    A unit schedule solves a contact's tangent pair right after its normal
+    row ``ctx.parent``, on the disk of ``radius`` (declared by the block): the
+    operator reduces the first tangent's residual with the pair's terms
+    (:meth:`.ResponseOperator.pair_terms`), the pair is projected as in
+    :func:`row_update`, and the same tail stores, votes and applies.
+    """
+    lines = [
+        f"const float old_impulse = {ctx.load(ctx.row)};",
+        "float new_impulse = old_impulse;",
+        "float delta_impulse = 0.0f;",
+        "int sib = -1;",
+        "float sib_new = 0.0f, sib_delta = 0.0f;",
+        friction_pair(ctx, own=True),
+        "delta_impulse = new_impulse - old_impulse;",
+        *_row_tail(ctx, laws),
+    ]
+    return indent("\n".join(line for line in lines if line != ""), pad)
+
+
+def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
+    """The friction pair at its first tangent: both tangents on the disk of ``radius`` (``sib_new``, ``sib_delta``).
+
+    With ``own`` the first tangent's residual is reduced with the pair's terms (a pair solved as a unit).
+    """
+    op = ctx.operator
+    lines = [
+        f"sib = {ctx.parent} + 2;",
+        f"const float sibling_impulse = {ctx.load('sib')};",
+        "wp::vec2 pair(0.0f);",
+        "// Zero load gives a zero disk; avoid unused tangent reductions.",
+        "if (radius > 0.0f) {",
+        op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
+        f"    pair = {ctx.pair_law}{op.value(ctx.row)}, cross, {op.value('sib')},",
+        "        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega);",
+        "}",
+        "pair = ProjectionLaw::disk(pair, radius);",
+        "new_impulse = pair[0];",
+        "sib_new = pair[1];",
+        "sib_delta = sib_new - sibling_impulse;",
+    ]
+    return "\n".join(line for line in lines if line != "")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The row visit: a row loop's admission of row ``i`` before the row law
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def friction_gate(kind: str, store: str, sync: str, pad: str, *, skip: bool = True) -> str:
+    """While friction is delayed (before ``friction_start_iteration``), zero a friction row's impulses and move on.
+
+    ``store`` zeroes them (the first lane's stores, or every lane's), ``sync`` is the barrier after it (nothing for
+    one thread); with ``skip`` the row loop continues.
+    """
+    lines = [
+        f"if (ProjectionLaw::friction_gate({kind}, global_iter, friction_start_iteration)) {{",
+        f"    {store}",
+        f"    {sync}" if sync else "",
+        "    continue;" if skip else "",
+        "}",
+    ]
+    return indent("\n".join(line for line in lines if line), pad)
+
+
+def admit_pair(kind: str, parent: str, pad: str, *, disk: str = "") -> str:
+    """Friction rows of the row loop over ``i``: visit the first tangent only.
+
+    Declares ``parent`` (the contact's normal row ``parent`` for a friction row, -1 for other kinds) and ``radius``,
+    which :func:`friction_radius` sets, or ``disk`` (:func:`pair_radius`'s statements, indented one level) in the
+    same block.
+    """
+    lines = [
+        "int parent = -1;",
+        "float radius = 0.0f;",
+        f"if ({kind} == {FRICTION}) {{",
+        f"    parent = {parent};",
+        "    if (i != parent + 1) continue;",
+        disk,
+        "}",
+    ]
+    return indent("\n".join(line for line in lines if line), pad)
+
+
+def pair_radius(
+    ring_load: str, mu: str, load_row: str, load_next: str, pad: str, *, keep_next: str | None = None
+) -> str:
+    """Set ``radius``: ``mu`` times the pooled normal load of the contact's patch ring, and skip a zero pair.
+
+    A zero disk with no carried tangent impulse (``load_row``, ``load_next``) cannot change the velocity, so the
+    pair is skipped before its residuals are reduced. ``keep_next`` names a declared register that keeps the second
+    tangent's impulse for the pair's update.
+    """
+    lines = [f"const float lambda_n = {ring_load};", f"radius = fmaxf({mu} * lambda_n, 0.0f);"]
+    if keep_next is not None:
+        lines.append(f"{keep_next} = {load_next};")
+        load_next = keep_next
+    lines.append(f"if (radius == 0.0f && {load_row} == 0.0f && {load_next} == 0.0f) continue;")
+    return indent("\n".join(lines), pad)
+
+
+def friction_radius(
+    kind: str, ring_load: str, mu: str, load_row: str, load_next: str, pad: str, *, keep_next: str | None = None
+) -> str:
+    """:func:`pair_radius` for a friction row of the row loop (one of kind ``kind``)."""
+    radius = pair_radius(ring_load, mu, load_row, load_next, pad + "    ", keep_next=keep_next)
+    return f"{pad}if ({kind} == {FRICTION}) {{\n{radius}\n{pad}}}"
+
+
+def row_visit(
+    ctx: RowContext,
+    laws: RowLaws,
+    *,
+    parent: str,
+    check: str | None,
+    declare: str = "",
+    hold: str = "",
+    keep_next: str | None = None,
+    entries: str = "",
+    residual: str | None = None,
+    pad: str = "            ",
+) -> str:
+    """Visit row ``i`` (``ctx.row``) of a row loop, its kind ``ctx.kind`` declared: admission, residual and row law.
+
+    A friction row waits for ``friction_start_iteration`` with a zero impulse (:func:`friction_gate`); a pair is
+    visited at its first tangent (``parent``: the row's parent, :func:`admit_pair`) and skipped while its disk and
+    impulses are zero (:func:`friction_radius`), before its residual is reduced. Every other row needs a positive
+    diagonal ``check`` (its value or stored inverse, declared by ``declare``), unless the schedule admitted the rows
+    on it already (``None``). ``hold`` declares, after the check, registers the disk and the law read (``keep_next``
+    keeps the second tangent's impulse in one); the disk joins the admission's block when nothing comes between
+    them. ``entries`` declares what the operator reads of the row and ``residual`` reduces ``jv`` (the operator's
+    :meth:`~.ResponseOperator.residual` by default). Rows without friction pairs (``ctx.friction`` false) have no
+    gate, admission or disk. A skipped row continues the loop.
+    """
+    row, kind, op = ctx.row, ctx.kind, ctx.operator
+    pairs = ctx.friction
+    between = [indent(declare, pad) if declare else ""]
+    if check is not None:
+        exempt = f" && {kind} != {FRICTION}" if pairs else ""
+        between.append(f"{pad}if ({check} <= 0.0f{exempt}) continue;")
+    between.append(indent(hold, pad) if hold else "")
+    lines = [friction_gate(kind, ctx.store(row, "0.0f"), ctx.sync(), pad) if pairs else ""]
+    disk = (ctx.ring_load("parent"), ctx.mu(row), ctx.load(row), ctx.load(f"{row} + 1"))
+    if pairs and not any(between):
+        lines.append(admit_pair(kind, parent, pad, disk=pair_radius(*disk, "    ", keep_next=keep_next)))
+    else:
+        lines += [
+            admit_pair(kind, parent, pad) if pairs else "",
+            *between,
+            friction_radius(kind, *disk, pad, keep_next=keep_next) if pairs else "",
+        ]
+    lines += [
+        indent(entries, pad) if entries else "",
+        op.residual("jv", pad) if residual is None else residual,
+        row_update(ctx, laws, residual="jv", pad=pad),
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The exit: the end of every sweep
+# ---------------------------------------------------------------------------------------------------------------------
+
+QUIET = "BALLOT(iteration_changed != 0) == 0u"
+"""No lane of the sweep's group voted a change."""
+
+BLOCK_QUIET = "!ANY(iteration_changed != 0)"
+"""No lane of a block group of several warps voted a change: the block's vote, a barrier."""
+
+EXACT_EXIT = """        if (global_iter >= friction_start_iteration) {
+            const unsigned changed = BALLOT(iteration_changed != 0);
+            if (changed == 0u) break;
+        }
+"""
+"""The exact law's end of a sweep: stop once friction is active and no row voted a change."""
+
+
+def end_sweep(
+    policy: SolvePolicy,
+    *,
+    iteration: str,
+    gated: bool = True,
+    exact: str | None = None,
+    violation: tuple[str, str, str] | None = None,
+    block: bool = False,
+) -> str:
+    """The end of a sweep under the solve policy (:func:`.solve_policy.sweep_exit`): stop once no row voted a change.
+
+    A ``gated`` sweep stops only once friction is active (delayed friction is a change to come). ``exact`` is the
+    sweep's text under the exact law (:data:`EXACT_EXIT` by default, or the ungated test of :data:`QUIET`);
+    ``violation`` bounds the rows a sweep of selected rows leaves unvisited. A ``block`` group spans several warps:
+    its quiet test is the block's vote (:data:`BLOCK_QUIET`).
+    """
+    gate = "global_iter >= friction_start_iteration" if gated else None
+    quiet = BLOCK_QUIET if block else QUIET
+    if exact is None:
+        if block:
+            stop = f"if ({quiet}) break;"
+            exact = f"        if ({gate}) {{\n            {stop}\n        }}\n" if gated else f"        {stop}\n"
+        else:
+            exact = EXACT_EXIT if gated else f"        if ({QUIET}) break;\n"
+    return sweep_exit(policy, exact, gate=gate, quiet=quiet, violation=violation, iteration=iteration)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Row blocks: a row store, an operator and the row law, over a range of rows in slot order
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def dense_rows_block(
+    rows: WorldRows,
+    op,
+    laws: RowLaws,
+    *,
+    admission: str = "",
+    lo: str = "dense_lo",
+    hi: str = "dense_hi",
+    inline_velocity_limit: bool = True,
+    pad: str = "        ",
+) -> str:
+    """The Gauss-Seidel loop over a world's dense rows ``[lo, hi)`` in slot order.
+
+    ``admission`` holds the block's own skips (row phases, frozen drives),
+    run after the row's type is read. Drive rows are skipped unless the laws
+    give them the PhysX drive law.
+    """
+    inner = pad + "    "
+    drive_skip = "" if laws.drive else f"if (row_type == {DRIVE}) continue;"
+    torsion_skip = f"if (row_type == {TORSION}) continue;" if laws.torsion else ""
+    op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+    ctx = RowContext(
+        row="i",
+        kind="row_type",
+        operator=op,
+        load=rows.load,
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=rows.mu,
+        weight=rows.weight,
+        parent="parent",
+        ring_load=rows.ring_load,
+        lanes=rows.lanes,
+        drive_data=rows.drive_data if laws.drive else None,
+        inline_velocity_limit=inline_velocity_limit,
+    )
+    body = [
+        op.consume("i", hi, inner),
+        f"{inner}int row_type = {rows.kind('i')};",
+        indent(torsion_skip, inner) if torsion_skip else "",
+        indent(admission, inner) if admission else "",
+        indent(drive_skip, inner) if drive_skip else "",
+        row_visit(
+            ctx, laws, parent=rows.parent("i"), check="denom", declare=f"float denom = {rows.diag('i')};", pad=inner
+        ),
+    ]
+    return (
+        f"{pad}if ({hi} > {lo}) {{\n{op.prefetch_first(lo, pad + '    ')}\n{pad}}}\n"
+        f"{pad}for (int i = {lo}; i < {hi}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
+    )
+
+
+def free_body_rows_block(
+    rows: FreeBodyRows,
+    op,
+    laws: RowLaws,
+    *,
+    admission: str = "",
+    end: str = "mf_contact_end",
+    pad: str = "        ",
+) -> str:
+    """The Gauss-Seidel loop over a world's free-body rows ``[0, end)`` in slot order.
+
+    The impulses need no barrier around their stores: every lane stores the value it computed (or, streamed, the
+    first lane stores and every read takes the first lane's value), so a lane only ever reads its own stores.
+    """
+    inner = pad + "    "
+    op = dataclasses.replace(op, inverse=lambda row: "mf_diag" if row == "i" else rows.inverse_meta(row))
+    ctx = RowContext(
+        row="i",
+        kind="mf_rt",
+        operator=op,
+        load=rows.load,
+        store=rows.store,
+        rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else rows.rhs_meta(row),
+        mu=rows.mu,
+        weight=rows.weight,
+        parent="parent",
+        ring_load=rows.ring_load,
+        lanes=rows.lanes,
+        contact_kinds=(CONTACT,),
+        owned=False,
+    )
+    body = [
+        op.consume("i", end, inner),
+        indent(admission, inner) if admission else "",
+        row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", pad=inner),
+    ]
+    return (
+        f"{op.pipeline_registers(pad)}\n"
+        f"{pad}if ({end} > 0) {{\n{op.prefetch_first('0', pad + '    ')}\n{pad}}}\n"
+        f"{pad}for (int i = 0; i < {end}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# End-of-sweep passes: rows whose law gives them the last word of every sweep
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_dense", pad: str = "            ") -> str:
+    """Dense joint velocity-limit rows after every other row of the sweep, under the sweep's velocity-limit law.
+
+    The stateless law corrects the current overshoot and stores that correction; the accumulated law keeps a
+    unilateral total, owned by the row's first lane. ``rows`` stages the rows' impulses, kinds, diagonals and
+    right-hand sides (:class:`WorldRows`, or a route's store of the same accessors); the operator reduces each row's
+    velocity term outside the row loop (:meth:`~.ResponseOperator.row_velocity`).
+    """
+    lanes = rows.lanes
+    accumulated = laws.accumulated
+    old = "old_vlim" if accumulated else "0.0f"
+    lines = [
+        f"for (int i = 0; i < {end}; i++) {{",
+        f"    if (({rows.kind('i', scan=True)}) != {VELOCITY_LIMIT}) continue;",
+        f"    float denom = {rows.diag('i')};",
+        "    if (denom <= 0.0f) continue;",
+        "",
+        op.row_velocity("my_sum_vlim", "i", "    "),
+        "    float jv_vlim = my_sum_vlim;",
+        "",
+        f"    float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
+    ]
+    if accumulated:
+        lines.append(f"    const float old_vlim = {rows.load('i')};")
+    lines += [
+        f"    const auto vlim = ProjectionLaw::velocity_limit_update({old}, residual_vlim, residual_vlim / denom, "
+        f"{accumulated});",
+        "    const float delta_impulse_vlim = vlim.v1;",
+    ]
+    if accumulated:
+        lines.append(f"    {lanes.sync()}")
+    lines += [
+        f"    {rows.store('i', 'vlim.v0')}",
+        "",
+        "    if (delta_impulse_vlim != 0.0f) {",
+        change_vote(laws, (("delta_impulse_vlim", "denom", str(VELOCITY_LIMIT)),), "        "),
+        op.apply_strided("i", "delta_impulse_vlim", "        "),
+        "    }",
+        f"    {lanes.sync()}",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def fused_clamp_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "            ") -> str:
+    """PhysX's stateless velocity clamp of driven coordinates, over the drive-row prefix, after the other rows.
+
+    Velocity only: the drive row keeps its drive impulse.
+    """
+    lanes = rows.lanes
+    lines = [
+        "int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);",
+        "for (int i = 0; i < drive_hi_fvl; i++) {",
+        f"    if (({rows.kind('i', scan=True)}) != {DRIVE}) continue;",
+        f"    float qdot_max_fvl = {rows.staged('s_drive_vel_limit_dense', 'i')};",
+        f"    float denom_fvl = {rows.diag('i')};",
+        "    if (denom_fvl <= 0.0f) continue;",
+        "",
+        op.row_velocity("my_sum_fvl", "i", "    "),
+        "    float jv_fvl = my_sum_fvl;",
+        "    if (fabsf(jv_fvl) > qdot_max_fvl) {",
+        "        const float delta_fvl = ProjectionLaw::velocity_clamp_impulse(jv_fvl, qdot_max_fvl, denom_fvl);",
+        vote(
+            laws.policy,
+            "        if (delta_fvl != 0.0f) iteration_changed = 1;",
+            flag="iteration_changed",
+            terms=(("delta_fvl", "denom_fvl", str(VELOCITY_LIMIT)),),
+        ),
+        op.apply_strided("i", "delta_fvl", "        "),
+        "    }",
+        f"    {lanes.sync()}",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def speed_rows_pass(rows: FreeBodyRows, op, laws: RowLaws, *, pad: str = "            ") -> str:
+    """Free-body speed rows (``[mf_contact_end, m_mf)``) after every other row: each bounds the magnitude of its
+    body's linear (``J = e_0``) or angular (``J = e_3``) velocity, along that velocity."""
+    lanes = rows.lanes
+    lines = [
+        "for (int i = mf_contact_end; i < m_mf; i++) {",
+        "    int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[off_meta + i * 4]);",
+        "    int packed_tp = meta.w;",
+        "    int mf_rt = packed_tp & 0xFFFF;",
+        f"    if (mf_rt != {VELOCITY_LIMIT}) continue;",
+        "",
+        "    int packed_dofs = meta.x;",
+        "    int dof_a = packed_dofs >> 16;",
+        "    float mf_diag = __int_as_float(meta.y);",
+        "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
+        "",
+        f"    int row_mf6 = {op.base} + i * 6;",
+        f"    const int speed_dof = dof_a + ({op.J_a}.data[row_mf6 + 3] != 0.0f ? 3 : 0);",
+        speed_row(
+            op,
+            laws,
+            load=rows.load("i"),
+            store=lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]"),
+            lanes=lanes,
+            rhs="__int_as_float(meta.z)",
+            inverse="mf_diag",
+            pad="    ",
+        ),
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def speed_row(
+    op,
+    laws: RowLaws,
+    *,
+    load: str,
+    store: str,
+    lanes: Lanes,
+    rhs: str,
+    inverse: str,
+    first: str = "speed_dof",
+    pad: str = "    ",
+) -> str:
+    """The update of a free-body speed row on its body's velocity coordinates ``[first, first + 3)``.
+
+    The speed is the coordinates' magnitude in the operator's layout (:meth:`.FreeBody6.speed`); the row's law
+    (:func:`.projection_laws.speed_row`) gives its stored value (``store`` stores ``speed_row[0]``, the row's
+    impulse ``load`` under the accumulated law) and the scale that pushes the velocity back along itself.
+    ``inverse`` is the row's stored inverse diagonal.
+    """
+    accumulated = laws.accumulated
+    lines = [op.speed("speed_mf_vlim", first, pad)]
+    if accumulated:
+        lines.append(f"{pad}const float old_mf_vlim = {load};")
+    lines.append(
+        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, "
+        f"{'old_mf_vlim' if accumulated else '0.0f'}, {accumulated});"
+    )
+    if accumulated and lanes.sync():
+        lines.append(f"{pad}{lanes.sync()}")
+    lines += [
+        f"{pad}{store}",
+        "",
+        f"{pad}if (speed_row[2] != 0.0f) {{",
+        change_vote(laws, (("speed_row[1]", f"1.0f / {inverse}", str(VELOCITY_LIMIT)),), pad + "    "),
+        op.scale_speed("speed_row[2]", first, pad + "    "),
+        f"{pad}}}",
+    ]
+    if lanes.sync():
+        lines.append(f"{pad}{lanes.sync()}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The dense-row tiers' worlds: a block per world without free-body rows, its dense rows within the tier's bounds
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def dense_tier_world(
+    capacity: int, min_rows: int, dofs: int, max_constraints: int, *, local: bool, rows: str, pad: str = "    "
+) -> str:
+    """Enter a world of a dense-row tier, or return: one without free-body rows and with more than ``min_rows`` and
+    at most ``capacity`` dense rows (and, with ``local``, one the local owners leave to the general sweeps).
+
+    Declares ``m_dense``, ``m_mf``, the row phase's range ``[dense_lo, dense_hi)`` (returning for an empty one),
+    ``rows`` (the rows the tier holds, ``[0, dense_hi)``), ``dof_map_base``, ``off_dense`` and ``jy_world_base``.
+    """
+    local_skip = (
+        f"\n{pad}if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;" if local else ""
+    )
+    return f"""{pad}int m_dense = world_constraint_count.data[world];
+{pad}const int m_mf = mf_constraint_count.data[world];
+{pad}if (m_dense == 0 || m_mf != 0) return;
+{pad}if (m_dense > {capacity} || m_dense <= {min_rows}) return;{local_skip}
+
+{pad}int dense_lo = 0;
+{pad}int dense_hi = m_dense;
+{pad}if (row_phase == 3) {{
+{pad}    dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+{pad}}} else if (row_phase == 5) {{
+{pad}    dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
+{pad}    dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+{pad}}} else if (row_phase == 4) {{
+{pad}    dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
+{pad}}}
+{pad}if (dense_hi <= dense_lo) return;
+{pad}// The block holds rows [0, dense_hi): a friction row's parent precedes it, rows below dense_lo never change.
+{pad}const int {rows} = dense_hi;
+{pad}const int dof_map_base = world * {dofs};
+{pad}const int off_dense = world * {max_constraints};
+{pad}const int jy_world_base = world * {max_constraints} * {dofs};"""
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The Jacobi law: every row of a world at once, from the extrapolated impulses, with momentum
+# ---------------------------------------------------------------------------------------------------------------------
+
+JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_DRIVE, JACOBI_FROZEN = 0, 1, 2, 3, -1
+"""The kinds of a Jacobi row (``s_kind``): its projection, decoded from its type once at staging. A unilateral row
+(contact normals, position limits, accumulated velocity limits) clamps at zero, a friction row's pair projects on its
+disk, a bilateral row takes its step, a PhysX drive row its drive law; a frozen row keeps its warm start."""
+
+
+@dataclasses.dataclass(frozen=True)
+class JacobiRows:
+    """A world's dense rows ``[0, rows)`` under the Jacobi law, a lane each (row ``i`` on lane ``i``, ``threads``
+    lanes, at most ``capacity`` rows).
+
+    Staged per row: its impulse ``s_x``; the extrapolated impulse the next step
+    reads, ``s_y``; its warm start ``s_lam0``; its right-hand side ``s_rhs``
+    (once the operator has staged, the residual at zero impulse); its scaled
+    step ``s_step``; its friction coefficient and parent; and its kind
+    ``s_kind`` (:data:`JACOBI_UNILATERAL` and the others). ``s_x`` and ``s_y``
+    are float4-aligned and padded with zeros to a multiple of four rows. With
+    ``drive`` the PhysX drive rows' right-hand side (``s_drive_rhs``) and data
+    (:data:`DRIVE_DATA`) are staged; with ``limits``, which rows are joint
+    velocity limits (``s_vlim``, for the last word: :func:`jacobi_limit_pass`).
+    A row is admitted on its stored ``diagonal`` (native, at row ``i``) or,
+    for ``None``, provisionally: the operator forms the diagonal from the
+    staged rows, and a row whose formed diagonal is not positive is frozen
+    once every lane has read the staged kinds (its lane's ``frozen``).
+    """
+
+    capacity: int
+    threads: int
+    drive: bool = False
+    limits: bool = False
+    diagonal: str | None = "world_diag.data[off_dense + i]"
+    rows: str = "n_rows"
+
+    @property
+    def formed(self) -> bool:
+        """Whether the operator forms the rows' diagonals."""
+        return self.diagonal is None
+
+    def buffers(self) -> tuple[Buffer, ...]:
+        """The rows' state and metadata."""
+        AM = self.capacity
+        state = (Buffer("s_x", "float", AM, align=16), Buffer("s_y", "float", AM, align=16))
+        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu"))
+        ints = (Buffer(name, "int", AM) for name in ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ())))
+        return (*state, *floats, *ints)
+
+    def drive_buffers(self) -> tuple[Buffer, ...]:
+        """The PhysX drive rows' right-hand side and data (none without drive rows)."""
+        if not self.drive:
+            return ()
+        names = ("s_drive_rhs", *(name for name, _ in DRIVE_DATA.values()))
+        return tuple(Buffer(name, "float", self.capacity) for name in names)
+
+    def loads(
+        self,
+        *,
+        rhs: str,
+        row_type: str,
+        parent: str,
+        mu: str,
+        unilateral: tuple[int, ...],
+        admission: str,
+        pad: str = "    ",
+    ) -> str:
+        """Stage each row, lane-strided: its impulses at their warm start, its metadata (native expressions at row
+        ``i``) and its kind; a row is admitted on its phase (``admission``: statements that clear ``admit``) and a
+        positive diagonal, and its step starts at the inverse diagonal. ``unilateral`` lists the row types that
+        clamp at zero; without drive rows a drive row is frozen."""
+        drive = self.drive
+        diagonal = "1.0f" if self.formed else self.diagonal
+        decode = [
+            f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
+            f"else if (row_type == {FRICTION}) kind = {JACOBI_FRICTION};",
+        ]
+        if drive:
+            decode.append(f"else if (row_type == {DRIVE}) kind = {JACOBI_DRIVE};")
+        lines = [
+            f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{",
+            "    const float l0 = world_impulses.data[off_dense + i];",
+            "    s_lam0[i] = l0; s_x[i] = l0; s_y[i] = l0;",
+            f"    s_rhs[i] = {rhs};",
+            f"    const int row_type = {row_type} & {_DENSE_META_ROW_TYPE_MASK};",
+            f"    s_parent[i] = {parent};",
+            f"    s_mu[i] = {mu};",
+            f"    s_vlim[i] = row_type == {VELOCITY_LIMIT} ? 1 : 0;" if self.limits else "",
+            f"    const float diag = {diagonal};",
+            f"    int kind = {JACOBI_BILATERAL};",
+            *("    " + line for line in decode),
+            f"    int admit = (i >= dense_lo && diag > 0.0f{'' if drive else f' && row_type != {DRIVE}'}) ? 1 : 0;",
+            indent(admission, "    "),
+            f"    if (freeze_drive_rows != 0 && row_type == {DRIVE}) admit = 0;" if drive else "",
+            f"    s_kind[i] = admit ? kind : {JACOBI_FROZEN};",
+            "    s_step[i] = admit ? 1.0f / diag : 0.0f;",
+        ]
+        if drive:
+            lines.append("    s_drive_rhs[i] = s_rhs[i];")
+            lines += [f"    {name}[i] = {source}.data[off_dense + i];" for name, source in DRIVE_DATA.values()]
+        lines.append("}")
+        if self.formed:
+            lines.insert(0, "int frozen = 0;")
+        return indent("\n".join(line for line in lines if line), pad)
+
+    def freeze(self, pad: str = "    ") -> str:
+        """Freeze the rows whose formed diagonal is not positive, after the staging's barrier; synchronized."""
+        return f"{pad}if (frozen) s_kind[lane] = {JACOBI_FROZEN};\n{pad}SYNC();"
+
+    def padding(self) -> str:
+        """Zero the impulses past the rows, up to a multiple of four rows (the float4 reads of ``s_y``)."""
+        rows = self.rows
+        return (
+            f"for (int j = {rows} + lane; j < (({rows} + 3) & ~3); j += {self.threads}) "
+            "{ s_y[j] = 0.0f; s_x[j] = 0.0f; }"
+        )
+
+    def ring_load(self, parent: str) -> str:
+        """The pooled normal load of the patch ring of normal row ``parent``; a parent past the rows ends the ring."""
+        rows = self.rows
+        return (
+            f"RING_LOAD(s_x[{parent}], {parent}, {rows},\n"
+            f"    [&](int r) {{ const int next = s_parent[r]; return next < {rows} ? next : -1; }},\n"
+            "    [&](int r) { return s_x[r]; })"
+        )
+
+    def stores(self, pad: str = "    ") -> str:
+        """Write the rows' impulses back."""
+        return (
+            f"{pad}for (int i = lane; i < {self.rows}; i += {self.threads}) {{\n"
+            f"{pad}    world_impulses.data[off_dense + i] = s_x[i];\n{pad}}}"
+        )
+
+
+def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
+    """Set admitted row ``i``'s Jacobi step: ``omega w_i / A_ii`` with ``w_i = min(A_ii / bound, 1)`` (zero for a zero
+    bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
+
+    ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
+    the simultaneous steps from diverging where many rows couple through one body. With ``cfm`` (the row's
+    compliance) the diagonal ``A_ii + cfm`` is formed here and a row without a positive one is marked for freezing
+    (``frozen``, :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds); otherwise ``s_step``
+    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it.
+    """
+    lines = [f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;"]
+    if cfm is None:
+        lines.append("s_step[i] *= w * omega;")
+    else:
+        lines += [
+            f"const float diag_i = {aii} + {cfm};",
+            "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
+        ]
+    return indent("\n".join(lines), pad)
+
+
+def isotropic_pair_step(rows: JacobiRows, pad: str = "    ") -> str:
+    """Give both tangents of every friction pair the smaller of their steps, then synchronize.
+
+    The radial projection onto the friction disk is then the projection in the pair's own metric, so a sliding pair
+    converges to maximal dissipation (the Gauss-Seidel pair solve's friction law). A row keeps its own step when its
+    sibling is not an admitted friction row of the same normal, or when either step is zero (a zero-Jacobian tangent
+    would otherwise freeze its live sibling). The pair's first tangent's lane handles it.
+    """
+    F = JACOBI_FRICTION
+    lines = [
+        f"for (int i = lane; i < {rows.rows}; i += {rows.threads}) {{",
+        f"    if (s_kind[i] == {F} && i == s_parent[i] + 1) {{",
+        "        const int j = i + 1;",
+        f"        if (j < {rows.rows} && s_kind[j] == {F} && s_parent[j] == s_parent[i]) {{",
+        "            const float step_a = s_step[i];",
+        "            const float step_b = s_step[j];",
+        "            if (step_a > 0.0f && step_b > 0.0f) {",
+        "                const float step_pair = fminf(step_a, step_b);",
+        "                s_step[i] = step_pair;",
+        "                s_step[j] = step_pair;",
+        "            }",
+        "        }",
+        "    }",
+        "}",
+        "SYNC();",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def _jacobi_step(rows: JacobiRows, op, pad: str) -> str:
+    """Row ``i``'s update ``x_new`` from the extrapolated impulses (``x_old``: its impulse), on its lane."""
+    drive = [
+        "value = ProjectionLaw::physx_drive(s_y[i], r - s_drive_rhs[i], s_drive_imp_mul[i], s_drive_vel_mul[i],",
+        "    s_drive_target[i], s_drive_max_imp[i]);",
+    ]
+    step = [
+        "value = s_y[i] - s_step[i] * r;",
+        f"if (s_kind[i] == {JACOBI_UNILATERAL}) value = ProjectionLaw::unilateral(value);",
+        f"if (s_kind[i] == {JACOBI_FRICTION} && global_iter < friction_start_iteration) value = 0.0f;",
+    ]
+    if rows.drive:
+        update = [f"if (s_kind[i] == {JACOBI_DRIVE}) {{", *("    " + line for line in drive), "} else {"]
+        update += [*("    " + line for line in step), "}"]
+    else:
+        update = step
+    lines = [
+        "float x_new = 0.0f, x_old = 0.0f;",
+        "{",
+        "    const int i = lane;",
+        f"    if (i < {rows.rows}) {{",
+        "        const float xi = s_x[i];",
+        "        x_old = xi;",
+        "        float value = xi;",
+        "        if (s_kind[i] >= 0) {",
+        op.jacobi_residual("r", "            "),
+        *("            " + line for line in update),
+        "        }",
+        "        x_new = value;",
+        "    }",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
+    """Project each friction row's update radially onto its pair's disk of radius ``mu`` times the normal load.
+
+    The load is the pair's normal's fresh impulse (``pooled``: the sum over its patch ring of normals, in ring order
+    from its own). One warp exchanges the fresh updates by shuffle (a pooled load reads the ring's staged ones, and
+    the warp synchronizes before the impulses are stored again); several warps stage them in ``s_x``. The pair's
+    tangents project together, each on its own lane.
+    """
+    F, n = JACOBI_FRICTION, rows.rows
+    disk = "radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2({first}, {second}), radius)[0]"
+    if rows.threads == 32:
+        load = "xp"
+        lines = [
+            "{",
+            "    const int i = lane;",
+            f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
+            "    const int p = fr ? s_parent[i] : i;",
+            "    const int sib = fr ? ((i == p + 1) ? p + 2 : p + 1) : i;",
+        ]
+        if pooled:
+            lines += [
+                "    const float xs = READ(x_new, sib & 31);",
+                f"    if (i < {n}) s_x[i] = x_new;",
+                "    WARP_SYNC();",
+                "    if (fr) {",
+                indent(f"const float load = {rows.ring_load('p')};", "        "),
+            ]
+            load = "load"
+        else:
+            lines += [
+                "    const float xp = READ(x_new, p & 31);",
+                "    const float xs = READ(x_new, sib & 31);",
+                "    if (fr) {",
+            ]
+        lines += [
+            f"        const float radius = fmaxf(s_mu[i] * {load}, 0.0f);",
+            f"        x_new = {disk.format(first='x_new', second='xs')};",
+            "    }",
+            "    WARP_SYNC();" if pooled else "",
+            "}",
+        ]
+        return indent("\n".join(line for line in lines if line), pad)
+    load = "s_x[p]"
+    ring = []
+    if pooled:
+        ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")]
+        load = "load"
+    lines = [
+        "SYNC();",
+        f"if (lane < {n}) s_x[lane] = x_new;",
+        "SYNC();",
+        "{",
+        "    const int i = lane;",
+        f"    if (i < {n} && s_kind[i] == {F}) {{",
+        "        const int p = s_parent[i];",
+        "        const int sib = (i == p + 1) ? p + 2 : p + 1;",
+        *ring,
+        f"        const float radius = fmaxf(s_mu[i] * {load}, 0.0f);",
+        f"        x_new = {disk.format(first='s_x[i]', second='s_x[sib]')};",
+        "    }",
+        "}",
+        "SYNC();",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def _jacobi_momentum(rows: JacobiRows, *, momentum: bool, pad: str) -> str:
+    """Nesterov's extrapolation factor ``beta`` with adaptive restart: the momentum restarts (``t_k = 1``) when the
+    last step points against it, ``(y - x_new) . (x_new - x_old) > 0`` summed over the rows (per warp, then over the
+    warps in order). Without ``momentum`` ``beta`` is zero."""
+    if not momentum:
+        return f"{pad}const float beta = 0.0f;"
+    lines = [
+        "float dot_local = 0.0f;",
+        f"if (lane < {rows.rows}) dot_local = (s_y[lane] - x_new) * (x_new - x_old);",
+        "float dot = dot_local;",
+        "SUM(dot);",
+    ]
+    if rows.threads > 32:
+        lines += [
+            "if ((lane & 31) == 0) s_dot[lane >> 5] = dot;",
+            "SYNC();",
+            "dot = 0.0f;",
+            "#pragma unroll",
+            f"for (int wv = 0; wv < {rows.threads // 32}; ++wv) dot += s_dot[wv];",
+        ]
+    lines += [
+        "if (dot > 0.0f) t_k = 1.0f;",
+        "const float t_next = 0.5f * (1.0f + sqrtf(1.0f + 4.0f * t_k * t_k));",
+        "const float beta = (t_k - 1.0f) / t_next;",
+        "t_k = t_next;",
+    ]
+    if rows.threads > 32:
+        lines.append("SYNC();")
+    return indent("\n".join(lines), pad)
+
+
+def jacobi_sweeps(
+    rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, momentum: bool, pooled: bool, pad: str = "    "
+) -> str:
+    """The Jacobi sweeps of a world's rows over the response operator ``op`` (its Jacobi actions), at most ``sweeps``.
+
+    Both tangents of a friction pair first take one step (:func:`isotropic_pair_step`). Each sweep, every admitted
+    row steps at once from the extrapolated impulses ``y``: its residual ``r = b' + (A y)_i``
+    (:meth:`~.ResponseOperator.jacobi_residual`, after the operator's :meth:`~.ResponseOperator.gather`), then
+    ``y_i - s_step_i r`` clamped at zero for a unilateral row, zero for a friction row while friction is delayed, or
+    the PhysX drive law on ``y_i`` and the row's ``J v = r - rhs``. Each friction row is then projected radially onto
+    its pair's disk (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
+    momentum and adaptive restart (``momentum``), each row votes its change against the laws' Jacobi tolerance, and
+    the sweep ends under the laws' policy (:func:`end_sweep`). Uncounted: the policy is the exact law's.
+    """
+    if laws.jacobi_tolerance is None:
+        raise ValueError("the Jacobi sweeps vote against the laws' jacobi_tolerance")
+    if not laws.policy.exact or laws.policy.counts:
+        raise SolvePolicyUnsupported("the Jacobi sweeps run under the exact law without readout")
+    inner = pad + "    "
+    # The exact law reads no scale; a velocity-scaled policy would need the row's A_ii, which the rows do not keep.
+    term = (("x_new - x_old", "A_ii", "s_kind[i]"),)
+    lines = [
+        rows.freeze(pad) if rows.formed else "",
+        isotropic_pair_step(rows, pad),
+        f"{pad}float t_k = 1.0f;" if momentum else "",
+        f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
+        f"{inner}const int global_iter = iteration_offset + sweep;",
+        op.gather(inner),
+        _jacobi_step(rows, op, inner),
+        f"{inner}int iteration_changed = 0;",
+        _jacobi_projection(rows, pooled=pooled, pad=inner),
+        _jacobi_momentum(rows, momentum=momentum, pad=inner),
+        f"{inner}{{",
+        f"{inner}    const int i = lane;",
+        f"{inner}    if (i < {rows.rows}) {{",
+        f"{inner}        s_x[i] = x_new;",
+        f"{inner}        s_y[i] = x_new + beta * (x_new - x_old);",
+        change_vote(laws, term, inner + "        ", new="x_new"),
+        f"{inner}    }}",
+        f"{inner}}}",
+        f"{inner}SYNC();",
+        end_sweep(laws.policy, iteration="sweep", block=rows.threads > 32).rstrip("\n"),
+        f"{pad}}}",
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def jacobi_limit_pass(rows: JacobiRows, op, laws: RowLaws, *, pad: str = "    ") -> str:
+    """The last word of the joint velocity-limit rows after the final Jacobi sweep, on the first warp, in row order.
+
+    With ``r_i = b'_i + (A x)_i``, the residual the sweeps use, a violated admitted row (``r_i < 0``) is pushed onto
+    its limit, ``x_i += -r_i / A_ii`` (the stateless law's correction added to the row's accumulated impulse,
+    :func:`.projection_laws.velocity_limit_update`). The pass only pushes: it changes nothing at the sweeps' fixed
+    point, where no row is violated, and gives the limits the last word of a world stopped early, as the
+    Gauss-Seidel sweeps' end pass does. The operator forms ``(A x)_i`` (:meth:`~.ResponseOperator.push_velocity`,
+    on ``w = Y^T x`` where it keeps one, following each push).
+    """
+    if not rows.limits or not laws.accumulated:
+        raise ValueError("the last word pushes the accumulated velocity-limit rows the rows stage")
+    warp = Lanes(32)
+    body = "            "
+    lines = [
+        "{",
+        "    SYNC();",
+        op.push_prologue("    "),
+        "    if (lane < 32) {",
+        f"        for (int i = 0; i < {rows.rows}; ++i) {{",
+        f"            if (s_kind[i] != {JACOBI_UNILATERAL} || s_vlim[i] == 0) continue;",
+        op.push_velocity("part", warp, body),
+        "            const float r_vlim = s_rhs[i] + part;",
+        f"            const float diag_vlim = {op.push_diagonal()};",
+        "            const float delta_vlim = diag_vlim > 0.0f",
+        "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim, r_vlim / diag_vlim, 0).v1 : 0.0f;",
+        "            if (delta_vlim != 0.0f) {",
+        "                if (lane == 0) s_x[i] += delta_vlim;",
+        op.push_apply("delta_vlim", warp, body + "    "),
+        "            }",
+        "            WARP_SYNC();",
+        "        }",
+        "    }",
+        "    SYNC();",
+        "}",
+    ]
+    return indent("\n".join(line for line in lines if line), pad)
