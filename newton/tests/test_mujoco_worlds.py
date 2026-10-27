@@ -2491,10 +2491,7 @@ class PopulationRecorderTests(unittest.TestCase):
                 validate = Mock(side_effect=[None, None, ValueError("prepared descriptors changed")])
                 poses = Mock()
                 with (
-                    patch.dict(
-                        sys.modules,
-                        {"mujoco_warp": SimpleNamespace(step=Mock(), kinematics=poses)},
-                    ),
+                    patch_sys_module("mujoco_warp", SimpleNamespace(step=Mock(), kinematics=poses)),
                     patch.object(native, "_validate_population", validate),
                     patch.object(native.wp, "capture_if", side_effect=lambda condition, on_true: on_true()),
                 ):
@@ -2615,14 +2612,8 @@ class PopulationRecorderTests(unittest.TestCase):
 
         with (
             patch.object(native, "_validate_population"),
-            patch.dict(
-                sys.modules,
-                {
-                    "mujoco_warp": SimpleNamespace(
-                        step=step,
-                        kinematics=lambda *args, **kwargs: calls.append("poses"),
-                    )
-                },
+            patch_sys_module(
+                "mujoco_warp", SimpleNamespace(step=step, kinematics=lambda *args, **kwargs: calls.append("poses"))
             ),
         ):
             with patch.object(self.native.wp, "capture_if", side_effect=lambda step_condition, on_true: on_true()):
