@@ -6103,14 +6103,11 @@ class SolverFeatherPGS(SolverBase):
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
         # they fork after response preparation and join before publication.
+        # Components are admitted on CUDA without gradients, under the factor-coordinate sweep's plain policy.
         paired_overlap = bool(
             self._paired_components is not None
             and self.use_parallel_streams
-            and model.device.is_cuda
-            and not model.requires_grad
             and self._paired_factor_solve_kernel is not None
-            and not self.pgs_debug
-            and not self._mf_warmstart_enabled
             and not getattr(self, "_mf_gs_tiers", ())
             and not _FPGS_SYNC_TIMINGS
         )

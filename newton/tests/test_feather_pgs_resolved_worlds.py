@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.step_plan import AdmissionFacts
 from newton.tests.feather_pgs_law_harness import contact_input
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
@@ -398,7 +399,10 @@ class TestResolvedWorlds(unittest.TestCase):
 
     def test_unsupported_constructor_has_empty_mask(self):
         """Keep unsupported solvers disabled without raising or launching."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=wp.get_device("cpu")))
+        facts = AdmissionFacts(
+            forward_cuda=False, matrix_free=False, plain_sweep=True, regularized=False, velocity_limits=False
+        )
+        solver = SimpleNamespace(model=SimpleNamespace(device=wp.get_device("cpu")), _facts=facts)
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)
         self.assertEqual(classifier.resolved.shape, (0,))
@@ -581,10 +585,9 @@ class TestResolvedWorlds(unittest.TestCase):
 def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     solver = SimpleNamespace(
-        pgs_mode="matrix_free",
-        drive_mode="augmented",
-        pgs_schedule="interleaved",
-        pgs_velocity_iterations=0,
+        _facts=AdmissionFacts(
+            forward_cuda=True, matrix_free=True, plain_sweep=True, regularized=False, velocity_limits=False
+        ),
         _mimic_count=0,
         _connect_count=0,
         _preelim_count=0,
@@ -602,17 +605,11 @@ def _admissible_solver():
         _joint_limit_q_index=1,
     )
     for name in (
-        "pgs_warmstart",
-        "_mf_warmstart_enabled",
-        "_preelim_active",
-        "_regularization_enabled",
         "enable_bilateral_preelimination",
-        "enable_joint_velocity_limits",
         "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
         "_compact_contact_boundary",
-        "pgs_debug",
         "_row_watermark",
     ):
         setattr(solver, name, False)

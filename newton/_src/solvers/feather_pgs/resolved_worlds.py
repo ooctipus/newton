@@ -657,11 +657,8 @@ def decline(solver) -> str | None:
     connect, drives, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
+    facts = solver._facts
     exact = {
-        "pgs_mode": "matrix_free",
-        "drive_mode": "augmented",
-        "pgs_schedule": "interleaved",
-        "pgs_velocity_iterations": 0,
         "_mimic_count": 0,
         "_connect_count": 0,
         "_preelim_count": 0,
@@ -670,17 +667,11 @@ def decline(solver) -> str | None:
         "drive_slot": None,
     }
     false = (
-        "pgs_warmstart",
-        "_mf_warmstart_enabled",
-        "_preelim_active",
-        "_regularization_enabled",
         "enable_bilateral_preelimination",
-        "enable_joint_velocity_limits",
         "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
         "_compact_contact_boundary",
-        "pgs_debug",
         "_row_watermark",
     )
     required = (
@@ -698,7 +689,7 @@ def decline(solver) -> str | None:
                 "FEATHER_PGS_RESOLVED_WORLDS disables the classifier.",
             ),
             (
-                getattr(solver, "pgs_mode", None) == "matrix_free" and solver.model.device.is_cuda,
+                facts.matrix_free and solver.model.device.is_cuda,
                 "The classifier evaluates the CUDA matrix-free route only.",
             ),
             (
@@ -707,10 +698,13 @@ def decline(solver) -> str | None:
             ),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
-                all(getattr(solver, name, object()) == value for name, value in exact.items())
+                facts.forward_cuda
+                and facts.plain_sweep
+                and not facts.regularized
+                and not facts.velocity_limits
+                and all(getattr(solver, name, object()) == value for name, value in exact.items())
                 and all(getattr(solver, name, None) is False for name in false)
                 and law
-                and not getattr(solver.model, "requires_grad", True)
                 and (getattr(solver, "max_world_dofs", 33) or 33) <= 32
                 and all(getattr(solver, name, None) is not None for name in required),
                 "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "

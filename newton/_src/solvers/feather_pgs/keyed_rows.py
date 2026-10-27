@@ -532,23 +532,19 @@ def create_owner(solver):
     """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
     from . import solver_feather_pgs as source  # noqa: PLC0415
 
+    facts = solver._facts
     supported = (
-        solver.model.device.is_cuda
-        and not solver.model.requires_grad
-        and solver.pgs_mode == "matrix_free"
-        and solver.drive_mode == "augmented"
-        and solver.pgs_schedule == "interleaved"
+        facts.forward_cuda
+        and facts.matrix_free
+        and facts.plain_sweep
+        and not facts.regularized
         and solver.enable_joint_limits
         and 0 < solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
         and solver.pgs_iterations > 0
-        and solver.pgs_velocity_iterations == 0
-        and not solver.pgs_warmstart
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
         and not solver.fuse_joint_velocity_limits
-        and not solver._regularization_enabled
-        and not solver._preelim_active
         and not solver._paired_factor_coordinates
         and not solver._has_loop_joints
         and not solver._fused_diagonal_joint_limits
@@ -556,8 +552,6 @@ def create_owner(solver):
         and not solver._sparse_diagonal_contact_solve
         and not solver._mimic_count
         and not solver._connect_count
-        and solver._contact_w == 1.0
-        and not solver._debug_buffers_enabled
         and source._INK_ON
     )
     if not supported:
