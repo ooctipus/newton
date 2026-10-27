@@ -308,6 +308,9 @@ class Example:
         default_contacts = 768 if args.scene == "cube" else contacts_per_object * self.object_count + 128
         self.contact_capacity = args.contacts_per_world or default_contacts
         self.triangle_pair_capacity = args.triangle_pairs_per_world or (131072 if args.scene == "hardware" else 65536)
+        # FeatherPGS solves separated rows as speculative contacts, so velocity-adapted gaps give a falling part
+        # its row before it reaches the part below; the 0.3 mm gap alone is a fraction of a substep's travel at
+        # impact speeds, and parts landing deeper than a thin feature's half thickness wedge.
         self.pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="sap",
@@ -316,6 +319,9 @@ class Example:
                 body_pair_cell_size=0.04,
                 body_pair_hysteresis=0.0,
                 body_pair_verify=args.test,
+            ),
+            speculative_config=(
+                newton.CollisionPipeline.SpeculativeContactConfig() if args.solver == "fpgs" else None
             ),
             rigid_contact_max=self.contact_capacity * args.world_count,
             max_triangle_pairs=self.triangle_pair_capacity * args.world_count,
@@ -361,7 +367,7 @@ class Example:
         self.viewer.set_camera(wp.vec3(1.23, -1.55, 1.10), pitch=-26.3, yaw=121.8)
         self.graph = None
         if self.body_pair_reduction:
-            self.pipeline.collide(self.state_0, self.contacts)
+            self.pipeline.collide(self.state_0, self.contacts, dt=self.sim_dt)
         # Even substep counts leave the same state buffer at frame boundaries.
         if args.cuda_graph and self.model.device.is_cuda and self.sim_substeps % 2 == 0:
             with wp.ScopedCapture(device=self.model.device) as capture:
@@ -371,7 +377,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.pipeline.collide(self.state_0, self.contacts)
+            self.pipeline.collide(self.state_0, self.contacts, dt=self.sim_dt)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
