@@ -1,0 +1,1 @@
+Make deterministic speculative mesh-SDF contacts repeat run to run: a predictive candidate the regular export did not buffer now stores the normal the regular export stores for it, not a renormalized copy, so the reduction's winner carries the same data whichever export buffered it (`CollisionPipeline(deterministic=True)` with `SpeculativeContactConfig`).

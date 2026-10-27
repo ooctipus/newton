@@ -1848,7 +1848,9 @@ def export_and_reduce_predictive_contact(
         shape_a: First shape index.
         shape_b: Second shape index.
         position: Contact midpoint in world space [m].
-        normal: Contact normal from the first shape to the second.
+        normal: Contact normal from the first shape to the second. A record this call buffers stores it as given,
+            the bits the regular export stores for the same candidate (:func:`export_contact_to_buffer`): which of
+            the two buffers a candidate depends on the slot races, so its data must not.
         depth: Centerline contact distance [m].
         surface_offset_sum: Combined collision margins [m].
         radius_eff_a: Effective radius of the first shape [m].
@@ -1941,7 +1943,7 @@ def export_and_reduce_predictive_contact(
     if not clearance_won and not impact_time_won:
         return -1
 
-    contact_id = export_contact_to_buffer(shape_a, shape_b, position, contact_normal, depth, fingerprint, reducer_data)
+    contact_id = export_contact_to_buffer(shape_a, shape_b, position, normal, depth, fingerprint, reducer_data)
     if contact_id < 0:
         if clearance_won:
             reduction_rollback_slot(
