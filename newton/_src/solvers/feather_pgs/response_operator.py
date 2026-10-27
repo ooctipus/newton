@@ -473,6 +473,11 @@ class ResponseOperator:
         """``float out = J_i Y_s``: the pair's off-diagonal entry."""
         raise self._lacks("pair coupling")
 
+    def pair_entries(self, sibling: str, indent: str) -> str:
+        """Declare what a friction pair's terms and its second tangent's apply read of the sibling ``sibling``, once,
+        before the pair's disk: nothing by default (:meth:`pair_terms` and :meth:`apply_row` read their own)."""
+        return ""
+
     def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
         """Declare a friction pair's ``sibling_residual`` (``J_s v + rhs_s``) and ``cross`` (``J_i Y_s``).
 
@@ -1939,6 +1944,49 @@ class SparsePairJY(ResponseOperator):
             + f"\n{indent}{self.lanes.reduce(out)}"
         )
 
+    def pair_entries(self, sibling: str, indent: str) -> str:
+        """Load the sibling's entries once for the pair's terms and its apply: one thread's slot entry (``sib_entry``,
+        its ``J`` and ``Y``); a lane's coordinate, ``J`` and ``Y`` of the sibling, and the sibling's ``Y`` on the
+        lane's own coordinate (``sib_response_here``: a sparse slot's when the sibling carries that coordinate)."""
+        if not self.lanes.parallel:
+            return (
+                f"{self._slot(sibling, 'sib_entry', indent)}\n"
+                f"{indent}const float sib_jacobian = {self.sparse_jy}.data[sib_entry];\n"
+                f"{indent}const float sib_response = {self.sparse_jy}.data[sib_entry + 1];"
+            )
+        lane, P = self.lanes.lane, self.dofs
+        lines = [
+            self._entries(sibling, "sib_coord", "sib_jacobian", "sib_response", ""),
+            "float sib_response_here = sib_response;",
+            f"if ({lane} >= {P} && {lane} <= {P + 1}) {{",
+            f"    const int sib_row = {self.base} + {sibling};",
+            "    sib_response_here = 0.0f;",
+            f"    if (coord >= 0 && coord == {self.sparse_dof}.data[sib_row * 2])",
+            f"        sib_response_here = {self.sparse_jy}.data[sib_row * 4 + 1];",
+            f"    else if (coord >= 0 && coord == {self.sparse_dof}.data[sib_row * 2 + 1])",
+            f"        sib_response_here = {self.sparse_jy}.data[sib_row * 4 + 3];",
+            "}",
+        ]
+        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
+
+    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
+        """The pair's terms from the sibling's entries (:meth:`pair_entries`): one thread's two products, a lane's
+        two products reduced in one ladder."""
+        if own:
+            return super().pair_terms(row, sibling, rhs, indent, own=own)
+        if not self.lanes.parallel:
+            return (
+                f"{indent}float sibling_residual = __fmul_rn(sib_jacobian, {self.velocity.at(self.coordinate)});\n"
+                f"{indent}sibling_residual += {rhs(sibling)};\n"
+                f"{indent}float cross = jacobian * sib_response;"
+            )
+        return (
+            f"{indent}float sibling_residual = sib_coord >= 0 ? sib_jacobian * {self.velocity.at('sib_coord')} : 0.0f;\n"
+            f"{indent}float cross = coord >= 0 ? jacobian * sib_response_here : 0.0f;\n"
+            f"{indent}{self.lanes.reduce('sibling_residual', 'cross')}\n"
+            f"{indent}sibling_residual += {rhs(sibling)};"
+        )
+
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
         """``float out = J_i Y_s`` of the visited row ``row``: each lane's ``J`` times the sibling's ``Y`` at its
         coordinate (a sparse slot's, when the sibling carries that coordinate), reduced."""
@@ -1973,7 +2021,12 @@ class SparsePairJY(ResponseOperator):
         return f"\n{indent}if (coord >= 0) {self.velocity.at('coord')} += response * {delta};"
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``v += Y_row delta`` for a row outside the visit."""
+        """``v += Y_row delta`` for a row outside the visit; the pair's sibling ``sib`` from its kept entries
+        (:meth:`pair_entries`)."""
+        if row == "sib":
+            if not self.lanes.parallel:
+                return f"\n{indent}{self.velocity.at(self.coordinate)} += sib_response * {delta};"
+            return f"\n{indent}if (sib_coord >= 0) {self.velocity.at('sib_coord')} += sib_response * {delta};"
         if not self.lanes.parallel:
             return (
                 f"\n{self._slot(row, 'apply_entry', indent)}\n"

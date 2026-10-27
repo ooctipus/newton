@@ -92,6 +92,26 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         self.assertNotIn("independent_group_count", plain)
         # Independent contacts: one product rounded alone, as the warp's sum of it rounds.
         self.assertIn("float jv = __fmul_rn(jacobian, s_v[scalar_coord]);", triples)
+        # A chain visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
+        # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
+        # only when it owns an anchor.
+        for text in (triples, units):
+            self.assertRegex(text, r"const int i = head;\s+const int row_type = 0;")
+            self.assertRegex(text, r"const int i = head \+ 1;\s+const int row_type = 2;")
+            self.assertIn("parent = head;", text)
+            self.assertRegex(
+                text,
+                r"friction_gate\(2, global_iter, friction_start_iteration\)\) \{\s+s_lam_dense\[head \+ 2\] = 0\.0f;",
+            )
+            self.assertNotIn("pair_visits", text)
+        self.assertIn("if (head + 2 < row_count", units)
+        self.assertNotIn("if (head + 2 < row_count", triples)
+        # A pair loads its sibling's entries once and reduces its two terms in one ladder; its apply reuses them.
+        for text in (triples, units):
+            self.assertEqual(text.count("SUM(sibling_residual, cross);"), 1)
+            self.assertEqual(text.count("const float sib_response = sparse_row_jy.data[sib_entry + 1];"), 1)
+            self.assertIn("s_v[scalar_coord] += sib_response * sib_delta;", text)
+            self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_response * sib_delta;", text)
 
     def test_tiled_row_stagings(self):
         for rows, staging in itertools.product((32, 64, 128), ("shared", "global")):

@@ -39,6 +39,7 @@ from .sweep import (
     WorldRows,
     change_vote,
     end_sweep,
+    friction_gate,
     indent,
     row_visit,
     speed_row,
@@ -185,9 +186,11 @@ def sparse_diagonal_source(
     rows = WorldRows(M, lanes=warp)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
 
-    def visit(lanes: Lanes, pad: str) -> str:
+    def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
         """Row ``i``'s visit in a layout: the warp's (every lane stores, the warp synchronizes after the apply) or one
-        thread's (an independent scalar contact on ``scalar_coord``)."""
+        thread's (an independent scalar contact on ``scalar_coord``). A ``kind`` (and a friction row's ``parent``)
+        known where the visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a
+        known kind other than friction admits no pair."""
         diagonal = lambda row: "denom" if row == "i" else rows.diag(row)  # noqa: E731
         op = SparsePairJY(P, M, lanes, diagonal=diagonal)
         ctx = RowContext(
@@ -203,12 +206,15 @@ def sparse_diagonal_source(
             ring_load=rows.ring_load,
             lanes=lanes,
             inline_velocity_limit=False,
-            owned=not lanes.parallel,
+            # Every lane (or the one thread) stores what it computed; a pair finishes its second tangent in its branch,
+            # on the entries it kept (SparsePairJY.pair_entries).
+            owned=False,
+            friction=kind in (None, FRICTION),
         )
-        return f"{pad}const int row_type = {rows.kind('i')};\n" + row_visit(
+        return f"{pad}const int row_type = {rows.kind('i') if kind is None else kind};\n" + row_visit(
             ctx,
             laws,
-            parent=rows.parent("i"),
+            parent=rows.parent("i") if parent is None else parent,
             check="denom",
             declare=f"const float denom = {rows.diag('i')};",
             entries=op.consume("i", ""),
@@ -238,30 +244,38 @@ def sparse_diagonal_source(
             "            }"
         )
 
-    # Independent scalar chains: one lane per chain, its contacts' rows in chain order. Schedule construction excludes
-    # every coordinate a coupled row touches, so they commute with the coupled rows. A contact's normal links the
-    # chain's next contact through its free slot (-2 ends the chain).
+    # Independent scalar chains: one lane per chain, its contacts in chain order. Schedule construction excludes every
+    # coordinate a coupled row touches, so they commute with the coupled rows. A contact's normal links the chain's
+    # next contact through its free slot (-2 ends the chain). A contact is a normal row and, for a triple or a unit
+    # that owns an anchor, the tangent pair after it, which names the normal as parent: the visits' kinds are known
+    # here, so each compiles to its own law. The pair is solved at its first tangent; the second tangent is only
+    # zeroed while friction is delayed. A visit that skips its row leaves its block (do-while), not the chain.
     independent_phase = ""
     if scheduled:
-        unit_rows = f"{owns_tangents('i', ' ' * 28)} ? 3 : 1" if contact_units else "3"
+        pad = " " * 16
+        tangents = f"""{pad}do {{
+{pad}    const int i = head + 1;
+{visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
+{pad}}} while (false);
+{friction_gate(str(FRICTION), f"{rows.peek('head + 2')} = 0.0f;", "", pad, skip=False)}"""
+        if contact_units:
+            tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         independent_phase = f"""
         const int independent_group_count = sparse_contact_group_count.data[world];
         for (int group = lane; group < independent_group_count; group += 32) {{
             int next_normal = sparse_contact_group_heads.data[world * {D} + group];
-            int scalar_coord = -1;
-            int unit_end = 0;
-            for (int i = 0;; ++i) {{
-                if (i >= unit_end) {{
-                    if (next_normal < 0) break;
-                    i = next_normal;
-                    const int normal_coord_0 = sparse_row_dof.data[(row_base + i) * 2];
-                    const int normal_coord_1 = sparse_row_dof.data[(row_base + i) * 2 + 1];
-                    scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
-                    const int link = normal_coord_0 < -1 ? normal_coord_0 : normal_coord_1;
-                    next_normal = link == -2 ? -1 : -link - 3;
-                    unit_end = i + ({unit_rows});
-                }}
-{visit(Lanes(1), "                ")}
+            while (next_normal >= 0) {{
+                const int head = next_normal;
+                const int normal_coord_0 = sparse_row_dof.data[(row_base + head) * 2];
+                const int normal_coord_1 = sparse_row_dof.data[(row_base + head) * 2 + 1];
+                const int scalar_coord = normal_coord_0 >= 0 ? normal_coord_0 : normal_coord_1;
+                const int link = normal_coord_0 < -1 ? normal_coord_0 : normal_coord_1;
+                next_normal = link == -2 ? -1 : -link - 3;
+                do {{
+                    const int i = head;
+{visit(Lanes(1), pad + "    ", kind=CONTACT)}
+                }} while (false);
+{tangents}
             }}
         }}
         SYNC();

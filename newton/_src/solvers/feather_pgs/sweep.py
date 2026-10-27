@@ -535,6 +535,7 @@ def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
     lines = [
         f"sib = {ctx.parent} + 2;",
         f"const float sibling_impulse = {ctx.load('sib')};",
+        op.pair_entries("sib", ""),
         "wp::vec2 pair(0.0f);",
         "// Zero load gives a zero disk; avoid unused tangent reductions.",
         "if (radius > 0.0f) {",
