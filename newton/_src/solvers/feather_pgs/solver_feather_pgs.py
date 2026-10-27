@@ -10205,6 +10205,14 @@ class SolverFeatherPGS(SolverBase):
         self.C.zero_()
         self.diag.zero_()
 
+    def _response_targets(self, size: int) -> tuple:
+        """The world-layout J and Y a size's response writes (its group buffers where none is allocated) and the
+        DOF offsets it writes them at."""
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        offsets = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        return J_world, Y_world, offsets
+
     def _stage4_response(self, size: int) -> None:
         """Build one size's contact response along the plan's stage-4 route (none where an owner publishes it)."""
         route = self._plan.response[size].name
@@ -10235,9 +10243,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_grouped(self, size: int) -> None:
         """The grouped response solve (grouped dynamics), a warp per articulation; verified up to 32 DOFs."""
         n_arts = self.n_arts_by_size[size]
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        J_world, Y_world, world_dof_offset = self._response_targets(size)
         diag_out = self.diag_by_size[size] if size in self._hinv_jt_diag_sizes else self._grouped_dummy_diag
         wpb = 4
         wp.launch_tiled(
@@ -10267,9 +10273,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        J_world, Y_world, world_dof_offset = self._response_targets(size)
         outputs = [self.Y_by_size[size], J_world, Y_world]
         if size in self._hinv_jt_diag_sizes:
             outputs.append(self.diag_by_size[size])
@@ -10292,9 +10296,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_diagonal(self, size: int) -> None:
         """Apply diagonal generalized inertia to the active response rows."""
         n_arts = self.n_arts_by_size[size]
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        J_world, Y_world, world_dof_offset = self._response_targets(size)
         wp.launch(
             response_builds_dense.response_diagonal_kernel(),
             dim=n_arts * self.dense_max_constraints,
@@ -10637,9 +10639,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_lanes(self, size: int) -> None:
         """The response a warp per articulation, skipping the worlds the local owners solve (route ``lanes``)."""
         n_arts = self.n_arts_by_size[size]
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        J_world, Y_world, world_dof_offset = self._response_targets(size)
         wp.launch(
             response_builds_dense.response_lanes_kernel(),
             dim=n_arts * 32,
@@ -10665,9 +10665,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_rows(self, size: int) -> None:
         """The response a thread per row (route ``rows``)."""
         n_arts = self.n_arts_by_size[size]
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        J_world, Y_world, world_dof_offset = self._response_targets(size)
         wp.launch(
             response_builds_dense.response_rows_kernel(),
             dim=n_arts * self.dense_max_constraints,
