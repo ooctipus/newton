@@ -386,6 +386,18 @@ def _write_linear_body(
     body_f_s[body] = -wp.spatial_vector(force, wp.cross(com, force))
 
 
+@wp.kernel(module="unique")
+def _direct_branch_tau(
+    group_to_art: wp.array[int], dof_joint_offset: wp.array[int], n_dofs: int, d: tree_passes.DynamicsData
+):
+    """The linear-state oracle's joint forces of one-body branches, one thread per coordinate: each body bears
+    only its own wrench (the serial pass's law for a leaf)."""
+    element = wp.tid()
+    group = element // n_dofs
+    joint = d.articulation_start[group_to_art[group]] + dof_joint_offset[element - group * n_dofs]
+    tree_passes.generalized_force(joint, tree_passes.net_wrench(joint, wp.spatial_vector(), d), d)
+
+
 @wp.kernel(enable_backward=False)
 def _repair_linear_state(
     body_joint: wp.array[int],
@@ -614,7 +626,7 @@ class _PrismaticRoute:
         )
         count = self.group.shape[0] * size
         wp.launch(
-            tree_passes.direct_branch_tau,
+            _direct_branch_tau,
             dim=count,
             inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
             device=self.device,
@@ -765,7 +777,7 @@ class _OrdinaryRoute:
             device=self.device,
         )
         wp.launch(
-            tree_passes.direct_branch_tau,
+            _direct_branch_tau,
             dim=count,
             inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
             device=self.device,

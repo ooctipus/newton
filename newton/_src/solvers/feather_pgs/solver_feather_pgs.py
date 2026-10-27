@@ -268,13 +268,11 @@ from .tree_passes import (
     composite_inertia_lanes,
     crba_fill,
     diagonal_inverse_mass,
-    direct_branch_tau,
     fk_id,
     fk_kinematics,
     inverse_dynamics_tau,
     publish_body_dynamics,
     refresh_body_inertia,
-    selected_inverse_dynamics_tau,
 )
 from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
@@ -2368,23 +2366,6 @@ class SolverFeatherPGS(SolverBase):
             if self._sparse_diagonal_contact_solve and self._parallel_augmented_drive_topology
             else None
         )
-        # One-body branches of the compact diagonal size read their bodies' own inertia records (no composite)
-        # and take their joint forces from their own wrenches, one thread per coordinate.
-        self._direct_compact_diagonal_inertia = bool(
-            self._compact_inertia_refresh and self._compact_diagonal_mass_size in self._direct_diagonal_inertia_sizes
-        )
-        self._selected_tau_articulation_count = 0
-        self._selected_tau_articulations = None
-        if self._direct_compact_diagonal_inertia:
-            composite_articulations = np.flatnonzero(
-                response_articulations & ~direct_body_inertia & (response_dof_count != self._compact_diagonal_mass_size)
-            ).astype(np.int32, copy=False)
-            self._composite_articulation_count = int(composite_articulations.size)
-            self._composite_articulations = wp.array(composite_articulations, dtype=wp.int32, device=model.device)
-            direct_tau_articulations = response_dof_count == self._compact_diagonal_mass_size
-            selected_tau_articulations = np.flatnonzero(~direct_tau_articulations).astype(np.int32, copy=False)
-            self._selected_tau_articulation_count = int(selected_tau_articulations.size)
-            self._selected_tau_articulations = wp.array(selected_tau_articulations, dtype=wp.int32, device=model.device)
         self._row_watermark = bool(row_watermark)
         self._setup_sparse_mass_matrix(model)
         if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
@@ -7884,35 +7865,11 @@ class SolverFeatherPGS(SolverBase):
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
         dynamics = self._dynamics(state_in, state_aug, control, add_existing_tau=int(add_to_existing))
-        if not self._direct_compact_diagonal_inertia:
-            wp.launch(
-                inverse_dynamics_tau,
-                dim=model.articulation_count,
-                inputs=[dynamics],
-                block_dim=SERIAL_BLOCK_DIM,
-                device=model.device,
-            )
-            return
-
-        if self._selected_tau_articulation_count:
-            wp.launch(
-                selected_inverse_dynamics_tau,
-                dim=self._selected_tau_articulation_count,
-                inputs=[self._selected_tau_articulations, dynamics],
-                block_dim=SERIAL_BLOCK_DIM,
-                device=model.device,
-            )
-        direct_size = self._compact_diagonal_mass_size
         wp.launch(
-            direct_branch_tau,
-            dim=self.n_arts_by_size[direct_size] * direct_size,
-            inputs=[
-                self.group_to_art[direct_size],
-                self._crba_dof_joint_offset_by_size[direct_size],
-                direct_size,
-                dynamics,
-            ],
-            block_dim=256,
+            inverse_dynamics_tau,
+            dim=model.articulation_count,
+            inputs=[dynamics],
+            block_dim=SERIAL_BLOCK_DIM,
             device=model.device,
         )
 
@@ -8097,14 +8054,12 @@ class SolverFeatherPGS(SolverBase):
                 )
                 continue
             if size == self._compact_diagonal_mass_size:
-                # One-body branches read their bodies' own records, others their composites.
-                records = self._body_inertia_terms if self._direct_compact_diagonal_inertia else self.body_I_c
                 wp.launch(
                     diagonal_inverse_mass,
                     dim=n_arts * size,
                     inputs=[
                         dynamics,
-                        records,
+                        self.body_I_c,
                         self.group_to_art[size],
                         self._crba_dof_joint_offset_by_size[size],
                         self.R_by_size[size],

@@ -252,7 +252,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 "fk_kinematics": "serial",
                 "fk_id": "serial",
                 "inverse_dynamics_tau": "serial",
-                "selected_inverse_dynamics_tau": "serial",
                 "composite_inertia": "serial",
                 "publish_body_dynamics": "mass_dynamics",
                 "refresh_body_inertia": "mass_dynamics",
@@ -566,9 +565,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(optimized._sparse_diagonal_contact_triples)
         self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
         self.assertEqual(optimized._direct_diagonal_inertia_sizes, frozenset((16,)))
-        self.assertTrue(optimized._direct_compact_diagonal_inertia)
-        self.assertEqual(optimized._composite_articulation_count, 2)
-        self.assertEqual(optimized._selected_tau_articulation_count, 2)
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
@@ -730,8 +726,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertFalse(solvers[0.01]._sparse_diagonal_contact_solve)
         self.assertFalse(solvers[0.01]._sparse_diagonal_contact_triples)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "direct compact diagonal inertia requires CUDA")
-    def test_direct_diagonal_inertia_refreshes_masked_inertial_changes(self):
+    @unittest.skipUnless(wp.is_cuda_available(), "compact diagonal inertia requires CUDA")
+    def test_compact_diagonal_inertia_refreshes_masked_inertial_changes(self):
         """Refresh the compact inertia terms when an inertial model change lands on a mass-reuse step."""
         model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)
         solver = SolverFeatherPGS(
@@ -743,7 +739,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             enable_joint_limits=True,
             update_mass_matrix_interval=4,
         )
-        self.assertTrue(solver._direct_compact_diagonal_inertia)
         self.assertEqual(solver._compact_diagonal_mass_size, 16)
 
         # Star branch joints and their child links (skip the fixed root joint of each star).
@@ -881,7 +876,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         serial = {
             tree_passes.fk_id,
             tree_passes.inverse_dynamics_tau,
-            tree_passes.selected_inverse_dynamics_tau,
             tree_passes.composite_inertia,
             feather_pgs_kernels.eval_rigid_tau_and_augmented_drives,
             feather_pgs_kernels.prepare_augmented_joint_drives,

@@ -475,13 +475,11 @@
   "tree_passes.composite_inertia": "6275c715ff320c0fbb7c2db2ce1a4073d1c2fbca9de7749bc016e0e71ad1688f",
   "tree_passes.crba_fill": "8bcde7dd1a4e9cf8823e0673fe8ee0aa348a8266900f92b02af3555929d4092f",
   "tree_passes.diagonal_inverse_mass": "432dcf4ff3eefcb548529820a57b21109eeb986c0530e4dd7bc6b29707fec28e",
-  "tree_passes.direct_branch_tau": "1778e7e6ca0942823d9319152971c8afced38e0de7530254a8e19e6ed2cf0928",
   "tree_passes.fk_id": "cee5bfdc50a4ce8a7a1a411c9b77dbf4e7454a37287a40f930c004da611e9f3b",
   "tree_passes.fk_kinematics": "1b39825a46fcdf6d156178857f259efab6bf16cc4e6ad1244935c79afe77ef68",
   "tree_passes.inverse_dynamics_tau": "f9c2fe5e86147b300a87f725c9da87a790fbdf387e08fa4178ba75f22922d492",
   "tree_passes.publish_body_dynamics": "03a2d6432e8a5dfb62b103ee36714a165892e9f4252d09226202f4b760897d78",
-  "tree_passes.refresh_body_inertia": "07edd65751869b472f2efdbd89df11367085e933d0f54e671bab5f91eb1484b6",
-  "tree_passes.selected_inverse_dynamics_tau": "02993304d32232e169290f0d8eff448c9c9d5d7ba0fa34ae7af1e36b61c911e8"
+  "tree_passes.refresh_body_inertia": "07edd65751869b472f2efdbd89df11367085e933d0f54e671bab5f91eb1484b6"
  },
  "warp": "1.17.0"
 }

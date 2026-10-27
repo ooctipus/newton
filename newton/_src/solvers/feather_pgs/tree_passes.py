@@ -66,14 +66,12 @@ __all__ = [
     "composite_inertia_lanes",
     "crba_fill",
     "diagonal_inverse_mass",
-    "direct_branch_tau",
     "fk_id",
     "fk_kinematics",
     "inverse_dynamics_tau",
     "publish_body",
     "publish_body_dynamics",
     "refresh_body_inertia",
-    "selected_inverse_dynamics_tau",
 ]
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -464,21 +462,6 @@ def articulation_tau(index: int, d: DynamicsData):
 def inverse_dynamics_tau(d: DynamicsData):
     """Every articulation's joint forces; one thread per articulation."""
     articulation_tau(wp.tid(), d)
-
-
-@wp.kernel(module=_SERIAL)
-def selected_inverse_dynamics_tau(selected: wp.array[int], d: DynamicsData):
-    """The joint forces of the listed articulations; one thread per listed articulation."""
-    articulation_tau(selected[wp.tid()], d)
-
-
-@wp.kernel(module="unique")
-def direct_branch_tau(group_to_art: wp.array[int], dof_joint_offset: wp.array[int], n_dofs: int, d: DynamicsData):
-    """The joint forces of one-body branches, one thread per coordinate: each body bears only its own wrench."""
-    element = wp.tid()
-    group = element // n_dofs
-    joint = d.articulation_start[group_to_art[group]] + dof_joint_offset[element - group * n_dofs]
-    generalized_force(joint, net_wrench(joint, wp.spatial_vector(), d), d)
 
 
 @wp.func
