@@ -2180,21 +2180,24 @@ class SolverFeatherPGS(SolverBase):
         self._build_mimic_plan(model)
         self._build_connect_plan(model)
         self._build_preelimination_plan(model)
+        # Contact torsion is decided with the other options, before the owners that exclude its appended row.
+        configure_contact_torsion(
+            self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
+        )
         # The facts the owners' admissions test, computed once (step_plan.AdmissionFacts).
         self._facts = facts = AdmissionFacts.build(self)
         self._setup_passive_joint_forces(model)
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
         self._setup_fused_diagonal_joint_limits(model)
-        # The sparse owner does not solve the appended torsion row; torsion is configured later in
-        # construction, so gate on the requested radius here.
+        # The sparse owner does not solve the appended torsion row.
         sparse_diagonal_pair = (
             None
-            if float(contact_torsion_radius) > 0.0 or self._explicit_dense_kernels
+            if self._contact_torsion_enabled or self._explicit_dense_kernels
             else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
-        if float(contact_torsion_radius) > 0.0 or self._explicit_dense_kernels:
+        if self._contact_torsion_enabled or self._explicit_dense_kernels:
             self._sparse_diagonal_reason = (
                 "Contact torsion or an explicit dense kernel choice keeps the general response."
             )
@@ -2292,8 +2295,7 @@ class SolverFeatherPGS(SolverBase):
                 (facts.plain_sweep, f"Local owners need {AdmissionFacts.PLAIN_SWEEP}."),
                 (not facts.velocity_limits, "Local owners do not solve joint velocity-limit rows."),
                 (self._local_solve_max_rows > 0, "dense_max_constraints leaves the local owners no row."),
-                # Torsion is configured later in construction, so the requested radius decides here.
-                (float(contact_torsion_radius) <= 0.0, "Local owners do not solve the appended torsion row."),
+                (not self._contact_torsion_enabled, "Local owners do not solve the appended torsion row."),
             )
         )
         local_base_supported = local_decline is None
@@ -2473,9 +2475,6 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = self._arrays.placeholder(wp.float32, (1, 1), 1.0)
-        configure_contact_torsion(
-            self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
-        )
         # Owners and consumers that neither write friction rows nor project
         # friction without the linked normal ring serve point and patch
         # friction. Producers that write their own friction rows stay
