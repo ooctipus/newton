@@ -320,16 +320,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         )
         for name in ("use_parallel_streams", "propagation_cached_response"):
             self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
-        solver = SolverFeatherPGS(
-            model,
-            angular_damping=0.1,
-            friction_anchor_beta=0.0,
-            pgs_iterations=7,
-            parallel_tree=True,
-            grouped_dynamics=True,
-            lazy_kinematics=True,
-            mf_gs_parallel_rows=48,
-        )
+        # The deprecated parallel_tree warns and selects nothing.
+        with self.assertWarnsRegex(DeprecationWarning, "parallel_tree is deprecated and has no effect"):
+            solver = SolverFeatherPGS(
+                model,
+                angular_damping=0.1,
+                friction_anchor_beta=0.0,
+                pgs_iterations=7,
+                parallel_tree=True,
+                grouped_dynamics=True,
+                lazy_kinematics=True,
+                mf_gs_parallel_rows=48,
+            )
         selected = solver.get_path_selection()
         options = selected["options"]
         self.assertEqual(
@@ -338,7 +340,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
         )
-        # CPU keeps serial traversal and ordinary dynamics: each request resolves to no owner.
+        # Each request resolves to no owner (CPU keeps ordinary dynamics).
         for name in ("parallel_tree", "grouped_dynamics", "lazy_kinematics"):
             self.assertEqual(
                 options[name], {"applied": False, "requested": True, "default": False, "source": "argument"}
