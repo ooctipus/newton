@@ -150,7 +150,7 @@ FLAGS = declare(
     _flag(
         "FEATHER_PGS_GROUPED_HINV",
         "policy",
-        _SOLVER,
+        ("step_plan",),
         "=0 keeps the tiled response solve instead of the grouped one.",
     ),
     _flag(
@@ -162,7 +162,7 @@ FLAGS = declare(
     _flag(
         "FEATHER_PGS_GROUPED_HINV_MAX",
         "policy",
-        _SOLVER,
+        ("step_plan",),
         "Largest DOF size that uses the grouped response solve (default 32).",
     ),
     _flag(

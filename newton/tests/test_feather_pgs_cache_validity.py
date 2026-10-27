@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs import (
     cached_state_binding,
     capture_joins,
     path_selection,
+    step_plan,
     tree_kinetic_owner,
     tree_kinetic_state,
 )
@@ -1751,12 +1752,12 @@ def _mass_matrices(solver):
 
 
 class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
-    def test_unread_sizes_follow_the_factor_classifier(self):
+    def test_unread_sizes_follow_the_factor_routes(self):
         """Report exactly the sizes stage 2 factors without reading a dense mass matrix, under an owner.
 
-        ``_stage2_factor`` routes a compact size and the sizes with a fused CRBA-Cholesky kernel to no
+        The step plan routes a compact size and the sizes with a fused CRBA-Cholesky kernel to no
         factorization, and a diagonal size and a tiled or loop size without its fused kernel to one
-        that reads H. ``_unread_mass_matrix_sizes`` lists the first kind.
+        that reads H. ``unread_mass_sizes`` lists the first kind.
         """
         sizes = (2, 4, 6, 18, 24, 25)
         fused_tiled = {24}
@@ -1766,7 +1767,6 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             return {size: object() for size in sizes}
 
         solver = SimpleNamespace(
-            _tree_kinetic_state=object(),
             size_groups=list(sizes),
             _compact_diagonal_mass_size=2,
             _sparse_mass_matrix_size=None,
@@ -1787,47 +1787,40 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             L_by_size=opaque(),
             group_to_art=opaque(),
         )
-        for name in ("_stage2_factor", "_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):
-            setattr(solver, name, functools.partial(getattr(SolverFeatherPGS, name), solver))
-        factors = {size: SolverFeatherPGS._stage2_factor(solver, size) for size in sizes}
+        routes = step_plan._factor(solver)
         self.assertEqual(
-            {size: None if factor is None else factor.func.__name__ for size, factor in factors.items()},
-            {
-                2: None,
-                4: "_stage2_cholesky_diagonal",
-                6: None,
-                18: "_stage2_cholesky_loop",
-                24: None,
-                25: "_stage2_cholesky_tiled",
-            },
+            {size: route.name for size, route in routes.items()},
+            {2: "none", 4: "diagonal", 6: "crba_warps", 18: "loop", 24: "crba_tiles", 25: "tiles"},
         )
-        self.assertEqual(SolverFeatherPGS._unread_mass_matrix_sizes(solver), (2, 6, 24))
+        self.assertEqual(step_plan._unread_mass_sizes(routes, held=True), (2, 6, 24))
+        self.assertEqual(step_plan._unread_mass_sizes(routes, held=False), ())
+        solver._plan = SimpleNamespace(factor=routes)
+        for name in ("_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):
+            setattr(solver, name, functools.partial(getattr(SolverFeatherPGS, name), solver))
         launched = []
 
         def record(kernel, *args, inputs=(), **kwargs):
             launched.extend(inputs)
 
         with patch.object(wp, "launch", record), patch.object(wp, "launch_tiled", record):
-            for size, factor in factors.items():
-                if factor is not None:
-                    launched.clear()
-                    factor(size)
-                    self.assertTrue(any(item is solver.H_by_size[size] for item in launched), f"size {size}")
-        solver._tree_kinetic_state = None
-        self.assertEqual(SolverFeatherPGS._unread_mass_matrix_sizes(solver), ())
+            for size, route in routes.items():
+                launched.clear()
+                SolverFeatherPGS._stage2_factor(solver, size)
+                reads = any(item is solver.H_by_size[size] for item in launched)
+                self.assertEqual(reads, route.name in step_plan.FACTOR_READS_MASS, f"size {size}")
 
-    def test_step_factors_every_size_through_the_classifier(self):
-        """Dispatch each size's stage-2 factorization in ``step`` through ``_stage2_factor``.
+    def test_step_factors_every_size_through_the_plan(self):
+        """Dispatch each size's stage-2 factorization in ``step`` through the plan's factor route.
 
-        ``_unread_mass_matrix_sizes`` reads the same classifier, so the sizes whose clear it skips
-        cannot drift from the factorizations a step runs.
+        ``unread_mass_sizes`` reads the same table, so the sizes whose clear it skips cannot drift
+        from the factorizations a step runs.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
         state_in, state_out = model.state(), model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        classify = SolverFeatherPGS._stage2_factor
-        with patch.object(SolverFeatherPGS, "_stage2_factor", autospec=True, side_effect=classify) as recorded:
+        factor = SolverFeatherPGS._stage2_factor
+        with patch.object(SolverFeatherPGS, "_stage2_factor", autospec=True, side_effect=factor) as recorded:
             solver.step(state_in, state_out, model.control(), None, DT)
         self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.size_groups))
         self.assertTrue(all(call.args[0] is solver for call in recorded.call_args_list))

@@ -106,27 +106,21 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         self.assertIn("diag_tile", diagonal_names)
 
     def test_cholesky_and_triangular_kernels_are_not_dense_constraint_gated(self):
-        init_method = self.solver_methods["_init_tiled_kernels"]
-        size_group_loop = self._find_size_group_loop(init_method)
-        first_dense_continue = self._first_dense_guard_continue_line(size_group_loop)
-
-        for helper_name in ("factor_tiles_kernel", "_get_triangular_solve_kernel"):
+        # The factor kernels (_init_tiled_kernels) and the plan's triangular-solve kernels (_build_stage_kernels)
+        # do not depend on the dense row capacity.
+        for method, helper_name in (
+            ("_init_tiled_kernels", "factor_tiles_kernel"),
+            ("_build_stage_kernels", "_get_triangular_solve_kernel"),
+        ):
             with self.subTest(helper_name=helper_name):
-                call_line = self._first_call_line(size_group_loop, helper_name)
+                node = self.solver_methods[method]
+                call_line = self._first_call_line(node, helper_name)
+                first_dense_continue = self._first_dense_guard_continue_line(node)
                 if first_dense_continue is not None:
                     self.assertLess(call_line, first_dense_continue)
-
-        dense_guarded_none_assignments = self._dense_guarded_none_assignments(size_group_loop)
-        self.assertNotIn("_cholesky_kernels_by_size", dense_guarded_none_assignments)
-        self.assertNotIn("_triangular_solve_kernels_by_size", dense_guarded_none_assignments)
-
-    @staticmethod
-    def _find_size_group_loop(function_node):
-        for node in ast.walk(function_node):
-            if isinstance(node, ast.For) and isinstance(node.iter, ast.Attribute):
-                if node.iter.attr == "size_groups":
-                    return node
-        raise AssertionError("_init_tiled_kernels does not iterate over self.size_groups")
+                dense_guarded_none_assignments = self._dense_guarded_none_assignments(node)
+                self.assertNotIn("_cholesky_kernels_by_size", dense_guarded_none_assignments)
+                self.assertNotIn("_triangular_solve_kernels_by_size", dense_guarded_none_assignments)
 
     @staticmethod
     def _references_dense_max_constraints(node):

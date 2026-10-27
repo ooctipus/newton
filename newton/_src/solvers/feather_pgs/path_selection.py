@@ -226,6 +226,8 @@ def route_selection(solver) -> dict:
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
+        # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
+        "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
         "contact_rows": _contact_rows(solver, source),
         "contact_consumers": _contact_consumers(solver),
@@ -233,13 +235,13 @@ def route_selection(solver) -> dict:
         "paired_response": _paired_response(solver),
         "sparse_diagonal": _sparse_diagonal(solver),
         "sparse_mass_matrix": _sparse_mass_matrix(solver),
-        "sweep": _sweep(solver, source),
+        "sweep": _sweep(solver),
         "resolved_worlds": _resolved_worlds(solver),
         "publication": _publication(solver),
         "velocity_limits": _velocity_limits(solver),
         "free_rigid_bodies": _free_rigid_bodies(solver),
         "friction": _friction(solver),
-        "dynamics": _dynamics(solver, source),
+        "dynamics": _dynamics(solver),
         "diagnostics": _diagnostics(solver),
     }
 
@@ -633,54 +635,10 @@ def _sparse_mass_matrix(solver) -> dict:
     return record
 
 
-def _sweep(solver, source) -> dict:
-    # Split mode sweeps assembled Delassus rows unless native sparse factors own its rows.
-    dense_split = solver.pgs_mode != "matrix_free" and not solver._sparse_split
-    if dense_split:
-        route = f"dense_{solver.pgs_kernel}"
-        reason = f"Split mode sweeps the assembled Delassus rows with the {solver.pgs_kernel} kernel."
-    elif solver._sparse_mass_matrix_size is not None:
-        route, reason = "sparse_pgs", "Native sparse factors own the sweep."
-    elif solver._sparse_diagonal_contact_solve:
-        route, reason = "sparse_diagonal", "The diagonal-mass contact owner owns the sweep."
-    else:
-        route = "matrix_free_gs"
-        reason = "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
-    # What drives the route's sweep each solve: mirrors the stage-6 branches of step(),
-    # _launch_matrix_free_position_solve and the schedule branches of _launch_matrix_free_gs_solve.
-    if dense_split and solver._has_mixed_contacts:
-        driver = "split_interleaved"
-        driver_reason = (
-            "A world holds free bodies and articulations: each iteration runs a one-iteration dense sweep, "
-            "rebuilds the velocity, runs a one-iteration matrix-free sweep and adds its velocity change to "
-            "the dense right-hand side."
-        )
-    elif dense_split and solver.pgs_debug:
-        driver = "debug_loop"
-        driver_reason = "pgs_debug launches one dense iteration per dispatch and reads the impulses back after each."
-    elif dense_split:
-        driver = "dense_split"
-        driver_reason = "One dense dispatch sweeps all iterations" + (
-            "; one matrix-free dispatch then sweeps the free-body rows." if solver._has_free_rigid_bodies else "."
-        )
-    elif solver.pgs_mode != "matrix_free":
-        driver, driver_reason = "direct", "The sparse split rows sweep once per solve."
-    elif solver.pgs_debug:
-        driver = "debug_loop"
-        driver_reason = "pgs_debug launches the position solve one iteration per dispatch with host reads."
-    elif solver.contact_compliance:
-        driver, driver_reason = (
-            "contact_compliance",
-            "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
-        )
-    elif route == "matrix_free_gs" and solver.pgs_schedule == "contact_then_internal":
-        driver = "contact_then_internal"
-        driver_reason = "Contact rows sweep all iterations in one dispatch, then internal rows in a second."
-    elif route == "matrix_free_gs" and solver.pgs_schedule == "physx_grasp":
-        driver = "physx_grasp"
-        driver_reason = "Each iteration launches the drive and limit, contact and velocity-limit row phases in turn."
-    else:
-        driver, driver_reason = "direct", "The route sweeps all iterations in one dispatch."
+def _sweep(solver) -> dict:
+    solve = solver._plan.solve
+    route, driver = solve.route.name, solve.driver.name
+    dense_split = solve.assembles_delassus
     dense = None
     if dense_split:
         if solver.pgs_kernel == "tiled_row":
@@ -700,8 +658,8 @@ def _sweep(solver, source) -> dict:
         free_body = _key(kernel)
     mf_meta_pack = None
     if solver.pgs_mode == "matrix_free":
-        # Mirrors _pack_mf_meta: only free rigid bodies produce matrix-free rows.
-        packed = bool(solver._has_free_rigid_bodies)
+        # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
+        packed = solver._pack_mf_meta_kernel is not None
         mf_meta_pack = {
             "launched": packed,
             "kernel": _key(solver._pack_mf_meta_kernel),
@@ -719,9 +677,9 @@ def _sweep(solver, source) -> dict:
         }
     record = {
         "route": route,
-        "reason": reason,
+        "reason": solve.route.reason,
         "driver": driver,
-        "driver_reason": driver_reason,
+        "driver_reason": solve.driver.reason,
         "schedule": solver.pgs_schedule,
         "iterations": int(solver.pgs_iterations),
         "velocity_iterations": int(solver.pgs_velocity_iterations),
@@ -1139,65 +1097,20 @@ def _friction(solver) -> dict:
     }
 
 
-def grouped_response(solver, size) -> bool:
-    """Whether a DOF size's stage-4 response launches the grouped H^-1 J^T kernel.
-
-    Mirrors the stage-4 dispatch of ``step()`` and the early return of ``_stage4_hinv_jt_tiled``:
-    sparse, diagonal, compact, paired and fused responses own their sizes.
-    """
-    if not solver._use_grouped_hinv_jt(size):
-        return False
-    if solver._execution_plan.use_diagonal_mass(size):
-        return False
-    if solver.pgs_mode == "matrix_free" or solver._sparse_split:
-        return not (
-            solver._compact_contact_boundary
-            or solver._sparse_mass_matrix_size is not None
-            or (solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size)
-            or size in (solver._paired_response_primary_size, solver._paired_response_secondary_size)
-        )
-    # Split mode: the fused response of one articulation per world replaces every per-size launch.
-    return not (
-        solver._is_one_solve_art_per_world
-        and bool(solver.size_groups)
-        and all(solver._execution_plan.use_fused_hinv_jt(other) for other in solver.size_groups)
-    )
-
-
-def _grouped_response_reason(solver, size, source) -> str:
-    # Follows the order of _use_grouped_hinv_jt.
-    if grouped_response(solver, size):
-        if solver._ink_skip_rows() > 0:
-            return "Grouped: the in-kernel tiers need the grouped kernel's per-world row skip."
-        return f"Grouped: sizes up to FEATHER_PGS_GROUPED_HINV_MAX={source._GROUPED_HINV_MAX} take the grouped kernel."
-    if int(size) > 32:
-        return "The grouped response solve is verified up to 32 DOFs only."
-    if solver._use_grouped_hinv_jt(size):
-        return "A sparse, diagonal, compact, paired or fused response owns this size."
-    if source._GROUPED_HINV_OFF:
-        return "FEATHER_PGS_GROUPED_HINV=0 keeps the planned response kernel."
-    if int(size) > source._GROUPED_HINV_MAX:
-        return f"Above FEATHER_PGS_GROUPED_HINV_MAX={source._GROUPED_HINV_MAX}."
-    return "Free-body sizes keep the per-row kernel, which is faster there."
-
-
-def _grouped(solver, source) -> dict | None:
+def _grouped(solver) -> dict | None:
     if not solver._grouped_response:
         return None
     return {
         "hinv_jt_by_dof": {
-            str(int(size)): {
-                "grouped": grouped_response(solver, size),
-                "reason": _grouped_response_reason(solver, size, source),
-            }
-            for size in solver.size_groups
+            str(int(size)): {"grouped": route.name == "grouped", "reason": route.reason}
+            for size, route in solver._plan.response.items()
         },
     }
 
 
-def _dynamics(solver, source) -> dict:
+def _dynamics(solver) -> dict:
     return {
-        "grouped": _grouped(solver, source),
+        "grouped": _grouped(solver),
         "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
@@ -1212,10 +1125,10 @@ def _dynamics(solver, source) -> dict:
         # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset
         # stream: empty without a double buffer, where the ordinary route's stage 1 clears H before
         # CRBA. Sizes a held-tree owner factors from its own geometry have no reader
-        # (_unread_mass_matrix_sizes).
+        # (routes.stages.unread_mass_dofs).
         "double_buffer_mass_matrix_clear_dofs": []
         if solver._memset_stream is None
-        else sorted(int(size) for size in solver.size_groups if size not in solver._unread_mass_sizes),
+        else sorted(int(size) for size in solver.size_groups if size not in solver._plan.unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
         "preelimination": bool(solver._preelim_active),
         "mimic_rows": int(solver._mimic_count or 0),

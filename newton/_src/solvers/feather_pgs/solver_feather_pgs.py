@@ -173,7 +173,6 @@ from .kernels import (
 from .path_selection import (
     applied_options,
     contact_update_warnings,
-    grouped_response,
     measurement_selection,
     options_selection,
     policy_warnings,
@@ -249,6 +248,7 @@ from .sparse_mass_matrix import (
     solve_sparse_mass_matrix,
 )
 from .staging import STATIC_SHARED_BYTES, arch_budget
+from .step_plan import StepPlan
 from .sweep_routes_sparse import (
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     CONTACT_TRANSACTION_BLOCKS,
@@ -276,10 +276,6 @@ from .velocity_limit_law import check_velocity_limit_law
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
-_GROUPED_HINV_OFF = os.environ.get("FEATHER_PGS_GROUPED_HINV") == "0"  # keep the tiled response solve (better on hands)
-_GROUPED_HINV_MAX = int(
-    os.environ.get("FEATHER_PGS_GROUPED_HINV_MAX", "32")
-)  # grouped response solve for DOF sizes up to this
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"  # parallel tiers form Y = H^-1 J^T and the diagonal in-kernel
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
@@ -2988,7 +2984,6 @@ class SolverFeatherPGS(SolverBase):
                     "A cached owner without scalar branches took these worlds: "
                     f"{self._cached_dynamics_selection_reason}"
                 )
-        self._unread_mass_sizes = self._unread_mass_matrix_sizes()
 
         # Worlds whose every candidate row separates at the predictor skip row
         # allocation entirely (resolved_worlds.py); the mask is empty when the
@@ -3011,6 +3006,9 @@ class SolverFeatherPGS(SolverBase):
 
             self._free_body_gyro_kernel = correct_free_body_gyroscopic_predictor
 
+        # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
+        self._plan = StepPlan.build(self)
+        self._build_stage_kernels()
         self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
@@ -3071,9 +3069,8 @@ class SolverFeatherPGS(SolverBase):
 
         Kernel plans describe ordinary stages per articulation DOF count. Cached
         prediction can replace these stages; its owner is reported separately.
-        Automatic choices use topology and resource rules; only the held-tree
-        lane width is timed, once, at construction. Recreate the solver to change
-        them. The ``reasons`` mapping explains construction-time admission and
+        Automatic choices use topology and resource rules, never timing.
+        Recreate the solver to change them. The ``reasons`` mapping explains construction-time admission and
         fallbacks; it does not predict dynamic per-world branches. Ordinary
         kernel plans can be superseded by a cache.
 
@@ -3099,8 +3096,8 @@ class SolverFeatherPGS(SolverBase):
         whose double-buffered mass matrix the end of a refresh step clears (empty
         without a double buffer, where the ordinary route's stage 1 clears it), and
         ``contact_consumers.max_blocks`` the block cap of the launches over the
-        contact capacity (0: uncapped). ``measurements`` holds the construction-time
-        lane timings and, under ``pgs_solve_readout``, the cumulative sweep counts
+        contact capacity (0: uncapped). ``measurements`` holds, under
+        ``pgs_solve_readout``, the cumulative sweep counts
         (``solve_readout``), kept out of ``routes`` so that two runs of one
         configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
@@ -3128,7 +3125,7 @@ class SolverFeatherPGS(SolverBase):
         for size in self.size_groups:
             sparse = size == self._sparse_mass_matrix_size
             diagonal = self._execution_plan.use_diagonal_mass(size)
-            grouped = not sparse and not diagonal and grouped_response(self, size)
+            grouped = self._plan.response[size].name == "grouped"
             kernels[size] = {
                 "cholesky_kernel": "sparse"
                 if sparse
@@ -5745,24 +5742,19 @@ class SolverFeatherPGS(SolverBase):
             self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
-        """Resolve size-specialized Warp kernels once for this solver shape."""
+        """Build the factor kernels per size (whose fusion the held-tree owner's admission reads) and the sweeps.
+
+        The stage-3 and stage-4 kernels follow the step plan (:meth:`_build_stage_kernels`).
+        """
         device_arch = model.device.arch
         self._cholesky_kernels_by_size = {}
         self._crba_cholesky_kernels_by_size = {}
         self._crba_cholesky_warp_kernels_by_size = {}
-        self._triangular_solve_kernels_by_size = {}
         self._inverse_cholesky_kernels_by_size = {}
         self._inverse_cholesky_lower_kernels_by_size = {}
-        self._hinv_jt_kernels_by_size = {}
-        self._hinv_jt_chunk_count_by_size = {}
-        self._hinv_jt_fused_kernels_by_size = {}
-        self._delassus_kernels_by_size = {}
 
         for size in self.size_groups:
             compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
-            sparse_response = self._sparse_mass_matrix_size is not None or (
-                self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
-            )
             use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
             use_tiled_cholesky = self._execution_plan.use_tiled_cholesky(size)
             fuse_crba_cholesky = bool(
@@ -5812,49 +5804,9 @@ class SolverFeatherPGS(SolverBase):
             )
             self._inverse_cholesky_lower_kernels_by_size[size] = (
                 response_builds_dense.inverse_lanes_kernel(size, lower_only=True)
-                if (
-                    self._paired_factor_coordinates
-                    and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
-                )
-                or (self._sparse_mass_matrix_size is not None and self._has_free_rigid_bodies and size == 6)
+                if self._paired_factor_coordinates
+                and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
                 else None
-            )
-            self._triangular_solve_kernels_by_size[size] = (
-                None
-                if use_diagonal_mass or compact_diagonal_mass
-                else _get_triangular_solve_kernel(size, device_arch, self.tile_threads)
-            )
-            if self.dense_max_constraints <= 0 or sparse_response:
-                self._hinv_jt_kernels_by_size[size] = None
-                self._hinv_jt_chunk_count_by_size[size] = 0
-                self._hinv_jt_fused_kernels_by_size[size] = None
-                self._delassus_kernels_by_size[size] = None
-                continue
-
-            hinv_jt_chunk_size = self._execution_plan.hinv_jt_chunk_size(size)
-            if hinv_jt_chunk_size is None:
-                self._hinv_jt_kernels_by_size[size] = None
-                self._hinv_jt_chunk_count_by_size[size] = 0
-            else:
-                self._hinv_jt_chunk_count_by_size[size] = (
-                    self.dense_max_constraints + hinv_jt_chunk_size - 1
-                ) // hinv_jt_chunk_size
-                self._hinv_jt_kernels_by_size[size] = response_builds_dense.response_tiles_kernel(
-                    size,
-                    self.dense_max_constraints,
-                    self.tile_threads,
-                    constraint_chunk_size=hinv_jt_chunk_size,
-                    write_world=self._hinv_jt_writes_world,
-                    write_group=self._hinv_jt_tiled_writes_group,
-                    compute_diag=size in self._hinv_jt_diag_sizes,
-                )
-            self._hinv_jt_fused_kernels_by_size[size] = (
-                response_builds_dense.delassus_tiles_kernel(size, self.dense_max_constraints, self.tile_threads)
-                if self._execution_plan.use_fused_hinv_jt(size)
-                else None
-            )
-            self._delassus_kernels_by_size[size] = response_builds_dense.delassus_stream_kernel(
-                size, self.dense_max_constraints, device_arch
             )
 
         self._paired_cholesky_inverse_kernel = None
@@ -5953,9 +5905,12 @@ class SolverFeatherPGS(SolverBase):
                         for budget, minimum in ((32, 0), (self.dense_max_constraints, 32))
                     )
 
-        self._pack_mf_meta_kernel = None
-        if hasattr(self, "mf_meta_packed") and self.mf_max_constraints > 0:
-            self._pack_mf_meta_kernel = response_builds_rows.free_body_meta_kernel(self.mf_max_constraints, device_arch)
+        # Only free rigid bodies produce matrix-free rows, which matrix-free mode packs each step.
+        self._pack_mf_meta_kernel = (
+            response_builds_rows.free_body_meta_kernel(self.mf_max_constraints, device_arch)
+            if self.pgs_mode == "matrix_free" and self._has_free_rigid_bodies and self.mf_max_constraints > 0
+            else None
+        )
 
         self._pgs_solve_local_internal_kernels = {}
         self._pgs_solve_local_pair_kernels = {}
@@ -6077,9 +6032,8 @@ class SolverFeatherPGS(SolverBase):
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
         self._incremental_rows = 0
         if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
-            # The grouped response solve (_stage4_hinv_jt_tiled) is grouped_dynamics' remaining kernel.
+            # The grouped response solve (_stage4_hinv_jt_grouped) is grouped_dynamics' remaining kernel.
             self._grouped_response = True
-            self._grouped_kernels = {}
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         if (
             self.pgs_mode == "matrix_free"
@@ -6283,8 +6237,15 @@ class SolverFeatherPGS(SolverBase):
             and getattr(self, "rigid_velocity_limit_slot", None) is not None
             and not np.isinf(self.velocity_limit_activation_fraction)
         )
+        # Split mode's free-body sweep (the CPU runs its loop sweep, _setup_contact_update).
         self._pgs_solve_mf_kernel = None
-        if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
+        if (
+            model.device.is_cuda
+            and self.pgs_mode == "split"
+            and not self._sparse_split
+            and hasattr(self, "max_mf_bodies")
+            and self.mf_max_constraints > 0
+        ):
             self._pgs_solve_mf_kernel = self._sweep_kernel(
                 "free_body_split",
                 sweep_routes_diag.mf_split_kernel,
@@ -6446,16 +6407,13 @@ class SolverFeatherPGS(SolverBase):
 
     def _pack_mf_meta(self, mf_rhs: wp.array) -> None:
         """Pack matrix-free row metadata for the GS kernels, or skip when no such row can exist."""
-        pack_kernel = self._pack_mf_meta_kernel
-        if pack_kernel is None:
-            raise RuntimeError("Matrix-free metadata pack kernel is unavailable for this solver shape")
         if not self._has_free_rigid_bodies:
             # Only free rigid bodies produce matrix-free rows, and the model plan fixes
             # them at construction: mf_constraint_count stays zero on the one-slot
-            # dummy buffers, so the pack would write nothing.
+            # dummy buffers, so the pack would write nothing, and no pack kernel is built.
             return
         wp.launch_tiled(
-            pack_kernel,
+            self._pack_mf_meta_kernel,
             dim=[self.world_count],
             inputs=[
                 self.mf_constraint_count,
@@ -7249,9 +7207,7 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
-                    factor = self._stage2_factor(size)
-                    if factor is not None:
-                        factor(size)
+                    self._stage2_factor(size)
                     self._stage2_materialize_paired_inverse(size)
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
@@ -7266,32 +7222,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage3_zero_qdd(state_aug)
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        use_tiled = (self.trisolve_kernel == "tiled") or (
-                            self.trisolve_kernel == "auto" and size > self.small_dof_threshold
-                        )
-                        if size == self._sparse_mass_matrix_size:
-                            wp.launch(
-                                solve_sparse_mass_matrix,
-                                dim=self.n_arts_by_size[size] * 32,
-                                inputs=[
-                                    self.group_to_art[size],
-                                    self.articulation_dof_start,
-                                    self._sparse_mass_matrix_indices,
-                                    self._sparse_Linv,
-                                    state_aug.joint_tau,
-                                ],
-                                outputs=[self._sparse_mass_matrix_scratch, state_aug.joint_qdd],
-                                block_dim=128,
-                                device=model.device,
-                            )
-                        elif size == self._compact_diagonal_mass_size:
-                            self._stage3_trisolve_compact_diagonal(size, state_aug)
-                        elif self._execution_plan.use_diagonal_mass(size):
-                            self._stage3_trisolve_diagonal(size, state_aug)
-                        elif use_tiled:
-                            self._stage3_trisolve_tiled(size, state_aug)
-                        else:
-                            self._stage3_trisolve_loop(size, state_aug)
+                        self._stage3_trisolve(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
             if self._debug_stage3_snapshots:
                 wp.copy(self._debug_stage3_qd_work, stage3_qd)
@@ -7312,26 +7243,13 @@ class SolverFeatherPGS(SolverBase):
             if self._contact_torsion_enabled:
                 prepare_torsion_rows(self, state_in, state_aug, contacts)
 
-        if self.pgs_mode == "matrix_free" or self._sparse_split:
+        solve = self._plan.solve
+        if not solve.assembles_delassus:
             # Compute Y = H^-1 * J^T only (no Delassus C)
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                     with ctx:
-                        if self._compact_contact_boundary or self._sparse_mass_matrix_size is not None:
-                            continue  # Contact owner and bounded limit prefix publish the complete response.
-                        if self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size:
-                            continue
-                        if size == self._paired_response_secondary_size:
-                            continue
-                        if size == self._paired_response_primary_size:
-                            self._stage4_hinv_jt_paired(size, self._paired_response_secondary_size)
-                            continue
-                        if self._execution_plan.use_diagonal_mass(size):
-                            self._stage4_hinv_jt_diagonal(size)
-                        elif self._execution_plan.use_tiled_hinv_jt(size) or self._use_grouped_hinv_jt(size):
-                            self._stage4_hinv_jt_tiled(size)
-                        else:
-                            self._stage4_hinv_jt_par_row(size)
+                        self._stage4_response(size)
 
                 # Bilateral pre-elimination: fold mimic/connect coupling into the
                 # response columns so the diag pass below sees closed-loop inertia.
@@ -7378,35 +7296,17 @@ class SolverFeatherPGS(SolverBase):
                         )
 
         else:
-            fused_ok = (
-                self._is_one_solve_art_per_world
-                and bool(self.size_groups)
-                and all(self._execution_plan.use_fused_hinv_jt(size) for size in self.size_groups)
-            )
-
-            if fused_ok:
-                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-                    with ctx:
-                        self._stage4_hinv_jt_tiled_fused(size)
-            else:
+            # Split mode: the response and the Delassus operator C (fused into one tile per articulation, or
+            # assembled per size after the response).
+            assemble = self._plan.assembles_world_delassus
+            if assemble:
                 self._stage4_zero_world_C()
-
-                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
-                    with ctx:
-                        if self._execution_plan.use_diagonal_mass(size):
-                            self._stage4_hinv_jt_diagonal(size)
-                        elif self._execution_plan.use_tiled_hinv_jt(size) or self._use_grouped_hinv_jt(size):
-                            self._stage4_hinv_jt_tiled(size)
-                        else:
-                            self._stage4_hinv_jt_par_row(size)
-
+            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                with ctx:
+                    self._stage4_response(size)
+            if assemble:
                 for size in self.size_groups:
-                    use_tiled_delassus = self.delassus_kernel != "par_row_col"
-                    if use_tiled_delassus:
-                        self._stage4_delassus_tiled(size)
-                    else:
-                        self._stage4_delassus_par_row_col(size)
-
+                    self._stage4_delassus(size)
                 self._stage4_finalize_world_diag_cfm()
 
             self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
@@ -7468,7 +7368,7 @@ class SolverFeatherPGS(SolverBase):
                     patch_routes(seeded),
                 )
 
-        if self._sparse_split:
+        if solve.family == "sparse_split":
             # The sparse producers already published bias, incident velocity,
             # CFM and restitution. Decode the accumulated factor delta once;
             # the dense RHS accumulation and Y*lambda publication do not apply.
@@ -7479,7 +7379,7 @@ class SolverFeatherPGS(SolverBase):
                 iterations=self.pgs_iterations,
                 omega=self.pgs_omega,
             )
-        elif self.pgs_mode == "matrix_free":
+        elif solve.family == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
                 # Gather J/Y from per-size-group arrays into world-indexed arrays.
                 # Skipped when J_world/Y_world alias the group buffers (identity
@@ -7656,7 +7556,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self.v_hat, self.v_out_snap)
                 self._run_matrix_free_velocity_post_solve()
                 self._stage6_integrate_position_from_velocity(state_in, state_aug, state_out, dt, self.v_out_snap)
-        elif self.pgs_mode == "split" and self._has_mixed_contacts:
+        elif solve.family == "split_interleaved":
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
             self._mf_pgs_setup(state_aug, dt)
             self._build_mf_body_map()
@@ -7716,7 +7616,7 @@ class SolverFeatherPGS(SolverBase):
             # v_out is already final (includes both dense and MF corrections)
 
         else:
-            # Dense or split without mixed contacts: dense PGS, then optional MF
+            # Split without mixed contacts (dense_split): dense PGS, then optional MF
             if self.pgs_debug:
                 self._pgs_convergence_log.append([])
                 friction_start_iteration = self._contact_friction_start_iteration(self.pgs_iterations)
@@ -7829,14 +7729,14 @@ class SolverFeatherPGS(SolverBase):
         # diagonal, structural zeros are never written after allocation, and
         # the Cholesky kernels never read H when mass_update_mask is 0.
         # Sizes a held-tree owner factors from its own geometry have no H
-        # reader at all (_unread_mass_matrix_sizes) and are never cleared.
+        # reader at all (StepPlan.unread_mass_sizes) and are never cleared.
         if self._memset_stream is not None:
             with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
                 if self._row_packets is None and self._keyed_rows is None:
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.size_groups:
-                        if self._mass_update_global_flag and size not in self._unread_mass_sizes:
+                        if self._mass_update_global_flag and size not in self._plan.unread_mass_sizes:
                             self._H_bufs[self._buf_idx][size].zero_()
                         if self._row_packets is not None or self._keyed_rows is not None:
                             continue  # Private J is current; general active rows are cleared before materialization.
@@ -8842,34 +8742,73 @@ class SolverFeatherPGS(SolverBase):
 
         self._force_mass_update = False
 
-    def _stage2_factor(self, size: int):
-        """The stage-2 factorization of one DOF size, or ``None`` when stage 2 has none to run.
+    def _build_stage_kernels(self) -> None:
+        """Build the stage-3 and stage-4 kernels the plan's tables launch, and only those (one entry per size)."""
+        plan, arch, threads, rows = self._plan, self.model.device.arch, self.tile_threads, self.dense_max_constraints
+        sizes = self.size_groups
 
-        :meth:`step` and :meth:`_unread_mass_matrix_sizes` both dispatch through this. Compact
-        and sparse sizes keep no dense factor, and a tiled or loop size with a fused
-        CRBA-Cholesky kernel was factored in stage 1 (by the held-tree owner's refresh when one
-        is installed). Every factorization it returns reads the size's dense mass matrix H.
-        """
-        if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
-            return None
-        if self._execution_plan.use_diagonal_mass(size):
-            return self._stage2_cholesky_diagonal
-        if self._execution_plan.use_tiled_cholesky(size):
-            return None if self._crba_cholesky_kernels_by_size[size] is not None else self._stage2_cholesky_tiled
-        return None if self._crba_cholesky_warp_kernels_by_size[size] is not None else self._stage2_cholesky_loop
+        def routed(stage, size, route):
+            entry = getattr(plan, stage).get(size)
+            return entry is not None and entry.name == route
 
-    def _unread_mass_matrix_sizes(self) -> tuple[int, ...]:
-        """DOF sizes whose dense mass matrix H no stage reads while a held-tree owner is installed.
+        self._triangular_solve_kernels_by_size = {
+            size: _get_triangular_solve_kernel(size, arch, threads) if routed("trisolve", size, "tiles") else None
+            for size in sizes
+        }
+        self._hinv_jt_kernels_by_size = {}
+        self._hinv_jt_chunk_count_by_size = {}
+        for size in sizes:
+            chunk = self._execution_plan.hinv_jt_chunk_size(size) if routed("response", size, "tiles") else None
+            self._hinv_jt_chunk_count_by_size[size] = 0 if chunk is None else (rows + chunk - 1) // chunk
+            self._hinv_jt_kernels_by_size[size] = (
+                None
+                if chunk is None
+                else response_builds_dense.response_tiles_kernel(
+                    size,
+                    rows,
+                    threads,
+                    constraint_chunk_size=chunk,
+                    write_world=self._hinv_jt_writes_world,
+                    write_group=self._hinv_jt_tiled_writes_group,
+                    compute_diag=size in self._hinv_jt_diag_sizes,
+                )
+            )
+        # Sizes the plan routes to the per-row kernel (e.g. free bodies) consume the group-layout response (diag
+        # from J.Y, world impulse apply), so the grouped kernel writes the group copy for them.
+        self._grouped_kernels_by_size = {
+            size: response_builds_dense.response_warps_kernel(
+                size,
+                int(rows),
+                write_world=bool(self._hinv_jt_writes_world),
+                write_group=bool(self._hinv_jt_tiled_writes_group) or not self._execution_plan.use_tiled_hinv_jt(size),
+                compute_diag=size in self._hinv_jt_diag_sizes,
+            )
+            for size in plan.sizes("response", "grouped")
+        }
+        self._hinv_jt_fused_kernels_by_size = {
+            size: response_builds_dense.delassus_tiles_kernel(size, rows, threads)
+            if routed("response", size, "fused")
+            else None
+            for size in sizes
+        }
+        self._delassus_kernels_by_size = {
+            size: response_builds_dense.delassus_stream_kernel(size, rows, arch)
+            if routed("delassus", size, "tiles")
+            else None
+            for size in sizes
+        }
 
-        Under an owner, ``_stage1_crba`` hands the factor refresh to the owner and returns before
-        any H write, and no other stage writes H, so H keeps its allocation zeros. Stage 2 reads H
-        only for the sizes :meth:`_stage2_factor` routes to a factorization. Skipping the
-        end-of-step clear of the other sizes is exact on both counts: no reader, and the clear
-        would rewrite zeros.
-        """
-        if self._tree_kinetic_state is None:
-            return ()
-        return tuple(size for size in self.size_groups if self._stage2_factor(size) is None)
+    def _stage2_factor(self, size: int) -> None:
+        """Factor one size's mass matrix along the plan's stage-2 route: none for compact, sparse and fused sizes."""
+        route = self._plan.factor[size].name
+        if route == "diagonal":
+            self._stage2_cholesky_diagonal(size)
+        elif route == "tiles":
+            self._stage2_cholesky_tiled(size)
+        elif route == "tiles_inverse":
+            self._stage2_cholesky_tiles_inverse(size)
+        elif route == "loop":
+            self._stage2_cholesky_loop(size)
 
     def _stage2_cholesky_diagonal(self, size: int) -> None:
         """Factor an articulation group known to have diagonal generalized inertia."""
@@ -8888,33 +8827,29 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _stage2_cholesky_tiles_inverse(self, size: int) -> None:
+        """Factor the paired response's primary size and materialize its inverse (factor route ``tiles_inverse``)."""
+        wp.launch_tiled(
+            self._paired_cholesky_inverse_kernel,
+            dim=[self.n_arts_by_size[size]],
+            inputs=[
+                self.H_by_size[size],
+                self.R_by_size[size],
+                self._paired_response_inverse_identity,
+                self.group_to_art[size],
+                self.mass_update_mask,
+            ],
+            outputs=[self.L_by_size[size], self.Hinv_by_size[size]],
+            block_dim=self.tile_threads,
+            device=self.model.device,
+        )
+
     def _stage2_cholesky_tiled(self, size: int):
-        """Factor a tiled size's H; :meth:`_stage2_factor` routes fused sizes past it."""
+        """Factor a tiled size's H (factor route ``tiles``)."""
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        if size == self._paired_response_primary_size and not self._paired_factor_coordinates:
-            if self._paired_cholesky_inverse_kernel is None or self._paired_response_inverse_identity is None:
-                raise RuntimeError("Paired Cholesky/inverse kernel is unavailable")
-            wp.launch_tiled(
-                self._paired_cholesky_inverse_kernel,
-                dim=[n_arts],
-                inputs=[
-                    self.H_by_size[size],
-                    self.R_by_size[size],
-                    self._paired_response_inverse_identity,
-                    self.group_to_art[size],
-                    self.mass_update_mask,
-                ],
-                outputs=[self.L_by_size[size], self.Hinv_by_size[size]],
-                block_dim=self.tile_threads,
-                device=model.device,
-            )
-            return
-        cholesky_kernel = self._cholesky_kernels_by_size[size]
-        if cholesky_kernel is None:
-            raise RuntimeError(f"Cholesky tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
-            cholesky_kernel,
+            self._cholesky_kernels_by_size[size],
             dim=[n_arts],
             inputs=[
                 self.H_by_size[size],
@@ -8928,7 +8863,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
-        """Factor a loop size's H; :meth:`_stage2_factor` routes fused sizes past it."""
+        """Factor a loop size's H (factor route ``loop``)."""
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(
@@ -8970,6 +8905,37 @@ class SolverFeatherPGS(SolverBase):
 
     def _stage3_zero_qdd(self, state_aug: State):
         state_aug.joint_qdd.zero_()
+
+    def _stage3_trisolve(self, size: int, state_aug: State) -> None:
+        """Solve one size's unconstrained acceleration along the plan's stage-3 route."""
+        route = self._plan.trisolve[size].name
+        if route == "sparse":
+            self._stage3_trisolve_sparse(size, state_aug)
+        elif route == "compact_diagonal":
+            self._stage3_trisolve_compact_diagonal(size, state_aug)
+        elif route == "diagonal":
+            self._stage3_trisolve_diagonal(size, state_aug)
+        elif route == "tiles":
+            self._stage3_trisolve_tiled(size, state_aug)
+        else:
+            self._stage3_trisolve_loop(size, state_aug)
+
+    def _stage3_trisolve_sparse(self, size: int, state_aug: State) -> None:
+        """Apply the native sparse factors' inverse to joint forces, a warp per articulation."""
+        wp.launch(
+            solve_sparse_mass_matrix,
+            dim=self.n_arts_by_size[size] * 32,
+            inputs=[
+                self.group_to_art[size],
+                self.articulation_dof_start,
+                self._sparse_mass_matrix_indices,
+                self._sparse_Linv,
+                state_aug.joint_tau,
+            ],
+            outputs=[self._sparse_mass_matrix_scratch, state_aug.joint_qdd],
+            block_dim=128,
+            device=self.model.device,
+        )
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a diagonal generalized inertia inverse to joint forces."""
@@ -9019,11 +8985,8 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.tau_by_size[size]],
             device=model.device,
         )
-        solve_kernel = self._triangular_solve_kernels_by_size[size]
-        if solve_kernel is None:
-            raise RuntimeError(f"Triangular solve tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
-            solve_kernel,
+            self._triangular_solve_kernels_by_size[size],
             dim=[n_arts],
             inputs=[
                 self.L_by_size[size],
@@ -10482,62 +10445,76 @@ class SolverFeatherPGS(SolverBase):
         self.C.zero_()
         self.diag.zero_()
 
+    def _stage4_response(self, size: int) -> None:
+        """Build one size's contact response along the plan's stage-4 route (none where an owner publishes it)."""
+        route = self._plan.response[size].name
+        if route == "paired":
+            self._stage4_hinv_jt_paired(size, self._paired_response_secondary_size)
+        elif route == "fused":
+            self._stage4_hinv_jt_tiled_fused(size)
+        elif route == "diagonal":
+            self._stage4_hinv_jt_diagonal(size)
+        elif route == "grouped":
+            self._stage4_hinv_jt_grouped(size)
+        elif route == "tiles":
+            self._stage4_hinv_jt_tiled(size)
+        elif route == "packets":
+            self._row_packets.response(size)
+        elif route == "lanes":
+            self._stage4_hinv_jt_lanes(size)
+        elif route == "rows":
+            self._stage4_hinv_jt_rows(size)
+
+    def _stage4_delassus(self, size: int) -> None:
+        """Assemble one size's Delassus block along the plan's stage-4 route (split mode)."""
+        if self._plan.delassus[size].name == "entries":
+            self._stage4_delassus_par_row_col(size)
+        else:
+            self._stage4_delassus_tiled(size)
+
+    def _stage4_hinv_jt_grouped(self, size: int) -> None:
+        """The grouped response solve (grouped dynamics), a warp per articulation; verified up to 32 DOFs."""
+        n_arts = self.n_arts_by_size[size]
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
+        diag_out = self.diag_by_size[size] if size in self._hinv_jt_diag_sizes else self._grouped_dummy_diag
+        wpb = 4
+        wp.launch_tiled(
+            self._grouped_kernels_by_size[size],
+            dim=[(n_arts + wpb - 1) // wpb],
+            inputs=[
+                wpb,
+                n_arts,
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                world_dof_offset,
+                self.constraint_count,
+                self.Y_by_size[size],
+                J_world,
+                Y_world,
+                diag_out,
+                self._mf_count_or_dummy(),
+                int(self._ink_skip_rows()),
+            ],
+            outputs=[],
+            block_dim=32 * wpb,
+            device=self.model.device,
+        )
+
     def _stage4_hinv_jt_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        hinv_jt_kernel = self._hinv_jt_kernels_by_size[size]
         J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
         Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
         world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
         outputs = [self.Y_by_size[size], J_world, Y_world]
         if size in self._hinv_jt_diag_sizes:
             outputs.append(self.diag_by_size[size])
-        # The grouped response solve is verified for <= 32 DOF only (43-DOF G1 diverged).
-        if self._use_grouped_hinv_jt(size):
-            key = ("hinv_jt", size)
-            kern = self._grouped_kernels.get(key)
-            if kern is None:
-                # Sizes the plan routed to the per-row kernel (e.g. free bodies) consume the group-layout
-                # response (diag from J.Y, world impulse apply), so the group copy must be written for them.
-                write_group = bool(self._hinv_jt_tiled_writes_group) or not self._execution_plan.use_tiled_hinv_jt(size)
-                kern = response_builds_dense.response_warps_kernel(
-                    size,
-                    int(self.dense_max_constraints),
-                    write_world=bool(self._hinv_jt_writes_world),
-                    write_group=write_group,
-                    compute_diag=size in self._hinv_jt_diag_sizes,
-                )
-                self._grouped_kernels[key] = kern
-            diag_out = self.diag_by_size[size] if size in self._hinv_jt_diag_sizes else self._grouped_dummy_diag
-            wpb = 4
-            wp.launch_tiled(
-                kern,
-                dim=[(n_arts + wpb - 1) // wpb],
-                inputs=[
-                    wpb,
-                    n_arts,
-                    self.L_by_size[size],
-                    self.J_by_size[size],
-                    self.group_to_art[size],
-                    self.art_to_world,
-                    world_dof_offset,
-                    self.constraint_count,
-                    self.Y_by_size[size],
-                    J_world,
-                    Y_world,
-                    diag_out,
-                    self._mf_count_or_dummy(),
-                    int(self._ink_skip_rows()),
-                ],
-                outputs=[],
-                block_dim=32 * wpb,
-                device=model.device,
-            )
-            return
-        if hinv_jt_kernel is None:
-            raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
-            hinv_jt_kernel,
+            self._hinv_jt_kernels_by_size[size],
             dim=[n_arts, self._hinv_jt_chunk_count_by_size[size]],
             inputs=[
                 self.L_by_size[size],
@@ -10620,11 +10597,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_hinv_jt_tiled_fused(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        hinv_jt_kernel = self._hinv_jt_fused_kernels_by_size[size]
-        if hinv_jt_kernel is None:
-            raise RuntimeError(f"Fused H^-1 J^T tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
-            hinv_jt_kernel,
+            self._hinv_jt_fused_kernels_by_size[size],
             dim=[n_arts],
             inputs=[
                 self.L_by_size[size],
@@ -10736,16 +10710,6 @@ class SolverFeatherPGS(SolverBase):
         L_b = self.L_by_size[nb] if nb else self._ink_dummy3
         J_b = self.J_by_size[nb] if nb else self._ink_dummy3
         return [self._ink_meta, self.L_by_size[na], L_b, self.J_by_size[na], J_b, self.row_cfm]
-
-    def _use_grouped_hinv_jt(self, size: int) -> bool:
-        if not self._grouped_response or int(size) > 32:
-            return False
-        if self._ink_skip_rows() > 0:
-            return True  # the grouped kernel is the only response kernel with the per-world skip
-        if _GROUPED_HINV_OFF or int(size) > _GROUPED_HINV_MAX:
-            return False
-        # Free-body size groups keep the per-row kernel: the grouped one was measured slower there.
-        return size not in self._free_body_inertia_sizes
 
     def _admit_parallel_contact_paths(self) -> tuple[bool, str]:
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
@@ -10910,38 +10874,40 @@ class SolverFeatherPGS(SolverBase):
             return 0
         return int(getattr(self, "_ink_rows", 0))
 
-    def _stage4_hinv_jt_par_row(self, size: int):
-        if self._row_packets is not None:
-            self._row_packets.response(size)
-            return
-        model = self.model
+    def _stage4_hinv_jt_lanes(self, size: int) -> None:
+        """The response a warp per articulation, skipping the worlds the local owners solve (route ``lanes``)."""
         n_arts = self.n_arts_by_size[size]
         J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
         Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
         world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
-        if self._local_internal_fast_path:
-            wp.launch(
-                response_builds_dense.response_lanes_kernel(),
-                dim=n_arts * 32,
-                inputs=[
-                    self.L_by_size[size],
-                    self.J_by_size[size],
-                    self.group_to_art[size],
-                    self.art_to_world,
-                    world_dof_offset,
-                    self.constraint_count,
-                    self._local_solve_owner,
-                    self.row_restitution,
-                    size,
-                    self.dense_max_constraints,
-                    n_arts,
-                    int(self._hinv_jt_writes_world),
-                ],
-                outputs=[self.Y_by_size[size], J_world, Y_world],
-                device=model.device,
-                block_dim=256,
-            )
-            return
+        wp.launch(
+            response_builds_dense.response_lanes_kernel(),
+            dim=n_arts * 32,
+            inputs=[
+                self.L_by_size[size],
+                self.J_by_size[size],
+                self.group_to_art[size],
+                self.art_to_world,
+                world_dof_offset,
+                self.constraint_count,
+                self._local_solve_owner,
+                self.row_restitution,
+                size,
+                self.dense_max_constraints,
+                n_arts,
+                int(self._hinv_jt_writes_world),
+            ],
+            outputs=[self.Y_by_size[size], J_world, Y_world],
+            device=self.model.device,
+            block_dim=256,
+        )
+
+    def _stage4_hinv_jt_rows(self, size: int) -> None:
+        """The response a thread per row (route ``rows``)."""
+        n_arts = self.n_arts_by_size[size]
+        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
+        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
+        world_dof_offset = self.articulation_world_dof_offset if self._hinv_jt_writes_world else self.group_to_art[size]
         wp.launch(
             response_builds_dense.response_rows_kernel(),
             dim=n_arts * self.dense_max_constraints,
@@ -10958,7 +10924,7 @@ class SolverFeatherPGS(SolverBase):
                 int(self._hinv_jt_writes_world),
             ],
             outputs=[self.Y_by_size[size], J_world, Y_world],
-            device=model.device,
+            device=self.model.device,
         )
 
     def _stage4_delassus_par_row_col(self, size: int):
@@ -10984,11 +10950,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_delassus_tiled(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        delassus_kernel = self._delassus_kernels_by_size[size]
-        if delassus_kernel is None:
-            raise RuntimeError(f"Delassus tiled kernel is unavailable for DOF size {size}")
         wp.launch_tiled(
-            delassus_kernel,
+            self._delassus_kernels_by_size[size],
             dim=[n_arts],
             inputs=[
                 self.J_by_size[size],

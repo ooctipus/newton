@@ -126,19 +126,6 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     self.assertTrue(any(operand is rhs for operand in kwargs["inputs"]))
                     self.assertEqual(kwargs["outputs"], [state.mf_meta_packed])
 
-    def test_missing_pack_kernel_still_raises(self):
-        """Keep the missing-kernel error whether or not matrix-free rows can exist."""
-        for has_free in (False, True):
-            state = _pack_state(has_free)
-            state._pack_mf_meta_kernel = None
-            with (
-                self.subTest(has_free_rigid_bodies=has_free),
-                patch.object(fpgs.wp, "launch_tiled") as launch,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "pack kernel is unavailable"):
-                    fpgs.SolverFeatherPGS._pack_mf_meta(state, object())
-                launch.assert_not_called()
-
     def test_pack_preserves_parent_bits_and_no_parent(self):
         """Preserve the existing word layout using defined unsigned shift arithmetic."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
@@ -360,8 +347,14 @@ def _record_pack_launches(solver):
 
 
 def _launch_pack_unconditionally(solver):
-    """Restore the launch that ran before the skip, whether or not matrix-free rows exist."""
+    """Restore the launch that ran before the skip, whether or not matrix-free rows exist.
+
+    The solver builds the pack kernel only where it launches, so the arm builds it here.
+    """
     pack = type(solver)._pack_mf_meta
+    solver._pack_mf_meta_kernel = response_builds_rows.free_body_meta_kernel(
+        solver.mf_max_constraints, solver.model.device.arch
+    )
 
     def unconditional(mf_rhs):
         # The production launch, with the skip's only gate held open for the call.
@@ -412,7 +405,8 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
                         model, pgs_mode="matrix_free", pgs_iterations=6, pgs_velocity_iterations=velocity_iterations
                     )
                     self.assertFalse(solver._has_free_rigid_bodies)
-                    self.assertIsNotNone(solver._pack_mf_meta_kernel)
+                    # The pack kernel is built only where it launches.
+                    self.assertIsNone(solver._pack_mf_meta_kernel)
                     if unconditional:
                         _launch_pack_unconditionally(solver)
                     runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
@@ -422,7 +416,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
                 # instance, so only the skipping arm's record describes its launches.
                 pack = skipping.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
                 self.assertFalse(pack["launched"])
-                self.assertEqual(pack["kernel"], skipping._pack_mf_meta_kernel.key)
+                self.assertIsNone(pack["kernel"])
                 # The legacy arm proves both call sites ran: position pass, then velocity pass.
                 passes = 2 if velocity_iterations else 1
                 expected = [legacy.mf_rhs, legacy.mf_rhs_unbiased][:passes] * steps

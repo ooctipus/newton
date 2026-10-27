@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.step_plan import StepPlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     STANDING_REGION_BOUNDS,
@@ -548,10 +549,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(point["routes"]["contact_rows"]["law"], "point")
 
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
-        """Label the sizes the grouped response would serve, with their reasons, from host state alone."""
+        """Label the sizes the grouped response would serve, with their reasons, from the step plan's table."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
-        # A stand-in for the CUDA-only grouped response: the record reads host state only.
+        # A stand-in for the CUDA-only grouped response: the plan reads host state only, and the record its table.
         solver._grouped_response = True
+        solver._plan = StepPlan.build(solver)
         selected = solver.get_path_selection()
         json.dumps(selected, allow_nan=False)
         grouped = selected["routes"]["dynamics"]["grouped"]
