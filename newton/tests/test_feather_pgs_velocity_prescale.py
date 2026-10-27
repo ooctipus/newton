@@ -20,6 +20,8 @@ import warp as wp
 
 import newton
 from newton._src.sim import BodyFlags, JointType
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
@@ -220,13 +222,14 @@ def _lanes(layout: dict, skip_driven: int, device, lanes: int) -> tuple[np.ndarr
     a CPU launch scales each lane's joints by that lane's own ratio.
     """
     count = len(layout["articulation_start"]) - 1
-    arrays = [wp.array(layout[name], device=device) for name in _ARRAYS]
+    joints = field_group.upload(JointTable, device, **{name: layout[name] for name in _ARRAYS[:-1]})
+    drive_slot = wp.array(layout["drive_slot"], device=device)
     joint_qd = wp.array(layout["joint_qd"], device=device)
     output = wp.full(len(layout["joint_qd"]), _UNWRITTEN, dtype=float, device=device)
     wp.launch(
         prescale_joint_velocity_limits,
         dim=(count * lanes + 31) // 32 * 32,
-        inputs=[count, lanes, *arrays, skip_driven, joint_qd],
+        inputs=[joints, count, lanes, drive_slot, skip_driven, joint_qd],
         outputs=[output],
         device=device,
     )

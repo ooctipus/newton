@@ -48,6 +48,7 @@ from .device_preludes import (
     warp_sync,
 )
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
+from .joint_table import JointTable
 from .projection_laws import (
     disk,
 )
@@ -176,37 +177,25 @@ def clamp_free_root_velocity_limits(
 
 
 @wp.func
-def _prescaled_axis_count(
-    joint: int,
-    joint_type: wp.array[int],
-    joint_child: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    body_flags: wp.array[wp.int32],
-) -> int:
+def _prescaled_axis_count(joint: int, joints: JointTable) -> int:
     """Return how many leading DOFs of ``joint`` the PhysX velocity prescale reads and scales.
 
     Joint types without a PhysX joint velocity limit and kinematic children
     have none.
     """
-    jtype = joint_type[joint]
+    jtype = joints.joint_type[joint]
     if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
         return 0
-    if (body_flags[joint_child[joint]] & BodyFlags.KINEMATIC) != 0:
+    if (joints.body_flags[joints.joint_child[joint]] & BodyFlags.KINEMATIC) != 0:
         return 0
-    return joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+    return joints.joint_dof_dim[joint, 0] + joints.joint_dof_dim[joint, 1]
 
 
 @wp.kernel(enable_backward=False)
 def prescale_joint_velocity_limits(
+    joints: JointTable,
     articulation_count: int,
     lanes: int,
-    articulation_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_child: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_velocity_limit: wp.array[float],
-    body_flags: wp.array[wp.int32],
     drive_slot: wp.array[int],
     skip_driven: int,
     joint_qd: wp.array[float],
@@ -247,18 +236,18 @@ def prescale_joint_velocity_limits(
     joint_start = int(0)
     joint_end = int(0)
     if art < articulation_count:
-        joint_start = articulation_start[art]
-        joint_end = articulation_start[art + 1]
+        joint_start = joints.articulation_start[art]
+        joint_end = joints.articulation_start[art + 1]
 
     ratio = float(1.0)
     for j in range(joint_start + lane, joint_end, lanes):
-        qd_start = joint_qd_start[j]
-        for axis in range(_prescaled_axis_count(j, joint_type, joint_child, joint_dof_dim, body_flags)):
+        qd_start = joints.joint_qd_start[j]
+        for axis in range(_prescaled_axis_count(j, joints)):
             dof = qd_start + axis
             if skip_driven != 0:
                 if drive_slot[dof] >= 0:
                     continue
-            limit = joint_velocity_limit[dof]
+            limit = joints.joint_velocity_limit[dof]
             qd_abs = wp.abs(joint_qd[dof])
             if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
                 scale = limit / qd_abs
@@ -269,13 +258,13 @@ def prescale_joint_velocity_limits(
 
     if art == 0:
         # Joints ahead of the first articulation keep their velocity.
-        for dof in range(lane, joint_qd_start[joint_start], lanes):
+        for dof in range(lane, joints.joint_qd_start[joint_start], lanes):
             prescaled_joint_qd[dof] = joint_qd[dof]
     if ratio < 1.0:
         for j in range(joint_start + lane, joint_end, lanes):
-            qd_start = joint_qd_start[j]
-            scaled_end = qd_start + _prescaled_axis_count(j, joint_type, joint_child, joint_dof_dim, body_flags)
-            for dof in range(qd_start, joint_qd_start[j + 1]):
+            qd_start = joints.joint_qd_start[j]
+            scaled_end = qd_start + _prescaled_axis_count(j, joints)
+            for dof in range(qd_start, joints.joint_qd_start[j + 1]):
                 qd = joint_qd[dof]
                 if dof < scaled_end:
                     if skip_driven == 0:
@@ -284,7 +273,7 @@ def prescale_joint_velocity_limits(
                         qd = qd * ratio
                 prescaled_joint_qd[dof] = qd
     else:
-        for dof in range(joint_qd_start[joint_start] + lane, joint_qd_start[joint_end], lanes):
+        for dof in range(joints.joint_qd_start[joint_start] + lane, joints.joint_qd_start[joint_end], lanes):
             prescaled_joint_qd[dof] = joint_qd[dof]
 
 
@@ -1236,20 +1225,11 @@ def eval_rigid_tau_and_augmented_drives(
 
 @wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
 def prepare_augmented_joint_drives(
-    articulation_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_target_q_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
+    joints: JointTable,
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
     # outputs
@@ -1261,20 +1241,20 @@ def prepare_augmented_joint_drives(
     """Prepare implicit drive rows and their explicit force independently of inverse dynamics."""
     prepare_articulation_augmented_drives(
         wp.tid(),
-        articulation_start,
-        articulation_H_rows,
-        joint_type,
-        joint_qd_start,
-        joint_q_start,
-        joint_target_q_start,
-        joint_dof_dim,
+        joints.articulation_start,
+        joints.articulation_H_rows,
+        joints.joint_type,
+        joints.joint_qd_start,
+        joints.joint_q_start,
+        joints.joint_target_q_start,
+        joints.joint_dof_dim,
         joint_q,
         joint_qd,
-        joint_target_ke,
-        joint_target_kd,
+        joints.joint_target_ke,
+        joints.joint_target_kd,
         joint_target_pos,
         joint_target_vel,
-        joint_effort_limit,
+        joints.joint_effort_limit,
         max_dofs,
         dt,
         1,
@@ -1287,15 +1267,7 @@ def prepare_augmented_joint_drives(
 
 @wp.kernel
 def allocate_physx_drive_slots(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    art_to_world: wp.array[int],
+    joints: JointTable,
     max_constraints: int,
     # outputs
     drive_slot: wp.array[int],
@@ -1304,30 +1276,30 @@ def allocate_physx_drive_slots(
 ):
     """Allocate one dense PhysX-style drive row for each driven scalar DOF."""
     art = wp.tid()
-    world = art_to_world[art]
+    world = joints.art_to_world[art]
 
-    dof_base = articulation_dof_start[art]
-    dof_count = articulation_H_rows[art]
+    dof_base = joints.articulation_dof_start[art]
+    dof_count = joints.articulation_H_rows[art]
     for d in range(dof_count):
         drive_slot[dof_base + d] = -1
 
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
+    joint_start = joints.articulation_start[art]
+    joint_end = joints.articulation_start[art + 1]
 
     for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
+        jtype = joints.joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
 
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
+        lin_count = joints.joint_dof_dim[j, 0]
+        ang_count = joints.joint_dof_dim[j, 1]
         axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
+        qd_start = joints.joint_qd_start[j]
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            stiffness = joint_target_ke[dof]
-            damping = joint_target_kd[dof]
+            stiffness = joints.joint_target_ke[dof]
+            damping = joints.joint_target_kd[dof]
             if stiffness <= 0.0 and damping <= 0.0:
                 continue
 
@@ -1368,22 +1340,11 @@ def clear_grouped_jacobian_active_rows(
 
 @wp.kernel
 def populate_physx_drive_J_for_size(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_target_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_effort_limit: wp.array[float],
+    joints: JointTable,
     joint_q: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
-    joint_velocity_limit: wp.array[float],
     fuse_vel_limits: int,
-    art_to_world: wp.array[int],
     drive_slot: wp.array[int],
     group_to_art: wp.array[int],
     # outputs
@@ -1408,22 +1369,22 @@ def populate_physx_drive_J_for_size(
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
-    world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
+    world = joints.art_to_world[art]
+    dof_start = joints.articulation_dof_start[art]
 
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
+    joint_start = joints.articulation_start[art]
+    joint_end = joints.articulation_start[art + 1]
 
     for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
+        jtype = joints.joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
 
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
+        lin_count = joints.joint_dof_dim[j, 0]
+        ang_count = joints.joint_dof_dim[j, 1]
         axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
-        q_start = joint_q_start[j]
+        qd_start = joints.joint_qd_start[j]
+        q_start = joints.joint_q_start[j]
 
         for axis in range(axis_count):
             dof = qd_start + axis
@@ -1434,9 +1395,9 @@ def populate_physx_drive_J_for_size(
             local_dof = dof - dof_start
             J_group[group_idx, slot, local_dof] = 1.0
 
-            stiffness = joint_target_ke[dof]
-            damping = joint_target_kd[dof]
-            target_pos = joint_target_pos[joint_target_q_start[j] + axis]
+            stiffness = joints.joint_target_ke[dof]
+            damping = joints.joint_target_kd[dof]
+            target_pos = joint_target_pos[joints.joint_target_q_start[j] + axis]
             target_vel = joint_target_vel[dof]
             q = joint_q[q_start + axis]
 
@@ -1450,9 +1411,9 @@ def populate_physx_drive_J_for_size(
             world_drive_stiffness[world, slot] = stiffness
             world_drive_damping[world, slot] = damping
             world_drive_geom_error[world, slot] = target_pos - q
-            world_drive_max_force[world, slot] = joint_effort_limit[dof]
+            world_drive_max_force[world, slot] = joints.joint_effort_limit[dof]
             if fuse_vel_limits != 0:
-                qdot_max = joint_velocity_limit[dof]
+                qdot_max = joints.joint_velocity_limit[dof]
                 if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
                     qdot_max = float(wp.inf)
                 world_drive_vel_limit[world, slot] = qdot_max
@@ -1550,17 +1511,9 @@ def build_mass_update_mask(
 
 @wp.kernel
 def build_joint_limit_rows_for_size(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_limit_lower: wp.array[float],
-    joint_limit_upper: wp.array[float],
+    joints: JointTable,
     joint_q: wp.array[float],
     joint_limit_activation_gap: float,
-    art_to_world: wp.array[int],
     group_to_art: wp.array[int],
     max_constraints: int,
     pgs_beta: float,
@@ -1575,24 +1528,24 @@ def build_joint_limit_rows_for_size(
     """Allocate and populate active joint-limit rows in one articulation pass."""
     group_idx = wp.tid()
     art = group_to_art[group_idx]
-    world = art_to_world[art]
+    world = joints.art_to_world[art]
     if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
-    dof_start = articulation_dof_start[art]
+    dof_start = joints.articulation_dof_start[art]
 
-    for j in range(articulation_start[art], articulation_start[art + 1]):
-        jtype = joint_type[j]
+    for j in range(joints.articulation_start[art], joints.articulation_start[art + 1]):
+        jtype = joints.joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
 
-        axis_count = joint_dof_dim[j, 0] + joint_dof_dim[j, 1]
-        qd_start = joint_qd_start[j]
-        q_start = joint_q_start[j]
+        axis_count = joints.joint_dof_dim[j, 0] + joints.joint_dof_dim[j, 1]
+        qd_start = joints.joint_qd_start[j]
+        q_start = joints.joint_q_start[j]
         for axis in range(axis_count):
             dof = qd_start + axis
             q_val = joint_q[q_start + axis]
-            lower = joint_limit_lower[dof]
-            upper = joint_limit_upper[dof]
+            lower = joints.joint_limit_lower[dof]
+            upper = joints.joint_limit_upper[dof]
 
             local_dof = dof - dof_start
 
@@ -1967,18 +1920,11 @@ def preelim_solve(
 
 @wp.kernel
 def allocate_joint_velocity_limit_slots(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_velocity_limit: wp.array[float],
+    joints: JointTable,
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
     drive_slot: wp.array[int],
     skip_driven: int,
-    art_to_world: wp.array[int],
     max_constraints: int,
     # outputs
     velocity_limit_slot: wp.array[int],
@@ -2023,11 +1969,11 @@ def allocate_joint_velocity_limit_slots(
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
     """
     art = wp.tid()
-    world = art_to_world[art]
+    world = joints.art_to_world[art]
 
     # Initialize all DOFs of this articulation to "no limit active"
-    dof_base = articulation_dof_start[art]
-    dof_count = articulation_H_rows[art]
+    dof_base = joints.articulation_dof_start[art]
+    dof_count = joints.articulation_H_rows[art]
     for d in range(dof_count):
         lower_idx = 2 * (dof_base + d)
         upper_idx = lower_idx + 1
@@ -2036,25 +1982,27 @@ def allocate_joint_velocity_limit_slots(
         velocity_limit_sign[lower_idx] = 0.0
         velocity_limit_sign[upper_idx] = 0.0
 
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
+    joint_start = joints.articulation_start[art]
+    joint_end = joints.articulation_start[art + 1]
     n_eligible = int(0)
 
     for j in range(joint_start, joint_end):
-        jtype = joint_type[j]
+        jtype = joints.joint_type[j]
         if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
             continue
 
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
+        lin_count = joints.joint_dof_dim[j, 0]
+        ang_count = joints.joint_dof_dim[j, 1]
         axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
+        qd_start = joints.joint_qd_start[j]
 
         for axis in range(axis_count):
             dof = qd_start + axis
             # A non-positive limit is unlimited (PhysX pins ``recipResponse`` off for ``unitResponse <= 0``);
             # a positive fraction admits only a DOF whose speed reaches that fraction of the limit.
-            if not velocity_limit_active(joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction):
+            if not velocity_limit_active(
+                joints.joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction
+            ):
                 continue
 
             # Fused path: driven DOFs are clamped at the end of each iteration.
@@ -2087,13 +2035,7 @@ def allocate_joint_velocity_limit_slots(
 
 @wp.kernel
 def populate_joint_velocity_limit_J_for_size(
-    articulation_start: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_velocity_limit: wp.array[float],
-    art_to_world: wp.array[int],
+    joints: JointTable,
     velocity_limit_slot: wp.array[int],
     velocity_limit_sign: wp.array[float],
     group_to_art: wp.array[int],
@@ -2126,13 +2068,13 @@ def populate_joint_velocity_limit_J_for_size(
     local_dof = (tid // 2) % n_dofs
     group_idx = tid // (2 * n_dofs)
     art = group_to_art[group_idx]
-    world = art_to_world[art]
-    dof = articulation_dof_start[art] + local_dof
+    world = joints.art_to_world[art]
+    dof = joints.articulation_dof_start[art] + local_dof
     row_idx = 2 * dof + side
     slot = velocity_limit_slot[row_idx]
     if slot < 0:
         return
-    qdot_max = joint_velocity_limit[dof]
+    qdot_max = joints.joint_velocity_limit[dof]
     sign = velocity_limit_sign[row_idx]
 
     J_group[group_idx, slot, local_dof] = sign

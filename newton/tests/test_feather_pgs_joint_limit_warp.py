@@ -10,6 +10,7 @@ import warp as wp
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
 
@@ -74,17 +75,15 @@ def _scalar_rows(problem, resolved=None):
         build_joint_limit_rows_for_size,
         dim=problem.articulation_count,
         inputs=[
-            problem.articulation_start,
-            problem.articulation_dof_start,
-            problem.joint_type,
-            problem.joint_q_start,
-            problem.joint_qd_start,
-            problem.joint_dof_dim,
-            problem.lower,
-            problem.upper,
+            field_group.upload(
+                JointTable,
+                problem.device,
+                problem,
+                joint_limit_lower=problem.lower,
+                joint_limit_upper=problem.upper,
+            ),
             problem.joint_q,
             0.25,
-            problem.art_to_world,
             problem.group_to_art,
             problem.max_constraints,
             0.2,

@@ -88,6 +88,7 @@ from .friction_patches import (
     patch_routes,
     patch_row_law,
 )
+from .joint_table import bind as bind_joint_table
 from .kernel_template import Dispatch, KernelTemplate, SweepTier, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -5353,15 +5354,9 @@ class SolverFeatherPGS(SolverBase):
             self._vel_limit_drive_slot_arg = self.drive_slot
         else:
             self._vel_limit_drive_slot_arg = self._arrays.placeholder(wp.int32, (1,), -1)
-        # The drive-row populate kernel only reads joint_velocity_limit when
-        # the fused clamp is enabled; otherwise pass a 1-element dummy so
-        # models without velocity limits stay valid.
-        if self.fuse_joint_velocity_limits:
-            self._drive_vel_limit_src_arg = model.joint_velocity_limit
-            if self._drive_vel_limit_src_arg is None:
-                raise ValueError("fuse_joint_velocity_limits=True requires model.joint_velocity_limit to be allocated")
-        else:
-            self._drive_vel_limit_src_arg = self._arrays.placeholder(wp.float32)
+        # The drive-row populate kernel reads joint_velocity_limit only when the fused clamp is enabled.
+        if self.fuse_joint_velocity_limits and model.joint_velocity_limit is None:
+            raise ValueError("fuse_joint_velocity_limits=True requires model.joint_velocity_limit to be allocated")
 
     def _allocate_world_buffers(self, model):
         """Allocate world-level constraint system buffers for multi-articulation support."""
@@ -7977,15 +7972,9 @@ class SolverFeatherPGS(SolverBase):
             prescale_joint_velocity_limits,
             dim=self._velocity_prescale_threads,
             inputs=[
+                bind_joint_table(self),
                 model.articulation_count,
                 self._velocity_prescale_lanes,
-                model.articulation_start,
-                model.joint_type,
-                model.joint_child,
-                model.joint_qd_start,
-                model.joint_dof_dim,
-                model.joint_velocity_limit,
-                model.body_flags,
                 self._vel_limit_drive_slot_arg,
                 self._vel_limit_skip_driven,
                 joint_qd,
@@ -8104,20 +8093,11 @@ class SolverFeatherPGS(SolverBase):
                     prepare_augmented_joint_drives,
                     dim=model.articulation_count,
                     inputs=[
-                        model.articulation_start,
-                        self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_q_start,
-                        model.joint_target_q_start,
-                        model.joint_dof_dim,
+                        bind_joint_table(self),
                         state_in.joint_q,
                         state_in.joint_qd,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
                         control.joint_target_q,
                         control.joint_target_qd,
-                        model.joint_effort_limit,
                         self.articulation_max_dofs,
                         dt,
                     ],
@@ -9050,8 +9030,10 @@ class SolverFeatherPGS(SolverBase):
             self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
-        # Every row producer writes the dense row records through one struct, bound for this step.
+        # Every row producer writes the dense row records through one struct, and the joint row producers read
+        # the joint table through another, both bound for this step.
         dense_rows = bind_dense_rows(self)
+        joints = bind_joint_table(self)
         mf_active = self._has_free_rigid_bodies
         if self._has_prescribed_response:
             self.mf_target_velocity.zero_()
@@ -9110,15 +9092,7 @@ class SolverFeatherPGS(SolverBase):
                 allocate_physx_drive_slots,
                 dim=model.articulation_count,
                 inputs=[
-                    model.articulation_start,
-                    self.articulation_dof_start,
-                    self.articulation_H_rows,
-                    model.joint_type,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    model.joint_target_ke,
-                    model.joint_target_kd,
-                    self.art_to_world,
+                    joints,
                     max_constraints,
                 ],
                 outputs=[
@@ -9140,22 +9114,11 @@ class SolverFeatherPGS(SolverBase):
                     populate_physx_drive_J_for_size,
                     dim=n_arts,
                     inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        model.joint_type,
-                        model.joint_q_start,
-                        model.joint_target_q_start,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        model.joint_effort_limit,
+                        joints,
                         state_in.joint_q,
                         control.joint_target_q,
                         control.joint_target_qd,
-                        self._drive_vel_limit_src_arg,
                         self._vel_limit_skip_driven,
-                        self.art_to_world,
                         self.drive_slot,
                         self.group_to_art[size],
                     ],
@@ -9426,17 +9389,9 @@ class SolverFeatherPGS(SolverBase):
                         build_joint_limit_rows_for_size,
                         dim=n_arts,
                         inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            model.joint_type,
-                            model.joint_q_start,
-                            model.joint_qd_start,
-                            model.joint_dof_dim,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
+                            joints,
                             state_in.joint_q,
                             self.joint_limit_activation_gap,
-                            self.art_to_world,
                             self.group_to_art[size],
                             max_constraints,
                             self.pgs_beta,
@@ -9472,18 +9427,11 @@ class SolverFeatherPGS(SolverBase):
                 allocate_joint_velocity_limit_slots,
                 dim=model.articulation_count,
                 inputs=[
-                    model.articulation_start,
-                    self.articulation_dof_start,
-                    self.articulation_H_rows,
-                    model.joint_type,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    model.joint_velocity_limit,
+                    joints,
                     self.v_hat,
                     self.velocity_limit_activation_fraction,
                     self._vel_limit_drive_slot_arg,
                     self._vel_limit_skip_driven,
-                    self.art_to_world,
                     max_constraints,
                 ],
                 outputs=[
@@ -9556,13 +9504,7 @@ class SolverFeatherPGS(SolverBase):
                     populate_joint_velocity_limit_J_for_size,
                     dim=n_arts * int(size) * 2,
                     inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        model.joint_type,
-                        model.joint_qd_start,
-                        model.joint_dof_dim,
-                        model.joint_velocity_limit,
-                        self.art_to_world,
+                        joints,
                         self.velocity_limit_slot,
                         self.velocity_limit_sign,
                         self.group_to_art[size],

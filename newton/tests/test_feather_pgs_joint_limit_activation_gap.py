@@ -11,6 +11,7 @@ from newton._src.core.types import MAXVAL
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -38,17 +39,21 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
         build_joint_limit_rows_for_size,
         dim=1,
         inputs=[
-            wp.array([0, 1], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([int(JointType.REVOLUTE)], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([[0, 1]], dtype=wp.int32, device=device),
-            wp.array([lower], dtype=wp.float32, device=device),
-            wp.array([upper], dtype=wp.float32, device=device),
+            field_group.upload(
+                JointTable,
+                device,
+                articulation_start=[0, 1],
+                articulation_dof_start=[0],
+                joint_type=[int(JointType.REVOLUTE)],
+                joint_q_start=[0],
+                joint_qd_start=[0],
+                joint_dof_dim=[[0, 1]],
+                joint_limit_lower=[lower],
+                joint_limit_upper=[upper],
+                art_to_world=[0],
+            ),
             wp.array([q], dtype=wp.float32, device=device),
             gap,
-            wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             max_constraints,
             0.2,

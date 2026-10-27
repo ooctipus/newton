@@ -29,10 +29,11 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import keyed_rows, path_selection, sweep_routes, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_selection, sweep_routes, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -460,15 +461,9 @@ def prescaled_joint_velocity(model):
         prescale_joint_velocity_limits,
         dim=threads,
         inputs=[
+            field_group.upload(JointTable, model.device, model),
             model.articulation_count,
             lanes,
-            model.articulation_start,
-            model.joint_type,
-            model.joint_child,
-            model.joint_qd_start,
-            model.joint_dof_dim,
-            model.joint_velocity_limit,
-            model.body_flags,
             wp.full(1, -1, dtype=wp.int32, device=model.device),  # drive slots: unread without the fused clamp
             0,
             model.joint_qd,
