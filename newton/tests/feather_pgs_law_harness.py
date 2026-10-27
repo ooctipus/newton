@@ -549,6 +549,9 @@ DENSE_ROW_ARGUMENTS = {
     "phi": "world_phi",
     "target": "world_target_velocity",
     "restitution": "world_row_restitution",
+    "rhs": "world_rhs",
+    "diag": "world_diag",
+    "row_w": "world_row_w",
 }
 """The scenes' names of the :data:`DenseRows` fields."""
 

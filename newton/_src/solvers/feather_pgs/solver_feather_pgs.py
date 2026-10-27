@@ -10685,15 +10685,13 @@ class SolverFeatherPGS(SolverBase):
             compute_physx_pgs_drive_desc,
             dim=self.world_count,
             inputs=[
+                bind_dense_rows(self),
                 self.constraint_count,
                 self.dense_max_constraints,
                 self.world_dof_indices,
                 self.max_world_dofs,
-                self.row_type,
-                self.diag,
                 self.J_world,
                 position_delta_velocity,
-                self.target_velocity,
                 self.drive_stiffness,
                 self.drive_damping,
                 self.drive_geom_error,
@@ -10855,19 +10853,16 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Private rows require the original single position pass")
             return
         model = self.model
-        rhs_out = self.rhs if output is None else output
+        rows = bind_dense_rows(self) if output is None else bind_dense_rows(self, rhs=output)
         if preserve_unreached_speculative:
             wp.launch(
                 compute_world_contact_velocity_bias,
                 dim=self.world_count * self.dense_max_constraints,
                 inputs=[
+                    rows,
                     self.constraint_count,
                     self.dense_max_constraints,
                     self.world_dof_count,
-                    self.phi,
-                    self.row_type,
-                    self.target_velocity,
-                    self.row_restitution,
                     self.v_out_snap,
                     self.v_hat,
                     self.world_dof_indices,
@@ -10876,7 +10871,6 @@ class SolverFeatherPGS(SolverBase):
                     int(apply_restitution),
                     self._effective_restitution_velocity_threshold,
                 ],
-                outputs=[rhs_out],
                 device=model.device,
             )
             return
@@ -10884,19 +10878,15 @@ class SolverFeatherPGS(SolverBase):
             compute_world_contact_bias,
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
+                rows,
                 self.constraint_count,
                 self.dense_max_constraints,
-                self.phi,
-                self.row_beta,
-                self.row_type,
-                self.target_velocity,
                 dt,
                 bias_scale,
                 contact_speculative_scale,
                 joint_limit_speculative_scale,
                 self._contact_w,
             ],
-            outputs=[rhs_out, self.row_w],
             device=model.device,
         )
 
@@ -10935,12 +10925,9 @@ class SolverFeatherPGS(SolverBase):
                     apply_sparse_diagonal_contact_restitution_matrix_free,
                     dim=self.world_count * self.dense_max_constraints,
                     inputs=[
+                        bind_dense_rows(self),
                         self.constraint_count,
                         self.dense_max_constraints,
-                        self.phi,
-                        self.row_type,
-                        self.target_velocity,
-                        self.row_restitution,
                         self.v_hat,
                         self.world_dof_indices,
                         self._sparse_diagonal_dense_offsets,
@@ -10952,7 +10939,6 @@ class SolverFeatherPGS(SolverBase):
                         dt,
                         self._effective_restitution_velocity_threshold,
                     ],
-                    outputs=[self.rhs],
                     device=self.model.device,
                 )
                 return
@@ -10960,13 +10946,10 @@ class SolverFeatherPGS(SolverBase):
                 apply_world_contact_restitution_matrix_free,
                 dim=self.world_count * self.dense_max_constraints,
                 inputs=[
+                    bind_dense_rows(self),
                     self.constraint_count,
                     self.dense_max_constraints,
                     self.world_dof_count,
-                    self.phi,
-                    self.row_type,
-                    self.target_velocity,
-                    self.row_restitution,
                     self.v_hat,
                     self.world_dof_indices,
                     self.J_world,
@@ -10974,7 +10957,6 @@ class SolverFeatherPGS(SolverBase):
                     self._effective_restitution_velocity_threshold,
                     int(self._regularization_enabled),
                 ],
-                outputs=[self.rhs, self.row_w],
                 device=self.model.device,
             )
             return
@@ -10983,18 +10965,14 @@ class SolverFeatherPGS(SolverBase):
             apply_world_contact_restitution_accumulated,
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
+                bind_dense_rows(self),
                 self.constraint_count,
                 self.dense_max_constraints,
-                self.phi,
-                self.row_beta,
-                self.row_type,
-                self.row_restitution,
                 dt,
                 self.contact_speculative_scale,
                 self._effective_restitution_velocity_threshold,
                 int(self._regularization_enabled),
             ],
-            outputs=[self.rhs, self.row_w],
             device=self.model.device,
         )
 

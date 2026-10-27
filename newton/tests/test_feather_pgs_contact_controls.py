@@ -12,6 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group, response_builds_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
@@ -206,23 +207,13 @@ def _launch_articulation_pair_contact_allocator(
 def _dense_speculative_rhs(scale: float) -> float:
     """Return the dense positive-gap RHS for a requested speculative scale."""
     rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
+    rows = field_group.upload(
+        DenseRows, "cpu", phi=[[1.0]], row_beta=[[0.2]], row_type=[[0]], target=[[0.0]], rhs=rhs, row_w=[[0.0]]
+    )
     wp.launch(
         compute_world_contact_bias,
         dim=1,
-        inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            1,
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0.2]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            0.5,
-            1.0,
-            scale,
-            1.0,
-            1.0,
-        ],
-        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
+        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 0.5, 1.0, scale, 1.0, 1.0],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -273,22 +264,13 @@ def _mf_speculative_rhs(scale: float) -> float:
 def _dense_restitution_rhs(scale: float) -> float:
     """Apply dense restitution after accumulating the scaled position RHS."""
     rhs = wp.array([[-2.0 + scale]], dtype=wp.float32, device="cpu")
+    rows = field_group.upload(
+        DenseRows, "cpu", phi=[[1.0]], row_beta=[[0.2]], row_type=[[0]], restitution=[[0.5]], rhs=rhs, row_w=[[0.0]]
+    )
     wp.launch(
         apply_world_contact_restitution_accumulated,
         dim=1,
-        inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            1,
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0.2]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.array([[0.5]], dtype=wp.float32, device="cpu"),
-            1.0,
-            scale,
-            0.0,
-            0,
-        ],
-        outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
+        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 1.0, scale, 0.0, 0],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])

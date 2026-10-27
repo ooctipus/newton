@@ -30,6 +30,9 @@ RECORDS = (
 DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
 
 
-def bind(solver, data=None):
-    """Bind the solver's dense row records into a :data:`DenseRows` (``data``: an instance to refill)."""
-    return field_group.bind(DenseRows, data, solver=solver)
+def bind(solver, data=None, **records):
+    """Bind the solver's dense row records into a :data:`DenseRows` (``data``: an instance to refill).
+
+    ``records`` replace records by field name, such as another ``rhs`` for the velocity pass.
+    """
+    return field_group.bind(DenseRows, data, solver=solver, **records)

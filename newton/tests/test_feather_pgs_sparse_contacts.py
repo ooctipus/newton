@@ -522,23 +522,17 @@ class TestSparseContacts(unittest.TestCase):
                         device=device,
                     )
                     reference_rhs = full((1, 9), -9.0)
+                    reference_rows = field_group.upload(
+                        dense_rows.DenseRows,
+                        device,
+                        **{field.name: value for field, value in zip(dense_rows.RECORDS, reference, strict=False)},
+                        rhs=reference_rhs,
+                        row_w=full((1, 9), -9.0),
+                    )
                     wp.launch(
                         compute_world_contact_bias,
                         dim=9,
-                        inputs=[
-                            count,
-                            9,
-                            reference[5],
-                            reference[3],
-                            reference[0],
-                            reference[6],
-                            0.01,
-                            1.0,
-                            law["speculative_scale"],
-                            1.0,
-                            1.0,
-                        ],
-                        outputs=[reference_rhs, full((1, 9), -9.0)],
+                        inputs=[reference_rows, count, 9, 0.01, 1.0, law["speculative_scale"], 1.0, 1.0],
                         device=device,
                     )
                     geometric_rhs = reference_rhs.numpy().copy()
@@ -546,13 +540,10 @@ class TestSparseContacts(unittest.TestCase):
                         apply_world_contact_restitution_matrix_free,
                         dim=9,
                         inputs=[
+                            reference_rows,
                             count,
                             9,
                             array([6], int),
-                            reference[5],
-                            reference[0],
-                            reference[6],
-                            reference[7],
                             f["velocity"],
                             array([np.arange(6)], int),
                             dense,
@@ -560,7 +551,6 @@ class TestSparseContacts(unittest.TestCase):
                             law["restitution_threshold"],
                             0,
                         ],
-                        outputs=[reference_rhs, full((1, 9), 1.0)],
                         device=device,
                     )
                     self.assertNotAlmostEqual(float(geometric_rhs[0, 0]), float(reference_rhs.numpy()[0, 0]))
@@ -656,19 +646,15 @@ class TestSparseContacts(unittest.TestCase):
             compute_world_contact_bias,
             dim=18,
             inputs=[
+                field_group.replace(rows, rhs=reference_rhs, row_w=array(np.full(shape, -9.0))),
                 prefix_count,
                 6,
-                rows.phi,
-                rows.row_beta,
-                rows.row_type,
-                rows.target,
                 0.0123,
                 1.0,
                 1.0,
                 1.0,
                 1.0,
             ],
-            outputs=[reference_rhs, array(np.full(shape, -9.0))],
             device=device,
         )
         np.testing.assert_array_equal(diagonal.numpy(), reference_diag.numpy())
@@ -915,13 +901,19 @@ class TestSparseContacts(unittest.TestCase):
             apply_world_contact_restitution_matrix_free,
             dim=row_count,
             inputs=[
+                field_group.upload(
+                    dense_rows.DenseRows,
+                    "cpu",
+                    row_type=kinds,
+                    phi=phi,
+                    target=target,
+                    restitution=restitution,
+                    rhs=rhs,
+                    row_w=_full((1, row_count), 1.0),
+                ),
                 count,
                 row_count,
                 _array([row_count], int),
-                phi,
-                kinds,
-                target,
-                restitution,
                 _array(incident.numpy()[0]),
                 _array([np.arange(row_count)], int),
                 _array(np.eye(row_count)[None]),
@@ -929,7 +921,6 @@ class TestSparseContacts(unittest.TestCase):
                 0.1,
                 0,
             ],
-            outputs=[rhs, _full((1, row_count), 1.0)],
             device="cpu",
         )
         np.testing.assert_allclose(rhs.numpy()[0], [-0.8, -1.08, -7.0, -7.0, -1.2, -7.0, -7.0], atol=1.0e-6)

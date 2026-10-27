@@ -32,6 +32,7 @@ import newton
 from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_selection, sweep_routes, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs import sweep as emitter
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
@@ -856,23 +857,20 @@ def _general_bias(solver, rows, dt):
     device = solver.model.device
     count = wp.array(rows["constraint_count"], dtype=wp.int32, device=device)
     rhs = wp.zeros(rows["rhs"].shape, dtype=wp.float32, device=device)
+    records = field_group.upload(
+        DenseRows,
+        device,
+        phi=rows["phi"],
+        row_beta=rows["row_beta"],
+        row_type=rows["row_type"],
+        target=rows["target_velocity"],
+        rhs=rhs,
+        row_w=wp.zeros_like(rhs),
+    )
     wp.launch(
         compute_world_contact_bias,
         dim=rhs.shape[0] * rhs.shape[1],
-        inputs=[
-            count,
-            rhs.shape[1],
-            wp.array(rows["phi"], dtype=wp.float32, device=device),
-            wp.array(rows["row_beta"], dtype=wp.float32, device=device),
-            wp.array(rows["row_type"], dtype=wp.int32, device=device),
-            wp.array(rows["target_velocity"], dtype=wp.float32, device=device),
-            dt,
-            1.0,
-            solver.contact_speculative_scale,
-            1.0,
-            1.0,
-        ],
-        outputs=[rhs, wp.zeros_like(rhs)],
+        inputs=[records, count, rhs.shape[1], dt, 1.0, solver.contact_speculative_scale, 1.0, 1.0],
         device=device,
     )
     return rhs.numpy()

@@ -6,7 +6,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import response_builds_rows
+from newton._src.solvers.feather_pgs import field_group, response_builds_rows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -355,23 +356,20 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
     inf = wp.array([float("inf")], dtype=wp.float32, device=device)
     rhs = zeros3()
     if family == "dense":
+        rows = field_group.upload(
+            DenseRows,
+            device,
+            phi=phi_arr,
+            row_beta=[list(row_beta)],
+            row_type=row_type,
+            target=zeros3(),
+            rhs=rhs,
+            row_w=zeros3(),
+        )
         wp.launch(
             compute_world_contact_bias,
             dim=3,
-            inputs=[
-                count,
-                3,
-                phi_arr,
-                wp.array([list(row_beta)], dtype=wp.float32, device=device),
-                row_type,
-                zeros3(),
-                dt,
-                bias_scale,
-                1.0,
-                1.0,
-                1.0,
-            ],
-            outputs=[rhs, zeros3()],
+            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0],
             device=device,
         )
     elif family == "mf_setup":

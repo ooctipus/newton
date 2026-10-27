@@ -16,6 +16,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import compact_contact, contact_laws, field_group, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -216,14 +217,11 @@ def _run_general(data, layout, beta):
     for w in range(WORLDS):
         world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
         world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
+    records = field_group.upload(DenseRows, device, **vars(rows))
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
-        inputs=[
-            *(layout.counts, ROWS, rows.phi, rows.row_beta, rows.row_type, rows.target, data.dt, data.bias_scale),
-            *(data.speculative_scale, 1.0, data.contact_w),
-        ],
-        outputs=[rows.rhs, rows.row_w],
+        inputs=[records, layout.counts, ROWS, data.dt, data.bias_scale, data.speculative_scale, 1.0, data.contact_w],
         device=device,
     )
     bias = rows.rhs.numpy().copy()
@@ -231,13 +229,12 @@ def _run_general(data, layout, beta):
         kernels.apply_world_contact_restitution_matrix_free,
         dim=WORLDS * ROWS,
         inputs=[
-            *(layout.counts, ROWS, wp.full(WORLDS, PRIMARY + SECONDARY, dtype=int, device=device)),
-            *(rows.phi, rows.row_type, rows.target, rows.restitution, data.incident),
+            *(records, layout.counts, ROWS, wp.full(WORLDS, PRIMARY + SECONDARY, dtype=int, device=device)),
+            data.incident,
             wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
             wp.array(world_jacobian, dtype=float, device=device),
             *(data.dt, data.restitution_threshold, 0),
         ],
-        outputs=[rows.rhs, rows.row_w],
         device=device,
     )
     return rows, jacobians, bias

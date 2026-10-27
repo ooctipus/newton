@@ -10,7 +10,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sweep_routes_split
+from newton._src.solvers.feather_pgs import field_group, sweep_routes_split
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     compute_world_contact_bias,
@@ -382,23 +383,20 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
     """A zero-gap contact is active; only a strictly positive gap is speculative."""
     with wp.ScopedDevice(device):
         row_w = wp.zeros((1, 1), dtype=wp.float32, device=device)
+        rows = field_group.upload(
+            DenseRows,
+            device,
+            phi=[[0.0]],
+            row_beta=[[0.2]],
+            row_type=[[PGS_CONSTRAINT_TYPE_CONTACT]],
+            target=[[0.0]],
+            rhs=[[0.0]],
+            row_w=row_w,
+        )
         wp.launch(
             compute_world_contact_bias,
             dim=1,
-            inputs=[
-                wp.array([1], dtype=wp.int32, device=device),
-                1,
-                wp.zeros((1, 1), dtype=wp.float32, device=device),
-                wp.full((1, 1), 0.2, dtype=wp.float32, device=device),
-                wp.full((1, 1), PGS_CONSTRAINT_TYPE_CONTACT, dtype=wp.int32, device=device),
-                wp.zeros((1, 1), dtype=wp.float32, device=device),
-                DT,
-                1.0,
-                1.0,
-                1.0,
-                0.5,
-            ],
-            outputs=[wp.zeros((1, 1), dtype=wp.float32, device=device), row_w],
+            inputs=[rows, wp.array([1], dtype=wp.int32, device=device), 1, DT, 1.0, 1.0, 1.0, 0.5],
             device=device,
         )
         test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)
