@@ -1,0 +1,1 @@
+Require warp-lang 1.17.0, which builds a module's kernels in sorted-hash order: each compile of a module now emits the same source, so kernels compile identically across processes and runs repeat bitwise. Kernel pins in `newton/tests/golden_data/test_feather_pgs_point_streams/pins.json` were re-recorded under 1.17.0.

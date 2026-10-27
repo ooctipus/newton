@@ -276,15 +276,15 @@
   "sweep_routes_diag.mf_split_kernel(32, 8, '120', has_velocity_limit_rows=True)": "95e47c80b923873a5443e06ed440da81e85ee629c35807cbd72c0572af14c746",
   "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_triples=True, solve_policy=SolvePolicy(readout='sweeps'), speculative_contact_batches=True)": "98300c6c6f2dff3766081f364330745f7fe8169132fafd47a9fdbe649b960c93",
   "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_triples=True, speculative_contact_batches=True)": "43faf009cf45914496f5cce759b6abb5523a968935face9f6c90674911fce178",
-  "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_units=True, solve_policy=SolvePolicy(readout='sweeps'), speculative_contact_batches=True)": "6dbb95f2bd208b549629da5cb554743ae7d770ef54aabdf5f4234a18ebd5df1e",
-  "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_units=True, speculative_contact_batches=True)": "5d95d3e1201847abdab0388b265c4bd88a42455063a9d590ce6f1c70de226f40",
+  "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_units=True, solve_policy=SolvePolicy(readout='sweeps'), speculative_contact_batches=True)": "cd2f8d443ad5ad883ea8d8967d63b115107bd0e428d60cab2b271e19d50c3f6b",
+  "sweep_routes_diag.sparse_diagonal_kernel(1024, 114, 6, '120', contact_units=True, speculative_contact_batches=True)": "1d4cf413263d326b82eeddb4aa27037909825934933448e8d3823e97662176e2",
   "sweep_routes_diag.sparse_diagonal_kernel(256, 13, 9, '120', contact_triples=True, speculative_contact_batches=True)": "9d4c9453c88ea1302755852c3db6bf77bf223338c1473e9c3d323c55addc3dba",
-  "sweep_routes_diag.sparse_diagonal_kernel(256, 13, 9, '120', contact_units=True, speculative_contact_batches=True)": "66f361b687e990c39e20fbc1af1bfae8afabcf0078e28e1eae1f0afb81c5b077",
+  "sweep_routes_diag.sparse_diagonal_kernel(256, 13, 9, '120', contact_units=True, speculative_contact_batches=True)": "7ab3829817f2be1efa38b85e737418bb7c39e6bd06831de57a11ace280de4a92",
   "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_triples=False, speculative_contact_batches=False)": "60dc5d42c8a7be8583ac5d85c81d1c1705b31b7c6f9b9af096e57a2c628b63c9",
   "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_triples=True, speculative_contact_batches=False)": "566878bda7a5d013ed0b03fab8afa1721eaa934744af30c314be714204c836c3",
   "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_triples=True, speculative_contact_batches=True)": "0c700505522deb105ce05f483b2168fd9e7a584156a4d2df36fe91758873c505",
-  "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, speculative_contact_batches=False)": "a1b318b9aa8bfef5d3ea7c89912bdee0a1edfc20d34c46773577a11e75b9b469",
-  "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, speculative_contact_batches=True)": "e4d00e0d9236967a1cbedcc80b8c7bcb77c6a08350370f79d3abcb48db9aad56",
+  "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, speculative_contact_batches=False)": "aedcd0c41bf04c2e307f373cdd24cf2febed36fa4a28f41e9cc0e67bbb418868",
+  "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, speculative_contact_batches=True)": "72473215b6bf7db7d302d60fce49393a13182ccff7ecda483a9c73a99512d63f",
   "sweep_routes_diag.tiled_row_kernel(128, '120')": "db058ad9f5dd8483aaee041ec0d80f9c69d63a1e86241763b27136773e4809c9",
   "sweep_routes_diag.tiled_row_kernel(128, '120', min_rows=0, row_budget=32)": "8b2e0732c279d08923205e066ba857c65a98d8f861ba793ed10e30f96aad7550",
   "sweep_routes_diag.tiled_row_kernel(128, '120', min_rows=32, row_budget=128)": "18ff94eedc4695109aced2be4bb3253d8b7968c441fc4e5b29c148cac95667df",
@@ -483,5 +483,5 @@
   "tree_passes.refresh_body_inertia": "07edd65751869b472f2efdbd89df11367085e933d0f54e671bab5f91eb1484b6",
   "tree_passes.selected_inverse_dynamics_tau": "02993304d32232e169290f0d8eff448c9c9d5d7ba0fa34ae7af1e36b61c911e8"
  },
- "warp": "1.17.0.dev20260807"
+ "warp": "1.17.0"
 }
