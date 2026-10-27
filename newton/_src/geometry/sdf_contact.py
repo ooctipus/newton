@@ -5,7 +5,12 @@ from typing import Any
 
 import warp as wp
 
-from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, SHAPE_PAIR_INDEX_MASK, ContactData
+from ..geometry.contact_data import (
+    SHAPE_PAIR_HFIELD_BIT,
+    SHAPE_PAIR_INDEX_MASK,
+    ContactData,
+    compute_contact_approach_speed,
+)
 from ..geometry.sdf_texture import (
     TextureSDFData,
     _texture_sample_sdf_hw_clamped,
@@ -1942,16 +1947,33 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                 if use_texture_sdf_for_search:
                                     inner_spatial_depth += wp.min(texture_voxel_radius * min_sdf_scale, base_gap_sum)
                                 outer_spatial_depth = margin_sum + gap_sum
+                                # The depth the contact reaches by the end of the step: the shapes' motion is known
+                                # with speculation, so a candidate its points' closing speed (rotation included)
+                                # carries into contact this step competes as touching for the bin's extremes.
+                                step_end_depth = dist
                                 if wp.static(speculative):
                                     # Keep velocity-expanded search candidates out of the regular
                                     # normal bins so the predictive pair manifold remains bounded.
                                     outer_spatial_depth = margin_sum + base_gap_sum
+                                    unit_normal = wp.normalize(contact_normal)
+                                    closing_speed = compute_contact_approach_speed(
+                                        pair[0],
+                                        pair[1],
+                                        point_world - unit_normal * (0.5 * dist),
+                                        point_world + unit_normal * (0.5 * dist),
+                                        unit_normal,
+                                        shape_transform,
+                                        shape_linear_velocity,
+                                        shape_angular_velocity,
+                                    )
+                                    step_end_depth = dist - closing_speed * collision_update_dt
                                 contact_id = export_and_reduce_contact_centered_two_spatial_depths(
                                     pair[0],
                                     pair[1],
                                     point_world,
                                     contact_normal,
                                     dist,
+                                    step_end_depth,
                                     (my_edge_idx << 2) | (mode << 1),
                                     point_world - midpoint,
                                     inner_spatial_depth,

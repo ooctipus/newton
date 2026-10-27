@@ -912,6 +912,7 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
             position=position,
             normal=normal,
             depth=depth,
+            step_end_depth=depth,
             fingerprint=fingerprint,
             centered_position=position,
             inner_spatial_depth=0.0,
@@ -963,6 +964,53 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
         outer_winners = get_winning_contacts(outer_reducer)
         outer_fingerprints = {int(outer_reducer.contact_fingerprints.numpy()[cid]) for cid in outer_winners}
         test.assertIn(2, outer_fingerprints, f"Outer contact should win when no inner contact exists ({mode})")
+
+
+def test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes(test, device):
+    """A separated candidate that closes within the step competes as touching for the directional slots."""
+
+    @wp.kernel
+    def store_step_end_contact_kernel(
+        reducer_data: GlobalContactReducerData,
+        x: float,
+        depth: float,
+        step_end_depth: float,
+        fingerprint: int,
+    ):
+        position = wp.vec3(x, 0.0, 0.0)
+        export_and_reduce_contact_centered_two_spatial_depths(
+            shape_a=0,
+            shape_b=1,
+            position=position,
+            normal=wp.vec3(0.0, 1.0, 0.0),
+            depth=depth,
+            step_end_depth=step_end_depth,
+            fingerprint=fingerprint,
+            centered_position=position,
+            inner_spatial_depth=0.0,
+            outer_spatial_depth=0.1,
+            position_local=position,
+            aabb_lower_voxel=wp.vec3(-1.0, -1.0, -1.0),
+            aabb_upper_voxel=wp.vec3(1.0, 1.0, 1.0),
+            voxel_res=wp.vec3i(1, 1, 1),
+            reducer_data=reducer_data,
+        )
+
+    # A body touching at x = 0 and rocking onto its far side at x = 0.1, 1 mm away and closing faster than 1 mm a
+    # step: the far side must keep a row, or it lands a substep's travel deep. Without closing it stays separated
+    # and the touching side holds every extreme.
+    for deterministic in (False, True):
+        for closing, expected in ((True, {1, 2}), (False, {1})):
+            reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
+            reducer_data = reducer.get_data_struct()
+            wp.launch(store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.0, -0.01, -0.01, 1], device=device)
+            step_end = -0.0005 if closing else 0.001
+            wp.launch(
+                store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.1, 0.001, step_end, 2], device=device
+            )
+            winners = get_winning_contacts(reducer)
+            fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
+            test.assertEqual(fingerprints, expected, f"closing far side: {closing}, deterministic: {deterministic}")
 
 
 def test_centered_different_pairs_independent(test, device):
@@ -1146,6 +1194,7 @@ def _store_probed_contact_kernel(reducer_data: GlobalContactReducerData, two_tie
             position=position,
             normal=normal,
             depth=depth,
+            step_end_depth=depth,
             fingerprint=5,
             centered_position=position,
             inner_spatial_depth=0.0,
@@ -1703,6 +1752,12 @@ add_function_test(
     TestGlobalContactReducer,
     "test_centered_two_spatial_depths_prefers_inner_then_outer",
     test_centered_two_spatial_depths_prefers_inner_then_outer,
+    devices=devices,
+)
+add_function_test(
+    TestGlobalContactReducer,
+    "test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes",
+    test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes,
     devices=devices,
 )
 add_function_test(

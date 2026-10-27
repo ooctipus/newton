@@ -1602,6 +1602,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     position: wp.vec3,
     normal: wp.vec3,
     depth: float,
+    step_end_depth: float,
     fingerprint: int,
     centered_position: wp.vec3,
     inner_spatial_depth: float,
@@ -1612,13 +1613,19 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     voxel_res: wp.vec3i,
     reducer_data: GlobalContactReducerData,
 ) -> int:
-    """Export contact with inner-preferred spatial winners.
+    """Export contact with touching-first spatial winners.
 
     Directional slots accept contacts out to ``outer_spatial_depth``, but
-    contacts inside ``inner_spatial_depth`` always outrank outer contacts.
-    Within the same inner/outer tier, the furthest spatial projection wins.
+    candidates that touch by the end of the step, ``step_end_depth`` inside
+    ``inner_spatial_depth``, outrank the others. ``step_end_depth`` is the
+    depth less the candidate's closing speed times the step (its current
+    ``depth`` when the motion is unknown), so the far side of a support that
+    a rocking body swings onto this step keeps rows. Within a tier the
+    furthest spatial projection wins; the max-depth and voxel slots take
+    contacts touching now (``depth`` inside ``inner_spatial_depth``) only.
     """
     use_inner = depth < inner_spatial_depth
+    step_end_inner = step_end_depth < inner_spatial_depth
     use_outer = depth < outer_spatial_depth
 
     if not use_outer:
@@ -1648,7 +1655,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
             if not might_win:
                 dir_2d = get_spatial_direction_2d(dir_i)
                 score = wp.dot(pos_2d, dir_2d)
-                probe = make_spatial_preprune_probe(score, use_inner, fingerprint, reducer_data.deterministic)
+                probe = make_spatial_preprune_probe(score, step_end_inner, fingerprint, reducer_data.deterministic)
                 if reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)] < probe:
                     might_win = True
     else:
@@ -1685,35 +1692,29 @@ def export_and_reduce_contact_centered_two_spatial_depths(
 
     won_mask = int(0)
     replaced_values = replaced_values_vec_type()
-    if use_inner and entry_idx >= 0:
+    if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             dir_2d = get_spatial_direction_2d(dir_i)
             score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, True, fingerprint, 0, reducer_data.deterministic)
+            provisional_value = make_spatial_contact_value(
+                score, step_end_inner, fingerprint, 0, reducer_data.deterministic
+            )
             previous_value = reduction_try_update_slot(entry_idx, dir_i, provisional_value, reducer_data.ht_values)
             if previous_value < provisional_value:
                 won_mask |= 1 << dir_i
                 replaced_values[dir_i] = previous_value
 
-        provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
-        previous_value = reduction_try_update_slot(
-            entry_idx,
-            wp.static(NUM_SPATIAL_DIRECTIONS),
-            provisional_value,
-            reducer_data.ht_values,
-        )
-        if previous_value < provisional_value:
-            won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS)
-            replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            provisional_value = make_spatial_contact_value(score, False, fingerprint, 0, reducer_data.deterministic)
-            previous_value = reduction_try_update_slot(entry_idx, dir_i, provisional_value, reducer_data.ht_values)
+        if use_inner:
+            provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
+            previous_value = reduction_try_update_slot(
+                entry_idx,
+                wp.static(NUM_SPATIAL_DIRECTIONS),
+                provisional_value,
+                reducer_data.ht_values,
+            )
             if previous_value < provisional_value:
-                won_mask |= 1 << dir_i
-                replaced_values[dir_i] = previous_value
+                won_mask |= 1 << wp.static(NUM_SPATIAL_DIRECTIONS)
+                replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
 
     if use_inner and voxel_entry_idx >= 0:
         provisional_value = make_contact_value(-depth, fingerprint, 0, reducer_data.deterministic)
@@ -1735,7 +1736,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
                 dir_2d = get_spatial_direction_2d(dir_i)
                 score = wp.dot(pos_2d, dir_2d)
                 provisional_value = make_spatial_contact_value(
-                    score, use_inner, fingerprint, 0, reducer_data.deterministic
+                    score, step_end_inner, fingerprint, 0, reducer_data.deterministic
                 )
                 if reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)] == provisional_value:
                     still_wins = True
@@ -1768,7 +1769,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
                     dir_2d = get_spatial_direction_2d(dir_i)
                     score = wp.dot(pos_2d, dir_2d)
                     provisional_value = make_spatial_contact_value(
-                        score, use_inner, fingerprint, 0, reducer_data.deterministic
+                        score, step_end_inner, fingerprint, 0, reducer_data.deterministic
                     )
                     reduction_rollback_slot(
                         entry_idx,
@@ -1797,21 +1798,18 @@ def export_and_reduce_contact_centered_two_spatial_depths(
             )
         return -1
 
-    if use_inner and entry_idx >= 0:
+    if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             dir_2d = get_spatial_direction_2d(dir_i)
             score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, True, fingerprint, contact_id, reducer_data.deterministic)
+            value = make_spatial_contact_value(
+                score, step_end_inner, fingerprint, contact_id, reducer_data.deterministic
+            )
             reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
 
-        max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
-        reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
-    elif entry_idx >= 0:
-        for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
-            value = make_spatial_contact_value(score, False, fingerprint, contact_id, reducer_data.deterministic)
-            reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
+        if use_inner:
+            max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
+            reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
 
     if use_inner:
         if voxel_entry_idx < 0:
