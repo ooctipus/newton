@@ -16,8 +16,7 @@ the world's response operator.
   row as above.
 
 The kernels are dual-native (:func:`.device_preludes.dual_native`): the projection laws, the patch ring's walks and the
-contact-unit law have CPU twins, and one thread needs no lane group. Each takes the parameters of the Warp kernel it
-replaces, in order, so a launch site can take either kernel unchanged.
+contact-unit law have CPU twins, and one thread needs no lane group.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ from .contact_unit import (
     RING_IMPULSE,
     RING_RESIDUAL,
     RING_SOLUTION,
-    get_unit_source,
 )
 from .device_preludes import RING
 from .kernel_template import KernelTemplate
@@ -68,12 +66,11 @@ from .sweep import (
 from .sweep import speed_row as speed_row_update
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Operands: the parameters of the Warp kernels these sweeps replace
+# Operands
 # ---------------------------------------------------------------------------------------------------------------------
 
 LOOP_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
-    ("max_constraints", int),
     ("world_diag", wp.array2d[float]),
     ("world_C", wp.array3d[float]),
     ("world_rhs", wp.array2d[float]),
@@ -88,8 +85,7 @@ LOOP_ABI = kernel_template.params(
     ("friction_start_iteration", int),
     ("iteration_offset", int),
 )
-"""The assembled loop sweep's operands (one world per thread). ``max_constraints``, the arrays' row capacity, goes
-unread, as in the replaced kernel: the sweep reads the capacity from the arrays."""
+"""The assembled loop sweep's operands (one world per thread); the arrays' row capacity is their second extent."""
 
 UNIT_ABI = kernel_template.params(
     ("ring_units", int),
@@ -139,7 +135,7 @@ the latch (its last applied load change and relaxation factor) of the unit whose
 
 _PRELUDES = (CPU_MATH, RING, *law_preludes(PROJECTION_LAW))
 """The loop sweeps' device preludes: each has a CPU twin."""
-_UNIT_PRELUDES = (*_PRELUDES, dataclasses.replace(CONTACT_UNIT, cpu=get_unit_source(cpu=True)))
+_UNIT_PRELUDES = (*_PRELUDES, CONTACT_UNIT)
 """With the contact-unit law, whose CPU twin is its CPU binding (Warp's helpers), the one its ``wp.func_native``
 functions take."""
 

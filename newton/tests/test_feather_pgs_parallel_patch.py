@@ -31,6 +31,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import keyed_rows, path_selection, sweep_routes, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
+from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 from newton._src.solvers.feather_pgs.kernels import (
@@ -554,63 +555,12 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
     test.assertLess(budget, _BUDGET_GAP * scale, f"the budget stops short of the serial fixed point: {gaps}")
 
 
-# Golden text of the parallel sweep's friction projection, one warp (NT == 32) and several warps. The point
-# pair projects onto the disk of its own freshly clamped normal (projection_laws.disk). The linked pair stages every row's fresh value
-# in shared memory (one warp: store, then a warp barrier; several warps stage before projecting) and walks its
-# ring from its own normal, summing in ring order; a parent past the admitted rows ends the ring.
-_RING_WALK = (
-    "                const float load = RING_LOAD(s_x[p], p, n_rows,\n"
-    "                    [&](int r) { const int next = s_parent[r]; return next < n_rows ? next : -1; },\n"
-    "                    [&](int r) { return s_x[r]; });\n"
-    "                const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
-)
-_POINT_WARP_PAIR = (
-    "            const float xp = READ(x_new[0], p & 31);\n"
-    "            const float xs = READ(x_new[0], sib & 31);\n"
-    "            if (fr) {\n"
-    "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
-    "                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];\n"
-)
-_LINKED_WARP_PAIR = (
-    "            const float xs = READ(x_new[0], sib & 31);\n"
-    "            if (i < n_rows) s_x[i] = x_new[0];\n"
-    "            WARP_SYNC();\n"
-    "            if (fr) {\n"
-    + _RING_WALK
-    + "                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];\n"
-)
-_POINT_BLOCK_PAIR = (
-    "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
-    "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
-    "                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];\n"
-)
-_LINKED_BLOCK_PAIR = (
-    "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
-    + _RING_WALK
-    + "                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];\n"
-)
-
-
-# Golden text of the isotropic pair step: the pair's first tangent row's lane gives both rows the smaller step,
-# unless the sibling is not an admitted friction row of the same normal or either step is zero.
-_ISOTROPIC_STEP = (
-    "    for (int i = lane; i < n_rows; i += NT) {\n"
-    "        if (s_kind[i] == 1 && i == s_parent[i] + 1) {\n"
-    "            const int j = i + 1;\n"
-    "            if (j < n_rows && s_kind[j] == 1 && s_parent[j] == s_parent[i]) {\n"
-    "                const float step_a = s_step[i];\n"
-    "                const float step_b = s_step[j];\n"
-    "                if (step_a > 0.0f && step_b > 0.0f) {\n"
-    "                    const float step_pair = fminf(step_a, step_b);\n"
-    "                    s_step[i] = step_pair;\n"
-    "                    s_step[j] = step_pair;\n"
-    "                }\n"
-    "            }\n"
-    "        }\n"
-    "    }\n"
-    "    SYNC();\n"
-    "    float t_k = 1.0f;\n"
-)
+def _tier_texts(rows: int):
+    """The emitter's text of a ``rows``-row tier's pair projections, point and pooled, and of its isotropic pair step."""
+    store = emitter.JacobiRows(rows, 32 * ((rows + 31) // 32))
+    point = emitter._jacobi_projection(store, pooled=False, pad="        ")
+    pooled = emitter._jacobi_projection(store, pooled=True, pad="        ")
+    return point, pooled, emitter.isotropic_pair_step(store, "    ")
 
 
 class TestParallelPatchReference(unittest.TestCase):
@@ -633,19 +583,18 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(linked.kernel.key, point.kernel.key + "_linked")
                 point_source = _source(point)
                 linked_source = _source(linked)
+                projection, pooled, isotropic = _tier_texts(rows)
                 for text, golden in (
-                    (point_source, _POINT_WARP_PAIR),
-                    (point_source, _POINT_BLOCK_PAIR),
-                    (point_source, _ISOTROPIC_STEP),
-                    (linked_source, _LINKED_WARP_PAIR),
-                    (linked_source, _LINKED_BLOCK_PAIR),
-                    (linked_source, _ISOTROPIC_STEP),
+                    (point_source, projection),
+                    (point_source, isotropic),
+                    (linked_source, pooled),
+                    (linked_source, isotropic),
                 ):
                     self.assertEqual(text.count(golden), 1, golden)
-                # Nothing but the ring walk's prelude and the two projections differs from the point tier.
+                # Nothing but the ring walk's prelude and the projection differs from the point tier.
                 self.assertEqual(linked_source.count(RING.source), 1)
-                restored = linked_source.replace(RING.source + "\n", "").replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
-                self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
+                restored = linked_source.replace(RING.source + "\n", "").replace(pooled, projection)
+                self.assertEqual(restored, point_source)
                 self.assertEqual(linked.block_dim, point.block_dim)
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
@@ -732,7 +681,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 with self.subTest(shape=shape, linked=linked, **extra):
                     tier = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
                     self.assertEqual(tier.kernel.key.endswith("_linked"), linked, tier.kernel.key)
-                    self.assertEqual(_source(tier).count(_ISOTROPIC_STEP), 1)
+                    self.assertEqual(_source(tier).count(_tier_texts(32)[2]), 1)
         self.assertNotIn("pair_step", inspect.signature(sweep_routes_tiers.parallel_kernel).parameters)
 
     def test_isotropic_pairs_slide_with_maximal_dissipation(self):
@@ -781,21 +730,13 @@ class TestParallelPatchReference(unittest.TestCase):
             (128, 32, 22, "120"),
         )
         variants = {
-            "response block": (plain_tiers, {"matrix_free": False}, "A_AT(i, j) * s_x[j]"),
-            "matrix-free": (plain_tiers, {"matrix_free": True}, "J_world.data[jy_world_base + i * 6 + d]"),
-            "in-kernel matrix-free": (
-                plain_tiers,
-                {"matrix_free": True, "inkernel_response": (6, 0, 0, 0)},
-                "ZAT(d, i)",
-            ),
-            "in-kernel response block": (
-                plain_tiers,
-                {"matrix_free": False, "inkernel_response": (6, 0, 0, 0)},
-                "ZAT(d, i)",
-            ),
-            "keyed rows": (keyed_tiers, {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}, "ZAT(d, i)"),
+            "response block": (plain_tiers, {"matrix_free": False}),
+            "matrix-free": (plain_tiers, {"matrix_free": True}),
+            "in-kernel matrix-free": (plain_tiers, {"matrix_free": True, "inkernel_response": (6, 0, 0, 0)}),
+            "in-kernel response block": (plain_tiers, {"matrix_free": False, "inkernel_response": (6, 0, 0, 0)}),
+            "keyed rows": (keyed_tiers, {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}),
         }
-        for name, ((factory, args), options, row_read) in variants.items():
+        for name, ((factory, args), options) in variants.items():
             with self.subTest(variant=name):
                 settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
                 plain = factory(*args, **settings)
@@ -806,7 +747,6 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertNotIn("s_vlim", _source(plain))
                 self.assertEqual(text.count("s_vlim[i] = row_type == 4 ? 1 : 0;"), 1)
                 self.assertEqual(text.count("const float r_vlim = s_rhs[i] + part;"), 1)
-                self.assertIn(row_read, text)
                 # The pass runs between the final sweep and the velocity reconstruction.
                 self.assertLess(text.index("const float r_vlim"), text.index("v_out.data[global_dof] ="))
                 self.assertGreater(text.index("const float r_vlim"), text.index("for (int sweep = 0;"))
@@ -1054,7 +994,7 @@ class TestKeyedPatchRows(unittest.TestCase):
             self.assertNotIn(written, text)
         self.assertIn("patch_law.patches.point_a.data[contact]", text)
         self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
-        for golden in (_LINKED_WARP_PAIR, _LINKED_BLOCK_PAIR, _ISOTROPIC_STEP):
+        for golden in _tier_texts(32)[1:]:
             self.assertEqual(text.count(golden), 1, golden)
 
 

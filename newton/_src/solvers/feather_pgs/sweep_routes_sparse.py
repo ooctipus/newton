@@ -20,8 +20,8 @@ caller decodes it. A configuration chooses:
   velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit under
   the solve policy.
 
-:func:`sparse_kernel` takes the arguments of the factory it replaces (``sweep_routes_sparse.sparse_kernel``)
-and builds a kernel of its ABI, dispatch and launch bounds, so a launch site can take either kernel unchanged.
+:func:`sparse_kernel` builds the kernel (:data:`SPARSE_ABI`, tiles of 64 threads) and :func:`sparse_staging` its
+working set, which the solver's admission and the factory check against the device's static budget.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from .row_inputs import RowArgument
 from .solve_policy import EXACT_POLICY, SolvePolicy
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .staging import Buffer, Staging
+from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -905,6 +905,12 @@ def _staging(sweep: SparseSweep, rows: SparseRows, op: SparseFactor) -> Staging:
     return Staging(tuple(buffers), groups=sweep.groups, threads=THREADS, layout="arrays")
 
 
+def sparse_staging(max_constraints: int, max_world_dofs: int, max_row_dofs: int, **options) -> Staging:
+    """The shared working set of the sweep :func:`sparse_kernel` builds from the same arguments, without its body."""
+    sweep = _resolve(max_constraints, max_world_dofs, max_row_dofs, **options)
+    return _staging(sweep, SparseRows(sweep.rows, Lanes(sweep.lanes)), factor_operator(sweep))
+
+
 def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     """The sweep's native body: staging and setup, then per sweep the active scan, the row loop (transaction, then
     the ordinary update), the last-word velocity-limit pass and the exit; then the publication."""
@@ -1017,7 +1023,7 @@ def sparse_source(
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
 ) -> tuple[str, Staging]:
-    """The native body of the sparse sweep and its staging (the arguments of the factory it replaces)."""
+    """The native body of the sparse sweep and its staging."""
     return _source(
         _resolve(
             max_constraints,
@@ -1061,11 +1067,13 @@ def sparse_kernel(
     solve_policy: SolvePolicy = EXACT_POLICY,
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
+    device_arch=None,
 ) -> wp.Kernel:
-    """The sparse sweep kernel (the arguments, ABI, dispatch and launch bounds of the factory it replaces).
+    """The sparse sweep kernel.
 
     Launch ``ceil(world_count / (64 / lanes_per_world))`` tiles of 64 threads. The single-stage transaction takes
-    ``contact_records`` after ``iteration_offset``; a solve readout appends its operand after ``support``.
+    ``contact_records`` after ``iteration_offset``; a solve readout appends its operand after ``support``. The
+    working set must fit the static budget of ``device_arch`` (:func:`.staging.arch_budget`).
     """
     sweep = _resolve(
         max_constraints,
@@ -1087,7 +1095,7 @@ def sparse_kernel(
         transaction_blocks=transaction_blocks,
     )
     snippet, staging = _source(sweep)
-    staging.check("the sparse sweep")
+    staging.check("the sparse sweep", arch_budget(device_arch))
     extra = sweep.policy.arguments
     if sweep.single_stage:
         extra = (RowArgument("contact_records", wp.array3d[float], after="iteration_offset"), *extra)

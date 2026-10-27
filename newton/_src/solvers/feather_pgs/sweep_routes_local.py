@@ -3,8 +3,7 @@
 
 """The local owners' sweeps and the paired factor sweep as configurations of the sweep emitter (:mod:`.sweep`).
 
-Each kernel function takes the arguments of the factory it replaces, with that factory's kernel ABI and dispatch,
-so a launch site can take either kernel unchanged.
+Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
 
 - :func:`local_owned_kernel`: one lane group (8, 16 or 32 lanes) per candidate articulation, or articulation and
   free body, with several groups per block. The group stages the factors and rows, builds each row's response in
@@ -415,7 +414,7 @@ def local_owned_kernel(
     row_inputs=None,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """A local owner's sweep kernel (the arguments and ABI of the factory it replaces).
+    """A local owner's sweep kernel.
 
     ``row_inputs`` (:class:`.row_inputs.CompactLocalRows`) reads the rows' Jacobians from its packets, whose
     operands follow the ABI's; a solve readout's operand comes last.
@@ -762,8 +761,7 @@ def paired_factor_kernel(
     contact_units: bool = False,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """The paired factor sweep kernel (the arguments and ABI of the factory it replaces); a readout's operand
-    follows ``v_out``."""
+    """The paired factor sweep kernel; a readout's operand follows ``v_out``."""
     snippet, staging = paired_factor_source(
         max_constraints,
         max_world_dofs,

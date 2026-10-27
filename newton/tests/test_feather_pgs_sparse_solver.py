@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration checks for the sparse dynamics and contact path."""
 
+import functools
 import os
 import unittest
 from unittest import mock
@@ -10,12 +11,14 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 400.0
@@ -147,6 +150,28 @@ def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous
     if not prescribed:
         builder.add_ground_plane()
     return builder.finalize(device=device)
+
+
+def _over_budget_rows(model) -> int:
+    """The smallest dense row capacity whose sparse sweep outgrows its device's static budget.
+
+    The working set is the one the admission sizes (:func:`.sweep_routes_sparse.sparse_staging`), for the sweep a
+    small capacity admits.
+    """
+    probe = _make_solver(model, True)
+    staging = functools.partial(
+        sweep_routes_sparse.sparse_staging,
+        max_world_dofs=probe.max_world_dofs,
+        max_row_dofs=probe._sparse_max_row_support,
+        active_rows=probe._sparse_active_rows,
+        linked_rows=probe._friction_anchors_enabled,
+    )
+    budget = arch_budget(model.device.arch)
+    low, high = 1, 1 << 16
+    while high - low > 1:
+        middle = (low + high) // 2
+        low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
+    return high
 
 
 def _make_solver(model, sparse, **overrides):
@@ -528,7 +553,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         model = _build_model()
         for options in (
             {"contact_torsion_radius": 0.01},
-            {"dense_max_constraints": 2048},
+            {"dense_max_constraints": _over_budget_rows(model)},
         ):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)

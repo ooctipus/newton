@@ -431,16 +431,15 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         """Keep the paired tangent law and fenced publication in the dense projector."""
         for stream in (False, True):
             with self.subTest(stream_mf_impulses=stream):
-                kernel = sweep_routes.mf_gs_kernel(
+                # The generated text (no device: staged impulses at this capacity exceed the CPU build's budget).
+                snippet, _ = sweep_routes.mf_gs_source(
                     256,
                     15984,
                     3135,
-                    "cpu",
                     has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
                     stream_mf_impulses=stream,
                 )
-                snippet = max(_native_snippets(kernel), key=len)
                 self.assertIn("READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
                 start = snippet.index("const float sibling_impulse = READ(lane == 0 ? s_lam_dense[sib] : 0.0f, 0);")

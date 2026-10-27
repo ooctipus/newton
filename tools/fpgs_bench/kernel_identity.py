@@ -209,9 +209,9 @@ def factory_calls():
             {"geometric": True, "geometric_index": index, "geometric_stride": size * size + 1, "geometric_group": True},
         )
         for kwargs in ({}, {"assembly": "crba"}, {"inverse": True}):
-            yield dense + "factor_tiles_kernel", tiles, (size, ARCH), kwargs
-        yield dense + "inverse_lanes_kernel", lanes, (size, ARCH), {}
-        yield dense + "inverse_lanes_kernel", lanes, (size, ARCH), {"lower_only": True}
+            yield dense + "factor_tiles_kernel", tiles, (size,), kwargs
+        yield dense + "inverse_lanes_kernel", lanes, (size,), {}
+        yield dense + "inverse_lanes_kernel", lanes, (size,), {"lower_only": True}
         yield name + "_get_triangular_solve_kernel", _unwrapped(solver._get_triangular_solve_kernel), (size, ARCH), {}
     yield from held_factor_calls()
 

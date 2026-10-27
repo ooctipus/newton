@@ -80,7 +80,8 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
         )
         self.assertIsNotNone(solver._sparse_mass_matrix_size, solver._sparse_selection_reason)
         self.assertTrue(solver._sparse_split)
-        self.assertEqual(solver._pgs_solve_sparse_kernel.key.endswith("_warm_start"), warmstart)
+        # The policy's slack follows the variant's name (``_ctol...``).
+        self.assertEqual("_warm_start" in solver._pgs_solve_sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
         states = [model.state() for _ in range(2)]

@@ -125,7 +125,6 @@ def _first_solve_sweeps(model, contacts, sweeps, dt=0.005):
             dim=solver.world_count,
             inputs=[
                 solver.constraint_count,
-                solver.dense_max_constraints,
                 solver.diag,
                 solver.C,
                 solver.rhs,

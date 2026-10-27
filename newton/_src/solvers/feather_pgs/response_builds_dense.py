@@ -390,7 +390,7 @@ ASSEMBLIES = ("mass", "crba")
 
 @functools.cache
 def factor_tiles_kernel(
-    n_dofs: int, device_arch, tile_threads: int = 64, *, assembly: str = "mass", inverse: bool = False
+    n_dofs: int, tile_threads: int = 64, *, assembly: str = "mass", inverse: bool = False
 ) -> wp.Kernel:
     """The factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
     ``tile_cholesky(tile_diag_add(H, R))``, the primitive's rounding.
@@ -399,7 +399,6 @@ def factor_tiles_kernel(
     entry ``S_p . F_s`` and the drives' ``K`` on the diagonal, ``(S F + K) + R``. With ``inverse`` the factor also
     materializes ``H^-1 = tile_cholesky_solve(L, I)``.
     """
-    del device_arch
     if assembly not in ASSEMBLIES:
         raise ValueError(f"assembly must be one of {ASSEMBLIES}, got {assembly!r}")
     if inverse and assembly != "mass":
@@ -527,11 +526,10 @@ def factor_tiles_kernel(
 
 
 @functools.cache
-def inverse_lanes_kernel(n_dofs: int, device_arch, *, lower_only: bool = False) -> wp.Kernel:
+def inverse_lanes_kernel(n_dofs: int, *, lower_only: bool = False) -> wp.Kernel:
     """An explicit inverse, one lane per column (``dim = articulations * 32``): lane ``l`` solves ``L x = e_l``
     (``lower_only``: ``L^-1``) and then ``L^T y = x`` (``H^-1``) in registers with the kit's solves (unrolled, Z0)
     and stores column ``l``. CUDA only."""
-    del device_arch
     n = int(n_dofs)
     solve = CholeskySolve(
         n, lambda row, col: f"L_group.data[factor_base + {row} * {n} + {col}]", ascending=True, unroll=True
@@ -887,7 +885,6 @@ for (int d = 0; d < N_; ++d) {
 def response_tiles_kernel(
     n_dofs: int,
     max_constraints: int,
-    device_arch,
     tile_threads: int = 64,
     constraint_chunk_size: int | None = None,
     write_world: bool = False,
@@ -900,7 +897,6 @@ def response_tiles_kernel(
     (the kernel then takes ``diag_group``, which a plain kernel does not declare at all: Warp keeps an unused
     output's work).
     """
-    del device_arch
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
     chunk_size = max_constraints if constraint_chunk_size is None else int(constraint_chunk_size)
     if chunk_size <= 0 or chunk_size > max_constraints:
@@ -1597,12 +1593,11 @@ def delassus_entries_kernel() -> wp.Kernel:
 
 
 @functools.cache
-def delassus_tiles_kernel(n_dofs: int, max_constraints: int, device_arch, tile_threads: int = 64) -> wp.Kernel:
+def delassus_tiles_kernel(n_dofs: int, max_constraints: int, tile_threads: int = 64) -> wp.Kernel:
     """The response and the Delassus fused, one tile per articulation (``launch_tiled(dim=[articulations],
     block_dim=tile_threads)``), rows in chunks (:func:`.execution_plan._fused_response_chunk_size`): per chunk
     ``Y_i`` by the tile solves, then ``C_ji = tile_matmul(J_j, X_i)`` stored, the diagonal ``C_tt + cfm`` stored
     (the primitives' rounding)."""
-    del device_arch
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
     chunk = _fused_response_chunk_size(max_constraints)
     TILE_CHUNK_LOCAL = wp.constant(chunk)

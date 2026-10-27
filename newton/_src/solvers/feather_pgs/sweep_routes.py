@@ -3,8 +3,8 @@
 
 """FeatherPGS's sweep routes as configurations of the sweep emitter (:mod:`.sweep`).
 
-Each function here builds one route's kernel from the emitter's parts and takes the arguments of the factory it
-replaces, with that factory's kernel ABI, so a launch site can take either kernel unchanged.
+Each function here builds one route's kernel from the emitter's parts; every kernel's working set fits the static
+budget of the device it is built for (:func:`.staging.arch_budget`).
 """
 
 from __future__ import annotations
@@ -371,7 +371,7 @@ def mf_gs_source(
     mapped = ""
     if colored_rows > 0:
         # The worlds of the other mapping; the unit builder takes the colored ones by the same test.
-        mapped = f"    if (mf_contact_end {'<' if colored else '>='} {int(colored_rows)}) return;"
+        mapped = f"\n    if (mf_contact_end {'<' if colored else '>='} {int(colored_rows)}) return;"
     load_lo = "    int load_lo = (row_phase == 5) ? 0 : dense_lo;" if fuse_vel_limits else ""
     empty_limit_phase = (
         "" if fuse_vel_limits else "    if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"
@@ -417,7 +417,7 @@ def mf_gs_source(
             argmax="BLOCK_ARGMAX",
         )
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
-        first_warp, end_first_warp, barrier = "    if (warp == 0) {", "    }", "__syncthreads();"
+        first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
         free_phase = _colored_units(free, laws, M_MF)
         trace_reduction = ""
         if solve_policy.traces:
@@ -448,8 +448,7 @@ def mf_gs_source(
     if (m_mf > {M_MF}) m_mf = {M_MF};
 {chr(10).join(skips)}
     int mf_contact_end = mf_contact_rows_end.data[world];
-    if (mf_contact_end > m_mf) mf_contact_end = m_mf;
-{mapped}
+    if (mf_contact_end > m_mf) mf_contact_end = m_mf;{mapped}
 
     // Row phases own contiguous dense ranges: 3 [0, bounds[0]), 5 [bounds[0], bounds[1]), 4 [bounds[1], m).
     int dense_lo = 0;
@@ -476,8 +475,7 @@ def mf_gs_source(
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}
 
-{first_warp}
-    for (int i = {"load_lo" if fuse_vel_limits else "dense_lo"} + lane; i < dense_hi; i += 32) {{
+{first_warp}    for (int i = {"load_lo" if fuse_vel_limits else "dense_lo"} + lane; i < dense_hi; i += 32) {{
 {dense_loads}
     }}
     if (row_phase != 3 && row_phase != 6) {{
@@ -489,8 +487,7 @@ def mf_gs_source(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
     }}
-{end_first_warp}
-    {barrier}
+{end_first_warp}    {barrier}
 
 {dense_op.pipeline_registers("    ")}
 
@@ -498,21 +495,16 @@ def mf_gs_source(
         int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 
-{first_warp}
-{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
-{end_first_warp}
-{"        __syncthreads();" if colored else ""}
+{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
+{end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
 {free_phase}
         }}
 
-{first_warp}
-{chr(10).join(passes)}
-{end_first_warp}
-{sweep_end}    }}
+{first_warp}{chr(10).join(passes)}
+{end_first_warp}{sweep_end}    }}
 
-{first_warp}
-    for (int d = lane; d < {D}; d += 32) {{
+{first_warp}    for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];
     }}
@@ -524,8 +516,7 @@ def mf_gs_source(
             {mf_store}
         }}
     }}
-{end_first_warp}
-#endif
+{end_first_warp}#endif
 """
     preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
@@ -578,8 +569,7 @@ def mf_gs_kernel(
         solve_policy=solve_policy,
     )
     colored = mapping == "colored"
-    if colored:
-        staging.check("the colored sweep", arch_budget(device_arch))
+    staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
     name = (
         f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
@@ -826,8 +816,9 @@ def incremental_kernel(
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """The incremental tier's kernel (the arguments and ABI of the factory it replaces: the matrix-free sweep's)."""
-    snippet, _staging = incremental_source(
+    """The incremental tier's kernel (the matrix-free sweep's ABI); its working set fits the static budget of
+    ``device_arch``."""
+    snippet, staging = incremental_source(
         max_constraints,
         max_world_dofs,
         incremental_rows=incremental_rows,
@@ -838,6 +829,7 @@ def incremental_kernel(
         velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
     )
+    staging.check("the incremental tier", arch_budget(device_arch))
     name = (
         f"sweep_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{int(incremental_rows)}"
         f"_min{int(min_rows)}_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"

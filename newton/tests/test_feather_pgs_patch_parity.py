@@ -181,7 +181,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         impulses = wp.zeros((1, capacity), dtype=float, device="cpu")
         diag = wp.ones((1, capacity), dtype=float, device="cpu")
         matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device="cpu")
-        inputs = [count, capacity, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, mu, 0, 0, 0]
+        inputs = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, mu, 0, 0, 0]
         wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=inputs, device="cpu")
         solved = impulses.numpy()
         np.testing.assert_allclose(solved[0, :7], [0, 1, 0, 4, 0, 1, 0], atol=1.0e-6)

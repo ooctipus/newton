@@ -527,7 +527,7 @@ class _SplitVelocityLimitChecks:
                     self.assertEqual(key, "sweep_mf_loop")
                 else:
                     suffix = "_vlim" if law else ""
-                    self.assertEqual(key, f"pgs_solve_mf_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
+                    self.assertEqual(key, f"sweep_mf_split_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
 
 
 class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCase):

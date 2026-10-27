@@ -321,7 +321,6 @@ class World:
         for count, offset in launches:
             common = [
                 self.w_count,
-                self.D,
                 self.w["diag"],
                 self.w_C,
                 self.w["rhs"],

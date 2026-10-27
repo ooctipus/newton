@@ -845,8 +845,8 @@ def get_unit_source(*, cpu: bool = False) -> str:
     )
 
 
-CONTACT_UNIT = DevicePrelude("contact_unit", get_unit_source())
-"""The contact-unit law, ``ContactUnit::solve``, ``latch`` and ``ring``, for native sweeps."""
+CONTACT_UNIT = DevicePrelude("contact_unit", get_unit_source(), get_unit_source(cpu=True))
+"""The contact-unit law, ``ContactUnit::solve``, ``latch`` and ``ring``, for native sweeps, with its CPU twin."""
 
 _CPU_UNIT = get_unit_source(cpu=True)
 

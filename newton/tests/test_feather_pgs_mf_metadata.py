@@ -161,11 +161,11 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         packed = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
         for stream in (False, True):
             with self.subTest(stream_mf_impulses=stream):
-                kernel = sweep_routes.mf_gs_kernel(
+                # The generated text (no device: at this row capacity the staged impulses fit none).
+                source, _ = sweep_routes.mf_gs_source(
                     4,
                     65535,
                     6,
-                    "cpu",
                     has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
                     shared_metadata=False,
@@ -173,7 +173,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 )
                 result = wp.zeros(len(parents), dtype=int, device="cpu")
                 wp.launch(
-                    _parent_decoder(max(_native_snippets(kernel), key=len)),
+                    _parent_decoder(source),
                     dim=len(parents),
                     inputs=[wp.array(packed, dtype=int, device="cpu")],
                     outputs=[result],
@@ -234,24 +234,18 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         """Use the same unsigned layout when following normal-load patch links."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         packed = ((parents.astype(np.int64) & 65535) << 16).astype(np.uint32).view(np.int32)
-        cases = (
-            (
-                sweep_routes.mf_gs_kernel(8, 65535, 29, "cpu"),
-                "sweep_mf_gs_native",
-                "mf_meta.data[off_meta + patch_row * 4 + 3]",
-            ),
-            (
-                sweep_routes_local.local_owned_kernel(
-                    8, 8, 23, "cpu", paired_dof_count=6, mf_max_constraints=65535, local_mf_max_constraints=3
-                ),
-                "sweep_local_native",
-                "mf_meta.data[off_meta + patch_row * 4 + 3]",
-            ),
+        local = sweep_routes_local.local_owned_kernel(
+            8, 8, 23, "cpu", paired_dof_count=6, mf_max_constraints=65535, local_mf_max_constraints=3
         )
-        for kernel, native_name, word in cases:
-            with self.subTest(kernel=kernel.key):
-                closure = inspect.getclosurevars(kernel.func)
-                source = (closure.globals | closure.nonlocals)[native_name].native_snippet
+        closure = inspect.getclosurevars(local.func)
+        cases = (
+            # The matrix-free sweep's generated text (no device: its staged impulses at this capacity fit none).
+            ("sweep_mf_gs", sweep_routes.mf_gs_source(8, 65535, 29)[0]),
+            (local.key, (closure.globals | closure.nonlocals)["sweep_local_native"].native_snippet),
+        )
+        word = "mf_meta.data[off_meta + patch_row * 4 + 3]"
+        for name, source in cases:
+            with self.subTest(kernel=name):
                 # Dense-row links use a different, unpacked array. The ring walk's parent accessor returns the
                 # decoded link of its row.
                 start = source.index(word)

@@ -649,7 +649,7 @@ def recorded_patch_seeds():
 
     def spy(launch):
         def run(kernel, *args, **kwargs):
-            if records and records[-1]["impulses"] is not None and kernel.key.startswith("pgs_solve"):
+            if records and records[-1]["impulses"] is not None and kernel.key.startswith("sweep_"):
                 record = records[-1]
                 impulses, record["impulses"] = record["impulses"].numpy(), None
                 for anchor in record["anchors"]:

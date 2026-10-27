@@ -561,8 +561,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             wp.zeros((worlds, 1), device=device),
                             8,
                             omega,
-                            0.0,
-                            0.0,
                             friction_start,
                             iteration_offset,
                         ],

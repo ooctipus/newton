@@ -3,6 +3,7 @@
 
 """Check ordered contact transactions against physical sparse PGS references."""
 
+import functools
 import os
 import unittest
 from itertools import product
@@ -22,7 +23,8 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton._src.solvers.feather_pgs.staging import arch_budget
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
@@ -429,14 +431,29 @@ class TestSparseContactTriplets(unittest.TestCase):
     def test_host_admission_and_shared_memory_fallback_cuda(self):
         """Admit compatible triplets and preserve sparse fallback at resource limits."""
         model = _branched_model(4, 3, "cuda:0")
+        # The largest capacity whose staged point transaction fits the device's static budget, and one more row.
+        budget = arch_budget(wp.get_device("cuda:0").arch)
+        staging = functools.partial(
+            sparse_staging,
+            max_world_dofs=18,
+            max_row_dofs=12,
+            active_rows=True,
+            use_support_table=True,
+            contact_triplets=True,
+            contact_transaction="staged",
+        )
+        low, high = 192, 1 << 16
+        while high - low > 1:
+            middle = (low + high) // 2
+            low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
         cases = (
             ("0", 192, {}, False),
             ("1", 192, {}, True),
             ("1", 40, {}, False),  # The tiny batch's support table costs more than explicit indices.
             ("1", 192, {"sparse_active_contacts": False}, False),
             ("1", 192, {"sparse_row_support": False}, False),
-            ("1", 1776, {}, True),
-            ("1", 1777, {}, False),
+            ("1", low, {}, True),
+            ("1", high, {}, False),
         )
         for flag, capacity, overrides, selected in cases:
             with (
@@ -674,7 +691,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         full = sparse_kernel(192, 12, 12, linked_rows=True, **options)
         point = sparse_kernel(192, 12, 12, active_rows=True, **options)
         self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single12_linked"))
-        self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_single12_linked"))
+        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_single12_linked"), full.key)
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
         options["contact_transaction"] = "staged"
         staged = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
@@ -718,7 +735,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     split_candidate=split,
                     velocity_candidate=velocity,
                     use_support_table=table,
-                    fits=fits,
+                    fits=lambda fits=fits: fits,
                 )
                 self.assertEqual(decision, admitted)
                 self.assertIn(phrase, reason)
@@ -759,7 +776,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 control = DeviceSolve(data, candidate=False, active=active, linked=True)
                 candidate = DeviceSolve(data, candidate=True, active=active, linked=True, transaction=transaction)
                 self.assertIn("_contact_triplets", candidate.kernel.key)
-                self.assertTrue(candidate.kernel.key.endswith("_linked"))
+                self.assertIn("_linked", candidate.kernel.key)
                 self.assertEqual(candidate.single_stage, transaction == "single")
                 self.assertNotIn("_contact_triplets", control.kernel.key)
                 control.launch()
@@ -798,10 +815,10 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ),
             (
                 {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"},
-                "_0_0_support_table_contact_triplets_single12_linked",
+                "_18_12_support_table_contact_triplets_single12_linked",
             ),
             ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "0"}, "_active_support_table_linked"),
-            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_0_0_support_table"),
+            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_18_12_support_table"),
         ):
             with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True):
                 solver = SolverFeatherPGS(

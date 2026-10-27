@@ -216,7 +216,7 @@ class _SparseCase:
             *[wp.zeros((worlds, 1, 6), device=device) for _ in range(4)],
             wp.zeros((worlds, 1), device=device),
         ]
-        self.solve = (omega, 0.0, 0.0, friction_start, offset)
+        self.solve = (omega, friction_start, offset)
         worlds_per_block = 64 // options.get("lanes_per_world", 32)
         self.blocks = (worlds + worlds_per_block - 1) // worlds_per_block
         self.worlds = worlds

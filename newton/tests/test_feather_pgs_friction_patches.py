@@ -1403,7 +1403,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             kernel = tiled_row_kernel(capacity, str(wp.get_device(device).arch))
             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
         else:
-            wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=[count, capacity, *args[1:]], device=device)
+            wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=args, device=device)
         np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
 
     def test_planar_patch_reduces_friction_rows(self):

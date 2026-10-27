@@ -82,7 +82,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                 if resolved_mode == "tiled_row":
                     self.assertEqual(
                         solver._pgs_solve_tiled_row_kernel.key,
-                        f"pgs_solve_tiled_row_{capacity}",
+                        f"sweep_tiled_row_{capacity}",
                     )
                 else:
                     self.assertIsNone(solver._pgs_solve_tiled_row_kernel)
@@ -91,7 +91,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                 else:
                     self.assertEqual(
                         [kernel.key for kernel in selected],
-                        [f"pgs_solve_tiled_row_{capacity}_b32_m0", f"pgs_solve_tiled_row_{capacity}_b{capacity}_m32"],
+                        [f"sweep_tiled_row_{capacity}_b32_m0", f"sweep_tiled_row_{capacity}_b{capacity}_m32"],
                     )
                 if selected:
                     original_labels = [argument.label for argument in solver._pgs_solve_tiled_row_kernel.adj.args]
@@ -140,7 +140,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
             double_buffer=False,
         )
         dense = solver.get_path_selection()["routes"]["sweep"]["dense"]
-        self.assertEqual(dense["kernels"], [f"pgs_solve_tiled_row_{capacity}_global"])
+        self.assertEqual(dense["kernels"], [f"sweep_tiled_row_{capacity}_global"])
         self.assertEqual(dense["staging"], "global")
         self.assertIn(str(limit), dense["staging_reason"])
         state_0, state_1 = model.state(), model.state()

@@ -3,9 +3,8 @@
 
 """The parallel (Jacobi) tiers as configurations of the sweep emitter (:mod:`.sweep`).
 
-:func:`parallel_kernel` takes the arguments of the solver's parallel tier factory and builds a kernel with its ABI
-and dispatch (:data:`PARALLEL_ABI`, the world queue), returning the same tier descriptor, so a launch site can take
-either kernel unchanged.
+:func:`parallel_kernel` builds a tier's kernel (:data:`PARALLEL_ABI`, the world queue) and returns its launch
+descriptor (:class:`.kernel_template.SweepTier`).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
 (:class:`.sweep.JacobiRows`). The rows step together under the Jacobi law with Nesterov momentum
@@ -32,7 +31,7 @@ from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax
-from .staging import Buffer, Staging
+from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
     JOINT_LIMIT,
@@ -114,8 +113,8 @@ def _operands(
     exact_row_sums: bool,
     row_inputs,
 ):
-    """Validate the tier's options as the factory it replaces does (same checks, order and messages); return the
-    in-kernel response's group sizes and offsets and the keyed rows' operands (``None`` without)."""
+    """Validate the tier's options; return the in-kernel response's group sizes and offsets and the keyed rows'
+    operands (``None`` without)."""
     _validate_dense_metadata_encoding(max_constraints)
     M_D, D, AM = max_constraints, max_world_dofs, int(rows)
     if AM <= 0 or AM > M_D or AM > 128:
@@ -287,7 +286,6 @@ def parallel_kernel(
     min_rows: int = 0,
     matrix_free: bool = False,
     has_drive_rows: bool = False,
-    has_dense_velocity_limit_rows: bool = False,
     skip_local_internal_worlds: bool = False,
     inkernel_response: tuple[int, int, int, int] | None = None,
     exact_row_sums: bool = False,
@@ -296,12 +294,12 @@ def parallel_kernel(
     velocity_limit_pass: bool = False,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> SweepTier:
-    """A parallel tier (the arguments, ABI and tier descriptor of the factory it replaces).
+    """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 
-    A thread per row: the block's threads cover ``rows`` in whole warps. ``has_dense_velocity_limit_rows`` and
-    ``device_arch`` are unused, ``mf_max_constraints`` names the kernel only: the tier owns no world with
-    free-body rows and admits its velocity-limit rows as accumulated unilateral rows whatever the serial sweeps'
-    law.
+    A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
+    of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
+    carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as accumulated
+    unilateral rows whatever the serial sweeps' law.
     """
     options = {
         "rows": rows,
@@ -312,7 +310,7 @@ def parallel_kernel(
         "exact_row_sums": exact_row_sums,
         "row_inputs": row_inputs,
     }
-    snippet, _staging = parallel_source(
+    snippet, staging = parallel_source(
         max_constraints,
         max_world_dofs,
         **options,
@@ -323,6 +321,7 @@ def parallel_kernel(
         velocity_limit_pass=velocity_limit_pass,
         solve_policy=solve_policy,
     )
+    staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
     AM = int(rows)
     NT = 32 * ((AM + 31) // 32)

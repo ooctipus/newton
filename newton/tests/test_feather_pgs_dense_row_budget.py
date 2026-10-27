@@ -87,6 +87,7 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
             _pgs_friction_start_iteration=2,
             _pgs_iteration_offset=3,
             _regularization_enabled=True,
+            _solve_readout=SimpleNamespace(operands=lambda kernel: []),
         )
         for name in ("constraint_count", "diag", "C", "rhs", "impulses", "row_type", "row_parent", "row_mu", "row_w"):
             setattr(state, name, object())

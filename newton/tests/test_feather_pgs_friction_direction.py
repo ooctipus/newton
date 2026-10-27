@@ -156,7 +156,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             wp.launch(
                                 sweep_routes_split.loop_kernel(),
                                 dim=1,
-                                inputs=[args[0], capacity, *args[1:]],
+                                inputs=args,
                                 device=device,
                             )
                         else:

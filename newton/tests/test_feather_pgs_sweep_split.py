@@ -256,7 +256,7 @@ def _dense_case(rng, unit):
 
     def launch(kernel):
         a = {name: wp.array(value, device="cpu") for name, value in data.items()}
-        inputs = [a["count"], capacity, a["diag"], a["C"], a["rhs"], a["lam"], options["iterations"], options["omega"]]
+        inputs = [a["count"], a["diag"], a["C"], a["rhs"], a["lam"], options["iterations"], options["omega"]]
         inputs += [a["kinds"], a["parents"], a["mu"], a["w"], options["regularize"], options["friction_start"]]
         inputs.append(options["offset"])
         storage = []

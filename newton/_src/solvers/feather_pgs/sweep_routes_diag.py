@@ -11,8 +11,7 @@
 - :func:`mf_split_kernel`: split mode's free-body rows (:class:`.FreeBody6` with one thread per row), their bodies'
   velocities staged through the world's local body map.
 
-Each takes the arguments of the factory it replaces, with that factory's kernel ABI, so a launch site can take either
-kernel unchanged.
+Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
 """
 
 from __future__ import annotations
@@ -461,8 +460,8 @@ def sparse_diagonal_kernel(
     contact_units: bool = False,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """The sparse-diagonal sweep kernel (the arguments and ABI of the factory it replaces)."""
-    snippet, _staging = sparse_diagonal_source(
+    """The sparse-diagonal sweep kernel."""
+    snippet, staging = sparse_diagonal_source(
         max_constraints,
         max_world_dofs,
         dense_dofs,
@@ -471,6 +470,7 @@ def sparse_diagonal_kernel(
         contact_units=contact_units,
         solve_policy=solve_policy,
     )
+    staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
         f"sweep_sparse_diagonal_{int(max_constraints)}_{int(max_world_dofs)}_{int(dense_dofs)}"
         + ("_contact_groups" if contact_triples else "")
@@ -885,10 +885,11 @@ def mf_split_kernel(
     has_velocity_limit_rows: bool = False,
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
-    """The split free-body sweep kernel (the arguments and ABI of the factory it replaces)."""
-    snippet, _staging = mf_split_source(
+    """The split free-body sweep kernel."""
+    snippet, staging = mf_split_source(
         mf_max_constraints, max_mf_bodies, has_velocity_limit_rows=has_velocity_limit_rows, solve_policy=solve_policy
     )
+    staging.check("the split free-body sweep", arch_budget(device_arch))
     name = (
         f"sweep_mf_split_{mf_max_constraints}_{max_mf_bodies}"
         + ("_vlim" if has_velocity_limit_rows else "")

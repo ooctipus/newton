@@ -46,7 +46,7 @@ from newton.tests.feather_pgs_row_builders import (
     is_row_builder,
     launched_kernels,
 )
-from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
+from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver, _over_budget_rows
 from newton.tests.unittest_utils import assert_host_only
 
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -1086,7 +1086,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         cases = (
             ({"sparse_mass_matrix": "off"}, "Explicit"),
             ({"trisolve_kernel": "loop"}, "explicit dense"),
-            ({"dense_max_constraints": 2048}, "shared memory"),
+            ({"dense_max_constraints": _over_budget_rows(model)}, "shared memory"),
         )
         for options, expected in cases:
             with self.subTest(options=options):

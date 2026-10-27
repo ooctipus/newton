@@ -3,6 +3,7 @@
 
 """Select persistent patch-friction rows at sparse sweep entry, as point friction does."""
 
+import functools
 import os
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import sweep_routes_sparse
+from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.test_feather_pgs_path_selection import _cpu_model
@@ -76,23 +79,27 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.assertIn(phrase, reason)
 
     def test_small_world_lanes_follow_the_full_sweep(self):
-        """Pack small complete sweeps into 8 or 16 lanes from the full sweep's shared memory."""
-        limit = 48 * 1024
-        for dofs, rows, environment, shared, expected in (
-            (8, 64, {}, 1000, 8),
-            (9, 32, {}, 1000, 16),
-            (16, 64, {}, limit // 2, 16),
-            (16, 64, {}, limit // 2 + 1, 0),
-            (17, 32, {}, 1000, 0),
-            (9, 65, {}, 1000, 0),
-            (9, 32, {"FEATHER_PGS_SPARSE_SMALL_WORLDS": "0"}, 1000, 0),
+        """Pack small complete sweeps into 8 or 16 lanes where the packed sweep's working set fits the budget."""
+        for dofs, rows, environment, slack, expected in (
+            (8, 64, {}, 0, 8),
+            (9, 32, {}, 0, 16),
+            (16, 64, {}, 0, 16),
+            (16, 64, {}, -1, 0),
+            (17, 32, {}, 0, 0),
+            (9, 65, {}, 0, 0),
+            (9, 32, {"FEATHER_PGS_SPARSE_SMALL_WORLDS": "0"}, 0, 0),
         ):
             with (
-                self.subTest(dofs=dofs, rows=rows, environment=environment, shared=shared),
+                self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
                 probe = _admission_probe(max_world_dofs=dofs, dense_max_constraints=rows)
-                self.assertEqual(SolverFeatherPGS._sparse_small_world_lanes(probe, shared, limit), expected)
+                staging = functools.partial(sweep_routes_sparse.sparse_staging, rows, dofs, dofs)
+                # A world past 16 DOFs or 64 rows never packs; its budget is moot.
+                packable = dofs <= 16 and rows <= 64
+                packed = staging(lanes_per_world=8 if dofs <= 8 else 16).bytes if packable else 1 << 20
+                lanes = SolverFeatherPGS._sparse_small_world_lanes(probe, staging, packed + slack)
+                self.assertEqual(lanes, expected)
 
     def test_policy_reads_the_environment_once_and_reports_it(self):
         """Read FEATHER_PGS_PATCH_ACTIVE_ROWS at construction and report it in the friction record."""
@@ -184,16 +191,24 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
     def test_patch_keeps_the_sparse_route_when_bitsets_exceed_shared_memory(self):
         """Keep the full patch sweep, not ordinary factors, when only the row bitsets overflow shared memory.
 
-        At 1884 rows an 18-DOF world's full sweep needs 49128 of 49152 bytes and the
-        active scan 50072: point friction loses the sparse route there, as before.
+        At the largest row capacity whose 18-DOF full sweep fits the device's static budget, the active
+        scan's bitsets do not: point friction, which sweeps by the scan, loses the sparse route there.
         """
         model = _branched_model(4, 3, "cuda:0")
+        budget = arch_budget(wp.get_device("cuda:0").arch)
+        staging = functools.partial(sweep_routes_sparse.sparse_staging, max_world_dofs=18, max_row_dofs=18)
+        low, high = 3, 3 * 4096
+        while high - low > 1:
+            middle = (low + high) // 2
+            low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
+        active = staging(low, active_rows=True)
+        self.assertFalse(active.fits(budget))
         options = {
             "pgs_mode": "matrix_free",
             "drive_mode": "augmented",
             "articulated_contact_response": "immediate",
             "enable_joint_velocity_limits": False,
-            "dense_max_constraints": 1884,
+            "dense_max_constraints": low,
             "grouped_dynamics": False,
             "mf_gs_parallel_rows": 0,
         }
@@ -203,7 +218,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         self.assertFalse(patch_friction._sparse_active_rows)
         self.assertIn("bitsets exceed shared memory", patch_friction._sparse_active_rows_reason)
         self.assertIsNone(point._sparse_mass_matrix_size)
-        self.assertIn("50072", point._sparse_selection_reason)
+        self.assertIn(str(active.bytes), point._sparse_selection_reason)
 
     def test_small_worlds_keep_their_packed_patch_sweep(self):
         """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, whatever the policy."""
@@ -245,10 +260,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, environment):
                 solvers[triplets] = _make_solver(model, True, **options)
-        self.assertTrue(
-            solvers["1"]._pgs_solve_sparse_kernel.key.endswith("_0_0_support_table_contact_triplets_linked")
-        )
-        self.assertTrue(solvers["0"]._pgs_solve_sparse_kernel.key.endswith("_0_0_support_table"))
+        # The full ordered sweep: no "_active" between the support width and the table.
+        self.assertRegex(solvers["1"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked$")
+        self.assertRegex(solvers["0"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table$")
         self.assertFalse(solvers["1"]._sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         np.testing.assert_array_equal(runs["1"][0], runs["0"][0])

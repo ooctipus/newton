@@ -72,7 +72,7 @@ class TestFeatherPGSFusedResponse(unittest.TestCase):
             expected_c[world, :stop, :stop] = c
             expected_diag[world, :count] = np.diag(c)[:count] + cfm[world, :count]
         values = (factors, jacobians, group_to_art, art_to_world, counts, cfm, initial_c, initial_diag, initial_y)
-        kernel = delassus_tiles_kernel(dofs, capacity, str(device.arch), threads)
+        kernel = delassus_tiles_kernel(dofs, capacity, threads)
         stream = wp.Stream(device)
         with wp.ScopedStream(stream):
             arrays = [

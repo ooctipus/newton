@@ -1900,7 +1900,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         kernel = response_tiles_kernel(
             num_dofs,
             max_constraints,
-            str(device.arch),
             constraint_chunk_size=8,
             write_world=True,
             write_group=False,

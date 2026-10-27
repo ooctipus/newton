@@ -248,9 +248,8 @@ from .sparse_mass_matrix import (
     row_supports,
     solve_sparse_mass_matrix,
 )
-from .staging import arch_budget
+from .staging import STATIC_SHARED_BYTES, arch_budget
 from .sweep_routes_sparse import (
-    _SPARSE_CONTACT_METRIC_CACHE_SIZE,
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     CONTACT_TRANSACTION_BLOCKS,
     CONTACT_TRANSACTIONS,
@@ -4687,37 +4686,43 @@ class SolverFeatherPGS(SolverBase):
         if not max_support:
             self._sparse_selection_reason = "Topology has no responsive row support."
             return
-        # Native kernels use static shared memory, as in the existing grouped CRBA path.
-        shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
-        # Two worlds share a block: three float row arrays, row types, and velocity deltas.
-        solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints
-        if split_candidate or velocity_candidate:
-            solve_shared_bytes += 256  # Warp's tiled launch base.
+        # The sweep's shared working set (sweep_routes_sparse.sparse_staging) against the device's static budget:
+        # every shared-memory choice below reads both, and the sweep's factory checks the same.
+        budget = arch_budget(model.device.arch)
+        staging = functools.partial(
+            sweep_routes_sparse.sparse_staging,
+            self.dense_max_constraints,
+            self.max_world_dofs,
+            int(max_support),
+            velocity_limits=velocity_candidate,
+            linked_rows=self._friction_anchors_enabled,
+        )
         # Patch friction keeps the packed lanes of small worlds, so size them from the
         # full sweep before the active-row scan claims whole warps.
-        small_world_lanes = self._sparse_small_world_lanes(solve_shared_bytes, shared_limit)
+        small_world_lanes = self._sparse_small_world_lanes(staging, budget)
         active_rows, active_rows_reason = self._admit_sparse_active_rows(
             split_candidate=split_candidate,
             velocity_candidate=velocity_candidate,
             small_world_lanes=small_world_lanes,
         )
+        solve = staging()
         if active_rows:
-            # Two row bitsets per world, with aligned unsigned-word storage.
-            active_bytes = (solve_shared_bytes + 16 * ((self.dense_max_constraints + 31) // 32) + 3) // 4 * 4
-            if self._friction_anchors_enabled and active_bytes > shared_limit:
+            active = staging(active_rows=True)
+            if self._friction_anchors_enabled and not active.fits(budget):
                 # Patch friction admitted this route before it adopted the scan; keep it.
                 active_rows = False
                 active_rows_reason = (
                     "Patch friction keeps the full ordered sweep: the row bitsets exceed shared memory."
                 )
             else:
-                solve_shared_bytes = active_bytes
-        if solve_shared_bytes > shared_limit:
+                solve = active
+        if not solve.fits(budget):
             self._sparse_selection_reason = (
-                f"Row capacity needs {solve_shared_bytes} bytes of shared memory for sparse solving; "
-                f"limit is {shared_limit}."
+                f"Row capacity needs {solve.bytes} bytes of shared memory for sparse solving; limit is {budget}."
             )
             return
+        # The factor build's warps share a block within the offline static budget.
+        shared_limit = min(STATIC_SHARED_BYTES, int(model.device.max_shared_memory_per_block))
         shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
         self._sparse_factor_warps_per_block = min(
             _CRBA_CHOLESKY_WARPS_PER_BLOCK,
@@ -4732,7 +4737,7 @@ class SolverFeatherPGS(SolverBase):
         source = "Explicit sparse_mass_matrix='on'" if sparse_choice == "on" else "Automatic sparse selection"
         self._sparse_selection_reason = (
             f"{source}: {size}-DOF topology and row policy admitted; "
-            f"solve uses {solve_shared_bytes}/{shared_limit} bytes of shared memory."
+            f"solve uses {solve.bytes}/{budget} bytes of shared memory."
         )
         self._sparse_mass_matrix_size = size
         self._sparse_active_rows = active_rows
@@ -4776,23 +4781,21 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
         triplet_capacity = self.dense_max_constraints // 3
         transaction, transaction_reason = self._request_sparse_contact_transaction()
-        if transaction == "single":
-            # Per-triplet records in global memory replace the metric cache: Warp's tiled base only.
-            triplet_shared_bytes = 256
-        else:
-            # The staged transaction retains a bounded set of five-scalar tangent
-            # metrics, with one signed-byte map entry per possible full triplet.
-            # Larger capacities keep the ordinary sparse owner at its launch bound.
-            metric_cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, triplet_capacity)
-            # Include Warp's tiled base and align the two maps before their counters.
-            metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
-            triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
         self._sparse_contact_triplets, self._sparse_contact_triplets_reason = self._admit_sparse_contact_triplets(
             active_rows=active_rows,
             split_candidate=split_candidate,
             velocity_candidate=velocity_candidate,
             use_support_table=use_support_table,
-            fits=triplet_capacity > 0 and solve_shared_bytes + triplet_shared_bytes <= shared_limit,
+            # The selected transaction's working set: the staged one's metric cache, the single-stage one's none.
+            fits=lambda: (
+                triplet_capacity > 0
+                and staging(
+                    active_rows=active_rows,
+                    use_support_table=use_support_table,
+                    contact_triplets=True,
+                    contact_transaction=transaction,
+                ).fits(budget)
+            ),
         )
         transaction_options = {}
         if self._sparse_contact_triplets:
@@ -4840,14 +4843,13 @@ class SolverFeatherPGS(SolverBase):
             use_support_table=use_support_table,
             **({"contact_records": True} if self._sparse_contact_records is not None else {}),
         )
-        local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
         # Large resident workspaces regressed whole-step timing in measured
         # small systems. Keep the global-row consumer when the cache is large.
         self._sparse_local_factors = bool(
             self._sparse_solve_lanes < 32
             and os.environ.get("FEATHER_PGS_SPARSE_LOCAL_FACTORS", "1") != "0"
-            and solve_shared_bytes * (32 // self._sparse_solve_lanes) + local_factor_bytes
-            <= min(shared_limit, _SPARSE_LOCAL_WORKSPACE_BYTES)
+            and staging(lanes_per_world=self._sparse_solve_lanes, local_factors=True).bytes
+            <= min(budget, _SPARSE_LOCAL_WORKSPACE_BYTES)
         )
         self._pgs_solve_sparse_kernel = self._sweep_kernel(
             "sparse_pgs",
@@ -4864,6 +4866,7 @@ class SolverFeatherPGS(SolverBase):
             warm_start=self.pgs_warmstart,
             linked_rows=self._friction_anchors_enabled,
             velocity_limit_law=self._velocity_limit_kernel_law(),
+            device_arch=model.device.arch,
             **transaction_options,
         )
 
@@ -4898,12 +4901,12 @@ class SolverFeatherPGS(SolverBase):
         )
         return built
 
-    def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int) -> int:
+    def _sparse_small_world_lanes(self, staging, budget: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
 
         Args:
-            solve_shared_bytes: Shared memory of one world's full ordered sweep.
-            shared_limit: Static shared memory available to one block.
+            staging: The sweep's working set for its options (:func:`.sweep_routes_sparse.sparse_staging`).
+            budget: Static shared memory available to one block [B].
         """
         if (
             os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") == "0"
@@ -4912,7 +4915,7 @@ class SolverFeatherPGS(SolverBase):
         ):
             return 0
         lanes = 8 if self.max_world_dofs <= 8 else 16
-        return lanes if solve_shared_bytes * (32 // lanes) <= shared_limit else 0
+        return lanes if staging(lanes_per_world=lanes).fits(budget) else 0
 
     def _admit_sparse_active_rows(
         self, *, split_candidate: bool, velocity_candidate: bool, small_world_lanes: int
@@ -4978,7 +4981,7 @@ class SolverFeatherPGS(SolverBase):
             split_candidate: Whether split mode sweeps the sparse rows.
             velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             use_support_table: Whether rows read the shared support table.
-            fits: Whether the selected triplet transaction fits the row capacity and shared memory.
+            fits: Whether the selected triplet transaction fits the row capacity and shared memory, evaluated last.
         """
         if os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") != "1":
             return False, "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
@@ -4990,7 +4993,7 @@ class SolverFeatherPGS(SolverBase):
             return False, f"Requested, but small worlds keep their packed {self._sparse_solve_lanes}-lane full sweep."
         if not use_support_table:
             return False, "Requested, but triplets need the row support table."
-        if not fits:
+        if not fits():
             return False, "Requested, but row capacity or shared memory leaves no room for the triplet transaction."
         # contact_transaction_reason records how the admitted triplets update.
         if self._friction_anchors_enabled:
@@ -5780,7 +5783,7 @@ class SolverFeatherPGS(SolverBase):
                 and (size != self._paired_response_primary_size or self._paired_factor_coordinates)
             )
             self._crba_cholesky_kernels_by_size[size] = (
-                response_builds_dense.factor_tiles_kernel(size, device_arch, self.tile_threads, assembly="crba")
+                response_builds_dense.factor_tiles_kernel(size, self.tile_threads, assembly="crba")
                 if fuse_crba_cholesky
                 else None
             )
@@ -5790,7 +5793,7 @@ class SolverFeatherPGS(SolverBase):
                 else None
             )
             self._cholesky_kernels_by_size[size] = (
-                response_builds_dense.factor_tiles_kernel(size, device_arch, self.tile_threads)
+                response_builds_dense.factor_tiles_kernel(size, self.tile_threads)
                 if use_tiled_cholesky
                 and not compact_diagonal_mass
                 and not fuse_crba_cholesky
@@ -5798,12 +5801,12 @@ class SolverFeatherPGS(SolverBase):
                 else None
             )
             self._inverse_cholesky_kernels_by_size[size] = (
-                response_builds_dense.inverse_lanes_kernel(size, device_arch)
+                response_builds_dense.inverse_lanes_kernel(size)
                 if size == self._paired_response_secondary_size and not self._paired_factor_coordinates
                 else None
             )
             self._inverse_cholesky_lower_kernels_by_size[size] = (
-                response_builds_dense.inverse_lanes_kernel(size, device_arch, lower_only=True)
+                response_builds_dense.inverse_lanes_kernel(size, lower_only=True)
                 if (
                     self._paired_factor_coordinates
                     and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
@@ -5834,7 +5837,6 @@ class SolverFeatherPGS(SolverBase):
                 self._hinv_jt_kernels_by_size[size] = response_builds_dense.response_tiles_kernel(
                     size,
                     self.dense_max_constraints,
-                    device_arch,
                     self.tile_threads,
                     constraint_chunk_size=hinv_jt_chunk_size,
                     write_world=self._hinv_jt_writes_world,
@@ -5842,9 +5844,7 @@ class SolverFeatherPGS(SolverBase):
                     compute_diag=size in self._hinv_jt_diag_sizes,
                 )
             self._hinv_jt_fused_kernels_by_size[size] = (
-                response_builds_dense.delassus_tiles_kernel(
-                    size, self.dense_max_constraints, device_arch, self.tile_threads
-                )
+                response_builds_dense.delassus_tiles_kernel(size, self.dense_max_constraints, self.tile_threads)
                 if self._execution_plan.use_fused_hinv_jt(size)
                 else None
             )
@@ -5878,9 +5878,7 @@ class SolverFeatherPGS(SolverBase):
             self._paired_cholesky_inverse_kernel = (
                 None
                 if self._paired_factor_coordinates
-                else response_builds_dense.factor_tiles_kernel(
-                    primary_size, device_arch, self.tile_threads, inverse=True
-                )
+                else response_builds_dense.factor_tiles_kernel(primary_size, self.tile_threads, inverse=True)
             )
             self._paired_response_kernel = response_builds_dense.response_pairs_kernel(
                 primary_size,
@@ -11424,7 +11422,6 @@ class SolverFeatherPGS(SolverBase):
             dim=self.world_count,
             inputs=[
                 self.constraint_count,
-                self.dense_max_constraints,
                 self.diag,
                 self.C,
                 self.rhs,
