@@ -24,7 +24,10 @@ def build_prototype() -> newton.ModelBuilder:
     for i in range(3):
         position = (0.3 * i, 0.0, 0.09)
         body = builder.add_link(xform=wp.transform(position, wp.quat_identity()))
-        builder.add_shape_sphere(body, radius=0.1)
+        if i == 2:
+            builder.add_shape_cone(body, radius=0.1, half_height=0.1)
+        else:
+            builder.add_shape_sphere(body, radius=0.1)
         joints.append(
             builder.add_joint_prismatic(
                 root,
@@ -73,7 +76,6 @@ class TestMuJoCoReplication(unittest.TestCase):
                     for owner, name in (
                         (SolverMuJoCo, "_convert_to_mjc"),
                         (SolverMuJoCo, "notify_model_changed"),
-                        (SolverMuJoCo, "_set_const_0_with_physical_meaninertia"),
                         (newton.ModelBuilder, "finalize"),
                         (source._mujoco.MjSpec, "compile"),
                         (source._mujoco, "mj_setConst"),

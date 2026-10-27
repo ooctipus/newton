@@ -15,9 +15,9 @@ import warnings
 from array import array
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass, fields, replace
 from enum import IntEnum, IntFlag
-from copy import copy
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -79,9 +79,8 @@ from .kernels import (
     apply_mjc_free_joint_f_to_body_f_kernel,
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
-    collect_overflow_kernel,
     clear_world_overflow_kernel,
-    compute_physical_meaninertia_kernel,
+    collect_overflow_kernel,
     convert_mj_coords_to_warp_kernel,
     convert_newton_contacts_to_mjwarp_kernel,
     convert_qfrc_actuator_from_mj_kernel,
@@ -207,6 +206,7 @@ def _remap_actuator_trnid(values: list[Any], context: dict[str, Any]) -> list[An
     # constructing each vector separately.
     result = list((vec2i * count).from_buffer_copy(targets))
     return [None if value is None else target for value, target in zip(values, result, strict=True)]
+
 
 @dataclass(frozen=True, slots=True, eq=False)
 class MuJoCoModelMapping:
@@ -4722,8 +4722,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._notify_ref_qd: wp.array[float] | None = None
         self._notify_ref_body_q: wp.array[wp.transform] | None = None
         self._notify_ref_body_qd: wp.array[wp.spatial_vector] | None = None
-        self._notify_qpos_saved: wp.array2d[float] | None = None
-        self._notify_physical_meaninertia: wp.array[float] | None = None
         self._notify_body_flags: wp.array[wp.int32] | None = None
         self._notify_joint_armature: wp.array[float] | None = None
         self._joint_limit_solref_snapshot: wp.array[wp.vec2] | None = None
@@ -4957,7 +4955,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         Only an unstepped, unmodified single-world MJWarp solver using native
         contacts is supported, on the same CUDA device. The source must meet
-        :meth:`Model.replicate` restrictions and must not contain cone shapes.
+        :meth:`Model.replicate` restrictions.
         Do not directly mutate source model, data or solver buffers after
         preparation. Public reset/property-update operations invalidate it.
         This creates fresh episodes; it does not migrate running simulations.
@@ -4973,8 +4971,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             raise ValueError("replicate requires the native-contact MuJoCo Warp CUDA backend.")
         if self.model.world_count != 1 or self._step != 0 or not self._replication_pristine:
             raise ValueError("replicate requires an unstepped, unmodified single-world solver.")
-        if self._cone_shape_indices.size:
-            raise ValueError("replicate does not yet support cone shapes.")
         if self._pipeline_contacts is not None:
             raise ValueError("replicate does not support solver-owned Newton contacts.")
 
@@ -6067,7 +6063,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
         cache_solref = cache_solref and (history[2] is None or not np.any(history[2] == SOLREF_MODE_RAW))
         outputs = (
-            m.stat.meaninertia,
             m.dof_invweight0,
             m.body_invweight0,
             m.actuator_acc0,
@@ -6304,7 +6299,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ):
                     getattr(self.mj_model, name)[ctrl_direct] = getattr(self.mjw_model, name).numpy()[0, ctrl_direct]
             if need_const_fixed or need_const_0:
-                self._set_const_0_with_physical_meaninertia()
+                self._mujoco.mj_setConst(self.mj_model, self.mj_data)
             if need_solref_update:
                 self._update_solref_from_invweight0()
             if need_const_0:
@@ -6337,7 +6332,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                         self._mujoco_warp.set_const_fixed(self.mjw_model, self.mjw_data)
                     if need_const_0:
                         if constant_variant_ids is None:
-                            self._set_const_0_with_physical_meaninertia()
+                            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
                         else:
                             self._restore_model_constants(constant_variant_ids, world_mask)
                     if need_solref_update:
@@ -9251,7 +9246,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.mjc_actuator_to_newton_ball_jnt = None
             self.mjc_actuator_to_newton_actuator_idx = None
 
-
         dampratio_actuators = [
             (actuator.id, actuator.biasprm[2])
             for actuator in spec.actuators
@@ -9426,8 +9420,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             )
             if heterogeneous_geoms:
                 self._initialize_mesh_assets(spec, mesh_assets, shape_mesh_names, geom_shape_mapping)
-            self._replication_offsets["mjc_geom_to_newton_shape"] = len(first_env_shapes)
-            self._replication_offsets["_mjc_site_to_newton_shape"] = len(first_env_shapes)
+            self._replication_offsets["mjc_geom_to_newton_shape"] = model.shape_count // nworld
+            self._replication_offsets["_mjc_site_to_newton_shape"] = model.shape_count // nworld
 
             # Scaled min_z per Newton shape (zero for non-heightfields): MuJoCo
             # heightfield elevations start at the geom origin, so syncing geom
@@ -9975,10 +9969,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mjw_model.geom_rbound = wp.array(rbound, dtype=float, device=self.model.device)
 
     def _expand_option_fields(self, mj_model: MjWarpModel, nworld: int):
-        """Tile per-world solver option and statistic arrays to ``nworld`` entries.
+        """Tile per-world solver option arrays to ``nworld`` entries.
 
         Top-level model fields are batched by ``mujoco_warp.put_model`` via
-        ``batch_sizes``; nested ``opt`` and ``stat`` arrays are not covered by
+        ``batch_sizes``; nested ``opt`` arrays are not covered by
         that API and are expanded here.
         """
         if nworld == 1:
@@ -10023,8 +10017,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             )
             return dst
 
-        mj_model.stat.meaninertia = tile(mj_model.stat.meaninertia)
-
         for field in mj_model.opt.__dataclass_fields__:
             if field in opt_fields_to_expand:
                 array = getattr(mj_model.opt, field)
@@ -10037,11 +10029,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._notify_joint_armature = wp.clone(self.model.joint_armature)
         solref = getattr(getattr(self.model, "mujoco", None), "solreflimit", None)
         self._joint_limit_solref_snapshot = wp.clone(solref) if solref is not None else None
+        for name in ("_notify_body_flags", "_notify_joint_armature", "_joint_limit_solref_snapshot"):
+            self._replication_offsets[name] = 0
         if not self.use_mujoco_cpu:
-            self._notify_qpos_saved = wp.empty_like(self.mjw_data.qpos)
-            self._notify_physical_meaninertia = wp.empty_like(self.mjw_model.stat.meaninertia)
-            self._replication_offsets["_notify_qpos_saved"] = 0
-            self._replication_offsets["_notify_physical_meaninertia"] = 0
             # Retain the imported gain baseline, then track edits on-device.
             for name in ("_joint_limit_ke_snapshot", "_joint_limit_kd_snapshot", "_solreflimit_mode_snapshot"):
                 snapshot = getattr(self, name)
@@ -10196,63 +10186,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             outputs=[self.mjw_model.body_inertia, self.mjw_model.body_iquat],
             device=self.model.device,
         )
-
-    def _set_const_0_with_physical_meaninertia(self) -> None:
-        """Recompute constants without counting kinematic locking armature in solver statistics."""
-        if not self.use_mujoco_cpu:
-            # Compute the qpos0 mass-matrix statistic with authored armature.
-            # This small pre-pass is branchless with respect to body_flags and
-            # avoids a second, much more expensive set_const_0 invocation.
-            # Keep its mass-matrix assembly and compute_physical_meaninertia_kernel
-            # aligned with MuJoCo Warp's set_const_0 when upgrading that dependency.
-            wp.copy(self._notify_qpos_saved, self.mjw_data.qpos)
-            wp.copy(self.mjw_data.qpos, self.mjw_model.qpos0)
-            self._update_body_properties(apply_kinematic_armature=False)
-            self._mujoco_warp.kinematics(self.mjw_model, self.mjw_data)
-            self._mujoco_warp.com_pos(self.mjw_model, self.mjw_data)
-            self._mujoco_warp.crb(self.mjw_model, self.mjw_data)
-            if self.mjw_model.ntendon:
-                # Match set_const_0, whose mass matrix includes tendon armature.
-                from mujoco_warp._src.smooth import tendon_armature
-
-                self._mujoco_warp.tendon(self.mjw_model, self.mjw_data)
-                tendon_armature(self.mjw_model, self.mjw_data)
-            wp.launch(
-                compute_physical_meaninertia_kernel,
-                dim=self.mjw_data.nworld,
-                inputs=[
-                    self.mjw_model.nv,
-                    self.mjw_model.M_rownnz,
-                    self.mjw_model.M_rowadr,
-                    self.mjw_data.M,
-                ],
-                outputs=[self._notify_physical_meaninertia],
-                device=self.model.device,
-            )
-
-            self._update_body_properties(apply_kinematic_armature=True)
-            wp.copy(self.mjw_data.qpos, self._notify_qpos_saved)
-            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
-            wp.copy(self.mjw_model.stat.meaninertia, self._notify_physical_meaninertia)
-            return
-
-        has_kinematic_bodies = bool(np.any((self._notify_body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0))
-        if not has_kinematic_bodies:
-            self._mujoco.mj_setConst(self.mj_model, self.mj_data)
-            return
-
-        # Subtracting the locking armature in float32 would lose the physical inertia.
-        self._update_body_properties(apply_kinematic_armature=False)
-        actuator_biasprm = self.mj_model.actuator_biasprm.copy()
-        self.mj_model.dof_armature[:] = self.mjw_model.dof_armature.numpy()[0]
-        self._mujoco.mj_setConst(self.mj_model, self.mj_data)
-        physical_meaninertia = float(self.mj_model.stat.meaninertia)
-
-        self._update_body_properties()
-        self.mj_model.actuator_biasprm[:] = actuator_biasprm
-        self.mj_model.dof_armature[:] = self.mjw_model.dof_armature.numpy()[0]
-        self._mujoco.mj_setConst(self.mj_model, self.mj_data)
-        self.mj_model.stat.meaninertia = physical_meaninertia
 
     def _update_body_properties(self, apply_kinematic_armature: bool = True):
         """Update body-property dependent MuJoCo DOF parameters.

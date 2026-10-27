@@ -34,7 +34,6 @@ def _import_contact_force_fn():
 
 # Custom vector types
 vec10 = wp.types.vector(length=10, dtype=wp.float32)
-vec11 = wp.types.vector(length=11, dtype=wp.float32)
 
 
 # Utility functions
@@ -1252,7 +1251,7 @@ def update_connect_constraint_anchors_kernel(
     connect_anchor2_q: wp.array[wp.quat],
     connect_anchor2_t: wp.array[wp.vec3],
     # output
-    eq_data_out: wp.array2d[vec11],
+    eq_data_out: wp.array2d[Any],
 ):
     """Write CONNECT constraint anchors into MuJoCo ``eq_data``.
 
@@ -1280,7 +1279,7 @@ def update_connect_constraint_anchors_kernel(
             constraint, shape ``[equality_constraint_count]``,
             dtype ``wp.vec3``.
         eq_data_out: *(output)* MuJoCo equality constraint data,
-            shape ``[world_count, neq]``, dtype ``vec11``.
+            shape ``[world_count, neq]``, native equality-data vector dtype.
             Slots ``[0:3]`` receive ``anchor1`` and ``[3:6]`` receive
             ``anchor2``.
     """
@@ -1443,7 +1442,7 @@ def update_jnt_connect_constraint_anchors_kernel(
     jnt_eq_q_rel: wp.array2d[wp.quat],
     jnt_eq_t_rel: wp.array2d[wp.vec3],
     # output
-    eq_data_out: wp.array2d[vec11],
+    eq_data_out: wp.array2d[Any],
 ):
     """Write joint-synthesized CONNECT constraint anchors into MuJoCo ``eq_data``.
 
@@ -1465,7 +1464,7 @@ def update_jnt_connect_constraint_anchors_kernel(
         jnt_eq_t_rel: Relative translation [m] per ``[world, eq]``,
             shape ``[world_count, neq]``, dtype ``wp.vec3``.
         eq_data_out: *(output)* MuJoCo equality constraint data,
-            shape ``[world_count, neq]``, dtype ``vec11``.
+            shape ``[world_count, neq]``, native equality-data vector dtype.
             Slots ``[0:3]`` receive ``anchor1`` and ``[3:6]`` receive
             ``anchor2``.
     """
@@ -2831,27 +2830,6 @@ def update_jnt_solref_from_invweight0_kernel(
     jnt_solref[world, mjc_jnt] = convert_solref(direct_stiffness, direct_damping, 1.0, 1.0)
 
 
-@wp.kernel
-def compute_physical_meaninertia_kernel(
-    nv: int,
-    M_rownnz: wp.array[wp.int32],
-    M_rowadr: wp.array[wp.int32],
-    M: wp.array2d[float],
-    meaninertia: wp.array[float],
-):
-    """Remove kinematic locking armature from MuJoCo's mean-inertia statistic."""
-    world = wp.tid()
-    if nv == 0:
-        meaninertia[world % meaninertia.shape[0]] = 1.0
-        return
-
-    total = float(0.0)
-    for mjc_dof in range(nv):
-        total += M[world, M_rowadr[mjc_dof] + M_rownnz[mjc_dof] - 1]
-
-    meaninertia[world % meaninertia.shape[0]] = total / float(nv)
-
-
 @wp.kernel(enable_backward=False)
 def update_tendon_limit_gains_kernel(
     tendon_mapping: wp.array2d[wp.int32],
@@ -3034,7 +3012,7 @@ def update_eq_data_and_active_kernel(
     eq_constraint_enabled: wp.array[wp.bool],
     preserve_inferred_poses: bool,
     # outputs
-    eq_data_out: wp.array2d[vec11],
+    eq_data_out: wp.array2d[Any],
     eq_active_out: wp.array2d[wp.bool],
 ):
     """Update MuJoCo equality constraint data and active status from Newton properties.
@@ -3103,7 +3081,7 @@ def update_mimic_eq_data_and_active_kernel(
     constraint_mimic_coef1: wp.array[wp.float32],
     constraint_mimic_enabled: wp.array[wp.bool],
     # outputs
-    eq_data_out: wp.array2d[vec11],
+    eq_data_out: wp.array2d[Any],
     eq_active_out: wp.array2d[wp.bool],
 ):
     """Update MuJoCo equality constraint data and active status from Newton mimic constraint properties.
@@ -3136,7 +3114,7 @@ def update_joint_mimic_eq_data_kernel(
     mjc_eq_to_newton_joint_mimic: wp.array2d[wp.int32],
     joint_mimic_coeffs: wp.array[wp.vec2],
     # outputs
-    eq_data_out: wp.array2d[vec11],
+    eq_data_out: wp.array2d[Any],
 ):
     """Update MuJoCo equality data from joint-owned mimic coefficients."""
     world, mjc_eq = wp.tid()

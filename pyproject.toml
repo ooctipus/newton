@@ -14,7 +14,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Natural Language :: English",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -26,7 +25,7 @@ classifiers = [
 ]
 description = "A GPU-accelerated physics engine for robotics simulation"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "warp-lang>=1.17.0",
 ]
@@ -36,8 +35,8 @@ dependencies = [
 # Core simulation dependencies
 sim = [
     # MuJoCo simulation
-    "mujoco-warp~=3.16.0",  # MuJoCo, warp-accelerated
-    "mujoco~=3.16.0",       # MuJoCo physics engine
+    "mujoco-warp~=3.17.0",  # MuJoCo, warp-accelerated
+    "mujoco~=3.17.0",       # MuJoCo physics engine
     "gpu-components>=0.1.0",  # optional growable-memory composition
 ]
 
@@ -164,7 +163,7 @@ explicit = true
 
 [tool.uv]
 # Current MJWarp uses discrete actuators and efm fields from this nightly.
-override-dependencies = ["mujoco==3.14.1.dev993205559"]
+override-dependencies = ["mujoco==3.17.1.dev1007121963"]
 conflicts = [
     [
         { extra = "torch-cu12" },
@@ -175,8 +174,8 @@ conflicts = [
 [tool.uv.sources]
 mujoco = { index = "mujoco" }
 # The application selects the custom Warp build for prepared execution.
-gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "6cc307cd5066dbd434dc6e7fc1b21b6327e2100f" }
-mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "34e044b58f1292121e0a906a5e76d96993097341" }
+gpu-components = { git = "https://github.com/ooctipus/gpu-components.git", rev = "3cbce6e2b7cda498bad73a45db337a74ca516bb8" }
+mujoco-warp = { git = "https://github.com/ooctipus/mujoco_warp.git", rev = "7a4a18394dcea65af1bb100a07d214c16635e839" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },

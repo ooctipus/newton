@@ -499,7 +499,12 @@ def replicate_model(source: Model, world_count: int) -> Model:
 
     result = Model(source.device)
     frequency = Model.AttributeFrequency
-    counts = {key: source._attribute_frequency_count(key) for key in source._ATTRIBUTE_FREQUENCY_COUNT_ATTRS}
+    contact_frequencies = (frequency.CONTACT, frequency.CONTACT_RIGID, frequency.CONTACT_SOFT)
+    counts = {
+        key: source._attribute_frequency_count(key)
+        for key in source._ATTRIBUTE_FREQUENCY_COUNT_ATTRS
+        if key not in contact_frequencies
+    }
     counts.update(source.custom_frequency_counts)
     counts[frequency.ONCE] = 1
     if max(counts.values(), default=0) * world_count > np.iinfo(np.int32).max:
@@ -517,9 +522,10 @@ def replicate_model(source: Model, world_count: int) -> Model:
         "heightfield_elevations",
         "heightfield_meshes",
         "_mesh_keep_alive",
-        "mesh_edge_indices",
-        "mesh_edge_centers",
-        "mesh_edge_halves",
+        "_mesh_edge_indices",
+        "_mesh_edge_centers",
+        "_mesh_edge_halves",
+        "_mesh_boundary_flags",
         "_texture_sdf_data",
         "_texture_sdf_coarse_textures",
         "_texture_sdf_subgrid_textures",
@@ -583,8 +589,17 @@ def replicate_model(source: Model, world_count: int) -> Model:
     del result.body_shapes
     result._shape_collision_filter_pairs = source._shape_collision_filter_pairs.repeat(world_count, source.shape_count)
     result.shape_contact_pairs = _repeat(source.shape_contact_pairs, world_count, offset=source.shape_count)
-    result.shape_contact_pair_count = source.shape_contact_pair_count * world_count
-    handled.update(("body_shapes", "_shape_collision_filter_pairs", "shape_contact_pairs", "shape_contact_pair_count"))
+    handled.update(
+        (
+            "body_shapes",
+            "_shape_collision_filter_pairs",
+            "shape_contact_pairs",
+            "_shape_contact_pairs",
+            "_shape_contact_pair_data",
+            "_shape_contact_pair_count",
+            "_shape_contact_pair_counts",
+        )
+    )
 
     # Preserve FK level schedules rather than rebuilding articulation traversal.
     if source._fk_articulation_level_start is not None:
@@ -622,6 +637,9 @@ def replicate_model(source: Model, world_count: int) -> Model:
     # arrays rather than silently sharing stale extension-owned model state.
     reset = {
         "_collision_pipeline",
+        "_contact_capacity_initialized",
+        "_rigid_contact_max",
+        "_soft_contact_max",
         "_replication_source",
         "_replication_copy_plan",
         "_replication_storage",
@@ -661,7 +679,11 @@ def replicate_model(source: Model, world_count: int) -> Model:
             setattr(target, field, value)
 
     for key, name in source._ATTRIBUTE_FREQUENCY_COUNT_ATTRS.items():
-        setattr(result, name, counts[key] * world_count)
+        if key not in contact_frequencies:
+            setattr(result, name, counts[key] * world_count)
+    for name in ("rigid_contact_max", "soft_contact_max"):
+        capacity = getattr(source, name)
+        setattr(result, name, None if capacity is None else capacity * world_count)
     if source.shape_count and source.bvh_shape_bounds is not None:
         result.bvh_shape_bounds = _repeat(source.bvh_shape_bounds, world_count)
         enabled = source.bvh_shape_count_enabled

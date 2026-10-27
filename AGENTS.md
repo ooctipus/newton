@@ -45,6 +45,7 @@ For reviews, also read and apply the [review guidelines](REVIEW_GUIDELINES.rst) 
 - Reject unsafe copy aliasing before launch. Exact self-copy can do no work; disjoint packed fields remain valid even when their enclosing address spans overlap.
 - Key typed fill patterns by canonical element bytes, never display representations. Equivalent typed values share prepared patterns; distinct bytes remain distinct, including during capture.
 - Numerical parity must reject nonfinite state explicitly. Include allocation reuse and poisoned scratch in first-write regressions; matching NaNs are not evidence of correct dynamics.
+- MuJoCo 3.17 owns convergence scaling from the current mass matrix. Do not retain a second mean-inertia calculation or refresh compilation-only statistics during model notifications; use native constant updates directly.
 - Omit a generic derived-property refresh only when the prepared bank proves its edit provenance remains unchanged. Keep that certificate in the existing bank relation; do not add a mirrored cache flag or bypass later generic invalidation and mode transitions. Withdraw it before a world transfer can replace that history, including transfers that subsequently fail.
 - Keep test-only fault injection out of public constructors. Patch private driver loaders in tests instead of exporting a fake-driver callback ABI.
 - Document every supported public owner method and property so the API documentation filter cannot silently hide operations; gate this without asserting incidental prose or inherited members.

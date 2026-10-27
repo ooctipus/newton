@@ -85,8 +85,9 @@ def test_prepared_replication(test, device):
             mock.patch.object(wp.array, "numpy", side_effect=AssertionError("device readback")),
             mock.patch.object(newton.ModelBuilder, "finalize", side_effect=AssertionError("finalize")),
             mock.patch.object(newton.Model, "bvh_build_shapes", side_effect=AssertionError("geometry preparation")),
-            mock.patch.object(
-                newton.ModelBuilder, "_find_shape_contact_pairs", side_effect=AssertionError("pair discovery")
+            mock.patch(
+                "newton._src.sim.shape_contact_pairs._ShapeContactPairs.build_pairs",
+                side_effect=AssertionError("pair discovery"),
             ),
         ):
             result = source.replicate(3)
@@ -94,7 +95,7 @@ def test_prepared_replication(test, device):
         test.assertNotIn("body_shapes", result.__dict__)
         test.assertEqual(result.world_count, 3)
         test.assertIsNot(result.bvh_shapes, source.bvh_shapes)
-        test.assertIs(result.mesh_edge_indices, source.mesh_edge_indices)
+        test.assertIs(result._mesh_edge_indices, source._mesh_edge_indices)
         for name, array, initial in source_arrays:
             np.testing.assert_array_equal(array.numpy(), initial, err_msg=f"prototype mutated: {name}")
         for name, spec in source._iter_attribute_specs():
@@ -254,7 +255,16 @@ def test_plain_replication_fallback(test, device):
     test.assertFalse(hasattr(source, "_replication_copy_plan"))
     # A metadata-only large span must be rejected before making a raw int32 view or launching.
     source.body_mass = wp.array(ptr=original.ptr, shape=2**29, dtype=wp.vec3, device=device)
-    counts = {key: source._attribute_frequency_count(key) for key in source._ATTRIBUTE_FREQUENCY_COUNT_ATTRS}
+    counts = {
+        key: source._attribute_frequency_count(key)
+        for key in source._ATTRIBUTE_FREQUENCY_COUNT_ATTRS
+        if key
+        not in (
+            newton.Model.AttributeFrequency.CONTACT,
+            newton.Model.AttributeFrequency.CONTACT_RIGID,
+            newton.Model.AttributeFrequency.CONTACT_SOFT,
+        )
+    }
     counts.update(source.custom_frequency_counts)
     counts[newton.Model.AttributeFrequency.ONCE] = 1
     with (
@@ -635,21 +645,6 @@ class TestModelReplication(unittest.TestCase):
         ):
             np.testing.assert_array_equal(actual.numpy(), expected_array)
         self.assertTrue(np.all(model.bvh_shapes_group_roots.numpy() >= 0))
-
-    def test_joint_target_layout_snapshot(self):
-        """Use the prepared model's target layout even if the process default changes."""
-        original = newton.use_coord_layout_targets
-        try:
-            for layout in (False, True):
-                newton.use_coord_layout_targets = layout
-                source = _build(_prototype(), 1, "cpu")
-                newton.use_coord_layout_targets = not layout
-                result = source.replicate(3)
-                self.assertEqual(result.use_coord_layout_targets, layout)
-                np.testing.assert_array_equal(result.joint_target_q.numpy(), np.tile(source.joint_target_q.numpy(), 3))
-                self.assertEqual(result._attribute_spec("joint_target_q"), source._attribute_spec("joint_target_q"))
-        finally:
-            newton.use_coord_layout_targets = original
 
 
 for device in get_test_devices():

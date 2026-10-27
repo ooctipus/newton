@@ -57,6 +57,7 @@ from newton.solvers import (
     mujoco_worlds_validate,
     mujoco_worlds_withdraw_backing,
 )
+from newton.tests.unittest_utils import patch_sys_module
 
 _CREATE, _REPLACE, _DESTROY = (
     int(value) for value in (InstanceOperation.CREATE, InstanceOperation.REPLACE, InstanceOperation.DESTROY)
@@ -274,6 +275,7 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         ):
             self.assertFalse((root / name).exists(), name)
         self.assertNotIn("worlds", newton.__all__)
+        self.assertFalse(hasattr(newton.solvers.SolverMuJoCo, "_set_const_0_with_physical_meaninertia"))
         self.assertNotIn("_KERNEL_CACHE", inspect.getsource(newton.solvers.SolverMuJoCo._prepare_generated_kernels))
         source = ast.parse(inspect.getsource(native))
         self.assertFalse({"_data_arrays", "_replace_data"} & vars(native).keys())
@@ -2471,10 +2473,7 @@ class PopulationRecorderTests(unittest.TestCase):
         group.before_step = before
         group.after_substep = lambda view: calls.append("after")
         with (
-            patch.dict(
-                sys.modules,
-                {"mujoco_warp": SimpleNamespace(step=step, kinematics=poses)},
-            ),
+            patch_sys_module("mujoco_warp", SimpleNamespace(step=step, kinematics=poses)),
             patch.object(native, "_validate_population", side_effect=validate),
             patch.object(native.wp, "capture_if", side_effect=conditional),
         ):
