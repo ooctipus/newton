@@ -481,12 +481,11 @@ def dense_cholesky(
 
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def prepare_fused_diagonal_joint_limits(
+    joints: JointTable,
     world_dof_indices: wp.array2d[int],
     max_world_dofs: int,
     fused_limit_dof_mask: wp.array[int],
     limit_q_index: wp.array[int],
-    joint_limit_lower: wp.array[float],
-    joint_limit_upper: wp.array[float],
     joint_q: wp.array[float],
     activation_gap: float,
     pgs_beta: float,
@@ -509,8 +508,8 @@ def prepare_fused_diagonal_joint_limits(
         q_index = limit_q_index[global_dof]
         if q_index >= 0:
             q = joint_q[q_index]
-            lower = joint_limit_lower[global_dof]
-            upper = joint_limit_upper[global_dof]
+            lower = joints.joint_limit_lower[global_dof]
+            upper = joints.joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
             lower_active, lower_phi, _lower_sign = joint_limit_side(q, lower, upper, 0, activation_gap)
             if lower_active:
@@ -1611,8 +1610,7 @@ def allocate_mimic_slots(
 
 @wp.kernel
 def populate_mimic_J_for_size(
-    articulation_dof_start: wp.array[int],
-    art_to_world: wp.array[int],
+    joints: JointTable,
     group_to_art: wp.array[int],
     mimic_slot: wp.array[int],
     mimic_art_start: wp.array[int],
@@ -1641,8 +1639,8 @@ def populate_mimic_J_for_size(
     """
     group_idx = wp.tid()
     art = group_to_art[group_idx]
-    world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
+    world = joints.art_to_world[art]
+    dof_start = joints.articulation_dof_start[art]
 
     for m in range(mimic_art_start[art], mimic_art_start[art + 1]):
         k = mimic_art_list[m]

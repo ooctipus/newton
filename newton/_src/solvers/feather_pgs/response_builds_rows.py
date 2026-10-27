@@ -64,7 +64,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .dense_rows import DenseRows
+from .dense_rows import DenseRows, MfRows
 from .device_preludes import cuda_native, dual_native, lane_group
 from .field_group import Field
 from .friction_patches import FrictionPatches, patch_friction_location
@@ -339,16 +339,9 @@ def free_body_inverse_kernel(
 
 @wp.kernel(enable_backward=False)
 def free_body_rows_kernel(
+    mf: MfRows,
     mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
     mf_body_Hinv: wp.array[wp.spatial_matrix],
-    mf_phi: wp.array2d[float],
-    mf_row_type: wp.array2d[int],
-    mf_target_velocity: wp.array2d[float],
-    mf_row_restitution: wp.array2d[float],
     has_target_velocity: int,
     body_to_articulation: wp.array[int],
     articulation_dof_start: wp.array[int],
@@ -365,7 +358,6 @@ def free_body_rows_kernel(
     mf_eff_mass_inv: wp.array2d[float],
     mf_MiJt_a: wp.array3d[float],
     mf_MiJt_b: wp.array3d[float],
-    mf_rhs: wp.array2d[float],
     mf_row_w: wp.array2d[float],
 ):
     """Build each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
@@ -379,25 +371,25 @@ def free_body_rows_kernel(
     i = tid % mf_max_constraints
     if i >= mf_constraint_count[world]:
         return
-    body_a = mf_body_a[world, i]
-    body_b = mf_body_b[world, i]
+    body_a = mf.body_a[world, i]
+    body_b = mf.body_b[world, i]
     mf_eff_mass_inv[world, i] = free_body_response(
-        mf_J_a, mf_J_b, world, i, body_a, body_b, mf_body_Hinv, pgs_cfm, mf_MiJt_a, mf_MiJt_b
+        mf.J_a, mf.J_b, world, i, body_a, body_b, mf_body_Hinv, pgs_cfm, mf_MiJt_a, mf_MiJt_b
     )
     target = float(0.0)
     if has_target_velocity != 0:
-        target = mf_target_velocity[world, i]
+        target = mf.target[world, i]
     rhs, row_w = free_body_row_rhs(
-        mf_J_a,
-        mf_J_b,
+        mf.J_a,
+        mf.J_b,
         world,
         i,
         body_a,
         body_b,
-        mf_row_type[world, i],
-        mf_phi[world, i],
+        mf.row_type[world, i],
+        mf.phi[world, i],
         target,
-        mf_row_restitution[world, i],
+        mf.restitution[world, i],
         body_to_articulation,
         articulation_dof_start,
         incident_velocity,
@@ -408,7 +400,7 @@ def free_body_rows_kernel(
         contact_speculative_scale,
         restitution_velocity_threshold,
     )
-    mf_rhs[world, i] = rhs
+    mf.rhs[world, i] = rhs
     if contact_w < 1.0:
         mf_row_w[world, i] = row_w
 

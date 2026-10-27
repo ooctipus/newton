@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group, response_builds_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
@@ -226,16 +226,21 @@ def _mf_speculative_rhs(scale: float) -> float:
         response_builds_rows.free_body_rows_kernel,
         dim=1,
         inputs=[
+            field_group.upload(
+                MfRows,
+                "cpu",
+                body_a=[[-1]],
+                body_b=[[-1]],
+                J_a=np.zeros((1, 1, 6), dtype=np.float32),
+                J_b=np.zeros((1, 1, 6), dtype=np.float32),
+                phi=[[1.0]],
+                row_type=[[0]],
+                target=[[0.0]],
+                restitution=[[0.0]],
+                rhs=rhs,
+            ),
             wp.array([1], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1,), dtype=wp.spatial_matrix, device="cpu"),
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             0,
             wp.array([-1], dtype=wp.int32, device="cpu"),
             wp.array([0], dtype=wp.int32, device="cpu"),
@@ -253,7 +258,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            rhs,
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
