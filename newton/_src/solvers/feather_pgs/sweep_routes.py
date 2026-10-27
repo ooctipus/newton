@@ -20,7 +20,7 @@ from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Block, DenseJY, FreeBody6, Lanes, Velocity
+from .response_operator import Block, DenseJY, DenseSupport, FreeBody6, Lanes, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
 from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
@@ -118,6 +118,9 @@ MF_GS_ABI = kernel_template.params(
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
 
+
+DENSE_SUPPORT = DenseSupport()
+"""Where a matrix-free sweep keeps its dense rows' support (:class:`.response_operator.DenseSupport`)."""
 
 MAPPINGS = ("warp", "colored")
 """The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
@@ -263,7 +266,13 @@ def mf_gs_staging(
         if traces:
             colored += block_argmax(warps, warp="warp", lane="lane")[1]
     return Staging(
-        (Buffer("s_v", "float", max_world_dofs), *dense.buffers(), *free.buffers(), *colored),
+        (
+            Buffer("s_v", "float", max_world_dofs),
+            *dense.buffers(),
+            *free.buffers(),
+            *DENSE_SUPPORT.buffers(max_world_dofs),
+            *colored,
+        ),
         threads=COLORED_THREADS if mapping == "colored" else 32,
     )
 
@@ -334,7 +343,7 @@ def mf_gs_source(
         lanes=lanes,
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
-    dense_op = DenseJY(D, lanes)
+    dense_op = DenseJY(D, lanes, support=DENSE_SUPPORT)
     free_op = FreeBody6(lanes)
     staging = mf_gs_staging(
         M_D,
@@ -446,6 +455,19 @@ def mf_gs_source(
         free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_PHASE_ADMISSION, pad="        ")
         offsets = trace_reduction = ""
 
+    # The dense rows' support: the coordinates their J or Y touch, from rows [0, m_dense) (every pass reads them).
+    support_build = DENSE_SUPPORT.build(
+        dofs=D,
+        rows="m_dense",
+        J="J_world",
+        Y="Y_world",
+        base="jy_world_base",
+        thread="tid" if colored else "lane",
+        threads="(int)blockDim.x" if colored else "32",
+        first_warp="warp == 0" if colored else "true",
+        lane="lane",
+        sync="__syncthreads();" if colored else "SYNC();",
+    )
     body = f"""{head}
 
     {dense_count}
@@ -495,7 +517,7 @@ def mf_gs_source(
         s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
     }}
 {end_first_warp}    {barrier}
-
+{support_build}
 {dense_op.pipeline_registers("    ")}
 
     for (int iter = 0; iter < iterations; iter++) {{

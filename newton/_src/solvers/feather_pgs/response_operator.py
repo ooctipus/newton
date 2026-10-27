@@ -556,6 +556,63 @@ class ResponseOperator:
 
 
 @dataclass(frozen=True)
+class DenseSupport:
+    """The coordinates a world's dense rows touch, as the words of their bitmap (native names): ``words[k]`` is the
+    ``k``-th word (``width`` coordinates from ``words[k] * width``) holding one, ascending, ``bits[k]`` its bits, and
+    ``count`` the words. :meth:`build` fills them in a block from the rows' ``J`` and ``Y``."""
+
+    words: str = "s_dense_words"
+    bits: str = "s_dense_bits"
+    count: str = "s_dense_count[0]"
+
+    def buffers(self, dofs: int) -> tuple:
+        from .staging import Buffer  # noqa: PLC0415
+
+        words = (int(dofs) + 31) // 32
+        return (
+            Buffer(self.words, "int", words),
+            Buffer(self.bits, "unsigned", words),
+            Buffer(self.count.split("[")[0], "int", 1),
+        )
+
+    def build(self, *, dofs: int, rows: str, J: str, Y: str, base: str, thread: str, threads: str,
+              first_warp: str, lane: str, sync: str, indent: str = "    ") -> str:
+        """Fill the support from rows ``[0, rows)`` of ``J`` and ``Y`` (``J[base + row * dofs + d]``): every thread
+        marks the coordinates of nonzero entries (``thread`` of ``threads``), then the first warp (``first_warp`` is
+        true on it, ``lane`` its lane) lists the nonzero words in order. ``sync`` is the barrier of the threads."""
+        words = (int(dofs) + 31) // 32
+        lines = [
+            f"for (int w = {thread}; w < {words}; w += {threads}) {self.bits}[w] = 0u;",
+            sync,
+            f"for (int e = {thread}; e < ({rows}) * {dofs}; e += {threads}) {{",
+            f"    const int row = e / {dofs}, d = e - row * {dofs};",
+            f"    if ({J}.data[{base} + e] != 0.0f || {Y}.data[{base} + e] != 0.0f)",
+            f"        atomicOr(&{self.bits}[d >> 5], 1u << (d & 31));",
+            "}",
+            sync,
+            f"if ({first_warp}) {{",
+            "    int listed = 0;",
+            f"    for (int start = 0; start < {words}; start += 32) {{",
+            f"        const int w = start + {lane};",
+            f"        const unsigned bits = w < {words} ? {self.bits}[w] : 0u;",
+            "        __syncwarp();",
+            "        const unsigned held = __ballot_sync(0xffffffffu, bits != 0u);",
+            f"        const int at = listed + __popc(held & ((1u << {lane}) - 1u));",
+            "        if (bits != 0u) {",
+            f"            {self.words}[at] = w;",
+            f"            {self.bits}[at] = bits;",
+            "        }",
+            "        listed += __popc(held);",
+            "        __syncwarp();",
+            "    }",
+            f"    if ({lane} == 0) {self.count} = listed;",
+            "}",
+            sync,
+        ]
+        return "\n".join(indent + line if line else line for line in lines)
+
+
+@dataclass(frozen=True)
 class DenseJY(ResponseOperator):
     """Rows of ``J`` and ``Y = H^-1 J^T`` over a world's ``dofs`` velocity coordinates.
 
@@ -567,10 +624,11 @@ class DenseJY(ResponseOperator):
     (next row) and ``cur_dJ_k``/``cur_dY_k`` (this row). Built by the
     response's Cholesky solves, ``A_ii = J_i Y_i + cfm`` is stored as a value.
 
-    With ``support`` (a list of coordinates and its length, both native names) every row action runs over the
-    listed coordinates only: the coordinates a world's rows can touch, ascending, when they are few of its ``dofs``
-    (an articulation's coordinates in a world of free bodies). Lane ``l`` then takes list entries ``l + width k``;
-    the terms a row skips are exact zeros, so only the sums' association changes.
+    With ``support`` (native names of a word list, its bits and its length: :class:`DenseSupport`) every row action
+    runs over the coordinates some row of the world touches only (an articulation's coordinates in a world of free
+    bodies): the words of the coordinate bitmap that hold one, ascending, each with its bits. Lane ``l`` still owns
+    coordinate ``word * width + l``, in ascending words, so each lane's partial sum adds the same nonzero terms in the
+    same order and skips only exact zeros: every sum, step and velocity is the dense loop's, bit for bit.
     """
 
     dofs: int
@@ -581,7 +639,7 @@ class DenseJY(ResponseOperator):
     velocity: Velocity = Velocity()
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
-    support: tuple[str, str] | None = None
+    support: DenseSupport | None = None
     name = "dense_jy"
 
     @property
@@ -619,13 +677,15 @@ class DenseJY(ResponseOperator):
         return "\n".join(f"{indent}float pre_dJ_{k} = 0.0f, pre_dY_{k} = 0.0f;" for k in range(self.elements))
 
     def _over_support(self, statement: Callable[[str], str], indent: str) -> str:
-        """A lane-strided loop over the support list running ``statement(d)`` for each listed coordinate ``d``."""
-        coordinates, count = self.support
-        lane, width = self.lanes.lane, self.lanes.width
+        """Run ``statement(d)`` for each supported coordinate ``d`` this lane owns, in ascending order (the dense
+        loop's order with its exact-zero terms skipped)."""
+        support, lane, width = self.support, self.lanes.lane, self.lanes.width
         return (
-            f"{indent}for (int support_k = {lane}; support_k < {count}; support_k += {width}) {{\n"
-            f"{indent}    const int support_d = {coordinates}[support_k];\n"
-            f"{indent}    {statement('support_d')}\n"
+            f"{indent}for (int support_k = 0; support_k < {support.count}; ++support_k) {{\n"
+            f"{indent}    if ((({support.bits}[support_k]) >> {lane}) & 1u) {{\n"
+            f"{indent}        const int support_d = {support.words}[support_k] * {width} + {lane};\n"
+            f"{indent}        {statement('support_d')}\n"
+            f"{indent}    }}\n"
             f"{indent}}}"
         )
 
