@@ -2029,7 +2029,6 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_mf_row_type = None
         self._ws_prev_mf_row_parent = None
         self._ws_prev_slot_sorted = None
-        self._ws_warned_no_match = False
 
         self.pgs_mode = pgs_mode
         self.mf_max_constraints = int(mf_max_constraints)
@@ -3352,7 +3351,6 @@ class SolverFeatherPGS(SolverBase):
         self._compute_root_free_metadata(model)
         self._setup_size_grouping(model)
         self._setup_world_mapping(model)
-        self._is_homogeneous = (len(self.size_groups) == 1) if self.size_groups else True
         self._build_body_maps(model)
         self._classify_free_rigid_bodies(model)
         self._compact_contact_jacobian = bool(
@@ -3534,7 +3532,6 @@ class SolverFeatherPGS(SolverBase):
         self._connect_valid_np = (
             np.ones(n, dtype=np.int32) if joint_enabled is None else (joint_enabled[joints] != 0).astype(np.int32)
         )
-        self._connect_joint_np = joints.astype(np.int32)
         self._connect_parent_prescribed_np = (~has_parent | cross)[enforced].astype(np.int32)
         self._connect_enabled_np = self._connect_valid_np.copy()
         self._connect_anchor_p_np = joint_X_p[joints, :3].astype(np.float32)
@@ -4151,8 +4148,6 @@ class SolverFeatherPGS(SolverBase):
             self.world_count = 0
             self.art_to_world = None
             self.world_art_start = None
-            self._is_multi_articulation = False
-            self._max_arts_per_world = 0
             self._is_one_solve_art_per_world = False
             return
         if self._model_plan is None:
@@ -4174,8 +4169,6 @@ class SolverFeatherPGS(SolverBase):
         response_world = articulation_world[self._model_plan.response_dof_count > 0]
         world_response_art_counts = np.bincount(response_world, minlength=self.world_count)
         self._is_one_solve_art_per_world = bool(np.all(world_response_art_counts == 1))
-        self._max_arts_per_world = int(np.max(world_art_counts)) if len(world_art_counts) else 0
-        self._is_multi_articulation = self._max_arts_per_world > 1
 
     def _setup_world_size_grouping(self, model):
         self.world_response_group_art_start = {}
@@ -4898,7 +4891,6 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count or not model.joint_count:
             self._has_free_rigid_bodies = False
             self._has_mixed_contacts = False
-            self._n_free_rigid = 0
             self._has_non_free_articulations = False
             self.is_free_rigid = None
             self.free_rigid_body_indices = None
@@ -4921,7 +4913,6 @@ class SolverFeatherPGS(SolverBase):
         # from the solve size groups, so they must not count as non-free
         # articulations when selecting the patch routes.
         self._has_non_free_articulations = bool(np.any(solve_mask & ~free_mask))
-        self._n_free_rigid = int(np.sum(free_mask))
         free_world = articulation_world[solve_mask & free_mask]
         free_world = free_world[free_world >= 0]
         self._free_rigid_per_world = np.bincount(free_world, minlength=self._free_rigid_per_world.size)
@@ -7862,7 +7853,6 @@ class SolverFeatherPGS(SolverBase):
             return
 
         main_stream = wp.get_stream(self.model.device)
-        self._main_stream = main_stream
         self._init_event = main_stream.record_event()
         try:
             yield
@@ -7871,7 +7861,6 @@ class SolverFeatherPGS(SolverBase):
                 stream = self._size_streams.get(size)
                 if stream is not None:
                     main_stream.wait_event(stream.record_event())
-            self._main_stream = None
             self._init_event = None
 
     @contextmanager
