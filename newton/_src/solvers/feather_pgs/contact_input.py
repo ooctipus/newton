@@ -10,7 +10,7 @@ Warp struct and :func:`bind` fills it from the solver's live storage.
 import warp as wp
 
 from . import dense_rows, field_group
-from .field_group import Field
+from .field_group import Field, FieldGroup
 
 CONTACT_INPUT = (
     # The collision pipeline's contacts.
@@ -58,6 +58,16 @@ CONTACT_INPUT = (
 )
 
 ContactInput = field_group.struct("ContactInput", CONTACT_INPUT, __name__)
+
+ContactRoutes = field_group.struct(
+    "ContactRoutes", FieldGroup(*CONTACT_INPUT).select("count", "normal", "world", "slot", "path"), __name__
+)
+"""The contacts' count and normals with each contact's world, row slot and path (0 dense, 1 matrix-free, -1 none)."""
+
+
+def bind_routes(solver, contacts):
+    """Bind the contacts' :data:`ContactRoutes` (the allocator's records of the last step)."""
+    return field_group.bind(ContactRoutes, solver=solver, contacts=contacts)
 
 
 def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):

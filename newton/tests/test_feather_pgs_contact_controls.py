@@ -11,7 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group, response_builds_rows
-from newton._src.solvers.feather_pgs.contact_input import ContactInput
+from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
@@ -438,11 +438,15 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             compute_contact_linear_force_from_impulses,
             dim=1,
             inputs=[
-                wp.array([1], dtype=wp.int32, device=device),
-                wp.full(1, wp.vec3(float("nan")), dtype=wp.vec3, device=device),
-                integers,
-                integers,
-                integers,
+                field_group.upload(
+                    ContactRoutes,
+                    device,
+                    count=[1],
+                    normal=wp.full(1, wp.vec3(float("nan")), dtype=wp.vec3, device=device),
+                    world=integers,
+                    slot=integers,
+                    path=integers,
+                ),
                 poisoned,
                 poisoned,
                 integers,

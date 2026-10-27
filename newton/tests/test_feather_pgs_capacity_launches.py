@@ -12,8 +12,8 @@ import warp as wp
 
 import newton
 from newton._src.sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
-from newton._src.solvers.feather_pgs import kernels, keyed_rows
-from newton._src.solvers.feather_pgs.contact_input import ContactInput
+from newton._src.solvers.feather_pgs import field_group, kernels, keyed_rows
+from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton.solvers import SolverFeatherPGS
 
 # Every launch over the contact capacity that grid-strides over the capped grid.
@@ -71,12 +71,17 @@ def _export_inputs(device, capacity, count, rng):
         return wp.array(values, dtype=dtype, device=device)
 
     counts = ints(np.full(worlds, rows, np.int32))
+    routes = field_group.upload(
+        ContactRoutes,
+        device,
+        count=[count],
+        normal=wp.array(normal.astype(np.float32), dtype=wp.vec3, device=device),
+        world=world,
+        slot=slot,
+        path=path,
+    )
     return [
-        ints([count]),
-        wp.array(normal.astype(np.float32), dtype=wp.vec3, device=device),
-        ints(world),
-        ints(slot),
-        ints(path),
+        routes,
         floats((worlds, rows)),
         floats((worlds, rows)),
         counts,
@@ -141,7 +146,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     wp.launch(
                         kernels.pack_contact_linear_force_as_spatial,
                         dim=capacity,
-                        inputs=[inputs[0], force],
+                        inputs=[inputs[0].count, force],
                         outputs=[spatial],
                         device=device,
                         max_blocks=max_blocks,

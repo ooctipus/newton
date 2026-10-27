@@ -8,7 +8,7 @@ import warp as wp
 import newton
 from newton._src.sim.enums import BodyFlags, JointType
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.joint_table import JointTable
+from newton._src.solvers.feather_pgs.joint_table import FreeBodies, JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_joint_velocity_limit_slots,
     allocate_rigid_velocity_limit_slots,
@@ -70,13 +70,17 @@ def _allocated_rigid_velocity_slots(
         allocate_rigid_velocity_limit_slots,
         dim=1,
         inputs=[
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([0], dtype=wp.int32, device=device),
-            wp.array([1], dtype=wp.int32, device=device),
+            field_group.upload(
+                FreeBodies,
+                device,
+                free_rigid_body_indices=[0],
+                body_to_articulation=[0],
+                art_to_world=[0],
+                is_free_rigid=[1],
+                max_linear_velocity=[lin_limit],
+                max_angular_velocity=[ang_limit],
+            ),
             wp.array([int(BodyFlags.DYNAMIC)], dtype=wp.int32, device=device),
-            wp.array([lin_limit], dtype=wp.float32, device=device),
-            wp.array([ang_limit], dtype=wp.float32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array(list(qd6), dtype=wp.float32, device=device),
             fraction,

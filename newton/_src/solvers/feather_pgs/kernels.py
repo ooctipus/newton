@@ -22,7 +22,7 @@ from ...sim.articulation import (
     eval_single_articulation_fk,
 )
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
-from .contact_input import ContactInput
+from .contact_input import ContactInput, ContactRoutes
 from .contact_laws import (
     contact_endpoints,
     contact_friction_points,
@@ -48,7 +48,7 @@ from .device_preludes import (
     warp_sync,
 )
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
-from .joint_table import JointTable
+from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     disk,
 )
@@ -945,12 +945,8 @@ def update_qdd_from_velocity(
 
 @wp.func
 def _contact_linear_force(
+    routes: ContactRoutes,
     c: int,
-    contact_count: wp.array[wp.int32],
-    contact_normal: wp.array[wp.vec3],
-    contact_world: wp.array[wp.int32],
-    contact_slot: wp.array[wp.int32],
-    contact_path: wp.array[wp.int32],
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
@@ -965,20 +961,20 @@ def _contact_linear_force(
     rigid_contact_force: wp.array[wp.vec3],
 ):
     """Convert solved FeatherPGS contact impulses into world-frame forces."""
-    total_contacts = contact_count[0]
+    total_contacts = routes.count[0]
     if c >= total_contacts:
         return
 
     force = wp.vec3(0.0)
-    slot = contact_slot[c]
-    path = contact_path[c]
+    slot = routes.slot[c]
+    path = routes.path[c]
 
     if slot >= 0 and path >= 0 and inv_dt > 0.0:
-        world = contact_world[c]
+        world = routes.world[c]
         # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
         # solves along the opposite direction internally, which corresponds to the
         # force on shape/body 0 from shape/body 1.
-        normal = -contact_normal[c]
+        normal = -routes.normal[c]
 
         lam_n = 0.0
         lam_t0 = 0.0
@@ -1021,11 +1017,7 @@ def _contact_linear_force(
 
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
-    contact_count: wp.array[wp.int32],
-    contact_normal: wp.array[wp.vec3],
-    contact_world: wp.array[wp.int32],
-    contact_slot: wp.array[wp.int32],
-    contact_path: wp.array[wp.int32],
+    routes: ContactRoutes,
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
@@ -1041,12 +1033,8 @@ def compute_contact_linear_force_from_impulses(
 ):
     "Convert solved FeatherPGS contact impulses into world-frame forces."
     _contact_linear_force(
+        routes,
         wp.tid(),
-        contact_count,
-        contact_normal,
-        contact_world,
-        contact_slot,
-        contact_path,
         world_impulses,
         mf_impulses,
         world_constraint_count,
@@ -2951,7 +2939,6 @@ def apply_sparse_diagonal_contact_restitution_matrix_free(
     sparse_row_jy: wp.array3d[float],
     dt: float,
     restitution_velocity_threshold: float,
-    # in/out
 ):
     """Apply restitution from a compact dense component plus two sparse response coordinates."""
     tid = wp.tid()
@@ -3311,7 +3298,6 @@ def compute_world_contact_bias(
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
     contact_w: float,
-    # outputs
 ):
     """Compute the RHS bias term for world-level PGS solve: each row's position law (:func:`.row_laws.row_rhs`).
 
@@ -3358,7 +3344,6 @@ def apply_world_contact_restitution_matrix_free(
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
-    # in/out
 ):
     """Replace a matrix-free contact bias with a one-shot restitution target."""
     tid = wp.tid()
@@ -3401,7 +3386,6 @@ def apply_world_contact_restitution_accumulated(
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
-    # in/out
 ):
     """Replace an accumulated impulse-space contact RHS with restitution."""
     tid = wp.tid()
@@ -3443,7 +3427,6 @@ def compute_world_contact_velocity_bias(
     dt: float,
     apply_restitution: int,
     restitution_velocity_threshold: float,
-    # outputs
 ):
     """Build the velocity-pass RHS from the position solution's end gap."""
     tid = wp.tid()
@@ -3749,7 +3732,6 @@ def build_mf_contact_rows(
     has_target_velocity: int,
     friction_patches: FrictionPatches,
     friction_anchor_beta: float,
-    # outputs
 ):
     """Build active matrix-free contacts with a capacity-independent launch."""
     total_contacts = data.count[0]
@@ -3819,18 +3801,14 @@ def _transport_warmstart_contact(
 
 @wp.kernel
 def gather_mf_warmstart(
+    routes: ContactRoutes,
     mf: MfRows,
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    contact_world: wp.array[int],
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev base MF slot (or -1)
     prev_mf_impulses: wp.array2d[float],
     prev_mf_row_type: wp.array2d[int],
     prev_mf_row_parent: wp.array2d[int],
     mf_constraint_count: wp.array[int],
-    contact_normal: wp.array[wp.vec3],
     previous_normal: wp.array[wp.vec3],
     decay: float,
     dt_scale: float,
@@ -3858,15 +3836,15 @@ def gather_mf_warmstart(
     offset (guards the variable 1-vs-3 stride).
     """
     c = wp.tid()
-    if c >= contact_count[0]:
+    if c >= routes.count[0]:
         return
-    if contact_path[c] != 1:  # MF path only
+    if routes.path[c] != 1:  # MF path only
         return
-    new_slot = contact_slot[c]
+    new_slot = routes.slot[c]
     if new_slot < 0:
         return
 
-    world = contact_world[c]
+    world = routes.world[c]
     count = mf_constraint_count[world]
     if new_slot >= count:
         return
@@ -3907,7 +3885,7 @@ def gather_mf_warmstart(
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
         _transport_warmstart_contact(
-            contact_normal[c],
+            routes.normal[c],
             previous_normal[mi],
             world,
             new_slot,
@@ -3921,23 +3899,20 @@ def gather_mf_warmstart(
 
 @wp.kernel
 def snapshot_contact_warmstart(
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    contact_normal: wp.array[wp.vec3],
+    routes: ContactRoutes,
     previous_dense_slot: wp.array[int],
     previous_mf_slot: wp.array[int],
     previous_normal: wp.array[wp.vec3],
 ):
     """Save all contact routes and live normals in one launch."""
     contact = wp.tid()
-    active = contact < contact_count[0]
+    active = contact < routes.count[0]
     path = int(-1)
     slot = int(-1)
     if active:
-        path = contact_path[contact]
-        slot = contact_slot[contact]
-        previous_normal[contact] = contact_normal[contact]
+        path = routes.path[contact]
+        slot = routes.slot[contact]
+        previous_normal[contact] = routes.normal[contact]
     # One thread per ready row; an empty table is a path the solver does not take.
     if previous_dense_slot.shape[0] > 0:
         previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
@@ -3947,18 +3922,14 @@ def snapshot_contact_warmstart(
 
 @wp.kernel
 def gather_dense_warmstart(
+    routes: ContactRoutes,
     rows: DenseRows,
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    contact_world: wp.array[int],
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
     prev_slot_sorted: wp.array[int],  # prev-sorted contact idx -> prev dense normal row (or -1)
     prev_dense_impulses: wp.array2d[float],
     prev_dense_row_type: wp.array2d[int],
     prev_dense_row_parent: wp.array2d[int],
     world_constraint_count: wp.array[int],
-    contact_normal: wp.array[wp.vec3],
     previous_normal: wp.array[wp.vec3],
     decay: float,
     dt_scale: float,
@@ -3980,15 +3951,15 @@ def gather_dense_warmstart(
     starting point near the converged solution.
     """
     c = wp.tid()
-    if c >= contact_count[0]:
+    if c >= routes.count[0]:
         return
-    if contact_path[c] != 0:  # dense path only
+    if routes.path[c] != 0:  # dense path only
         return
-    new_slot = contact_slot[c]
+    new_slot = routes.slot[c]
     if new_slot < 0:
         return
 
-    world = contact_world[c]
+    world = routes.world[c]
     count = world_constraint_count[world]
     if new_slot >= count:
         return
@@ -4029,7 +4000,7 @@ def gather_dense_warmstart(
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
         _transport_warmstart_contact(
-            contact_normal[c],
+            routes.normal[c],
             previous_normal[mi],
             world,
             new_slot,
@@ -4047,13 +4018,8 @@ RIGID_SPEED_ROWS = wp.constant(2)
 
 @wp.kernel
 def allocate_rigid_velocity_limit_slots(
-    free_rigid_body_indices: wp.array[int],
-    body_to_articulation: wp.array[int],
-    art_to_world: wp.array[int],
-    is_free_rigid: wp.array[int],
+    bodies: FreeBodies,
     body_flags: wp.array[wp.int32],
-    rigid_body_max_linear_velocity: wp.array[float],
-    rigid_body_max_angular_velocity: wp.array[float],
     articulation_root_dof_start: wp.array[int],
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
@@ -4080,30 +4046,30 @@ def allocate_rigid_velocity_limit_slots(
     reserves every finitely limited speed's row without reading ``joint_qd``.
     """
     candidate = wp.tid()
-    body = free_rigid_body_indices[candidate]
+    body = bodies.free_rigid_body_indices[candidate]
     base = RIGID_SPEED_ROWS * candidate
 
     for row in range(RIGID_SPEED_ROWS):
         rigid_velocity_limit_slot[base + row] = -1
 
-    art = body_to_articulation[body]
+    art = bodies.body_to_articulation[body]
     if art < 0:
         return
-    if is_free_rigid[art] == 0:
+    if bodies.is_free_rigid[art] == 0:
         return
     if (body_flags[body] & BodyFlags.KINEMATIC) != 0:
         return
 
-    world = art_to_world[art]
+    world = bodies.art_to_world[art]
     if world < 0:
         return
     if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
     for speed_axis in range(RIGID_SPEED_ROWS):
-        limit = rigid_body_max_linear_velocity[body]
+        limit = bodies.max_linear_velocity[body]
         if speed_axis == 1:
-            limit = rigid_body_max_angular_velocity[body]
+            limit = bodies.max_angular_velocity[body]
         # An infinite speed limit is no limit; otherwise the velocity-limit activation law, whose proximity
         # gate reserves the row only when the speed reaches ``fraction * limit``.
         if not wp.isfinite(limit):
@@ -4120,15 +4086,9 @@ def allocate_rigid_velocity_limit_slots(
 
 @wp.kernel
 def populate_rigid_velocity_limit_rows(
+    bodies: FreeBodies,
     mf: MfRows,
-    free_rigid_body_indices: wp.array[int],
-    body_to_articulation: wp.array[int],
-    art_to_world: wp.array[int],
-    is_free_rigid: wp.array[int],
-    rigid_body_max_linear_velocity: wp.array[float],
-    rigid_body_max_angular_velocity: wp.array[float],
     rigid_velocity_limit_slot: wp.array[int],
-    # outputs
 ):
     """Populate the MF speed rows of free rigid bodies' linear and angular velocity limits.
 
@@ -4139,14 +4099,14 @@ def populate_rigid_velocity_limit_rows(
     stores. ``mf_phi`` holds the limit.
     """
     candidate = wp.tid()
-    body = free_rigid_body_indices[candidate]
-    art = body_to_articulation[body]
+    body = bodies.free_rigid_body_indices[candidate]
+    art = bodies.body_to_articulation[body]
     if art < 0:
         return
-    if is_free_rigid[art] == 0:
+    if bodies.is_free_rigid[art] == 0:
         return
 
-    world = art_to_world[art]
+    world = bodies.art_to_world[art]
     if world < 0:
         return
 
@@ -4155,9 +4115,9 @@ def populate_rigid_velocity_limit_rows(
         slot = rigid_velocity_limit_slot[base + speed_axis]
         if slot < 0:
             continue
-        limit = rigid_body_max_linear_velocity[body]
+        limit = bodies.max_linear_velocity[body]
         if speed_axis == 1:
-            limit = rigid_body_max_angular_velocity[body]
+            limit = bodies.max_angular_velocity[body]
 
         for k in range(6):
             mf.J_a[world, slot, k] = 0.0
@@ -4300,7 +4260,6 @@ def compute_mf_rhs_bias(
     apply_restitution: int,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
-    # outputs
 ):
     """Compute only the MF contact RHS bias for a previously-built contact set."""
     tid = wp.tid()

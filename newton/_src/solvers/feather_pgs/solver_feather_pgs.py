@@ -71,6 +71,7 @@ from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import check_options, resolve_kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
+from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
     configure_contact_torsion,
@@ -90,6 +91,7 @@ from .friction_patches import (
     patch_row_law,
 )
 from .joint_table import bind as bind_joint_table
+from .joint_table import bind_free_bodies
 from .kernel_template import Dispatch, KernelTemplate, SweepTier, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -7094,18 +7096,14 @@ class SolverFeatherPGS(SolverBase):
                     gather_dense_warmstart,
                     pool.launch_rows(),
                     inputs=[
+                        bind_contact_routes(self, contacts),
                         bind_dense_rows(self),
-                        contacts.rigid_contact_count,
-                        self.contact_path,
-                        self.contact_slot,
-                        self.contact_world,
                         match_index,
                         self._ws_prev_dense_slot_sorted,
                         self._ws_prev_dense_impulses,
                         self._ws_prev_dense_row_type,
                         self._ws_prev_dense_row_parent,
                         self.constraint_count,
-                        contacts.rigid_contact_normal,
                         self._ws_prev_contact_normal,
                         self.pgs_warmstart_decay,
                         dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
@@ -7428,12 +7426,7 @@ class SolverFeatherPGS(SolverBase):
                 pool.launch(
                     snapshot_contact_warmstart,
                     pool.launch_rows(),
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        self.contact_path,
-                        self.contact_slot,
-                        contacts.rigid_contact_normal,
-                    ],
+                    inputs=[bind_contact_routes(self, contacts)],
                     outputs=[
                         self._ws_prev_dense_slot_sorted,
                         self._ws_prev_slot_sorted,
@@ -7731,11 +7724,7 @@ class SolverFeatherPGS(SolverBase):
             compute_contact_linear_force_from_impulses,
             rows,
             inputs=[
-                contacts.rigid_contact_count,
-                contacts.rigid_contact_normal,
-                self.contact_world,
-                self.contact_slot,
-                self.contact_path,
+                bind_contact_routes(self, contacts),
                 self.impulses,
                 mf_impulses,
                 self.constraint_count,
@@ -9855,18 +9844,14 @@ class SolverFeatherPGS(SolverBase):
                         gather_mf_warmstart,
                         rows,
                         inputs=[
+                            bind_contact_routes(self, contacts),
                             bind_mf_rows(self),
-                            contacts.rigid_contact_count,
-                            self.contact_path,
-                            self.contact_slot,
-                            self.contact_world,
                             match_index,
                             self._ws_prev_slot_sorted,
                             self._ws_prev_mf_impulses,
                             self._ws_prev_mf_row_type,
                             self._ws_prev_mf_row_parent,
                             self.mf_constraint_count,
-                            contacts.rigid_contact_normal,
                             self._ws_prev_contact_normal,
                             self._mf_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
@@ -9905,13 +9890,8 @@ class SolverFeatherPGS(SolverBase):
                 allocate_rigid_velocity_limit_slots,
                 dim=self._free_rigid_body_count,
                 inputs=[
-                    self.free_rigid_body_indices,
-                    self.body_to_articulation,
-                    self.art_to_world,
-                    is_free_rigid,
+                    bind_free_bodies(self),
                     model.body_flags,
-                    self.rigid_body_max_linear_velocity,
-                    self.rigid_body_max_angular_velocity,
                     root_dof_start,
                     self.v_hat,
                     self.velocity_limit_activation_fraction,
@@ -9928,16 +9908,7 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 populate_rigid_velocity_limit_rows,
                 dim=self._free_rigid_body_count,
-                inputs=[
-                    bind_mf_rows(self),
-                    self.free_rigid_body_indices,
-                    self.body_to_articulation,
-                    self.art_to_world,
-                    is_free_rigid,
-                    self.rigid_body_max_linear_velocity,
-                    self.rigid_body_max_angular_velocity,
-                    self.rigid_velocity_limit_slot,
-                ],
+                inputs=[bind_free_bodies(self), bind_mf_rows(self), self.rigid_velocity_limit_slot],
                 device=model.device,
             )
             wp.launch(

@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.contact_input import ContactRoutes
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -111,23 +112,27 @@ def _gather_dense_rows(
         dim=n,
         inputs=[
             field_group.upload(
+                ContactRoutes,
+                "cpu",
+                count=[n],
+                path=[0] * n,
+                slot=current_slots,
+                world=[0] * n,
+                normal=wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
+            ),
+            field_group.upload(
                 DenseRows,
                 "cpu",
                 row_type=[current_types],
                 row_parent=[current_parents],
                 row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
             ),
-            wp.array([n], dtype=wp.int32, device="cpu"),
-            wp.array([0] * n, dtype=wp.int32, device="cpu"),
-            wp.array(current_slots, dtype=wp.int32, device="cpu"),
-            wp.array([0] * n, dtype=wp.int32, device="cpu"),
             wp.array(match_indices, dtype=wp.int32, device="cpu"),
             wp.array(prev_slots, dtype=wp.int32, device="cpu"),
             wp.array([prev_impulses], dtype=wp.float32, device="cpu"),
             wp.array([prev_types], dtype=wp.int32, device="cpu"),
             wp.array([prev_parents], dtype=wp.int32, device="cpu"),
             wp.array([count], dtype=wp.int32, device="cpu"),
-            wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device="cpu"),
             decay,
             dt_scale,
@@ -229,23 +234,27 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             dim=2,
             inputs=[
                 field_group.upload(
+                    ContactRoutes,
+                    "cpu",
+                    count=contact_count,
+                    path=[1, 1],
+                    slot=contact_slots,
+                    world=contact_world,
+                    normal=wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
+                ),
+                field_group.upload(
                     MfRows,
                     "cpu",
                     row_type=current_types,
                     row_parent=current_parents,
                     row_mu=wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
                 ),
-                contact_count,
-                wp.array([1, 1], dtype=wp.int32, device="cpu"),
-                contact_slots,
-                contact_world,
                 match_indices,
                 prev_slots,
                 prev_impulses,
                 prev_types,
                 prev_parents,
                 constraint_count,
-                wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
                 1.0,
                 1.0,
