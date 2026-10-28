@@ -24,7 +24,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import seed_patch_routes
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 # Per route: constraint count, row type, parent, mu, right-hand side, impulse, phi and
@@ -33,6 +33,14 @@ _ROUTE_ARRAYS = {
     0: ("constraint_count", "row_type", "row_parent", "row_mu", "rhs", "impulses", "phi", "target_velocity"),
     1: ("mf_constraint_count", "mf_row_type", "mf_row_parent", "mf_row_mu", "mf_rhs", "mf_impulses", "mf_phi", None),
 }
+
+
+def point_row_law(device, count):
+    """Point friction's row law: the patch law with beta 0, a disabled view and a zero phi for ``count`` contacts."""
+    law = PatchRowLaw()
+    law.patches = FrictionPatches()
+    law.patches.phi = wp.zeros(count, dtype=wp.vec2, device=device)
+    return law
 
 
 def route_arrays(solver, route=0):

@@ -88,8 +88,16 @@ def clear_contact_response(
             Y[group, row, dof] = 0.0
 
 
-@wp.func
-def _produce_contact(data: ContactInput, boundary: CompactBoundary, contact: int):
+@wp.kernel
+def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
+    """Publish each contact's rows in their original collision order, one thread per contact.
+
+    Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
+    persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
+    undivided coefficient; under point friction (``law.patches.enabled`` 0, beta 0, a zero phi view) at the
+    contact's friction points.
+    """
+    contact = wp.tid()
     if contact >= data.count[0]:
         return
     slot = data.slot[contact]
@@ -120,75 +128,8 @@ def _produce_contact(data: ContactInput, boundary: CompactBoundary, contact: int
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
-    group = boundary.dense_group[world]
-    for row in range(data.slots_needed[contact]):
-        direction, p0, p1 = contact_row_frame(
-            row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-        )
-        output_row = slot + row
-        data.target[world, output_row] = prescribed_target(
-            body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-        )
-        data.row_cfm[world, output_row] = data.cfm
-        if row == 0:
-            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_CONTACT
-            data.row_parent[world, output_row] = -1
-            data.row_mu[world, output_row] = mu
-            data.row_beta[world, output_row] = data.beta
-            data.phi[world, output_row] = phi
-            data.restitution[world, output_row] = restitution
-        else:
-            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_FRICTION
-            data.row_parent[world, output_row] = slot
-            data.row_mu[world, output_row] = mu * data.friction_scale
-            data.row_beta[world, output_row] = 0.0
-            data.phi[world, output_row] = 0.0
-            data.restitution[world, output_row] = 0.0
-        sparse_pair_row_response(
-            data, boundary, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
-        )
-
-
-@wp.func
-def _produce_patch_contact(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw, contact: int):
-    """Publish one contact's rows with the persistent patch friction law.
-
-    The normal row is ``_produce_contact``'s. Tangent rows, present only when the
-    contact owns an anchor, follow the patch row law (``contact_laws.contact_row_frame`` at the
-    patch friction location, and ``patch_tangent_row``): they act at the patch friction location, carry the
-    anchor's tangential phi with ``law.beta``, and keep the undivided friction
-    coefficient.
-    """
-    if contact >= data.count[0]:
-        return
-    slot = data.slot[contact]
-    if data.path[contact] != 0 or slot < 0:
-        return
-    world = data.world[contact]
-    art0 = data.art0[contact]
-    art1 = data.art1[contact]
-    body0, body1, normal, point0, point1, phi = contact_geometry(
-        contact,
-        data.shape0,
-        data.shape1,
-        data.point0,
-        data.point1,
-        data.normal,
-        data.margin0,
-        data.margin1,
-        data.shape_body,
-        data.body_q,
-    )
-    has_dense = False
-    if art0 >= 0 and body0 >= 0:
-        has_dense = data.response_dofs[art0] == 6
-    if art1 >= 0 and body1 >= 0:
-        has_dense = has_dense or data.response_dofs[art1] == 6
-    mu, restitution = contact_materials(
-        data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
-    )
-    tangent0, tangent1 = contact_tangent_basis(normal)
-    friction0, friction1 = patch_friction_location(law.patches, contact)
+    if law.patches.enabled != 0:
+        friction0, friction1 = patch_friction_location(law.patches, contact)
     group = boundary.dense_group[world]
     for row in range(data.slots_needed[contact]):
         direction, p0, p1 = contact_row_frame(
@@ -219,18 +160,6 @@ def _produce_patch_contact(data: ContactInput, boundary: CompactBoundary, law: P
         )
 
 
-@wp.kernel
-def produce_contacts(data: ContactInput, boundary: CompactBoundary):
-    """Publish contacts in their original collision order."""
-    _produce_contact(data, boundary, wp.tid())
-
-
-@wp.kernel
-def produce_patch_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
-    """Publish contacts with the patch friction law in their original collision order."""
-    _produce_patch_contact(data, boundary, law, wp.tid())
-
-
 def launch_contacts(solver, data, workers):
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
     boundary = field_group.bind(
@@ -249,14 +178,10 @@ def launch_contacts(solver, data, workers):
     # patch link (_FrictionPatchState.link, one link_patch_routes launch) still
     # runs after this producer: it alone links normal rows into patch rings and
     # divides the tangent coefficient.
-    law = patch_row_law(solver)
     # One thread per contact; in a capture whose launches bind, each replay runs the live count.
     pool = solver._contact_pool
     count = data.count
-    if law is None:
-        pool.launch(produce_contacts, pool.launch_rows(), inputs=[data, boundary], extent=count)
-    else:
-        pool.launch(produce_patch_contacts, pool.launch_rows(), inputs=[data, boundary, law], extent=count)
+    pool.launch(produce_contacts, pool.launch_rows(), inputs=[data, boundary, patch_row_law(solver)], extent=count)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     pool.launch(

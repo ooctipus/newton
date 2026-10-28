@@ -30,6 +30,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_ring_coulomb,
     assert_rows_close,
     contact_rows,
+    point_row_law,
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 
@@ -282,7 +283,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
 def run_candidate(data, aux, law=None):
     """Execute complete owners and the contact clear, leaving original allocation untouched.
 
-    ``law`` selects the patch friction producer.
+    ``law`` is the friction row law; point friction's (beta 0, a disabled view) by default.
     """
     install_prefix(data, aux)
     wp.launch(
@@ -293,9 +294,8 @@ def run_candidate(data, aux, law=None):
         device=aux.device,
     )
     if law is None:
-        wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
-    else:
-        wp.launch(compact.produce_patch_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
+        law = point_row_law(aux.device, data.point0.shape[0])
+    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
     wp.launch(
         response_builds_rows.sparse_pair_limit_kernel,
         dim=(2, 12),
@@ -725,8 +725,7 @@ class TestCompactContact(unittest.TestCase):
                 for name in ("count", "point0", "point1", "normal", "shape0", "shape1", "margin0", "margin1")
             },
         )
-        producers = {False: compact.produce_contacts, True: compact.produce_patch_contacts}
-        for anchors, producer in producers.items():
+        for anchors in (False, True):
             with self.subTest(anchors=anchors):
                 solver = launch_solver(data, aux, anchors=anchors, beta=0.375 if anchors else 0.0)
                 with mock.patch.object(compact.wp, "launch") as launch:
@@ -742,19 +741,19 @@ class TestCompactContact(unittest.TestCase):
                 marker = solver._mark_independent_sparse_contact_candidates_kernel
                 self.assertEqual(
                     [call.args[0] for call in launch.call_args_list],
-                    [compact.clear_contact_response, producer, marker],
+                    [compact.clear_contact_response, compact.produce_contacts, marker],
                 )
                 produce = launch.call_args_list[-2]
                 self.assertEqual(produce.kwargs["dim"], 16)
                 inputs = produce.kwargs["inputs"]
-                # The contact input and the compact boundary, then the patch row law under anchors.
-                self.assertEqual(len(inputs), 2 + int(anchors))
-                if anchors:
-                    law, view = inputs[2], solver._friction_patches.view
-                    self.assertEqual(law.beta, 0.375)
-                    self.assertEqual(law.patches.enabled, 1)
-                    for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
-                        self.assertIs(getattr(law.patches, name), getattr(view, name), name)
+                # The contact input, the compact boundary and the row law: point friction is the patch law
+                # with beta 0 and a disabled view.
+                self.assertEqual(len(inputs), 3)
+                law, view = inputs[2], solver._friction_patches.view
+                self.assertEqual(law.beta, 0.375 if anchors else 0.0)
+                self.assertEqual(law.patches.enabled, int(anchors))
+                for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                    self.assertIs(getattr(law.patches, name), getattr(view, name), name)
 
     def test_empty_and_growing_prefix_with_poison(self):
         """Overwrite every active row through empty, growing and shrinking prefix cases."""
@@ -1063,7 +1062,12 @@ class TestCompactContact(unittest.TestCase):
                         block_dim=256,
                         device=device,
                     )
-                    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(candidate)], device=device)
+                    wp.launch(
+                        compact.produce_contacts,
+                        dim=16,
+                        inputs=[*structs(candidate), point_row_law(device, candidate.point0.shape[0])],
+                        device=device,
+                    )
                     wp.launch(
                         response_builds_rows.sparse_pair_limit_kernel,
                         dim=(2, 12),

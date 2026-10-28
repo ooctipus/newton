@@ -2,8 +2,7 @@
  "kernels": {
   "compact_contact.clear_contact_response": "40bfb5f4f1602fff174cc57df8937bdcf8dc7777f80542a7833987f649b748a6",
   "compact_contact.clear_limit_prefix": "7f1b983839f72e16f5904707bbf87c71c6c1b4c141c6ac634a5203eaafb0f1a8",
-  "compact_contact.produce_contacts": "d407b1d687d87554f92951bf82d69d5ef77c2806fb0a7fe29c9fc83c1763eb28",
-  "compact_contact.produce_patch_contacts": "88489c1bd3c37f8c7ef16a6cba0b4d10d51f6f6e74a06b2693c49b09c41a22ce",
+  "compact_contact.produce_contacts": "c6bbbd5ce0d14ec442e7167596b6af0325efa659f8b7b912b97925443e4d7e1d",
   "contact_compliance.update_compliant_rhs": "a70684cc25f74be3186c1c96d9b6b2085abbe59808ec1a1dc75a88a4c6972f6e",
   "contact_torsion._prepare_velocity_torsion_rows": "a2141e9942863f59f744062af8c440237db0a7ebfc20afa1b513f3ba7d3386fa",
   "contact_torsion_device._apply_counts": "7526241579441e586c430e6f7b599735db2153f73263db7101af37b324e8f2d8",

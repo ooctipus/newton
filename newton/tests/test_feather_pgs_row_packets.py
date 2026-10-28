@@ -541,7 +541,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
         producers = (
             rp.produce_patch_contacts,
             rp.materialize_patch_fallback,
-            compact_contact.produce_patch_contacts,
+            compact_contact.produce_contacts,
         )
         for kernel in producers:
             name = f"{kernel.func.__module__}.{kernel.key}"

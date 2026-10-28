@@ -14,6 +14,7 @@ from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
 from newton._src.solvers.feather_pgs import contact_input, response_builds_rows
 from newton.tests import test_feather_pgs_compact_contact as baseline
+from newton.tests.feather_pgs_patch_parity import point_row_law
 from newton.tests.test_feather_pgs_compact_contact import (
     _LAUNCH_FIELDS,
     OUTPUTS,
@@ -35,10 +36,16 @@ def clear(data, aux):
     )
 
 
+def produce(data, aux):
+    """Publish the contact rows under point friction (the patch law with beta 0 and a disabled view)."""
+    law = point_row_law(aux.device, data.point0.shape[0])
+    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
+
+
 def publish(data, aux):
     """Run all new output owners without host readbacks inside the captured sequence."""
     clear(data, aux)
-    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
+    produce(data, aux)
     wp.launch(
         response_builds_rows.sparse_pair_limit_kernel,
         dim=(2, 12),
@@ -74,7 +81,7 @@ class TestCoalescedContact(unittest.TestCase):
         data, aux = fixture(shared=1)
         data.J.fill_(713.0)
         data.Y.fill_(-919.0)
-        wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
+        produce(data, aux)
         response_dofs = data.response_dofs.numpy()
         arts = (data.art0.numpy(), data.art1.numpy())
         for contact, slot in enumerate(data.slot.numpy()):
@@ -186,8 +193,10 @@ class TestCoalescedContact(unittest.TestCase):
             J_by_size={6: data.J},
             Y_by_size={6: data.Y},
             _mark_independent_sparse_contact_candidates_kernel=marker,
-            # The point producer: no patch row law.
+            # Point friction: the patch row law with beta 0 and a disabled view.
             _friction_anchors_enabled=False,
+            friction_anchor_beta=0.0,
+            _friction_patches=SimpleNamespace(view=point_row_law("cpu", 16).patches),
             # Launches sized by contact rows go through the pool, eagerly here.
             _contact_pool=ContactPool(device="cpu", rows=16),
         )

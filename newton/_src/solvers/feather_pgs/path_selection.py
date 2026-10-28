@@ -408,7 +408,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "compact_contact_boundary":
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
+        produce = (compact_contact.produce_contacts,)
         if size == solver._sparse_diagonal_response_size:
             # The marker encodes schedule links into the freshly published sparse DOF slots.
             kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)

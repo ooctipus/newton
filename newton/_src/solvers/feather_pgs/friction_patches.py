@@ -140,13 +140,13 @@ native row source (``keyed_rows._patch_row_law``), and the masked row builder's 
 """
 
 
-def patch_row_law(solver) -> "PatchRowLaw | None":
-    """The solver's patch row law for this step, or ``None`` without persistent patch friction.
+def patch_row_law(solver) -> "PatchRowLaw":
+    """The solver's patch row law for this step.
 
-    Bound every step: contact-pool growth replaces the patch view.
+    Point friction is the patch law with beta 0: its view is disabled, with a zero phi, and the producers take
+    the contact's friction points instead of a patch friction location. Bound every step: contact-pool growth
+    replaces the patch view.
     """
-    if not solver._friction_anchors_enabled:
-        return None
     return field_group.bind(PatchRowLaw, solver=solver, friction_patches=solver._friction_patches)
 
 
