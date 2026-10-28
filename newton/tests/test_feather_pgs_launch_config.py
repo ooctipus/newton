@@ -240,7 +240,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         expected_modules = {
             feather_pgs_kernels: {
                 "eval_rigid_tau_and_augmented_drives": "inverse_dynamics",
-                "prepare_augmented_joint_drives": "inverse_dynamics",
             },
             tree_passes: {
                 "fk_id": "serial",
@@ -873,7 +872,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             tree_passes.inverse_dynamics_tau,
             tree_passes.composite_inertia,
             feather_pgs_kernels.eval_rigid_tau_and_augmented_drives,
-            feather_pgs_kernels.prepare_augmented_joint_drives,
         }
         blocks = {}
         launch = wp.launch

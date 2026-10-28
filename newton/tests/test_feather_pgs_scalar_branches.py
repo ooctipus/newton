@@ -234,8 +234,7 @@ def cpu_solver(model, size):
     scalar kernels and the head kernels bind the arrays the CUDA route binds.
     """
     solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True, update_mass_matrix_interval=2)
-    solver._async_augmented_drives = True
-    solver._setup_parallel_augmented_drive_topology(model)
+    solver._setup_parallel_augmented_drive_topology(model, True)
     solver._compact_diagonal_mass_size = size
     solver._fk_id_cache_enabled = True
     return solver

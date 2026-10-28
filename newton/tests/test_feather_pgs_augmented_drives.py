@@ -15,7 +15,6 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau_and_augmented_drives,
     populate_physx_drive_J_for_size,
-    prepare_augmented_joint_drives,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
@@ -108,7 +107,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 - state.joint_q.numpy()[coords]
                 - dt * state.joint_qd.numpy()[dofs]
             ) + 3.0 * (control.joint_target_qd.numpy()[dofs] - state.joint_qd.numpy()[dofs])
-            for path in ("generic", "combined", "per_dof"):
+            for path in ("combined", "per_dof"):
                 with self.subTest(coord_layout=coord_layout, path=path):
                     row_counts = wp.zeros(model.articulation_count, dtype=int, device=device)
                     row_indices = wp.zeros(row_count, dtype=int, device=device)
@@ -140,30 +139,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                                 dt,
                             ],
                             outputs=[row_K, tau],
-                            device=device,
-                        )
-                    elif path == "generic":
-                        wp.launch(
-                            prepare_augmented_joint_drives,
-                            dim=model.articulation_count,
-                            inputs=[
-                                field_group.upload(
-                                    JointTable,
-                                    device,
-                                    model,
-                                    articulation_H_rows=counts,
-                                    joint_target_ke=gains[0],
-                                    joint_target_kd=gains[1],
-                                    joint_effort_limit=gains[4],
-                                ),
-                                state.joint_q,
-                                state.joint_qd,
-                                gains[2],
-                                gains[3],
-                                max_dofs,
-                                dt,
-                            ],
-                            outputs=[row_counts, row_indices, row_K, tau],
                             device=device,
                         )
                     else:
@@ -264,7 +239,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 np.testing.assert_array_equal(fields[6].numpy().ravel(), control.joint_target_qd.numpy()[dofs])
 
     def test_split_augmented_drive_pipeline_matches_combined_kernel(self):
-        """Match combined drive forces and clear articulations without active drives."""
+        """Match the per-coordinate drives plus additive joint forces to the combined kernel; clear drives without
+        gains."""
         device = wp.get_device()
         articulation_start = wp.array([0, 2], dtype=wp.int32, device=device)
         articulation_joint_end = wp.array([2], dtype=wp.int32, device=device)
@@ -380,64 +356,20 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         np.testing.assert_array_equal(combined_indices.numpy(), [0, 1])
         np.testing.assert_allclose(combined_stiffness.numpy(), [0.2, 0.4], rtol=0.0, atol=1.0e-7)
 
-        prepared_counts = wp.zeros_like(combined_counts)
-        prepared_indices = wp.zeros_like(combined_indices)
-        prepared_stiffness = wp.zeros_like(combined_stiffness)
-        prepared_tau = wp.zeros_like(combined_tau)
-        wp.launch(
-            prepare_augmented_joint_drives,
-            dim=1,
-            inputs=[
-                field_group.upload(
-                    JointTable,
-                    device,
-                    articulation_start=articulation_start,
-                    articulation_H_rows=articulation_dof_count,
-                    joint_type=joint_type,
-                    joint_qd_start=joint_start,
-                    joint_q_start=joint_start,
-                    joint_target_q_start=joint_start,
-                    joint_dof_dim=joint_dof_dim,
-                    joint_target_ke=target_ke,
-                    joint_target_kd=target_kd,
-                    joint_effort_limit=effort_limit,
-                ),
-                joint_q,
-                joint_qd,
-                target_q,
-                target_qd,
-                2,
-                0.1,
-            ],
-            outputs=[prepared_counts, prepared_indices, prepared_stiffness, prepared_tau],
-            device=device,
-        )
-        np.testing.assert_array_equal(prepared_counts.numpy(), combined_counts.numpy())
-        np.testing.assert_array_equal(prepared_indices.numpy(), combined_indices.numpy())
-        np.testing.assert_array_equal(prepared_stiffness.numpy(), combined_stiffness.numpy())
-        np.testing.assert_allclose(prepared_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
-
         topology_stiffness = wp.zeros_like(combined_stiffness)
         topology_tau = wp.zeros_like(combined_tau)
-        wp.launch(
-            _prepare_augmented_joint_drives_by_dof,
-            dim=2,
-            inputs=[
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                wp.array([0, 1], dtype=wp.int32, device=device),
-                joint_q,
-                joint_qd,
-                target_ke,
-                target_kd,
-                target_q,
-                target_qd,
-                effort_limit,
-                0.1,
-            ],
-            outputs=[topology_stiffness, topology_tau],
-            device=device,
-        )
+        rows = wp.array([0, 1], dtype=wp.int32, device=device)
+
+        def prepare_by_dof(ke, kd, stiffness, tau):
+            wp.launch(
+                _prepare_augmented_joint_drives_by_dof,
+                dim=2,
+                inputs=[rows, rows, rows, joint_q, joint_qd, ke, kd, target_q, target_qd, effort_limit, 0.1],
+                outputs=[stiffness, tau],
+                device=device,
+            )
+
+        prepare_by_dof(target_ke, target_kd, topology_stiffness, topology_tau)
         np.testing.assert_array_equal(topology_stiffness.numpy(), combined_stiffness.numpy())
         np.testing.assert_allclose(topology_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
 
@@ -445,47 +377,43 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         wp.launch(
             inverse_dynamics_tau,
             dim=1,
-            inputs=[dynamics(additive_body_ft, prepared_tau, add_existing_tau=1)],
+            inputs=[dynamics(additive_body_ft, topology_tau, add_existing_tau=1)],
             device=device,
         )
         np.testing.assert_array_equal(additive_body_ft.numpy(), combined_body_ft.numpy())
-        np.testing.assert_allclose(prepared_tau.numpy(), combined_tau.numpy(), rtol=0.0, atol=1.0e-6)
+        np.testing.assert_array_equal(topology_tau.numpy(), combined_tau.numpy())
 
-        passive_counts = wp.array([7], dtype=wp.int32, device=device)
-        passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
+        # Without gains neither preparation keeps a drive row or a drive force.
         zero_target_ke = wp.zeros_like(target_ke)
         zero_target_kd = wp.zeros_like(target_kd)
+        passive_stiffness = wp.array([7.0, 7.0], dtype=wp.float32, device=device)
+        passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
+        prepare_by_dof(zero_target_ke, zero_target_kd, passive_stiffness, passive_tau)
+        np.testing.assert_array_equal(passive_stiffness.numpy(), [0.0, 0.0])
+        np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
+
+        passive_counts = wp.array([7], dtype=wp.int32, device=device)
+        passive_combined_tau = wp.zeros_like(combined_tau)
         wp.launch(
-            prepare_augmented_joint_drives,
+            eval_rigid_tau_and_augmented_drives,
             dim=1,
             inputs=[
-                field_group.upload(
-                    JointTable,
-                    device,
-                    articulation_start=articulation_start,
-                    articulation_H_rows=articulation_dof_count,
-                    joint_type=joint_type,
-                    joint_qd_start=joint_start,
-                    joint_q_start=joint_start,
-                    joint_target_q_start=joint_start,
-                    joint_dof_dim=joint_dof_dim,
-                    joint_target_ke=zero_target_ke,
-                    joint_target_kd=zero_target_kd,
-                    joint_effort_limit=effort_limit,
-                ),
-                joint_q,
-                joint_qd,
+                dynamics(wp.zeros_like(combined_body_ft), passive_combined_tau, row_K=wp.zeros_like(target_ke)),
+                articulation_dof_count,
+                joint_start,
+                zero_target_ke,
+                zero_target_kd,
                 target_q,
                 target_qd,
+                effort_limit,
                 2,
                 0.1,
             ],
-            outputs=[passive_counts, prepared_indices, prepared_stiffness, passive_tau],
+            outputs=[passive_counts, wp.zeros_like(combined_indices)],
             device=device,
         )
-
         np.testing.assert_array_equal(passive_counts.numpy(), [0])
-        np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
+        np.testing.assert_array_equal(passive_combined_tau.numpy(), sequential_tau.numpy())
 
 
 if __name__ == "__main__":

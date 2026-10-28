@@ -150,7 +150,6 @@ from .kernels import (
     populate_rigid_velocity_limit_rows,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
-    prepare_augmented_joint_drives,
     prepare_fused_diagonal_joint_limits,
     prepare_world_contact_rows,
     prepare_world_impulses,
@@ -2257,15 +2256,6 @@ class SolverFeatherPGS(SolverBase):
             else "No world holds one non-free articulation of at most "
             f"{_LOCAL_INTERNAL_MAX_DOF} DOFs whose local staging fits the device."
         )
-        # Drives are prepared apart from inverse dynamics (per coordinate where the topology allows) on CUDA without
-        # gradients; use_parallel_streams only decides whether that preparation overlaps on a stream of its own.
-        self._async_augmented_drives = bool(
-            model.device.is_cuda
-            and not model.requires_grad
-            and self.drive_mode == "augmented"
-            and self.articulation_max_dofs > 0
-        )
-
         # All inactive weight arguments alias this one element. Their producer
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
@@ -2292,7 +2282,16 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._jy_world_aliased = False
         self._allocate_common_buffers(model)
-        self._setup_parallel_augmented_drive_topology(model)
+        # Drives are prepared per coordinate, apart from inverse dynamics, on CUDA without gradients wherever each
+        # coordinate has one owning drive row; use_parallel_streams only decides whether that preparation overlaps on
+        # a stream of its own. Elsewhere the joint-force pass evaluates them, as on the CPU.
+        self._setup_parallel_augmented_drive_topology(
+            model,
+            model.device.is_cuda
+            and not model.requires_grad
+            and self.drive_mode == "augmented"
+            and self.articulation_max_dofs > 0,
+        )
         if self._sparse_diagonal_contact_solve and not self._parallel_augmented_drive_topology:
             raise RuntimeError("sparse diagonal response requires owned augmented-drive topology")
         self._compact_diagonal_mass_size = (
@@ -4848,15 +4847,15 @@ class SolverFeatherPGS(SolverBase):
             drive_row=model.articulation_count * max_dofs,
         )
 
-    def _setup_parallel_augmented_drive_topology(self, model) -> None:
-        """Separate immutable augmented-drive row ownership from per-step coefficients."""
+    def _setup_parallel_augmented_drive_topology(self, model, eligible: bool) -> None:
+        """Separate immutable augmented-drive row ownership from per-step coefficients, where ``eligible``."""
         self._parallel_augmented_drive_topology = False
         self._augmented_drive_row_by_dof = wp.full(
             (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
         )
         self._augmented_drive_q_index_by_dof = None
         self._augmented_drive_target_index_by_dof = None
-        if not self._async_augmented_drives or self._has_loop_joints or not model.joint_dof_count:
+        if not eligible or self._has_loop_joints or not model.joint_dof_count:
             return
 
         dof_count = int(model.joint_dof_count)
@@ -5728,7 +5727,7 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._articulation_dynamics_stream = (
-            wp.Stream(model.device) if self._async_augmented_drives and self.use_parallel_streams else None
+            wp.Stream(model.device) if self._parallel_augmented_drive_topology and self.use_parallel_streams else None
         )
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
@@ -7591,8 +7590,8 @@ class SolverFeatherPGS(SolverBase):
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float
     ) -> wp.Event | None:
-        """Launch DOF-local augmented-drive preparation independently of FK/ID."""
-        if not self._async_augmented_drives:
+        """Launch the per-coordinate augmented-drive preparation independently of FK/ID."""
+        if not self._parallel_augmented_drive_topology:
             return None
 
         model = self.model
@@ -7604,7 +7603,7 @@ class SolverFeatherPGS(SolverBase):
             if scalar is not None:
                 # Scalar branches evaluate their drives in their predict.
                 scalar.launch_other_drives(state_in, state_aug, control, dt)
-            elif self._parallel_augmented_drive_topology:
+            else:
                 wp.launch(
                     _prepare_augmented_joint_drives_by_dof,
                     dim=model.joint_dof_count,
@@ -7623,28 +7622,6 @@ class SolverFeatherPGS(SolverBase):
                     ],
                     outputs=[self.aug_row_K, state_aug.joint_tau],
                     block_dim=256,
-                    device=model.device,
-                )
-            else:
-                wp.launch(
-                    prepare_augmented_joint_drives,
-                    dim=model.articulation_count,
-                    inputs=[
-                        bind_joint_table(self),
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        self.articulation_max_dofs,
-                        dt,
-                    ],
-                    outputs=[
-                        self.aug_row_counts,
-                        self.aug_row_dof_index,
-                        self.aug_row_K,
-                        state_aug.joint_tau,
-                    ],
-                    block_dim=SERIAL_BLOCK_DIM,
                     device=model.device,
                 )
         return None if dynamics_stream is None else dynamics_stream.record_event()
@@ -7676,7 +7653,7 @@ class SolverFeatherPGS(SolverBase):
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
-        if not self._async_augmented_drives:
+        if not self._parallel_augmented_drive_topology:
             self._stage1_drives(state_in, state_aug, control, dt)
             return None
 
@@ -7790,7 +7767,7 @@ class SolverFeatherPGS(SolverBase):
 
         # The immutable drive layout gives CRBA direct DOF-to-row ownership.
         # Make the dynamic coefficients visible before any fused mass write.
-        if drive_rows_ready is not None and self._parallel_augmented_drive_topology:
+        if drive_rows_ready is not None:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
         # The composite inertia of the articulations the mass mask selects.
@@ -7869,9 +7846,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
                 block_dim=128,
             )
-
-        if drive_rows_ready is not None and not self._parallel_augmented_drive_topology:
-            wp.get_stream(model.device).wait_event(drive_rows_ready)
 
         if not self._parallel_augmented_drive_topology:
             for size in self.size_groups:

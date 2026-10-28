@@ -1098,22 +1098,15 @@ def prepare_articulation_augmented_drives(
     joint_effort_limit: wp.array[float],
     max_dofs: int,
     dt: float,
-    reset_tau: int,
     # outputs
     row_counts: wp.array[int],
     row_dof_index: wp.array[int],
     row_K: wp.array[float],
     tau: wp.array[float],
 ):
-    """Prepare one articulation's implicit drive rows and explicit force."""
+    """Prepare one articulation's implicit drive rows and add their explicit force to ``tau``."""
     joint_start = articulation_start[articulation]
     joint_end = articulation_start[articulation + 1]
-    if reset_tau != 0:
-        dof_start = joint_qd_start[joint_start]
-        dof_end = dof_start + articulation_H_rows[articulation]
-        for dof_index in range(dof_start, dof_end):
-            tau[dof_index] = 0.0
-
     if articulation_H_rows[articulation] == 0:
         row_counts[articulation] = 0
         return
@@ -1151,10 +1144,7 @@ def prepare_articulation_augmented_drives(
             row_index = articulation * max_dofs + slot
             row_dof_index[row_index] = dof_index
             row_K[row_index] = K
-            if reset_tau != 0:
-                tau[dof_index] = u0
-            else:
-                tau[dof_index] = tau[dof_index] + u0
+            tau[dof_index] = tau[dof_index] + u0
             slot += 1
             if slot >= max_dofs:
                 break
@@ -1200,53 +1190,10 @@ def eval_rigid_tau_and_augmented_drives(
         joint_effort_limit,
         max_dofs,
         dt,
-        0,
         row_counts,
         row_dof_index,
         d.row_K,
         d.tau,
-    )
-
-
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
-def prepare_augmented_joint_drives(
-    joints: JointTable,
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    drive_tau: wp.array[float],
-):
-    """Prepare implicit drive rows and their explicit force independently of inverse dynamics."""
-    prepare_articulation_augmented_drives(
-        wp.tid(),
-        joints.articulation_start,
-        joints.articulation_H_rows,
-        joints.joint_type,
-        joints.joint_qd_start,
-        joints.joint_q_start,
-        joints.joint_target_q_start,
-        joints.joint_dof_dim,
-        joint_q,
-        joint_qd,
-        joints.joint_target_ke,
-        joints.joint_target_kd,
-        joint_target_pos,
-        joint_target_vel,
-        joints.joint_effort_limit,
-        max_dofs,
-        dt,
-        1,
-        row_counts,
-        row_dof_index,
-        row_K,
-        drive_tau,
     )
 
 

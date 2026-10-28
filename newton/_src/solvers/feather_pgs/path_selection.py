@@ -1019,7 +1019,6 @@ def _dynamics(solver) -> dict:
         # Response layout: whether J/Y are gathered per world or already world-indexed.
         "jy_world_aliased": bool(solver._jy_world_aliased),
         "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),
-        "async_augmented_drives": bool(solver._async_augmented_drives),
         "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
         "double_buffer": bool(solver._double_buffer),
         # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset
