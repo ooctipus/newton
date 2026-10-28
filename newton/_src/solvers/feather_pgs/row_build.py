@@ -11,9 +11,9 @@ bitmask that the solver already builds, so the whole Jacobian row is written onc
 bit-identical to the legacy kernel: each entry is one signed projection (two when both bodies belong to the same
 articulation, summed in the same order).
 
-Persistent patch friction has its own prelude and Jacobian pass (``*_patch``): the allocation's extent decides which
-contacts own tangent rows, and those rows follow the patch row law (:class:`PatchRowLaw`), as the generic per-contact
-builder writes them.
+Both passes take the friction row law (:class:`PatchRowLaw`): the allocation's extent decides which contacts own
+tangent rows, and those rows follow the patch row law, as the generic per-contact builder writes them. Point friction is
+the patch law with beta 0, a disabled view and a zero phi: its tangent rows act at the contact's friction points.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .friction_patches import PatchRowLaw, patch_friction_location
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 
@@ -40,19 +40,23 @@ def contact_row_prelude(
     total_threads: int,
     size_a: int,
     size_b: int,
+    law: PatchRowLaw,
     # outputs (and the row records of ``data``)
     pre_flags: wp.array[int],  # bit0 active, bit1 friction rows, bit2 A in size, bit3 B in size
 ):
     """Per contact row (grid-stride, 3 threads per contact): geometry, friction decisions and row metadata.
 
     Thread ``r`` of a contact writes the flags (r == 0) and the metadata of row ``slot + r`` only, so each thread's
-    dependency chain carries one prescribed-target evaluation and eight stores instead of three and twenty-four.
+    dependency chain carries one prescribed-target evaluation and eight stores instead of three and twenty-four. A
+    contact owns tangent rows when the allocation reserved them (``contact_slots_needed`` of 3); they follow the row
+    law (``patch_tangent_row``) and keep the undivided friction coefficient: the patch link, which runs after every
+    row producer, divides it and links the normal rows into rings.
     """
     tid = wp.tid()
     r = tid % 3
     total_contacts = data.count[0]
     for c in range(tid // 3, total_contacts, total_threads // 3):
-        _contact_row_prelude_one(c, r, data, size_a, size_b, pre_flags)
+        _contact_row_prelude_one(c, r, data, size_a, size_b, law, pre_flags)
 
 
 @wp.func
@@ -72,7 +76,9 @@ def _contact_in_sizes(data: ContactInput, c: int, size_a: int, size_b: int):
 
 
 @wp.func
-def _contact_row_prelude_one(c: int, r: int, data: ContactInput, size_a: int, size_b: int, pre_flags: wp.array[int]):
+def _contact_row_prelude_one(
+    c: int, r: int, data: ContactInput, size_a: int, size_b: int, law: PatchRowLaw, pre_flags: wp.array[int]
+):
     if r == 0:
         pre_flags[c] = 0
     if data.path[c] != 0:
@@ -84,6 +90,11 @@ def _contact_row_prelude_one(c: int, r: int, data: ContactInput, size_a: int, si
     art_b = data.art1[c]
     a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
     if not a_in and not b_in:
+        return
+    # Allocation owns the row extent; recomputing eligibility can cross a
+    # floating-point threshold and overwrite the following contact.
+    will_add_friction = data.slots_needed[c] == 3
+    if r > 0 and not will_add_friction:
         return
 
     world = data.world[c]
@@ -102,9 +113,12 @@ def _contact_row_prelude_one(c: int, r: int, data: ContactInput, size_a: int, si
     mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction_a, friction_b = contact_friction_points(point_a, point_b, data.shared_anchor, data.friction_shared_anchor)
-    # Allocation owns the row extent; recomputing eligibility can cross a
-    # floating-point threshold and overwrite the following contact.
-    will_add_friction = data.slots_needed[c] >= 3
+    if law.patches.enabled != 0:
+        friction_a, friction_b = patch_friction_location(law.patches, c)
+    direction, p0, p1 = contact_row_frame(
+        r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+    )
+    row = slot + r
     if r == 0:
         flags = 1
         if will_add_friction:
@@ -114,29 +128,24 @@ def _contact_row_prelude_one(c: int, r: int, data: ContactInput, size_a: int, si
         if b_in:
             flags |= 8
         pre_flags[c] = flags
-    if r == 0 or will_add_friction:
-        direction, p0, p1 = contact_row_frame(
-            r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-        )
-        row = slot + r
-        if r == 0:
-            data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
-            data.row_parent[world, row] = -1
-            data.row_mu[world, row] = mu
-            data.row_beta[world, row] = data.beta
-            data.phi[world, row] = phi
-            data.restitution[world, row] = restitution
-        else:
-            data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
-            data.row_parent[world, row] = slot
-            data.row_mu[world, row] = mu * data.friction_scale
-            data.row_beta[world, row] = 0.0
-            data.phi[world, row] = 0.0
-            data.restitution[world, row] = 0.0
-        data.row_cfm[world, row] = data.cfm
-        data.target[world, row] = prescribed_target(
-            body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-        )
+        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+        data.row_parent[world, row] = -1
+        data.row_mu[world, row] = mu
+        data.row_beta[world, row] = data.beta
+        data.phi[world, row] = phi
+        data.restitution[world, row] = restitution
+    else:
+        tangent_phi, beta, friction_mu = patch_tangent_row(law, c, r, mu, data.friction_scale)
+        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+        data.row_parent[world, row] = slot
+        data.row_mu[world, row] = friction_mu
+        data.row_beta[world, row] = beta
+        data.phi[world, row] = tangent_phi
+        data.restitution[world, row] = 0.0
+    data.row_cfm[world, row] = data.cfm
+    data.target[world, row] = prescribed_target(
+        body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -146,6 +155,7 @@ def populate_world_J_masked(
     size_a: int,
     size_b: int,
     art_group_idx: wp.array[int],
+    law: PatchRowLaw,
     pre_flags: wp.array[int],
     # outputs: Jacobian blocks of the two size groups (the second may alias the first when only one group exists)
     J_group_a: wp.array3d[float],
@@ -154,13 +164,14 @@ def populate_world_J_masked(
     """One thread per (contact, local dof), grid-stride over contacts: the Jacobian entries of that dof, written once.
 
     ``lanes`` threads per contact (the larger group size, not 32): idle lanes were 30% of the launch on 22-DOF worlds.
+    Tangent rows act at the row law's friction location.
     """
     tid = wp.tid()
     lanes = wp.max(size_a, size_b)
     lane = tid % lanes
     total_contacts = data.count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
-        _populate_world_J_masked_one(c, lane, data, size_a, art_group_idx, pre_flags, J_group_a, J_group_b)
+        _populate_world_J_masked_one(c, lane, data, size_a, art_group_idx, law, pre_flags, J_group_a, J_group_b)
 
 
 @wp.func
@@ -170,6 +181,7 @@ def _populate_world_J_masked_one(
     data: ContactInput,
     size_a: int,
     art_group_idx: wp.array[int],
+    law: PatchRowLaw,
     pre_flags: wp.array[int],
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
@@ -191,6 +203,8 @@ def _populate_world_J_masked_one(
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction_a, friction_b = contact_friction_points(point_a, point_b, data.shared_anchor, data.friction_shared_anchor)
+    if law.patches.enabled != 0:
+        friction_a, friction_b = patch_friction_location(law.patches, c)
     _write_contact_jacobian_lane(
         lane,
         flags,
@@ -212,160 +226,6 @@ def _populate_world_J_masked_one(
         J_group_a,
         J_group_b,
     )
-
-
-@wp.kernel(enable_backward=False)
-def contact_row_prelude_patch(
-    data: ContactInput,
-    total_threads: int,
-    size_a: int,
-    size_b: int,
-    law: PatchRowLaw,
-    # outputs (and the row records of ``data``)
-    pre_flags: wp.array[int],  # bit0 active, bit1 friction rows, bit2 A in size, bit3 B in size
-):
-    """Per contact row (grid-stride, 3 threads per contact): the metadata of the persistent patch row law.
-
-    A contact owns tangent rows when the allocation reserved them (``contact_slots_needed`` of 3). They
-    act at the patch friction location, carry the anchor's tangential displacement as phi with
-    ``law.beta`` and keep the undivided friction coefficient: the patch link, which runs after every
-    row producer, divides it and links the normal rows into rings.
-    """
-    tid = wp.tid()
-    r = tid % 3
-    total_contacts = data.count[0]
-    for c in range(tid // 3, total_contacts, total_threads // 3):
-        _contact_row_prelude_patch_one(c, r, data, size_a, size_b, law, pre_flags)
-
-
-@wp.func
-def _contact_row_prelude_patch_one(
-    c: int, r: int, data: ContactInput, size_a: int, size_b: int, law: PatchRowLaw, pre_flags: wp.array[int]
-):
-    if r == 0:
-        pre_flags[c] = 0
-    if data.path[c] != 0:
-        return
-    slot = data.slot[c]
-    if slot < 0:
-        return
-    art_a = data.art0[c]
-    art_b = data.art1[c]
-    a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
-    if not a_in and not b_in:
-        return
-    will_add_friction = data.slots_needed[c] == 3
-    if r > 0 and not will_add_friction:
-        return
-
-    world = data.world[c]
-    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
-        c,
-        data.shape0,
-        data.shape1,
-        data.point0,
-        data.point1,
-        data.normal,
-        data.margin0,
-        data.margin1,
-        data.shape_body,
-        data.body_q,
-    )
-    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-    tangent0, tangent1 = contact_tangent_basis(normal)
-    friction_a, friction_b = patch_friction_location(law.patches, c)
-    direction, p0, p1 = contact_row_frame(
-        r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
-    row = slot + r
-    if r == 0:
-        flags = 1
-        if will_add_friction:
-            flags |= 2
-        if a_in:
-            flags |= 4
-        if b_in:
-            flags |= 8
-        pre_flags[c] = flags
-        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
-        data.row_parent[world, row] = -1
-        data.row_mu[world, row] = mu
-        data.row_beta[world, row] = data.beta
-        data.phi[world, row] = phi
-        data.restitution[world, row] = restitution
-    else:
-        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
-        data.row_parent[world, row] = slot
-        data.row_mu[world, row] = mu * data.friction_scale
-        data.row_beta[world, row] = law.beta
-        data.phi[world, row] = law.patches.phi[c][r - 1]
-        data.restitution[world, row] = 0.0
-    data.row_cfm[world, row] = data.cfm
-    data.target[world, row] = prescribed_target(
-        body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-    )
-
-
-@wp.kernel(enable_backward=False)
-def populate_world_J_masked_patch(
-    data: ContactInput,
-    total_threads: int,
-    size_a: int,
-    size_b: int,
-    art_group_idx: wp.array[int],
-    law: PatchRowLaw,
-    pre_flags: wp.array[int],
-    # outputs: Jacobian blocks of the two size groups (the second may alias the first when only one group exists)
-    J_group_a: wp.array3d[float],
-    J_group_b: wp.array3d[float],
-):
-    """One thread per (contact, local dof): the patch rows' Jacobian entries of that dof, written once.
-
-    Tangent rows act at the patch friction location; everything else is :func:`populate_world_J_masked`'s.
-    """
-    tid = wp.tid()
-    lanes = wp.max(size_a, size_b)
-    lane = tid % lanes
-    total_contacts = data.count[0]
-    for c in range(tid // lanes, total_contacts, total_threads // lanes):
-        flags = pre_flags[c]
-        if (flags & 1) == 0:
-            continue
-        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
-            c,
-            data.shape0,
-            data.shape1,
-            data.point0,
-            data.point1,
-            data.normal,
-            data.margin0,
-            data.margin1,
-            data.shape_body,
-            data.body_q,
-        )
-        tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_a, friction_b = patch_friction_location(law.patches, c)
-        _write_contact_jacobian_lane(
-            lane,
-            flags,
-            data.slot[c],
-            data.art0[c],
-            data.art1[c],
-            body_a,
-            body_b,
-            normal,
-            tangent0,
-            tangent1,
-            point_a,
-            point_b,
-            friction_a,
-            friction_b,
-            data,
-            size_a,
-            art_group_idx,
-            J_group_a,
-            J_group_b,
-        )
 
 
 @wp.func

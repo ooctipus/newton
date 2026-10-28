@@ -11,7 +11,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.dense_rows import MfRows
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw
 from newton._src.solvers.feather_pgs.kernels import (
     build_mf_contact_rows,
     populate_world_J_for_size,
@@ -100,10 +100,13 @@ def translation_dofs(device):
 
 
 def launch(kernel, values, threads, device):
-    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input and
-    ``mf`` the matrix-free rows."""
+    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input,
+    ``mf`` the matrix-free rows and ``law`` the friction row law."""
     data, _arrays = contact_input(values, device)
-    arguments = {**values, "data": data, "mf": bind_struct(MfRows, values, device)[0]}
+    law = PatchRowLaw()
+    law.patches = values["friction_patches"]
+    law.beta = values["friction_anchor_beta"]
+    arguments = {**values, "data": data, "mf": bind_struct(MfRows, values, device)[0], "law": law}
     wp.launch(
         kernel,
         dim=threads,

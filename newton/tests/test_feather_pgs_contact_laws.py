@@ -23,6 +23,7 @@ from newton.tests.feather_pgs_law_harness import (
     transforms,
     unit_vectors,
 )
+from newton.tests.feather_pgs_patch_parity import point_row_law
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Contact front end against the producers it replaces
@@ -278,6 +279,7 @@ def test_contact_front_end_matches_masked_row_prelude(test, device):
                 contact_path=np.zeros(contacts, dtype=np.int32),
                 size_a=6,
                 size_b=6,
+                law=point_row_law(device, contacts),
                 articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
                 contact_friction_shared_anchor=friction_shared,
                 contact_friction_anchor_limit=0,

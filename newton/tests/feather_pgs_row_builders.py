@@ -32,9 +32,7 @@ ROW_BUILDER_KERNELS = frozenset(
     (
         "populate_world_J_for_size",
         "contact_row_prelude",
-        "contact_row_prelude_patch",
         "populate_world_J_masked",
-        "populate_world_J_masked_patch",
         "prepare_world_contact_rows",
         "populate_world_J_for_compact_size",
         "sparse_pair_contact_rows_kernel",

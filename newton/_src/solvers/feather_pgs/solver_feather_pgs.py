@@ -178,12 +178,7 @@ from .path_selection import (
     policy_warnings,
     route_selection,
 )
-from .row_build import (
-    contact_row_prelude,
-    contact_row_prelude_patch,
-    populate_world_J_masked,
-    populate_world_J_masked_patch,
-)
+from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import ROW_LAW
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
@@ -9281,107 +9276,43 @@ class SolverFeatherPGS(SolverBase):
                             clamp=True,
                         )
             else:
+                # The masked builder: a prelude writes the row records and per-contact flags, then one
+                # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
+                law = patch_row_law(self)
+                flags = self._rows_prelude_flags
+                rows_threads = min(rows, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
                 combined_done = False
                 for size in self.size_groups:
                     method = plan.methods[size]
-                    if method == "masked_combined":
-                        if combined_done:
-                            continue
-                        combined_done = True
-                        cap = rows
-                        pre = {"flags": self._rows_prelude_flags}
-                        size_a = plan.combined[0]
-                        size_b = plan.combined[1] if len(plan.combined) > 1 else -1
+                    if method in ("masked_combined", "masked"):
+                        if method == "masked_combined":
+                            if combined_done:
+                                continue
+                            combined_done = True
+                            size_a = plan.combined[0]
+                            size_b = plan.combined[1] if len(plan.combined) > 1 else -1
+                            lanes = max(size_a, size_b)
+                            jacobian_threads = rows_threads * lanes
+                        else:
+                            size_a, size_b, lanes, jacobian_threads = size, -1, size, rows_threads * 32
                         J_a = self.J_by_size[size_a]
                         J_b = self.J_by_size[size_b] if size_b > 0 else J_a
-                        rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
-
-                        def _launch_prelude(size_a=size_a, size_b=size_b, rows_threads=rows_threads, pre=pre):
-                            if self._friction_anchors_enabled:
-                                self._launch_patch_contact_prelude(
-                                    contact_input, contacts, size_a, size_b, rows_threads, pre["flags"]
-                                )
-                                return
-                            pool.launch(
-                                contact_row_prelude,
-                                rows_threads * 3,
-                                inputs=[contact_input, rows_threads * 3, size_a, size_b],
-                                outputs=[pre["flags"]],
-                                extent=count,
-                                scale=3,
-                                clamp=True,
-                            )
-
-                        _launch_prelude()
-
-                        def _launch_j_pass(
-                            J_a=J_a,
-                            J_b=J_b,
-                            size_a=size_a,
-                            size_b=size_b,
-                            flags=pre["flags"],
-                            rows_threads=rows_threads,
-                        ):
-                            if self._friction_anchors_enabled:
-                                self._launch_patch_contact_jacobian(
-                                    contact_input,
-                                    contacts,
-                                    size_a,
-                                    size_b,
-                                    rows_threads * max(size_a, size_b if size_b > 0 else 1),
-                                    flags,
-                                    J_a,
-                                    J_b,
-                                )
-                                return
-                            pool.launch(
-                                populate_world_J_masked,
-                                rows_threads * max(size_a, size_b if size_b > 0 else 1),
-                                inputs=[
-                                    contact_input,
-                                    rows_threads * max(size_a, size_b if size_b > 0 else 1),
-                                    size_a,
-                                    size_b,
-                                    self.art_group_idx,
-                                    flags,
-                                ],
-                                outputs=[J_a, J_b],
-                                extent=count,
-                                scale=max(size_a, size_b if size_b > 0 else 1),
-                                clamp=True,
-                            )
-
-                        _launch_j_pass()
-                        continue
-                    if method == "masked":
-                        cap = rows
-                        pre = {"flags": self._rows_prelude_flags}
-                        J_out = self.J_by_size[size]
-                        rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
-                        if self._friction_anchors_enabled:
-                            self._launch_patch_contact_prelude(
-                                contact_input, contacts, size, -1, rows_threads, pre["flags"]
-                            )
-                            self._launch_patch_contact_jacobian(
-                                contact_input, contacts, size, -1, rows_threads * 32, pre["flags"], J_out, J_out
-                            )
-                            continue
                         pool.launch(
                             contact_row_prelude,
                             rows_threads * 3,
-                            inputs=[contact_input, rows_threads * 3, size, -1],
-                            outputs=[pre["flags"]],
+                            inputs=[contact_input, rows_threads * 3, size_a, size_b, law],
+                            outputs=[flags],
                             extent=count,
                             scale=3,
                             clamp=True,
                         )
                         pool.launch(
                             populate_world_J_masked,
-                            rows_threads * 32,
-                            inputs=[contact_input, rows_threads * 32, size, -1, self.art_group_idx, pre["flags"]],
-                            outputs=[J_out, J_out],
+                            jacobian_threads,
+                            inputs=[contact_input, jacobian_threads, size_a, size_b, self.art_group_idx, law, flags],
+                            outputs=[J_a, J_b],
                             extent=count,
-                            scale=size,
+                            scale=lanes,
                             clamp=True,
                         )
                         continue
@@ -9832,31 +9763,6 @@ class SolverFeatherPGS(SolverBase):
         and native sparse factors own their worlds' rows first, so masked patch rows serve the rest.
         """
         return bool(self._point_contact_paths or self._patch_dense_paths)
-
-    def _launch_patch_contact_prelude(self, contact_input, contacts, size_a, size_b, rows_threads, flags):
-        """Write the patch row law's contact row metadata and the masked builder's per-contact flags."""
-        self._contact_pool.launch(
-            contact_row_prelude_patch,
-            rows_threads * 3,
-            inputs=[contact_input, rows_threads * 3, size_a, size_b, patch_row_law(self)],
-            outputs=[flags],
-            extent=contacts.rigid_contact_count,
-            scale=3,
-            clamp=True,
-        )
-
-    def _launch_patch_contact_jacobian(self, contact_input, contacts, size_a, size_b, threads, flags, J_a, J_b):
-        """Write the patch rows' Jacobians, tangent rows at the patch friction location, one thread per DOF."""
-        self._contact_pool.launch(
-            populate_world_J_masked_patch,
-            threads,
-            inputs=[contact_input, threads, size_a, size_b, self.art_group_idx, patch_row_law(self), flags],
-            outputs=[J_a, J_b],
-            # The kernel gives each contact one lane per DOF of the larger group.
-            extent=contacts.rigid_contact_count,
-            scale=max(size_a, size_b),
-            clamp=True,
-        )
 
     def _build_inkernel_response_meta(self) -> tuple[int, int] | None:
         """Per-world (group index, DOF offset) of up to two size groups for the in-kernel response solve.

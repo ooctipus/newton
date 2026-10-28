@@ -357,11 +357,9 @@ def _kernel_names(kernels) -> list:
     return [kernel if isinstance(kernel, str) else _key(kernel) for kernel in kernels]
 
 
-def _general_kernels(method, patch, source) -> tuple:
+def _general_kernels(method, source) -> tuple:
     """The general builder's kernels for one method, in launch order (_stage4_build_rows)."""
     if method in ("masked", "masked_combined"):
-        if patch:
-            return (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
         return (source.contact_row_prelude, source.populate_world_J_masked)
     if method == "per_contact":
         return (source.populate_world_J_for_size,)
@@ -423,7 +421,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "compact_jacobian":
         kernels = (*prepare, source.populate_world_J_for_compact_size)
     else:
-        kernels = _general_kernels(method, patch, source)
+        kernels = _general_kernels(method, source)
     entry = {"method": method, "kernels": _kernel_names(kernels), "law": "patch" if patch else "point"}
     if method == "keyed_rows":
         entry["direct_rows"] = "routes.sweep.tiers"

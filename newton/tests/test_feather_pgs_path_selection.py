@@ -493,7 +493,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # The general builder's masked rows take the patch row law.
         method = "masked_combined"
         self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
-        kernels = ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
+        kernels = ["contact_row_prelude", "populate_world_J_masked"]
         builder = {"method": method, "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Contact torsion keeps ordinary factors, rows and serial sweeps under every patch route flag.
@@ -639,11 +639,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             point = law == "point"
             p = "" if point else "patch_"
             produce = f"produce_{p}contacts"
-            masked = (
-                ["contact_row_prelude", "populate_world_J_masked"]
-                if point
-                else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
-            )
+            masked = ["contact_row_prelude", "populate_world_J_masked"]
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
                 "_sparse_diagonal_contact_solve": True,
@@ -678,8 +674,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (108, 6),
                     "compact_contact_boundary",
                     {
-                        108: ("compact_contact_boundary", [produce, marker.key]),
-                        6: ("compact_contact_boundary", ["clear_contact_response", produce]),
+                        108: ("compact_contact_boundary", ["produce_contacts", marker.key]),
+                        6: ("compact_contact_boundary", ["clear_contact_response", "produce_contacts"]),
                     },
                 ),
                 (
@@ -800,7 +796,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(forced_record["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
         assert_row_builders_named(self, record, masked)
         assert_row_builders_named(self, forced_record, forced)
-        builders = ("contact_row_prelude_patch", "populate_world_J_masked_patch", "populate_world_J_for_size")
+        builders = ("contact_row_prelude", "populate_world_J_masked", "populate_world_J_for_size")
         # One combined masked launch for both sizes, then one per-contact launch per size.
         self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
         self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
@@ -1201,10 +1197,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
                 self.assertEqual(selected["cached_prediction"], "tree")
                 self.assertTrue(routes["paired_response"]["factor_coordinates"])
-                # Masked rows build both sizes in one launch, with the friction law's own variant.
-                prelude = "contact_row_prelude_patch" if law == "patch" else "contact_row_prelude"
-                jacobian = "populate_world_J_masked_patch" if law == "patch" else "populate_world_J_masked"
-                builder = {"method": "masked_combined", "kernels": [prelude, jacobian], "law": law}
+                # Masked rows build both sizes in one launch pair, under either friction law.
+                kernels = ["contact_row_prelude", "populate_world_J_masked"]
+                builder = {"method": "masked_combined", "kernels": kernels, "law": law}
                 self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"18": builder, "6": builder})
                 if law == "patch":
                     self.assertTrue(routes["paired_response"]["contact_units"])
