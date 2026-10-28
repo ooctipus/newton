@@ -1367,6 +1367,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 if wp.static(use_precomputed_edge_data):
                     cull_clusters = use_texture_sdf_for_search and not tri_is_hfield
 
+                # ``tile_scatter_masked`` writes before its barrier: wait until every thread has read the
+                # previous loop's exit condition before thread 0 resets the counter.
+                wp.tile_stack_clear(cluster_stack)
                 wp.tile_scatter_masked(cluster_progress, 0, 0, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield
@@ -1880,6 +1883,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 edge_start = block_in_pair * chunk_size
                 edge_end = wp.min(edge_start + chunk_size, num_edges)
 
+                # ``tile_scatter_masked`` writes before its barrier: wait until every thread has read the
+                # previous loop's exit condition before thread 0 resets the counter.
+                wp.tile_stack_clear(cluster_stack)
                 wp.tile_scatter_masked(cluster_progress, 0, edge_start, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield

@@ -1,0 +1,1 @@
+Close a write-after-read race at the per-mode loop counter reset in the mesh-SDF kernels (no behavior change expected).
