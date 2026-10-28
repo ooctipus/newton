@@ -281,7 +281,7 @@ def materialize_general_rows(
             value = endpoint_projection(data, body_a, data.art0[c], size, local, p0, direction)
             value -= endpoint_projection(data, body_b, data.art1[c], size, local, p1, direction)
             if q == 0:
-                write_contact_row(data, law, c, r)
+                write_contact_row(data, law, c, r, True)
         if size == primary:
             J_a[z.maps.groups[world, 0], row, local] = value
         else:

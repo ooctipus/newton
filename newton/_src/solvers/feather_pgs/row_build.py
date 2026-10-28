@@ -86,8 +86,6 @@ def _contact_row_prelude_one(
     slot = data.slot[c]
     if slot < 0:
         return
-    art_a = data.art0[c]
-    art_b = data.art1[c]
     a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
     if not a_in and not b_in:
         return
@@ -96,14 +94,6 @@ def _contact_row_prelude_one(
     will_add_friction = data.slots_needed[c] == 3
     if r > 0 and not will_add_friction:
         return
-
-    body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-        data, law, c
-    )
-    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-    direction, p0, p1 = contact_row_frame(
-        r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
     if r == 0:
         flags = 1
         if will_add_friction:
@@ -113,10 +103,7 @@ def _contact_row_prelude_one(
         if b_in:
             flags |= 8
         pre_flags[c] = flags
-    target = prescribed_target(
-        body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-    )
-    write_row_record(data, law, c, data.world[c], slot, r, mu, phi, restitution, target)
+    write_contact_row(data, law, c, r, False)
 
 
 @wp.kernel(enable_backward=False)
@@ -303,13 +290,15 @@ def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3,
 
 
 @wp.func
-def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int):
-    """Write contact ``c``'s row ``row``: its records (:func:`.contact_input.write_row_record`), its position-pass
-    ``rhs`` and the CFM seed of its diagonal.
+def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, with_rhs: bool):
+    """Write contact ``c``'s row ``row`` from its front end (:func:`.contact_input.contact_frame`): its records
+    (:func:`.contact_input.write_row_record`) and, ``with_rhs``, its position-pass ``rhs`` and the CFM seed of its
+    diagonal; return its bodies and frame ``(body_a, body_b, direction, p0, p1)``.
 
-    A normal row takes :func:`.row_laws.contact_rhs`, and a bouncing one the restitution target from its incident
-    velocity summed per body (:func:`incident_projection`); a tangent row takes the friction law at the anchor's
-    tangential phi and the row law's beta.
+    Every contact row producer writes its records here; the general route forms its rhs later. A normal row's rhs
+    is :func:`.row_laws.contact_rhs`, and a bouncing one's the restitution target from its incident velocity summed
+    per body (:func:`incident_projection`); a tangent row takes the friction law at the anchor's tangential phi and
+    the row law's beta.
     """
     body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
         data, law, c
@@ -326,27 +315,29 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int):
         body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
     )
     write_row_record(data, law, c, world, slot, row, mu, phi, restitution, target)
-    inv_dt = 1.0 / data.dt
-    rhs = float(0.0)
-    weight = float(1.0)
-    if row == 0:
-        rhs, weight = contact_rhs(
-            phi, data.beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
-        )
-        if restitution > 0.0:
-            relative = incident_projection(data, body_a, art_a, p0, direction)
-            relative -= incident_projection(data, body_b, art_b, p1, direction)
-            relative -= target
-            fires, bounce = contact_restitution_rhs(
-                phi, relative, target, restitution, data.dt, data.restitution_threshold
+    if with_rhs:
+        inv_dt = 1.0 / data.dt
+        rhs = float(0.0)
+        weight = float(1.0)
+        if row == 0:
+            rhs, weight = contact_rhs(
+                phi, data.beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
             )
-            if fires:
-                rhs = bounce
-                weight = 1.0
-    else:
-        tangent_phi, beta, _mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
-        rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
-    data.rhs[world, slot + row] = rhs
-    data.diag[world, slot + row] = data.cfm
-    if data.contact_w < 1.0:
-        data.row_w[world, slot + row] = weight
+            if restitution > 0.0:
+                relative = incident_projection(data, body_a, art_a, p0, direction)
+                relative -= incident_projection(data, body_b, art_b, p1, direction)
+                relative -= target
+                fires, bounce = contact_restitution_rhs(
+                    phi, relative, target, restitution, data.dt, data.restitution_threshold
+                )
+                if fires:
+                    rhs = bounce
+                    weight = 1.0
+        else:
+            tangent_phi, beta, _mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+            rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
+        data.rhs[world, slot + row] = rhs
+        data.diag[world, slot + row] = data.cfm
+        if data.contact_w < 1.0:
+            data.row_w[world, slot + row] = weight
+    return body_a, body_b, direction, p0, p1

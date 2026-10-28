@@ -297,7 +297,8 @@ def run_candidate(data, aux, law=None):
     )
     if law is None:
         law = point_row_law(aux.device, data.point0.shape[0])
-    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
+    # One thread per row: three per contact.
+    wp.launch(compact.produce_contacts, dim=(16, 3), inputs=[*structs(data), law], device=aux.device)
     wp.launch(
         response_builds_rows.sparse_pair_limit_kernel,
         dim=(2, 12),
@@ -759,7 +760,8 @@ class TestCompactContact(unittest.TestCase):
                     [compact.clear_contact_response, compact.produce_contacts, marker],
                 )
                 produce = launch.call_args_list[-2]
-                self.assertEqual(produce.kwargs["dim"], 16)
+                # A thread per row over the contact capacity.
+                self.assertEqual(produce.kwargs["dim"], (16, 3))
                 inputs = produce.kwargs["inputs"]
                 # The contact input, the compact boundary and the row law: point friction is the patch law
                 # with beta 0 and a disabled view.
@@ -1078,7 +1080,7 @@ class TestCompactContact(unittest.TestCase):
                     )
                     wp.launch(
                         compact.produce_contacts,
-                        dim=16,
+                        dim=(16, 3),
                         inputs=[*structs(candidate), point_row_law(device, candidate.point0.shape[0])],
                         device=device,
                     )

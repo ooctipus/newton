@@ -14,14 +14,10 @@ links the patch rings and divides the friction coefficient, in one
 import warp as wp
 
 from . import field_group
-from .contact_input import ContactInput, contact_frame, write_row_record
-from .contact_laws import (
-    contact_materials,
-    contact_row_frame,
-    prescribed_target,
-)
+from .contact_input import ContactInput
 from .friction_patches import PatchRowLaw, patch_row_law
 from .response_builds_rows import CompactBoundary, sparse_pair_row_response
+from .row_build import write_contact_row
 
 
 def supported(solver) -> bool:
@@ -86,45 +82,33 @@ def clear_contact_response(
 
 @wp.kernel
 def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
-    """Publish each contact's rows in their original collision order, one thread per contact.
+    """Publish each contact's rows in their original collision order, one thread per row (3 per contact): its records
+    (:func:`.row_build.write_contact_row`), then its dense-six and sparse pair response.
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
     undivided coefficient; under point friction (``law.patches.enabled`` 0, beta 0, a zero phi view) at the
     contact's friction points.
     """
-    contact = wp.tid()
+    contact, row = wp.tid()
     if contact >= data.count[0]:
         return
     slot = data.slot[contact]
-    if data.path[contact] != 0 or slot < 0:
+    if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
     art0 = data.art0[contact]
     art1 = data.art1[contact]
-    body0, body1, normal, point0, point1, phi, tangent0, tangent1, friction0, friction1 = contact_frame(
-        data, law, contact
-    )
+    body0, body1, direction, p0, p1 = write_contact_row(data, law, contact, row, False)
     has_dense = False
     if art0 >= 0 and body0 >= 0:
         has_dense = data.response_dofs[art0] == 6
     if art1 >= 0 and body1 >= 0:
         has_dense = has_dense or data.response_dofs[art1] == 6
-    mu, restitution = contact_materials(
-        data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
-    )
     group = boundary.dense_group[world]
-    for row in range(data.slots_needed[contact]):
-        direction, p0, p1 = contact_row_frame(
-            row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-        )
-        target = prescribed_target(
-            body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-        )
-        write_row_record(data, law, contact, world, slot, row, mu, phi, restitution, target)
-        sparse_pair_row_response(
-            data, boundary, world, slot + row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
-        )
+    sparse_pair_row_response(
+        data, boundary, world, slot + row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
+    )
 
 
 def launch_contacts(solver, data, workers):
@@ -145,10 +129,12 @@ def launch_contacts(solver, data, workers):
     # patch link (_FrictionPatchState.link, one link_patch_routes launch) still
     # runs after this producer: it alone links normal rows into patch rings and
     # divides the tangent coefficient.
-    # One thread per contact; in a capture whose launches bind, each replay runs the live count.
+    # A thread per (contact, row); in a capture whose launches bind, each replay runs the live count. The rows
+    # take their own axis: the contact axis is captured at the pool's bound, which a scalar thread index times 3
+    # would overflow.
     pool = solver._contact_pool
     count = data.count
-    pool.launch(produce_contacts, pool.launch_rows(), inputs=[data, boundary, patch_row_law(solver)], extent=count)
+    pool.launch(produce_contacts, (pool.launch_rows(), 3), inputs=[data, boundary, patch_row_law(solver)], extent=count)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     pool.launch(

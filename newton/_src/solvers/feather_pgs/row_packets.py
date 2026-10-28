@@ -413,7 +413,7 @@ def produce_contacts(
         warp_sync()
         # A lane per row writes its records and rhs with the row law the owners share.
         for row in range(lane, rows, stride):
-            write_contact_row(data, law, contact, row)
+            write_contact_row(data, law, contact, row, True)
             if slot + row < capacity:
                 packet.row_contact[world, slot + row] = contact * 3 + row
         warp_sync()

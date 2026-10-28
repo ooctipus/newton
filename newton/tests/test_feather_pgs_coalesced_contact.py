@@ -39,7 +39,8 @@ def clear(data, aux):
 def produce(data, aux):
     """Publish the contact rows under point friction (the patch law with beta 0 and a disabled view)."""
     law = point_row_law(aux.device, data.point0.shape[0])
-    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
+    # One thread per row: three per contact.
+    wp.launch(compact.produce_contacts, dim=(16, 3), inputs=[*structs(data), law], device=aux.device)
 
 
 def publish(data, aux):
