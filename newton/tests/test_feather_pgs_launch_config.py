@@ -243,11 +243,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 "prepare_augmented_joint_drives": "inverse_dynamics",
             },
             tree_passes: {
-                "fk_kinematics": "serial",
                 "fk_id": "serial",
                 "inverse_dynamics_tau": "serial",
                 "composite_inertia": "serial",
-                "publish_body_dynamics": "mass_dynamics",
                 "refresh_body_inertia": "mass_dynamics",
                 "crba_fill": "mass_dynamics",
                 "diagonal_inverse_mass": "mass_dynamics",

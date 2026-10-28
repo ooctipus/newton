@@ -261,15 +261,12 @@ from .tree_passes import (
     crba_fill,
     diagonal_inverse_mass,
     fk_id,
-    fk_kinematics,
     inverse_dynamics_tau,
-    publish_body_dynamics,
     refresh_body_inertia,
 )
 from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
 
-_FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
     os.environ.get("FEATHER_PGS_MF_EXACT_ROWSUM") == "1"
@@ -1959,14 +1956,11 @@ class SolverFeatherPGS(SolverBase):
         self._mass_update_global_flag = True
         self._last_step_dt = None
         self._fk_id_cache_available = bool(
-            model.device.is_cuda
-            and model.articulation_count
-            and model.joint_count
-            and not model.requires_grad
-            and not _FK_ID_CACHE_OFF
+            model.device.is_cuda and model.articulation_count and model.joint_count and not model.requires_grad
         )
-        # Stage 7 publishes next-step dynamics in place.
-        self._fk_id_cache_enabled = self._fk_id_cache_available and not enable_joint_velocity_limits
+        # The held tree's cache of next-step dynamics (held_tree.install enables it); ordinary dynamics derive
+        # them from the state at every step, on CUDA as on the CPU.
+        self._fk_id_cache_enabled = False
         self._fk_id_cache_source_state = None
         self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         if model.body_count and not model.requires_grad:
@@ -3380,10 +3374,11 @@ class SolverFeatherPGS(SolverBase):
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
 
-        The solver caches forward kinematics and inverse dynamics of the state it
-        produced. Overwriting ``joint_q``/``joint_qd`` of the next input state (for
-        example to prescribe kinematic bodies) makes that cache stale; call this so the
-        next step re-derives it from the state.
+        The held tree caches forward kinematics and inverse dynamics of the state it
+        produced (ordinary dynamics derive them from the state at every step). Writes to
+        ``joint_q``/``joint_qd`` of the next input state between steps (for example to
+        prescribe kinematic bodies) must be notified here: the held tree sees an
+        un-notified write one step late.
 
         Args:
             articulations: Optional device array of articulation indices whose joint
@@ -7509,7 +7504,6 @@ class SolverFeatherPGS(SolverBase):
         """
         arrays = self._arrays
         values.setdefault("write_inertia_records", 0)
-        values.setdefault("reuse_cached", 0)
         values.setdefault("add_existing_tau", 0)
         values.setdefault("fused_augmented_drive", int(self._parallel_augmented_drive_topology))
         if state is None:
@@ -7574,17 +7568,11 @@ class SolverFeatherPGS(SolverBase):
             )
             return stage3_qd
         # A refresh step places every body's inertia record for the composite inertia.
-        dynamics = self._dynamics(
-            state_in,
-            state_aug,
-            joint_qd=stage3_qd,
-            write_inertia_records=int(refresh_composite),
-            reuse_cached=int(self._fk_id_cache_enabled),
-        )
+        dynamics = self._dynamics(state_in, state_aug, joint_qd=stage3_qd, write_inertia_records=int(refresh_composite))
         wp.launch(
             fk_id, dim=model.articulation_count, inputs=[dynamics], block_dim=SERIAL_BLOCK_DIM, device=model.device
         )
-        if model.body_count and not self._fk_id_cache_enabled:
+        if model.body_count:
             wp.launch(
                 update_body_qd_from_featherstone,
                 dim=model.body_count,
@@ -10772,24 +10760,8 @@ class SolverFeatherPGS(SolverBase):
             self._stage7_update_kinematics(state_out, state_aug)
 
     def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
-        """Publish kinematics and prepare reusable inverse dynamics for the next step."""
-        model = self.model
-        if not self._fk_id_cache_enabled:
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
-            return
-
-        # The next step reuses these inverse dynamics; a refresh step places every body's inertia record.
-        next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
-        dynamics = self._dynamics(state_out, state_aug, write_inertia_records=int(next_refresh))
-        wp.launch(
-            fk_kinematics,
-            dim=model.articulation_count,
-            inputs=[dynamics],
-            block_dim=SERIAL_BLOCK_DIM,
-            device=model.device,
-        )
-        wp.launch(publish_body_dynamics, dim=model.body_count, inputs=[dynamics], block_dim=128, device=model.device)
-        self._fk_id_cache_source_state = state_out
+        """Publish the output state's kinematics (ordinary dynamics derive the next step's from the state)."""
+        eval_fk(self.model, state_out.joint_q, state_out.joint_qd, state_out)
 
     def __del__(self):
         """Drain queued work without accessing cyclically finalized streams."""

@@ -529,8 +529,8 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
     )
 
 
-GENERAL_PASSES = ("fk_kinematics", "fk_id", "tau", "composite_inertia", "crba")
-"""The general route's passes, in step order (``fk_kinematics`` stands alone; the others follow ``fk_id``)."""
+GENERAL_PASSES = ("fk_id", "tau", "composite_inertia", "crba")
+"""The general route's passes, in step order."""
 
 
 def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None, **values):
@@ -541,7 +541,6 @@ def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None,
     m, solver, device = route.model, route.solver, route.model.device
     dynamics = solver._dynamics(route.state, route.aug, route.control, **values)
     kernels = {
-        "fk_kinematics": (tree_passes.fk_kinematics, tree_passes.SERIAL_BLOCK_DIM),
         "fk_id": (tree_passes.fk_id, tree_passes.SERIAL_BLOCK_DIM),
         "tau": (tree_passes.inverse_dynamics_tau, tree_passes.SERIAL_BLOCK_DIM),
         "composite_inertia": (tree_passes.composite_inertia, tree_passes.SERIAL_BLOCK_DIM),
@@ -580,9 +579,8 @@ def run_pass(route: GeneralRoute, name: str, **values):
 
 def run_inputs(route: GeneralRoute, name: str):
     """Run the passes whose outputs ``name`` reads, with every inertia record."""
-    if name != "fk_kinematics":
-        for previous in GENERAL_PASSES[GENERAL_PASSES.index("fk_id") : GENERAL_PASSES.index(name)]:
-            run_pass(route, previous, write_inertia_records=1)
+    for previous in GENERAL_PASSES[: GENERAL_PASSES.index(name)]:
+        run_pass(route, previous, write_inertia_records=1)
 
 
 def joint_space_inertias(route: GeneralRoute) -> np.ndarray:
@@ -595,7 +593,6 @@ def joint_space_inertias(route: GeneralRoute) -> np.ndarray:
 
 
 GRADIENT_INPUTS = {
-    "fk_kinematics": ("joint_q", "joint_qd"),
     "fk_id": ("joint_q", "joint_qd", "body_mass", "body_inertia"),
     "tau": ("joint_q", "joint_qd", "joint_f", "joint_S_s", "body_f_s", "body_f", "body_q"),
     "composite_inertia": ("_body_inertia_terms",),
@@ -605,7 +602,6 @@ GRADIENT_INPUTS = {
 the solver's or the model's arrays."""
 
 GRADIENT_OUTPUTS = {
-    "fk_kinematics": ("body_q", "body_q_com", "articulation_origin", "joint_S_s", "body_v_s", "body_a_s"),
     "fk_id": ("body_q", "body_q_com", "joint_S_s", "_body_inertia_terms", "body_v_s", "body_f_s", "body_a_s"),
     "tau": ("body_ft_s", "joint_tau"),
     "composite_inertia": ("body_I_c",),

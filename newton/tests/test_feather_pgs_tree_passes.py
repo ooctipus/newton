@@ -49,7 +49,7 @@ def _external_forces(model, state, jacobian) -> np.ndarray:
 
 
 def check_physics(test, device):
-    from newton._src.solvers.feather_pgs.tree_passes import publish_body_dynamics  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.kernels import update_body_qd_from_featherstone  # noqa: PLC0415
     from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
         articulated_model,
         general_route,
@@ -63,13 +63,16 @@ def check_physics(test, device):
     reference = model.state()
     newton.eval_fk(model, reference.joint_q, reference.joint_qd, reference)
 
-    # Poses, by both FK passes, and the center-of-mass twists published from the twists about the origin.
-    run_pass(route, "fk_kinematics")
-    poses = state.body_q.numpy().copy()
-    test.assertLess(_gap(poses, reference.body_q.numpy()), 32.0, "poses")
+    # Poses, and the center-of-mass twists published from the twists about the origin.
     run_pass(route, "fk_id", write_inertia_records=1)
-    np.testing.assert_array_equal(state.body_q.numpy(), poses, "fk_id poses")
-    wp.launch(publish_body_dynamics, model.body_count, inputs=[solver._dynamics(state, aug)], device=device)
+    test.assertLess(_gap(state.body_q.numpy(), reference.body_q.numpy()), 32.0, "poses")
+    wp.launch(
+        update_body_qd_from_featherstone,
+        model.body_count,
+        inputs=[aug.body_v_s, state.body_q, model.body_com, solver.body_to_articulation, solver.articulation_origin],
+        outputs=[state.body_qd],
+        device=device,
+    )
     test.assertLess(_gap(state.body_qd.numpy(), reference.body_qd.numpy()), 32.0, "center-of-mass twists")
 
     # Joint forces: the manipulator equation at zero acceleration with the external wrenches, generalized
@@ -125,8 +128,6 @@ def check_physics(test, device):
 
 # Per pass and input, the central-difference step: small on the nonlinear inputs, larger on the linear ones.
 GRADIENT_CASES = (
-    ("fk_kinematics", "joint_q", 1e-3),
-    ("fk_kinematics", "joint_qd", 1e-2),
     ("fk_id", "joint_q", 1e-3),
     ("fk_id", "joint_qd", 1e-2),
     ("fk_id", "body_mass", 1e-2),

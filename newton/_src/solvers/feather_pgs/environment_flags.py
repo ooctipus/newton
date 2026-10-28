@@ -48,7 +48,6 @@ _READ = (
         _SOLVER,
         "tiled_row row budgets: 1 on for 64 or 128 rows, unset automatic (128 rows, 1024+ worlds), else off.",
     ),
-    ("FEATHER_PGS_FK_ID_CACHE", "policy", _SOLVER, "=0 disables the CUDA FK/inverse-dynamics cache."),
     (
         "FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO",
         "experiment",

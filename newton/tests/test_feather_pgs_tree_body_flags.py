@@ -490,8 +490,9 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     self.assertEqual(owner is not None, cached == "auto")
                     _Rollout(model, solver, probe, wrench).run(5)
                     before = _solver_snapshot(solver)
-                    # Valid caches, so an invalidation would show.
-                    self.assertTrue(before["fk_id_cache_valid"].all())
+                    if owner is not None:
+                        # The held tree's caches are valid, so an invalidation would show.
+                        self.assertTrue(before["fk_id_cache_valid"].all())
                     _set_flag(model, box, DYNAMIC)
                     with self.assertRaises(RuntimeError) as raised:
                         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)

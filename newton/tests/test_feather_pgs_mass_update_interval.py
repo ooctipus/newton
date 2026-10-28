@@ -356,12 +356,11 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             )
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
-    def test_captured_two_substep_fk_id_reuse_matches_eager(self):
-        """Replay two captured substeps without erasing the cached body forces.
+    def test_captured_two_substeps_match_eager(self):
+        """Replay two captured substeps whose solver launches first inside the capture, as eager steps do.
 
-        The solver allocates its augmented dynamics buffers on the first step. When that first step runs inside a
-        CUDA graph capture, a zero-initialised allocation records a memset that replays before every frame; the
-        FK/ID reuse path then consumes cleared body forces while its cache still reads valid.
+        A zero-initialised allocation on the first step, inside a CUDA graph capture, records a memset that replays
+        before every frame and clears whatever the solver carries across steps; the solver allocates at construction.
         """
         warm_model = _build_model("cuda:0", ground=False)
         warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
@@ -370,16 +369,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        # Both solvers keep the zero-copy FK/ID reuse path of matrix_free.
         graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
         eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
-        self.assertTrue(graph_solver._fk_id_cache_enabled)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()
 
         def two_substeps(solver, state_in, state_out, control):
-            # Keep one input state object so the FK/ID cache stays valid across substeps and frames.
+            # Keep one input state object across substeps and frames.
             for _ in range(2):
                 solver.step(state_in, state_out, control, None, DT)
                 for name in ("joint_q", "joint_qd", "body_q", "body_qd"):

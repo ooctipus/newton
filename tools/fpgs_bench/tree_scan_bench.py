@@ -303,7 +303,7 @@ def bench_serial(args, device):
     for worlds in args.world_counts:
         for shape in args.shapes or ("anymal13", "g1_30", "chain64", "random60", "pendulum2"):
             route = general_route(articulated_model((shape,), worlds, device))
-            for name in args.passes or ("fk_kinematics", "fk_id", "tau", "composite_inertia"):
+            for name in args.passes or ("fk_id", "tau", "composite_inertia"):
                 run_inputs(route, name)
                 row = {"worlds": worlds, "shape": shape, "pass": name, "fixed": tree_passes.SERIAL_BLOCK_DIM}
                 for block in (1, 2, 4, 8, 16, 32, 64, 128, 256):

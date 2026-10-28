@@ -8,13 +8,10 @@ passes run on the CPU and record on Warp's tape when a model requires gradients.
 Each pass is a :mod:`.tree_scan` schedule over the articulation's tree joints
 with the pass's per-node laws, all from :mod:`.spatial_laws`, as hooks:
 
-* :data:`fk_kinematics`: TRANSFORM down from each joint's pose in its parent,
+* :data:`fk_id`: TRANSFORM down from each joint's pose in its parent,
   ``X_p X_j X_c^-1``, publishing COM poses; then TWIST down from each joint's
-  relative twist about the origin;
-* :data:`fk_id`: the same, each body's inertia record and inverse-dynamics
-  wrench formed as its twist completes (:func:`body_dynamics`);
-  :data:`publish_body_dynamics` forms them one thread per body instead, after
-  :data:`fk_kinematics`;
+  relative twist about the origin, each body's inertia record and
+  inverse-dynamics wrench formed as its twist completes (:func:`body_dynamics`);
 * :data:`inverse_dynamics_tau`: ADD up, each body's net wrench from its
   children's sum, then its joint's generalized forces;
 * :data:`composite_inertia`: ADD up of the bodies' inertia records
@@ -59,10 +56,7 @@ __all__ = [
     "crba_fill",
     "diagonal_inverse_mass",
     "fk_id",
-    "fk_kinematics",
     "inverse_dynamics_tau",
-    "publish_body",
-    "publish_body_dynamics",
     "refresh_body_inertia",
 ]
 
@@ -98,7 +92,6 @@ DYNAMICS = (
     Field("body_inertia_terms", inertia_record, ("body",), attr="_body_inertia_terms"),
     Field("body_I_c", inertia_record, ("body",)),
     Field("mass_update_mask", wp.int32, ("articulation",)),
-    Field("fk_id_cache_valid", wp.int32, ("articulation",), attr="_fk_id_cache_valid"),
     Field("spring_stiffness", wp.float32, ("dof",), attr="_passive_spring_stiffness"),
     Field("spring_reference", wp.float32, ("dof",), attr="_passive_spring_ref"),
     Field("damping", wp.float32, ("dof",), attr="_passive_joint_damping"),
@@ -126,7 +119,6 @@ DYNAMICS = (
     Field("joint_f", wp.float32, ("dof",), owner="control"),
     # The launch's switches.
     Field("write_inertia_records", wp.int32, owner="step"),
-    Field("reuse_cached", wp.int32, owner="step"),
     Field("add_existing_tau", wp.int32, owner="step"),
     Field("fused_augmented_drive", wp.int32, owner="step"),
 )
@@ -295,7 +287,6 @@ def joint_body_dynamics(node: int, velocity: wp.spatial_vector, acceleration: wp
 
 
 _POSES = serial_scan(TRANSFORM, Direction.DOWN, relative_pose, com_pose)
-_TWISTS = serial_scan(TWIST, Direction.DOWN, relative_twist)
 _TWISTS_AND_DYNAMICS = serial_scan(TWIST, Direction.DOWN, relative_twist, joint_body_dynamics)
 
 
@@ -313,67 +304,13 @@ def articulation_poses(index: int, d: DynamicsData):
 
 
 @wp.kernel(module=_SERIAL)
-def fk_kinematics(d: DynamicsData):
-    """Body poses, COM frames, origins, motion columns, twists and bias accelerations; one thread per
-    articulation."""
-    index = wp.tid()
-    articulation_poses(index, d)
-    start, end = d.articulation_start[index], d.articulation_joint_end[index]
-    _TWISTS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
-    d.fk_id_cache_valid[index] = 1
-
-
-@wp.kernel(module=_SERIAL)
 def fk_id(d: DynamicsData):
-    """:data:`fk_kinematics` and each body's inertia and inverse-dynamics wrench (skipped on a reused cache)."""
+    """Body poses, COM frames, origins, motion columns, twists and bias accelerations, with each body's inertia and
+    inverse-dynamics wrench as its twist completes; one thread per articulation."""
     index = wp.tid()
-    if d.reuse_cached != 0 and d.fk_id_cache_valid[index] != 0:
-        return
     articulation_poses(index, d)
     start, end = d.articulation_start[index], d.articulation_joint_end[index]
     _TWISTS_AND_DYNAMICS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
-    d.fk_id_cache_valid[index] = 1
-
-
-@wp.func
-def publish_body(body: int, d: DynamicsData):
-    """A body's inertia and inverse-dynamics wrench from its published twist, and its COM twist."""
-    articulation = d.body_to_articulation[body]
-    origin = wp.vec3(0.0)
-    pose_com = wp.transform_identity()
-    acceleration = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
-    free_rigid = int(0)
-    if articulation >= 0:
-        origin = d.articulation_origin[articulation]
-        pose_com = d.body_q_com[body]
-        acceleration = d.body_a_s[body]
-        free_rigid = d.is_free_rigid[articulation]
-    body_dynamics(
-        body,
-        articulation,
-        d.body_q[body],
-        pose_com,
-        origin,
-        d.body_v_s[body],
-        acceleration,
-        d.body_mass[body],
-        d.body_inertia[body],
-        d.body_com[body],
-        d.gravity[0],
-        free_rigid,
-        d.write_inertia_records,
-        1,
-        d.body_I_s,
-        d.body_inertia_terms,
-        d.body_f_s,
-        d.body_qd,
-    )
-
-
-@wp.kernel(module=_MASS_DYNAMICS)
-def publish_body_dynamics(d: DynamicsData):
-    """Every body's :func:`publish_body`, one thread per body, after :data:`fk_kinematics`."""
-    publish_body(wp.tid(), d)
 
 
 @wp.kernel(module=_MASS_DYNAMICS)

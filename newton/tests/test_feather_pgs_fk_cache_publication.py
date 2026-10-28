@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-place next-step dynamics publication across graph replays."""
+"""Graph replays of a split-mode contact scene: the published state advances and replays deterministically."""
 
 import hashlib
 import unittest
@@ -69,7 +69,7 @@ def _digest(state):
     ).hexdigest()
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "The FK/ID cache publication is a CUDA path")
+@unittest.skipUnless(wp.is_cuda_available(), "Graph replays are a CUDA path")
 class TestFeatherPGSFkCachePublication(unittest.TestCase):
     def _run(self, replays, substeps=3, dt=0.005):
         device = wp.get_device("cuda:0")
@@ -82,7 +82,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
             pgs_iterations=6,
             friction_anchor_beta=0.0,
         )
-        self.assertTrue(solver._fk_id_cache_enabled)
         states = [model.state() for _ in range(2)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
         control = model.control()
@@ -92,7 +91,7 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
                 solver.step(states[0], states[1], control, contacts, dt)
                 states.reverse()
 
-        # Warm the cache eagerly, then capture one block and replay it.
+        # Step one block eagerly, then capture one block and replay it.
         substep_block()
         wp.synchronize_device(device)
         with wp.ScopedCapture(device=device) as capture:
@@ -107,7 +106,7 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
         return digests
 
     def test_in_place_publication_advances_across_replays(self):
-        """Advance the trajectory at every replay: the cache is not frozen."""
+        """Advance the trajectory at every replay: the published state is not frozen."""
         self.assertGreater(len(set(self._run(replays=40))), 30)
 
     def test_in_place_publication_is_deterministic(self):

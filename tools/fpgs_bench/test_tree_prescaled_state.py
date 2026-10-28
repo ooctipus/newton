@@ -11,7 +11,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
@@ -212,23 +211,18 @@ class TestPrescaledTreeContract(unittest.TestCase):
         self.check_current_motion("cuda:0", exclude_driven=True)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
-    def test_failed_admission_keeps_ordinary_cache_disabled(self):
-        """Retain the ordinary velocity guard when complete tree ownership is unavailable."""
+    def test_ordinary_dynamics_keep_no_cache(self):
+        """Ordinary dynamics (here by cached_dynamics='off') keep no FK/ID cache of their own."""
         model = split._model(floating=False)
-        for disabled, parallel in ((True, True), (False, False)):
-            with (
-                self.subTest(disabled=disabled, parallel=parallel),
-                patch.object(solver_module, "_FK_ID_CACHE_OFF", disabled),
-                patch.dict(
-                    os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "1", "FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}
-                ),
-            ):
+        for parallel in (True, False):
+            with self.subTest(parallel=parallel):
                 solver = split._solver(
                     model,
                     True,
                     pgs_mode="matrix_free",
                     enable_joint_velocity_limits=True,
                     use_parallel_streams=parallel,
+                    cached_dynamics="off",
                 )
                 self.assertIsNone(solver._tree_kinetic_state)
                 self.assertFalse(solver._fk_id_cache_enabled)

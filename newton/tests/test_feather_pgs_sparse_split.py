@@ -372,7 +372,9 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 old_host = solver._kinematic_dof_mask_host.copy()
                 old_device = solver._kinematic_dof_mask.numpy().copy()
                 old_fk = solver._fk_id_cache_valid.numpy().copy()
-                self.assertTrue(old_fk.all())
+                if owner:
+                    # The held tree's caches are valid, so an invalidation would show.
+                    self.assertTrue(old_fk.all())
                 names = ("current_valid", "geometry_valid", "generation", "geometry_generation", "status")
                 old_cache = {name: getattr(group.data, name).numpy().copy() for name in names} if owner else {}
                 flags = model.body_flags.numpy().copy()

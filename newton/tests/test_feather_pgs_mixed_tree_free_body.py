@@ -231,13 +231,14 @@ TRAY_VELOCITY = 0.25
 
 
 def _kinematic_free_joints(model):
-    """Coordinate and velocity starts of free joints whose body is kinematic."""
+    """Coordinate and velocity starts of free joints whose body is kinematic, and their articulations."""
     types, flags = model.joint_type.numpy(), model.body_flags.numpy()
     child = model.joint_child.numpy()
     joints = np.flatnonzero(
         (types == int(newton.JointType.FREE)) & (flags[child] & int(newton.BodyFlags.KINEMATIC) != 0)
     )
-    return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints]
+    articulations = wp.array(model.joint_articulation.numpy()[joints], dtype=wp.int32, device=model.device)
+    return model.joint_q_start.numpy()[joints], model.joint_qd_start.numpy()[joints], articulations
 
 
 def _rollout(
@@ -312,8 +313,9 @@ def _rollout(
     # Prescribed trays glide along +x at a constant speed.
     # The solver holds a kinematic joint's coordinates, so the tray pose is
     # advanced externally each step (as Isaac Lab writes kinematic targets)
-    # and its velocity is given.
-    tray_q, tray_qd = _kinematic_free_joints(model)
+    # and its velocity is given. Like Isaac Lab, the rollout notifies the
+    # solver of each write (notify_state_changed).
+    tray_q, tray_qd, tray_articulations = _kinematic_free_joints(model)
     for start in tray_qd:
         qd[start] = TRAY_VELOCITY
     states[0].joint_qd.assign(qd)
@@ -324,6 +326,7 @@ def _rollout(
             q = states[0].joint_q.numpy()
             q[tray_q] += TRAY_VELOCITY * DT
             states[0].joint_q.assign(q)
+            solver.notify_state_changed(tray_articulations)
         pipeline.collide(states[0], contacts)
         states[0].clear_forces()
         solver.step(states[0], states[1], control, contacts, DT)

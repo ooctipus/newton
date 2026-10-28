@@ -22,7 +22,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, path_selection, tree_passes
+from newton._src.solvers.feather_pgs import environment_flags, path_selection, tree_passes, tree_scan
 from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
@@ -344,6 +344,68 @@ def _linear_state_plan(solver):
     return wp.array(ends, dtype=int, device=model.device), wp.array(body_joint, dtype=int, device=model.device)
 
 
+# The oracle replays the ordinary route's former FK/ID cache: a refresh skipped for valid articulations, the stage-7
+# kinematics and a per-body publication of the inverse-dynamics terms.
+_ORACLE_TWISTS = tree_scan.serial_scan(tree_scan.TWIST, tree_scan.Direction.DOWN, tree_passes.relative_twist)
+
+
+@wp.kernel(enable_backward=False)
+def _oracle_fk_id(d: tree_passes.DynamicsData, valid: wp.array[int]):
+    """The general route's FK/ID pass, skipped for the articulations ``valid`` marks, which it then marks."""
+    index = wp.tid()
+    if valid[index] != 0:
+        return
+    tree_passes.articulation_poses(index, d)
+    start, end = d.articulation_start[index], d.articulation_joint_end[index]
+    tree_passes._TWISTS_AND_DYNAMICS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
+    valid[index] = 1
+
+
+@wp.kernel(enable_backward=False)
+def _oracle_kinematics(d: tree_passes.DynamicsData, valid: wp.array[int]):
+    """Body poses, COM frames, origins, motion columns, twists and bias accelerations; marks the articulation."""
+    index = wp.tid()
+    tree_passes.articulation_poses(index, d)
+    start, end = d.articulation_start[index], d.articulation_joint_end[index]
+    _ORACLE_TWISTS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
+    valid[index] = 1
+
+
+@wp.func
+def _oracle_publish_body(body: int, d: tree_passes.DynamicsData):
+    """A body's inertia and inverse-dynamics wrench from its published twist, and its COM twist."""
+    articulation = d.body_to_articulation[body]
+    origin = wp.vec3(0.0)
+    pose_com = wp.transform_identity()
+    acceleration = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+    free_rigid = int(0)
+    if articulation >= 0:
+        origin = d.articulation_origin[articulation]
+        pose_com = d.body_q_com[body]
+        acceleration = d.body_a_s[body]
+        free_rigid = d.is_free_rigid[articulation]
+    tree_passes.body_dynamics(
+        body,
+        articulation,
+        d.body_q[body],
+        pose_com,
+        origin,
+        d.body_v_s[body],
+        acceleration,
+        d.body_mass[body],
+        d.body_inertia[body],
+        d.body_com[body],
+        d.gravity[0],
+        free_rigid,
+        d.write_inertia_records,
+        1,
+        d.body_I_s,
+        d.body_inertia_terms,
+        d.body_f_s,
+        d.body_qd,
+    )
+
+
 @wp.func
 def _write_linear_body(
     body: int,
@@ -509,7 +571,7 @@ def _finalize_linear_state(
         )
         body_qd[body] = body_v_s[body]
     else:
-        tree_passes.publish_body(body, dynamics)
+        _oracle_publish_body(body, dynamics)
 
 
 @functools.cache
@@ -575,9 +637,9 @@ class _PrismaticRoute:
         s, model = self.solver, self.model
         wp.copy(self.previous, s._fk_id_cache_valid)
         wp.launch(
-            tree_passes.fk_id,
+            _oracle_fk_id,
             dim=model.articulation_count,
-            inputs=[s._dynamics(state, s, articulation_joint_end=self.joint_end, reuse_cached=1)],
+            inputs=[s._dynamics(state, s, articulation_joint_end=self.joint_end), s._fk_id_cache_valid],
             device=self.device,
         )
         wp.launch(
@@ -699,9 +761,9 @@ class _PrismaticRoute:
             device=self.device,
         )
         wp.launch(
-            tree_passes.fk_kinematics,
+            _oracle_kinematics,
             dim=model.articulation_count,
-            inputs=[s._dynamics(state_out, s, articulation_joint_end=self.joint_end)],
+            inputs=[s._dynamics(state_out, s, articulation_joint_end=self.joint_end), s._fk_id_cache_valid],
             device=self.device,
         )
         wp.launch(
