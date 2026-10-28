@@ -9,10 +9,8 @@ ancestor pattern. Neither assembly nor factorization allocates a dense H.
 
 import warp as wp
 
-from . import field_group, response_operator
-from .device_preludes import lane_group
+from . import field_group
 from .field_group import Field
-from .kernel_template import THREADS, KernelTemplate, substitute
 from .tree_plan import FactorPattern, SupportClasses
 
 SPARSE_MASS_INDICES = (
@@ -62,58 +60,3 @@ def row_supports(classes: SupportClasses, world_count: int, max_constraints: int
     support index per row."""
     row_class = wp.empty((world_count, max_constraints), dtype=int, device=device)
     return field_group.upload(_SparseRowSupport, device, classes, enabled=1, row_class=row_class)
-
-
-_RESPONSE = response_operator.SparseInverseFactor(
-    "Linv_group.data+base",
-    response_operator.CompressedSupport(
-        "indices.row_offsets.data",
-        "indices.columns.data",
-        "indices.column_offsets.data",
-        "indices.column_entries.data",
-        "indices.entry_rows.data",
-    ),
-)
-
-
-# Apply physical H inverse as P.T Linv.T Linv P; launch 32 threads per group.
-solve_sparse_mass_matrix = KernelTemplate(
-    "solve_sparse_mass_matrix",
-    (
-        ("group_to_art", wp.array[int]),
-        ("articulation_dof_start", wp.array[int]),
-        ("indices", _SparseMassMatrixIndices),
-        ("Linv_group", wp.array2d[float]),
-        ("tau", wp.array[float]),
-        ("scratch", wp.array2d[float]),
-        ("qdd", wp.array[float]),
-    ),
-    substitute(
-        """
-    const int group = tid >> 5;
-    if (group >= group_to_art.shape[0]) return;
-#if !defined(__CUDA_ARCH__)
-    if ((tid & 31) != 0) return;
-#endif
-    const int n = indices.dof_count;
-    const int base = group * indices.nonzero_count;
-    const int start = articulation_dof_start.data[group_to_art.data[group]];
-    for (int row = LANE; row < n; row += STRIDE) {
-        $FORWARD_ACTION
-        scratch.data[group * n + row] = value;
-    }
-    SYNC();
-    for (int col = LANE; col < n; col += STRIDE) {
-        $TRANSPOSE_ACTION
-        qdd.data[start + indices.permutation.data[col]] = value;
-    }
-""",
-        FORWARD_ACTION=_RESPONSE.forward("row", lambda index: f"tau.data[start+indices.permutation.data[{index}]]"),
-        TRANSPOSE_ACTION=_RESPONSE.transpose("col", lambda index: f"scratch.data[group*n+{index}]"),
-    ),
-    THREADS,
-    preludes=(lane_group(32),),
-    dual=True,
-    native_name="_solve_native",
-    module=__name__,
-).kernel()

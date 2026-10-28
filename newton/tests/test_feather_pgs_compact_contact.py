@@ -473,8 +473,10 @@ def build_solver_fixture(device):
         if index < 2:
             template.add_shape_sphere(body=body, radius=0.01)
     template.add_articulation(joints)
-    parent = -1
-    joints = []
+    # The chain stands on a fixed base: the held tree, which alone evaluates the compact diagonal, takes fixed or
+    # free roots.
+    parent = template.add_link(mass=0.4, inertia=inertia)
+    joints = [template.add_joint_fixed(parent=-1, child=parent)]
     for index in range(6):
         body = template.add_link(mass=0.4, com=wp.vec3(0.02, 0.01, 0.06), inertia=inertia)
         joints.append(

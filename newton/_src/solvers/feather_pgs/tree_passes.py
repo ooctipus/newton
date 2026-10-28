@@ -54,7 +54,6 @@ __all__ = [
     "body_dynamics",
     "composite_inertia",
     "crba_fill",
-    "diagonal_inverse_mass",
     "fk_id",
     "inverse_dynamics_tau",
     "refresh_body_inertia",
@@ -95,7 +94,6 @@ DYNAMICS = (
     Field("spring_stiffness", wp.float32, ("dof",), attr="_passive_spring_stiffness"),
     Field("spring_reference", wp.float32, ("dof",), attr="_passive_spring_ref"),
     Field("damping", wp.float32, ("dof",), attr="_passive_joint_damping"),
-    Field("drive_row_by_dof", wp.int32, ("dof",), attr="_augmented_drive_row_by_dof"),
     Field("row_K", wp.float32, ("drive_row",), attr="aug_row_K"),
     Field("dfs_order", wp.int32, ("joint",), attr="_joint_dfs_order"),
     Field("dfs_position", wp.int32, ("joint",), attr="_joint_dfs_position"),
@@ -119,7 +117,6 @@ DYNAMICS = (
     Field("joint_f", wp.float32, ("dof",), owner="control"),
     # The launch's switches.
     Field("write_inertia_records", wp.int32, owner="step"),
-    Field("add_existing_tau", wp.int32, owner="step"),
 )
 """Everything the dynamics passes read and write, by owner role: ``model``; the solver (the default);
 ``state``, whose coordinates the passes read and to which they publish poses and COM twists; ``aug``, the
@@ -369,7 +366,6 @@ def generalized_force(node: int, wrench: wp.spatial_vector, d: DynamicsData):
         d.joint_dof_dim[node, 0],
         d.joint_dof_dim[node, 1],
         wrench,
-        d.add_existing_tau,
         d.tau,
     )
 
@@ -411,7 +407,7 @@ def composite_inertia(d: DynamicsData):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The joint-space inertia: CRBA and its diagonal
+# The joint-space inertia: CRBA
 # ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -503,32 +499,3 @@ def crba_fill(
     column.H_group = H_group
     force = column_force(pivot, column_dof, records, d)
     _MASS_COLUMN(joint_start, pivot, force, d.dfs_order, d.dfs_position, d.dfs_end, d, column)
-
-
-@wp.kernel(module=_MASS_DYNAMICS)
-def diagonal_inverse_mass(
-    d: DynamicsData,
-    records: wp.array[inertia_record],
-    group_to_art: wp.array[int],
-    dof_joint_offset: wp.array[int],
-    armature: wp.array2d[float],
-    n_dofs: int,
-    inverse: wp.array[float],
-):
-    """Inverse joint-space inertias of independent one-coordinate branches, one thread per coordinate:
-    ``1 / (S . I S + armature + drive stiffness)``, ``I`` the branch's record (composite, or its body's)."""
-    element = wp.tid()
-    group = element // n_dofs
-    dof = element - group * n_dofs
-    art = group_to_art[group]
-    if d.mass_update_mask[art] == 0:
-        return
-    coordinate = d.articulation_dof_start[art] + dof
-    joint = d.articulation_start[art] + dof_joint_offset[dof]
-    mass = wp.dot(d.joint_S_s[coordinate], column_force(joint, coordinate, records, d)) + armature[group, dof]
-    drive_row = d.drive_row_by_dof[coordinate]
-    if drive_row >= 0:
-        stiffness = d.row_K[drive_row]
-        if stiffness > 0.0:
-            mass += stiffness
-    inverse[coordinate] = 1.0 / mass

@@ -71,7 +71,8 @@ _READ = (
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE",
         "policy",
         _CACHE,
-        "Values other than 1 disable the dense-route held-tree cache under cached_dynamics='auto'.",
+        "Values other than 1 disable the dense-route held-tree cache, and the compact diagonal only it evaluates, "
+        "under cached_dynamics='auto'.",
     ),
     (
         "FEATHER_PGS_PAIRED_COMPONENTS",
@@ -196,7 +197,8 @@ _READ = (
         "FEATHER_PGS_TREE_KINETIC_STATE",
         "policy",
         _CACHE,
-        "Values other than 1 disable the sparse-route tree cache under cached_dynamics='auto'.",
+        "Values other than 1 disable the sparse-route tree cache, and the native sparse factors only it evaluates, "
+        "under cached_dynamics='auto'.",
     ),
     (
         "FEATHER_PGS_TREE_REFERENCE",

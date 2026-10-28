@@ -239,9 +239,9 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(fields[6].numpy().ravel(), control.joint_target_qd.numpy()[dofs])
 
-    def test_split_augmented_drive_pipeline_matches_combined_kernel(self):
-        """Match the per-coordinate drives plus additive joint forces to the combined kernel; clear drives without
-        gains."""
+    def test_per_coordinate_drives_match_combined_kernel(self):
+        """Match the held tree's per-coordinate drives plus the joint forces to the combined kernel; clear drives
+        without gains."""
         device = wp.get_device()
         articulation_start = wp.array([0, 2], dtype=wp.int32, device=device)
         articulation_joint_end = wp.array([2], dtype=wp.int32, device=device)
@@ -290,7 +290,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         target_qd = wp.array([0.0, 0.05], dtype=wp.float32, device=device)
         effort_limit = wp.array([1.25, 2.5], dtype=wp.float32, device=device)
 
-        def dynamics(body_ft_s, tau, row_K=None, add_existing_tau=0):
+        def dynamics(body_ft_s, tau, row_K=None):
             return field_group.upload(
                 DynamicsData,
                 device,
@@ -319,7 +319,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 body_ft_s=body_ft_s,
                 tau=tau,
                 row_K=row_K if row_K is not None else wp.zeros(1, dtype=wp.float32, device=device),
-                add_existing_tau=add_existing_tau,
                 up_flags=up_flags,
             )
 
@@ -374,15 +373,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         np.testing.assert_array_equal(topology_stiffness.numpy(), combined_stiffness.numpy())
         np.testing.assert_allclose(topology_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
 
-        additive_body_ft = wp.zeros_like(combined_body_ft)
-        wp.launch(
-            inverse_dynamics_tau,
-            dim=1,
-            inputs=[dynamics(additive_body_ft, topology_tau, add_existing_tau=1)],
-            device=device,
-        )
-        np.testing.assert_array_equal(additive_body_ft.numpy(), combined_body_ft.numpy())
-        np.testing.assert_array_equal(topology_tau.numpy(), combined_tau.numpy())
+        # The combined kernel's force is one fp32 sum of the joint force and the drive force.
+        np.testing.assert_array_equal(sequential_tau.numpy() + topology_tau.numpy(), combined_tau.numpy())
 
         # Without gains neither preparation keeps a drive row or a drive force.
         zero_target_ke = wp.zeros_like(target_ke)

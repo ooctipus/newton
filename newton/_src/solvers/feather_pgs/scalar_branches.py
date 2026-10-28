@@ -510,17 +510,19 @@ class ScalarBranchPlan:
     """The group's DOFs, sorted."""
 
 
-def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan | None, str]:
+def plan_scalar_branches(solver, *, requested: bool, size: int | None = None) -> tuple[ScalarBranchPlan | None, str]:
     """Decide whether the solver's diagonal-mass group runs as scalar branches.
 
     The rule is topology only: the group must be the compact diagonal-mass size
-    of the sparse-diagonal response, each of its coordinates must move one body,
-    and each articulation must pass :func:`branch_topology`.
+    of the sparse-diagonal response (``size``, by default the solver's; the
+    response's admission passes its candidate), each of its coordinates must
+    move one body, and each articulation must pass :func:`branch_topology`.
 
     Returns:
         ``(plan, reason)``; ``plan`` is ``None`` when the group stays as it is.
     """
-    size = solver._compact_diagonal_mass_size
+    if size is None:
+        size = solver._compact_diagonal_mass_size
     if size is None:
         return None, "No diagonal-mass group shares the sparse-diagonal response."
     if not requested:

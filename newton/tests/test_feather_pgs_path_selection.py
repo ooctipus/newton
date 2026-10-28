@@ -1027,8 +1027,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
             disabled = _make_solver(model, True)
             forced = _make_solver(model, True, cached_dynamics="on")
-        self.assertEqual(disabled.get_path_selection()["cached_dynamics"], "off")
-        self.assertIn("FEATHER_PGS_TREE_KINETIC_STATE", disabled.get_path_selection()["reasons"]["cached_dynamics"])
+        # The switch disables the sparse factor's held group, and with it the native sparse factor, which only the
+        # held tree evaluates.
+        self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
+        self.assertIn("FEATHER_PGS_TREE_KINETIC_STATE", disabled.get_path_selection()["reasons"]["sparse_mass_matrix"])
+        self.assertEqual(forced.get_path_selection()["sparse_mass_matrix"], "on")
         self.assertEqual(forced.get_path_selection()["cached_dynamics"], "on")
         self.assertIn("Explicit", forced.get_path_selection()["reasons"]["cached_dynamics"])
 
@@ -1078,10 +1081,17 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):
         """Honor explicit cache choices and retain automatic dense kernel requests."""
         model = _build_model()
-        for choice, legacy, expected in (("on", "0", True), ("off", "1", False), ("auto", "0", False)):
+        # FEATHER_PGS_TREE_KINETIC_STATE=0 under auto declines the native sparse factor, which only the held tree
+        # evaluates; the dense groups' held tree takes the solver.
+        for choice, legacy, expected, sparse in (
+            ("on", "0", True, True),
+            ("off", "1", False, False),
+            ("auto", "0", True, False),
+        ):
             with self.subTest(choice=choice), patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": legacy}):
                 solver = _make_solver(model, True, cached_dynamics=choice)
                 selected = solver.get_path_selection()
+                self.assertEqual(solver._sparse_mass_matrix_size is not None, sparse)
                 self.assertEqual(solver._tree_kinetic_state is not None, expected)
                 self.assertEqual(selected["cached_dynamics"], "on" if expected else "off")
                 self.assertEqual(selected["publication"], "cached" if expected else "ordinary")

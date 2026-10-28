@@ -541,7 +541,6 @@ def _sparse_mass_matrix(solver) -> dict:
                 "solve_lanes": int(solver._sparse_solve_lanes),
                 "local_factors": bool(solver._sparse_local_factors),
                 "factor_warps_per_block": int(solver._sparse_factor_warps_per_block),
-                "factor_kernel": _key(solver._crba_sparse_factor_kernel),
                 "contact_response_kernel": _key(solver._sparse_contact_response_kernel),
                 "sweep_kernel": _key(solver._pgs_solve_sparse_kernel),
             }

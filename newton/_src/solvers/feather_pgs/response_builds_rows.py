@@ -90,7 +90,6 @@ from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseMassMatrixIndices, _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
-from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_record
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Free-body rows (FreeBody6)
@@ -2224,10 +2223,10 @@ def factor_contact_rows_kernel(
 
 # The factor of an articulation's mass matrix: ``P H P^T = L L^T`` in packed ancestor-closed storage, then
 # ``L^-1`` in the same pattern. One warp per articulation (the CPU runs it on one thread): the mass entries are
-# assembled from the motion subspace and the composite inertias (or read from a held tree's geometric entries),
-# with the joint regularization and a fused drive's stiffness on the diagonal, then factored left-looking level by
-# level and inverted column by column along each column's ancestor chain, both with plain division. A nonpositive
-# or nonfinite pivot sets the articulation's status and publishes NaN in place of the inverse.
+# read from the held tree's geometric entries, with the joint regularization and the drive's stiffness on the
+# diagonal, then factored left-looking level by level and inverted column by column along each column's ancestor
+# chain, both with plain division. A nonpositive or nonfinite pivot sets the articulation's status and publishes
+# NaN in place of the inverse.
 
 
 def sparse_cholesky_source(dof_count: int, nonzero_count: int) -> str:
@@ -2314,7 +2313,6 @@ _FACTOR_ASSEMBLY = """
 #if defined(__CUDA_ARCH__)
     __shared__ float factors[$FACTORS];
     __shared__ float inverses[$FACTORS];
-$FORCE_STORAGE_CUDA
     float* factor = factors + SUB * $NNZ;
     float* inverse = inverses + SUB * $NNZ;
 
@@ -2322,24 +2320,19 @@ $FORCE_STORAGE_CUDA
     if ((tid & 31) != 0) return;
     float factor[$NNZ];
     float inverse[$NNZ];
-$FORCE_STORAGE_CPU
 #endif
     const int start = articulation_dof_start.data[art];
-$PREPARE_MASS
     if (lane == 0) status.data[group] = 0;
     SYNC();
     for (int entry = lane; entry < $NNZ; entry += stride) {
         const int row = indices.entry_rows.data[entry];
         const int col = indices.columns.data[entry];
         const int physical_row = indices.permutation.data[row];
-        const int physical_col = indices.permutation.data[col];
-$READ_MASS
+        float value = geometric.data[group * $NNZ + entry];
         if (row == col) {
             value += R_group.data[group * $N + physical_row];
-            if (fused_augmented_drive != 0) {
-                const int drive = drive_row_by_dof.data[start + physical_row];
-                if (drive >= 0 && row_K.data[drive] > 0.0f) value += row_K.data[drive];
-            }
+            const int drive = drive_row_by_dof.data[start + physical_row];
+            if (drive >= 0 && row_K.data[drive] > 0.0f) value += row_K.data[drive];
         }
         factor[entry] = value;
     }
@@ -2355,69 +2348,40 @@ $READ_MASS
 
 
 @cache
-def sparse_factor_kernel(
-    dof_count: int, nonzero_count: int, *, warps_per_block: int = 4, geometric: bool = False
-) -> wp.Kernel:
-    """Assemble each articulation's mass matrix and publish its packed ``L^-1`` (see the section's comment).
+def sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block: int = 4) -> wp.Kernel:
+    """Read each articulation's mass matrix from the held tree's packed geometric entries and publish its packed
+    ``L^-1`` (see the section's comment).
 
     ``dof_count * 32`` threads per group of articulations, ``warps_per_block * 32`` per block; value arrays must be
-    contiguous. ``geometric`` reads a held tree's packed geometric mass entries instead of assembling CRBA's. An
-    articulation without a mass update keeps its factor and status; ``status`` is 0 after a refresh and 1 for a
-    nonpositive or nonfinite pivot (no pivot floor).
+    contiguous. An articulation without a mass update keeps its factor and status; ``status`` is 0 after a refresh
+    and 1 for a nonpositive or nonfinite pivot (no pivot floor).
     """
     n, nnz, warps = int(dof_count), int(nonzero_count), int(warps_per_block)
     if not 1 <= n <= 64 or not n <= nnz <= n * (n + 1) // 2 or not 1 <= warps <= 32:
         raise ValueError("Invalid sparse factor dimensions or warp count")
-    if geometric:
-        storage_cuda, storage_cpu, prepare = "", "", ""
-        read = f"        float value = body_I_c.data[group * {nnz}+entry];"
-    else:
-        storage_cuda = f"""    __shared__ float forces[{warps * n * 6}];
-    float* force = forces + SUB * {n * 6};"""
-        storage_cpu = f"""    float force[{n * 6}];"""
-        prepare = f"""    for (int physical = lane; physical < {n}; physical += stride) {{
-        const int joint = articulation_start.data[art] + indices.dof_joint.data[physical];
-        const auto value = InertiaRecord::apply(body_I_c.data[joint_child.data[joint]].c, joint_S_s.data[start + physical]);
-        for (int k = 0; k < 6; ++k) force[physical * 6 + k] = value.c[k];
-    }}
-"""
-        read = """        const auto motion = joint_S_s.data[start + physical_row];
-        float value = 0.0f;
-        for (int k = 0; k < 6; ++k) value += motion.c[k] * force[physical_col * 6 + k];
-"""
     body = kernel_template.substitute(
         _FACTOR_ASSEMBLY,
         FACTORS=warps * nnz,
         NNZ=nnz,
         N=n,
-        FORCE_STORAGE_CUDA=storage_cuda,
-        FORCE_STORAGE_CPU=storage_cpu,
-        PREPARE_MASS=prepare,
-        READ_MASS=read,
         FACTOR=sparse_cholesky_source(n, nnz),
         INVERSE=sparse_inverse_source(n),
     )
-    preludes = (lane_group(32),) if geometric else (lane_group(32), *SPATIAL.preludes(), INERTIA_RECORDS)
-    name = f"sparse_factor_{n}_{nnz}_{warps}" + ("_geometric" if geometric else "")
     return KernelTemplate(
-        name,
+        f"sparse_factor_{n}_{nnz}_{warps}",
         (
             ("group_to_art", wp.array[int]),
             ("mass_update_mask", wp.array[int]),
-            ("articulation_start", wp.array[int]),
             ("articulation_dof_start", wp.array[int]),
-            ("joint_child", wp.array[int]),
-            ("joint_S_s", wp.array[wp.spatial_vector]),
-            ("body_I_c", wp.array2d[float] if geometric else wp.array[inertia_record]),
+            ("geometric", wp.array2d[float]),
             ("R_group", wp.array2d[float]),
-            ("fused_augmented_drive", int),
             ("drive_row_by_dof", wp.array[int]),
             ("row_K", wp.array[float]),
             ("indices", _SparseMassMatrixIndices),
             ("Linv_group", wp.array2d[float]),
             ("status", wp.array[int]),
         ),
-        dual_native(body, preludes=preludes),
+        dual_native(body, preludes=(lane_group(32),)),
         kernel_template.THREADS,
         composed=True,
         native_name="sparse_factor_native",

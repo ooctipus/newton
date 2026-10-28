@@ -645,7 +645,6 @@ def _suite_shape_calls():
     factory = response_builds_rows.sparse_factor_kernel.__wrapped__
     for size in ((6, 21), (9, 44), (14, 81), (18, 117), (18, 135), (25, 194), (27, 243), (43, 434)):
         yield "response_builds_rows.sparse_factor_kernel", factory, size, {}
-        yield "response_builds_rows.sparse_factor_kernel", factory, size, {"geometric": True}
     # 18 coordinates with a support table are pinned with the patch-varied factories.
     factory = response_builds_rows.factor_contact_rows_kernel.__wrapped__
     for dofs, table in ((6, True), (9, False), (14, True), (25, True), (27, True), (43, False)):

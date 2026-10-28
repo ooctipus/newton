@@ -7,8 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.response_builds_rows import sparse_factor_kernel
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices, solve_sparse_mass_matrix
-from newton._src.solvers.feather_pgs.spatial_laws import INERTIA_CHANNELS, inertia_record
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
@@ -147,61 +146,50 @@ class TestSparseMassMatrix(unittest.TestCase):
             with self.subTest(parents=parents, counts=counts), self.assertRaises(ValueError):
                 _ = TreePlan.build(parents, counts).factor
 
-    def _factor(self, parents, counts, *, fused_drive=True, mask=None, armature=0.4, device="cpu"):
+    def _factor(self, parents, counts, *, mask=None, armature=0.4, device="cpu"):
+        """Factor two articulations' mass matrices from their packed entries, as the held tree publishes them, with
+        the regularization and the drives' stiffness on the diagonal; returns the dense oracle with both."""
         plan = TreePlan.build(parents, counts).factor
         n, j = plan.dof_count, len(parents)
         rng = np.random.default_rng(742)
         motion = rng.normal(size=(2 * n, 6)).astype(np.float32)
-        composite = np.zeros((2 * j, INERTIA_CHANNELS), dtype=np.float32)
         dense = np.zeros((2, n, n))
         for art in range(2):
             for joint in range(j):
-                record, body_inertia = _random_inertia(rng)
+                _, body_inertia = _random_inertia(rng)
                 physical_support = plan.permutation[_endpoint_support(plan, joint)]
                 jacobian = np.zeros((6, n))
                 jacobian[:, physical_support] = motion[art * n + physical_support].T
                 dense[art] += jacobian.T @ body_inertia @ jacobian
-                ancestor = joint
-                while ancestor != -1:
-                    composite[art * j + ancestor] += record
-                    ancestor = parents[ancestor]
         drive_map = np.arange(2 * n, dtype=np.int32)
         drive_map[::3] = -1
         stiffness = rng.uniform(-0.1, 0.5, size=2 * n).astype(np.float32)
         regularizer = np.full((2, n), armature, dtype=np.float32)
         mapping = np.array([1, 0], dtype=np.int32)
+        # The held geometry: each group's entries in the factor's packed order, without the diagonal terms.
+        physical_rows, physical_cols = plan.permutation[plan.entry_rows], plan.permutation[plan.columns]
+        geometric = np.stack([dense[art][physical_rows, physical_cols] for art in mapping]).astype(np.float32)
         for group, art in enumerate(mapping):
             diagonal = regularizer[group].astype(np.float64)
-            if fused_drive:
-                diagonal += np.where(
-                    drive_map[art * n : (art + 1) * n] >= 0, np.maximum(stiffness[art * n : (art + 1) * n], 0.0), 0.0
-                )
+            diagonal += np.where(
+                drive_map[art * n : (art + 1) * n] >= 0, np.maximum(stiffness[art * n : (art + 1) * n], 0.0), 0.0
+            )
             dense[art] += np.diag(diagonal)
 
         def array(value, dtype):
             return wp.array(value, dtype=dtype, device=device)
 
-        indices = factor_indices(plan, device)
         inverse = wp.full((2, plan.nonzero_count), -98.0, dtype=float, device=device)
         status = wp.full(2, 17, dtype=int, device=device)
-        if mask is None:
-            mask = [1, 1]
-        joint_child = rng.permutation(2 * j).astype(np.int32)
-        reordered_composite = np.empty_like(composite)
-        reordered_composite[joint_child] = composite
         inputs = [
             array(mapping, int),
-            array(mask, int),
-            array([0, j, 2 * j], int),
+            array([1, 1] if mask is None else mask, int),
             array([0, n, 2 * n], int),
-            array(joint_child, int),
-            array(motion, wp.spatial_vector),
-            array(reordered_composite, inertia_record),
+            array(geometric, float),
             array(regularizer, float),
-            int(fused_drive),
             array(drive_map, int),
             array(stiffness, float),
-            indices,
+            factor_indices(plan, device),
         ]
         wp.launch(
             sparse_factor_kernel(n, plan.nonzero_count),
@@ -211,49 +199,37 @@ class TestSparseMassMatrix(unittest.TestCase):
             device=device,
             block_dim=128,
         )
-        return plan, dense, inverse, status, inputs
+        return plan, dense, inverse, status
 
-    def test_crba_factor_solve_and_endpoint_response(self):
-        """Match dense dynamics and endpoint response for branched multi-DOF forests."""
+    def _assert_whitens(self, plan, dense, inverse, tolerance):
+        """Each group's ``L^-1`` whitens its articulation's dense oracle: ``L^-1 chol(P H P^T) = I``."""
+        n = plan.dof_count
+        for group, art in enumerate([1, 0]):
+            whiten = np.zeros((n, n))
+            whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
+            reordered = dense[art][np.ix_(plan.permutation, plan.permutation)]
+            np.testing.assert_allclose(
+                whiten @ np.linalg.cholesky(reordered), np.eye(n), rtol=tolerance, atol=tolerance
+            )
+
+    def test_factor_and_endpoint_response(self):
+        """Match the dense oracle and its endpoint response for branched multi-DOF forests."""
         for parents, counts in [([-1, 0, 0, 1], [6, 1, 3, 0]), ([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])]:
-            for fused_drive in (False, True):
-                with self.subTest(parents=parents, fused_drive=fused_drive):
-                    plan, dense, inverse, status, inputs = self._factor(parents, counts, fused_drive=fused_drive)
-                    np.testing.assert_array_equal(status.numpy(), [0, 0])
-                    n = plan.dof_count
-                    rng = np.random.default_rng(66)
-                    tau = rng.normal(size=2 * n).astype(np.float32)
-                    qdd = wp.zeros(2 * n, dtype=float, device="cpu")
-                    scratch = wp.zeros((2, n), dtype=float, device="cpu")
-                    wp.launch(
-                        solve_sparse_mass_matrix,
-                        dim=64,
-                        inputs=[inputs[0], inputs[3], inputs[-1], inverse, wp.array(tau, device="cpu"), scratch],
-                        outputs=[qdd],
-                        device="cpu",
-                        block_dim=128,
-                    )
-                    for group, art in enumerate([1, 0]):
-                        whiten = np.zeros((n, n))
-                        whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
-                        reordered = dense[art][np.ix_(plan.permutation, plan.permutation)]
-                        np.testing.assert_allclose(
-                            whiten @ np.linalg.cholesky(reordered), np.eye(n), rtol=2.0e-5, atol=2.0e-5
-                        )
-                        np.testing.assert_allclose(
-                            qdd.numpy()[art * n : (art + 1) * n],
-                            np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
-                            rtol=1.0e-4,
-                            atol=1.0e-5,
-                        )
-                        support = _endpoint_support(plan, 0, len(parents) - 1)
-                        row = np.zeros(n)
-                        row[plan.permutation[support]] = rng.normal(size=len(support))
-                        z = whiten @ row[plan.permutation]
-                        np.testing.assert_allclose(np.delete(z, support), 0.0, atol=1.0e-12)
-                        np.testing.assert_allclose(
-                            z @ z, row @ np.linalg.solve(dense[art], row), rtol=3.0e-5, atol=1.0e-6
-                        )
+            with self.subTest(parents=parents):
+                plan, dense, inverse, status = self._factor(parents, counts)
+                np.testing.assert_array_equal(status.numpy(), [0, 0])
+                self._assert_whitens(plan, dense, inverse, 2.0e-5)
+                n = plan.dof_count
+                rng = np.random.default_rng(66)
+                for group, art in enumerate([1, 0]):
+                    whiten = np.zeros((n, n))
+                    whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
+                    support = _endpoint_support(plan, 0, len(parents) - 1)
+                    row = np.zeros(n)
+                    row[plan.permutation[support]] = rng.normal(size=len(support))
+                    z = whiten @ row[plan.permutation]
+                    np.testing.assert_allclose(np.delete(z, support), 0.0, atol=1.0e-12)
+                    np.testing.assert_allclose(z @ z, row @ np.linalg.solve(dense[art], row), rtol=3.0e-5, atol=1.0e-6)
 
     def test_mask_bit_63_and_fixed_root(self):
         """Preserve the highest mask bit and fixed-root endpoint support."""
@@ -264,50 +240,28 @@ class TestSparseMassMatrix(unittest.TestCase):
 
     def _check_branched_factor(self, device):
         """Compare a broad articulated tree with the independent dense oracle."""
-        plan, dense, inverse, status, inputs = self._factor(*_branched_humanoid_topology(), armature=2.0, device=device)
+        plan, dense, inverse, status = self._factor(*_branched_humanoid_topology(), armature=2.0, device=device)
         np.testing.assert_array_equal(status.numpy(), [0, 0])
-        n = plan.dof_count
-        tau = np.random.default_rng(521).normal(size=2 * n).astype(np.float32)
-        qdd = wp.zeros(2 * n, device=device)
-        scratch = wp.zeros((2, n), device=device)
-        wp.launch(
-            solve_sparse_mass_matrix,
-            dim=64,
-            inputs=[inputs[0], inputs[3], inputs[-1], inverse, wp.array(tau, device=device), scratch],
-            outputs=[qdd],
-            device=device,
-            block_dim=128,
-        )
-        for group, art in enumerate([1, 0]):
-            whiten = np.zeros((n, n))
-            whiten[plan.entry_rows, plan.columns] = inverse.numpy()[group]
-            expected = dense[art][np.ix_(plan.permutation, plan.permutation)]
-            np.testing.assert_allclose(whiten @ np.linalg.cholesky(expected), np.eye(n), atol=1.0e-4, rtol=1.0e-4)
-            np.testing.assert_allclose(
-                qdd.numpy()[art * n : (art + 1) * n],
-                np.linalg.solve(dense[art], tau[art * n : (art + 1) * n]),
-                atol=2.0e-5,
-                rtol=2.0e-4,
-            )
+        self._assert_whitens(plan, dense, inverse, 1.0e-4)
 
-    def test_branched_43_dof_factor_and_predictor(self):
-        """Match dense dynamics for a broad 43-DOF articulated tree on CPU."""
+    def test_branched_43_dof_factor(self):
+        """Match the dense oracle for a broad 43-DOF articulated tree on CPU."""
         self._check_branched_factor("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse factor CUDA schedule requires CUDA")
-    def test_branched_43_dof_factor_and_predictor_cuda(self):
+    def test_branched_43_dof_factor_cuda(self):
         """Match the dense oracle with parallel factor dependencies and inverse columns."""
         self._check_branched_factor("cuda:0")
 
     def test_mask_preserves_factor(self):
         """Retain the inverse factor and status when an articulation is not refreshed."""
-        _, _, inverse, status, _ = self._factor([-1, 0, 0], [2, 1, 1], mask=[0, 1])
+        _, _, inverse, status = self._factor([-1, 0, 0], [2, 1, 1], mask=[0, 1])
         np.testing.assert_array_equal(inverse.numpy()[1], -98.0)
         np.testing.assert_array_equal(status.numpy(), [0, 17])
 
     def test_invalid_pivot_is_not_regularized(self):
         """Report an invalid factor without adding a new pivot floor."""
-        _, _, inverse, status, _ = self._factor([-1], [1], armature=-1.0e6)
+        _, _, inverse, status = self._factor([-1], [1], armature=-1.0e6)
         np.testing.assert_array_equal(status.numpy(), [1, 1])
         self.assertTrue(np.isnan(inverse.numpy()).all())
 

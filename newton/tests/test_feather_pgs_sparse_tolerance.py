@@ -48,15 +48,15 @@ def _build(device, worlds=8, *, hip_pitch=False):
         legs = (legs[0], legs[2])
     for _world in range(worlds):
         builder.begin_world()
-        # A fixed-base torso with two legs: the branching keeps the mass factor sparse.
+        # A torso turning on a fixed base, with two legs: the branching keeps the mass factor sparse, and the held
+        # tree, which alone evaluates native sparse factors, takes the fixed root.
+        base = builder.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
         torso = builder.add_link(mass=2.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
         joints = [
-            builder.add_joint_revolute(
-                parent=-1,
-                child=torso,
-                axis=newton.Axis.Z,
-                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
-            )
+            builder.add_joint_fixed(
+                parent=-1, child=base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity())
+            ),
+            builder.add_joint_revolute(parent=base, child=torso, axis=newton.Axis.Z),
         ]
         for side in (-1.0, 1.0):
             parent = torso

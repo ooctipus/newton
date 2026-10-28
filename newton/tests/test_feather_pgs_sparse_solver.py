@@ -14,7 +14,6 @@ import newton
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
@@ -253,50 +252,13 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                     indices[classes[world, :count]], explicit[1]._sparse_row_dof.numpy()[world, :count]
                 )
 
-    def test_moving_prescribed_support_and_reset(self):
-        """Preserve nonzero prescribed contact targets, support velocity and masked reset."""
-        dense = _case(False, prescribed=True)
-        sparse = _case(True, prescribed=True)
-        self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
-        self.assertTrue(sparse[1]._has_prescribed_response)
-        target_seen = tangent_target_seen = False
-        for step in range(8):
-            if step == 4:
-                for model, solver, state, *_ in (dense, sparse):
-                    q = state.joint_q.numpy()
-                    q[2] += 0.002
-                    state.joint_q.assign(q)
-                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                    solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
-            for case in (dense, sparse):
-                _step(case)
-            self.assert_states_close(dense[2], sparse[2])
-            counts = sparse[1].constraint_count.numpy()
-            np.testing.assert_array_equal(counts, dense[1].constraint_count.numpy())
-            for world, count in enumerate(counts):
-                kinds = sparse[1].row_type.numpy()[world, :count]
-                np.testing.assert_array_equal(kinds, dense[1].row_type.numpy()[world, :count])
-                np.testing.assert_allclose(
-                    sparse[1].rhs.numpy()[world, :count], dense[1].rhs.numpy()[world, :count], atol=2.0e-5, rtol=2.0e-5
-                )
-                actual = sparse[1].target_velocity.numpy()[world, :count]
-                expected = dense[1].target_velocity.numpy()[world, :count]
-                # Prepared tangents consume prescribed targets directly in RHS; only normals retain
-                # restitution metadata.
-                normals = kinds != PGS_CONSTRAINT_TYPE_FRICTION
-                tangent_target_seen |= bool(np.any(np.abs(expected[~normals]) > 0.01))
-                np.testing.assert_allclose(actual[normals], expected[normals], atol=2.0e-5, rtol=2.0e-5)
-                target_seen |= bool(np.any(np.abs(actual[normals]) > 0.01))
-            # The moving supports are the model's only kinematic bodies.
-            prescribed_bodies = np.flatnonzero(sparse[0].body_flags.numpy() & int(newton.BodyFlags.KINEMATIC))
-            np.testing.assert_allclose(
-                sparse[2].body_qd.numpy()[prescribed_bodies],
-                np.tile([0.2, 0.0, 0.04, 0.0, 0.0, 0.15], (len(prescribed_bodies), 1)),
-                atol=1.0e-6,
-            )
-        self.assertTrue(target_seen, "Exercise prescribed contact targets")
-        self.assertTrue(tangent_target_seen, "Exercise prescribed tangential motion in prepared RHS")
-        self.assert_sparse_state(sparse)
+    def test_moving_prescribed_supports_keep_dense_factors(self):
+        """Keep moving prescribed supports on dense factors: native sparse factors are the held tree's, whose
+        sparse group holds no prescribed articulations."""
+        _, solver, *_ = _case(True, prescribed=True)
+        self.assertTrue(solver._has_prescribed_response)
+        self.assertIsNone(solver._sparse_mass_matrix_size)
+        self.assertIn("holds no prescribed articulations", solver._sparse_selection_reason)
 
     def assert_states_close(self, first, second):
         """Allow float32 factor-order roundoff, not a changed physics recipe."""

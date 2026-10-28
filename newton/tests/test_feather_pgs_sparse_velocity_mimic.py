@@ -168,15 +168,13 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
 def _model(offset, scale, error, device="cuda:0"):
     """Build independently driven sibling joints coupled by one authored mimic."""
     scene = newton.ModelBuilder()
+    # The root turns on a fixed base: the held tree, which alone evaluates native sparse factors, takes fixed or free
+    # roots.
+    base = scene.add_link(mass=2.0, inertia=wp.mat33(np.diag([0.025, 0.03, 0.04])))
     root = scene.add_link(mass=2.0, inertia=wp.mat33(np.diag([0.025, 0.03, 0.04])))
     joints = [
-        scene.add_joint_revolute(
-            -1,
-            root,
-            axis=newton.Axis.Z,
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.16), wp.quat_identity()),
-            armature=0.05,
-        )
+        scene.add_joint_fixed(-1, base, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.16), wp.quat_identity())),
+        scene.add_joint_revolute(base, root, axis=newton.Axis.Z, armature=0.05),
     ]
     for branch in range(2):
         body = scene.add_link(mass=0.5, inertia=wp.mat33(np.diag([0.002, 0.003, 0.004])))
@@ -201,7 +199,7 @@ def _model(offset, scale, error, device="cuda:0"):
                 body, radius=0.055, xform=wp.transform(wp.vec3(0.02, 0.0, 0.0), wp.quat_identity()), cfg=cfg
             )
     scene.add_articulation(joints)
-    scene.add_constraint_mimic(joint0=joints[2], joint1=joints[1], coef0=offset, coef1=scale)
+    scene.add_constraint_mimic(joint0=joints[3], joint1=joints[2], coef0=offset, coef1=scale)
     scene.joint_q[:] = [0.0, 0.1, offset + scale * 0.1 + error]
     scene.joint_qd[:] = [0.08, 0.7, -0.6]
     builder = newton.ModelBuilder()

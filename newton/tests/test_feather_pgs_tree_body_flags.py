@@ -305,7 +305,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     # Body 1 is the contacting leaf of the first world's tree; every body carries a wrench.
                     case = _sparse_case(beta, cached, kinematic_body=1)
                     solver = case[1]
-                    self.assertIsNotNone(solver._sparse_mass_matrix_size)
+                    # Ordinary dynamics take the dense factors: native sparse factors are the held tree's.
+                    self.assertEqual(solver._sparse_mass_matrix_size is not None, cached == "auto")
                     if cached == "auto":
                         self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
                     for _ in range(40):

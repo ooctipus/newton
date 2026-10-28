@@ -544,25 +544,6 @@ def solve_diagonal_mass(
     joint_qdd[global_dof] = value / diagonal
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
-def solve_compact_diagonal_mass(
-    diagonal_inverse_mass: wp.array[float],
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    joint_tau: wp.array[float],
-    # output
-    joint_qdd: wp.array[float],
-):
-    """Apply a directly stored inverse diagonal to generalized forces."""
-    element = wp.tid()
-    group = element // n_dofs
-    dof = element - group * n_dofs
-    art = group_to_art[group]
-    global_dof = articulation_dof_start[art] + dof
-    joint_qdd[global_dof] = joint_tau[global_dof] * diagonal_inverse_mass[global_dof]
-
-
 @wp.func
 def _active_free_root_dof_start(
     free_root_joint_indices: wp.array[int],
@@ -1169,7 +1150,7 @@ def eval_rigid_tau_and_augmented_drives(
     row_dof_index: wp.array[int],
 ):
     """An articulation's joint forces (:func:`.tree_passes.articulation_tau`) and its augmented drives in one
-    launch; one thread per articulation. ``d.add_existing_tau`` must be 0."""
+    launch; one thread per articulation."""
     articulation = wp.tid()
     articulation_tau(articulation, d)
     prepare_articulation_augmented_drives(

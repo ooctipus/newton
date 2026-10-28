@@ -511,11 +511,10 @@ def joint_force(
     lin_axis_count: int,
     ang_axis_count: int,
     wrench: wp.spatial_vector,
-    add_existing: int,
     tau: wp.array[float],
 ):
     """Write a joint's generalized forces: ``joint_f - S^T wrench``, with the passive spring and damper of
-    one-coordinate axes (prismatic, revolute and D6 joints), added to ``tau`` when ``add_existing``.
+    one-coordinate axes (prismatic, revolute and D6 joints), into ``tau``.
 
     ``wrench`` is the joint's subtree wrench about the origin. Drive gains stay on the implicit augmented
     path; a ball joint's quaternion is never a spring coordinate.
@@ -545,6 +544,4 @@ def joint_force(
             )
         else:
             value = -wp.dot(joint_S_s[dof], wrench) + joint_f[dof]
-        if add_existing != 0:
-            value += tau[dof]
         tau[dof] = value

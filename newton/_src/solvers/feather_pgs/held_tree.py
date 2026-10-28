@@ -13,6 +13,7 @@ dynamics stay on the serial passes; :func:`install` installs the owner.
 """
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -56,12 +57,19 @@ def _diagonal_geometry(
     inverse[dof] = 1.0 / mass
 
 
-def decline(solver) -> str | None:
+def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | None = None) -> str | None:
     """Why the held tree does not evaluate the solver's dynamics, or ``None`` when it does.
 
-    The terms every group needs, then those of the representation the solver's data chose: the native sparse
-    factor when it admitted one, else its dense size groups. A term is read only once the earlier ones hold.
+    The terms every group needs, then those of the representation: the native sparse factor's group (``sparse``:
+    its ``(velocity_limits, split)``), else the dense size groups with ``compact`` as the compact diagonal size.
+    Both default to the representation the solver chose; the native sparse factor and the compact diagonal, which
+    only the held tree evaluates, pass their candidates (:func:`sparse_decline`, :func:`compact_decline`). A term
+    is read only once the earlier ones hold.
     """
+    if sparse is None and getattr(solver, "_sparse_mass_matrix_size", None) is not None:
+        sparse = (solver._sparse_velocity_limits, solver._sparse_split)
+    if compact is None:
+        compact = getattr(solver, "_compact_diagonal_mass_size", None)
     model = solver.model
     if not model.device.is_cuda:
         return "The held tree runs on CUDA."
@@ -69,12 +77,12 @@ def decline(solver) -> str | None:
         return "Gradients keep the differentiable serial passes."
     if model.particle_count:
         return "Particles are outside the held tree."
-    sparse = solver._sparse_mass_matrix_size is not None
-    if sparse:
+    if sparse is not None:
+        velocity_limits, split = sparse
         if solver._has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
         if solver._mimic_count and not (
-            solver._sparse_velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
+            velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
         ):
             return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
     else:
@@ -101,23 +109,23 @@ def decline(solver) -> str | None:
             return "Velocity iterations keep the ordinary dynamics."
     if solver._connect_count or solver._has_loop_joints:
         return "Loop closures keep the serial passes."
-    if sparse and solver._has_prescribed_response:
+    if sparse is not None and solver._has_prescribed_response:
         return "The sparse factor's group holds no prescribed articulations."
     if not solver._fk_id_cache_available:
         return "The FK/ID cache is unavailable."
-    if sparse and not (solver.pgs_mode == "matrix_free" or solver._sparse_split):
+    if sparse is not None and not (solver.pgs_mode == "matrix_free" or split):
         return "The sparse factor's group serves the matrix-free and sparse split sweeps."
     if not solver._parallel_augmented_drive_topology:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
     if solver._debug_buffers_enabled:
         return "Debug buffers keep the ordinary dynamics."
-    if sparse:
-        return "The double buffer keeps the ordinary dynamics." if solver._double_buffer else None
+    if sparse is not None:
+        return None
     # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32
     # coordinates) into the solver's dense factor of the same shape, in place of the size's stage-2 factor; the
     # compact diagonal size keeps its compact inverse.
     for size in solver.size_groups:
-        if size != solver._compact_diagonal_mass_size and size > 32:
+        if size != compact and size > 32:
             return f"Size {size} has no held Cholesky family (1 to 32 coordinates)."
     return None
 
@@ -133,8 +141,9 @@ def _prescribed_articulations(solver):
     return np.flatnonzero(solver._prescribed_articulation.numpy() != 0).astype(np.int32)
 
 
-def _coverage(solver):
-    """Prove complete disjoint articulation and physical coordinate ownership."""
+def _coverage(solver, compact):
+    """Prove complete disjoint articulation and physical coordinate ownership; ``compact`` is the compact diagonal
+    size the groups carry."""
     model = solver.model
     prescribed = _prescribed_articulations(solver)
     if not solver.size_groups or model.joint_count != model.body_count:
@@ -162,9 +171,91 @@ def _coverage(solver):
     return (
         tuple(solver.size_groups),
         tuple(sorted(solver.n_arts_by_size.items())),
-        solver._compact_diagonal_mass_size,
+        compact,
         int(prescribed.size),
     )
+
+
+def _plan_view(group_to_art, art_to_world, host, *, prescribed=False):
+    """What :func:`.make_plan` reads of a group's operator: its articulations, their worlds and its metadata."""
+    return SimpleNamespace(
+        plan=SimpleNamespace(group_to_art=group_to_art, art_to_world=art_to_world), host=host, prescribed=prescribed
+    )
+
+
+def _size_group(solver, size, *, diagonal):
+    """Size group ``size`` as a held group: whether its trees stand on free roots, their mass pattern, its metadata
+    and its layout (:func:`.make_plan`). Raises ValueError where the trees do not fit a held group."""
+    model = solver.model
+    first_art = int(solver.group_to_art[size].numpy()[0])
+    starts = model.articulation_start.numpy()
+    first, end = starts[first_art], starts[first_art + 1]
+    parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
+    counts = np.diff(model.joint_qd_start.numpy())[first:end]
+    root_type = model.joint_type.numpy()[first]
+    fixed_root = counts[0] == 0 and root_type in (int(JointType.FIXED), int(JointType.D6))
+    # A free rigid body is a one-body tree on a free root: its six coordinates
+    # share the held Cholesky action and the generic free-root transport.
+    free_root = counts[0] == 6 and root_type == int(JointType.FREE)
+    if not (fixed_root or free_root):
+        raise ValueError("Mixed held tree groups require fixed or free roots")
+    mass = TreePlan.build(parents, counts).factor
+    if mass.dof_count != size:
+        raise ValueError("Mixed tree physical and factor dimensions differ")
+    if diagonal and mass.nonzero_count != size:
+        raise ValueError("Compact diagonal cache requires independent physical coordinates")
+    host = operator_metadata(mass)
+    layout, _ = make_plan(model, _plan_view(solver.group_to_art[size], solver.art_to_world, host), complete=False)
+    return bool(free_root), mass, host, layout
+
+
+def _prescribed_group(solver, group_to_art):
+    """The prescribed free bodies as a held group: their mass pattern, metadata and layout (:func:`.make_plan`)."""
+    mass = TreePlan.build([-1], [6]).factor
+    host = operator_metadata(mass)
+    view = _plan_view(group_to_art, solver.art_to_world, host, prescribed=True)
+    layout, _ = make_plan(solver.model, view, complete=False)
+    return mass, host, layout
+
+
+def sparse_decline(solver, size, plan, *, velocity_limits, split) -> str | None:
+    """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
+    ``None``: :func:`options_decline`, :func:`decline` of the candidate, then its one complete group's fit.
+
+    Only the held tree evaluates native sparse factors, so their admission reads this before choosing one.
+    """
+    reason = options_decline(solver, sparse=True) or decline(solver, sparse=(velocity_limits, split))
+    if reason is not None:
+        return reason
+    view = _plan_view(solver.group_to_art[size], solver.art_to_world, operator_metadata(plan))
+    try:
+        make_plan(solver.model, view, complete=True)
+    except ValueError as error:
+        return f"The topology does not fit the held groups: {error}"
+    return None
+
+
+def compact_decline(solver, size, *, scalar) -> str | None:
+    """Why the held tree would not take the dense size groups with a compact diagonal of ``size`` coordinates, or
+    ``None``: :func:`options_decline`, :func:`decline` of the candidate, then the groups' fit (the coverage, the
+    diagonal group unless ``scalar`` branches take it, every other size group, the prescribed roots).
+
+    Only the held tree evaluates a compact diagonal, so the sparse-diagonal response reads this before choosing one.
+    """
+    reason = options_decline(solver, sparse=False) or decline(solver, compact=size)
+    if reason is not None:
+        return reason
+    try:
+        _coverage(solver, size)
+        for group_size in solver.size_groups:
+            if group_size != size or not scalar:
+                _size_group(solver, group_size, diagonal=group_size == size)
+        prescribed = _prescribed_articulations(solver)
+        if prescribed.size:
+            _prescribed_group(solver, wp.array(prescribed, dtype=int, device=solver.model.device))
+    except ValueError as error:
+        return f"The topology does not fit the held groups: {error}"
+    return None
 
 
 class TreeSparseOperator:
@@ -184,7 +275,7 @@ class TreeSparseOperator:
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = solver._sparse_mass_matrix_status
         self.refresh_kernel = sparse_factor_kernel(
-            n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block, geometric=True
+            n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block
         )
         self.kinetic_state = None
 
@@ -197,13 +288,9 @@ class TreeSparseOperator:
             inputs=[
                 s.group_to_art[n],
                 s.mass_update_mask,
-                s.model.articulation_start,
                 s.articulation_dof_start,
-                s.model.joint_child,
-                state_aug.joint_S_s,
                 self.kinetic_state.geometric,
                 s.R_by_size[n],
-                1,
                 s._augmented_drive_row_by_dof,
                 s.aug_row_K,
                 s._sparse_mass_matrix_indices,
@@ -223,30 +310,13 @@ class TreeHeldOperator:
     def __init__(self, solver, size):
         self.solver, self.size = solver, size
         self.requires_body_velocity = True
-        model, device = solver.model, solver.model.device
+        device = solver.model.device
         group = solver.group_to_art[size].numpy()
-        starts = model.articulation_start.numpy()
-        first, end = starts[group[0]], starts[group[0] + 1]
-        parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
-        counts = np.diff(model.joint_qd_start.numpy())[first:end]
-        root_type = model.joint_type.numpy()[first]
-        fixed_root = counts[0] == 0 and root_type in (int(JointType.FIXED), int(JointType.D6))
-        # A free rigid body is a one-body tree on a free root: its six coordinates
-        # share the held Cholesky action and the generic free-root transport.
-        free_root = counts[0] == 6 and root_type == int(JointType.FREE)
-        if not (fixed_root or free_root):
-            raise ValueError("Mixed held tree groups require fixed or free roots")
-        self.free_root = bool(free_root)
-        mass = self.mass = TreePlan.build(parents, counts).factor
-        if mass.dof_count != size:
-            raise ValueError("Mixed tree physical and factor dimensions differ")
-        self.host = operator_metadata(mass)
-        self.plan = bind_operator_plan(solver, size, self.host)
-        self.layout, _ = make_plan(model, self, complete=False)
-        physical_index = mass.physical_lookup
         self.diagonal = size == solver._compact_diagonal_mass_size
-        if self.diagonal and mass.nonzero_count != size:
-            raise ValueError("Compact diagonal cache requires independent physical coordinates")
+        self.free_root, mass, self.host, self.layout = _size_group(solver, size, diagonal=self.diagonal)
+        self.mass = mass
+        self.plan = bind_operator_plan(solver, size, self.host)
+        physical_index = mass.physical_lookup
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(group), dtype=int, device=device)
         self.data.status = wp.zeros(len(group), dtype=int, device=device)
@@ -337,11 +407,9 @@ class PrescribedRootOperator:
             raise ValueError("No prescribed articulations to own")
         self.free_root = True
         self.diagonal = True
-        self.mass = mass = TreePlan.build([-1], [6]).factor
-        self.host = operator_metadata(mass)
         self.group_to_art = wp.array(arts, dtype=int, device=device)
+        self.mass, self.host, self.layout = _prescribed_group(solver, self.group_to_art)
         self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
-        self.layout, _ = make_plan(solver.model, self, complete=False)
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(arts), dtype=int, device=device)
         self.data.status = wp.zeros(len(arts), dtype=int, device=device)
@@ -398,6 +466,10 @@ def forest_families(solver):
     if np.any(np.diff(per_world, axis=1) != 1):
         return None
     if np.any(counts[per_world] != counts[per_world[0]]) or np.any(prescribed[per_world] != prescribed[per_world[0]]):
+        return None
+    # One layout holds a world's trees: at most 64 bodies and coordinates (make_plan).
+    bodies = np.diff(model.articulation_start.numpy())
+    if bodies[per_world[0]].sum() > 64 or counts[per_world[0]].sum() > 64:
         return None
     signature = [(int(counts[a]), int(prescribed[a])) for a in per_world[0]]
     families = [0 if pres else size for size, pres in signature]
@@ -598,7 +670,7 @@ class HeldTree:
             self.bank_compare = group.bank_compare
             self.skip_captured_repairs = group.skip_captured_repairs
             return
-        self.coverage = _coverage(solver)
+        self.coverage = _coverage(solver, solver._compact_diagonal_mass_size)
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
@@ -740,29 +812,45 @@ class HeldTree:
             group.finish(state, augmented, output, dt, refresh)
 
 
-def install(solver) -> None:
-    """Install the held tree as ``solver._tree_kinetic_state`` where :func:`decline` admits it, with the reason.
+def options_decline(solver, *, sparse: bool) -> str | None:
+    """Why the solver's options keep ordinary dynamics on the dense groups (``sparse``: on the native sparse factor's
+    group), or ``None``.
 
     ``cached_dynamics='off'``, an explicit dense kernel choice and the CPU keep the serial passes. Under ``auto``,
     ``FEATHER_PGS_TREE_KINETIC_STATE=0`` (the sparse factor's group) and ``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0``
-    (the dense groups) disable it; ``cached_dynamics='on'`` raises where it is not admitted.
+    (the dense groups) disable the held tree. Only the held tree evaluates the native sparse factor and the compact
+    diagonal, so their admissions read this before :func:`install` does.
     """
-    solver._tree_kinetic_state = None
     choice = solver.cached_dynamics
-    if solver._sparse_mass_matrix_size is not None:
+    if sparse:
         switch, enabled = "FEATHER_PGS_TREE_KINETIC_STATE", os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "1")
     else:
         switch = "FEATHER_PGS_MIXED_TREE_KINETIC_STATE"
         enabled = os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "1")
     if choice == "off":
-        reason = "Explicit cached_dynamics='off' retains ordinary dynamics."
-    elif solver._explicit_dense_kernels:
-        reason = "An explicit dense kernel choice retains ordinary dynamics."
-    elif solver.model.device.is_cpu:
-        reason = "CPU uses ordinary dynamics; cached prediction requires CUDA."
-    elif choice != "on" and enabled != "1":
-        reason = f"Disabled cache option: {switch}."
-    else:
+        return "Explicit cached_dynamics='off' retains ordinary dynamics."
+    if solver._explicit_dense_kernels:
+        return "An explicit dense kernel choice retains ordinary dynamics."
+    if solver.model.device.is_cpu:
+        return "CPU uses ordinary dynamics; cached prediction requires CUDA."
+    if choice != "on" and enabled != "1":
+        return f"Disabled cache option: {switch}."
+    return None
+
+
+def install(solver) -> None:
+    """Install the held tree as ``solver._tree_kinetic_state`` where :func:`options_decline` and :func:`decline` admit
+    it, with the reason; ``cached_dynamics='on'`` raises where it is not admitted.
+
+    The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
+    where :func:`sparse_decline` and :func:`compact_decline` admit them, so the held tree takes every solver that
+    holds one.
+    """
+    solver._tree_kinetic_state = None
+    choice = solver.cached_dynamics
+    sparse = solver._sparse_mass_matrix_size is not None
+    reason = options_decline(solver, sparse=sparse)
+    if reason is None:
         reason = decline(solver)
         if reason is None:
             try:

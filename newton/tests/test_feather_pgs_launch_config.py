@@ -103,8 +103,10 @@ def _build_sparse_diagonal_pair_model(num_branches=16, num_worlds=2, *, device=N
         )
     scene.add_articulation(star_joints)
 
-    chain_joints = []
-    parent = -1
+    # The chain stands on a fixed base: the held tree, which alone evaluates the compact diagonal, takes fixed or
+    # free roots.
+    parent = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    chain_joints = [scene.add_joint_fixed(parent=-1, child=parent)]
     for _link_index in range(3):
         child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
         chain_joints.append(
@@ -161,8 +163,10 @@ def _build_sparse_contact_friction_model(num_branches=16, num_worlds=2, *, devic
         )
     scene.add_articulation(star_joints)
 
-    chain_joints = []
-    parent = -1
+    # The chain stands on a fixed base: the held tree, which alone evaluates the compact diagonal, takes fixed or
+    # free roots.
+    parent = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    chain_joints = [scene.add_joint_fixed(parent=-1, child=parent)]
     for _link_index in range(3):
         child = scene.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
         chain_joints.append(
@@ -247,7 +251,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 "composite_inertia": "serial",
                 "refresh_body_inertia": "mass_dynamics",
                 "crba_fill": "mass_dynamics",
-                "diagonal_inverse_mass": "mass_dynamics",
             },
         }
         for owner, kernels in expected_modules.items():

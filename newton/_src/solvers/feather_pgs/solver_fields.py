@@ -246,9 +246,8 @@ count, its Schur complement, factor and regularization, and the regularization's
 SPARSE_FACTOR = FieldGroup(
     Field("_sparse_Linv", wp.float32, ("group", "nonzero"), grad=False),
     Field("_sparse_mass_matrix_status", wp.int32, ("group",), grad=False),
-    Field("_sparse_mass_matrix_scratch", wp.float32, ("group", "size"), fill=None, grad=False),
 )
-"""The native sparse factor's inverse entries, status and scratch, per articulation of the factored size."""
+"""The native sparse factor's inverse entries and status, per articulation of the factored size."""
 
 SPARSE_ROWS = FieldGroup(
     Field("_sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, grad=False),

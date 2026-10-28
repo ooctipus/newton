@@ -520,7 +520,8 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 model = _build(wp.get_device("cuda:0"), cabinet=True)
                 plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
                 self.assertIsNone(plain_owner)
-                self.assertEqual(plain_solver._compact_diagonal_mass_size, 2)
+                # Ordinary dynamics take the dense representations: the compact diagonal is the held tree's.
+                self.assertIsNone(plain_solver._compact_diagonal_mass_size)
                 _rollout.forest = True
                 try:
                     owner_solver, owner, cached, cached_qd = _rollout(

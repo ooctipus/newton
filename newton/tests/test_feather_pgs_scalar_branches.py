@@ -27,6 +27,7 @@ from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
+from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.solvers import SolverFeatherPGS
@@ -273,6 +274,29 @@ def recipe_solver(model, *, scalar, compact=True, **options):
         return SolverFeatherPGS(model, **arguments)
 
 
+def ordinary_head(model, *, rows=64, **options):
+    """The A/B head: the keyboard recipe on ordinary dynamics, which take the dense representations and the
+    general rows, since the compact diagonal and its fused limit rows are the held tree's.
+
+    ``rows`` is its dense row capacity: every key's limit rows are dense rows there. The general rows are inside
+    the resolved-world classifier's law, the sparse-diagonal rows of the scalar route are not: the head alone leaves
+    a world whose rows all separate without rows (:func:`_normal_impulses`), which changes the rows the arms keep,
+    not their physics (the pusher press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
+    """
+    return recipe_solver(model, scalar=False, cached_dynamics="off", dense_max_constraints=rows, **options)
+
+
+def ordinary_inverse_mass(solver, size):
+    """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its diagonal factor
+    (``L_jj = sqrt(H_jj + R_j)``), for every coordinate (zero outside the group)."""
+    factor = solver.L_by_size[size].numpy().astype(np.float64)
+    starts = solver.articulation_dof_start.numpy()[solver.group_to_art[size].numpy()]
+    inverse = np.zeros(solver.model.joint_dof_count)
+    for group, start in enumerate(starts):
+        inverse[start : start + size] = 1.0 / np.diagonal(factor[group]) ** 2
+    return wp.array(inverse, dtype=wp.float64, device="cpu")
+
+
 def install_held_contacts(model, state, contacts, pairs):
     """Hold one contact per ``(body, other body or -1 for the world)`` pair with fixed local witnesses.
 
@@ -453,11 +477,30 @@ def _direct_branch_tau(
     group_to_art: wp.array[int], dof_joint_offset: wp.array[int], n_dofs: int, d: tree_passes.DynamicsData
 ):
     """The linear-state oracle's joint forces of one-body branches, one thread per coordinate: each body bears
-    only its own wrench (the serial pass's law for a leaf)."""
+    only its own wrench (the serial pass's law for a leaf), added onto the drive force ``tau`` holds."""
     element = wp.tid()
     group = element // n_dofs
     joint = d.articulation_start[group_to_art[group]] + dof_joint_offset[element - group * n_dofs]
+    dof = d.joint_qd_start[joint]
+    drive = d.tau[dof]
     tree_passes.generalized_force(joint, tree_passes.net_wrench(joint, wp.spatial_vector(), d), d)
+    d.tau[dof] = d.tau[dof] + drive
+
+
+@wp.kernel(enable_backward=False)
+def _apply_inverse_mass(
+    inverse_mass: wp.array[float],
+    group_to_art: wp.array[int],
+    articulation_dof_start: wp.array[int],
+    n_dofs: int,
+    joint_tau: wp.array[float],
+    joint_qdd: wp.array[float],
+):
+    """The linear-state oracle's accelerations of one-body branches: ``tau`` times the inverse mass."""
+    element = wp.tid()
+    group = element // n_dofs
+    dof = articulation_dof_start[group_to_art[group]] + element - group * n_dofs
+    joint_qdd[dof] = joint_tau[dof] * inverse_mass[dof]
 
 
 @wp.kernel(enable_backward=False)
@@ -690,7 +733,7 @@ class _PrismaticRoute:
         wp.launch(
             _direct_branch_tau,
             dim=count,
-            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
+            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control)],
             device=self.device,
         )
         wp.launch(
@@ -714,7 +757,7 @@ class _PrismaticRoute:
             device=self.device,
         )
         wp.launch(
-            fk.solve_compact_diagonal_mass,
+            _apply_inverse_mass,
             dim=count,
             inputs=[s._diagonal_inverse_mass, self.group, s.articulation_dof_start, size, s.joint_tau],
             outputs=[s.joint_qdd],
@@ -1283,35 +1326,6 @@ class TestScalarBranchRule(unittest.TestCase):
             {"enabled": False, "reason": "No diagonal-mass group shares the sparse-diagonal response."},
         )
 
-    def _admitted(self, model):
-        """A plan the rule admits for the model's branch group, as the CUDA route builds it."""
-        solver = cpu_solver(model, branch_size(model))
-        plan, reason = sb.plan_scalar_branches(solver, requested=True)
-        self.assertIsNotNone(plan, reason)
-        return plan, reason
-
-    def test_declined_branches_keep_ordinary_dynamics(self):
-        """Drop an admitted plan the held-tree owner does not take and build the routes of a solver without it.
-
-        The declined solver and a twin built without the plan must hold the
-        same routes, apart from the scalar branches' reason.
-        """
-        model = build_branch_model(worlds=2)
-        with mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)):
-            solver = SolverFeatherPGS(model, pgs_mode="split")
-        plain = SolverFeatherPGS(model, pgs_mode="split")
-        self.assertIsNone(solver._tree_kinetic_state)
-        self.assertIsNone(solver._scalar_branches)
-        self.assertIn("did not take them", solver._scalar_branches_reason)
-        self.assertIn("CPU", solver._scalar_branches_reason)
-        self.assertIn("ordinary dynamics runs them", solver._scalar_branches_reason)
-        self.assertIn("No diagonal-mass group", plain._scalar_branches_reason)
-        routes = [twin.get_path_selection()["routes"] for twin in (solver, plain)]
-        for record in routes:
-            self.assertFalse(record["held_tree"]["scalar_branches"]["enabled"])
-            del record["held_tree"]["scalar_branches"]["reason"]
-        self.assertEqual(routes[0], routes[1])
-
 
 class TestScalarBranchKernels(unittest.TestCase):
     def test_prismatic_branches_match_the_linear_state_route(self):
@@ -1452,8 +1466,15 @@ def _contact_rows(test, solver, count):
 
 
 def _normal_impulses(test, solver, count):
-    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order."""
-    return solver.impulses.numpy()[_contact_rows(test, solver, count)].astype(np.float64)
+    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order.
+
+    A contact of a world the resolved-world classifier resolved (every row separates at the predictor) has no
+    rows and carries none.
+    """
+    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
+    resolved = solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
+    test.assertTrue(np.all((slot >= 0) | resolved), "every contact owns a row or sits in a resolved world")
+    return np.where(resolved, 0.0, solver.impulses.numpy()[world, np.maximum(slot, 0)]).astype(np.float64)
 
 
 def _key_inertia(model, leaves, dofs, axes):
@@ -1759,7 +1780,8 @@ class TestScalarBranchOwner(unittest.TestCase):
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
         # The head, the scalar route (captured below) and the scalar route's eager twin.
         solvers = [
-            recipe_solver(model, scalar=False, cached_dynamics="off"),
+            # Every key's limit rows are dense rows on the head: with the arm's and the contacts', 240 rows a world.
+            ordinary_head(model, rows=256),
             recipe_solver(model, scalar=True),
             recipe_solver(model, scalar=True),
         ]
@@ -1820,7 +1842,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             _close(self, head.v_hat, scalar.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
             _close(
                 self,
-                head._diagonal_inverse_mass,
+                ordinary_inverse_mass(head, KEYBOARD_LEAVES),
                 scalar._diagonal_inverse_mass,
                 layout.key_dofs,
                 f"{tag} minv",
@@ -2043,7 +2065,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         mu = model.shape_material_mu.numpy()
         mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
         model.shape_material_mu.assign(mu)
-        solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
+        solvers = [ordinary_head(model), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2201,16 +2223,15 @@ class TestScalarBranchOwner(unittest.TestCase):
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", head["held_tree"]["scalar_branches"]["reason"])
-        # Without the held-tree owner the branches stay on ordinary dynamics: every route is the one
-        # of the same solver built without the flag, apart from the reason.
+        # Without the held-tree owner there is no compact diagonal, which only it evaluates, so no group to
+        # branch: every route is the one of the same solver built without the flag.
         declined = recipe_solver(model, scalar=True, cached_dynamics="off")
         self.assertIsNone(declined._scalar_branches)
+        self.assertIsNone(declined._compact_diagonal_mass_size)
         routes = declined.get_path_selection()["routes"]
         self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("did not take them", routes["held_tree"]["scalar_branches"]["reason"])
+        self.assertIn("No diagonal-mass group", routes["held_tree"]["scalar_branches"]["reason"])
         plain = recipe_solver(model, scalar=False, cached_dynamics="off").get_path_selection()["routes"]
-        for record in (routes, plain):
-            del record["held_tree"]["scalar_branches"]["reason"]
         self.assertEqual(routes, plain)
 
 

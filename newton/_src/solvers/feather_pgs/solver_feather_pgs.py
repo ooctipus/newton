@@ -162,7 +162,6 @@ from .kernels import (
     scatter_qdd_from_groups,
     snapshot_contact_warmstart,
     snapshot_dense_phase_bound,
-    solve_compact_diagonal_mass,
     solve_diagonal_mass,
     trisolve_loop,
     update_body_qd_from_featherstone,
@@ -243,7 +242,6 @@ from .sparse_mass_matrix import (
     _SparseRowSupport,
     factor_indices,
     row_supports,
-    solve_sparse_mass_matrix,
 )
 from .staging import STATIC_SHARED_BYTES, arch_budget
 from .step_plan import AdmissionFacts, StepPlan, first_failed
@@ -258,7 +256,6 @@ from .tree_passes import (
     DynamicsData,
     composite_inertia,
     crba_fill,
-    diagonal_inverse_mass,
     fk_id,
     inverse_dynamics_tau,
     refresh_body_inertia,
@@ -1021,6 +1018,7 @@ class SolverFeatherPGS(SolverBase):
             delassus_kernel: Dense Delassus assembly kernel; explicit choices require split mode.
             sparse_mass_matrix: Experimental native sparse factors: ``auto`` retains topology/resource
                 admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
+                Only the held-tree owner evaluates them, so ``cached_dynamics='off'`` keeps the ordinary one.
                 Compatible split sweeps and velocity limits compose automatically.
                 Legacy sparse-composition opt-outs apply to ``auto``; ``on`` overrides those gates.
                 This option does not enable research packed-factor owners. Incompatible forced choices
@@ -2004,17 +2002,52 @@ class SolverFeatherPGS(SolverBase):
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
         self._setup_fused_diagonal_joint_limits(model)
+        # Owners and consumers that neither write friction rows nor project
+        # friction without the linked normal ring serve point and patch
+        # friction. Producers that write their own friction rows stay
+        # point-only until they write the patch row law. Defined before route
+        # selection so admission can read both.
+        self._law_agnostic_contact_paths = not (self._contact_torsion_enabled or self.contact_compliance)
+        # The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
+        # on CUDA without gradients wherever each coordinate has one owning drive row. The held tree's admission,
+        # which the representations only it evaluates (the compact diagonal, the native sparse factor) read before
+        # they are chosen, needs them; ordinary dynamics drop them once the held tree declines (below) and evaluate
+        # drives with the joint forces, as on the CPU.
+        self._setup_parallel_augmented_drive_topology(
+            model,
+            model.device.is_cuda
+            and not model.requires_grad
+            and self.drive_mode == "augmented"
+            and self.articulation_max_dofs > 0,
+        )
+        # The switch is read here, at construction, like the environment record.
+        self._scalar_branches_requested = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
+        from . import held_tree  # noqa: PLC0415
+        from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
+
         # The sparse owner does not solve the appended torsion row.
         sparse_diagonal_pair = (
             None
             if self._contact_torsion_enabled or self._explicit_dense_kernels
             else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
+        held = None
+        if sparse_diagonal_pair is not None:
+            # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
+            # the dense groups with it, the diagonal group as scalar branches or a held family.
+            scalar, _ = plan_scalar_branches(
+                self, requested=self._scalar_branches_requested, size=sparse_diagonal_pair[0]
+            )
+            held = held_tree.compact_decline(self, sparse_diagonal_pair[0], scalar=scalar is not None)
+            if held is not None:
+                sparse_diagonal_pair = None
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
         if self._contact_torsion_enabled or self._explicit_dense_kernels:
             self._sparse_diagonal_reason = (
                 "Contact torsion or an explicit dense kernel choice keeps the general response."
             )
+        elif held is not None:
+            self._sparse_diagonal_reason = f"Only the held tree evaluates the compact diagonal. {held}"
         elif sparse_diagonal_pair is None:
             self._sparse_diagonal_reason = (
                 "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
@@ -2260,12 +2293,6 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = self._arrays.placeholder(wp.float32, (1, 1), 1.0)
-        # Owners and consumers that neither write friction rows nor project
-        # friction without the linked normal ring serve point and patch
-        # friction. Producers that write their own friction rows stay
-        # point-only until they write the patch row law. Defined before route
-        # selection so admission can read both.
-        self._law_agnostic_contact_paths = not (self._contact_torsion_enabled or self.contact_compliance)
         self._point_contact_paths = self._law_agnostic_contact_paths and not self._friction_anchors_enabled
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
         # ring and keyed rows write the patch row law, so both can serve point and patch
@@ -2282,24 +2309,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._jy_world_aliased = False
         self._allocate_common_buffers(model)
-        # The per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics) on CUDA
-        # without gradients wherever each coordinate has one owning drive row: the held tree, the sparse factor and
-        # the compact diagonal read them. Ordinary dynamics on dense factors drop them once the held tree declines
-        # (below) and evaluate drives with the joint forces, as on the CPU.
-        self._setup_parallel_augmented_drive_topology(
-            model,
-            model.device.is_cuda
-            and not model.requires_grad
-            and self.drive_mode == "augmented"
-            and self.articulation_max_dofs > 0,
-        )
-        if self._sparse_diagonal_contact_solve and not self._parallel_augmented_drive_topology:
-            raise RuntimeError("sparse diagonal response requires owned augmented-drive topology")
-        self._compact_diagonal_mass_size = (
-            self._sparse_diagonal_response_size
-            if self._sparse_diagonal_contact_solve and self._parallel_augmented_drive_topology
-            else None
-        )
+        self._compact_diagonal_mass_size = self._sparse_diagonal_response_size
         self._row_watermark = bool(row_watermark)
         self._setup_sparse_mass_matrix(model)
         if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
@@ -2565,13 +2575,9 @@ class SolverFeatherPGS(SolverBase):
 
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
-        # then publishes. The owner is decided below; if it declines, ordinary
-        # dynamics runs the group. The switch, on unless =0, is read here, at
-        # construction, like the environment record.
-        from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
-
+        # then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
-            self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
+            self, requested=self._scalar_branches_requested
         )
 
         # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
@@ -2592,32 +2598,15 @@ class SolverFeatherPGS(SolverBase):
         self._compact_contact_boundary = declined is None
         self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
 
-        from .held_tree import install as install_held_tree  # noqa: PLC0415
-
-        install_held_tree(self)
-        # Ordinary dynamics on dense factors take the CPU's drive pass and layout (_stage1_drives: the joint forces
-        # and the drives in one launch, K added after the assembly); the per-coordinate drive rows stay where the
-        # held tree, the sparse factor or the compact diagonal reads them. use_parallel_streams overlaps their
-        # preparation with FK/ID on a stream of its own.
-        readers = (self._tree_kinetic_state, self._sparse_mass_matrix_size, self._compact_diagonal_mass_size)
-        if all(reader is None for reader in readers):
+        held_tree.install(self)
+        # Ordinary dynamics take the CPU's drive pass and layout (_stage1_drives: the joint forces and the drives in
+        # one launch, K added after the assembly); the per-coordinate drive rows are the held tree's.
+        # use_parallel_streams overlaps their preparation with FK/ID on a stream of its own.
+        if self._tree_kinetic_state is None:
             self._parallel_augmented_drive_topology = False
         self._articulation_dynamics_stream = (
             wp.Stream(model.device) if self._parallel_augmented_drive_topology and self.use_parallel_streams else None
         )
-        if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
-            self._scalar_branches = None
-            if self._tree_kinetic_state is None:
-                self._scalar_branches_reason = (
-                    f"The held-tree owner did not take them ({self._cached_dynamics_selection_reason}); "
-                    "ordinary dynamics runs them."
-                )
-            else:
-                # Today no other cached owner admits a sparse-diagonal response, so this branch is defensive.
-                self._scalar_branches_reason = (
-                    "A cached owner without scalar branches took these worlds: "
-                    f"{self._cached_dynamics_selection_reason}"
-                )
 
         # Worlds whose every candidate row separates at the predictor skip row
         # allocation entirely (resolved_worlds.py); the mask is empty when the
@@ -4180,6 +4169,13 @@ class SolverFeatherPGS(SolverBase):
         if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
             self._sparse_selection_reason = "Topology has no usable sparse factor layout for this row policy."
             return
+        # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
+        from . import held_tree  # noqa: PLC0415
+
+        held = held_tree.sparse_decline(self, size, plan, velocity_limits=velocity_candidate, split=split_candidate)
+        if held is not None:
+            self._sparse_selection_reason = f"Only the held tree evaluates native sparse factors. {held}"
+            return
 
         if split_candidate:
             self._compute_world_response_dof_mapping(model)
@@ -4285,7 +4281,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_plan = plan
         self._sparse_mass_matrix_indices = factor_indices(plan, model.device)
         self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
-        self._arrays.allocate(SPARSE_FACTOR, group=self.n_arts_by_size[size], nonzero=plan.nonzero_count, size=size)
+        self._arrays.allocate(SPARSE_FACTOR, group=self.n_arts_by_size[size], nonzero=plan.nonzero_count)
         shape = (self.world_count, self.dense_max_constraints, max_support)
         offsets = self.articulation_world_dof_offset.numpy()
         if (
@@ -4364,9 +4360,6 @@ class SolverFeatherPGS(SolverBase):
         # free rigid bodies.
         self._sparse_row_free_response = self._arrays.placeholder(wp.float32, (1, 1, 1))
         self._sparse_free_factor_dummy = self._arrays.placeholder(wp.float32, (1, 6, 6))
-        self._crba_sparse_factor_kernel = response_builds_rows.sparse_factor_kernel(
-            size, plan.nonzero_count, warps_per_block=self._sparse_factor_warps_per_block
-        )
         self._sparse_contact_lanes = 8
         self._sparse_contact_response_kernel = response_builds_rows.factor_contact_rows_kernel(
             size,
@@ -4849,17 +4842,15 @@ class SolverFeatherPGS(SolverBase):
 
         arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
 
-        max_dofs = self.articulation_max_dofs
-        if max_dofs == 0:
-            return
-        arrays.allocate(
-            AUGMENTED_DRIVE_ROWS,
-            articulation=model.articulation_count,
-            drive_row=model.articulation_count * max_dofs,
-        )
-
     def _setup_parallel_augmented_drive_topology(self, model, eligible: bool) -> None:
-        """Separate immutable augmented-drive row ownership from per-step coefficients, where ``eligible``."""
+        """Allocate the augmented drive rows and separate immutable per-coordinate row ownership from per-step
+        coefficients, where ``eligible``."""
+        if model.articulation_count and model.joint_count and self.articulation_max_dofs:
+            self._arrays.allocate(
+                AUGMENTED_DRIVE_ROWS,
+                articulation=model.articulation_count,
+                drive_row=model.articulation_count * self.articulation_max_dofs,
+            )
         self._parallel_augmented_drive_topology = False
         self._augmented_drive_row_by_dof = wp.full(
             (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
@@ -7511,7 +7502,6 @@ class SolverFeatherPGS(SolverBase):
         """
         arrays = self._arrays
         values.setdefault("write_inertia_records", 0)
-        values.setdefault("add_existing_tau", 0)
         if state is None:
             for name in ("joint_q", "joint_qd"):
                 values.setdefault(name, arrays.placeholder(wp.float32))
@@ -7633,16 +7623,13 @@ class SolverFeatherPGS(SolverBase):
                 )
         return None if dynamics_stream is None else dynamics_stream.record_event()
 
-    def _launch_rigid_tau(
-        self, state_in: State, state_aug: State, control: Control, *, add_to_existing: bool = False
-    ) -> None:
+    def _launch_rigid_tau(self, state_in: State, state_aug: State, control: Control) -> None:
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
-        dynamics = self._dynamics(state_in, state_aug, control, add_existing_tau=int(add_to_existing))
         wp.launch(
             inverse_dynamics_tau,
             dim=model.articulation_count,
-            inputs=[dynamics],
+            inputs=[self._dynamics(state_in, state_aug, control)],
             block_dim=SERIAL_BLOCK_DIM,
             device=model.device,
         )
@@ -7655,25 +7642,13 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         drive_rows_ready: wp.Event | None,
     ) -> wp.Event | None:
-        """Complete ``joint_tau``: the CPU's one pass of joint forces and drives, or inverse dynamics added onto
-        the per-coordinate drives (the sparse factor and the compact diagonal under ordinary dynamics)."""
+        """Complete ``joint_tau``: the CPU's one pass of joint forces and drives, or the held tree's drives."""
         if getattr(self, "_tree_kinetic_state", None) is not None:
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
-        if not self._parallel_augmented_drive_topology:
-            self._stage1_drives(state_in, state_aug, control, dt)
-            return None
-
-        model = self.model
-        dynamics_stream = self._articulation_dynamics_stream
-        if dynamics_stream is None:
-            self._launch_rigid_tau(state_in, state_aug, control, add_to_existing=True)
-            return None
-        dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
-        with wp.ScopedStream(dynamics_stream, sync_enter=False):
-            self._launch_rigid_tau(state_in, state_aug, control, add_to_existing=True)
-        return dynamics_stream.record_event()
+        self._stage1_drives(state_in, state_aug, control, dt)
+        return None
 
     def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
         """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
@@ -7773,10 +7748,6 @@ class SolverFeatherPGS(SolverBase):
                 refresh_body_inertia, dim=model.joint_count, inputs=[dynamics], block_dim=128, device=model.device
             )
 
-        # The per-coordinate drives' coefficients, prepared on the dynamics stream, before any mass write reads them.
-        if drive_rows_ready is not None:
-            wp.get_stream(model.device).wait_event(drive_rows_ready)
-
         # The composite inertia of the articulations the mass mask selects.
         wp.launch(
             composite_inertia,
@@ -7798,46 +7769,6 @@ class SolverFeatherPGS(SolverBase):
         # the per-step memset.
         for size in self.size_groups:
             n_arts = self.n_arts_by_size[size]
-            if size == self._sparse_mass_matrix_size:
-                wp.launch(
-                    self._crba_sparse_factor_kernel,
-                    dim=n_arts * 32,
-                    inputs=[
-                        self.group_to_art[size],
-                        self.mass_update_mask,
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        model.joint_child,
-                        state_aug.joint_S_s,
-                        self.body_I_c,
-                        self.R_by_size[size],
-                        1,
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                        self._sparse_mass_matrix_indices,
-                    ],
-                    outputs=[self._sparse_Linv, self._sparse_mass_matrix_status],
-                    block_dim=32 * self._sparse_factor_warps_per_block,
-                    device=model.device,
-                )
-                continue
-            if size == self._compact_diagonal_mass_size:
-                wp.launch(
-                    diagonal_inverse_mass,
-                    dim=n_arts * size,
-                    inputs=[
-                        dynamics,
-                        self.body_I_c,
-                        self.group_to_art[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self.R_by_size[size],
-                        size,
-                    ],
-                    outputs=[self._diagonal_inverse_mass],
-                    device=model.device,
-                    block_dim=128,
-                )
-                continue
             if self._H_bufs is None and global_flag:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
@@ -7853,7 +7784,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
                 block_dim=128,
             )
-            # K after the assembly, through the rows of either drive layout.
+            # K after the assembly.
             wp.launch(
                 apply_augmented_mass_diagonal_grouped,
                 dim=n_arts,
@@ -8046,33 +7977,12 @@ class SolverFeatherPGS(SolverBase):
     def _stage3_trisolve(self, size: int, state_aug: State) -> None:
         """Solve one size's unconstrained acceleration along the plan's stage-3 route."""
         route = self._plan.trisolve[size].name
-        if route == "sparse":
-            self._stage3_trisolve_sparse(size, state_aug)
-        elif route == "compact_diagonal":
-            self._stage3_trisolve_compact_diagonal(size, state_aug)
-        elif route == "diagonal":
+        if route == "diagonal":
             self._stage3_trisolve_diagonal(size, state_aug)
         elif route == "tiles":
             self._stage3_trisolve_tiled(size, state_aug)
         else:
             self._stage3_trisolve_loop(size, state_aug)
-
-    def _stage3_trisolve_sparse(self, size: int, state_aug: State) -> None:
-        """Apply the native sparse factors' inverse to joint forces, a warp per articulation."""
-        wp.launch(
-            solve_sparse_mass_matrix,
-            dim=self.n_arts_by_size[size] * 32,
-            inputs=[
-                self.group_to_art[size],
-                self.articulation_dof_start,
-                self._sparse_mass_matrix_indices,
-                self._sparse_Linv,
-                state_aug.joint_tau,
-            ],
-            outputs=[self._sparse_mass_matrix_scratch, state_aug.joint_qdd],
-            block_dim=128,
-            device=self.model.device,
-        )
 
     def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
         """Apply a diagonal generalized inertia inverse to joint forces."""
@@ -8081,22 +7991,6 @@ class SolverFeatherPGS(SolverBase):
             dim=self.n_arts_by_size[size] * size,
             inputs=[
                 self.L_by_size[size],
-                self.group_to_art[size],
-                self.articulation_dof_start,
-                size,
-                state_aug.joint_tau,
-            ],
-            outputs=[state_aug.joint_qdd],
-            device=self.model.device,
-        )
-
-    def _stage3_trisolve_compact_diagonal(self, size: int, state_aug: State) -> None:
-        """Apply a directly stored diagonal inverse without grouped mass storage."""
-        wp.launch(
-            solve_compact_diagonal_mass,
-            dim=self.n_arts_by_size[size] * size,
-            inputs=[
-                self._diagonal_inverse_mass,
                 self.group_to_art[size],
                 self.articulation_dof_start,
                 size,
