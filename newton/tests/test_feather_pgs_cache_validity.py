@@ -1755,13 +1755,11 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
     def test_unread_sizes_follow_the_factor_routes(self):
         """Report exactly the sizes stage 2 factors without reading a dense mass matrix, under an owner.
 
-        The step plan routes a compact size and the sizes with a fused CRBA-Cholesky kernel to no
-        factorization, and a diagonal size and a tiled or loop size without its fused kernel to one
-        that reads H. ``unread_mass_sizes`` lists the first kind.
+        Without an owner the step plan routes a compact size to no factorization and a diagonal, tiled or loop
+        size to one that reads H; under the held tree every size but the compact one takes the held refresh.
+        ``unread_mass_sizes`` lists the sizes no stage-2 route reads H for, under an owner.
         """
         sizes = (2, 4, 6, 18, 24, 25)
-        fused_tiled = {24}
-        fused_warp = {6, 25}
 
         def opaque():
             return {size: object() for size in sizes}
@@ -1770,6 +1768,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             size_groups=list(sizes),
             _compact_diagonal_mass_size=2,
             _sparse_mass_matrix_size=None,
+            _tree_kinetic_state=None,
             _execution_plan=SimpleNamespace(
                 use_diagonal_mass=lambda size: size == 4,
                 use_tiled_cholesky=lambda size: size >= 20,
@@ -1777,8 +1776,6 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             ),
             _kernel_choice_reasons={"cholesky_kernel": "Automatic selection."},
             _sparse_selection_reason="No sparse factors.",
-            _crba_cholesky_kernels_by_size={size: object() if size in fused_tiled else None for size in sizes},
-            _crba_cholesky_warp_kernels_by_size={size: object() if size in fused_warp else None for size in sizes},
             _cholesky_kernels_by_size=opaque(),
             _paired_response_primary_size=None,
             _paired_factor_coordinates=False,
@@ -1791,12 +1788,18 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             L_by_size=opaque(),
             group_to_art=opaque(),
         )
+        solver._tree_kinetic_state = object()
+        held = step_plan._factor(solver)
+        self.assertEqual(
+            {size: route.name for size, route in held.items()}, {2: "none", **dict.fromkeys(sizes[1:], "held")}
+        )
+        self.assertEqual(step_plan._unread_mass_sizes(held, held=True), sizes)
+        solver._tree_kinetic_state = None
         routes = step_plan._factor(solver)
         self.assertEqual(
             {size: route.name for size, route in routes.items()},
-            {2: "none", 4: "diagonal", 6: "crba_warps", 18: "loop", 24: "crba_tiles", 25: "tiles"},
+            {2: "none", 4: "diagonal", 6: "loop", 18: "loop", 24: "tiles", 25: "tiles"},
         )
-        self.assertEqual(step_plan._unread_mass_sizes(routes, held=True), (2, 6, 24))
         self.assertEqual(step_plan._unread_mass_sizes(routes, held=False), ())
         solver._plan = SimpleNamespace(factor=routes)
         for name in ("_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):

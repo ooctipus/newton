@@ -114,20 +114,11 @@ def decline(solver) -> str | None:
     if sparse:
         return "The double buffer keeps the ordinary dynamics." if solver._double_buffer else None
     # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32
-    # coordinates) into the solver's dense factor of the same shape; a diagonal-mass size keeps its compact
-    # inverse. The solver's own factor stage must be fused into its CRBA stage for the size (warp or tiled
-    # kernel), which the owner's refresh replaces; otherwise stage 2 would refactor the held L from an
-    # unbuilt H.
+    # coordinates) into the solver's dense factor of the same shape, in place of the size's stage-2 factor; the
+    # compact diagonal size keeps its compact inverse.
     for size in solver.size_groups:
-        if size != solver._compact_diagonal_mass_size and not (
-            1 <= size <= 32
-            and not solver._execution_plan.use_diagonal_mass(size)
-            and (
-                solver._crba_cholesky_warp_kernels_by_size.get(size) is not None
-                or solver._crba_cholesky_kernels_by_size.get(size) is not None
-            )
-        ):
-            return f"Size {size} has no fused held Cholesky family."
+        if size != solver._compact_diagonal_mass_size and size > 32:
+            return f"Size {size} has no held Cholesky family (1 to 32 coordinates)."
     return None
 
 
@@ -267,10 +258,7 @@ class TreeHeldOperator:
         else:
             self.data.lower = solver.L_by_size[size]
             self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
-            self.refresh_kernel = factor_warps_kernel(
-                size, geometric=True, geometric_index=tuple(map(int, physical_index.ravel()))
-            )
-            self.factor_offsets = wp.zeros(size, dtype=int, device=device)
+            self.refresh_kernel = factor_warps_kernel(size, tuple(map(int, physical_index.ravel())))
             self.factor_schedule = wp.array(
                 [row * size + col for row in range(size) for col in range(row + 1)], dtype=int, device=device
             )
@@ -304,17 +292,11 @@ class TreeHeldOperator:
                 dim=solver.n_arts_by_size[size] * 32,
                 inputs=[
                     solver.n_arts_by_size[size],
-                    solver.model.articulation_start,
                     solver.articulation_dof_start,
                     solver.mass_update_mask,
-                    solver.model.joint_child,
-                    state_aug.joint_S_s,
-                    solver.body_I_c,
                     self.plan.group_to_art,
                     solver.R_by_size[size],
-                    self.factor_offsets,
                     self.factor_schedule,
-                    1,
                     solver._augmented_drive_row_by_dof,
                     solver.aug_row_K,
                     self.kinetic_state.geometric,
@@ -495,7 +477,6 @@ class ForestHeldOperator:
                         family,
                         _diagonal_geometry,
                         None,
-                        None,
                         wp.array(np.diag(block).astype(np.int32), dtype=int, device=device),
                         wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                     )
@@ -513,12 +494,10 @@ class ForestHeldOperator:
                     family,
                     factor_warps_kernel(
                         family,
-                        geometric=True,
-                        geometric_index=tuple(map(int, block.ravel())),
+                        tuple(map(int, block.ravel())),
                         geometric_stride=self.layout.entries,
                         geometric_group=True,
                     ),
-                    wp.zeros(family, dtype=int, device=device),
                     wp.array(
                         [row * family + col for row in range(family) for col in range(row + 1)],
                         dtype=int,
@@ -540,7 +519,7 @@ class ForestHeldOperator:
     def refresh(self, state_aug):
         """Refresh every root family's dense factor from the forest geometry."""
         solver = self.solver
-        for _r, family, kernel, offsets, schedule, geometry_index, geometry_group in self.families:
+        for _r, family, kernel, schedule, geometry_index, geometry_group in self.families:
             if family < 0:
                 size = -family
                 wp.launch(
@@ -567,17 +546,11 @@ class ForestHeldOperator:
                 dim=solver.n_arts_by_size[family] * 32,
                 inputs=[
                     solver.n_arts_by_size[family],
-                    solver.model.articulation_start,
                     solver.articulation_dof_start,
                     solver.mass_update_mask,
-                    solver.model.joint_child,
-                    state_aug.joint_S_s,
-                    solver.body_I_c,
                     solver.group_to_art[family],
                     solver.R_by_size[family],
-                    offsets,
                     schedule,
-                    1,
                     solver._augmented_drive_row_by_dof,
                     solver.aug_row_K,
                     self.kinetic_state.geometric,

@@ -108,8 +108,8 @@ class StepPlan:
     """The per-stage dispatch tables of one solver, built once by :meth:`build`."""
 
     factor: Mapping[int, Route]
-    """Stage 2, per size: ``none`` (no dense factor), ``diagonal``, ``tiles``, ``tiles_inverse`` (the paired
-    response's primary factor with its inverse), ``loop``, or ``crba_tiles`` / ``crba_warps`` (factored in stage 1)."""
+    """Stage 2, per size: ``none`` (no dense factor), ``held`` (the held tree refreshes the factor in stage 1),
+    ``diagonal``, ``tiles``, ``tiles_inverse`` (the paired response's primary factor with its inverse) or ``loop``."""
     trisolve: Mapping[int, Route]
     """Stage 3, per size: ``sparse``, ``compact_diagonal``, ``diagonal``, ``tiles`` or ``loop``; empty under a
     held-tree owner, whose predictor replaces the stage."""
@@ -200,23 +200,22 @@ def _route(solver, size: int, kernel: str, name: str, reason: str) -> Route:
 
 def _factor(solver) -> dict[int, Route]:
     plan = solver._execution_plan
+    held = solver._tree_kinetic_state is not None
     routes = {}
     for size in solver.size_groups:
         if size == solver._compact_diagonal_mass_size:
             route = "none", "The compact diagonal size stores its inverse mass directly; no dense factor."
         elif size == solver._sparse_mass_matrix_size:
             route = "none", solver._sparse_selection_reason
+        elif held:
+            route = "held", "The held tree refreshes the factor from its geometry in stage 1."
         elif plan.use_diagonal_mass(size):
             route = "diagonal", ""
         elif plan.use_tiled_cholesky(size):
-            if solver._crba_cholesky_kernels_by_size[size] is not None:
-                route = "crba_tiles", "Stage 1 assembles and factors the mass matrix in one tile per articulation."
-            elif size == solver._paired_response_primary_size and not solver._paired_factor_coordinates:
+            if size == solver._paired_response_primary_size and not solver._paired_factor_coordinates:
                 route = "tiles_inverse", "The paired response's primary factor also materializes its inverse."
             else:
                 route = "tiles", ""
-        elif solver._crba_cholesky_warp_kernels_by_size[size] is not None:
-            route = "crba_warps", "Stage 1 assembles and factors the mass matrix in one warp per articulation."
         else:
             route = "loop", ""
         routes[size] = _route(solver, size, "cholesky_kernel", *route)

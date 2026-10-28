@@ -297,7 +297,6 @@ _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
-_FACTOR_DENSE_MAX_DOF = 64
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
 # A persistent queue avoids launching one expensive general-solver block for
 # every mostly local world. Eight blocks per SM preserves general-only latency.
@@ -3953,9 +3952,7 @@ class SolverFeatherPGS(SolverBase):
 
     def _setup_crba_topology_schedules(self, model) -> None:
         """Build immutable mass-matrix schedules for topology-homogeneous size groups."""
-        self._crba_source_dof_by_size = {}
         self._crba_dof_joint_offset_by_size = {}
-        self._crba_lower_schedule_by_size = {}
         diagonal_mass_sizes: set[int] = set()
         direct_diagonal_inertia_sizes: set[int] = set()
         self._diagonal_mass_sizes = frozenset()
@@ -4019,14 +4016,6 @@ class SolverFeatherPGS(SolverBase):
                         direct_diagonal_inertia_sizes.add(int(size))
                 self._crba_dof_joint_offset_by_size[int(size)] = wp.array(
                     reference_offsets, dtype=wp.int32, device=model.device
-                )
-                self._crba_source_dof_by_size[int(size)] = wp.array(sources, dtype=wp.int32, device=model.device)
-                rows, cols = np.tril_indices(int(size))
-                source = sources[rows, cols]
-                projection = np.where(source == cols, rows, cols)
-                lower_schedule = rows * int(size) + cols | (source + 1) << 8 | projection << 16
-                self._crba_lower_schedule_by_size[int(size)] = wp.array(
-                    lower_schedule.astype(np.int32), dtype=wp.int32, device=model.device
                 )
 
         self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
@@ -4165,7 +4154,7 @@ class SolverFeatherPGS(SolverBase):
             return
         size = int(sizes[0])
         # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
-        if size > 64 or size not in self._crba_source_dof_by_size or size in self._diagonal_mass_sizes:
+        if size > 64 or size not in self._crba_dof_joint_offset_by_size or size in self._diagonal_mass_sizes:
             self._sparse_selection_reason = (
                 "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
             )
@@ -5277,61 +5266,15 @@ class SolverFeatherPGS(SolverBase):
             self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
-        """Build the factor kernels per size (whose fusion the held-tree owner's admission reads) and the sweeps.
+        """Build the paired response's inverse kernels and the sweeps.
 
-        The stage-3 and stage-4 kernels follow the step plan (:meth:`_build_stage_kernels`).
+        The factor, stage-3 and stage-4 kernels follow the step plan (:meth:`_build_stage_kernels`).
         """
         device_arch = model.device.arch
-        self._cholesky_kernels_by_size = {}
-        self._crba_cholesky_kernels_by_size = {}
-        self._crba_cholesky_warp_kernels_by_size = {}
         self._inverse_cholesky_kernels_by_size = {}
         self._inverse_cholesky_lower_kernels_by_size = {}
 
         for size in self.size_groups:
-            compact_diagonal_mass = size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size)
-            use_diagonal_mass = self._execution_plan.use_diagonal_mass(size)
-            use_tiled_cholesky = self._execution_plan.use_tiled_cholesky(size)
-            fuse_crba_cholesky = bool(
-                model.device.is_cuda
-                and not model.requires_grad
-                and self._parallel_augmented_drive_topology
-                and not compact_diagonal_mass
-                and use_tiled_cholesky
-                and size <= _FACTOR_DENSE_MAX_DOF
-                and size in self._crba_source_dof_by_size
-                and (size != self._paired_response_primary_size or self._paired_factor_coordinates)
-            )
-            fuse_crba_cholesky_warp = bool(
-                model.device.is_cuda
-                and not model.requires_grad
-                and self._parallel_augmented_drive_topology
-                and not compact_diagonal_mass
-                and self.cholesky_kernel == "auto"
-                and not use_diagonal_mass
-                and size <= self.small_dof_threshold
-                and size in self._crba_source_dof_by_size
-                and size in self._crba_lower_schedule_by_size
-                and (size != self._paired_response_primary_size or self._paired_factor_coordinates)
-            )
-            self._crba_cholesky_kernels_by_size[size] = (
-                response_builds_dense.factor_tiles_kernel(size, self.tile_threads, assembly="crba")
-                if fuse_crba_cholesky
-                else None
-            )
-            self._crba_cholesky_warp_kernels_by_size[size] = (
-                response_builds_dense.factor_warps_kernel(size, warps_per_block=_CRBA_CHOLESKY_WARPS_PER_BLOCK)
-                if fuse_crba_cholesky_warp
-                else None
-            )
-            self._cholesky_kernels_by_size[size] = (
-                response_builds_dense.factor_tiles_kernel(size, self.tile_threads)
-                if use_tiled_cholesky
-                and not compact_diagonal_mass
-                and not fuse_crba_cholesky
-                and (size != self._paired_response_primary_size or self._paired_factor_coordinates)
-                else None
-            )
             self._inverse_cholesky_kernels_by_size[size] = (
                 response_builds_dense.inverse_lanes_kernel(size)
                 if size == self._paired_response_secondary_size and not self._paired_factor_coordinates
@@ -7967,57 +7910,6 @@ class SolverFeatherPGS(SolverBase):
                     block_dim=128,
                 )
                 continue
-            fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
-            if fused_crba_cholesky_warp is not None:
-                wp.launch(
-                    fused_crba_cholesky_warp,
-                    dim=n_arts * 32,
-                    inputs=[
-                        n_arts,
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.mass_update_mask,
-                        model.joint_child,
-                        state_aug.joint_S_s,
-                        self._body_inertia_terms if size in self._free_body_inertia_sizes else self.body_I_c,
-                        self.group_to_art[size],
-                        self.R_by_size[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self._crba_lower_schedule_by_size[size],
-                        1,
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                    ],
-                    outputs=[self.L_by_size[size]],
-                    block_dim=_CRBA_CHOLESKY_WARPS_PER_BLOCK * 32,
-                    device=model.device,
-                )
-                continue
-            fused_crba_cholesky = self._crba_cholesky_kernels_by_size[size]
-            if fused_crba_cholesky is not None:
-                wp.launch_tiled(
-                    fused_crba_cholesky,
-                    dim=[n_arts],
-                    inputs=[
-                        model.articulation_start,
-                        self.articulation_dof_start,
-                        self.mass_update_mask,
-                        model.joint_child,
-                        state_aug.joint_S_s,
-                        self._body_inertia_terms if size in self._free_body_inertia_sizes else self.body_I_c,
-                        self.group_to_art[size],
-                        self.R_by_size[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self._crba_source_dof_by_size[size],
-                        1,
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                    ],
-                    outputs=[self.L_by_size[size]],
-                    block_dim=self.tile_threads,
-                    device=model.device,
-                )
-                continue
             if self._H_bufs is None and global_flag:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
@@ -8070,6 +7962,10 @@ class SolverFeatherPGS(SolverBase):
             entry = getattr(plan, stage).get(size)
             return entry is not None and entry.name == route
 
+        self._cholesky_kernels_by_size = {
+            size: response_builds_dense.factor_tiles_kernel(size, threads) if routed("factor", size, "tiles") else None
+            for size in sizes
+        }
         self._triangular_solve_kernels_by_size = {
             size: _get_triangular_solve_kernel(size, arch, threads) if routed("trisolve", size, "tiles") else None
             for size in sizes

@@ -325,8 +325,6 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             self.assertNotIn(size, getattr(solver, name))
         for name in (
             "_cholesky_kernels_by_size",
-            "_crba_cholesky_kernels_by_size",
-            "_crba_cholesky_warp_kernels_by_size",
             "_triangular_solve_kernels_by_size",
         ):
             self.assertIsNone(getattr(solver, name)[size])

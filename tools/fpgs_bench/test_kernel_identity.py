@@ -110,7 +110,7 @@ class TestKernelIdentity(unittest.TestCase):
         observed = {
             (
                 args[0],
-                kwargs.get("geometric_stride") or max(kwargs["geometric_index"].value) + 1,
+                kwargs.get("geometric_stride") or max(args[1].value) + 1,
                 kwargs.get("geometric_group", False),
             )
             for _, _, args, kwargs in identity.held_factor_calls()

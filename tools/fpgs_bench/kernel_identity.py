@@ -199,16 +199,14 @@ def factory_calls():
     lanes = _unwrapped(response_builds_dense.inverse_lanes_kernel)
     for size in (6, 9, 16):
         index = Named(f"range({size * size})", tuple(range(size * size)))
-        yield dense + "factor_warps_kernel", warps, (size,), {}
-        yield dense + "factor_warps_kernel", warps, (size,), {"geometric": True}
-        yield dense + "factor_warps_kernel", warps, (size,), {"geometric": True, "geometric_index": index}
+        yield dense + "factor_warps_kernel", warps, (size, index), {}
         yield (
             dense + "factor_warps_kernel",
             warps,
-            (size,),
-            {"geometric": True, "geometric_index": index, "geometric_stride": size * size + 1, "geometric_group": True},
+            (size, index),
+            {"geometric_stride": size * size + 1, "geometric_group": True},
         )
-        for kwargs in ({}, {"assembly": "crba"}, {"inverse": True}):
+        for kwargs in ({}, {"inverse": True}):
             yield dense + "factor_tiles_kernel", tiles, (size,), kwargs
         yield dense + "inverse_lanes_kernel", lanes, (size,), {}
         yield dense + "inverse_lanes_kernel", lanes, (size,), {"lower_only": True}
@@ -262,24 +260,15 @@ def held_factor_calls():
         physical = mass.physical_lookup
         if families is None:
             index = Named(f"{name}.index", tuple(map(int, physical.ravel())))
-            yield (
-                "response_builds_dense.factor_warps_kernel",
-                warps,
-                (mass.dof_count,),
-                {"geometric": True, "geometric_index": index},
-            )
+            yield "response_builds_dense.factor_warps_kernel", warps, (mass.dof_count, index), {}
             continue
         offsets = np.cumsum([0, *(sum(count for _, count in tree) for tree in trees[:-1])])
         for root, (family, offset) in enumerate(zip(families, offsets, strict=True)):
             if family:
                 block = physical[offset : offset + family, offset : offset + family]
-                kwargs = {
-                    "geometric": True,
-                    "geometric_index": Named(f"{name}.index[{root}]", tuple(map(int, block.ravel()))),
-                    "geometric_stride": mass.nonzero_count,
-                    "geometric_group": True,
-                }
-                yield "response_builds_dense.factor_warps_kernel", warps, (family,), kwargs
+                index = Named(f"{name}.index[{root}]", tuple(map(int, block.ravel())))
+                kwargs = {"geometric_stride": mass.nonzero_count, "geometric_group": True}
+                yield "response_builds_dense.factor_warps_kernel", warps, (family, index), kwargs
 
 
 def _schedules(layout, chain, reference=False):

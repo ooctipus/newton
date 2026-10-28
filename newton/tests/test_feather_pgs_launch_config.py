@@ -780,9 +780,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(solver._step % solver.update_mass_matrix_interval == 0)
         np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
-    def test_topology_owned_crba_matches_generic_trajectory(self):
-        """Match the generic mass pipeline (the CPU's) while fusing topology-known factorization on CUDA."""
+    @unittest.skipUnless(wp.is_cuda_available(), "the CUDA trajectory requires CUDA")
+    def test_cuda_ordinary_mass_pipeline_matches_cpu_trajectory(self):
+        """Run ordinary dynamics' mass pipeline on CUDA as on the CPU (a revolute root keeps the held tree out)."""
         model = _build_chain_model(num_links=3, num_worlds=2)
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         # Streams no longer choose the pipeline: the CPU runs the generic drive preparation and mass pipeline.
@@ -792,7 +792,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             dense_max_constraints=16,
         )
         self.assertTrue(optimized._parallel_augmented_drive_topology)
-        self.assertIsNotNone(optimized._crba_cholesky_warp_kernels_by_size[3])
+        self.assertIsNone(optimized._tree_kinetic_state)
+        self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
         self.assertFalse(reference._parallel_augmented_drive_topology)
 
         q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)
@@ -815,9 +816,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             trajectories.append(history)
 
         # The reference runs on the CPU, whose float order differs (velocities about 1e-5 relative after 5 steps).
-        for fused, generic in zip(*trajectories, strict=True):
-            np.testing.assert_allclose(fused[0], generic[0], rtol=0.0, atol=5.0e-6)
-            np.testing.assert_allclose(fused[1], generic[1], rtol=0.0, atol=5.0e-6)
+        for cuda, cpu in zip(*trajectories, strict=True):
+            np.testing.assert_allclose(cuda[0], cpu[0], rtol=0.0, atol=5.0e-6)
+            np.testing.assert_allclose(cuda[1], cpu[1], rtol=0.0, atol=5.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):

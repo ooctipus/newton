@@ -106,10 +106,10 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         self.assertIn("diag_tile", diagonal_names)
 
     def test_cholesky_and_triangular_kernels_are_not_dense_constraint_gated(self):
-        # The factor kernels (_init_tiled_kernels) and the plan's triangular-solve kernels (_build_stage_kernels)
-        # do not depend on the dense row capacity.
+        # The plan's factor and triangular-solve kernels (_build_stage_kernels) do not depend on the dense row
+        # capacity.
         for method, helper_name in (
-            ("_init_tiled_kernels", "factor_tiles_kernel"),
+            ("_build_stage_kernels", "factor_tiles_kernel"),
             ("_build_stage_kernels", "_get_triangular_solve_kernel"),
         ):
             with self.subTest(helper_name=helper_name):

@@ -46,9 +46,6 @@ def _held_tree_solver(law):
         _articulation_dynamics_stream=object(),
         _debug_buffers_enabled=False,
         _compact_diagonal_mass_size=None,
-        _execution_plan=SimpleNamespace(use_diagonal_mass=lambda size: False),
-        _crba_cholesky_warp_kernels_by_size={9: object()},
-        _crba_cholesky_kernels_by_size={},
     )
 
 

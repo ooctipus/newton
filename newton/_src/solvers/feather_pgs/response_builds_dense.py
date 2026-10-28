@@ -10,7 +10,7 @@ thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the data 
 dense kit:
 
 * :class:`.CholeskyFactor`: ``H + diag(R) = L L^T`` by columns on one thread (``factor`` over articulations, and
-  lane 0 of the warp-mapped factor that assembles ``H`` from the composite inertia);
+  lane 0 of the warp-mapped factor that assembles ``H`` from the held tree's geometry);
 * :class:`.CholeskySolve`: the triangular solves, with the zero-diagonal conventions as named options: a zero
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
   group, the register inverse), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
@@ -43,7 +43,6 @@ from .kernel_template import THREADS, Dispatch, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskyFactor, CholeskySolve, Vector
 from .row_packets import PrefixData, QueueData
-from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_apply, inertia_record, unpack_inertia
 from .staging import Buffer, Staging, static_budget
 
 __all__ = [
@@ -222,8 +221,8 @@ def factor_coordinates_kernel() -> wp.Kernel:
     return _kernel("dense_factor_coordinates", FACTOR_ABI, body)
 
 
-# A warp per articulation assembles H from the composite inertia (or reads held geometry) in shared memory, lane 0
-# factors it with the kit, and the lanes store the lower triangle. The diagonal rounds as (S F + R) + K.
+# A warp per articulation reads its H from the held tree's geometry into shared memory, lane 0 factors it with the
+# kit, and the lanes store the lower triangle. The diagonal rounds as (S F + R) + K.
 _WARP_FACTOR = """
     const int group = tid >> 5;
     if (group >= n_arts) return;
@@ -233,21 +232,18 @@ _WARP_FACTOR = """
 
 $STAGING
     const int dof_start = articulation_dof_start.data[articulation];
-$FORCE_INIT
     for (int schedule_index = LANE; schedule_index < $LOWER; schedule_index += STRIDE) {
-        const int packed = lower_schedule.data[schedule_index];
-        const int element = $ELEMENT;
+        const int element = lower_schedule.data[schedule_index];
         const int row = element / $DOFS;
         const int col = element - row * $DOFS;
-$MASS_INPUT
+        const int geometry_entry = geometry_lookup.data[element];
+        float value = geometry_entry < 0 ? 0.0f : geometric.data[$GEOMETRY_ROW * $GEOMETRY_STRIDE + geometry_entry];
         if (row == col) {
             value += R_group.data[group * $DOFS + row];
-            if (fused_augmented_drive != 0) {
-                const int drive_row = drive_row_by_dof.data[dof_start + row];
-                if (drive_row >= 0) {
-                    const float K = row_K.data[drive_row];
-                    if (K > 0.0f) value += K;
-                }
+            const int drive_row = drive_row_by_dof.data[dof_start + row];
+            if (drive_row >= 0) {
+                const float K = row_K.data[drive_row];
+                if (K > 0.0f) value += K;
             }
         }
         factor[element] = value;
@@ -268,211 +264,73 @@ $FACTOR
 #endif
 """
 
-_FORCE_INIT = """
-    if (LANE < $DOFS) {
-        const int joint = articulation_start.data[articulation] + dof_joint_offset.data[LANE];
-        const auto force = InertiaRecord::apply(body_I_c.data[joint_child.data[joint]].c, joint_S_s.data[dof_start + LANE]);
-        #pragma unroll
-        for (int component = 0; component < 6; ++component)
-            force_components[LANE * 6 + component] = force.c[component];
-    }
-    SYNC();
-"""
-
-_COMPOSITE_INPUT = """
-        const int source_code = (packed >> 8) & 255;
-        float value = 0.0f;
-        if (source_code != 0) {
-            const int source = source_code - 1;
-            const int projection = (packed >> 16) & 255;
-            const auto motion = joint_S_s.data[dof_start + projection];
-#pragma unroll
-            for (int component = 0; component < 6; ++component)
-                value += motion.c[component] * force_components[source * 6 + component];
-        }
-"""
-
 _WARP_FACTOR_INPUTS = (
     ("n_arts", int),
-    ("articulation_start", wp.array[int]),
     ("articulation_dof_start", wp.array[int]),
     ("mass_update_mask", wp.array[int]),
-    ("joint_child", wp.array[int]),
-    ("joint_S_s", wp.array[wp.spatial_vector]),
-    ("body_I_c", wp.array[inertia_record]),
     ("group_to_art", wp.array[int]),
     ("R_group", wp.array2d[float]),
-    ("dof_joint_offset", wp.array[int]),
     ("lower_schedule", wp.array[int]),
-    ("fused_augmented_drive", int),
     ("drive_row_by_dof", wp.array[int]),
     ("row_K", wp.array[float]),
+    ("geometric", wp.array2d[float]),
+    ("geometry_lookup", wp.array[int]),
 )
 
 
 @functools.cache
 def factor_warps_kernel(
-    size: int,
-    *,
-    warps_per_block: int = 4,
-    geometric: bool = False,
-    geometric_index=(),
-    geometric_stride: int = 0,
-    geometric_group: bool = False,
+    size: int, geometric_index, *, warps_per_block: int = 4, geometric_stride: int = 0, geometric_group: bool = False
 ) -> wp.Kernel:
-    """The factor, one warp per articulation (``dim = articulations * 32``), its mass matrix assembled in the
-    kernel: the composite-body products ``S F`` of the packed lower schedule, or held physical geometry
-    (``geometric``, a lookup of each entry with ``geometric_index``, rows of ``geometric_stride``, groups mapped to
-    geometry rows with ``geometric_group``), then ``R`` and the augmented drives' ``K`` on the diagonal; lane 0
-    factors with the kit (:class:`.CholeskyFactor`, unrolled), the lanes store the lower triangle.
+    """The held tree's factor, one warp per articulation (``dim = articulations * 32``): each lower entry of ``H``
+    read from the held geometry through ``geometric_index`` (the physical ``(row, col)`` entry's geometry slot, ``-1``
+    where structurally zero; rows of ``geometric_stride``, groups mapped to geometry rows with ``geometric_group``),
+    then ``R`` and the augmented drives' ``K`` on the diagonal; lane 0 factors with the kit (:class:`.CholeskyFactor`,
+    unrolled), the lanes store the lower triangle.
     """
     size, warps_per_block = int(size), int(warps_per_block)
-    limit = 32 if geometric_index else 16
-    if not 1 <= size <= limit or not 1 <= warps_per_block <= 32:
-        raise ValueError(f"Small Cholesky requires 1..{limit} DOFs and 1..32 warps per block")
-    if geometric_index and (not geometric or len(geometric_index) != size * size or min(geometric_index) < -1):
+    if not 1 <= size <= 32 or not 1 <= warps_per_block <= 32:
+        raise ValueError("Small Cholesky requires 1..32 DOFs and 1..32 warps per block")
+    if len(geometric_index) != size * size or min(geometric_index) < -1:
         raise ValueError("Geometric factor requires a complete physical matrix index")
-    if (geometric_stride or geometric_group) and not geometric_index:
-        raise ValueError("Geometry rows and groups require a physical matrix index")
     if geometric_stride and geometric_stride <= max(geometric_index):
         raise ValueError("Geometry stride must cover every indexed entry")
     elements = size * size
     inputs = list(_WARP_FACTOR_INPUTS)
-    if geometric:
-        inputs.append(("geometric", wp.array2d[float]))
-        mass_input = f"        float value = geometric.data[group * {elements} + element];"
-        if geometric_index:
-            inputs.append(("geometry_lookup", wp.array[int]))
-            row = "group"
-            if geometric_group:
-                inputs.append(("geometry_group", wp.array[int]))
-                row = "geometry_group.data[group]"
-            stride = geometric_stride or max(geometric_index) + 1
-            mass_input = (
-                "        const int geometry_entry=geometry_lookup.data[element];\n"
-                "        float value = geometry_entry < 0 ? 0.0f : "
-                f"geometric.data[{row} * {stride} + geometry_entry];"
-            )
-    else:
-        mass_input = _COMPOSITE_INPUT
+    row = "group"
+    if geometric_group:
+        inputs.append(("geometry_group", wp.array[int]))
+        row = "geometry_group.data[group]"
     inputs.append(("L_group", wp.array3d[float]))
-    buffers = [Buffer("factor", "float", elements)]
-    if not geometric:
-        buffers.append(Buffer("force_components", "float", size * 6))
-    staging = Staging(tuple(buffers), groups=warps_per_block, layout="arrays")
+    staging = Staging((Buffer("factor", "float", elements),), groups=warps_per_block, layout="arrays")
     factor = CholeskyFactor(size, lambda row, col: f"factor[{row} * {size} + {col}]", unroll=True)
     snippet = substitute(
         _WARP_FACTOR,
         DOFS=size,
         ELEMENTS=elements,
-        # A packed composite schedule keeps the element in its low byte; a geometric schedule above sixteen
-        # coordinates is a plain element list.
-        ELEMENT="packed & 255" if size <= 16 else "packed & 1023",
         LOWER=size * (size + 1) // 2,
         STAGING=staging.declarations(),
-        FORCE_INIT="" if geometric else substitute(_FORCE_INIT, DOFS=size),
-        MASS_INPUT=mass_input,
+        GEOMETRY_ROW=row,
+        GEOMETRY_STRIDE=geometric_stride or max(geometric_index) + 1,
         FACTOR=_indent(factor.factor(), "        "),
     )
     return KernelTemplate(
-        f"{'geometric_' if geometric else ''}dense_factor_warps{warps_per_block}_{size}",
+        f"geometric_dense_factor_warps{warps_per_block}_{size}",
         tuple(inputs),
         snippet,
         THREADS,
-        preludes=(lane_group(32),) if geometric else (lane_group(32), *SPATIAL.preludes(), INERTIA_RECORDS),
+        preludes=(lane_group(32),),
         native_name="factor_native",
     ).kernel()
 
 
-ASSEMBLIES = ("mass", "crba")
-"""Where a tiled factor's ``H`` comes from: the size group's mass matrices, or the composite inertia in the kernel."""
-
-
 @functools.cache
-def factor_tiles_kernel(
-    n_dofs: int, tile_threads: int = 64, *, assembly: str = "mass", inverse: bool = False
-) -> wp.Kernel:
+def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = False) -> wp.Kernel:
     """The factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
-    ``tile_cholesky(tile_diag_add(H, R))``, the primitive's rounding.
-
-    ``assembly`` ``"mass"`` loads ``H``; ``"crba"`` assembles it in a shared tile from the composite inertia, each
-    entry ``S_p . F_s`` and the drives' ``K`` on the diagonal, ``(S F + K) + R``. With ``inverse`` the factor also
-    materializes ``H^-1 = tile_cholesky_solve(L, I)``.
+    ``tile_cholesky(tile_diag_add(H, R))``, the primitive's rounding. With ``inverse`` the factor also materializes
+    ``H^-1 = tile_cholesky_solve(L, I)``.
     """
-    if assembly not in ASSEMBLIES:
-        raise ValueError(f"assembly must be one of {ASSEMBLIES}, got {assembly!r}")
-    if inverse and assembly != "mass":
-        raise ValueError("the tiled inverse factors a loaded mass matrix")
     dofs = wp.constant(int(n_dofs))
-    if assembly == "crba":
-        element_rounds = (int(n_dofs) * int(n_dofs) + int(tile_threads) - 1) // int(tile_threads)
-        tile_stride = wp.constant(int(tile_threads))
-
-        def crba_cholesky_template(
-            articulation_start: wp.array[int],
-            articulation_dof_start: wp.array[int],
-            mass_update_mask: wp.array[int],
-            joint_child: wp.array[int],
-            joint_S_s: wp.array[wp.spatial_vector],
-            body_I_c: wp.array[inertia_record],
-            group_to_art: wp.array[int],
-            R_group: wp.array2d[float],
-            dof_joint_offset: wp.array[int],
-            source_dof: wp.array2d[int],
-            fused_augmented_drive: int,
-            drive_row_by_dof: wp.array[int],
-            row_K: wp.array[float],
-            L_group: wp.array3d[float],
-        ):
-            group, lane = wp.tid()
-            art = group_to_art[group]
-            if mass_update_mask[art] == 0:
-                return
-
-            H_tile = wp.tile_zeros(shape=(dofs, dofs), dtype=wp.float32, storage="shared")
-            force_tile = wp.tile_zeros(shape=(dofs,), dtype=wp.spatial_vector, storage="shared")
-            dof_start = articulation_dof_start[art]
-            force = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            lane_has_dof = lane < dofs
-            if lane_has_dof:
-                joint = articulation_start[art] + dof_joint_offset[lane]
-                mass, moment, rotational = unpack_inertia(body_I_c[joint_child[joint]])
-                force = inertia_apply(mass, moment, rotational, joint_S_s[dof_start + lane])
-            wp.tile_scatter_masked(force_tile, lane, force, lane_has_dof)
-
-            # Every lane executes the same fixed number of cooperative scatters; the source map turns tree ancestry
-            # into direct indexing: H[row, col] projects the deeper coordinate's composite force on the ancestor's
-            # motion, or stays zero for unrelated branches.
-            for element_round in range(element_rounds):
-                element = lane + element_round * tile_stride
-                row = int(0)
-                col = int(0)
-                value = float(0.0)
-                has_value = element < dofs * dofs
-                if has_value:
-                    row = element // dofs
-                    col = element - row * dofs
-                    source = source_dof[row, col]
-                    has_value = source >= 0
-                    if has_value:
-                        projection = col
-                        if source == col:
-                            projection = row
-                        value = wp.dot(joint_S_s[dof_start + projection], wp.tile_extract(force_tile, source))
-                        if fused_augmented_drive != 0 and row == col:
-                            drive_row = drive_row_by_dof[dof_start + row]
-                            if drive_row >= 0:
-                                K = row_K[drive_row]
-                                if K > 0.0:
-                                    value += K
-                wp.tile_scatter_masked(H_tile, row, col, value, has_value)
-
-            armature = wp.tile_load(R_group[group], shape=(dofs,), bounds_check=False)
-            L_tile = wp.tile_cholesky(wp.tile_diag_add(H_tile, armature))
-            wp.tile_store(L_group[group], L_tile, bounds_check=False)
-
-        return python_kernel(crba_cholesky_template, f"dense_factor_tiles_crba_{int(n_dofs)}_bd{int(tile_threads)}")
-
     if inverse:
 
         def cholesky_inverse_tiled_template(
