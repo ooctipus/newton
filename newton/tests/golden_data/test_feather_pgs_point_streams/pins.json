@@ -193,7 +193,7 @@
   "row_packets.get_prefix_kernel(9, 1, 40)": "b7f20ab07eef1e04fb09dc993e8d4d0fcf06966673512a09a8c4197b43fb4d4c",
   "row_packets.materialize_fallback": "ce3b3ed384e5c13ef01283e600c373b61a5c7c01a52837e17cf6f30465ffe31d",
   "row_packets.materialize_general_prefix": "5169e9d04cee6ee88f73be751079c31471f2d00a603666280addf9a8808090c6",
-  "row_packets.produce_contacts": "cb623f30ec258f9d54d044b2bf1921f98161b98104bb7f1544f205277e9f92bb",
+  "row_packets.produce_contacts": "27cfd403291347b412ee05b2ddae5448d56b23c1b20c4bfa67bc640483e539ae",
   "scalar_branches.finish_prismatic_branches": "758751bafe95b65da737e647b694c13c902e8c304fdd53a8119585092b5febd8",
   "scalar_branches.predict_prismatic_branches": "a42796d52f01f2fc168bf344098aa584407e323695adbee4d0c945aae78a5c62",
   "scalar_branches.prepare_listed_augmented_drives": "09dbf6609575c6b9d3a1ebff6649cbeef512848771ccf03a1135b66192cf6923",

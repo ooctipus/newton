@@ -33,11 +33,9 @@ from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
     contact_friction_points,
-    contact_materials,
     contact_points,
     contact_row_frame,
     contact_tangent_basis,
-    prescribed_target,
 )
 from .device_preludes import (
     lane_group,
@@ -48,17 +46,13 @@ from .device_preludes import (
     warp_sync,
 )
 from .field_group import Field, FieldGroup, SolverArrays
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law, patch_tangent_row
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law
 from .kernel_template import KernelTemplate, substitute
-from .kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-)
+from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from .prefix_rows import LAW, limits, prefix_rows
-from .row_build import _contact_in_sizes, endpoint_projection, incident_projection, populate_contact_J
+from .row_build import _contact_in_sizes, endpoint_projection, populate_contact_J, write_contact_row
 from .row_inputs import CompactLocalRows, RowArgument
-from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
+from .row_laws import ROW_LAW
 from .step_plan import first_failed
 
 WARPS_PER_BLOCK = 4
@@ -348,7 +342,8 @@ def materialize_general_prefix(
 def produce_contacts(
     workers: int, data: ContactInput, law: PatchRowLaw, packet: ContactPacketData, primary: int, secondary: int
 ):
-    """Cooperatively project current contacts into physical packets after allocation.
+    """Cooperatively project current contacts into physical packets after allocation; a lane per row writes its
+    records and rhs (:func:`.row_build.write_contact_row`).
 
     Tangent rows act at the friction location and follow the row law that the compact producer shares
     (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): under persistent patches at the patch
@@ -377,11 +372,10 @@ def produce_contacts(
         normal = wp.vec3()
         point0 = wp.vec3()
         point1 = wp.vec3()
-        separation = float(0.0)
         tangent0 = wp.vec3()
         tangent1 = wp.vec3()
         if lane == 0:
-            normal, point0, point1, separation = contact_points(
+            normal, point0, point1, _phi = contact_points(
                 data.normal[contact],
                 data.point0[contact],
                 data.point1[contact],
@@ -417,61 +411,11 @@ def produce_contacts(
                 value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
                 packet.jacobian[world, output_row, coordinate] = value
         warp_sync()
-        if lane == 0:
-            mu, restitution = contact_materials(
-                data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
-            )
-            inv_dt = 1.0 / data.dt
-            for row in range(rows):
-                output_row = slot + row
-                direction, p0, p1 = contact_row_frame(
-                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-                )
-                target = prescribed_target(
-                    body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-                )
-                phi = separation
-                beta = data.beta
-                row_restitution = restitution
-                row_mu = mu
-                kind = int(PGS_CONSTRAINT_TYPE_CONTACT)
-                parent = int(-1)
-                rhs = -target
-                weight = float(1.0)
-                if row == 0:
-                    rhs, weight = contact_rhs(
-                        phi, beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
-                    )
-                    if restitution > 0.0:
-                        relative = incident_projection(data, body0, art0, p0, direction)
-                        relative -= incident_projection(data, body1, art1, p1, direction)
-                        relative -= target
-                        fires, bounce = contact_restitution_rhs(
-                            phi, relative, target, restitution, data.dt, data.restitution_threshold
-                        )
-                        if fires:
-                            rhs = bounce
-                            weight = 1.0
-                else:
-                    phi, beta, row_mu = patch_tangent_row(law, contact, row, mu, data.friction_scale)
-                    row_restitution = 0.0
-                    kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
-                    parent = slot
-                    rhs, _w = row_rhs(kind, phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
-                data.row_type[world, output_row] = kind
-                data.row_parent[world, output_row] = parent
-                data.row_mu[world, output_row] = row_mu
-                data.row_beta[world, output_row] = beta
-                data.row_cfm[world, output_row] = data.cfm
-                data.phi[world, output_row] = phi
-                data.target[world, output_row] = target
-                data.restitution[world, output_row] = row_restitution
-                data.rhs[world, output_row] = rhs
-                data.diag[world, output_row] = data.cfm
-                if data.contact_w < 1.0:
-                    data.row_w[world, output_row] = weight
-                if output_row < capacity:
-                    packet.row_contact[world, output_row] = contact * 3 + row
+        # A lane per row writes its records and rhs with the row law the owners share.
+        for row in range(lane, rows, stride):
+            write_contact_row(data, law, contact, row)
+            if slot + row < capacity:
+                packet.row_contact[world, slot + row] = contact * 3 + row
         warp_sync()
 
 
