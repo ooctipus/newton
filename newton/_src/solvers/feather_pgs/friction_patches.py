@@ -210,33 +210,35 @@ def _local_point(q: wp.array[wp.transform], body: int, point: wp.vec3):
     return result
 
 
+@wp.struct
+class _PatchContacts:
+    """The contacts a frame build reads and the gates it applies, which :func:`_prepare` and :func:`_prepare_frame`
+    share (the host's :meth:`_FrictionPatchState._prepare_inputs`)."""
+
+    shape0: wp.array[int]
+    shape1: wp.array[int]
+    point0: wp.array[wp.vec3]
+    point1: wp.array[wp.vec3]
+    normal: wp.array[wp.vec3]
+    margin0: wp.array[float]
+    margin1: wp.array[float]
+    shape_body: wp.array[int]
+    shape_mu: wp.array[float]
+    shape_gap: wp.array[float]
+    body_radius: wp.array[float]
+    q: wp.array[wp.transform]
+    body_to_articulation: wp.array[int]
+    is_free_rigid: wp.array[int]
+    contact_gap_gate: float
+    same_articulation_gap_gate: float
+    articulation_pair_gap_gate: float
+    friction_gap: float
+    friction_articulation_pairs_only: int
+    key_stride: int
+
+
 @wp.func
-def _prepare_contact_fields(
-    c: int,
-    live: int,
-    shape0: wp.array[int],
-    shape1: wp.array[int],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-    shape_body: wp.array[int],
-    shape_mu: wp.array[float],
-    shape_gap: wp.array[float],
-    body_radius: wp.array[float],
-    q: wp.array[wp.transform],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
-    contact_gap_gate: float,
-    same_articulation_gap_gate: float,
-    articulation_pair_gap_gate: float,
-    friction_gap: float,
-    friction_articulation_pairs_only: int,
-    key_stride: int,
-    frame: _PatchFrame,
-    patches: FrictionPatches,
-):
+def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches):
     """Prepare contact ``c``'s frame record, all but slot ``c``'s pair key and index; return the pair key.
 
     Past ``live`` the record is empty and the key the empty key. A build stores the key and the index in
@@ -253,40 +255,42 @@ def _prepare_contact_fields(
     patches.phi[c] = wp.vec2(0.0)
     if c >= live:
         return wp.int64(0x7FFFFFFFFFFFFFFF)
-    sa = shape0[c]
-    sb = shape1[c]
-    a, b = contact_bodies(sa, sb, shape_body)
+    sa = inputs.shape0[c]
+    sb = inputs.shape1[c]
+    a, b = contact_bodies(sa, sb, inputs.shape_body)
     ka = a + 1
     kb = b + 1
     if a < 0:
-        ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
+        ka = inputs.q.shape[0] + (sa if sa >= 0 else inputs.shape_body.shape[0]) + 1
     if b < 0:
-        kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
-    n, pa, pb, gap = contact_points(normal[c], point0[c], point1[c], margin0[c], margin1[c], a, b, q)
+        kb = inputs.q.shape[0] + (sb if sb >= 0 else inputs.shape_body.shape[0]) + 1
+    n, pa, pb, gap = contact_points(
+        inputs.normal[c], inputs.point0[c], inputs.point1[c], inputs.margin0[c], inputs.margin1[c], a, b, inputs.q
+    )
     art_a = int(-1)
     art_b = int(-1)
-    if a >= 0 and a < body_to_articulation.shape[0]:
-        art_a = body_to_articulation[a]
-    if b >= 0 and b < body_to_articulation.shape[0]:
-        art_b = body_to_articulation[b]
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+    if a >= 0 and a < inputs.body_to_articulation.shape[0]:
+        art_a = inputs.body_to_articulation[a]
+    if b >= 0 and b < inputs.body_to_articulation.shape[0]:
+        art_b = inputs.body_to_articulation[b]
+    a_non_free = art_a >= 0 and inputs.is_free_rigid[art_a] == 0
+    b_non_free = art_b >= 0 and inputs.is_free_rigid[art_b] == 0
     support_gap_limit = float(0.0)
     if sa >= 0:
-        support_gap_limit += shape_gap[sa]
+        support_gap_limit += inputs.shape_gap[sa]
     if sb >= 0:
-        support_gap_limit += shape_gap[sb]
+        support_gap_limit += inputs.shape_gap[sb]
     normal_gap_limit = contact_normal_gap_limit(
         a_non_free,
         b_non_free,
         art_a == art_b,
-        contact_gap_gate,
-        articulation_pair_gap_gate,
-        same_articulation_gap_gate,
+        inputs.contact_gap_gate,
+        inputs.articulation_pair_gap_gate,
+        inputs.same_articulation_gap_gate,
     )
     support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
     eligible = gap <= normal_gap_limit and contact_friction_eligible(
-        gap, a_non_free, b_non_free, friction_articulation_pairs_only, friction_gap
+        gap, a_non_free, b_non_free, inputs.friction_articulation_pairs_only, inputs.friction_gap
     )
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
@@ -309,26 +313,26 @@ def _prepare_contact_fields(
     frame.shape_a[c] = sa
     frame.shape_b[c] = sb
     frame.flipped[c] = flip
-    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
-    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
+    frame.surface_a[c] = _local_point(inputs.q, a, pb if flip != 0 else pa)
+    frame.surface_b[c] = _local_point(inputs.q, b, pa if flip != 0 else pb)
     frame.center[c] = 0.5 * (pa + pb)
     frame.normal[c] = n
     mu_a = float(0.0)
     mu_b = float(0.0)
     if sa >= 0:
-        mu_a = shape_mu[sa]
+        mu_a = inputs.shape_mu[sa]
     if sb >= 0:
-        mu_b = shape_mu[sb]
+        mu_b = inputs.shape_mu[sb]
     frame.mu[c] = wp.vec2(mu_a, mu_b)
     r = float(1.0e10)
     if a >= 0:
-        r = wp.min(r, body_radius[a])
+        r = wp.min(r, inputs.body_radius[a])
     if b >= 0:
-        r = wp.min(r, body_radius[b])
+        r = wp.min(r, inputs.body_radius[b])
     frame.radius[c] = wp.max(r, 1.0e-4)
     # ka and kb are below key_stride, so the key orders pairs as (ka, kb) does
     # and occupies only the low bits that build() sorts.
-    return wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
+    return wp.int64(ka) * wp.int64(inputs.key_stride) + wp.int64(kb)
 
 
 # Defined ahead of _prepare_frame: a kernel of a unique module is named after the functions
@@ -349,26 +353,7 @@ def _publish_extent(extent: wp.array[int], end: int, live: int):
 @wp.kernel(enable_backward=False)
 def _prepare(
     count: wp.array[int],
-    shape0: wp.array[int],
-    shape1: wp.array[int],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-    shape_body: wp.array[int],
-    shape_mu: wp.array[float],
-    shape_gap: wp.array[float],
-    body_radius: wp.array[float],
-    q: wp.array[wp.transform],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
-    contact_gap_gate: float,
-    same_articulation_gap_gate: float,
-    articulation_pair_gap_gate: float,
-    friction_gap: float,
-    friction_articulation_pairs_only: int,
-    key_stride: int,
+    inputs: _PatchContacts,
     stored: wp.array[int],
     built: wp.array[int],
     threads: int,
@@ -392,32 +377,7 @@ def _prepare(
         _publish_extent(extent, end, live)
     for c in range(thread, end, threads):
         frame.indices[c] = c
-        frame.keys[c] = _prepare_contact_fields(
-            c,
-            live,
-            shape0,
-            shape1,
-            point0,
-            point1,
-            normal,
-            margin0,
-            margin1,
-            shape_body,
-            shape_mu,
-            shape_gap,
-            body_radius,
-            q,
-            body_to_articulation,
-            is_free_rigid,
-            contact_gap_gate,
-            same_articulation_gap_gate,
-            articulation_pair_gap_gate,
-            friction_gap,
-            friction_articulation_pairs_only,
-            key_stride,
-            frame,
-            patches,
-        )
+        frame.keys[c] = _prepare_contact_fields(c, live, inputs, frame, patches)
 
 
 # The frame-reuse variants compile in modules of their own, so the base patch
@@ -427,26 +387,7 @@ def _prepare(
 @wp.kernel(enable_backward=False, module="unique")
 def _prepare_frame(
     count: wp.array[int],
-    shape0: wp.array[int],
-    shape1: wp.array[int],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-    shape_body: wp.array[int],
-    shape_mu: wp.array[float],
-    shape_gap: wp.array[float],
-    body_radius: wp.array[float],
-    q: wp.array[wp.transform],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
-    contact_gap_gate: float,
-    same_articulation_gap_gate: float,
-    articulation_pair_gap_gate: float,
-    friction_gap: float,
-    friction_articulation_pairs_only: int,
-    key_stride: int,
+    inputs: _PatchContacts,
     stored: wp.array[int],
     built: wp.array[int],
     threads: int,
@@ -509,32 +450,7 @@ def _prepare_frame(
             if recorded == 0 and live > 0:
                 sort_pairs[0] = 1
     for c in range(thread, end, threads):
-        key = _prepare_contact_fields(
-            c,
-            live,
-            shape0,
-            shape1,
-            point0,
-            point1,
-            normal,
-            margin0,
-            margin1,
-            shape_body,
-            shape_mu,
-            shape_gap,
-            body_radius,
-            q,
-            body_to_articulation,
-            is_free_rigid,
-            contact_gap_gate,
-            same_articulation_gap_gate,
-            articulation_pair_gap_gate,
-            friction_gap,
-            friction_articulation_pairs_only,
-            key_stride,
-            frame,
-            patches,
-        )
+        key = _prepare_contact_fields(c, live, inputs, frame, patches)
         # A kept slot holds the sorted pair at position c, not contact c's key.
         if recorded == 0 or c >= live:
             frame.indices[c] = c
@@ -1532,28 +1448,27 @@ class _FrictionPatchState:
         friction_articulation_pairs_only=False,
     ):
         """Return the inputs that :func:`_prepare` and :func:`_prepare_frame` share, with :meth:`build`'s gates."""
-        return [
-            contacts.rigid_contact_count,
-            contacts.rigid_contact_shape0,
-            contacts.rigid_contact_shape1,
-            contacts.rigid_contact_point0,
-            contacts.rigid_contact_point1,
-            contacts.rigid_contact_normal,
-            contacts.rigid_contact_margin0,
-            contacts.rigid_contact_margin1,
+        inputs = _PatchContacts()
+        inputs.shape0, inputs.shape1 = contacts.rigid_contact_shape0, contacts.rigid_contact_shape1
+        inputs.point0, inputs.point1 = contacts.rigid_contact_point0, contacts.rigid_contact_point1
+        inputs.normal = contacts.rigid_contact_normal
+        inputs.margin0, inputs.margin1 = contacts.rigid_contact_margin0, contacts.rigid_contact_margin1
+        inputs.shape_body, inputs.shape_mu, inputs.shape_gap = (
             model.shape_body,
             model.shape_material_mu,
             model.shape_gap,
-            self.body_radius,
-            state.body_q,
-            body_to_articulation,
-            is_free_rigid,
-            contact_gap_gate,
-            same_articulation_gap_gate,
-            articulation_pair_gap_gate,
-            friction_gap,
-            int(friction_articulation_pairs_only),
-            self.key_stride,
+        )
+        inputs.body_radius, inputs.q = self.body_radius, state.body_q
+        inputs.body_to_articulation, inputs.is_free_rigid = body_to_articulation, is_free_rigid
+        inputs.contact_gap_gate = contact_gap_gate
+        inputs.same_articulation_gap_gate = same_articulation_gap_gate
+        inputs.articulation_pair_gap_gate = articulation_pair_gap_gate
+        inputs.friction_gap = friction_gap
+        inputs.friction_articulation_pairs_only = int(friction_articulation_pairs_only)
+        inputs.key_stride = self.key_stride
+        return [
+            contacts.rigid_contact_count,
+            inputs,
             self.stored,
             self.built,
             self.threads,
