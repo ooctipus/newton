@@ -89,9 +89,8 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
         if not solver.size_groups:
             return "No articulation has response coordinates."
         # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the
-        # solver pipeline around it, so it serves point and patch friction alike.
-        if not solver._law_agnostic_contact_paths:
-            return "Contact torsion and compliance rows are outside the held tree."
+        # solver pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body
+        # twists every group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
         # Split mode composes its rows from the same held factors the owner refreshes.
         if solver.pgs_mode not in ("matrix_free", "split"):
             return "The held tree serves the matrix-free and split modes."

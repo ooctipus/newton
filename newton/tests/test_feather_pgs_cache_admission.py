@@ -80,11 +80,11 @@ class TestSparseTreeAdmission(unittest.TestCase):
 
 
 class TestHeldTreeContactLaw(unittest.TestCase):
-    def test_held_tree_owner_serves_point_and_patch_friction(self):
-        """Admit the dense held-tree owner under either friction law, but not under torsion or compliance."""
-        for law, admitted in (("point", True), ("patch", True), ("torsion", False), ("compliance", False)):
+    def test_held_tree_owner_serves_every_contact_law(self):
+        """Admit the dense held-tree owner under either friction law, torsion and compliance."""
+        for law in _CONTACT_LAWS:
             with self.subTest(law=law):
-                self.assertEqual(held_tree.admitted(_held_tree_solver(law)), admitted)
+                self.assertTrue(held_tree.admitted(_held_tree_solver(law)))
 
     def test_contact_law_predicates_precede_route_selection(self):
         """Define the contact-law predicates, the parallel-row one included, before sparse route selection."""
