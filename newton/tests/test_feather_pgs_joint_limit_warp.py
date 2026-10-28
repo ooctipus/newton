@@ -12,6 +12,7 @@ from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
+from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
 
 
@@ -99,26 +100,32 @@ def _scalar_rows(problem, resolved=None):
 def _warp_rows(problem, resolved=None, warps_per_block=4):
     """Build the joint-limit rows with the warp-parallel kernel (CUDA only)."""
     outputs = _outputs(problem.articulation_count, problem.max_constraints, problem.size, problem.device)
-    kernel = _get_joint_limit_warp_kernel(problem.size, problem.device.arch, warps_per_block)
+    names = ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target")
+    law = field_group.upload(
+        PrefixLaw,
+        problem.device,
+        limit_q_index=np.arange(problem.dof_count),
+        lower=problem.lower,
+        upper=problem.upper,
+        q=problem.joint_q,
+        activation_gap=0.25,
+        beta=0.2,
+        cfm=1.0e-6,
+        slot_counter=outputs[0],
+        **dict(zip(names, outputs[2:], strict=True)),
+    )
     wp.launch_tiled(
-        kernel,
+        _get_joint_limit_warp_kernel(problem.size, warps_per_block),
         dim=[(problem.articulation_count + warps_per_block - 1) // warps_per_block],
         inputs=[
             problem.articulation_count,
             problem.articulation_dof_start,
             problem.art_to_world,
             problem.group_to_art,
-            wp.array(np.arange(problem.dof_count), dtype=wp.int32, device=problem.device),
-            problem.lower,
-            problem.upper,
-            problem.joint_q,
-            0.25,
-            problem.max_constraints,
-            0.2,
-            1.0e-6,
             _resolved_mask(problem, resolved),
+            law,
         ],
-        outputs=[*outputs[:2], _dense_rows(outputs, problem.device)],
+        outputs=[outputs[1]],
         block_dim=32 * warps_per_block,
         device=problem.device,
     )

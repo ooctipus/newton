@@ -56,6 +56,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .prefix_rows import LAW, limits, prefix_rows
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
 from .step_plan import AdmissionFacts, first_failed
@@ -78,38 +79,18 @@ PREFIX = (
     Field("mimic_q1", wp.int32, ("mimic",), owner="mimics", attr="_mimic_q1"),
     Field("mimic_coef0", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef0"),
     Field("mimic_coef1", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef1"),
-    Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
-    Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
-    Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
-    Field("beta", wp.float32, attr="pgs_beta"),
-    Field("cfm", wp.float32, attr="pgs_cfm"),
-    Field("dt", wp.float32, owner="step"),
-    Field("bias_scale", wp.float32, owner="step"),
-    Field("limit_speculative_scale", wp.float32, owner="step"),
+    *LAW,
     # Sparse private prefix coefficients, never a global dense J allocation, and each packet row's contact.
     Field("dofs", wp.int32, ("world", "packet", PREFIX_WIDTH), fill=None, owner="packets"),
     Field("weights", wp.float32, ("world", "packet", PREFIX_WIDTH), fill=None, owner="packets"),
     Field("row_contact", wp.int32, ("world", "packet"), fill=-1, owner="packets"),
     Field("mimic_slot", wp.int32, ("mimic",), owner="mimics"),
-    Field("slot_counter", wp.int32, ("world",)),
     Field("first_rejected_slot", wp.int32, ("world",), attr="_dense_first_rejected_slot"),
-    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
-    Field("kind", wp.int32, ("world", "row"), attr="row_type"),
-    Field("parent", wp.int32, ("world", "row"), attr="row_parent"),
-    Field("mu", wp.float32, ("world", "row"), attr="row_mu"),
-    Field("row_beta", wp.float32, ("world", "row")),
-    Field("row_cfm", wp.float32, ("world", "row")),
-    Field("phi", wp.float32, ("world", "row")),
-    Field("target", wp.float32, ("world", "row"), attr="target_velocity"),
-    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution"),
-    Field("rhs", wp.float32, ("world", "row")),
-    Field("diag", wp.float32, ("world", "row")),
     Field("impulses", wp.float32, ("world", "row")),
 )
 """The prefix kernel's inputs and outputs: the size group, the mimic tables (``mimics``: the solver's, or the
-placeholders of a model without mimics), the limits, the state, the private prefix packets and the dense rows."""
+placeholders of a model without mimics), the prefix law and the dense rows (:data:`.prefix_rows.LAW`), and the
+private prefix packets."""
 
 PrefixData = field_group.struct("PrefixData", PREFIX, __name__)
 
@@ -157,20 +138,17 @@ _PREFIX_SOURCE = r"""
     const int first_dof = data.dof_start.data[art];
     const int mimic_first = data.mimic_start.data[art];
     const int mimic_end = data.mimic_start.data[art + 1];
-    const int M = data.kind.shape[1];
     for (int row = LANE; row < $PACKETS; row += STRIDE) data.row_contact.data[world * $PACKETS + row] = -1;
-    int count = 0;
-    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
-        const int candidate = chunk + LANE;
-        int active = 0, d0 = -1, d1 = -1, type = 3, mimic = -1;
-        float w0 = 0.0f, w1 = 0.0f, phi = 0.0f;
-        if (candidate < $MIMICS) {
-            if (mimic_first + candidate < mimic_end) {
-                mimic = data.mimic_list.data[mimic_first + candidate];
+$ROWS    }
+"""
+
+_MIMIC = """if (mimic_first + index < mimic_end) {
+                mimic = data.mimic_list.data[mimic_first + index];
                 data.mimic_slot.data[mimic] = -1;
                 active = data.mimic_valid.data[mimic] != 0 && data.mimic_enabled.data[mimic];
                 if (active) {
                     type = 5;
+                    beta = data.beta;
                     d0 = data.mimic_dof0.data[mimic] - first_dof;
                     d1 = data.mimic_dof1.data[mimic] - first_dof;
                     w0 = 1.0f;
@@ -178,49 +156,18 @@ _PREFIX_SOURCE = r"""
                     phi = RowLaw::mimic_phi(data.q.data[data.mimic_q0.data[mimic]], data.q.data[data.mimic_q1.data[mimic]],
                                             data.mimic_coef0.data[mimic], data.mimic_coef1.data[mimic]);
                 }
-            }
-        } else if (candidate < $CANDIDATES) {
-            const int local = (candidate - $MIMICS) / 2, side = (candidate - $MIMICS) & 1;
-            const int dof = first_dof + local, qi = data.limit_q_index.data[dof];
-            if (qi >= 0) {
-                const auto limit = RowLaw::joint_limit_side(data.q.data[qi], data.lower.data[dof], data.upper.data[dof],
-                                                            side, data.activation_gap);
-                active = limit.v0;
-                phi = limit.v1;
-                d0 = local;
-                w0 = limit.v2;
-            }
-        }
-        const int slot = ORDERED(count, active != 0);
-        if (active && slot < $PACKETS) {
-            const int sparse = (world * $PACKETS + slot) * 2;
+            }"""
+"""The mimic family: an enabled, valid mimic row of the primary (``J = e_follower - coef1 e_leader``)."""
+
+_SINK = """            const int sparse = (world * $PACKETS + slot) * 2;
             data.dofs.data[sparse] = d0;
             data.dofs.data[sparse + 1] = d1;
             data.weights.data[sparse] = w0;
             data.weights.data[sparse + 1] = w1;
-            const int row = world * M + slot;
-            data.kind.data[row] = type;
-            data.parent.data[row] = -1;
-            data.mu.data[row] = 0.0f;
-            data.row_beta.data[row] = data.beta;
-            data.row_cfm.data[row] = data.cfm;
-            data.phi.data[row] = phi;
-            data.target.data[row] = 0.0f;
-            data.restitution.data[row] = 0.0f;
-            data.rhs.data[row] = RowLaw::row_rhs(type, phi, data.beta, 0.0f, 1.0f / data.dt, data.bias_scale, 0.0f,
-                                                 data.limit_speculative_scale, 1.0f).v0;
-            data.diag.data[row] = data.cfm;
-            data.impulses.data[row] = 0.0f;
-            if (mimic >= 0) data.mimic_slot.data[mimic] = slot;
-        }
-    }
-    if (LANE == 0) {
-        data.slot_counter.data[world] = count;
-        data.bounds.data[world * 2] = count;
-        data.bounds.data[world * 2 + 1] = count;
-    }
-    }
-"""
+            data.diag.data[at] = data.cfm;
+            data.impulses.data[at] = 0.0f;
+            if (mimic >= 0) data.mimic_slot.data[mimic] = slot;"""
+"""The packets' sink: a row's sparse coefficients, its diagonal seed and impulse, and its mimic's slot."""
 
 
 @cache
@@ -235,9 +182,16 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     """
     if primary <= 0 or mimics < 0 or mimics + 2 * primary > packets:
         raise ValueError("the prefix candidates must fit the packet capacity")
-    source = substitute(
-        _PREFIX_SOURCE, CANDIDATES=mimics + 2 * primary, MIMICS=mimics, PACKETS=packets, WARPS=WARPS_PER_BLOCK
+    positions = ((mimics, "", _MIMIC),) if mimics else ()
+    rows = prefix_rows(
+        ((*positions, limits(tuple(range(primary)), "first_dof + d", "data.")), ()),
+        law="data.",
+        sink=substitute(_SINK, PACKETS=packets),
+        ordered=True,
+        rhs=True,
+        locals_="int mimic = -1;",
     )
+    source = substitute(_PREFIX_SOURCE, ROWS=rows, PACKETS=packets, WARPS=WARPS_PER_BLOCK)
     return KernelTemplate(
         f"row_packet_prefix{primary}_m{mimics}_r{packets}",
         (("data", PrefixData),),
@@ -319,7 +273,9 @@ def finalize_and_queue(
 ):
     """Fuse the dense-count clamp, the local ownership decision and the two queues."""
     world = wp.tid()
-    rows = reserved_count(prefix.slot_counter, world, prefix.kind.shape[1], prefix.first_rejected_slot, queue.status, 0)
+    rows = reserved_count(
+        prefix.slot_counter, world, prefix.row_type.shape[1], prefix.first_rejected_slot, queue.status, 0
+    )
     queue.count[world] = rows
     mf_count = queue.mf_count[world]
     primary = queue.primary[world]
@@ -730,8 +686,6 @@ class LocalRowPackets:
             packets=self._packets,
             group_to_art=solver.group_to_art[self.primary],
             dt=dt,
-            bias_scale=1.0,
-            limit_speculative_scale=1.0,
             **({} if self.mimics else self._absent_mimics),
         )
         self.contact_input = None

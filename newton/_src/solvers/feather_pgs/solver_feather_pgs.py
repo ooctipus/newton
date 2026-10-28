@@ -54,6 +54,7 @@ from . import (
     field_group,
     host_index,
     kernel_template,
+    prefix_rows,
     response_builds_dense,
     response_builds_rows,
     sweep_routes,
@@ -79,9 +80,9 @@ from .contact_torsion import (
     validate_torsion_step,
 )
 from .contact_unit import CONTACT_UNIT_STATE_FIELDS, RING_BLOCK_SIZE, check_contact_update
-from .dense_rows import DenseRows, bind_mf_body_map
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
+from .dense_rows import bind_mf_body_map
 from .device_preludes import lane_group
 from .field_group import SolverArrays
 from .friction_patches import (
@@ -94,7 +95,6 @@ from .joint_table import bind_free_bodies
 from .kernel_template import Dispatch, KernelTemplate, SweepTier, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
@@ -3884,11 +3884,7 @@ class SolverFeatherPGS(SolverBase):
         self._joint_limit_q_index_host = limit_q_index
         self._joint_limit_warp_kernels = (
             {
-                size: _get_joint_limit_warp_kernel(
-                    size,
-                    str(getattr(model.device, "arch", "")),
-                    warps_per_block=_JOINT_LIMIT_WARPS_PER_BLOCK,
-                )
+                size: _get_joint_limit_warp_kernel(size, warps_per_block=_JOINT_LIMIT_WARPS_PER_BLOCK)
                 for size in self._joint_limit_sizes
             }
             if model.device.is_cuda and not model.requires_grad
@@ -8741,6 +8737,8 @@ class SolverFeatherPGS(SolverBase):
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
+            # The native limit rows (prefix_rows) read the law and write the records through one struct.
+            law = field_group.bind(prefix_rows.PrefixLaw, solver=self, model=model, state_in=state_in, dt=dt)
             for size in self.size_groups:
                 if size not in self._joint_limit_sizes or size in self._fused_diagonal_joint_limit_sizes:
                     continue
@@ -8755,13 +8753,7 @@ class SolverFeatherPGS(SolverBase):
                             self.art_to_world,
                             self.articulation_world_dof_offset,
                             self.articulation_dof_start,
-                            self._joint_limit_q_index,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
-                            state_in.joint_q,
-                            self.joint_limit_activation_gap,
-                            self.pgs_beta,
-                            self.pgs_cfm,
+                            law,
                             indices.ancestor_mask,
                             indices.inverse_permutation,
                             indices.lookup,
@@ -8769,8 +8761,6 @@ class SolverFeatherPGS(SolverBase):
                             self.v_hat,
                         ],
                         outputs=[
-                            self.slot_counter,
-                            dense_rows,
                             self._sparse_row_dof,
                             self._sparse_row_factor,
                             self._sparse_row_incident,
@@ -8790,17 +8780,10 @@ class SolverFeatherPGS(SolverBase):
                             self.articulation_dof_start,
                             self.art_to_world,
                             self.group_to_art[size],
-                            self._joint_limit_q_index,
-                            model.joint_limit_lower,
-                            model.joint_limit_upper,
-                            state_in.joint_q,
-                            self.joint_limit_activation_gap,
-                            max_constraints,
-                            self.pgs_beta,
-                            self.pgs_cfm,
                             self._resolved_worlds,
+                            law,
                         ],
-                        outputs=[self.slot_counter, self.J_by_size[size], dense_rows],
+                        outputs=[self.J_by_size[size]],
                         block_dim=32 * _JOINT_LIMIT_WARPS_PER_BLOCK,
                         device=model.device,
                     )
@@ -10831,68 +10814,30 @@ _JOINT_LIMIT_WARP_PARAMS = kernel_template.params(
     ("articulation_dof_start", wp.array[int]),
     ("art_to_world", wp.array[int]),
     ("group_to_art", wp.array[int]),
-    ("limit_q_index", wp.array[int]),
-    ("joint_limit_lower", wp.array[float]),
-    ("joint_limit_upper", wp.array[float]),
-    ("joint_q", wp.array[float]),
-    ("activation_gap", float),
-    ("max_constraints", int),
-    ("pgs_beta", float),
-    ("pgs_cfm", float),
     ("resolved_worlds", wp.array[int]),
-    ("world_slot_counter", wp.array[int]),
+    ("law", prefix_rows.PrefixLaw),
     ("J_group", wp.array3d[float]),
-    ("rows", DenseRows),
 )
 """The warp joint-limit row builder's operands."""
 
 
 @cache
-def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: int) -> "wp.Kernel":
-    """Build a deterministic one-warp-per-articulation joint-limit row builder."""
-    _ = device_arch
-    snippet = f"""    const int group_idx = block * {warps_per_block} + SUB;
-    if (group_idx >= articulation_count) return;
-
-    const int articulation = group_to_art.data[group_idx];
-    const int world = art_to_world.data[articulation];
+def _get_joint_limit_warp_kernel(size: int, warps_per_block: int) -> "wp.Kernel":
+    """Build the general route's joint-limit rows, one warp per articulation (:func:`.prefix_rows.prefix_rows`)."""
+    rows = prefix_rows.prefix_rows(
+        ((prefix_rows.limits(tuple(range(size)), "first_dof + d", "law."),),),
+        law="law.",
+        sink=f"            J_group.data[(group * J_group.shape[1] + slot) * {size} + d0] = w0;",
+        ordered=False,
+        rhs=False,
+    )
+    snippet = f"""    const int group = block * {warps_per_block} + SUB;
+    if (group >= articulation_count) return;
+    const int world = art_to_world.data[group_to_art.data[group]];
     if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
-    const int dof_start = articulation_dof_start.data[articulation];
-    for (int base = 0; base < {2 * size}; base += STRIDE) {{
-        const int candidate = base + LANE;
-        const int local_dof = candidate >> 1;
-        const int side = candidate & 1;
-        const int dof = dof_start + local_dof;
-        const int q_index = local_dof < {size} ? limit_q_index.data[dof] : -1;
-        float phi_value = 0.0f;
-        int active = 0;
-        if (q_index >= 0) {{
-            const auto limit = RowLaw::joint_limit_side(joint_q.data[q_index], joint_limit_lower.data[dof],
-                                                        joint_limit_upper.data[dof], side, activation_gap);
-            active = limit.v0;
-            phi_value = limit.v1;
-        }}
-
-        const unsigned active_mask = BALLOT(active != 0);
-        const int first_slot = RESERVE(&world_slot_counter.data[world], COUNT(active_mask));
-        if (active != 0) {{
-            const int slot = first_slot + BELOW(active_mask);
-            if (slot < max_constraints) {{
-                J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = side == 0 ? 1.0f : -1.0f;
-                const int row = world * max_constraints + slot;
-                rows.row_type.data[row] = {PGS_CONSTRAINT_TYPE_JOINT_LIMIT};
-                rows.row_parent.data[row] = -1;
-                rows.row_mu.data[row] = 0.0f;
-                rows.row_beta.data[row] = pgs_beta;
-                rows.row_cfm.data[row] = pgs_cfm;
-                rows.phi.data[row] = phi_value;
-                rows.target.data[row] = 0.0f;
-            }}
-        }}
-    }}
-#endif
+    const int first_dof = articulation_dof_start.data[group_to_art.data[group]];
+{rows}#endif
 """
-
     return KernelTemplate(
         f"build_joint_limit_rows_warp_{size}_{warps_per_block}",
         _JOINT_LIMIT_WARP_PARAMS,

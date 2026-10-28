@@ -10,7 +10,8 @@ import numpy as np
 
 from ...sim import JointType
 from .device_preludes import lane_group
-from .kernel_template import WORLDS, KernelTemplate, substitute
+from .kernel_template import WORLDS, KernelTemplate
+from .prefix_rows import limits, prefix_rows, velocity_limits
 from .row_laws import ROW_LAW
 
 
@@ -44,11 +45,6 @@ class KeyedLayout:
     @property
     def position_eligibility(self):
         return (1 << self.dofs) - 1 if self.position_mask is None else self.position_mask
-
-    @property
-    def limit_coordinates(self):
-        mask = self.position_eligibility | (self.velocity_mask if self.velocity_limits else 0)
-        return tuple(d for d in range(self.dofs) if mask & (1 << d))
 
     def primary_test(self, coordinate):
         return f"({coordinate} >= {self.primary_offset} && {coordinate} < {self.primary_offset + self.primary})"
@@ -119,92 +115,37 @@ def topology_plan(solver):
 
 @cache
 def prefix_kernel(layout, prefix_type, rows_type):
-    """Generate ordered unary rows for eligible coordinates, using the existing laws."""
-    source = r"""
-    const int M = p.kind.shape[1];
-#if $VELOCITY
-    for (int k = LANE; k < $DOUBLE; k += STRIDE) {
+    """Generate a world's ordered unary rows for its eligible coordinates (:func:`.prefix_rows.prefix_rows`).
+
+    A row's key ``~(2 d + side)`` names its coordinate ``d`` and side; a velocity-limit row also records its slot and
+    sign per DOF side.
+    """
+    dof = f"p.starts.data[world * 2 + ({layout.primary_test('d')} ? 0 : 1)] + {layout.local('d')}"
+    velocities = layout.velocity_mask if layout.velocity_limits else 0
+    sink = "            z.rowkeys.data[at] = ~(d0 * 2 + side);"
+    clear = ""
+    if velocities:
+        sink += """
+            if (type == 4) {
+                p.velocity_slots.data[dof * 2 + side] = slot;
+                p.velocity_signs.data[dof * 2 + side] = w0;
+            }"""
+        clear = f"""    for (int k = LANE; k < {2 * layout.dofs}; k += STRIDE) {{
         const int d = k / 2;
-        const int dof = p.starts.data[world * 2 + ($PRIMARY ? 0 : 1)] + $LOCAL;
+        const int dof = {dof};
         p.velocity_slots.data[dof * 2 + k % 2] = -1;
         p.velocity_signs.data[dof * 2 + k % 2] = 0.0f;
-    }
-#endif
-    int base = 0;
-    $COORDINATE_DECL
-    for (int phase = 0; phase < 2; ++phase) {
-        for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
-            const int candidate = chunk + LANE, side = candidate & 1;
-            const int d = candidate < $CANDIDATES ? $COORDINATE_INDEX : 0;
-            const int dof = p.starts.data[world * 2 + ($PRIMARY ? 0 : 1)] + $LOCAL;
-            const float sign = side == 0 ? 1.0f : -1.0f;
-            bool active = false;
-            float phi = 0.0f, target = 0.0f;
-            if (candidate < $CANDIDATES) {
-                if (phase == 0 && ($POSITION & (1u << d)) != 0u) {
-                    const int qi = p.q_index.data[dof];
-                    if (qi >= 0) {
-                        const auto limit = RowLaw::joint_limit_side(p.q.data[qi], p.lower.data[dof], p.upper.data[dof],
-                                                                    side, p.gap);
-                        active = limit.v0;
-                        phi = limit.v1;
-                    }
-                }
-#if $VELOCITY
-                else if (phase == 1 && ($MASK & (1u << d)) != 0u) {
-                    const float limit = p.velocity_limit.data[dof];
-                    active = RowLaw::velocity_limit_active(limit, p.vhat.data[dof], p.activation);
-                    target = -limit;
-                }
-#endif
-            }
-            const int slot = ORDERED(base, active);
-            if (active && slot < M) {
-                const int at = world * M + slot;
-                z.rowkeys.data[at] = ~(d * 2 + side);
-                p.kind.data[at] = phase == 0 ? 3 : 4;
-                p.parent.data[at] = -1; p.mu.data[at] = 0.0f;
-                p.beta.data[at] = phase == 0 ? p.pgs_beta : 0.0f;
-                p.cfm.data[at] = p.pgs_cfm;
-                p.phi.data[at] = phi; p.target.data[at] = target;
-                p.restitution.data[at] = 0.0f;
-                // The position pass's row law (bias scale 1): a limit's Baumgarte or speculative term, a velocity
-                // limit's target.
-                p.rhs.data[at] = RowLaw::row_rhs(phase == 0 ? 3 : 4, phi, phase == 0 ? p.pgs_beta : 0.0f, target,
-                                                 1.0f / p.dt, 1.0f, 0.0f, 1.0f, 1.0f).v0;
-#if $VELOCITY
-                if (phase == 1) {
-                    p.velocity_slots.data[dof * 2 + side] = slot;
-                    p.velocity_signs.data[dof * 2 + side] = sign;
-                }
-#endif
-            }
-        }
-        if (LANE == 0)
-            p.bounds.data[world * 2 + phase] = base;
-    }
-    if (LANE == 0)
-        p.counts.data[world] = base;
+    }}
 """
-    coordinates = layout.limit_coordinates
-    consecutive = bool(coordinates) and coordinates == tuple(range(coordinates[0], coordinates[-1] + 1))
-    # A dynamically indexed local array survives CUDA compilation even when
-    # its values form an interval. Emit the equivalent arithmetic directly.
-    coordinate_decl = (
-        "" if consecutive else "const int coordinates[] = {" + (", ".join(map(str, coordinates)) or "0") + "};"
+    positions, velocities = (
+        tuple(d for d in range(layout.dofs) if mask & (1 << d)) for mask in (layout.position_eligibility, velocities)
     )
-    coordinate_index = f"candidate / 2 + {coordinates[0]}" if consecutive else "coordinates[candidate / 2]"
-    source = substitute(
-        source,
-        VELOCITY=int(layout.velocity_limits),
-        DOUBLE=2 * layout.dofs,
-        CANDIDATES=2 * len(layout.limit_coordinates),
-        COORDINATE_DECL=coordinate_decl,
-        COORDINATE_INDEX=coordinate_index,
-        POSITION=f"{layout.position_eligibility}u",
-        PRIMARY=layout.primary_test("d"),
-        LOCAL=layout.local("d"),
-        MASK=f"{layout.velocity_mask}u",
+    source = clear + prefix_rows(
+        ((limits(positions, dof, "p."),), (velocity_limits(velocities, dof, "p."),) if velocities else ()),
+        law="p.",
+        sink=sink,
+        ordered=True,
+        rhs=True,
     )
     # A warp generates a world's rows on CUDA, one thread on the CPU.
     return KernelTemplate(

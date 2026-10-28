@@ -49,21 +49,21 @@ class TestKeyedRowLayout(unittest.TestCase):
                 q = np.linspace(-0.4, 0.4, worlds * d, dtype=np.float32)
                 v = np.linspace(-3.0, 3.0, worlds * d, dtype=np.float32)
                 p.starts = wp.array(starts, dtype=int, device="cpu")
-                p.q_index = wp.array(np.arange(worlds * d, dtype=np.int32), device="cpu")
+                p.limit_q_index = wp.array(np.arange(worlds * d, dtype=np.int32), device="cpu")
                 p.q, p.vhat = wp.array(q, device="cpu"), wp.array(v, device="cpu")
                 p.lower = wp.full(worlds * d, -0.2, dtype=float, device="cpu")
                 p.upper = wp.full(worlds * d, 0.2, dtype=float, device="cpu")
                 p.velocity_limit = wp.full(worlds * d, 2.0, dtype=float, device="cpu")
                 p.velocity_slots = wp.full(worlds * d * 2, -9, dtype=int, device="cpu")
                 p.velocity_signs = wp.full(worlds * d * 2, -9.0, dtype=float, device="cpu")
-                p.counts = wp.empty(worlds, dtype=int, device="cpu")
+                p.slot_counter = wp.empty(worlds, dtype=int, device="cpu")
                 p.bounds = wp.empty((worlds, 2), dtype=int, device="cpu")
-                for name in ("kind", "parent"):
+                for name in ("row_type", "row_parent"):
                     setattr(p, name, wp.full((worlds, capacity), -99, dtype=int, device="cpu"))
-                for name in ("mu", "beta", "cfm", "phi", "target", "restitution", "rhs"):
+                for name in ("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution", "rhs"):
                     setattr(p, name, wp.full((worlds, capacity), -99.0, dtype=float, device="cpu"))
                 z.rowkeys = wp.full((worlds, capacity), 99, dtype=int, device="cpu")
-                p.gap, p.activation, p.pgs_beta, p.pgs_cfm, p.dt = 0.1, 0.7, 0.05, 1e-5, 0.01
+                p.activation_gap, p.activation, p.beta, p.cfm, p.dt = 0.1, 0.7, 0.05, 1e-5, 0.01
                 wp.launch_tiled(
                     prefix_kernel(layout, rows.PrefixInput, rows.KineticRows),
                     dim=[worlds],
@@ -89,7 +89,7 @@ class TestKeyedRowLayout(unittest.TestCase):
                                     rhs = (0.05 if phi < 0 else 1.0) * phi / 0.01 if phase == 0 else 2.0
                                     expected.append((~(2 * coordinate + side), 3 + phase, phi, rhs))
                         self.assertEqual(p.bounds.numpy()[world, phase], len(expected))
-                    self.assertEqual(p.counts.numpy()[world], len(expected))
+                    self.assertEqual(p.slot_counter.numpy()[world], len(expected))
                     if velocity:
                         slots, signs = p.velocity_slots.numpy(), p.velocity_signs.numpy()
                         for coordinate in range(d):
@@ -108,7 +108,7 @@ class TestKeyedRowLayout(unittest.TestCase):
                                 )
                     for row, (key, kind, phi, rhs) in enumerate(expected[:capacity]):
                         self.assertEqual(z.rowkeys.numpy()[world, row], key)
-                        self.assertEqual(p.kind.numpy()[world, row], kind)
+                        self.assertEqual(p.row_type.numpy()[world, row], kind)
                         self.assertAlmostEqual(p.phi.numpy()[world, row], phi, places=6)
                         self.assertAlmostEqual(p.rhs.numpy()[world, row], rhs, places=5)
 

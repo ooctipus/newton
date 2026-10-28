@@ -71,7 +71,6 @@ from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
     PREELIM_MAX_ROWS,
@@ -82,6 +81,7 @@ from .kernels import (
     spatial_matrix_block_inverse,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
+from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import PROJECTION_LAW
 from .response_builds_dense import _Vec6, solve_six
 from .response_operator import FactorComponent, FactorRows, FreeBody6, Lanes
@@ -1377,11 +1377,11 @@ _GROUP_ARTICULATION = """
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
-    const int capacity = rows.row_type.shape[1];
+    const int capacity = ${ROWS}row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];"""
 """A warp per articulation of the factor group (``tid >> 5``; the CPU runs a warp's work on its first thread), and
-the group's sizes: coordinates, row and support capacities, the articulation's factor."""
+the group's sizes: coordinates, row and support capacities (of the records ``$ROWS``), the articulation's factor."""
 
 
 def _record(row: str, fields: dict[str, str], indent: str) -> str:
@@ -1389,35 +1389,15 @@ def _record(row: str, fields: dict[str, str], indent: str) -> str:
     return "\n".join(f"{indent}rows.{name}.data[{row}] = {value};" for name, value in fields.items())
 
 
-_LIMIT_ROWS = """$ARTICULATION
-    for (int base = 0; base < 2 * dofs; base += STRIDE) {
-        const int candidate = base + LANE;
-        const int local_dof = candidate >> 1;
-        const int side = candidate & 1;
-        const int dof = start + local_dof;
-        const int q_index = candidate < 2 * dofs ? limit_q_index.data[dof] : -1;
-        float gap = 0.0f;
-        int active = 0;
-        if (q_index >= 0) {
-            const auto limit = RowLaw::joint_limit_side(joint_q.data[q_index], joint_limit_lower.data[dof],
-                                                        joint_limit_upper.data[dof], side, activation_gap);
-            active = limit.v0;
-            gap = limit.v1;
-        }
-        const unsigned active_mask = BALLOT(active != 0);
-        const int first_slot = RESERVE(&slot_counter.data[world], COUNT(active_mask));
-        // Visit the ballot in lane order, matching the existing lower/upper DOF order.
-        unsigned pending = active_mask;
-        int rank = 0;
+_LIMIT_WALK = """        // Visit the ballot in lane order: the rows' slots, in the articulation's lower/upper coordinate order.
+        unsigned pending = votes;
         while (pending != 0) {
-            const int row = first_slot + rank;
-            // The reservation above still counts every over-capacity row.
-            if (row >= capacity) break;
             const int source = FIRST(pending);
-            const int selected_dof = READ(local_dof, source);
-            const int selected_side = READ(side, source);
-            const float selected_gap = READ(gap, source);
-            const float sign = selected_side == 0 ? 1.0f : -1.0f;
+            const int row = READ(slot, source);
+            // The reservation still counts every over-capacity row.
+            if (row >= capacity) break;
+            const int selected_dof = READ(d0, source);
+            const float sign = READ(w0, source);
             const int column = inverse_permutation.data[selected_dof];
             const unsigned long long support_mask = dof_mask.data[selected_dof];
             const int row_offset = world * capacity + row;
@@ -1427,13 +1407,13 @@ $WALK
                 if (support.enabled)
                     support.row_class.data[row_offset] = support.limit_class.data[selected_dof];
                 row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
-$RECORD
+                law.diag.data[row_offset] = norm;
             }
             pending &= pending - 1;
-            ++rank;
         }
-    }
 """
+"""A position-limit row's packed ``L^-1`` column, signed by side, and its ``|Z|^2`` diagonal: the whole warp walks
+each row the chunk reserved."""
 
 _VELOCITY_LIMIT_ROWS = """$ARTICULATION
     for (int local_dof = 0; local_dof < dofs; ++local_dof) {
@@ -1516,20 +1496,20 @@ def _internal_row_record(kind: int, beta: str, phi: str, target: str) -> dict[st
     }
 
 
-_LIMIT_ROWS_SOURCE = kernel_template.substitute(
-    _LIMIT_ROWS,
-    ARTICULATION=_GROUP_ARTICULATION,
-    WALK=factor_rows("support_mask", _column_value("column", "sign"), (FactorRow("response_offset"),), " " * 12),
-    RECORD=_record(
-        "row_offset",
-        _internal_row_record(PGS_CONSTRAINT_TYPE_JOINT_LIMIT, "pgs_beta", "selected_gap", "0.0f"),
-        " " * 16,
+_LIMIT_ROWS_SOURCE = kernel_template.substitute(_GROUP_ARTICULATION + "\n", ROWS="law.") + prefix_rows(
+    ((limits("dofs", "start + d", "law."),),),
+    law="law.",
+    ordered=False,
+    rhs=False,
+    after=kernel_template.substitute(
+        _LIMIT_WALK,
+        WALK=factor_rows("support_mask", _column_value("column", "sign"), (FactorRow("response_offset"),), " " * 12),
     ),
 )
 
 _VELOCITY_LIMIT_ROWS_SOURCE = kernel_template.substitute(
     _VELOCITY_LIMIT_ROWS,
-    ARTICULATION=_GROUP_ARTICULATION,
+    ARTICULATION=kernel_template.substitute(_GROUP_ARTICULATION, ROWS="rows."),
     WALK=factor_rows(
         "support_mask",
         _column_value("column"),
@@ -1548,7 +1528,7 @@ _VELOCITY_LIMIT_ROWS_SOURCE = kernel_template.substitute(
 
 _MIMIC_ROWS_SOURCE = kernel_template.substitute(
     _MIMIC_ROWS,
-    ARTICULATION=_GROUP_ARTICULATION,
+    ARTICULATION=kernel_template.substitute(_GROUP_ARTICULATION, ROWS="rows."),
     WALK=factor_rows("support_mask", _MIMIC_VALUE, (FactorRow("response_offset", explicit=""),), " " * 8),
     RECORD=_record(
         "row_offset",
@@ -1602,26 +1582,15 @@ def _internal_rows_kernel(name: str, params, source: str, preludes) -> wp.Kernel
 factor_limit_rows_kernel = _internal_rows_kernel(
     "factor_limit_rows",
     _FACTOR_GROUP
-    + kernel_template.params(
-        ("limit_q_index", wp.array[int]),
-        ("joint_limit_lower", wp.array[float]),
-        ("joint_limit_upper", wp.array[float]),
-        ("joint_q", wp.array[float]),
-        ("activation_gap", float),
-        ("pgs_beta", float),
-        ("pgs_cfm", float),
-    )
+    + kernel_template.params(("law", PrefixLaw))
     + _FACTOR_COLUMNS
-    + kernel_template.params(("slot_counter", wp.array[int]))
-    + _FACTOR_OUTPUTS
+    + _FACTOR_OUTPUTS[1:]
     + kernel_template.params(("support", _SparseRowSupport)),
     _LIMIT_ROWS_SOURCE,
     ROW_LAW.preludes(),
 )
-"""The position-limit rows of each articulation and their packed columns of ``L^-1``, signed by side.
-
-Active sides (:func:`.row_laws.joint_limit_side`) reserve their rows in the articulation's lower/upper coordinate
-order; a reservation past the row capacity still counts, and writes stay within it."""
+"""The position-limit rows of each articulation (:func:`.prefix_rows.prefix_rows`) and their packed columns of
+``L^-1``, signed by side; a reservation past the row capacity still counts, and writes stay within it."""
 
 factor_velocity_limit_rows_kernel = _internal_rows_kernel(
     "factor_velocity_limit_rows",

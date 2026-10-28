@@ -31,6 +31,7 @@ from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
+from .prefix_rows import LAW, VELOCITY_LAW
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 
@@ -44,33 +45,13 @@ RowMaps = field_group.struct("RowMaps", ROW_MAPS, __name__)
 
 PREFIX_INPUT = (
     ROW_MAPS["starts"],
-    Field("q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
-    Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
-    Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
-    Field("vhat", wp.float32, ("dof",), attr="v_hat"),
-    Field("counts", wp.int32, ("world",), attr="slot_counter"),
-    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
+    *LAW,
+    *VELOCITY_LAW,
     Field("velocity_slots", wp.int32, ("velocity_row",), attr="velocity_limit_slot"),
     Field("velocity_signs", wp.float32, ("velocity_row",), attr="velocity_limit_sign"),
-    Field("kind", wp.int32, ("world", "row"), attr="row_type"),
-    Field("parent", wp.int32, ("world", "row"), attr="row_parent"),
-    Field("mu", wp.float32, ("world", "row"), attr="row_mu"),
-    Field("beta", wp.float32, ("world", "row"), attr="row_beta"),
-    Field("cfm", wp.float32, ("world", "row"), attr="row_cfm"),
-    Field("phi", wp.float32, ("world", "row")),
-    Field("target", wp.float32, ("world", "row"), attr="target_velocity"),
-    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution"),
-    Field("rhs", wp.float32, ("world", "row")),
-    Field("gap", wp.float32, attr="joint_limit_activation_gap"),
-    Field("activation", wp.float32, attr="velocity_limit_activation_fraction"),
-    Field("pgs_beta", wp.float32),
-    Field("pgs_cfm", wp.float32),
-    Field("dt", wp.float32, owner="step"),
 )
-"""The keyed prefix's inputs and the dense rows it writes; without joint velocity limits, their tables take
-placeholders."""
+"""The keyed prefix's inputs and the dense rows it writes (:data:`.prefix_rows.LAW`); without joint velocity limits,
+their tables take placeholders."""
 
 PrefixInput = field_group.struct("PrefixInput", PREFIX_INPUT, __name__)
 
