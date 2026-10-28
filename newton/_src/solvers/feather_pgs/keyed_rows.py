@@ -99,11 +99,12 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
         if data.path[contact] == 0 and data.slot[contact] >= 0:
             world = data.world[contact]
             slot = data.slot[contact]
-            mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
             for direction in range(data.slots_needed[contact]):
-                row = slot + direction
-                z.rowkeys[world, row] = contact * 4 + direction
-                if law.patches.enabled != 0:
+                z.rowkeys[world, slot + direction] = contact * 4 + direction
+            if law.patches.enabled != 0:
+                mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
+                for direction in range(data.slots_needed[contact]):
+                    row = slot + direction
                     if direction == 0:
                         data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
                         data.row_parent[world, row] = -1

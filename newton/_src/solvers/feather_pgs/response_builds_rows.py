@@ -2140,7 +2140,11 @@ def factor_contact_rows_kernel(
                         restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
                     else:
                         beta = friction_anchor_beta
-                        phi = friction_patches.phi[c][lane - 1]
+                        # Selected, not indexed by the lane, which would place the pair in local memory.
+                        anchor_phi = friction_patches.phi[c]
+                        phi = anchor_phi[0]
+                        if lane == 2:
+                            phi = anchor_phi[1]
                         mu *= data.friction_scale
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION
                         parent = data.slot[c]
