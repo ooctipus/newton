@@ -561,9 +561,6 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             dfs_order=plan.dfs_order,
             dfs_position=plan.dfs_position,
             dfs_end=plan.dfs_end,
-            fused_augmented_drive=0,
-            drive_row_by_dof=wp.full(model.joint_dof_count, -1, dtype=int, device=device),
-            row_K=wp.zeros(1, dtype=float, device=device),
         )
         inputs = [
             dynamics,

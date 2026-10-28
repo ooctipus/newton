@@ -779,18 +779,19 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "the CUDA trajectory requires CUDA")
     def test_cuda_ordinary_mass_pipeline_matches_cpu_trajectory(self):
-        """Run ordinary dynamics' mass pipeline on CUDA as on the CPU (a revolute root keeps the held tree out)."""
+        """Run ordinary dynamics' drives and mass pipeline on CUDA as on the CPU (a revolute root keeps the held tree
+        out)."""
         model = _build_chain_model(num_links=3, num_worlds=2)
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-        # Streams no longer choose the pipeline: the CPU runs the generic drive preparation and mass pipeline.
         reference = SolverFeatherPGS(
             _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
             enable_joint_limits=False,
             dense_max_constraints=16,
         )
-        self.assertTrue(optimized._parallel_augmented_drive_topology)
         self.assertIsNone(optimized._tree_kinetic_state)
         self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
+        # Both evaluate the drives with the joint forces in one pass and add K after the assembly.
+        self.assertFalse(optimized._parallel_augmented_drive_topology)
         self.assertFalse(reference._parallel_augmented_drive_topology)
 
         q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)

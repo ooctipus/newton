@@ -74,8 +74,9 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         mf_max_constraints=16,
                         pgs_iterations=8,
                     )
-                    # The per-coordinate drive preparation follows the drive mode; streams only overlap it.
-                    self.assertEqual(solver._parallel_augmented_drive_topology, drive_mode == "augmented")
+                    # Ball roots keep the held tree out: ordinary dynamics evaluate the drives with the joint forces.
+                    self.assertIsNone(solver._tree_kinetic_state)
+                    self.assertFalse(solver._parallel_augmented_drive_topology)
                     initial_qd = state.joint_qd.numpy()[dofs].copy()
                     position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
                     following = model.state()

@@ -2282,9 +2282,10 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._jy_world_aliased = False
         self._allocate_common_buffers(model)
-        # Drives are prepared per coordinate, apart from inverse dynamics, on CUDA without gradients wherever each
-        # coordinate has one owning drive row; use_parallel_streams only decides whether that preparation overlaps on
-        # a stream of its own. Elsewhere the joint-force pass evaluates them, as on the CPU.
+        # The per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics) on CUDA
+        # without gradients wherever each coordinate has one owning drive row: the held tree, the sparse factor and
+        # the compact diagonal read them. Ordinary dynamics on dense factors drop them once the held tree declines
+        # (below) and evaluate drives with the joint forces, as on the CPU.
         self._setup_parallel_augmented_drive_topology(
             model,
             model.device.is_cuda
@@ -2594,6 +2595,16 @@ class SolverFeatherPGS(SolverBase):
         from .held_tree import install as install_held_tree  # noqa: PLC0415
 
         install_held_tree(self)
+        # Ordinary dynamics on dense factors take the CPU's drive pass and layout (_stage1_drives: the joint forces
+        # and the drives in one launch, K added after the assembly); the per-coordinate drive rows stay where the
+        # held tree, the sparse factor or the compact diagonal reads them. use_parallel_streams overlaps their
+        # preparation with FK/ID on a stream of its own.
+        readers = (self._tree_kinetic_state, self._sparse_mass_matrix_size, self._compact_diagonal_mass_size)
+        if all(reader is None for reader in readers):
+            self._parallel_augmented_drive_topology = False
+        self._articulation_dynamics_stream = (
+            wp.Stream(model.device) if self._parallel_augmented_drive_topology and self.use_parallel_streams else None
+        )
         if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
             self._scalar_branches = None
             if self._tree_kinetic_state is None:
@@ -5726,9 +5737,6 @@ class SolverFeatherPGS(SolverBase):
             and self._pgs_solve_local_pair_kernels
             else None
         )
-        self._articulation_dynamics_stream = (
-            wp.Stream(model.device) if self._parallel_augmented_drive_topology and self.use_parallel_streams else None
-        )
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
         # they fork after response preparation and join before publication.
@@ -7504,7 +7512,6 @@ class SolverFeatherPGS(SolverBase):
         arrays = self._arrays
         values.setdefault("write_inertia_records", 0)
         values.setdefault("add_existing_tau", 0)
-        values.setdefault("fused_augmented_drive", int(self._parallel_augmented_drive_topology))
         if state is None:
             for name in ("joint_q", "joint_qd"):
                 values.setdefault(name, arrays.placeholder(wp.float32))
@@ -7648,7 +7655,8 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         drive_rows_ready: wp.Event | None,
     ) -> wp.Event | None:
-        """Complete ``joint_tau``: the separately prepared drives' plus inverse dynamics, or the fused pass."""
+        """Complete ``joint_tau``: the CPU's one pass of joint forces and drives, or inverse dynamics added onto
+        the per-coordinate drives (the sparse factor and the compact diagonal under ordinary dynamics)."""
         if getattr(self, "_tree_kinetic_state", None) is not None:
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
@@ -7765,8 +7773,7 @@ class SolverFeatherPGS(SolverBase):
                 refresh_body_inertia, dim=model.joint_count, inputs=[dynamics], block_dim=128, device=model.device
             )
 
-        # The immutable drive layout gives CRBA direct DOF-to-row ownership.
-        # Make the dynamic coefficients visible before any fused mass write.
+        # The per-coordinate drives' coefficients, prepared on the dynamics stream, before any mass write reads them.
         if drive_rows_ready is not None:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
@@ -7846,26 +7853,23 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
                 block_dim=128,
             )
-
-        if not self._parallel_augmented_drive_topology:
-            for size in self.size_groups:
-                n_arts = self.n_arts_by_size[size]
-                wp.launch(
-                    apply_augmented_mass_diagonal_grouped,
-                    dim=n_arts,
-                    inputs=[
-                        self.group_to_art[size],
-                        self.articulation_dof_start,
-                        size,
-                        self.articulation_max_dofs,
-                        self.mass_update_mask,
-                        self.aug_row_counts,
-                        self.aug_row_dof_index,
-                        self.aug_row_K,
-                    ],
-                    outputs=[self.H_by_size[size]],
-                    device=model.device,
-                )
+            # K after the assembly, through the rows of either drive layout.
+            wp.launch(
+                apply_augmented_mass_diagonal_grouped,
+                dim=n_arts,
+                inputs=[
+                    self.group_to_art[size],
+                    self.articulation_dof_start,
+                    size,
+                    self.articulation_max_dofs,
+                    self.mass_update_mask,
+                    self.aug_row_counts,
+                    self.aug_row_dof_index,
+                    self.aug_row_K,
+                ],
+                outputs=[self.H_by_size[size]],
+                device=model.device,
+            )
 
         self._mass_update_requested.zero_()
 

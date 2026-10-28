@@ -120,7 +120,6 @@ DYNAMICS = (
     # The launch's switches.
     Field("write_inertia_records", wp.int32, owner="step"),
     Field("add_existing_tau", wp.int32, owner="step"),
-    Field("fused_augmented_drive", wp.int32, owner="step"),
 )
 """Everything the dynamics passes read and write, by owner role: ``model``; the solver (the default);
 ``state``, whose coordinates the passes read and to which they publish poses and COM twists; ``aug``, the
@@ -423,7 +422,6 @@ class _Column:
     group: int
     col: int
     first_dof: int
-    column_dof: int
     H_group: wp.array3d[float]
 
 
@@ -443,12 +441,6 @@ def _mass_entries(ancestor: int, pivot: int, force: wp.spatial_vector, d: Dynami
     for k in range(first, count):
         row = local + k
         value = wp.dot(d.joint_S_s[q_start + k], force)
-        if d.fused_augmented_drive != 0 and row == column.col:
-            drive_row = d.drive_row_by_dof[column.column_dof]
-            if drive_row >= 0:
-                K = d.row_K[drive_row]
-                if K > 0.0:
-                    value += K
         column.H_group[column.group, row, column.col] = value
         column.H_group[column.group, column.col, row] = value
 
@@ -508,7 +500,6 @@ def crba_fill(
     column.group = group
     column.col = col
     column.first_dof = first_dof
-    column.column_dof = column_dof
     column.H_group = H_group
     force = column_force(pivot, column_dof, records, d)
     _MASS_COLUMN(joint_start, pivot, force, d.dfs_order, d.dfs_position, d.dfs_end, d, column)
