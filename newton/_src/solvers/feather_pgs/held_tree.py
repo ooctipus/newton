@@ -107,12 +107,8 @@ def decline(solver) -> str | None:
         return "The FK/ID cache is unavailable."
     if sparse and not (solver.pgs_mode == "matrix_free" or solver._sparse_split):
         return "The sparse factor's group serves the matrix-free and sparse split sweeps."
-    if not (
-        solver._async_augmented_drives
-        and solver._parallel_augmented_drive_topology
-        and solver._articulation_dynamics_stream is not None
-    ):
-        return "The held tree needs the per-coordinate drive preparation on the dynamics stream (CUDA streams)."
+    if not (solver._async_augmented_drives and solver._parallel_augmented_drive_topology):
+        return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
     if solver._debug_buffers_enabled:
         return "Debug buffers keep the ordinary dynamics."
     if sparse:

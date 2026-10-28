@@ -490,7 +490,7 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
     from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
 
     device = model.device
-    solver = SolverFeatherPGS(model, use_parallel_streams=False)
+    solver = SolverFeatherPGS(model, use_parallel_streams=False, cached_dynamics="off")
     state, control = model.state(), model.control()
     aug = solver._prepare_augmented_state(state, model.state(), control)
     rng = np.random.default_rng(seed)

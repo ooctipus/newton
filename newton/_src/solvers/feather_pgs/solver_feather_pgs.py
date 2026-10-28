@@ -1548,8 +1548,9 @@ class SolverFeatherPGS(SolverBase):
                 warn, have no effect and select the ``auto`` kernel.
             pgs_chunk_size (int, optional): Deprecated compatibility argument. It tuned the removed
                 streaming kernel; a value other than ``None`` warns and has no effect. Defaults to None.
-            use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
-                Defaults to True.
+            use_parallel_streams (bool, optional): Overlap independent work on separate CUDA streams: the
+                size groups, and the drive preparation beside inverse dynamics. It never selects the
+                dynamics evaluator. Defaults to True.
             drive_mode (str, optional): Joint target drive implementation.
                 ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
                 that folds drive stiffness into the articulated mass matrix.
@@ -2293,9 +2294,10 @@ class SolverFeatherPGS(SolverBase):
             model.device.is_cuda and not model.requires_grad and np.any(response_articulations)
         )
         self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
+        # Drives are prepared apart from inverse dynamics (per coordinate where the topology allows) on CUDA without
+        # gradients; use_parallel_streams only decides whether that preparation overlaps on a stream of its own.
         self._async_augmented_drives = bool(
-            self.use_parallel_streams
-            and model.device.is_cuda
+            model.device.is_cuda
             and not model.requires_grad
             and self.drive_mode == "augmented"
             and self.articulation_max_dofs > 0
@@ -5874,7 +5876,9 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
-        self._articulation_dynamics_stream = wp.Stream(model.device) if self._async_augmented_drives else None
+        self._articulation_dynamics_stream = (
+            wp.Stream(model.device) if self._async_augmented_drives and self.use_parallel_streams else None
+        )
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
         # they fork after response preparation and join before publication.
@@ -7782,8 +7786,9 @@ class SolverFeatherPGS(SolverBase):
 
         model = self.model
         dynamics_stream = self._articulation_dynamics_stream
-        dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
-        with wp.ScopedStream(dynamics_stream, sync_enter=False):
+        if dynamics_stream is not None:
+            dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
+        with wp.ScopedStream(dynamics_stream or wp.get_stream(model.device), sync_enter=False):
             scalar = getattr(self._tree_kinetic_state, "scalar", None)
             if scalar is not None:
                 # Scalar branches evaluate their drives in their predict.
@@ -7831,7 +7836,7 @@ class SolverFeatherPGS(SolverBase):
                     block_dim=SERIAL_BLOCK_DIM,
                     device=model.device,
                 )
-        return dynamics_stream.record_event()
+        return None if dynamics_stream is None else dynamics_stream.record_event()
 
     def _launch_rigid_tau(
         self, state_in: State, state_aug: State, control: Control, *, add_to_existing: bool = False
@@ -7855,19 +7860,20 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         drive_rows_ready: wp.Event | None,
     ) -> wp.Event | None:
-        """Complete ``joint_tau`` through async inverse dynamics or the fused fallback."""
+        """Complete ``joint_tau``: the separately prepared drives' plus inverse dynamics, or the fused pass."""
         if getattr(self, "_tree_kinetic_state", None) is not None:
-            if drive_rows_ready is None:
-                raise RuntimeError("Tree kinetic state requires asynchronous augmented-drive preparation")
             # joint_tau currently holds only u0. Current external/control/bias
             # contributions are added by the retained-W predictor after waiting.
             return drive_rows_ready
-        if drive_rows_ready is None:
+        if not self._async_augmented_drives:
             self._stage1_drives(state_in, state_aug, control, dt)
             return None
 
         model = self.model
         dynamics_stream = self._articulation_dynamics_stream
+        if dynamics_stream is None:
+            self._launch_rigid_tau(state_in, state_aug, control, add_to_existing=True)
+            return None
         dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(dynamics_stream, sync_enter=False):
             self._launch_rigid_tau(state_in, state_aug, control, add_to_existing=True)

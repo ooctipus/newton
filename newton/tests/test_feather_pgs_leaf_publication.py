@@ -124,6 +124,7 @@ def _solver(model, *, mode="split"):
         pgs_iterations=8,
         update_mass_matrix_interval=2,
         use_parallel_streams=False,
+        cached_dynamics="off",
     )
     # Exercise the production cached Stage 7 on CPU, where it is normally off.
     if model.device.is_cpu:

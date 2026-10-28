@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 from newton.solvers import SolverFeatherPGS
 
 
-def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
+def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False, device=None):
     chain = newton.ModelBuilder()
     hx = 0.3
     joints = []
@@ -57,7 +57,7 @@ def _build_chain_model(num_links=3, num_worlds=2, *, with_free_body=False):
         chain.add_articulation([chain.add_joint_free(parent=-1, child=body)])
     main = newton.ModelBuilder()
     main.replicate(chain, num_worlds, spacing=(3.0, 3.0, 0.0))
-    return main.finalize()
+    return main.finalize(device=device)
 
 
 def _build_fixed_base_star_model(num_branches=16, num_worlds=2):
@@ -786,14 +786,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "topology-owned CRBA requires CUDA")
     def test_topology_owned_crba_matches_generic_trajectory(self):
-        """Match the generic mass pipeline while fusing topology-known factorization."""
+        """Match the generic mass pipeline (the CPU's) while fusing topology-known factorization on CUDA."""
         model = _build_chain_model(num_links=3, num_worlds=2)
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        # Streams no longer choose the pipeline: the CPU runs the generic drive preparation and mass pipeline.
         reference = SolverFeatherPGS(
-            model,
+            _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
             enable_joint_limits=False,
             dense_max_constraints=16,
-            use_parallel_streams=False,
         )
         self.assertTrue(optimized._parallel_augmented_drive_topology)
         self.assertIsNotNone(optimized._crba_cholesky_warp_kernels_by_size[3])
@@ -803,6 +803,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         qd = np.tile(np.array([0.1, -0.05, 0.2], dtype=np.float32), 2)
         trajectories = []
         for solver in (optimized, reference):
+            model = solver.model
             state_0, state_1 = model.state(), model.state()
             state_0.joint_q.assign(q)
             state_0.joint_qd.assign(qd)
@@ -817,9 +818,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 history.append((state_0.joint_q.numpy().copy(), state_0.joint_qd.numpy().copy()))
             trajectories.append(history)
 
+        # The reference runs on the CPU, whose float order differs (velocities about 1e-5 relative after 5 steps).
         for fused, generic in zip(*trajectories, strict=True):
-            np.testing.assert_allclose(fused[0], generic[0], rtol=0.0, atol=2.0e-6)
-            np.testing.assert_allclose(fused[1], generic[1], rtol=0.0, atol=2.0e-6)
+            np.testing.assert_allclose(fused[0], generic[0], rtol=0.0, atol=5.0e-6)
+            np.testing.assert_allclose(fused[1], generic[1], rtol=0.0, atol=5.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
     def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
