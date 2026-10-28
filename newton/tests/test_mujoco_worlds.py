@@ -35,7 +35,6 @@ from gpu_components.directory_data import (
     InstanceStatus,
 )
 from gpu_components.field_data import FieldStorage
-from gpu_components.graph_data import GraphUpdateTable
 from warp._src import capture_allocation
 
 import newton.solvers
@@ -88,6 +87,7 @@ def _population_view(group, prototype_index=0):
         prototype_index,
         group.model,
         group.data,
+        group.execution_data,
         group.world_storage.capacity,
         group.contact_storage.capacity,
         wp.upper_bound(group.count_parameters[2]),
@@ -178,10 +178,10 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
                 self.assertIsNot(bindings[first][1], bindings[second][1])
             self.assertNotIn(bindings[4][1].ptr, (bindings[0][1].ptr, bindings[1][1].ptr))
             self.assertEqual([owner.capacity for owner in group.transient_storages], [4, 8, 12])
-            signature = native._binding_signature(group)
+            signature = native._storage_signature(group)
             column = group.transient_storages[0].arrays["0"]
             group.transient_storages[0].arrays["0"] = wp.empty_like(column)
-            self.assertNotEqual(signature, native._binding_signature(group))
+            self.assertNotEqual(signature, native._storage_signature(group))
             with self.assertRaisesRegex(ValueError, "Prepared storage or count descriptors changed"):
                 native._validate_population(group)
             group.transient_storages[0].arrays["0"] = column
@@ -300,7 +300,7 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
             body = ast.parse(textwrap.dedent(inspect.getsource(record))).body[0].body
             self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in body))
         self.assertTrue(
-            {"execution_data", "updates", "bindings", "transient_storages", "transient_arrays"}
+            {"execution_data", "transient_storages", "transient_arrays"}
             <= _MuJoCoWorldPopulation.__dataclass_fields__.keys()
         )
         self.assertFalse(
@@ -335,8 +335,10 @@ class MuJoCoWorldsHostTests(unittest.TestCase):
         capture_source = inspect.getsource(mujoco_worlds_capture)
         self.assertIn("record_launches=True", capture_source)
         self.assertIn("record_memory_operations=True", capture_source)
-        self.assertIn("_bind_native_program", capture_source)
-        self.assertIn("graph_ops.adopt_launches", capture_source)
+        self.assertIn("wp.capture_update_counts", capture_source)
+        self.assertNotIn("adopt_launches", capture_source)
+        self.assertNotIn("application_bindings", inspect.signature(mujoco_worlds_capture).parameters)
+        self.assertFalse({"updates", "bindings"} & _MuJoCoWorldPopulation.__dataclass_fields__.keys())
         self.assertIn("group.application_ranges = None", capture_source)
 
     def test_base_import_does_not_require_optional_native_components(self):
@@ -500,22 +502,9 @@ assert 'worlds' not in newton.__all__
         )
         group.view = _population_view(group)
         population._populations, population.populations = [group], (group.view,)
-        group.updates = GraphUpdateTable(
-            enable_count=scalar,
-            enable_count_maximum=2,
-            device=population.device,
-            binding_capacity=2,
-            binding_stride_bytes=120,
-            bindings=wp.empty(240, dtype=wp.uint8, device="cpu"),
-            binding_count=wp.zeros(1, dtype=wp.int32, device="cpu"),
-            errors=wp.zeros(2, dtype=wp.int32, device="cpu"),
-            _library=None,
-            _captured_nodes={},
-        )
-        retired_program = (weakref.ref(group.updates),)
-        retired_buffers = tuple(
-            weakref.ref(getattr(group.updates, name)) for name in ("bindings", "binding_count", "errors")
-        )
+        group.execution_data = wp.zeros(3, dtype=wp.int32, device="cpu")
+        group.view.execution_data = group.execution_data
+        retired_buffers = (weakref.ref(group.execution_data),)
         borrowed_view = group.view
         attempts = []
 
@@ -548,7 +537,7 @@ assert 'worlds' not in newton.__all__
             with self.assertRaisesRegex(RuntimeError, "retirement failed"):
                 mujoco_worlds_close(population, streams=(stream,))
             gc.collect()
-            for reference in (*retired_program, *retired_buffers):
+            for reference in retired_buffers:
                 self.assertIsNone(reference(), "An invalid borrowed view must not retain retired program buffers")
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 mujoco_world_population_validate(borrowed_view)
@@ -557,9 +546,9 @@ assert 'worlds' not in newton.__all__
             report = mujoco_worlds_memory_report(population)["populations"][0]
             self.assertEqual(
                 report["retired_subowners"],
-                ["initialization_transfer", "compaction_transfer", "updates"],
+                ["initialization_transfer", "compaction_transfer"],
             )
-            for name in ("initialization", "compaction", "compacted_fields", "graph_updates"):
+            for name in ("initialization", "compaction", "compacted_fields"):
                 self.assertIsNone(report[name], name)
             self.assertEqual(report["contact_storage"], {"owner": "contact_storage"})
             self.assertEqual(report["transient_storages"]["ccd"], {"owner": "ccd_scratch"})
@@ -610,7 +599,7 @@ assert 'worlds' not in newton.__all__
             directory_ops.allocate_results(2, device="cpu"),
         )
         with (
-            patch.object(graph_ops, "prepare_updates", side_effect=[object(), RuntimeError("preparation failed")]),
+            patch.object(native.wp, "load_module", side_effect=RuntimeError("preparation failed")),
             patch.object(native.wp, "get_stream", return_value=object()),
             patch.object(native.wp, "synchronize_stream"),
             self.assertRaisesRegex(RuntimeError, "preparation failed"),
@@ -640,7 +629,7 @@ assert 'worlds' not in newton.__all__
         )
         population._populations = [group]
         with (
-            patch.object(graph_ops, "prepare_updates", side_effect=original),
+            patch.object(native.wp, "load_module", side_effect=original),
             self.assertRaises(BaseExceptionGroup) as caught,
         ):
             mujoco_worlds_capture(
@@ -698,7 +687,7 @@ assert 'worlds' not in newton.__all__
                 np.testing.assert_array_equal(step.numpy(), [advance * stepping])
                 np.testing.assert_array_equal(poses.numpy(), [advance])
 
-    def test_graph_update_error_latches_health_and_ignores_unused_entries(self):
+    def test_graph_update_error_latches_health(self):
         """Reject active updater errors before physics and keep the quarantine sticky."""
         healthy = wp.ones(1, dtype=int, device="cpu")
         batch = InstanceBatchResult()
@@ -706,20 +695,19 @@ assert 'worlds' not in newton.__all__
         batch.consumed = wp.ones(1, dtype=int, device="cpu")
         batch.advance_allowed = wp.ones(1, dtype=int, device="cpu")
         batch.status = wp.zeros(1, dtype=int, device="cpu")
-        count = wp.array([2], dtype=int, device="cpu")
-        errors = wp.array([0, 0, -1], dtype=int, device="cpu")
-        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, batch], device="cpu")
+        errors = wp.zeros(3, dtype=int, device="cpu")
+        wp.launch(native._guard_graph_updates, 3, [errors, healthy, batch], device="cpu")
         np.testing.assert_array_equal(healthy.numpy(), [1])
         np.testing.assert_array_equal(batch.advance_allowed.numpy(), [1])
         np.testing.assert_array_equal(batch.status.numpy(), [0])
         errors.assign(np.array([0, -1, 0], dtype=np.int32))
-        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, batch], device="cpu")
+        wp.launch(native._guard_graph_updates, 3, [errors, healthy, batch], device="cpu")
         np.testing.assert_array_equal(healthy.numpy(), [0])
         np.testing.assert_array_equal(batch.consumed.numpy(), [1])
         np.testing.assert_array_equal(batch.advance_allowed.numpy(), [0])
         np.testing.assert_array_equal(batch.status.numpy(), [int(InstanceStatus.PHASE_INVALID)])
         errors.zero_()
-        wp.launch(native._guard_graph_updates, 3, [errors, count, healthy, batch], device="cpu")
+        wp.launch(native._guard_graph_updates, 3, [errors, healthy, batch], device="cpu")
         np.testing.assert_array_equal(healthy.numpy(), [0])
 
     def test_graph_updates_and_global_guards_precede_every_native_condition(self):
@@ -742,7 +730,7 @@ assert 'worlds' not in newton.__all__
         ]
         self.assertEqual(len(scopes), 1)
         stages = []
-        for name in ("record_update", "_guard_graph_updates", "_execution_conditions", "record_population"):
+        for name in ("capture_update_counts", "_guard_graph_updates", "_execution_conditions", "record_population"):
             matches = [
                 index
                 for index, statement in enumerate(scopes[0].body)
@@ -754,7 +742,7 @@ assert 'worlds' not in newton.__all__
             ]
             self.assertEqual(len(matches), 1, f"One complete capture phase must own {name}")
             statement = scopes[0].body[matches[0]]
-            if name == "record_update":
+            if name == "capture_update_counts":
                 self.assertIsInstance(statement, ast.If)
                 self.assertEqual(ast.unparse(statement.test), "not discovering")
                 statement = statement.body[0]
@@ -764,8 +752,11 @@ assert 'worlds' not in newton.__all__
                 self.assertIsInstance(statement, ast.Expr)
                 self.assertIsInstance(statement.value, ast.Call)
                 self.assertIsInstance(statement.value.func, ast.Attribute)
-                self.assertEqual(statement.value.func.attr, "capture_parallel")
-                self.assertEqual(statement.value.func.value.id, "graph_ops")
+                expected = {
+                    "capture_update_counts": ("wp", "capture_update_counts"),
+                    "_guard_graph_updates": ("wp", "launch"),
+                }.get(name, ("graph_ops", "capture_parallel"))
+                self.assertEqual((statement.value.func.value.id, statement.value.func.attr), expected)
             stages.append(matches[0])
         self.assertEqual(stages, sorted(set(stages)), "Execution phases must be distinct and ordered")
 
@@ -1981,19 +1972,6 @@ class PopulationRecorderTests(unittest.TestCase):
         group.ccd_count = group.transient_storages[2].protected_count
         group.execution_data = SimpleNamespace(qpos=group.data.qpos)
         group.view = _population_view(group, 3)
-        updates = GraphUpdateTable(
-            enable_count=group.world_storage.protected_count,
-            enable_count_maximum=17,
-            device=wp.get_device("cpu"),
-            binding_capacity=16,
-            binding_stride_bytes=0,
-            bindings=None,
-            binding_count=None,
-            errors=None,
-            _library=None,
-            _captured_nodes={},
-        )
-        group.updates = updates
         kernel = SimpleNamespace(
             key="named_counts",
             func=SimpleNamespace(__module__="test", __qualname__="named_counts"),
@@ -2077,7 +2055,7 @@ class PopulationRecorderTests(unittest.TestCase):
         """Reject same-object CCD count mutations even when no CCD array owns the scalar."""
         group, _, _ = self.group()
         group.transient_storages = (None, None, None)
-        group.storage_signature = native._binding_signature(group)[0:2]
+        group.storage_signature = native._storage_signature(group)
         population = MuJoCoWorlds(
             device=wp.get_device("cpu"),
             _directory=object(),
@@ -2111,7 +2089,7 @@ class PopulationRecorderTests(unittest.TestCase):
     def test_public_count_validation_does_not_visit_private_scratch(self):
         """Borrowed-count reads stay independent of the private scratch relation checked by service."""
         group, _, _ = self.group()
-        group.storage_signature = native._binding_signature(group)[0:2]
+        group.storage_signature = native._storage_signature(group)
         population = MuJoCoWorlds(device=wp.get_device("cpu"), _directory=object(), _populations=[group])
         with patch.object(
             native, "_population_count_signature", side_effect=AssertionError("count descriptors inspected")
@@ -2119,7 +2097,7 @@ class PopulationRecorderTests(unittest.TestCase):
             self.assertEqual(mujoco_world_population_ready_capacity(group.view), 4)
             with self.assertRaisesRegex(AssertionError, "count descriptors inspected"):
                 mujoco_world_population_validate(group.view)
-        with patch.object(native, "_binding_signature", side_effect=AssertionError("private storage inspected")):
+        with patch.object(native, "_storage_signature", side_effect=AssertionError("private storage inspected")):
             mujoco_world_population_validate(group.view)
             for service in (mujoco_worlds_grow_backing, mujoco_worlds_resize_backing):
                 with self.subTest(service=service.__name__):
@@ -2155,7 +2133,7 @@ class PopulationRecorderTests(unittest.TestCase):
                     self.assertEqual(mujoco_world_population_ready_capacity(view), 4)
                 setattr(view, name, original)
                 mujoco_world_population_validate(view)
-        group.storage_signature = native._binding_signature(group)[0:2]
+        group.storage_signature = native._storage_signature(group)
         count = view.world_live_count
         original_shape = count.shape
         try:
@@ -2167,7 +2145,7 @@ class PopulationRecorderTests(unittest.TestCase):
             count.shape = original_shape
         mujoco_world_population_validate(view)
 
-    def _capture(self, group, *, publication=None, extra_groups=(), validate_population=None, **callbacks):
+    def _capture(self, group, *, extra_groups=(), validate_population=None, **callbacks):
         """Run the real composition root with CPU records and mocked native graph mechanics."""
         import mujoco_warp as mjw
 
@@ -2188,7 +2166,6 @@ class PopulationRecorderTests(unittest.TestCase):
         self.records.clear()
         self.native_kernel = object()
         self.native_records = []
-        self.adopted = []
         self.invalidations = []
         self.contact_invalidations = []
         self.conditional_recordings = []
@@ -2197,10 +2174,6 @@ class PopulationRecorderTests(unittest.TestCase):
         def native_bind(owner, graph, records):
             self.assertIn(owner, groups)
             self.native_records.extend(records)
-
-        def application_bind(updates, graph, records, **relations):
-            self.adopted.append((records, relations))
-            return ()
 
         def invalidate(graph):
             if graph.graph_exec is not None:
@@ -2245,12 +2218,8 @@ class PopulationRecorderTests(unittest.TestCase):
                     "capture_get_memory_operations",
                     {"side_effect": lambda graph: tuple(self.memory_operations)},
                 ),
-                (graph_ops, "prepare_updates", {"side_effect": [owner.updates for owner in groups]}),
+                (native.wp, "capture_update_counts", {}),
                 (graph_ops, "capture_parallel", {"side_effect": lambda branches: [branch() for branch in branches]}),
-                (graph_ops, "record_update", {}),
-                (graph_ops, "adopt_launches", {"side_effect": application_bind}),
-                (graph_ops, "bind", {}),
-                (graph_ops, "instantiate_and_upload", {"side_effect": publication}),
                 (graph_ops, "invalidate", {"side_effect": invalidate}),
                 (directory_ops, "begin", {}),
                 (directory_ops, "publish_admissible_slots", {}),
@@ -2264,7 +2233,7 @@ class PopulationRecorderTests(unittest.TestCase):
                     "invalidate_contact_cache",
                     {"side_effect": lambda data: self.contact_invalidations.append((data, condition_stack[-1]))},
                 ),
-                (native, "_bind_native_program", {"side_effect": native_bind}),
+                (native, "_validate_native_memory", {"side_effect": native_bind}),
             ):
                 stack.enter_context(patch.object(target, name, **options))
             stack.enter_context(patch.object(native.wp, "ScopedCapture", side_effect=scoped_capture))
@@ -2282,105 +2251,26 @@ class PopulationRecorderTests(unittest.TestCase):
             self.assertIs(condition, consumed)
         self.assertEqual(sum(condition is consumed for condition in self.conditional_recordings), 1)
 
-    def test_later_application_binding_cannot_mutate_an_already_bound_population(self):
-        """Revalidate every population after the final callback compiler and before graph publication."""
-        first, kernel, _ = self.group()
+    def test_later_callback_cannot_mutate_an_earlier_population(self):
+        """Revalidate every population after the final callback and before graph publication."""
+        first, _, _ = self.group()
         second, _, _ = self.group()
         compiled = []
-        publication = Mock()
 
-        def compile_application(view, records):
+        def callback(view):
             compiled.append(view)
             if view is second.view:
                 first.view.world_live_count = second.view.world_live_count
-            return (), (), tuple(range(len(records)))
 
         with self.assertRaisesRegex(ValueError, "count source changed"):
             self._capture(
                 first,
                 extra_groups=(second,),
-                before_step=lambda view: wp.launch(kernel, 17),
-                application_bindings=compile_application,
+                before_step=callback,
                 validate_population=lambda owner: mujoco_world_population_validate(owner.view),
-                publication=publication,
             )
         self.assertEqual(compiled, [first.view, second.view])
-        publication.assert_not_called()
-        self.assertEqual(self.invalidations, [self.graph])
         self.assertTrue(self.population._service_failed)
-
-    def test_publication_failure_preserves_created_execution_ownership_and_quarantines(self):
-        """Preserve publication errors and quarantine without invalidating a retained executable."""
-        for created in (False, True):
-            with self.subTest(created=created):
-                group, _, _ = self.group()
-                failure = RuntimeError("completion failed" if created else "instantiation failed")
-                executable = object() if created else None
-
-                def publication(updates, graph, executable=executable, failure=failure):
-                    graph.graph_exec = executable
-                    graph._preparation_failed = True
-                    raise failure
-
-                with self.assertRaises(RuntimeError) as caught:
-                    self._capture(group, publication=publication)
-                self.assertIs(caught.exception, failure)
-                self.assertIs(self.graph.graph_exec, executable)
-                self.assertEqual(self.invalidations, [] if created else [self.graph])
-                np.testing.assert_array_equal(self.population._healthy.numpy(), [0])
-                self.assertTrue(self.population._service_failed)
-                with self.assertRaisesRegex(RuntimeError, "closed or its backing service failed"):
-                    mujoco_worlds_validate(self.population)
-                self.assertIsNone(group.before_step)
-                self.assertIsNone(group.after_substep)
-
-    def test_application_compiler_receives_only_exact_callback_records(self):
-        """The same kernel can bind two call sites to different numeric populations."""
-        group, kernel, _ = self.group()
-
-        def callback(population):
-            wp.launch(kernel, 17)
-            wp.launch(kernel, 17)
-
-        def compile_application(population, records):
-            self.assertIs(population, group.view)
-            self.assertEqual(len(records), 2)
-            self.assertTrue(all(record.kernel is kernel for record in records))
-            return ((0, 0, population.world_live_count), (1, 0, population.contact_storage_ready_count)), (), ()
-
-        self._capture(group, before_step=callback, application_bindings=compile_application)
-        records, relations = self.adopted[0]
-        self.assertIs(relations["extents"][0][2], group.world_storage.protected_count)
-        self.assertIs(relations["extents"][1][2], group.contact_count)
-        self.assertTrue(all(record.kernel is self.native_kernel for record in self.native_records))
-        self.assertTrue(all(any(record is candidate for candidate in self.records) for record in records))
-        self.assertIsNone(group.application_ranges)
-
-    def test_known_native_kernel_in_callback_still_requires_application_compiler(self):
-        """A physics catalog identity does not authorize application-owned records."""
-        from mujoco_warp._src import sleep
-
-        group, _, _ = self.group()
-        with self.assertRaisesRegex(ValueError, "require application_bindings"):
-            self._capture(group, before_step=lambda population: wp.launch(sleep._wake_collision_kernel, 17))
-        self.assertEqual(self.adopted, [])
-        self.assertIsNone(group.application_ranges)
-
-    def test_application_compiler_rejects_wrong_kernel_identity(self):
-        """Application count declarations are supplied after checking exact code identity."""
-        group, kernel, _ = self.group()
-
-        def compile_application(population, records):
-            if any(record.kernel is not kernel for record in records):
-                raise ValueError("Unexpected application kernel")
-            return (), (), tuple(range(len(records)))
-
-        with self.assertRaisesRegex(ValueError, "Unexpected application kernel"):
-            self._capture(
-                group, before_step=lambda population: wp.launch(object(), 17), application_bindings=compile_application
-            )
-        self.assertEqual(self.adopted, [])
-        self.assertIsNone(group.application_ranges)
 
     def test_application_memory_operations_require_storage_admission(self):
         """Count declarations alone cannot authorize full-capacity fills into unbacked storage."""
@@ -2390,11 +2280,8 @@ class PopulationRecorderTests(unittest.TestCase):
             wp.launch(kernel, 17)
             self.memory_operations.append(SimpleNamespace(launch=self.records[-1]))
 
-        compiler = Mock(return_value=((), (), (0,)))
         with self.assertRaisesRegex(NotImplementedError, "storage admission"):
-            self._capture(group, before_step=callback, application_bindings=compiler)
-        compiler.assert_not_called()
-        self.assertEqual(self.adopted, [])
+            self._capture(group, before_step=callback)
 
     def test_lifecycle_memory_operations_require_storage_admission(self):
         """Initializer/validator arrays do not inherit native population storage permissions."""
@@ -2409,7 +2296,6 @@ class PopulationRecorderTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(NotImplementedError, "Lifecycle fills/copies"):
                     self._capture(group, **{phase: callback})
-                self.assertEqual(self.adopted, [])
 
     def test_plain_callback_launches_keep_exact_intervals_and_numeric_sources(self):
         """Repeated kernels and equal capacities do not merge application ownership."""
@@ -2431,7 +2317,6 @@ class PopulationRecorderTests(unittest.TestCase):
         self.assertEqual(first.application_ranges, [(1, 2), (3, 4)])
         self.assertEqual(second.application_ranges, [(5, 6), (7, 8)])
         for group in (first, second):
-            self.assertEqual(group.bindings, [])
             self.assertIsNotNone(group.before_step)
             self.assertIsNotNone(group.after_substep)
         self.assertTrue(all(self.records[index].kernel is kernel for index in (1, 3, 5, 7)))
@@ -2822,7 +2707,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
             permit = wp.zeros(1, dtype=int, device=device)
             try:
                 graph = mujoco_worlds_capture(population, commands, results, permit=permit, substeps=2)
-                graph_id = int(graph.graph_exec.value)
+                graph_id = int(graph.graph.value)
                 commands.sequence.fill_(1)
                 commands.count.fill_(4)
                 commands.operation.fill_(_CREATE)
@@ -2857,7 +2742,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 shrunk = backing_ops.memory_report(population._backing)
                 self.assertEqual(shrunk["physical_retained_bytes"], full["physical_retained_bytes"])
                 self.assertLess(shrunk["mapped_bytes"], full["mapped_bytes"])
-                self.assertEqual(int(graph.graph_exec.value), graph_id)
+                self.assertEqual(int(graph.graph.value), graph_id)
                 reference = mjw.replicate_data(prepared[0][1], 1)
                 permit.fill_(1)
                 wp.capture_launch(graph)
@@ -3043,7 +2928,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                             world_capacities=(4,),
                             id_capacity=2,
                             command_capacity=2,
-                            memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                            memory_budget_bytes=128 * 1024**2 if storage == "vmm" else None,
                             initial_world_ready_capacities=(0,) if storage == "vmm" else None,
                         )
                     commands = directory_ops.allocate_commands(2, device=device)
@@ -3133,13 +3018,20 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 )
             granule = probe._backing.granularity_bytes
             widths = tuple(
-                owner.row_stride_bytes * (1, group.contact_quota, group.ccd_quota)[domain]
+                tuple(
+                    width * (1, group.contact_quota, group.ccd_quota)[domain]
+                    for width in (
+                        owner.row_stride_bytes,
+                        *(owner.fields[name].row_payload_bytes for name in owner.dense_reservations),
+                    )
+                    if width
+                )
                 for owner, domain in native._storage_domains(group)
                 if owner.backing is not None
             )
 
             def required(rows, widths=widths):
-                return sum((rows * width + granule - 1) // granule * granule for width in widths)
+                return sum((rows * width + granule - 1) // granule * granule for spans in widths for width in spans)
 
             target = next(n for n in range(2, 129) if required(n, widths[:-1]) >= required(1))
             budget = required(target, widths[:-1])
@@ -3201,7 +3093,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
         self.assertEqual(device.uuid, os.environ["NEWTON_TEST_CUDA_UUID"])
         with wp.ScopedDevice(device):
             prepared = [_prototype(6, mujoco, mjw, convex=True)]
-            budget, capacity = 32 * 1024**2, 128
+            budget, capacity = 64 * 1024**2, 128
             population = mujoco_worlds_prepare(
                 prepared,
                 world_capacities=(capacity,),
@@ -3236,7 +3128,14 @@ class TestMuJoCoWorlds(unittest.TestCase):
 
                 def mapped_bytes(n):
                     return tuple(
-                        (n * quota * owner.row_stride_bytes + granule - 1) // granule * granule
+                        sum(
+                            (n * quota * width + granule - 1) // granule * granule
+                            for width in (
+                                owner.row_stride_bytes,
+                                *(owner.fields[name].row_payload_bytes for name in owner.dense_reservations),
+                            )
+                            if width
+                        )
                         for owner, quota in zip(owners, quotas, strict=True)
                     )
 
@@ -3326,7 +3225,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         world_capacities=(8, 8),
                         id_capacity=4,
                         command_capacity=4,
-                        memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                        memory_budget_bytes=128 * 1024**2 if storage == "vmm" else None,
                         initial_world_ready_capacities=(0, 0) if storage == "vmm" else None,
                     )
                     graph = None
@@ -3382,7 +3281,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                         world_capacities=(8, 8),
                         id_capacity=4,
                         command_capacity=4,
-                        memory_budget_bytes=64 * 1024**2 if storage == "vmm" else None,
+                        memory_budget_bytes=128 * 1024**2 if storage == "vmm" else None,
                         initial_world_ready_capacities=(0, 0) if storage == "vmm" else None,
                     )
                     graph = None
@@ -3422,13 +3321,11 @@ class TestMuJoCoWorlds(unittest.TestCase):
             )
             permit, injected = wp.zeros(1, dtype=int, device=device), wp.zeros(1, dtype=int, device=device)
             calls = [wp.zeros(2, dtype=int, device=device) for _ in prepared]
-            original, recorded = graph_ops.record_update, []
+            original = wp.capture_update_counts
 
-            def inject(updater, stream=None):
-                original(updater, stream=stream)
-                recorded.append(updater)
-                if len(recorded) == 2:
-                    wp.launch(_inject_graph_update_error, 1, [updater.errors, injected], device=device)
+            def inject(counts, sources, *, errors, stream=None):
+                original(counts, sources, errors=errors, stream=stream)
+                wp.launch(_inject_graph_update_error, 1, [errors, injected], device=device)
 
             class Task:
                 def __init__(self, buffers):
@@ -3437,25 +3334,19 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 def before_step(self, group):
                     wp.launch(_record_control, 1, inputs=[self.buffers[group.prototype_index]])
 
-                def application_bindings(self, group, launches):
-                    if any(record.kernel is not _record_control for record in launches):
-                        raise ValueError("Unexpected control kernel")
-                    return (), (), tuple(range(len(launches)))
-
             task = Task(calls)
             task_reference, array_references = weakref.ref(task), [weakref.ref(array) for array in calls]
 
             graph = None
             try:
                 wp.load_module(module=__name__, device=device)
-                with patch.object(graph_ops, "record_update", inject):
+                with patch.object(wp, "capture_update_counts", inject):
                     graph = mujoco_worlds_capture(
                         population,
                         commands,
                         results,
                         permit=permit,
                         before_step=task.before_step,
-                        application_bindings=task.application_bindings,
                         retain=(injected, *calls),
                     )
                 del task, calls
@@ -3468,7 +3359,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 for group in population._populations:
                     self.assertIsNone(group.before_step)
                     self.assertIsNone(group.after_substep)
-                graph_id = int(graph.graph_exec.value)
+                graph_id = int(graph.graph.value)
                 commands.sequence.fill_(1)
                 commands.count.fill_(4)
                 commands.operation.fill_(_CREATE)
@@ -3489,14 +3380,14 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     wp.synchronize_stream(wp.get_stream(device))
                     self.assertEqual(population._healthy.numpy()[0], 0)
                     self.assertEqual(population.batch_result.status.numpy()[0], int(InstanceStatus.PHASE_INVALID))
-                    self.assertEqual(int(graph.graph_exec.value), graph_id)
+                    self.assertEqual(int(graph.graph.value), graph_id)
                     for p, group in enumerate(population._populations):
                         np.testing.assert_array_equal(calls[p].numpy(), [0, 0])
                         self.assertEqual(group.step_condition.numpy()[0], 0)
                         self.assertEqual(group.kinematics_condition.numpy()[0], 0)
                         self.assertEqual(group.move_count.numpy()[0], 0)
-                        errors = group.updates.errors.numpy()[: len(group.bindings)]
-                        self.assertEqual(np.count_nonzero(errors), int(p == 1 and injection_enabled))
+                        errors = wp.capture_get_count_update_errors(graph).numpy()
+                        self.assertEqual(np.count_nonzero(errors), injection_enabled)
                         for name, value in saved[p].items():
                             np.testing.assert_array_equal(getattr(_prefix(group.data, 2), name).numpy(), value)
             except BaseException as error:
@@ -3568,12 +3459,13 @@ class TestMuJoCoWorlds(unittest.TestCase):
                     initialize=payload,
                     retain=(calls, offset, initialized_calls),
                 )
-                executable = int(graph.graph_exec.value)
+                self.assertIsNone(graph.graph_exec)
                 commands.sequence.fill_(1)
                 commands.count.fill_(6)
                 commands.operation.fill_(int(InstanceOperation.CREATE))
                 commands.prototype.assign(np.array([0, 0, 0, 1, 1, 1], dtype=np.int32))
                 replay()
+                executable = int(graph.graph_exec.value)
                 np.testing.assert_array_equal(results.status.numpy(), np.zeros(6, dtype=np.int32))
                 d = population.directory
                 populations, slots, generations = d.prototype.numpy(), d.slot.numpy(), d.generation.numpy()
@@ -3618,7 +3510,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 np.testing.assert_array_equal(calls.numpy(), [2, 4])
                 for group, n, old in zip(population._populations, counts, saved, strict=True):
                     assert np.all(_prefix(group.data, int(n)).time.numpy() > old["time"])
-                    assert not group.updates.errors.numpy()[: len(group.bindings)].any()
+                    assert not wp.capture_get_count_update_errors(graph).numpy().any()
                 permit.zero_()
                 commands.sequence.fill_(3)
                 commands.count.zero_()
@@ -3838,18 +3730,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
 
         def after_substep(group):
             calls, sticky = counters[group.prototype_index]
-            wp.launch(_record_substep, group.world_capacity, inputs=[group.data.overflow, sticky, calls])
-
-        def application_bindings(group, launches):
-            extents, fixed = [], []
-            for index, record in enumerate(launches):
-                if record.kernel is _record_control:
-                    fixed.append(index)
-                elif record.kernel is _record_substep:
-                    extents.append((index, 0, group.world_live_count))
-                else:
-                    raise ValueError("Unexpected dynamics-test callback kernel")
-            return tuple(extents), (), tuple(fixed)
+            wp.launch(_record_substep, group.execution_data.nworld, inputs=[group.data.overflow, sticky, calls])
 
         with ExitStack() as probe:
             if require_convex:
@@ -3894,10 +3775,9 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 substeps=2,
                 before_step=before_step,
                 after_substep=after_substep,
-                application_bindings=application_bindings,
                 retain=(valid, offset, permit, *(array for pair in counters for array in pair), *convex_observed),
             )
-        graph_id = int(graph.graph_exec.value)
+        executable = None
         addresses = [(group.data.qpos.ptr, group.data.site_xpos.ptr) for group in population.populations]
         for group in population.populations:
             self.assertGreater(group.data.site_xpos.shape[1], 0)
@@ -3910,8 +3790,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
             owner = population._populations[group.prototype_index]
             self.assertIsNone(owner.before_step)
             self.assertIsNone(owner.after_substep)
-            self.assertIsNotNone(owner.updates)
-            self.assertTrue(owner.bindings)
+            self.assertTrue(wp.capture_get_count_bound_launches(graph))
             self.assertFalse(hasattr(group, "world_storage"))
             self.assertFalse(hasattr(group, "updates"))
         labels, previous, expected_calls = {}, {}, np.zeros((2, 2), dtype=np.int32)
@@ -4057,7 +3936,9 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 self.assertEqual(counters[p][1].numpy()[0], 0)
             self.assertEqual(population.batch_result.status.numpy()[0], int(InstanceStatus.OK))
             previous = after
-            self.assertEqual(graph_id, int(graph.graph_exec.value))
+            if executable is None:
+                executable = int(graph.graph_exec.value)
+            self.assertEqual(executable, int(graph.graph_exec.value))
             self.assertEqual(addresses, [(g.data.qpos.ptr, g.data.site_xpos.ptr) for g in population.populations])
         for prototype, observed in enumerate(convex_observed):
             ccd, contacts = observed.numpy()
@@ -4087,7 +3968,7 @@ class TestMuJoCoWorlds(unittest.TestCase):
                 view = _prefix(group.data, int(count))
                 np.testing.assert_array_equal(view.qpos.numpy(), expected[0])
                 np.testing.assert_array_equal(view.time.numpy(), expected[1])
-            self.assertEqual(graph_id, int(graph.graph_exec.value))
+            self.assertEqual(executable, int(graph.graph_exec.value))
         return {
             "passed": True,
             "invalid_count_batches": 2,

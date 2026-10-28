@@ -9,7 +9,6 @@ Native Data is authoritative; this root owns no dense Newton State mirror.
 
 from __future__ import annotations
 
-import sys
 import traceback
 import weakref
 from contextlib import nullcontext
@@ -66,11 +65,9 @@ def _withdraw_native_counts(
 
 
 @wp.kernel
-def _guard_graph_updates(
-    errors: wp.array[int], count: wp.array[int], healthy: wp.array[int], batch: InstanceBatchResult
-):
+def _guard_graph_updates(errors: wp.array[int], healthy: wp.array[int], batch: InstanceBatchResult):
     index = wp.tid()
-    if index < count[0] and errors[index] != 0:
+    if errors[index] != 0:
         wp.atomic_min(healthy, 0, 0)
         wp.atomic_min(batch.advance_allowed, 0, 0)
         wp.atomic_max(batch.status, 0, int(InstanceStatus.PHASE_INVALID))
@@ -261,8 +258,8 @@ def _population_count_signature(group):
     )
 
 
-def _binding_signature(group):
-    """Freeze this composition's exact storage, parameter and updater relations."""
+def _storage_signature(group):
+    """Freeze this composition's exact storage and count-operand relations."""
     return (
         _population_count_signature(group),
         (
@@ -283,8 +280,6 @@ def _binding_signature(group):
             tuple(_array_signature(array) for array in group.transient_arrays),
             tuple(id(parameter) for parameter in group.count_parameters),
         ),
-        id(group.updates),
-        id(group.bindings),
     )
 
 
@@ -294,11 +289,9 @@ def _validate_population(group):
 
     if group.recording_failed:
         raise RuntimeError("The population program has a failed recording")
-    signature = _binding_signature(group)
-    if signature[0:2] != group.storage_signature:
+    signature = _storage_signature(group)
+    if signature != group.storage_signature:
         raise ValueError("Prepared storage or count descriptors changed")
-    if group.binding_signature is not None and signature != group.binding_signature:
-        raise ValueError("Prepared storage, count or graph bindings changed")
     for owner, _ in _storage_domains(group):
         if owner.closed or owner.service_failed:
             raise RuntimeError("Native population storage is closed or quarantined")
@@ -309,8 +302,8 @@ def _validate_population(group):
         mujoco_world_population_validate(group.view)
 
 
-def _bind_native_program(group, graph, launches):
-    """Bind one population's exact native operations to its admitted count sources."""
+def _validate_native_memory(group, graph, launches):
+    """Validate native memory operands against this population's admitted storage."""
     _validate_population(group)
     storages = tuple(owner for owner, _ in _storage_domains(group))
     count_sources = tuple(
@@ -332,18 +325,6 @@ def _bind_native_program(group, graph, launches):
         storages,
         count_sources=count_sources,
         fixed_arrays=tuple(array for array in (*group.global_arrays.values(), *group.transient_arrays) if array.size),
-    )
-    fixed = tuple(
-        i for i, record in enumerate(launches) if not record.extent_parameters and not record.scalar_parameters
-    )
-    group.bindings.extend(
-        graph_ops.adopt_launches(
-            group.updates,
-            graph,
-            launches,
-            count_sources=count_sources,
-            fixed=fixed,
-        )
     )
 
 
@@ -368,6 +349,8 @@ class MuJoCoWorldPopulation:
     """Borrowed native Model containing this prototype's constants."""
     data: mujoco_warp.Data
     """Borrowed native Data; descriptors stay fixed during the population lifetime."""
+    execution_data: mujoco_warp.Data
+    """The same arrays with symbolic W/C/D counts for captured callback launches."""
     world_capacity: int
     """Reserved world slots, independently of live membership and readiness."""
     contact_capacity: int
@@ -405,7 +388,6 @@ class _MuJoCoWorldPopulation:
     execution_data: object = None
     count_parameters: tuple = ()
     metadata_signature: tuple | None = None
-    binding_signature: tuple | None = None
     storage_signature: tuple | None = None
     recording_failed: bool = False
     substeps: int = 1
@@ -414,8 +396,6 @@ class _MuJoCoWorldPopulation:
     refresh_kinematics: bool = True
     initialization_transfer: object = None
     compaction_transfer: object = None
-    updates: object = None
-    bindings: list = field(default_factory=list)
     data_defaults: dict = field(default_factory=dict)
     application_ranges: list[tuple[int, int]] | None = None
     request_indices: object = None
@@ -489,7 +469,11 @@ def _population_owner(population):
 def mujoco_world_population_validate(population: MuJoCoWorldPopulation) -> None:
     """Validate experimental borrowed descriptors before preparing their consumers."""
     owner = _population_owner(population)
-    if owner.data is not population.data or owner.model is not population.model:
+    if (
+        owner.data is not population.data
+        or owner.execution_data is not population.execution_data
+        or owner.model is not population.model
+    ):
         raise ValueError("Borrowed native population descriptors changed")
     if (
         type(population.world_capacity) is not int
@@ -675,8 +659,7 @@ def _prepare_transient_storage(worlds, graph, native_regions):
         if worlds._backing is not None:
             group.retirements = tuple(field_ops.prepare_retirement(owner) for owner, _ in _storage_domains(group))
         _publish_native_counts(group)
-        group.storage_signature = _binding_signature(group)[0:2]
-        group.binding_signature = _binding_signature(group)
+        group.storage_signature = _storage_signature(group)
     return tuple(bindings)
 
 
@@ -717,8 +700,6 @@ def mujoco_worlds_prepare(
         graph and call :func:`mujoco_worlds_close` with every consumer stream.
     """
     worlds = MuJoCoWorlds()
-    if sys.version_info < (3, 11):
-        raise RuntimeError("Experimental MuJoCoWorlds requires Python 3.11 or newer")
     import mujoco_warp as mjw
 
     prepared, world_capacities = tuple(prepared), tuple(world_capacities)
@@ -887,6 +868,7 @@ def mujoco_worlds_prepare(
                     prototype,
                     group.model,
                     group.data,
+                    group.execution_data,
                     capacity,
                     contact_cap,
                     ccd_cap,
@@ -896,7 +878,7 @@ def mujoco_worlds_prepare(
                     group.ccd_count,
                     weakref.ref(group),
                 )
-                group.storage_signature = _binding_signature(group)[0:2]
+                group.storage_signature = _storage_signature(group)
                 start = end
             worlds.populations = tuple(group.view for group in worlds._populations)
             directory_ops.publish_admissible_slots(
@@ -927,7 +909,6 @@ def mujoco_worlds_capture(
     substeps=1,
     before_step=None,
     after_substep=None,
-    application_bindings=None,
     refresh_kinematics=True,
 ):
     """Discover bounded transient allocations, then record one retained executable.
@@ -969,14 +950,9 @@ def mujoco_worlds_capture(
         substeps: Ordered native steps per graph replay.
         before_step: Callback ``(population)`` recording controls once before ordered native steps.
         after_substep: Callback ``(population)`` recording contact consumers after each native step.
-        application_bindings: Preparation operation ``(population, launches)`` returning
-            ``(extents, parameters, fixed)`` for :func:`gpu_components.graph.adopt_launches`.
-            Launches are the exact records emitted by this population's callbacks, in recording
-            order. Check expected kernel identities and declare every local record index;
-            repeated kernels may use different count sources. Required for nonempty callback
-            work. The operation runs after capture and is never retained by the graph.
-            Application and lifecycle callback fills/copies are currently rejected: their
-            storage admission is not established by numerical launch-count declarations.
+            Physics callbacks use ``population.execution_data.nworld``, ``naconmax`` and ``naccdmax``
+            as symbolic launch/scalar operands. Concrete dimensions declare fixed work.
+            Callback fills/copies remain unsupported until their storage admission is explicit.
         refresh_kinematics: Refresh body, geometry and site transforms after valid
             reset-only frames or after the final substep, independently of permit.
 
@@ -996,7 +972,7 @@ def mujoco_worlds_capture(
             raise RuntimeError("Each native population prepares exactly one graph")
         if any(
             callback is not None and not callable(callback)
-            for callback in (validate, initialize, before_step, after_substep, application_bindings)
+            for callback in (validate, initialize, before_step, after_substep)
         ):
             raise TypeError("Payload recording callbacks must be callable")
         if type(substeps) is not int or not 1 <= substeps < 2**31 // 512:
@@ -1021,15 +997,12 @@ def mujoco_worlds_capture(
         native_regions = [[] for _ in worlds._populations]
         population_ranges = [None] * len(worlds._populations)
         invalidation_ranges = []
+        # Discovery needs the same guard structure, but no executable updater. The
+        # unused error tail stays zero; Warp fills the actual prefix after final capture.
+        count_errors = wp.zeros(512 * substeps * len(worlds._populations), dtype=wp.int32, device=worlds.device)
         try:
             for group, ranges in zip(worlds._populations, application_ranges, strict=True):
                 group.substeps, group.refresh_kinematics = substeps, refresh_kinematics
-                group.updates = graph_ops.prepare_updates(
-                    group.world_storage.protected_count,
-                    enable_count_maximum=group.world_storage.capacity,
-                    binding_capacity=512 * substeps,
-                )
-                group.binding_signature = _binding_signature(group)
                 group.application_ranges = ranges
                 group.before_step, group.after_substep = before_step, after_substep
             # Warmed native programs use separate Data. Load lifecycle and row
@@ -1184,28 +1157,27 @@ def mujoco_worlds_capture(
                             lambda group=group: invalidate_contacts(group) for group in worlds._populations
                         ),
                     )
-                    # Every updater must finish and be checked before any prototype
+                    # The count updater must finish and be checked before any prototype
                     # enters its conditional program, including native solver loops.
                     if not discovering:
-                        graph_ops.capture_parallel(
-                            [
-                                lambda group=group: graph_ops.record_update(group.updates)
+                        wp.capture_update_counts(
+                            tuple(parameter for group in worlds._populations for parameter in group.count_parameters),
+                            tuple(
+                                source
                                 for group in worlds._populations
-                            ]
+                                for source in (
+                                    group.world_storage.protected_count,
+                                    group.contact_count,
+                                    group.ccd_count,
+                                )
+                            ),
+                            errors=count_errors,
                         )
-                    graph_ops.capture_parallel(
-                        lambda group=group: wp.launch(
-                            _guard_graph_updates,
-                            group.updates.binding_capacity,
-                            [
-                                group.updates.errors,
-                                group.updates.binding_count,
-                                worlds._healthy,
-                                worlds._directory.batch_result,
-                            ],
-                            device=worlds.device,
-                        )
-                        for group in worlds._populations
+                    wp.launch(
+                        _guard_graph_updates,
+                        count_errors.size,
+                        [count_errors, worlds._healthy, worlds._directory.batch_result],
+                        device=worlds.device,
                     )
                     for prototype, group in enumerate(worlds._populations):
                         wp.launch(
@@ -1291,32 +1263,17 @@ def mujoco_worlds_capture(
                     raise RuntimeError("Application records must belong exactly once to their population range")
                 application_indices = set(indices)
                 if indices:
-                    if application_bindings is None:
-                        raise ValueError("Physics callbacks emitting kernels require application_bindings")
                     records = tuple(launches[index] for index in indices)
                     if any(id(record) in memory_launches for record in records):
                         raise NotImplementedError("Application fills/copies require explicit storage admission")
-                    extents, parameters, fixed = application_bindings(group.view, records)
-                    group.bindings.extend(
-                        graph_ops.adopt_launches(
-                            group.updates,
-                            graph,
-                            records,
-                            extents=extents,
-                            parameters=parameters,
-                            fixed=fixed,
-                        )
-                    )
-                _bind_native_program(
+                _validate_native_memory(
                     group,
                     graph,
                     tuple(launches[index] for index in range(start, end) if index not in application_indices),
                 )
-                graph_ops.bind(group.updates, graph, group.bindings)
-            # The last application's declaration may reference any borrowed population.
+            # The last callback may reference any borrowed population.
             for group in worlds._populations:
                 _validate_population(group)
-            graph_ops.instantiate_and_upload(worlds._populations[0].updates, graph)
             return graph
         except BaseException as failure:
             # This root cannot silently retry partially marked CUDA graph nodes.
@@ -1395,7 +1352,7 @@ def mujoco_worlds_grow_backing(worlds, world_ready_capacities: tuple[int, ...], 
         mujoco_worlds_validate(worlds)
         for group in worlds._populations:
             if group.view is not None:
-                if _binding_signature(group)[0:2] != group.storage_signature:
+                if _storage_signature(group) != group.storage_signature:
                     raise ValueError("Prepared storage or count descriptors changed")
                 mujoco_world_population_validate(group.view)
         if wp.get_device(worlds.device).is_capturing:
@@ -1491,7 +1448,7 @@ def mujoco_worlds_resize_backing(
         mujoco_worlds_validate(worlds)
         for group in worlds._populations:
             if group.view is not None:
-                if _binding_signature(group)[0:2] != group.storage_signature:
+                if _storage_signature(group) != group.storage_signature:
                     raise ValueError("Prepared storage or count descriptors changed")
                 mujoco_world_population_validate(group.view)
         if wp.get_device(worlds.device).is_capturing:
@@ -1616,7 +1573,7 @@ def mujoco_worlds_withdraw_backing(
             raise RuntimeError("Resolve pending backing retirement before another withdrawal")
         for group in worlds._populations:
             if group.view is not None:
-                if _binding_signature(group)[0:2] != group.storage_signature:
+                if _storage_signature(group) != group.storage_signature:
                     raise ValueError("Prepared storage or count descriptors changed")
                 mujoco_world_population_validate(group.view)
             if not group.retirements:
@@ -1794,11 +1751,8 @@ def mujoco_worlds_memory_report(worlds):
                 if group.compaction_transfer is not None
                 else None,
                 "retired_subowners": [
-                    name
-                    for name in ("initialization_transfer", "compaction_transfer", "updates")
-                    if getattr(group, name) is None
+                    name for name in ("initialization_transfer", "compaction_transfer") if getattr(group, name) is None
                 ],
-                "graph_updates": graph_ops.memory_report(group.updates) if group.updates is not None else None,
                 "execution_metadata_bytes": sum(
                     array.capacity
                     for array in (
@@ -1848,11 +1802,11 @@ def mujoco_worlds_close(worlds, *, streams: tuple[wp.Stream, ...]):
             directory_ops.close(worlds._directory, streams=streams)
         for group in worlds._populations:
             group.initialization_transfer = group.compaction_transfer = None
-            group.data = group.execution_data = group.updates = None
-            group.bindings.clear()
-            group.metadata_signature = group.binding_signature = None
+            group.data = group.execution_data = None
+            group.metadata_signature = None
             if group.view is not None:
                 group.view.data = None
+                group.view.execution_data = None
         for group in worlds._populations:
             for owner in (*[owner for owner, _ in _storage_domains(group)], group.default_storage):
                 if owner is not None:

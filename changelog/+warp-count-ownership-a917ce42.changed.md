@@ -1,0 +1,1 @@
+Delegate captured world-count binding to Warp and remove the per-population GPU Components binder. Replace `application_bindings` callbacks with direct `wp.launch` count operands from `MuJoCoWorldPopulation.execution_data`; integer operands remain fixed.
