@@ -53,7 +53,7 @@ from .prefix_rows import LAW, limits, prefix_rows
 from .row_build import _contact_in_sizes, endpoint_projection, populate_contact_J, write_contact_row
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW
-from .step_plan import first_failed
+from .step_plan import JOINT_TOPOLOGY, TopologyPin, first_failed
 
 WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
@@ -443,20 +443,8 @@ def materialize_fallback(
         populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, J_a, J_b)
 
 
-def topology_signature(solver):
-    """Pin only structural indices; enabled flags, coefficients, q and limits stay live."""
-    names = (
-        "constraint_mimic_joint0",
-        "constraint_mimic_joint1",
-        "constraint_mimic_world",
-        "joint_type",
-        "joint_parent",
-        "joint_child",
-        "joint_q_start",
-        "joint_qd_start",
-        "body_flags",
-    )
-    return tuple((name, getattr(solver.model, name).numpy().tobytes()) for name in names)
+TOPOLOGY = (*JOINT_TOPOLOGY, "constraint_mimic_joint0", "constraint_mimic_joint1", "constraint_mimic_world")
+"""The structural model arrays the packets' plan reads; enabled flags, coefficients, q and limits stay live."""
 
 
 def plan(solver):
@@ -545,26 +533,17 @@ class LocalRowPackets:
         self.queue = field_group.bind(QueueData, solver=solver, size=size, status=None)
         self.contact_input = None
         self.law = None
-        self._topology_signature = topology_signature(solver)
+        self._topology = TopologyPin.read(solver.model, TOPOLOGY)
         self._prefix_kernel = get_prefix_kernel(self.primary, self.mimics, self.packets)
 
     def local_factory(self):
         return get_local_factory(self.primary, self.secondary, self.packets)
 
     def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
-        """Validate structural changes without reading back numeric-only updates."""
-        numeric_flags = (
-            ModelFlags.JOINT_DOF_PROPERTIES
-            | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.SHAPE_PROPERTIES
-            | ModelFlags.MODEL_PROPERTIES
+        """Refuse a structural change the packet topology does not survive (:class:`.step_plan.TopologyPin`)."""
+        self._topology.validate(
+            self.solver.model, flags, lambda: topology_supported(self.solver, self.primary, self.mimics), "Row-packet"
         )
-        if flags and not (int(flags) & ~int(numeric_flags)):
-            return
-        if topology_signature(self.solver) != self._topology_signature or not topology_supported(
-            self.solver, self.primary, self.mimics
-        ):
-            raise RuntimeError("Row-packet topology changed; reconstruct the solver to select a complete fallback")
 
     def prepare_prefix(self, state_in, dt):
         """Bind current coefficients/state and the current double-buffered row owners."""

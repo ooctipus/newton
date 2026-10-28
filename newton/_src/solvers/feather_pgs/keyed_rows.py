@@ -35,6 +35,7 @@ from .prefix_rows import LAW, VELOCITY_LAW
 from .row_build import endpoint_projection, write_contact_row
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
+from .step_plan import JOINT_TOPOLOGY, TopologyPin
 
 ROW_MAPS = FieldGroup(
     Field("groups", wp.int32, ("world", "size"), owner="maps"),
@@ -350,19 +351,8 @@ def get_parallel_factory(original, layout):
     return factory
 
 
-def _signature(solver):
-    names = (
-        "joint_type",
-        "joint_parent",
-        "joint_child",
-        "joint_qd_start",
-        "joint_q_start",
-        "joint_dof_dim",
-        "articulation_start",
-        "body_flags",
-        "body_world",
-    )
-    return tuple(getattr(solver.model, name).numpy().tobytes() for name in names)
+TOPOLOGY = (*JOINT_TOPOLOGY, "joint_dof_dim", "articulation_start", "body_world")
+"""The structural model arrays the keyed layout reads."""
 
 
 class KeyedRows:
@@ -381,25 +371,16 @@ class KeyedRows:
         # The placeholders of absent prefix tables, allocated before any capture.
         solver._arrays.placeholder(wp.int32)
         solver._arrays.placeholder(wp.float32)
-        self._signature = _signature(solver)
+        self._topology = TopologyPin.read(solver.model, TOPOLOGY)
         # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
         self.patch = bool(solver._friction_anchors_enabled)
         self.law = patch_row_law(solver)
 
     def validate_notification(self, flags=ModelFlags.ALL):
-        """Reject static-plan changes before retiring any canonical producer."""
-        numeric = (
-            ModelFlags.JOINT_DOF_PROPERTIES
-            | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.SHAPE_PROPERTIES
-            | ModelFlags.MODEL_PROPERTIES
+        """Refuse a structural change the keyed layout does not survive (:class:`.step_plan.TopologyPin`)."""
+        self._topology.validate(
+            self.solver.model, flags, lambda: direct_topology_plan(self.solver)[0] == self.prefix_layout, "Keyed row"
         )
-        if flags and not (int(flags) & ~int(numeric)):
-            return
-        if _signature(self.solver) != self._signature:
-            raise RuntimeError("Keyed row topology changed; reconstruct the solver before notification")
-        if direct_topology_plan(self.solver)[0] != self.prefix_layout:
-            raise RuntimeError("Keyed row topology changed; reconstruct the solver")
 
     def begin_rows(self, state_in, state_aug, dt):
         """Read current motion and predictor with the current held-factor buffers."""

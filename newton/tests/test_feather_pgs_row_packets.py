@@ -571,7 +571,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
         for anchors in (False, True):
             with self.subTest(anchors=anchors):
                 solver = _owner_solver(device, anchors=anchors, beta=0.375 if anchors else 0.0)
-                with mock.patch.object(rp, "topology_signature", return_value=()):
+                with mock.patch.object(rp.TopologyPin, "read", return_value=None):
                     owner = rp.LocalRowPackets(solver, PRIMARY, SECONDARY, 0)
                 for beta in (0.5, 0.125) if anchors else (0.0,):
                     solver.friction_anchor_beta = beta

@@ -22,7 +22,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-__all__ = ["AdmissionFacts", "Route", "SolveRoute", "StepPlan", "first_failed"]
+from ...sim import ModelFlags
+
+__all__ = ["AdmissionFacts", "Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
 
 _GROUPED_VERIFIED_DOFS = 32
 
@@ -67,6 +69,40 @@ class AdmissionFacts:
             regularized=bool(solver._regularization_enabled),
             velocity_limits=bool(solver.enable_joint_velocity_limits),
         )
+
+
+NUMERIC_PROPERTIES = (
+    ModelFlags.JOINT_DOF_PROPERTIES
+    | ModelFlags.BODY_INERTIAL_PROPERTIES
+    | ModelFlags.SHAPE_PROPERTIES
+    | ModelFlags.MODEL_PROPERTIES
+)
+"""The model notifications that change only numbers (coefficients, limits, inertias, shape materials), never a row
+owner's topology."""
+
+JOINT_TOPOLOGY = ("joint_type", "joint_parent", "joint_child", "joint_q_start", "joint_qd_start", "body_flags")
+"""The structural joint and body arrays every row owner's plan reads."""
+
+
+@dataclass(frozen=True)
+class TopologyPin:
+    """The structural model arrays a row owner's plan was built from, read at construction (:meth:`read`)."""
+
+    names: tuple[str, ...]
+    data: tuple[bytes, ...]
+
+    @classmethod
+    def read(cls, model, names) -> TopologyPin:
+        names = tuple(names)
+        return cls(names, tuple(getattr(model, name).numpy().tobytes() for name in names))
+
+    def validate(self, model, flags, holds, owner: str) -> None:
+        """Refuse a notification beyond :data:`NUMERIC_PROPERTIES` that changes a pinned array or after which the
+        owner's own check ``holds()`` fails; a numeric notification reads nothing back."""
+        if flags and not (int(flags) & ~int(NUMERIC_PROPERTIES)):
+            return
+        if TopologyPin.read(model, self.names) != self or not holds():
+            raise RuntimeError(f"{owner} topology changed; reconstruct the solver")
 
 
 @dataclass(frozen=True)
