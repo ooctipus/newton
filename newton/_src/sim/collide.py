@@ -4323,6 +4323,9 @@ class CollisionPipeline:
             mesh_edge_indices=model.mesh_edge_indices,
             mesh_edge_centers=model.mesh_edge_centers,
             mesh_edge_halves=model.mesh_edge_halves,
+            mesh_edge_order=model.mesh_edge_order,
+            mesh_edge_clusters=model.mesh_edge_clusters,
+            mesh_edge_cluster_reach=model.mesh_edge_cluster_reach,
             shape_edge_range=model.shape_edge_range,
             writer_data=writer_data,
             # The demand record flags a pass whose contacts outnumbered the rows.

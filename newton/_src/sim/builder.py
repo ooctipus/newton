@@ -12229,6 +12229,8 @@ class ModelBuilder:
             m._texture_sdf_coarse_textures = compact_texture_sdf_coarse_textures
             m._texture_sdf_subgrid_textures = compact_texture_sdf_subgrid_textures
             m._texture_sdf_subgrid_start_slots = compact_texture_sdf_subgrid_start_slots
+            # The struct table holds raw pointers to these lower-bound tables; keep them alive.
+            m._texture_sdf_cell_lower = [data.cell_lower for data in compact_texture_sdf_data]
 
             # ---------------------
             # heightfield collision data
@@ -12288,11 +12290,16 @@ class ModelBuilder:
             # ---------------------
             # mesh edges (packed array + per-shape slice)
 
+            from ..geometry.sdf_contact import build_mesh_edge_clusters  # noqa: PLC0415
+
             edge_shapes = np.flatnonzero((shape_is_mesh | shape_is_box) & generated_has_source & shape_collides)
             shape_edge_ranges = []  # per shape in edge_shapes
             edge_chunks = []
             edge_center_chunks = []
             edge_half_chunks = []
+            edge_order_chunks = []
+            edge_cluster_chunks = []
+            edge_reach_chunks = []
             edge_offset = 0
             edge_cache = {}  # mesh python id → (start, count)
             scale_cache = {}  # scale python id → (float32 scale, scale key)
@@ -12348,6 +12355,15 @@ class ModelBuilder:
                         edge_half_chunks.append(
                             np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
                         )
+                        # Clusters live at the shape's edge offset, ahead of unused slots.
+                        order, cluster_bounds, cluster_reach = build_mesh_edge_clusters(edge_centers, edge_radii[:, 0])
+                        clusters = np.zeros((count, 4), dtype=np.float32)
+                        clusters[: len(cluster_bounds)] = cluster_bounds
+                        reach = np.zeros(count, dtype=np.float32)
+                        reach[: len(cluster_reach)] = cluster_reach
+                        edge_order_chunks.append(order)
+                        edge_cluster_chunks.append(clusters)
+                        edge_reach_chunks.append(reach)
                     edge_offset += count
                     entry = (start, count)
                     edge_cache[mesh_key] = entry
@@ -12375,6 +12391,21 @@ class ModelBuilder:
                 wp.array(np.concatenate(edge_half_chunks), dtype=wp.vec4, device=device)
                 if edge_offset > 0
                 else wp.zeros(1, dtype=wp.vec4, device=device)
+            )
+            m.mesh_edge_order = (
+                wp.array(np.concatenate(edge_order_chunks), dtype=wp.int32, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.int32, device=device)
+            )
+            m.mesh_edge_clusters = (
+                wp.array(np.concatenate(edge_cluster_chunks), dtype=wp.vec4, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.vec4, device=device)
+            )
+            m.mesh_edge_cluster_reach = (
+                wp.array(np.concatenate(edge_reach_chunks), dtype=wp.float32, device=device)
+                if edge_offset > 0
+                else wp.zeros(1, dtype=wp.float32, device=device)
             )
 
             # ---------------------

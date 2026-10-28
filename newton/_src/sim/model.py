@@ -958,6 +958,20 @@ class Model:
         Components ``xyz`` are shape-scaled half-vectors [m]. Component ``w``
         is a unitless internal endpoint-ownership code.
         """
+        self.mesh_edge_order: wp.array[wp.int32] | None = None
+        """Packed collision-edge indices in cluster order, shape [total_edge_count].
+
+        Within a shape's edge range, cluster ``q`` holds the shape-local edge indices at positions
+        ``[q * EDGE_CLUSTER_SIZE, (q + 1) * EDGE_CLUSTER_SIZE)``.
+        """
+        self.mesh_edge_clusters: wp.array[wp.vec4] | None = None
+        """Packed collision-edge cluster bounds, shape [total_edge_count, 4] [m].
+
+        At a shape's edge offset plus the cluster index: the cluster center ``xyz`` in the
+        shape-scaled frame and, in ``w``, the largest distance from it to a member edge's center.
+        """
+        self.mesh_edge_cluster_reach: wp.array[wp.float32] | None = None
+        """Packed largest member edge radius per cluster, shape [total_edge_count] [m]."""
         self.shape_edge_range: wp.array[wp.vec2i] | None = None
         """Per-shape (start, count) into mesh edge arrays, shape [shape_count]. (-1,0) if no edges."""
         self._shape_mesh_properties: wp.array[wp.int32] | None = None

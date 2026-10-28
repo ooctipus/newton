@@ -3175,6 +3175,9 @@ class NarrowPhase:
             self._empty_edge_indices = wp.zeros(1, dtype=wp.vec2i, device=device)
             self._empty_edge_centers = wp.zeros(1, dtype=wp.vec4, device=device)
             self._empty_edge_halves = wp.zeros(1, dtype=wp.vec4, device=device)
+            self._empty_edge_order = wp.zeros(1, dtype=wp.int32, device=device)
+            self._empty_edge_clusters = wp.zeros(1, dtype=wp.vec4, device=device)
+            self._empty_edge_cluster_reach = wp.zeros(1, dtype=wp.float32, device=device)
             self._empty_edge_range = wp.full(max(num_shapes, 1), (-1, 0), dtype=wp.vec2i, device=device)
             # Indexed by shape id; all-zero means "no watertight bit set" so the
             # sign method falls back to automatic selection (see resolve_mesh_sign_method).
@@ -3373,6 +3376,9 @@ class NarrowPhase:
         mesh_edge_indices: wp.array[wp.vec2i] | None = None,
         mesh_edge_centers: wp.array[wp.vec4] | None = None,
         mesh_edge_halves: wp.array[wp.vec4] | None = None,
+        mesh_edge_order: wp.array[wp.int32] | None = None,
+        mesh_edge_clusters: wp.array[wp.vec4] | None = None,
+        mesh_edge_cluster_reach: wp.array[wp.float32] | None = None,
         shape_edge_range: wp.array[wp.vec2i] | None = None,
         hydroelastic_shape_sdf_data_prepared: bool = False,
         shape_linear_velocity: wp.array[wp.vec3] | None = None,
@@ -3413,6 +3419,11 @@ class NarrowPhase:
             mesh_edge_indices: Packed array of mesh edge vertex pairs for all shapes.
             mesh_edge_centers: Packed precomputed mesh edge centers [m].
             mesh_edge_halves: Packed precomputed mesh edge half-vectors [m].
+            mesh_edge_order: Packed per-shape edge indices in cluster order (see
+                :func:`~newton._src.geometry.sdf_contact.build_mesh_edge_clusters`).
+            mesh_edge_clusters: Packed per-shape edge-cluster centers and spreads [m], at the
+                shape's edge offset.
+            mesh_edge_cluster_reach: Packed per-shape largest edge radius per cluster [m].
             shape_edge_range: Per-shape (start, count) into mesh_edge_indices.
             hydroelastic_shape_sdf_data_prepared: Whether finalized hydroelastic SDF descriptors were cached upstream.
             shape_linear_velocity: Shape-origin linear velocities [m/s]. Required in speculative mode.
@@ -4100,11 +4111,24 @@ class NarrowPhase:
                 texture_sdf_data = wp.zeros(0, dtype=TextureSDFData, device=device)
             if mesh_edge_indices is None:
                 mesh_edge_indices = self._empty_edge_indices
-            has_precomputed_edge_data = mesh_edge_centers is not None and mesh_edge_halves is not None
+            precomputed_edge_data = (
+                mesh_edge_centers,
+                mesh_edge_halves,
+                mesh_edge_order,
+                mesh_edge_clusters,
+                mesh_edge_cluster_reach,
+            )
+            has_precomputed_edge_data = all(array is not None for array in precomputed_edge_data)
             if mesh_edge_centers is None:
                 mesh_edge_centers = self._empty_edge_centers
             if mesh_edge_halves is None:
                 mesh_edge_halves = self._empty_edge_halves
+            if mesh_edge_order is None:
+                mesh_edge_order = self._empty_edge_order
+            if mesh_edge_clusters is None:
+                mesh_edge_clusters = self._empty_edge_clusters
+            if mesh_edge_cluster_reach is None:
+                mesh_edge_cluster_reach = self._empty_edge_cluster_reach
             if shape_edge_range is None:
                 shape_edge_range = self._empty_edge_range
 
@@ -4158,6 +4182,9 @@ class NarrowPhase:
                             mesh_edge_indices,
                             mesh_edge_centers,
                             mesh_edge_halves,
+                            mesh_edge_order,
+                            mesh_edge_clusters,
+                            mesh_edge_cluster_reach,
                             shape_edge_range,
                             self.mesh_mesh_block_offsets,
                             reducer_data,
@@ -4196,6 +4223,9 @@ class NarrowPhase:
                             mesh_edge_indices,
                             mesh_edge_centers,
                             mesh_edge_halves,
+                            mesh_edge_order,
+                            mesh_edge_clusters,
+                            mesh_edge_cluster_reach,
                             shape_edge_range,
                             writer_data,
                             self.num_tile_blocks,
@@ -4509,6 +4539,9 @@ class NarrowPhase:
         mesh_edge_indices = kwargs.pop("mesh_edge_indices", None)
         mesh_edge_centers = kwargs.pop("mesh_edge_centers", None)
         mesh_edge_halves = kwargs.pop("mesh_edge_halves", None)
+        mesh_edge_order = kwargs.pop("mesh_edge_order", None)
+        mesh_edge_clusters = kwargs.pop("mesh_edge_clusters", None)
+        mesh_edge_cluster_reach = kwargs.pop("mesh_edge_cluster_reach", None)
         shape_edge_range = kwargs.pop("shape_edge_range", None)
         if kwargs:
             unknown_keys = sorted(kwargs.keys())
@@ -4598,6 +4631,9 @@ class NarrowPhase:
             mesh_edge_indices=mesh_edge_indices,
             mesh_edge_centers=mesh_edge_centers,
             mesh_edge_halves=mesh_edge_halves,
+            mesh_edge_order=mesh_edge_order,
+            mesh_edge_clusters=mesh_edge_clusters,
+            mesh_edge_cluster_reach=mesh_edge_cluster_reach,
             shape_edge_range=shape_edge_range,
             shape_linear_velocity=shape_linear_velocity,
             shape_angular_velocity=shape_angular_velocity,
