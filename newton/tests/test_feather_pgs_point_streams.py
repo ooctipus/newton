@@ -53,7 +53,6 @@ _PATCH_ONLY = frozenset(
         "friction_patches.link_patch_routes",
         "friction_patches.seed_patch_routes",
         # The resolved-world classifier under persistent patch friction.
-        "kernels.allocate_world_contact_slots_patch_resolved",
         "resolved_worlds.check_raw_contact_normals_by_route",
         "resolved_worlds.finalize_resolved_worlds_bounded",
         "row_build.contact_row_prelude_patch",

@@ -2310,6 +2310,21 @@ def allocate_world_contact_slots(
                 data.slot[c] = -1
                 data.path[c] = -1
                 data.slots_needed[c] = 0
+                if friction_patches.enabled != 0:
+                    # Persistent patch friction releases the anchors of the contacts the complete
+                    # path would give rows (CONTACT_PATH_RESOLVED).
+                    _mark_resolved_patch_contact(
+                        c,
+                        data,
+                        body_to_articulation,
+                        art_to_world,
+                        body_flags,
+                        body_has_response_dofs,
+                        is_free_rigid,
+                        contact_gap_gate,
+                        same_articulation_contact_gap_gate,
+                        articulation_pair_contact_gap_gate,
+                    )
                 continue
         _allocate_world_contact_slot(
             c,
@@ -2339,113 +2354,7 @@ def allocate_world_contact_slots(
         )
 
 
-# Persistent patch friction with the resolved-world classifier: in a world the classifier skips,
-# the twin of the kernel above marks the contacts that kernel would reserve rows for with
-# CONTACT_PATH_RESOLVED, so the patch finish releases their anchors as the complete path does.
-# It differs from that kernel only by the _mark_resolved_patch_contact call.
-@wp.kernel
-def allocate_world_contact_slots_patch_resolved(
-    data: ContactInput,
-    total_num_threads: int,
-    body_to_articulation: wp.array[int],
-    art_to_world: wp.array[int],
-    body_flags: wp.array[wp.int32],
-    body_has_response_dofs: wp.array[int],
-    is_free_rigid: wp.array[int],
-    has_free_rigid: int,
-    contact_gap_gate: float,
-    same_articulation_contact_gap_gate: float,
-    articulation_pair_contact_gap_gate: float,
-    max_constraints: int,
-    mf_max_constraints: int,
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
-    contact_friction_articulation_pairs_only: int,
-    row_capacity_telemetry: int,
-    friction_patches: FrictionPatches,
-    resolved_worlds: wp.array[int],
-    # outputs
-    world_slot_counter: wp.array[int],
-    mf_slot_counter: wp.array[int],
-    dense_dropped_contact_rows: wp.array[int],
-    mf_dropped_contact_rows: wp.array[int],
-    dense_first_rejected_slot: wp.array[int],
-    mf_first_rejected_slot: wp.array[int],
-):
-    """Allocate active contacts with work proportional to the materialized prefix.
-
-    A collision pass clamps :paramref:`contact_count` to the rows its writers
-    filled, every one of them, and flags an overflow in its own capacity
-    status, so the count always describes a materialized prefix.
-
-    Slot counters only grow. A contact whose reservation does not fit records its
-    slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
-    value) instead of rolling the counter back: every later reservation starts at
-    or past that slot, so the finalize kernels truncate the row count there and
-    no accepted contact can hold a slot at or beyond the count. Rolling back
-    raced with concurrent reservations and left accepted rows past the count,
-    which the friction patch links then chained into.
-    """
-    thread = wp.tid()
-    # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
-    total_contacts = data.count[0]
-
-    for c in range(thread, total_contacts, total_num_threads):
-        if resolved_worlds.shape[0] > 0:
-            _body_a, _body_b, art_a, art_b, world = contact_endpoints(
-                data.shape0[c], data.shape1[c], data.shape_body, body_to_articulation, art_to_world
-            )
-            if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
-                # Refresh every active mapping each solve. The original force
-                # converter publishes zero before reading any row for this path.
-                data.world[c] = world
-                data.art0[c] = art_a
-                data.art1[c] = art_b
-                data.slot[c] = -1
-                data.path[c] = -1
-                data.slots_needed[c] = 0
-                _mark_resolved_patch_contact(
-                    c,
-                    data,
-                    body_to_articulation,
-                    art_to_world,
-                    body_flags,
-                    body_has_response_dofs,
-                    is_free_rigid,
-                    contact_gap_gate,
-                    same_articulation_contact_gap_gate,
-                    articulation_pair_contact_gap_gate,
-                )
-                continue
-        _allocate_world_contact_slot(
-            c,
-            data,
-            body_to_articulation,
-            art_to_world,
-            body_flags,
-            body_has_response_dofs,
-            is_free_rigid,
-            has_free_rigid,
-            contact_gap_gate,
-            same_articulation_contact_gap_gate,
-            articulation_pair_contact_gap_gate,
-            max_constraints,
-            mf_max_constraints,
-            enable_friction,
-            contact_friction_gap_threshold,
-            contact_friction_articulation_pairs_only,
-            row_capacity_telemetry,
-            friction_patches,
-            world_slot_counter,
-            mf_slot_counter,
-            dense_dropped_contact_rows,
-            mf_dropped_contact_rows,
-            dense_first_rejected_slot,
-            mf_first_rejected_slot,
-        )
-
-
-# The allocators above reserve each contact's rows with an atomic on its world's counter, so on CUDA a
+# The allocator above reserves each contact's rows with an atomic on its world's counter, so on CUDA a
 # world's rows follow the order in which warps reach that counter, which varies between runs, and an
 # unconverged Gauss-Seidel solve changes with it. Under a deterministic collision pipeline
 # (Contacts.rigid_contacts_pair_sorted) the contacts arrive sorted by (shape0, shape1), and the two kernels

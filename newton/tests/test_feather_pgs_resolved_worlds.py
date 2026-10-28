@@ -114,9 +114,13 @@ _ALLOCATION_SHAPES = ((0, 4), (1, 4), (0, 4), (2, 4), (0, 2), (3, 4))
 _ALLOCATION_LIFT = (0.0, 0.0, 0.5, 0.0, 0.0, 0.0)
 
 
-def _allocate(kernel, resolved):
+def _allocate(kernel, resolved, patch_friction=False):
     """Run one allocator serially over the synthetic contacts; return its per-contact outputs and counters."""
     count = len(_ALLOCATION_SHAPES)
+    patches = FrictionPatches()
+    patches.enabled = int(patch_friction)
+    # Every anchor carries load, so patch friction reserves the rows point friction does.
+    patches.weight = wp.ones(count, dtype=float, device="cpu")
 
     def integers(values):
         return wp.array(values, dtype=wp.int32, device="cpu")
@@ -150,7 +154,7 @@ def _allocate(kernel, resolved):
         "contact_friction_gap_threshold": float("inf"),
         "contact_friction_articulation_pairs_only": 0,
         "row_capacity_telemetry": 0,
-        "friction_patches": FrictionPatches(),
+        "friction_patches": patches,
         "resolved_worlds": integers(resolved),
         "contact_world": integers([-9] * count),
         "contact_slot": integers([-9] * count),
@@ -411,7 +415,7 @@ class TestResolvedWorlds(unittest.TestCase):
         """In a resolved world, mark exactly the contacts the allocator would give rows; leave other worlds alone."""
         complete = _allocate(kernels.allocate_world_contact_slots, [])
         point = _allocate(kernels.allocate_world_contact_slots, [1, 0])
-        patch_friction = _allocate(kernels.allocate_world_contact_slots_patch_resolved, [1, 0])
+        patch_friction = _allocate(kernels.allocate_world_contact_slots, [1, 0], patch_friction=True)
         np.testing.assert_array_equal(complete["contact_slot"] >= 0, [True, False, False, True, False, True])
         np.testing.assert_array_equal(complete["contact_path"], [0, -1, -1, 0, -1, 1])
         world_zero = np.array([True, True, True, False, False, True])
@@ -428,30 +432,6 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
         for name in ("contact_slot", "contact_path", "contact_slots_needed"):
             np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
-
-    def test_patch_allocator_adds_only_the_release_call(self):
-        """Keep the persistent-patch allocator the plain allocator plus one release call in resolved worlds."""
-        base = _definition(kernels.allocate_world_contact_slots)
-        twin = _definition(kernels.allocate_world_contact_slots_patch_resolved)
-        release = _definition(kernels._mark_resolved_patch_contact)
-        calls = [
-            (block, statement)
-            for node in ast.walk(twin)
-            for block in (getattr(node, field, None) for field in ("body", "orelse", "finalbody"))
-            if isinstance(block, list)
-            for statement in block
-            if isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Call)
-            and ast.unparse(statement.value.func) == release.name
-        ]
-        self.assertEqual(len(calls), 1)
-        block, call = calls[0]
-        # The release reads the allocator's operands of the same names, in its own parameter order.
-        self.assertEqual([ast.unparse(argument) for argument in call.value.args], [a.arg for a in release.args.args])
-        self.assertEqual(call.value.keywords, [])
-        block.remove(call)
-        twin.name = base.name
-        self.assertEqual(ast.dump(twin), ast.dump(base))
 
     def test_patch_release_repeats_the_allocator_admission(self):
         """Mark a resolved contact by the allocator's own admission, the checks that precede its row reservation."""

@@ -106,7 +106,6 @@ from .kernels import (
     allocate_physx_drive_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
-    allocate_world_contact_slots_patch_resolved,
     apply_augmented_mass_diagonal_grouped,
     apply_free_root_transport_to_predictor,
     apply_free_root_velocity_corrections,
@@ -9114,13 +9113,8 @@ class SolverFeatherPGS(SolverBase):
 
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
             # give rows are marked so the patch finish releases their anchors (kernels.py).
-            allocator = (
-                allocate_world_contact_slots_patch_resolved
-                if self._friction_anchors_enabled and self._resolved_worlds_owner is not None
-                else allocate_world_contact_slots
-            )
             pool.launch(
-                allocator,
+                allocate_world_contact_slots,
                 contact_build_threads,
                 inputs=[
                     contact_input,
