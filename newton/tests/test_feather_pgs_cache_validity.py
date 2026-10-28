@@ -1752,12 +1752,11 @@ def _mass_matrices(solver):
 
 
 class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
-    def test_unread_sizes_follow_the_factor_routes(self):
-        """Report exactly the sizes stage 2 factors without reading a dense mass matrix, under an owner.
+    def test_stage_two_reads_mass_only_without_an_owner(self):
+        """Under the held tree no stage-2 route reads a dense mass matrix, so the plan lists every size as unread.
 
-        Without an owner the step plan routes a compact size to no factorization and a diagonal, tiled or loop
-        size to one that reads H; under the held tree every size but the compact one takes the held refresh.
-        ``unread_mass_sizes`` lists the sizes no stage-2 route reads H for, under an owner.
+        The held tree's sizes take the held refresh and the compact size no factorization; without an owner the
+        diagonal, tiled and loop routes factor H.
         """
         sizes = (2, 4, 6, 18, 24, 25)
 
@@ -1793,15 +1792,12 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         self.assertEqual(
             {size: route.name for size, route in held.items()}, {2: "none", **dict.fromkeys(sizes[1:], "held")}
         )
-        self.assertEqual(step_plan._unread_mass_sizes(held, held=True), sizes)
         solver._tree_kinetic_state = None
         routes = step_plan._factor(solver)
         self.assertEqual(
             {size: route.name for size, route in routes.items()},
             {2: "none", 4: "diagonal", 6: "loop", 18: "loop", 24: "tiles", 25: "tiles"},
         )
-        self.assertEqual(step_plan._unread_mass_sizes(routes, held=False), ())
-        solver._plan = SimpleNamespace(factor=routes)
         for name in ("_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):
             setattr(solver, name, functools.partial(getattr(SolverFeatherPGS, name), solver))
         launched = []
@@ -1810,11 +1806,13 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             launched.extend(inputs)
 
         with patch.object(wp, "launch", record), patch.object(wp, "launch_tiled", record):
-            for size, route in routes.items():
-                launched.clear()
-                SolverFeatherPGS._stage2_factor(solver, size)
-                reads = any(item is solver.H_by_size[size] for item in launched)
-                self.assertEqual(reads, route.name in step_plan.FACTOR_READS_MASS, f"size {size}")
+            for table, owner in ((held, True), (routes, False)):
+                solver._plan = SimpleNamespace(factor=table)
+                for size, route in table.items():
+                    launched.clear()
+                    SolverFeatherPGS._stage2_factor(solver, size)
+                    reads = any(item is solver.H_by_size[size] for item in launched)
+                    self.assertEqual(reads, not owner and route.name != "none", f"size {size}, owner {owner}")
 
     def test_step_factors_every_size_through_the_plan(self):
         """Dispatch each size's stage-2 factorization in ``step`` through the plan's factor route.

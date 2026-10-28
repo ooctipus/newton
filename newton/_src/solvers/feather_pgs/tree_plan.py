@@ -16,9 +16,9 @@ template tree and a whole model alike):
   so a subtree is the interval ``[position, end)``;
 * the heavy-light decomposition: heavy child, chains, light children and the
   packing of padded chains into warps;
-* ancestor masks over nodes and over each tree's coordinates, from the host
-  root-path scan (:meth:`TreePlan.scan_down`), and how a leaf-to-root walk
-  meets each node (:attr:`TreePlan.up_flags`);
+* the ancestor relation, from the host root-path scan
+  (:meth:`TreePlan.scan_down`), and how a leaf-to-root walk meets each node
+  (:attr:`TreePlan.up_flags`);
 * the fill-free factor pattern of the joint-space inertia
   (:meth:`TreePlan.factor`) and its row support classes
   (:meth:`TreePlan.support_classes`).
@@ -394,23 +394,9 @@ class TreePlan:
         return int(self.jump.shape[0])
 
     @property
-    def level_widths(self) -> np.ndarray:
-        """Nodes of each depth."""
-        return np.diff(self.level_offsets)
-
-    @property
     def dof_node(self) -> np.ndarray:
         """The node owning each coordinate."""
         return expand(self.dofs)[0].astype(np.int32)
-
-    def parent_slots(self, slot: np.ndarray) -> np.ndarray:
-        """Each node's parent's slot, ``slot[parent]``, or ``-1`` at a root.
-
-        A forest of articulations scans body-indexed values through its joints: ``slot`` is each joint's
-        child body, so a joint's parent slot is its parent joint's child body.
-        """
-        slot = np.asarray(slot, dtype=np.int32)
-        return np.where(self.parent >= 0, slot[np.maximum(self.parent, 0)], -1).astype(np.int32)
 
     @property
     def parent_first(self) -> bool:
@@ -434,12 +420,6 @@ class TreePlan:
         flags.setflags(write=False)
         return flags
 
-    def tree_depths(self) -> np.ndarray:
-        """Nodes on the longest root-to-leaf path of each tree, per root (a tree's depth in joints)."""
-        deepest = np.zeros(self.count, dtype=np.int64)
-        np.maximum.at(deepest, self.root_of, self.depth.astype(np.int64) + 1)
-        return deepest[self.roots]
-
     # --- root paths ----------------------------------------------------------------------------------------------
     def scan_down(self, own, combine=np.add) -> np.ndarray:
         """Combine each node's ``own`` value with its ancestors' along its root path, root first.
@@ -454,30 +434,9 @@ class TreePlan:
             total[level_set] = combine(total[self.parent[level_set]], total[level_set])
         return total
 
-    @functools.cached_property
-    def ancestor_mask(self) -> np.ndarray:
-        """Bit ``a`` of node ``i``'s mask is set when ``a`` is ``i`` or one of its ancestors (64 nodes at most)."""
-        if self.count > 64:
-            raise ValueError("Node ancestor masks cover at most 64 nodes")
-        mask = self.scan_down(np.left_shift(np.uint64(1), np.arange(self.count, dtype=np.uint64)), np.bitwise_or)
-        mask.setflags(write=False)
-        return mask
-
     def ancestor_matrix(self) -> np.ndarray:
         """``matrix[i, a]`` tells whether ``a`` is ``i`` or one of its ancestors (a dense square of the nodes)."""
         return self.scan_down(np.eye(self.count, dtype=bool), np.logical_or)
-
-    @functools.cached_property
-    def coordinate_mask(self) -> np.ndarray:
-        """Bits of the coordinates of each node and its ancestors, from its root's first coordinate (64 at most)."""
-        first = self.dof_start[self.root_of].astype(np.int64)
-        low = self.dof_start[:-1].astype(np.int64) - first
-        high = low + self.dofs
-        if np.any(high > 64):
-            raise ValueError("Coordinate masks cover trees of at most 64 coordinates")
-        mask = self.scan_down(bit_range(low, high), np.bitwise_or)
-        mask.setflags(write=False)
-        return mask
 
     # --- heavy chains --------------------------------------------------------------------------------------------
     def chain_packing(self, warps: int = 2) -> ChainPacking | None:

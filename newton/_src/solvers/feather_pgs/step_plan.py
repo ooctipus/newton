@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-__all__ = ["FACTOR_READS_MASS", "AdmissionFacts", "Route", "SolveRoute", "StepPlan", "first_failed"]
+__all__ = ["AdmissionFacts", "Route", "SolveRoute", "StepPlan", "first_failed"]
 
 _GROUPED_VERIFIED_DOFS = 32
 
@@ -81,10 +81,6 @@ class Route:
         return {"route": self.name, "reason": self.reason}
 
 
-FACTOR_READS_MASS = frozenset(("diagonal", "tiles", "tiles_inverse", "loop"))
-"""Factor routes that read the size's dense mass matrix H in stage 2."""
-
-
 @dataclass(frozen=True)
 class SolveRoute:
     """Stages 5 and 6: the branch of ``step()``, the rows the sweep solves and what drives the sweep."""
@@ -124,8 +120,8 @@ class StepPlan:
     """Stage 5 of the matrix-free family: the sizes whose group-layout J and Y are gathered into world layout; none
     where the response is written in world layout, aliases it, or a sparse owner keeps no dense response."""
     unread_mass_sizes: tuple[int, ...]
-    """Sizes whose dense mass matrix no stage reads: under a held-tree owner, the sizes stage 2 factors without
-    H. Their end-of-step clear is skipped."""
+    """Sizes whose dense mass matrix no stage reads: every size under a held-tree owner, which refreshes the factors
+    from its own geometry (stage 2 reads no H). Their end-of-step clear is skipped."""
     jacobian_clear_sizes: tuple[int, ...]
     """End of a double-buffered step: the sizes whose active Jacobian rows are cleared for the buffer's next use;
     none under owners that keep a private Jacobian (local row packets, keyed rows), and never the sparse-diagonal
@@ -153,7 +149,7 @@ class StepPlan:
                 or solver._sparse_mass_matrix_size is not None
             )
             else (),
-            unread_mass_sizes=_unread_mass_sizes(factor, held=held),
+            unread_mass_sizes=tuple(solver.size_groups) if held else (),
             jacobian_clear_sizes=()
             if solver._row_packets is not None or solver._keyed_rows is not None
             else tuple(
@@ -220,12 +216,6 @@ def _factor(solver) -> dict[int, Route]:
             route = "loop", ""
         routes[size] = _route(solver, size, "cholesky_kernel", *route)
     return routes
-
-
-def _unread_mass_sizes(factor: Mapping[int, Route], *, held: bool) -> tuple[int, ...]:
-    """Under a held-tree owner, which refreshes the factors from its own geometry and writes no H, the sizes whose
-    stage-2 route reads no H either; without an owner, stage 1 writes every H."""
-    return tuple(size for size, route in factor.items() if route.name not in FACTOR_READS_MASS) if held else ()
 
 
 def _trisolve(solver) -> dict[int, Route]:

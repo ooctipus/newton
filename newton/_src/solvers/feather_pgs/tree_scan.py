@@ -67,7 +67,7 @@ import numpy as np
 import warp as wp
 
 from . import field_group
-from .device_preludes import DevicePrelude, device_branches, dual_native, lane_group
+from .device_preludes import DevicePrelude, device_branches
 from .field_group import Field
 from .law_source import law_preludes
 from .spatial_laws import SPATIAL, transform_compose, twist_compose
@@ -1082,8 +1082,3 @@ def serial_path(visit):
                 visit(dfs_order[position], node, value, data, context)
 
     return walk
-
-
-def native_scan(text: ScanSource, lanes: int | str, extra: tuple[DevicePrelude, ...] = ()) -> str:
-    """A ``func_native`` snippet of a scan for both devices: the lane group's and the combine's preludes, then it."""
-    return dual_native(text.text, preludes=(lane_group(lanes), *text.preludes, *extra))

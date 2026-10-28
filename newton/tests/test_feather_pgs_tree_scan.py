@@ -27,6 +27,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import tree_scan as ts
+from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
 from newton.tests.feather_pgs_tree_scan_fixture import (
     EXTERNAL,
@@ -251,38 +252,6 @@ class TestTreePlan(unittest.TestCase):
         # A range that starts inside a tree leaves its first joint's ancestor outside: not a group of whole trees.
         with self.assertRaises(ValueError):
             local_parents(ancestor, starts + 1, 8)
-
-    def test_global_forest(self):
-        """A whole model's forest: tree depths (conditioning.articulation_depths) and coordinate supports."""
-        rng = np.random.default_rng(3)
-        parent, dofs = [], []
-        for _ in range(40):
-            start = len(parent)
-            local = _random_forest(rng, int(rng.integers(1, 12)), 1)
-            parent.extend(np.where(local >= 0, local + start, -1))
-            dofs.extend(rng.integers(0, 3, local.size))
-        parent, dofs = np.asarray(parent), np.asarray(dofs)
-        plan = TreePlan.build(parent, dofs)
-        depth = np.ones(parent.size, np.int64)
-        for _ in range(parent.size):
-            deeper = np.where(parent >= 0, depth[np.maximum(parent, 0)] + 1, 1)
-            if np.array_equal(deeper, depth):
-                break
-            depth = deeper
-        tree = np.zeros(parent.size, np.int64)
-        root = plan.root_of
-        np.maximum.at(tree, root, depth)
-        np.testing.assert_array_equal(plan.tree_depths(), tree[plan.roots])
-        # body_mapping.build_body_maps' support: the coordinate bits of a body's joint and its ancestors,
-        # counted from its tree's first coordinate.
-        start = np.concatenate(([0], np.cumsum(dofs)))
-        for node in rng.integers(0, parent.size, 50):
-            bits, walk = 0, int(node)
-            while walk >= 0:
-                for dof in range(start[walk], start[walk + 1]):
-                    bits |= 1 << int(dof - start[root[node]])
-                walk = int(parent[walk])
-            self.assertEqual(int(plan.coordinate_mask[node]), bits)
 
     def test_up_flags_set_every_slot_they_read(self):
         """A descending walk that follows the up flags (the serial up scans' protocol) sums every subtree from slots
@@ -603,7 +572,7 @@ def check_path(test, device):
                 visit="        visits.data[node*count+ancestor]=++rank;",
             )
 
-            @wp.func_native("    int rank=0;\n" + ts.native_scan(scan, 1))
+            @wp.func_native("    int rank=0;\n" + dual_native(scan.text, preludes=(lane_group(1), *scan.preludes)))
             def native_path(plan: ts.ScanPlan, node: int, count: int, visits: wp.array[int]): ...
 
             def run(plan: ts.ScanPlan, count: int, visits: wp.array[int]):
