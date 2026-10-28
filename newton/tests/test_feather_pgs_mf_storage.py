@@ -260,11 +260,12 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
             return _storage(shape, budget, block_count=blocks, sm_count=sms, **request)
 
         large = (2304, 2304, 75)
-        # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses and the packed
-        # row metadata take 128 + 4 * (75 + 3 * 2304) = 28076 bytes; the float metadata streams.
+        # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses, the packed row
+        # metadata and the dense rows' support (3 words of 75 coordinates: 2 * 3 + 1 entries) take
+        # 128 + 4 * (75 + 3 * 2304) + 4 * (2 * 3 + 1) = 28104 bytes; the float metadata streams.
         storage = select(large, 100352, 128)
         self.assertEqual(storage[:3], (False, False, True))
-        self.assertIn("28076 <= 49152 bytes", storage.reason)
+        self.assertIn("28104 <= 49152 bytes", storage.reason)
         self.assertEqual(select(large, 231424, 128)[:3], (False, False, True))
         # A grid of one block per SM is the largest that cannot lose concurrency to the extra bytes.
         self.assertTrue(select(large, 100352, 188).resident_row_metadata)
@@ -273,25 +274,26 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 storage = select(large, 100352, blocks)
                 self.assertEqual(storage[:3], (False, False, False))
                 self.assertIn(f"{blocks}-block grid exceeds one block per SM (188 SMs)", storage.reason)
-        # 48 KiB of static shared memory: 128 + 4 * (5344 + 2 * 2304 + 2304) bytes is exactly the budget.
-        self.assertTrue(select((2304, 2304, 5344), 100352, 128).resident_row_metadata)
-        storage = select((2304, 2304, 5345), 100352, 128)
+        # 48 KiB of static shared memory: 128 + 4 * (5027 + 2 * 2304 + 2304) + 4 * (2 * 158 + 1) bytes (the
+        # support's 158 words) is exactly the budget.
+        self.assertTrue(select((2304, 2304, 5027), 100352, 128).resident_row_metadata)
+        storage = select((2304, 2304, 5028), 100352, 128)
         self.assertFalse(storage.resident_row_metadata)
         self.assertIn("49156 bytes of static shared memory, over the 49152-byte budget", storage.reason)
         # A device that exposes less than 48 KiB sets the budget.
-        self.assertTrue(select(large, 28076, 128).resident_row_metadata)
-        self.assertFalse(select(large, 28075, 128).resident_row_metadata)
-        # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) = 8380 bytes.
+        self.assertTrue(select(large, 28104, 128).resident_row_metadata)
+        self.assertFalse(select(large, 28103, 128).resident_row_metadata)
+        # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) + 4 * (2 * 49 + 1) = 8776 bytes.
         storage = select((256, 37248, 1551), 100352, 32)
         self.assertEqual(storage[:3], (False, True, True))
-        self.assertIn("8380 <= 49152", storage.reason)
-        # Resident MF impulses do not: 22528 of them hold the block at 98492 bytes.
+        self.assertIn("8776 <= 49152", storage.reason)
+        # Resident MF impulses do not: 22528 of them hold the block at 98888 bytes.
         self.assertEqual(select((256, 22528, 1551), 100352, 32)[:3], (False, False, False))
         # Streaming them on request takes their bytes out of the block before the budget is checked.
         storage = select((256, 22528, 1551), 100352, 32, force_stream_mf_impulses=True)
         self.assertEqual(storage[:3], (False, True, True))
         self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", storage.reason)
-        self.assertIn("8380 <= 49152", storage.reason)
+        self.assertIn("8776 <= 49152", storage.reason)
         # The request changes nothing where capacity streams them already, or where nothing is resident to free.
         for shape, blocks in (((256, 37248, 1551), 32), ((2304, 2304, 75), 16384)):
             with self.subTest(shape=shape, blocks=blocks):
