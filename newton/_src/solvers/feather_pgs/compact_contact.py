@@ -21,7 +21,12 @@ from .row_build import write_contact_row
 
 
 def supported(solver) -> bool:
-    """Require the inherited complete sparse contract and its dense-six triple or unit mode."""
+    """Require the inherited complete sparse contract and its dense-six triple or unit mode.
+
+    The sparse-diagonal owner exists only with its fused wide-articulation limits, whose admission already requires
+    augmented drives, no velocity-limit, mimic or connect rows, no debug rows and no pre-elimination: only the dense
+    six position axes keep rows, at most lower + upper for each axis.
+    """
     return bool(
         solver.model.device.is_cuda
         and solver._sparse_diagonal_contact_solve
@@ -29,18 +34,8 @@ def supported(solver) -> bool:
         and solver._sparse_diagonal_response_size > 6
         and (solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units)
         and solver.dense_max_constraints >= 12
-        # The inherited sparse owner fuses all wide-articulation limits. With
-        # augmented (implicit) drives and no other row family, only the dense
-        # six position axes remain: at most lower + upper for each axis.
-        and solver._fused_diagonal_joint_limits
         and 0 <= solver._dense_internal_max_rows <= 12
-        and solver.drive_mode == "augmented"
-        and not solver.enable_joint_velocity_limits
-        and solver._mimic_count == 0
-        and solver._connect_count == 0
         and solver._compact_diagonal_mass_size == solver._sparse_diagonal_response_size
-        and not solver._debug_buffers_enabled
-        and not solver._preelim_active
     )
 
 

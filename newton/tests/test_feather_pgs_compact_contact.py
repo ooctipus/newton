@@ -833,7 +833,12 @@ class TestCompactContact(unittest.TestCase):
                 np.testing.assert_allclose(data.Y.numpy()[group, row], response, rtol=5e-6, atol=4e-6)
 
     def test_exact_mode_admission(self):
-        """Reject incomplete mode compositions before any contact ownership changes."""
+        """Reject incomplete mode compositions before any contact ownership changes.
+
+        The sparse-diagonal owner's own admission (its fused limits: augmented drives, no velocity-limit, mimic or
+        connect rows, no debug rows or pre-elimination) is the owner's, which ``_sparse_diagonal_contact_solve``
+        stands for here.
+        """
         valid = {
             "model": SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
             "_sparse_diagonal_contact_solve": True,
@@ -842,15 +847,8 @@ class TestCompactContact(unittest.TestCase):
             "_sparse_diagonal_contact_triples": True,
             "_sparse_diagonal_contact_units": False,
             "dense_max_constraints": 40,
-            "_fused_diagonal_joint_limits": True,
             "_dense_internal_max_rows": 12,
-            "drive_mode": "augmented",
-            "enable_joint_velocity_limits": False,
-            "_mimic_count": 0,
-            "_connect_count": 0,
             "_compact_diagonal_mass_size": 108,
-            "_debug_buffers_enabled": False,
-            "_preelim_active": False,
         }
         self.assertTrue(compact.supported(SimpleNamespace(**valid)))
         # Patch friction schedules units instead of triples.
@@ -861,14 +859,7 @@ class TestCompactContact(unittest.TestCase):
             ("_sparse_diagonal_dense_size", 7),
             ("_sparse_diagonal_contact_triples", False),
             ("dense_max_constraints", 11),
-            ("_fused_diagonal_joint_limits", False),
             ("_dense_internal_max_rows", 13),
-            ("drive_mode", "physx_pgs"),
-            ("enable_joint_velocity_limits", True),
-            ("_mimic_count", 1),
-            ("_connect_count", 1),
-            ("_debug_buffers_enabled", True),
-            ("_preelim_active", True),
             ("_compact_diagonal_mass_size", None),
         ):
             self.assertFalse(compact.supported(SimpleNamespace(**{**valid, name: value})), name)
