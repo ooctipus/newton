@@ -4,7 +4,7 @@
 
 This API is experimental. It requires CUDA and Python 3.11 or newer. Install Newton's optional `sim` dependencies, including the Apache-2.0 `gpu-components` package. Importing base Newton does not load this optional composition.
 
-The current integration build uses MuJoCo `3.14.1.dev993205559` from `https://py.mujoco.org/`, selected by the repository's uv source and override. MJWarp's current discrete-actuator and `efm` fields are absent from the MuJoCo 3.14.0 release. The application must also select the qualified custom Warp build for recorded counts and allocations.
+The current integration build uses MuJoCo `3.17.1.dev1007121963` from `https://py.mujoco.org/`, selected by the repository's uv source and override. The application must also select the qualified custom Warp build for recorded counts and allocations: [Warp PR #1](https://github.com/ooctipus/warp/pull/1) is merged into `ooctipus/warp:mem_fragmentation` at `3806983b31eff7bc3ec677ee324bc4179c086c33`. Released Warp does not provide the required count-update API. Newton's optional dependency pins select the matching GPU Components and MJWarp revisions; Warp installation remains application-owned.
 
 ## Ownership
 
@@ -12,9 +12,9 @@ The consuming application owns prototype preparation, controls, initialization p
 
 - The standalone `gpu_components.directory` operations own numeric identities, generations, placement and admission. Their records live in `gpu_components.directory_data`.
 - `gpu_components.fields` owns typed allocations and transfer operations. `gpu_components.backing` owns virtual reservations and physical byte mappings. These components have no simulation knowledge.
-- `gpu_components.graph` binds declared counts to captured CUDA kernel nodes. It does not infer field domains or choose physics stages.
+- `gpu_components.graph` retains managed resources and composes parallel capture branches. Warp binds declared counts to captured CUDA kernel nodes; neither layer chooses physics stages.
 - MJWarp owns numerical Data, defaults, alignment requirements and ordinary local scratch allocations. Algorithm-local records such as `SolverContext` remain inside their numerical stages. MJWarp has no GPU Components dependency or storage, readiness, graph-binding or publication manager.
-- Newton owns the admitted feature subset, lifecycle ordering and one update table and binding ledger per population. It records native and application work, then supplies exact launch/count relations to GPU Components.
+- Newton owns the admitted feature subset, lifecycle ordering and storage admission. Native work and callbacks declare symbolic count operands directly; one Warp update point receives the exact W/C/D sources. Warp owns binding and replay resources.
 - Native MJWarp `Data` is the authoritative physical state. There is no dense Newton `State` mirror.
 
 `mjw.array_fields(model_or_data)` yields native paths, borrowed arrays and their declared
@@ -165,33 +165,36 @@ Every consumed lifecycle batch invalidates transient contact indices. Until nati
 
 ## Record controls and observations
 
-Application callbacks use ordinary Warp launches. Count semantics belong to a separate preparation operation:
+Application callbacks declare dynamic counts directly in ordinary Warp launches:
 
 ```python
 def before_step(population):
     wp.launch(
-        apply_controls, (population.world_capacity, control_width),
+        apply_controls,
+        (population.execution_data.nworld, control_width),
         inputs=(population.data.ctrl, controls),
     )
 
 
-def application_bindings(population, launches):
-    if any(record.kernel is not apply_controls for record in launches):
-        raise ValueError("Unexpected application kernel")
-    extents = tuple((index, 0, population.world_live_count) for index in range(len(launches)))
-    return extents, (), ()
-
-
 # Use this call instead of the earlier capture when controls are required.
-graph = mujoco_worlds_capture(
-    runtime, commands, results, before_step=before_step,
-    application_bindings=application_bindings, retain=(controls,),
-)
+graph = mujoco_worlds_capture(runtime, commands, results, before_step=before_step, retain=(controls,))
 ```
 
-`application_bindings` receives exactly this population's callback records, in recording order. It returns the numeric `extents`, `parameters`, and `fixed` relations accepted by `gpu_components.graph.adopt_launches`. Every record needs an explicit declaration. Repeated uses of the same kernel may have different count sources; kernel identity and shape never imply ownership. Scalar bindings use `KernelParameterBinding` with explicit int32 argument slots. Fixed records are declared by local index and must guard their own accesses. Application fills/copies are rejected until their storage admission is explicit.
+`population.execution_data` shares the concrete Data arrays and carries symbolic
+`nworld`, `naconmax` and `naccdmax` operands. Use these identities for dynamic
+launch dimensions or scalar arguments; integer operands declare fixed work.
+There is no `application_bindings` callback or per-population binding ledger.
+Warp binds its canonical launch records at capture completion and creates the
+executable on first replay. It owns update tables and diagnostic buffers;
+Newton supplies count sources and records one error guard before physics.
+Application fills/copies remain rejected until their storage admission is explicit.
 
-`before_step` records controls once; `after_substep` records consumers after each native substep. Preparation validates native descriptors before each step and after the final callback. Optional final kinematics also covers valid reset-only frames. Updater completion and global error guards precede every prototype's conditional program. Compilation operations and numerical callbacks are released after preparation; only explicit data buffers and numeric bindings remain retained.
+`before_step` records controls once; `after_substep` records consumers after each
+native substep. Preparation validates native descriptors before each step and
+after the final callback. Optional final kinematics also covers valid reset-only
+frames. Update completion and the error guard precede every prototype's
+conditional program. Recording callbacks are released after preparation; the
+graph retains count sources and payload owners for replay.
 
 ## Borrow live state and export
 
@@ -224,7 +227,8 @@ The caller excludes concurrent submissions and supplies every consumer stream.
 
 ```python
 mujoco_worlds_grow_backing(
-    runtime, larger_world_ready_capacities,
+    runtime,
+    larger_world_ready_capacities,
     streams=consumer_streams,
 )
 ```
@@ -275,7 +279,8 @@ The application must exclude new submissions and supply every consumer stream. `
 
 ```python
 mujoco_worlds_resize_backing(
-    runtime, requested_world_ready_capacities,
+    runtime,
+    requested_world_ready_capacities,
     streams=consumer_streams,
     spare_bytes=0,
 )
