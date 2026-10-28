@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs import response_builds_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_patch_parity import row_law
 
 
 def _launch_workers(capacity, enabled):
@@ -119,7 +120,7 @@ def _fixture(device, capacity=4353, shared_anchor=0):
 def _launch(values, workers, device):
     """Launch the unchanged source kernel with the selected complete-prefix owner."""
     data, _arrays = contact_input(values, device)
-    values = {**values, "data": data, "total_num_workers": workers}
+    values = {**values, "data": data, "total_num_workers": workers, "law": row_law(values["friction_patches"])}
     kernel = response_builds_rows.sparse_pair_contact_rows_kernel
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
     wp.launch(kernel, dim=workers, inputs=arguments, device=device)

@@ -27,6 +27,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 
@@ -416,7 +417,7 @@ class TestSparseContacts(unittest.TestCase):
                 wp.launch(
                     populate_world_J_for_compact_size,
                     dim=(1, 32),
-                    inputs=[compact, 1, 6, f["group"], f["patches"]],
+                    inputs=[compact, 1, 6, f["group"], row_law(f["patches"])],
                     outputs=[dense],
                     device=device,
                 )
@@ -507,7 +508,7 @@ class TestSparseContacts(unittest.TestCase):
                     wp.launch(
                         prepare_world_contact_rows,
                         dim=workers,
-                        inputs=[reference_data, workers, f["patches"], friction_beta],
+                        inputs=[reference_data, workers, row_law(f["patches"], friction_beta)],
                         device=device,
                     )
                     count = array([7], int)
@@ -592,7 +593,7 @@ class TestSparseContacts(unittest.TestCase):
             row_parent=row_parent,
             **dict(zip(("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"), other, strict=True)),
         )
-        wp.launch(prepare_world_contact_rows, dim=1, inputs=[data, 1, f["patches"], 0.0], device="cpu")
+        wp.launch(prepare_world_contact_rows, dim=1, inputs=[data, 1, row_law(f["patches"])], device="cpu")
         self.assertEqual(row_type.numpy()[0, 0], PGS_CONSTRAINT_TYPE_CONTACT)
         for output in [row_type, row_parent, *other]:
             np.testing.assert_array_equal(output.numpy()[0, 1:], -9)

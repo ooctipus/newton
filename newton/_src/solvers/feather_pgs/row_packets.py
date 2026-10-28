@@ -29,11 +29,10 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import field_group, sweep_routes_local
-from .contact_input import ContactInput
+from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
     contact_bodies,
     contact_friction_points,
-    contact_geometry,
     contact_materials,
     contact_points,
     contact_row_frame,
@@ -390,24 +389,6 @@ def materialize_general_prefix(
 
 
 @wp.func
-def contact_geometry_of(data: ContactInput, contact: int):
-    """Contact ``contact``'s bodies, normal, world points and gap (:func:`.contact_laws.contact_geometry`)."""
-    body0, body1, normal, point0, point1, separation = contact_geometry(
-        contact,
-        data.shape0,
-        data.shape1,
-        data.point0,
-        data.point1,
-        data.normal,
-        data.margin0,
-        data.margin1,
-        data.shape_body,
-        data.body_q,
-    )
-    return body0, body1, normal, point0, point1, separation
-
-
-@wp.func
 def endpoint_projection(
     data: ContactInput, body: int, art: int, size: int, dof: int, point: wp.vec3, direction: wp.vec3
 ):
@@ -586,11 +567,9 @@ def materialize_fallback(
         world = data.world[contact]
         if owner[world] != 0:
             continue
-        body0, body1, normal, point0, point1, _separation = contact_geometry_of(data, contact)
-        tangent0, tangent1 = contact_tangent_basis(normal)
-        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
-        if law.patches.enabled != 0:
-            friction0, friction1 = patch_friction_location(law.patches, contact)
+        body0, body1, normal, point0, point1, _separation, tangent0, tangent1, friction0, friction1 = contact_frame(
+            data, law, contact
+        )
         art0, art1 = data.art0[contact], data.art1[contact]
         group0, group1 = int(-1), int(-1)
         if art0 >= 0 and data.response_dofs[art0] == target_size:

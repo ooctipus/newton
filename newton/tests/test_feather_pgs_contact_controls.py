@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import row_law
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
@@ -339,7 +340,6 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     )
     body_v = wp.zeros((3,), dtype=wp.spatial_vector, device=device)
     prescribed = wp.zeros((1,), dtype=wp.int32, device=device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
     material_mu = wp.array([0.6, 0.8], dtype=wp.float32, device=device)
     material_restitution = wp.array([0.2, 0.4], dtype=wp.float32, device=device)
 
@@ -399,9 +399,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             body_to_joint,
             joint_ancestor,
             joint_qd_start,
-            shape_transform,
-            _disabled_patches(device),  # patch friction off
-            0.0,  # friction_anchor_beta
+            row_law(_disabled_patches(device)),  # point friction
         ],
         outputs=[serial["J"]],
         device=device,
@@ -412,13 +410,13 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     wp.launch(
         prepare_world_contact_rows,
         dim=1,
-        inputs=[compact_input, 1, _disabled_patches(device), 0.0],  # patch friction off
+        inputs=[compact_input, 1, row_law(_disabled_patches(device))],  # point friction
         device=device,
     )
     wp.launch(
         populate_world_J_for_compact_size,
         dim=(1, 32),
-        inputs=[compact_input, 1, 3, art_group_idx, FrictionPatches()],
+        inputs=[compact_input, 1, 3, art_group_idx, row_law(_disabled_patches(device))],
         outputs=[compact["J"]],
         device=device,
     )

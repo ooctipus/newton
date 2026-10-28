@@ -18,11 +18,9 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
-from .contact_input import ContactInput, ContactRoutes
+from .contact_input import ContactInput, ContactRoutes, contact_frame, write_row_record
 from .contact_laws import (
     contact_endpoints,
-    contact_friction_points,
-    contact_geometry,
     contact_materials,
     contact_points,
     contact_responds,
@@ -43,7 +41,7 @@ from .device_preludes import (
     warp_sum,
     warp_sync,
 )
-from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
+from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, PatchRowLaw, patch_normal_load, patch_tangent_row
 from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     disk,
@@ -2595,62 +2593,8 @@ def accumulate_jacobian_row_world(
         curr_joint = joint_ancestor[curr_joint]
 
 
-@wp.func
-def _write_dense_contact_row(
-    c: int,
-    world: int,
-    slot: int,
-    row: int,
-    mu: float,
-    phi: float,
-    restitution: float,
-    target: float,
-    contact_friction_scale: float,
-    pgs_beta: float,
-    pgs_cfm: float,
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
-    world_row_type: wp.array2d[int],
-    world_row_parent: wp.array2d[int],
-    world_row_mu: wp.array2d[float],
-    world_row_beta: wp.array2d[float],
-    world_row_cfm: wp.array2d[float],
-    world_phi: wp.array2d[float],
-    world_target_velocity: wp.array2d[float],
-    world_row_restitution: wp.array2d[float],
-):
-    """Write the metadata of contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents) at ``slot + row``.
-
-    A tangent row carries the patch anchor's tangential displacement as its gap, with
-    ``friction_anchor_beta`` and the scaled friction coefficient.
-    """
-    r = slot + row
-    if row == 0:
-        world_row_type[world, r] = PGS_CONSTRAINT_TYPE_CONTACT
-        world_row_parent[world, r] = -1
-        world_row_mu[world, r] = mu
-        world_row_beta[world, r] = pgs_beta
-        world_phi[world, r] = phi
-        world_row_restitution[world, r] = restitution
-    else:
-        world_row_type[world, r] = PGS_CONSTRAINT_TYPE_FRICTION
-        world_row_parent[world, r] = slot
-        world_row_mu[world, r] = mu * contact_friction_scale
-        world_row_beta[world, r] = friction_anchor_beta
-        world_phi[world, r] = friction_patches.phi[c][row - 1]
-        world_row_restitution[world, r] = 0.0
-    world_row_cfm[world, r] = pgs_cfm
-    world_target_velocity[world, r] = target
-
-
 @wp.kernel
-def prepare_world_contact_rows(
-    data: ContactInput,
-    total_num_threads: int,
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
-    # outputs
-):
+def prepare_world_contact_rows(data: ContactInput, total_num_threads: int, law: PatchRowLaw):
     """Build current metadata inside each allocator-recorded contact row reservation."""
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
@@ -2659,25 +2603,10 @@ def prepare_world_contact_rows(
             continue
         art_a = data.art0[c]
         art_b = data.art1[c]
-        body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
-            c,
-            data.shape0,
-            data.shape1,
-            data.point0,
-            data.point1,
-            data.normal,
-            data.margin0,
-            data.margin1,
-            data.shape_body,
-            data.body_q,
+        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+            data, law, c
         )
         mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-        tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_a, friction_b = contact_friction_points(
-            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
-        )
-        if friction_patches.enabled != 0:
-            friction_a, friction_b = patch_friction_location(friction_patches, c)
         # Allocation owns the row extent; recomputing eligibility can cross a
         # floating-point threshold and overwrite the following contact.
         rows = 1
@@ -2690,29 +2619,7 @@ def prepare_world_contact_rows(
             target = prescribed_target(
                 body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
             )
-            _write_dense_contact_row(
-                c,
-                data.world[c],
-                slot,
-                row,
-                mu,
-                phi,
-                restitution,
-                target,
-                data.friction_scale,
-                data.beta,
-                data.cfm,
-                friction_patches,
-                friction_anchor_beta,
-                data.row_type,
-                data.row_parent,
-                data.row_mu,
-                data.row_beta,
-                data.row_cfm,
-                data.phi,
-                data.target,
-                data.restitution,
-            )
+            write_row_record(data, law, c, data.world[c], slot, row, mu, phi, restitution, target)
 
 
 @wp.kernel
@@ -2721,7 +2628,7 @@ def populate_world_J_for_compact_size(
     total_num_workers: int,
     target_size: int,
     art_group_idx: wp.array[int],
-    friction_patches: FrictionPatches,
+    law: PatchRowLaw,
     # output
     J_group: wp.array3d[float],
 ):
@@ -2736,27 +2643,9 @@ def populate_world_J_for_compact_size(
     for c in range(worker, total_contacts, total_num_workers):
         if data.path[c] != 0 or data.slot[c] < 0 or row >= data.slots_needed[c]:
             continue
-        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
-            c,
-            data.shape0,
-            data.shape1,
-            data.point0,
-            data.point1,
-            data.normal,
-            data.margin0,
-            data.margin1,
-            data.shape_body,
-            data.body_q,
+        body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+            data, law, c
         )
-        tangent0 = wp.vec3(0.0)
-        tangent1 = wp.vec3(0.0)
-        if row > 0:
-            tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_a, friction_b = contact_friction_points(
-            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
-        )
-        if friction_patches.enabled != 0:
-            friction_a, friction_b = patch_friction_location(friction_patches, c)
         direction, p0, p1 = contact_row_frame(
             row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
         )
@@ -2897,124 +2786,6 @@ def mf_contact_row_dot(
     return out
 
 
-@wp.func
-def _populate_world_J_for_size_contact(
-    c: int,
-    total_contacts: int,
-    data: ContactInput,
-    target_size: int,
-    art_group_idx: wp.array[int],
-    body_to_joint: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_qd_start: wp.array[int],
-    shape_transform: wp.array[wp.transform],
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
-    # outputs
-    J_group: wp.array3d[float],
-):
-    """Populate one contact for a specific articulation-size group.
-
-    Each contact may contribute to multiple articulations' Jacobian matrices.
-    Contacts routed to the matrix-free path (contact_path==1) are skipped.
-    """
-    slot = data.slot[c]
-    if data.path[c] != 0 or slot < 0:
-        return
-    art_a = data.art0[c]
-    art_b = data.art1[c]
-    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
-        c,
-        data.shape0,
-        data.shape1,
-        data.point0,
-        data.point1,
-        data.normal,
-        data.margin0,
-        data.margin1,
-        data.shape_body,
-        data.body_q,
-    )
-    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-    tangent0, tangent1 = contact_tangent_basis(normal)
-    friction_a, friction_b = contact_friction_points(point_a, point_b, data.shared_anchor, data.friction_shared_anchor)
-    if friction_patches.enabled != 0:
-        friction_a, friction_b = patch_friction_location(friction_patches, c)
-    a_matches = art_a >= 0 and data.response_dofs[art_a] == target_size
-    b_matches = art_b >= 0 and data.response_dofs[art_b] == target_size
-    # Allocation owns the row extent; recomputing eligibility can cross a
-    # floating-point threshold and overwrite the following contact.
-    rows = 1
-    if data.slots_needed[c] >= 3:
-        rows = 3
-    for row in range(rows):
-        direction, p0, p1 = contact_row_frame(
-            row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-        )
-        if a_matches:
-            accumulate_jacobian_row_world(
-                body_a,
-                1.0,
-                p0,
-                data.origin[art_a],
-                direction,
-                body_to_joint,
-                joint_ancestor,
-                joint_qd_start,
-                data.motion,
-                data.dof_start[art_a],
-                target_size,
-                art_group_idx[art_a],
-                slot + row,
-                J_group,
-            )
-        if b_matches:
-            accumulate_jacobian_row_world(
-                body_b,
-                -1.0,
-                p1,
-                data.origin[art_b],
-                direction,
-                body_to_joint,
-                joint_ancestor,
-                joint_qd_start,
-                data.motion,
-                data.dof_start[art_b],
-                target_size,
-                art_group_idx[art_b],
-                slot + row,
-                J_group,
-            )
-        # The row metadata, from the size group of either endpoint.
-        if a_matches or b_matches:
-            target = prescribed_target(
-                body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-            )
-            _write_dense_contact_row(
-                c,
-                data.world[c],
-                slot,
-                row,
-                mu,
-                phi,
-                restitution,
-                target,
-                data.friction_scale,
-                data.beta,
-                data.cfm,
-                friction_patches,
-                friction_anchor_beta,
-                data.row_type,
-                data.row_parent,
-                data.row_mu,
-                data.row_beta,
-                data.row_cfm,
-                data.phi,
-                data.target,
-                data.restitution,
-            )
-
-
 @wp.kernel
 def populate_world_J_for_size(
     data: ContactInput,
@@ -3024,29 +2795,78 @@ def populate_world_J_for_size(
     body_to_joint: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
-    shape_transform: wp.array[wp.transform],
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
+    law: PatchRowLaw,
     # outputs
     J_group: wp.array3d[float],
 ):
-    """Populate active dense contacts with a capacity-independent launch."""
+    """Populate active dense contacts for one articulation-size group with a capacity-independent launch.
+
+    Each contact may contribute to multiple articulations' Jacobian matrices: each endpoint of the size walks its
+    kinematic chain into the pre-cleared Jacobian. Contacts routed to the matrix-free path (contact_path==1) are
+    skipped.
+    """
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
-        _populate_world_J_for_size_contact(
-            c,
-            total_contacts,
-            data,
-            target_size,
-            art_group_idx,
-            body_to_joint,
-            joint_ancestor,
-            joint_qd_start,
-            shape_transform,
-            friction_patches,
-            friction_anchor_beta,
-            J_group,
+        slot = data.slot[c]
+        if data.path[c] != 0 or slot < 0:
+            continue
+        art_a = data.art0[c]
+        art_b = data.art1[c]
+        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+            data, law, c
         )
+        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
+        a_matches = art_a >= 0 and data.response_dofs[art_a] == target_size
+        b_matches = art_b >= 0 and data.response_dofs[art_b] == target_size
+        # Allocation owns the row extent; recomputing eligibility can cross a
+        # floating-point threshold and overwrite the following contact.
+        rows = 1
+        if data.slots_needed[c] >= 3:
+            rows = 3
+        for row in range(rows):
+            direction, p0, p1 = contact_row_frame(
+                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            if a_matches:
+                accumulate_jacobian_row_world(
+                    body_a,
+                    1.0,
+                    p0,
+                    data.origin[art_a],
+                    direction,
+                    body_to_joint,
+                    joint_ancestor,
+                    joint_qd_start,
+                    data.motion,
+                    data.dof_start[art_a],
+                    target_size,
+                    art_group_idx[art_a],
+                    slot + row,
+                    J_group,
+                )
+            if b_matches:
+                accumulate_jacobian_row_world(
+                    body_b,
+                    -1.0,
+                    p1,
+                    data.origin[art_b],
+                    direction,
+                    body_to_joint,
+                    joint_ancestor,
+                    joint_qd_start,
+                    data.motion,
+                    data.dof_start[art_b],
+                    target_size,
+                    art_group_idx[art_b],
+                    slot + row,
+                    J_group,
+                )
+            # The row metadata, from the size group of either endpoint.
+            if a_matches or b_matches:
+                target = prescribed_target(
+                    body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
+                )
+                write_row_record(data, law, c, data.world[c], slot, row, mu, phi, restitution, target)
 
 
 @wp.kernel
@@ -3504,134 +3324,81 @@ def invalidate_articulation_fk_id_cache(
 # =============================================================================
 
 
-@wp.func
-def _build_mf_contact_row(
-    c: int,
-    total_contacts: int,
-    data: ContactInput,
-    has_target_velocity: int,
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
-    # outputs
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_row_type: wp.array2d[int],
-    mf_row_parent: wp.array2d[int],
-    mf_row_mu: wp.array2d[float],
-    mf_phi: wp.array2d[float],
-    mf_target_velocity: wp.array2d[float],
-    mf_row_restitution: wp.array2d[float],
-):
-    """Build MF constraint rows for contacts between free rigid bodies / ground.
-
-    For root free joints, the internal qd used here stores the COM-point linear
-    term and angular velocity, i.e. `qd = [v_com_point, omega]`, where the COM
-    point is the root body's world-space COM position. The MF contact Jacobian
-    uses contact position relative to that point:
-        J = [d, r x d]   (r = p_contact - p_com_world)
-    """
-    slot = data.slot[c]
-    if data.path[c] != 1 or slot < 0:
-        return
-    world = data.world[c]
-    art_a = data.art0[c]
-    art_b = data.art1[c]
-    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
-        c,
-        data.shape0,
-        data.shape1,
-        data.point0,
-        data.point1,
-        data.normal,
-        data.margin0,
-        data.margin1,
-        data.shape_body,
-        data.body_q,
-    )
-    # Zero-DOF articulations contribute collision geometry but own no
-    # generalized response: their rows treat them like ground.
-    response_body_a = -1
-    response_body_b = -1
-    if body_a >= 0 and art_a >= 0 and data.response_dofs[art_a] > 0:
-        response_body_a = body_a
-    if body_b >= 0 and art_b >= 0 and data.response_dofs[art_b] > 0:
-        response_body_b = body_b
-    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-    tangent0, tangent1 = contact_tangent_basis(normal)
-    friction_a, friction_b = contact_friction_points(point_a, point_b, data.shared_anchor, data.friction_shared_anchor)
-    if friction_patches.enabled != 0:
-        friction_a, friction_b = patch_friction_location(friction_patches, c)
-    # Allocation owns the row extent; recomputing eligibility can cross a
-    # floating-point threshold and overwrite the following contact.
-    rows = 1
-    if data.slots_needed[c] >= 3:
-        rows = 3
-    for row in range(rows):
-        row_idx = slot + row
-        direction, p0, p1 = contact_row_frame(
-            row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-        )
-        # A free body's row about its articulation origin: J = [d, r x d], opposite on body B.
-        if response_body_a >= 0:
-            J_a = free_body_jacobian(direction, p0, data.origin[art_a])
-            for k in range(6):
-                mf_J_a[world, row_idx, k] = J_a[k]
-        if response_body_b >= 0:
-            J_b = free_body_jacobian(direction, p1, data.origin[art_b])
-            for k in range(6):
-                mf_J_b[world, row_idx, k] = -J_b[k]
-        mf_body_a[world, row_idx] = response_body_a
-        mf_body_b[world, row_idx] = response_body_b
-        if row == 0:
-            mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
-            mf_row_parent[world, row_idx] = -1
-            mf_row_mu[world, row_idx] = mu
-            mf_phi[world, row_idx] = phi
-            mf_row_restitution[world, row_idx] = restitution
-        else:
-            mf_row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
-            mf_row_parent[world, row_idx] = slot
-            mf_row_mu[world, row_idx] = mu * data.friction_scale
-            mf_phi[world, row_idx] = friction_anchor_beta * friction_patches.phi[c][row - 1]
-            mf_row_restitution[world, row_idx] = 0.0
-        if has_target_velocity != 0:
-            mf_target_velocity[world, row_idx] = prescribed_target(
-                body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-            )
-
-
 @wp.kernel
 def build_mf_contact_rows(
     mf: MfRows,
     data: ContactInput,
     total_num_threads: int,
     has_target_velocity: int,
-    friction_patches: FrictionPatches,
-    friction_anchor_beta: float,
+    law: PatchRowLaw,
 ):
-    """Build active matrix-free contacts with a capacity-independent launch."""
+    """Build matrix-free rows for contacts between free rigid bodies / ground, with a capacity-independent launch.
+
+    For root free joints, the internal qd used here stores the COM-point linear
+    term and angular velocity, i.e. `qd = [v_com_point, omega]`, where the COM
+    point is the root body's world-space COM position. The MF contact Jacobian
+    uses contact position relative to that point:
+        J = [d, r x d]   (r = p_contact - p_com_world)
+    A tangent row folds the row law's beta into its gap (matrix-free rows keep no beta).
+    """
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
-        _build_mf_contact_row(
-            c,
-            total_contacts,
-            data,
-            has_target_velocity,
-            friction_patches,
-            friction_anchor_beta,
-            mf.body_a,
-            mf.body_b,
-            mf.J_a,
-            mf.J_b,
-            mf.row_type,
-            mf.row_parent,
-            mf.row_mu,
-            mf.phi,
-            mf.target,
-            mf.restitution,
+        slot = data.slot[c]
+        if data.path[c] != 1 or slot < 0:
+            continue
+        world = data.world[c]
+        art_a = data.art0[c]
+        art_b = data.art1[c]
+        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+            data, law, c
         )
+        # Zero-DOF articulations contribute collision geometry but own no
+        # generalized response: their rows treat them like ground.
+        response_body_a = -1
+        response_body_b = -1
+        if body_a >= 0 and art_a >= 0 and data.response_dofs[art_a] > 0:
+            response_body_a = body_a
+        if body_b >= 0 and art_b >= 0 and data.response_dofs[art_b] > 0:
+            response_body_b = body_b
+        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
+        # Allocation owns the row extent; recomputing eligibility can cross a
+        # floating-point threshold and overwrite the following contact.
+        rows = 1
+        if data.slots_needed[c] >= 3:
+            rows = 3
+        for row in range(rows):
+            row_idx = slot + row
+            direction, p0, p1 = contact_row_frame(
+                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B.
+            if response_body_a >= 0:
+                J_a = free_body_jacobian(direction, p0, data.origin[art_a])
+                for k in range(6):
+                    mf.J_a[world, row_idx, k] = J_a[k]
+            if response_body_b >= 0:
+                J_b = free_body_jacobian(direction, p1, data.origin[art_b])
+                for k in range(6):
+                    mf.J_b[world, row_idx, k] = -J_b[k]
+            mf.body_a[world, row_idx] = response_body_a
+            mf.body_b[world, row_idx] = response_body_b
+            if row == 0:
+                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+                mf.row_parent[world, row_idx] = -1
+                mf.row_mu[world, row_idx] = mu
+                mf.phi[world, row_idx] = phi
+                mf.restitution[world, row_idx] = restitution
+            else:
+                tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+                mf.row_parent[world, row_idx] = slot
+                mf.row_mu[world, row_idx] = friction_mu
+                mf.phi[world, row_idx] = beta * tangent_phi
+                mf.restitution[world, row_idx] = 0.0
+            if has_target_velocity != 0:
+                mf.target[world, row_idx] = prescribed_target(
+                    body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
+                )
 
 
 @wp.func

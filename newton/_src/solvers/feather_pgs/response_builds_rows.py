@@ -50,12 +50,11 @@ import warp as wp
 
 from ...sim import BodyFlags
 from . import field_group, kernel_template
-from .contact_input import ContactInput
+from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
     contact_bodies,
     contact_friction,
     contact_friction_points,
-    contact_geometry,
     contact_points,
     contact_restitution,
     contact_row_frame,
@@ -67,7 +66,7 @@ from .contact_laws import (
 from .dense_rows import DenseRows, MfBodyMap, MfRows
 from .device_preludes import cuda_native, dual_native, lane_group
 from .field_group import Field
-from .friction_patches import FrictionPatches, patch_friction_location
+from .friction_patches import FrictionPatches, PatchRowLaw, patch_friction_location
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -757,15 +756,15 @@ def sparse_pair_contact_rows_kernel(
     articulation_world_dof_offset: wp.array[int],
     body_single_response_dof: wp.array[int],
     diagonal_inverse_mass: wp.array[float],
-    friction_patches: FrictionPatches,
+    law: PatchRowLaw,
     # outputs
     sparse_row_dof: wp.array3d[int],
     sparse_row_jy: wp.array3d[float],
 ):
     """Write each contact row's sparse slots (:func:`sparse_pair_slots`); a worker strides over the contacts.
 
-    A row's geometry is the contact front end's (:mod:`.contact_laws`): tangent rows act at the patch anchors when
-    patch friction is on, as in the dense Jacobian builders.
+    A row's geometry is the contact front end's (:func:`.contact_input.contact_frame`): tangent rows act at the
+    row law's friction location, as in the dense Jacobian builders.
     """
     worker = wp.tid()
     total_contacts = data.count[0]
@@ -773,24 +772,9 @@ def sparse_pair_contact_rows_kernel(
         slot = data.slot[c]
         if data.path[c] != 0 or slot < 0:
             continue
-        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
-            c,
-            data.shape0,
-            data.shape1,
-            data.point0,
-            data.point1,
-            data.normal,
-            data.margin0,
-            data.margin1,
-            data.shape_body,
-            data.body_q,
+        body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+            data, law, c
         )
-        tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_a, friction_b = contact_friction_points(
-            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
-        )
-        if friction_patches.enabled != 0:
-            friction_a, friction_b = patch_friction_location(friction_patches, c)
         world = data.world[c]
         art_a = data.art0[c]
         art_b = data.art1[c]

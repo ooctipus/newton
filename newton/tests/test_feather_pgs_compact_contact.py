@@ -31,6 +31,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_rows_close,
     contact_rows,
     point_row_law,
+    row_law,
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 
@@ -222,6 +223,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "contact_friction_shared_anchor": data.friction_shared_anchor,
         "friction_patches": patches,
         "friction_anchor_beta": friction_anchor_beta,
+        "law": row_law(patches, friction_anchor_beta),
         "contact_friction_articulation_pairs_only": 0,
         "is_free_rigid": wp.zeros(6, dtype=int, device=aux.device),
         "contact_friction_scale": data.friction_scale,

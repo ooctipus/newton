@@ -201,14 +201,15 @@ def _run_general(data, layout, beta):
     """
     device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
     general = field_group.replace(data, **vars(rows))
-    wp.launch(kernels.prepare_world_contact_rows, dim=16, inputs=[general, 16, layout.view, beta], device=device)
+    law = _law(layout.view, beta)
+    wp.launch(kernels.prepare_world_contact_rows, dim=16, inputs=[general, 16, law], device=device)
     jacobians = {}
     for size in (PRIMARY, SECONDARY):
         jacobians[size] = wp.zeros((WORLDS, ROWS, size), dtype=float, device=device)
         wp.launch(
             kernels.populate_world_J_for_compact_size,
             dim=(4, 32),
-            inputs=[general, 4, size, layout.groups, layout.view],
+            inputs=[general, 4, size, layout.groups, law],
             outputs=[jacobians[size]],
             device=device,
         )

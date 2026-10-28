@@ -9105,6 +9105,8 @@ class SolverFeatherPGS(SolverBase):
             # contacts' allocation records and their row records, through one struct
             # (contact_input.ContactInput), bound for this step.
             contact_input = bind_contact_input(self, state_in, state_aug, contacts, dt, 1.0)
+            # The friction row law every producer writes: point friction is the patch law with beta 0.
+            law = patch_row_law(self)
 
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
             # give rows are marked so the patch finish releases their anchors (kernels.py).
@@ -9173,13 +9175,7 @@ class SolverFeatherPGS(SolverBase):
                     pool.launch(
                         prepare_world_contact_rows,
                         contact_build_threads,
-                        inputs=[
-                            contact_input,
-                            contact_build_threads,
-                            self._friction_patches.view,
-                            self.friction_anchor_beta,
-                        ],
-                        outputs=[],
+                        inputs=[contact_input, contact_build_threads, law],
                         extent=count,
                         clamp=True,
                     )
@@ -9230,13 +9226,7 @@ class SolverFeatherPGS(SolverBase):
                     pool.launch(
                         populate_world_J_for_compact_size,
                         (contact_jacobian_workers, 32),
-                        inputs=[
-                            contact_input,
-                            contact_jacobian_workers,
-                            size,
-                            self.art_group_idx,
-                            self._friction_patches.view,
-                        ],
+                        inputs=[contact_input, contact_jacobian_workers, size, self.art_group_idx, law],
                         outputs=[self.J_by_size[size]],
                         extent=count,
                         clamp=True,
@@ -9257,7 +9247,7 @@ class SolverFeatherPGS(SolverBase):
                             self.articulation_world_dof_offset,
                             self.body_single_response_dof,
                             self._diagonal_inverse_mass,
-                            self._friction_patches.view,
+                            law,
                         ],
                         outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_jy],
                         extent=count,
@@ -9278,7 +9268,6 @@ class SolverFeatherPGS(SolverBase):
             else:
                 # The masked builder: a prelude writes the row records and per-contact flags, then one
                 # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
-                law = patch_row_law(self)
                 flags = self._rows_prelude_flags
                 rows_threads = min(rows, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
                 combined_done = False
@@ -9327,9 +9316,7 @@ class SolverFeatherPGS(SolverBase):
                             self.body_to_joint,
                             model.joint_ancestor,
                             model.joint_qd_start,
-                            model.shape_transform,
-                            self._friction_patches.view,
-                            self.friction_anchor_beta,
+                            law,
                         ],
                         outputs=[self.J_by_size[size]],
                         extent=count,
@@ -9346,8 +9333,7 @@ class SolverFeatherPGS(SolverBase):
                         contact_input,
                         contact_build_threads,
                         int(self._has_prescribed_response),
-                        self._friction_patches.view,
-                        self.friction_anchor_beta,
+                        law,
                     ],
                     extent=count,
                     clamp=True,

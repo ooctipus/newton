@@ -22,6 +22,7 @@ from newton._src.solvers.feather_pgs import contact_laws, field_group, kernels, 
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
+from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -571,6 +572,7 @@ STRUCT_ARGUMENTS = {
     JointTable: JOINT_TABLE_ARGUMENTS,
     MfRows: MF_ROW_ARGUMENTS,
     Mimics: MIMIC_ARGUMENTS,
+    PatchRowLaw: {"patches": "friction_patches", "beta": "friction_anchor_beta"},
 }
 """The scenes' field names of each struct a kernel takes in place of separate arguments."""
 

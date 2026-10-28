@@ -35,12 +35,19 @@ _ROUTE_ARRAYS = {
 }
 
 
+def row_law(patches, beta=0.0):
+    """The friction row law of a patch view and its beta (``friction_anchor_beta``)."""
+    law = PatchRowLaw()
+    law.patches = patches
+    law.beta = beta
+    return law
+
+
 def point_row_law(device, count):
     """Point friction's row law: the patch law with beta 0, a disabled view and a zero phi for ``count`` contacts."""
-    law = PatchRowLaw()
-    law.patches = FrictionPatches()
-    law.patches.phi = wp.zeros(count, dtype=wp.vec2, device=device)
-    return law
+    patches = FrictionPatches()
+    patches.phi = wp.zeros(count, dtype=wp.vec2, device=device)
+    return row_law(patches)
 
 
 def route_arrays(solver, route=0):
