@@ -300,27 +300,22 @@ _FALLBACK_PARAMS = (
 
 
 @cache
-def get_fallback_kernel(layout):
-    """Materialize current physical rows in one pass over fallback worlds only."""
-    return KernelTemplate(
-        "keyed_rows_fallback", _FALLBACK_PARAMS, _fallback_source(layout), WORLDS, composed=True
-    ).kernel()
+def get_fallback_kernel(layout, patch=False):
+    """Materialize current physical rows in one pass over fallback worlds only.
 
-
-@cache
-def get_patch_fallback_kernel(layout):
-    """Materialize the fallback worlds' rows with the persistent patch row law."""
-    params = (_FALLBACK_PARAMS[0], ("patch_law", PatchRowLaw), *_FALLBACK_PARAMS[1:])
-    return KernelTemplate(
-        "keyed_rows_patch_fallback", params, _fallback_source(layout, patch=True), WORLDS, composed=True
-    ).kernel()
+    ``patch`` writes the persistent patch row law, whose struct the kernel takes after the rows.
+    """
+    params = (_FALLBACK_PARAMS[0], ("patch_law", PatchRowLaw), *_FALLBACK_PARAMS[1:]) if patch else _FALLBACK_PARAMS
+    name = "keyed_rows_patch_fallback" if patch else "keyed_rows_fallback"
+    return KernelTemplate(name, params, _fallback_source(layout, patch=patch), WORLDS, composed=True).kernel()
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
     """Decode physical endpoints in the ordinary factor stage.
 
     ``patch`` writes the persistent patch row law and reads every row's parent and
-    coefficient as the scatter and the patch link left them.
+    coefficient as the scatter and the patch link left them; point friction builds
+    them with the row.
     """
     if (na, nb, oa, ob, dofs) != (
         layout.primary,
@@ -331,54 +326,35 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
     ):
         raise ValueError("physical row layout and parallel operator disagree")
     key = "kinetic_rows.rowkeys.data[off_dense + i]"
+    built = "float built_rhs = 0.0f, built_mu = 0.0f;\n            int built_parent = -1;"
+    publish = "{\n                s_rhs[i] = built_rhs; s_parent[i] = built_parent; s_mu[i] = built_mu;\n            }"
+    arguments = (RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),)
+    parent = f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0"
+    mu = f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0"
     if patch:
-        reader = (
-            """
-            const int row = i;
-            const auto& z = kinetic_rows;
-            float built_rhs = 0.0f;
-    """
-            + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True, patch=True)
-            + f"""
-            if ({key} >= 0) s_rhs[i] = built_rhs;
-    """
-        )
-        return ParallelRowInputs(
-            stage=None,
-            physical_row=reader,
-            preludes=ROW_PRELUDES,
-            arguments=(
-                RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),
-                RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),
-            ),
-            row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
-            rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
-            parent="world_row_parent.data[off_dense + i]",
-            mu="world_row_mu.data[off_dense + i]",
-        )
+        built, publish = "float built_rhs = 0.0f;", "s_rhs[i] = built_rhs;"
+        arguments += (RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),)
+        parent, mu = "world_row_parent.data[off_dense + i]", "world_row_mu.data[off_dense + i]"
     reader = (
-        """
+        f"""
             const int row = i;
             const auto& z = kinetic_rows;
-            float built_rhs = 0.0f, built_mu = 0.0f;
-            int built_parent = -1;
+            {built}
     """
-        + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True)
+        + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True, patch=patch)
         + f"""
-            if ({key} >= 0) {{
-                s_rhs[i] = built_rhs; s_parent[i] = built_parent; s_mu[i] = built_mu;
-            }}
+            if ({key} >= 0) {publish}
     """
     )
     return ParallelRowInputs(
         stage=None,
         physical_row=reader,
         preludes=ROW_PRELUDES,
-        arguments=(RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),),
+        arguments=arguments,
         row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
         rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
-        parent=f"{key} < 0 ? world_row_parent.data[off_dense + i] : 0",
-        mu=f"{key} < 0 ? world_row_mu.data[off_dense + i] : 0",
+        parent=parent,
+        mu=mu,
     )
 
 
@@ -486,7 +462,7 @@ class KeyedRows:
         if self.contact_input is not None and not self.patch:
             self._scatter_keys()
         na, nb = self.layout.primary, self.layout.secondary
-        fallback = get_patch_fallback_kernel(self.layout) if self.patch else get_fallback_kernel(self.layout)
+        fallback = get_fallback_kernel(self.layout, patch=self.patch)
         wp.launch_tiled(
             fallback,
             dim=[s.world_count],

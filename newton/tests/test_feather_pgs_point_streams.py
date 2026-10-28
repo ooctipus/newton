@@ -289,7 +289,7 @@ def _patch_only_factory_labels():
     """Labels of the factory-built kernels only patch friction launches."""
     for name, args, kwargs in _linked_tier_calls():
         yield _label(name, args, kwargs)
-    yield _label("keyed_rows.get_patch_fallback_kernel", (_keyed_layout(),), {})
+    yield _label("keyed_rows.get_fallback_kernel", (_keyed_layout(),), {"patch": True})
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
     for size, kwargs, patch_only in _suite_sparse_sweeps():
@@ -664,7 +664,7 @@ def _keyed_row_calls():
     for kwargs in _keyed_tier_kwargs(linked=False):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     # The persistent patch row law of the same rows.
-    yield "keyed_rows.get_patch_fallback_kernel", keyed_rows.get_patch_fallback_kernel.__wrapped__, (layout,), {}
+    yield "keyed_rows.get_fallback_kernel", keyed_rows.get_fallback_kernel.__wrapped__, (layout,), {"patch": True}
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     for args, kwargs in _keyed_last_word_calls():

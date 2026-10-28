@@ -638,7 +638,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for law in ("point", "patch"):
             point = law == "point"
             masked = ["contact_row_prelude", "populate_world_J_masked"]
-            fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
+            fallback = keyed_rows.get_fallback_kernel(layout, patch=not point).key
             diagonal = {
                 "_sparse_diagonal_contact_solve": True,
                 "_sparse_diagonal_response_size": 108,

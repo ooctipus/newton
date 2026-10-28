@@ -392,8 +392,7 @@ def _row_builder(solver, plan, size, source) -> dict:
         patch = bool(owner.patch)
         # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
         # materializes the rows of every other world.
-        fallback = keyed_rows.get_patch_fallback_kernel if patch else keyed_rows.get_fallback_kernel
-        kernels = (keyed_rows.scatter_contact_keys, fallback(owner.layout))
+        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.get_fallback_kernel(owner.layout, patch=patch))
     elif method == "compact_contact_boundary":
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 
