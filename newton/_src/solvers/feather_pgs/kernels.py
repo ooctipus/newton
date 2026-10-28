@@ -18,7 +18,7 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
-from .contact_input import ContactInput, ContactRoutes, contact_frame, write_row_record
+from .contact_input import ContactInput, ContactRoutes, contact_frame
 from .contact_laws import (
     contact_endpoints,
     contact_friction_points,
@@ -55,6 +55,7 @@ from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     disk,
 )
+from .row_build import write_contact_row
 from .row_laws import (
     contact_depenetration_cap,
     contact_restitution_fires,
@@ -2418,31 +2419,18 @@ def accumulate_jacobian_row_world(
 
 @wp.kernel
 def prepare_world_contact_rows(data: ContactInput, total_num_threads: int, law: PatchRowLaw):
-    """Build current metadata inside each allocator-recorded contact row reservation."""
+    """Build current metadata inside each allocator-recorded contact row reservation (:func:`.row_build.write_contact_row`)."""
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
-        slot = data.slot[c]
-        if data.path[c] != 0 or slot < 0:
+        if data.path[c] != 0 or data.slot[c] < 0:
             continue
-        art_a = data.art0[c]
-        art_b = data.art1[c]
-        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-            data, law, c
-        )
-        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
         # Allocation owns the row extent; recomputing eligibility can cross a
         # floating-point threshold and overwrite the following contact.
         rows = 1
         if data.slots_needed[c] >= 3:
             rows = 3
         for row in range(rows):
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
-            target = prescribed_target(
-                body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-            )
-            write_row_record(data, law, c, data.world[c], slot, row, mu, phi, restitution, target)
+            write_contact_row(data, law, c, row, False)
 
 
 @wp.kernel
@@ -2654,21 +2642,18 @@ def populate_world_J_for_size(
             continue
         art_a = data.art0[c]
         art_b = data.art1[c]
-        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-            data, law, c
-        )
-        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
         a_matches = art_a >= 0 and data.response_dofs[art_a] == target_size
         b_matches = art_b >= 0 and data.response_dofs[art_b] == target_size
+        if not a_matches and not b_matches:
+            continue
         # Allocation owns the row extent; recomputing eligibility can cross a
         # floating-point threshold and overwrite the following contact.
         rows = 1
         if data.slots_needed[c] >= 3:
             rows = 3
         for row in range(rows):
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
+            # The row metadata, from the size group of either endpoint, and the row's frame.
+            body_a, body_b, direction, p0, p1 = write_contact_row(data, law, c, row, False)
             if a_matches:
                 accumulate_jacobian_row_world(
                     body_a,
@@ -2703,12 +2688,6 @@ def populate_world_J_for_size(
                     slot + row,
                     J_group,
                 )
-            # The row metadata, from the size group of either endpoint.
-            if a_matches or b_matches:
-                target = prescribed_target(
-                    body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
-                )
-                write_row_record(data, law, c, data.world[c], slot, row, mu, phi, restitution, target)
 
 
 @wp.kernel

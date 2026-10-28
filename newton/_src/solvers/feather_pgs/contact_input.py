@@ -6,10 +6,9 @@
 Declared once as fields (:mod:`.field_group`); :data:`ContactInput` is their
 Warp struct and :func:`bind` fills it from the solver's live storage.
 
-Every producer reads a contact through the same front end and writes its rows' records with the same law, in its
-own layout and thread mapping: :func:`contact_frame` gives a contact's geometry, tangent basis and friction location
-under the friction row law (:data:`.friction_patches.PatchRowLaw`, whose point form is the patch law with beta 0 and a
-disabled view), and :func:`write_row_record` writes a row's dense records.
+Every producer reads a contact through the same front end, :func:`contact_frame`: a contact's geometry, tangent basis
+and friction location under the friction row law (:data:`.friction_patches.PatchRowLaw`, whose point form is the patch
+law with beta 0 and a disabled view). Its rows' records come from :func:`.row_build.write_contact_row`.
 """
 
 import warp as wp
@@ -17,8 +16,7 @@ import warp as wp
 from . import dense_rows, field_group
 from .contact_laws import contact_friction_points, contact_geometry, contact_tangent_basis
 from .field_group import Field, FieldGroup
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
-from .row_laws import ROW_CONTACT, ROW_FRICTION
+from .friction_patches import PatchRowLaw, patch_friction_location
 
 CONTACT_INPUT = (
     # The collision pipeline's contacts.
@@ -98,44 +96,6 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
     if law.patches.enabled != 0:
         friction_a, friction_b = patch_friction_location(law.patches, c)
     return body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b
-
-
-@wp.func
-def write_row_record(
-    data: ContactInput,
-    law: PatchRowLaw,
-    c: int,
-    world: int,
-    slot: int,
-    row: int,
-    mu: float,
-    phi: float,
-    restitution: float,
-    target: float,
-):
-    """Write the dense records of contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents) at ``slot + row``.
-
-    A tangent row follows the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's
-    tangential displacement as its gap, the law's beta and the undivided coefficient ``mu * friction_scale``.
-    """
-    r = slot + row
-    if row == 0:
-        data.row_type[world, r] = ROW_CONTACT
-        data.row_parent[world, r] = -1
-        data.row_mu[world, r] = mu
-        data.row_beta[world, r] = data.beta
-        data.phi[world, r] = phi
-        data.restitution[world, r] = restitution
-    else:
-        tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
-        data.row_type[world, r] = ROW_FRICTION
-        data.row_parent[world, r] = slot
-        data.row_mu[world, r] = friction_mu
-        data.row_beta[world, r] = beta
-        data.phi[world, r] = tangent_phi
-        data.restitution[world, r] = 0.0
-    data.row_cfm[world, r] = data.cfm
-    data.target[world, r] = target
 
 
 def bind_routes(solver, contacts):
