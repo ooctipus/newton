@@ -7,9 +7,8 @@ The candidate changes only the PGS mode (``--candidate-pgs-mode``).
 Replay holds the loaded control fixed and shares reference-generated contacts.
 It tests execution-path closeness, publication and reset invalidation, not
 independent collision trajectories, projection convergence or RL equivalence.
-Use the timing recipe's common environment: FEATHER_PGS_ROWS_MASKED=1,
-NEWTON_NARROW_PHASE_THREADS_X=4. Contact diagnostics do not replace the
-original strict qualification gate.
+Use the timing recipe's common environment: NEWTON_NARROW_PHASE_THREADS_X=4.
+Contact diagnostics do not replace the original strict qualification gate.
 """
 
 from __future__ import annotations

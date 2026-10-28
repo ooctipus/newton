@@ -8,7 +8,6 @@ import dataclasses
 import inspect
 import json
 import os
-import types
 import unittest
 import warnings
 from contextlib import contextmanager
@@ -41,7 +40,6 @@ from newton.tests.feather_pgs_patch_parity import (
     standing_model,
 )
 from newton.tests.feather_pgs_row_builders import (
-    ROW_SWITCHES_OFF,
     assert_row_builders_named,
     install_cpu_keyed_rows,
     is_row_builder,
@@ -149,10 +147,7 @@ def _resting_arms_and_box(*links, device="cpu"):
 
 
 def _plan_stand_in(law, sizes=(108, 6), **attributes):
-    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted.
-
-    The general builder's admission is the solver's own _masked_contact_rows, bound to the stand-in.
-    """
+    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
     values = {
         "_friction_anchors_enabled": law == "patch",
         "_point_contact_paths": law == "point",
@@ -170,9 +165,7 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
         "_compact_contact_jacobian": False,
     }
     values.update(attributes)
-    stand_in = SimpleNamespace(**values)
-    stand_in._masked_contact_rows = types.MethodType(SolverFeatherPGS._masked_contact_rows, stand_in)
-    return stand_in
+    return SimpleNamespace(**values)
 
 
 def _branched_arm_and_box(device="cuda:0", worlds=2, depth=9):
@@ -441,11 +434,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["held_tree"]["owner"])
         self.assertIn("CPU", routes["held_tree"]["reason"])
         self.assertEqual(routes["contact_rows"]["producer"], "general")
-        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
-        # Every size names its builder and the law it writes; the per-contact kernel serves both laws.
+        method = "masked_combined"
+        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
+        # Every size names its builder and the law it writes; one masked launch pair builds both sizes.
         self.assertEqual(routes["contact_rows"]["law"], "patch")
-        per_contact = {"method": "per_contact", "kernels": ["populate_world_J_for_size"], "law": "patch"}
-        self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": per_contact, "1": per_contact})
+        masked = {"method": method, "kernels": ["contact_row_prelude", "populate_world_J_masked"], "law": "patch"}
+        self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": masked, "1": masked})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
         # Patch friction reaches the packet owner, which serves the local owners' worlds (CUDA only): none here.
         self.assertIn("local owners' worlds; none is built", routes["contact_rows"]["row_packets"]["reason"])
@@ -483,9 +477,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         routes whatever the flags say.
         """
         model = _cpu_free_body_model()
-        masked = {**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}
-        with patch.multiple(solver_module, **masked):
-            routes = SolverFeatherPGS(model).get_path_selection()["routes"]
+        routes = SolverFeatherPGS(model).get_path_selection()["routes"]
         friction = routes["friction"]
         self.assertEqual(friction["law"], "patch")
         # The resolved-world classifier serves patch friction.
@@ -496,12 +488,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         kernels = ["contact_row_prelude", "populate_world_J_masked"]
         builder = {"method": method, "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
-        # Contact torsion keeps ordinary factors, rows and serial sweeps under every patch route flag.
+        # Contact torsion keeps ordinary factors and serial sweeps under every patch route flag; its rows take the
+        # masked builder, as the zero-radius solver's do.
         for flags in ({}, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
             with (
                 self.subTest(torsion=True, **flags),
                 patch.dict(os.environ, flags),
-                patch.multiple(solver_module, **masked),
                 # Construct on the CPU, as TestTorsionNeutralRoute does; nothing is stepped.
                 patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
             ):
@@ -510,13 +502,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual((friction["law"], friction["torsion"]), ("patch", True))
                 self.assertIn("need point friction", friction["reason"])
                 self.assertFalse(friction["parallel_rows"]["admitted"])
-                self.assertEqual(
-                    routes["contact_rows"]["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"}
-                )
-                # Torsion's per-contact rows still follow the patch law: one kernel serves both laws.
-                self.assertEqual(
-                    {entry["law"] for entry in routes["contact_rows"]["builder_by_dof"].values()}, {"patch"}
-                )
+                self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Point friction's record names no patch route.
         point = SolverFeatherPGS(model, friction_anchor_beta=0.0).get_path_selection()
         self.assertEqual(point["routes"]["friction"]["reason"], "friction_anchor_beta passed explicitly.")
@@ -567,30 +553,24 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_record_names_every_launched_row_builder(self):
         """Name in builder_by_dof exactly the contact-row builders one CPU step launches, under both laws.
 
-        The general builder's methods: per-contact rows, masked rows in one launch for up to two
-        sizes or per size for three, and a size above the masked builder's 32 DOFs; then keyed rows on
-        CPU stand-ins. Each record is taken under the switches its step runs with.
+        The general builder's methods: masked rows in one launch for up to two sizes or per size for
+        three, and per-contact rows for a size above the masked builder's 32 DOFs; then keyed rows on
+        CPU stand-ins.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
         pair = ("6", "1")
-        masked = {"_ROWS_MASKED": True}
         cases = (
-            # (model, switches, friction_anchor_beta, methods by size)
-            (mixed, {}, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, {}, 0.0, dict.fromkeys(pair, "per_contact")),
-            (mixed, masked, None, dict.fromkeys(pair, "masked_combined")),
-            (mixed, masked, 0.0, dict.fromkeys(pair, "masked_combined")),
-            (three, masked, None, dict.fromkeys(("6", "2", "1"), "masked")),
-            (three, masked, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
-            (wide, masked, None, {"34": "per_contact", "6": "masked_combined"}),
-            (wide, masked, 0.0, {"34": "per_contact", "6": "masked_combined"}),
+            # (model, friction_anchor_beta, methods by size)
+            (mixed, None, dict.fromkeys(pair, "masked_combined")),
+            (mixed, 0.0, dict.fromkeys(pair, "masked_combined")),
+            (three, None, dict.fromkeys(("6", "2", "1"), "masked")),
+            (three, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
+            (wide, None, {"34": "per_contact", "6": "masked_combined"}),
+            (wide, 0.0, {"34": "per_contact", "6": "masked_combined"}),
         )
-        for model, switches, beta, methods in cases:
+        for model, beta, methods in cases:
             law = "patch" if beta is None else "point"
-            with (
-                self.subTest(sizes=list(methods), switches=switches, law=law),
-                patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
-            ):
+            with self.subTest(sizes=list(methods), law=law):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 record = solver.get_path_selection()["routes"]["contact_rows"]
                 keys = _launched_kernel_keys(model, solver)
@@ -600,7 +580,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 assert_row_builders_named(self, record, keys)
         model = standing_model(device="cpu", worlds=2)
         for law, beta in (("patch", 0.2), ("point", 0.0)):
-            with self.subTest(producer="keyed_rows", law=law), patch.multiple(solver_module, **ROW_SWITCHES_OFF):
+            with self.subTest(producer="keyed_rows", law=law):
                 solver = SolverFeatherPGS(
                     model,
                     friction_anchor_beta=beta,
@@ -651,24 +631,21 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 return dict.fromkeys(sizes, (method, kernels))
 
             cases = (
-                # (attributes, switches, sizes, producer, {size: (method, kernels)})
+                # (attributes, sizes, producer, {size: (method, kernels)})
                 (
                     {"_row_packets": SimpleNamespace()},
-                    {},
                     (18, 6),
                     "local_packets",
                     same((18, 6), "local_packets", ["produce_contacts", "materialize_fallback"]),
                 ),
                 (
                     {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
-                    {},
                     (16, 6),
                     "keyed_rows",
                     same((16, 6), "keyed_rows", ["scatter_contact_keys", fallback]),
                 ),
                 (
                     {"_compact_contact_boundary": True, **diagonal, **schedule},
-                    {},
                     (108, 6),
                     "compact_contact_boundary",
                     {
@@ -678,14 +655,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     {**sparse, "_sparse_prepare_contacts": True},
-                    {},
                     (18,),
                     "sparse_contact_response",
                     {18: ("sparse_response", [response.key])},
                 ),
                 (
                     {**diagonal, **schedule},
-                    {},
                     (108, 6),
                     "sparse_diagonal",
                     {
@@ -695,7 +670,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     diagonal,
-                    {},
                     (108, 6),
                     "sparse_diagonal",
                     {
@@ -705,26 +679,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     {"_compact_contact_jacobian": True},
-                    {},
                     (6, 1),
                     "compact_jacobian",
                     same((6, 1), "compact_jacobian", [prepare, compact]),
                 ),
-                ({}, {}, (34, 6), "general", same((34, 6), "per_contact", per_contact)),
-                ({}, {"_ROWS_MASKED": True}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked)),
-                (
-                    {},
-                    {"_ROWS_MASKED": True},
-                    (34, 6),
-                    "general",
-                    {34: ("per_contact", per_contact), 6: ("masked_combined", masked)},
-                ),
+                ({}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked)),
+                ({}, (34, 6), "general", {34: ("per_contact", per_contact), 6: ("masked_combined", masked)}),
             )
-            for attributes, switches, sizes, producer, expected in cases:
-                with (
-                    self.subTest(producer, law=law, attributes=sorted(attributes), switches=switches),
-                    patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
-                ):
+            for attributes, sizes, producer, expected in cases:
+                with self.subTest(producer, law=law, attributes=sorted(attributes)):
                     stand_in = _plan_stand_in(law, sizes, **attributes)
                     plan = contact_row_plan(stand_in)
                     builders = {
@@ -751,10 +714,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         launch, still names the launched set, and the check must reject it.
         """
         model = _resting_arms_and_box(1, 2)
-        with patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
-            solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-            record = solver.get_path_selection()["routes"]["contact_rows"]
-            keys = _launched_kernel_keys(model, solver)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        record = solver.get_path_selection()["routes"]["contact_rows"]
+        keys = _launched_kernel_keys(model, solver)
         self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"masked"})
         assert_row_builders_named(self, record, keys)
         reversed_order = copy.deepcopy(record)
@@ -768,7 +730,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_row_build_dispatches_on_the_recorded_plan(self):
         """Record and launch the builders of one plan: the row build and the record call the same function.
 
-        Both modules bind one contact_row_plan. A plan that names per-contact rows where the switches select
+        Both modules bind one contact_row_plan. A plan that names per-contact rows where the data selects
         combined masked rows, substituted in both, makes the record name the per-contact builder and the row
         build launch it, so neither can follow a decision of its own.
         """
@@ -780,16 +742,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             plan = plan_rows(solver)
             return dataclasses.replace(plan, methods=dict.fromkeys(plan.methods, "per_contact"), combined=())
 
-        with patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
-            solver = SolverFeatherPGS(model)
-            record = solver.get_path_selection()["routes"]["contact_rows"]
-            masked = _launched_kernel_keys(model, solver)
-            with (
-                patch.object(solver_module, "contact_row_plan", per_contact),
-                patch.object(path_selection, "contact_row_plan", per_contact),
-            ):
-                forced_record = solver.get_path_selection()["routes"]["contact_rows"]
-                forced = _launched_kernel_keys(model, solver)
+        solver = SolverFeatherPGS(model)
+        record = solver.get_path_selection()["routes"]["contact_rows"]
+        masked = _launched_kernel_keys(model, solver)
+        with (
+            patch.object(solver_module, "contact_row_plan", per_contact),
+            patch.object(path_selection, "contact_row_plan", per_contact),
+        ):
+            forced_record = solver.get_path_selection()["routes"]["contact_rows"]
+            forced = _launched_kernel_keys(model, solver)
         self.assertEqual(record["general_method_by_dof"], {"6": "masked_combined", "1": "masked_combined"})
         self.assertEqual(forced_record["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
         assert_row_builders_named(self, record, masked)
@@ -1178,15 +1139,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """A branched arm with a free body per world stays dense with the tree cache, under patch friction too.
 
         Sparse factors admit the arm alone. On the dense route patch friction keeps the bundle that makes
-        it worth taking: contact units in the paired factor sweep, masked rows (FEATHER_PGS_ROWS_MASKED,
-        set by the recipes) and the resolved-world classifier.
+        it worth taking: contact units in the paired factor sweep, masked rows and the resolved-world classifier.
         """
         model = _branched_arm_and_box()
         for law, beta in (("patch", None), ("point", 0.0)):
-            with (
-                self.subTest(law=law),
-                patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}),
-            ):
+            with self.subTest(law=law):
                 solver = _make_solver(model, True, friction_anchor_beta=beta, dense_max_constraints=96)
                 selected = solver.get_path_selection()
                 routes = selected["routes"]
@@ -1220,12 +1177,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """
         tripod, arm, small = _build_model(), _branched_arm_and_box(), _resting_arms_and_box(1, device="cuda:0")
         cases = (
-            # (name, model, switches, environment, build(beta), producer, methods by size or None)
-            ("sparse", tripod, {}, {}, lambda beta: _make_solver(tripod, True, friction_anchor_beta=beta), None, None),
+            # (name, model, environment, build(beta), producer, methods by size or None)
+            ("sparse", tripod, {}, lambda beta: _make_solver(tripod, True, friction_anchor_beta=beta), None, None),
             (
                 "compact_jacobian",
                 small,
-                {},
                 {},
                 lambda beta: SolverFeatherPGS(small, friction_anchor_beta=beta, sparse_mass_matrix="off"),
                 "compact_jacobian",
@@ -1234,20 +1190,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             (
                 "masked_combined",
                 arm,
-                {"_ROWS_MASKED": True},
                 {},
                 lambda beta: _make_solver(arm, True, friction_anchor_beta=beta, dense_max_constraints=96),
                 "general",
                 dict.fromkeys(("18", "6"), "masked_combined"),
             ),
         )
-        for name, model, switches, environment, build, producer, methods in cases:
+        for name, model, environment, build, producer, methods in cases:
             for law, beta in (("patch", None), ("point", 0.0)):
-                with (
-                    self.subTest(name, law=law),
-                    patch.dict(os.environ),
-                    patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
-                ):
+                with self.subTest(name, law=law), patch.dict(os.environ):
                     os.environ.update(environment)
                     solver = build(beta)
                     record = solver.get_path_selection()["routes"]["contact_rows"]

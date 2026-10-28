@@ -53,7 +53,6 @@ from newton.tests.feather_pgs_patch_parity import (
     standing_model,
 )
 from newton.tests.feather_pgs_row_builders import (
-    ROW_SWITCHES_OFF,
     assert_row_builders_named,
     install_cpu_keyed_rows,
     launched_kernels,
@@ -1777,7 +1776,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         with patch.object(source, "_INK_ON", True), patch.dict(os.environ, {_SWITCH: "1"}):
             os.environ.pop("FEATHER_PGS_KEYED_ROWS", None)
             for law, beta in (("point", 0.0), ("patch", 0.2)):
-                with self.subTest(law=law), patch.multiple(source, **ROW_SWITCHES_OFF):
+                with self.subTest(law=law):
                     solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
                     routes = solver.get_path_selection()["routes"]
                     record = routes["contact_rows"]
@@ -1817,7 +1816,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
         for reuse in (None, "0"):
             with (
                 patch.object(source, "_INK_ON", True),
-                patch.multiple(source, **ROW_SWITCHES_OFF),
                 patch.dict(os.environ, {_SWITCH: "1"}),
             ):
                 for name in ("FEATHER_PGS_KEYED_ROWS", "FEATHER_PGS_PATCH_FRAME_REUSE"):

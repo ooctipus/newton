@@ -421,7 +421,7 @@ def _row_builder(solver, plan, size, source) -> dict:
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
     # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
-    # contact row; the general builder's masked patch rows serve only solvers no earlier producer took.
+    # contact row; the general builder serves only solvers no earlier producer took.
     plan = contact_row_plan(solver)
     methods = None
     if plan.producer == "general":

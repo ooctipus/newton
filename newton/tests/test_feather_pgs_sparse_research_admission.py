@@ -162,15 +162,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver._friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
-    def test_contact_writer_requests_do_not_block_sparse(self):
-        """Allow general sparse producers to supersede optional canonical row writers."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_ROWS_MASKED": "1"}, clear=True),
-            self.assertRaises(_TopologyReached),
-        ):
-            SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
-
     def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
         """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)

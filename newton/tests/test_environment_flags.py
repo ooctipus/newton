@@ -332,7 +332,7 @@ class TestEnvironmentRecord(unittest.TestCase):
     def test_record_classifies_names(self):
         """Record declared values, undeclared names, retired names and Isaac Lab-owned names separately."""
         environ = {
-            "FEATHER_PGS_ROWS_MASKED": "1",
+            "FEATHER_PGS_ROWS_THREADS_X": "2",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_COUPLED_JACOBI": "1",
             "IL_NEWTON_FPGS_MF_WARMSTART": "0",
@@ -342,7 +342,7 @@ class TestEnvironmentRecord(unittest.TestCase):
         self.assertEqual(
             fpgs_flags.record(environ),
             {
-                "applied": {"FEATHER_PGS_ROWS_MASKED": "1", "IL_NEWTON_FPGS_MF_WARMSTART": "0"},
+                "applied": {"FEATHER_PGS_ROWS_THREADS_X": "2", "IL_NEWTON_FPGS_MF_WARMSTART": "0"},
                 "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED"],
                 "retired": [],
                 "isaac_lab": {},
@@ -354,7 +354,7 @@ class TestEnvironmentRecord(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
             "NEWTON_UNDECLARED_EXAMPLE": "1",
-            "FEATHER_PGS_ROWS_MASKED": "1",
+            "FEATHER_PGS_ROWS_THREADS_X": "2",
         }
         self.assertEqual(
             core_flags.record_newton_environment(environ),
@@ -450,7 +450,7 @@ class TestSelectionEnvironment(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
             "NEWTON_UNDECLARED_EXAMPLE": "1",
-            "FEATHER_PGS_ROWS_MASKED": "1",
+            "FEATHER_PGS_ROWS_THREADS_X": "2",
         }
         model = _cpu_model()
         with _environment(flags):

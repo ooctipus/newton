@@ -3,14 +3,16 @@
 
 """The masked contact-row builder writes the persistent patch row law as the per-contact builder does."""
 
+import contextlib
+import dataclasses
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -79,12 +81,36 @@ def _rows(solver, contacts):
     return records
 
 
-def _rollout(model, *, masked, steps, **solver_kwargs):
-    """Step the scene with the masked builder on or off; return the solver and each step's rows by contact.
+_PLAN = solver_module.contact_row_plan
 
-    Each step records its rows by contact, the body poses and, on CPU, the whole row arrays.
+
+def _per_contact_plan(solver):
+    """The solver's contact-row plan with the per-contact builder in place of every masked method."""
+    plan = _PLAN(solver)
+    return dataclasses.replace(plan, methods=dict.fromkeys(plan.methods, "per_contact"), combined=())
+
+
+@contextlib.contextmanager
+def _builder(masked):
+    """Keep the plan's masked builder, or substitute the per-contact builder in the row build and the record."""
+    if masked:
+        yield
+        return
+    with (
+        mock.patch.object(solver_module, "contact_row_plan", _per_contact_plan),
+        mock.patch.object(path_selection, "contact_row_plan", _per_contact_plan),
+    ):
+        yield
+
+
+def _rollout(model, *, masked, steps, **solver_kwargs):
+    """Step the scene with the masked or the per-contact builder; return the solver and each step's rows by contact.
+
+    The masked builder writes every size of at most 32 DOFs; ``masked=False`` substitutes the
+    per-contact builder for it. Each step records its rows by contact, the body poses and, on CPU,
+    the whole row arrays.
     """
-    with mock.patch.object(solver_module, "_ROWS_MASKED", masked):
+    with _builder(masked):
         solver = SolverFeatherPGS(model, **solver_kwargs)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
         contacts = pipeline.contacts()
@@ -99,7 +125,7 @@ def _rollout(model, *, masked, steps, **solver_kwargs):
             states.reverse()
             arrays = None if model.device.is_cuda else _arrays(solver)
             records.append((_rows(solver, contacts), states[0].body_q.numpy().copy(), arrays))
-        # The record mirrors the row builders under the same import-time switches.
+        # The record mirrors the row builders of the same plan.
         methods = solver.get_path_selection()["routes"]["contact_rows"]["general_method_by_dof"]
     return solver, records, set(methods.values())
 
@@ -212,20 +238,6 @@ def _conveyor_model(device, worlds=2):
 
 def _anchor_count(records):
     return sum(len(record["types"]) == 3 for rows, _, _ in records for record in rows.values())
-
-
-class TestMaskedPatchRowAdmission(unittest.TestCase):
-    def _admit(self, **overrides):
-        solver = SimpleNamespace(_point_contact_paths=False, _patch_dense_paths=True)
-        for name, value in overrides.items():
-            setattr(solver, name, value)
-        return SolverFeatherPGS._masked_contact_rows(solver)
-
-    def test_patch_takes_masked_rows_unless_an_experiment_needs_ordinary_rows(self):
-        """Patch friction takes masked rows; torsion and compliance keep it off."""
-        self.assertTrue(self._admit())
-        self.assertTrue(self._admit(_point_contact_paths=True, _patch_dense_paths=False))
-        self.assertFalse(self._admit(_patch_dense_paths=False))
 
 
 class TestMaskedPatchRows(unittest.TestCase):

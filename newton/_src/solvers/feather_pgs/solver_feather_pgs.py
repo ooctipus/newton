@@ -271,7 +271,6 @@ from .velocity_limit_law import check_velocity_limit_law
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
-_ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"  # parallel tiers form Y = H^-1 J^T and the diagonal in-kernel
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
@@ -2294,9 +2293,8 @@ class SolverFeatherPGS(SolverBase):
         # ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         # Patch friction on the dense route: the paired factor sweep walks patch
-        # contact units, the masked row builder writes the patch row law, the
-        # resolved-world classifier skips worlds whose rows all separate, and
-        # worlds with free rigid bodies keep the dense route.
+        # contact units, the resolved-world classifier skips worlds whose rows
+        # all separate, and worlds with free rigid bodies keep the dense route.
         self._patch_dense_paths = bool(self._law_agnostic_contact_paths and self._friction_anchors_enabled)
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
@@ -4150,10 +4148,10 @@ class SolverFeatherPGS(SolverBase):
             # by the held-tree owner and the paired response on the dense route
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
-            # sweep, writes masked patch rows and keeps the resolved-world
-            # classifier. A parallel tier that mf_gs_parallel_rows requests (unless
-            # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first
-            # (above), so native sparse factors never serve free rigid bodies.
+            # sweep and keeps the resolved-world classifier. A parallel tier that
+            # mf_gs_parallel_rows requests (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)
+            # declines sparse factors first (above), so native sparse factors never
+            # serve free rigid bodies.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
@@ -9159,7 +9157,7 @@ class SolverFeatherPGS(SolverBase):
             # the compact and sparse producers, then the general builder. Under patch friction this
             # order is the row precedence: the local row packets and keyed rows (unless
             # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) take their worlds' rows before the general builder's
-            # masked patch rows (_masked_contact_rows), and native sparse factors admit neither.
+            # masked rows, and native sparse factors admit neither.
             # get_path_selection() records the same plan (routes.contact_rows).
             plan = contact_row_plan(self)
             if plan.producer == "local_packets":
@@ -9737,18 +9735,6 @@ class SolverFeatherPGS(SolverBase):
             block_dim=self.tile_threads,
             device=model.device,
         )
-
-    def _masked_contact_rows(self) -> bool:
-        """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
-
-        Point friction may. Patch friction takes the same builder with the patch row law (row_build.py),
-        unless torsion or compliance keeps ordinary rows.
-
-        This decides only the general builder's method (contact_row_plan). Local row packets, keyed
-        rows (under patch friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact producers
-        and native sparse factors own their worlds' rows first, so masked patch rows serve the rest.
-        """
-        return bool(self._point_contact_paths or self._patch_dense_paths)
 
     def _build_inkernel_response_meta(self) -> tuple[int, int] | None:
         """Per-world (group index, DOF offset) of up to two size groups for the in-kernel response solve.

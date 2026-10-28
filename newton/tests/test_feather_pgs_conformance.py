@@ -1121,10 +1121,6 @@ _MF = {"pgs_mode": "matrix_free"}
 _GENERAL = {**_MF, "sparse_mass_matrix": "off", "cached_dynamics": "off", "mf_gs_incremental_rows": 0}
 
 
-def _masked(builders) -> bool:
-    return bool(builders) and all(entry["method"] in ("masked", "masked_combined") for entry in builders.values())
-
-
 REFERENCE_CUDA = Route(
     "reference",
     "cuda",
@@ -1187,18 +1183,6 @@ MF_HELD = Route(
         "sweep.tiers.family": "incremental",
         "held_tree.owner": "mixed",
         "held_tree.groups.0.operator": "TreeHeldOperator",
-    },
-)
-MF_MASKED = Route(
-    "mf_masked_rows",
-    "cuda",
-    # Every suite recipe sets FEATHER_PGS_ROWS_MASKED=1 (an import-time switch).
-    options={**_MF, "sparse_mass_matrix": "off"},
-    module={"_ROWS_MASKED": True},
-    expect={
-        "sweep.route": "matrix_free_gs",
-        "contact_rows.producer": "general",
-        "contact_rows.builder_by_dof": _masked,
     },
 )
 MF_PARALLEL = Route(
@@ -1448,7 +1432,7 @@ def cuda_groups() -> list:
     vlimits = {"enable_joint_velocity_limits": True}
     groups = []
     for law in _laws():
-        legged = [SPARSE, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL, MF_MASKED]
+        legged = [SPARSE, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL]
         legged += [MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, KEYED_PARALLEL]
         if law == "point":
             legged.insert(1, SPARSE_TRIPLETS)

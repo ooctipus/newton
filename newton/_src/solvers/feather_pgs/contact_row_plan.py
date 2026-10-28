@@ -56,7 +56,7 @@ def contact_row_plan(solver) -> ContactRowPlan:
     compact contact boundary, then the shared-metadata producers (native sparse factors' response,
     the sparse-diagonal owner, the compact Jacobian) and last the general builder. Owners decided at
     construction admit the producers, so the plan stays fixed for a solver; it is evaluated from the
-    solver's current attributes and the solver module's import-time switches.
+    solver's current attributes.
 
     Builder methods by producer:
 
@@ -64,11 +64,10 @@ def contact_row_plan(solver) -> ContactRowPlan:
     - Shared-metadata producers: ``sparse_response`` for the factored size, the only size of a model
       native sparse factors admit; ``sparse_diagonal`` for the diagonal-mass size; ``compact_jacobian``
       for every other size.
-    - ``general``: ``masked_combined`` (one launch for the one or two sizes of at most 32 DOFs),
-      ``masked`` (one launch per size), else ``per_contact``.
+    - ``general``: sizes of at most 32 DOFs take the masked builder (``masked_combined``, one launch
+      for one or two such sizes; ``masked``, one launch per size for three or more); wider sizes take
+      ``per_contact``.
     """
-    from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time switches
-
     law = "patch" if solver._friction_anchors_enabled else "point"
     sizes = solver.size_groups
     if solver._row_packets is not None:
@@ -100,8 +99,7 @@ def contact_row_plan(solver) -> ContactRowPlan:
         else:
             producer = "compact_jacobian"
         return ContactRowPlan(producer, law, methods, metadata_launch=not solver._sparse_prepare_contacts)
-    masked = solver._masked_contact_rows() and source._ROWS_MASKED
-    masked_sizes = tuple(size for size in sizes if size <= 32) if masked else ()
+    masked_sizes = tuple(size for size in sizes if size <= 32)
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
     methods = {}
     for size in sizes:

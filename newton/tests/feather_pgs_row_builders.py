@@ -8,8 +8,7 @@ size, the kernels that build the dense contact rows outside the sweep, in launch
 order. :func:`assert_row_builders_named` requires those names to be exactly the
 contact-row builders among the kernels one recorded step launched, in that order
 and with one launch per step or per size. The module also holds the keyed-row CPU
-stand-in and the row-builder switch table the record tests share. It defines no
-tests.
+stand-in the record tests share. It defines no tests.
 """
 
 import collections
@@ -19,10 +18,6 @@ from unittest import mock
 import warp as wp
 
 from newton._src.solvers.feather_pgs import keyed_rows
-
-# The import-time row-builder switches of the solver module, held off unless a case sets one, whatever the
-# shell exports.
-ROW_SWITCHES_OFF = {"_ROWS_MASKED": False}
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
 # builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed

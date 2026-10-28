@@ -397,16 +397,8 @@ class TestAdaptiveManifold(unittest.TestCase):
     @patch.dict(os.environ, {"FEATHER_PGS_GROUP_LANES": "16", "NEWTON_NARROW_PHASE_THREADS_X": "4"})
     def test_loaded_cuda(self):
         """Existing complete physical gates, plus yaw/step, at unchanged eight sweeps."""
-        from newton._src.solvers.feather_pgs import solver_feather_pgs  # noqa: PLC0415
-
-        # ROWS_MASKED is fixed at import; the other recorded fixture options are
-        # read at construction. Match the original qualification recipe without
-        # changing solver defaults or the physical gates.
-        self.assertTrue(
-            solver_feather_pgs._ROWS_MASKED,
-            "Loaded heightfield qualification requires FEATHER_PGS_ROWS_MASKED=1 before importing Newton; "
-            "restart the test process with the recorded fixture environment.",
-        )
+        # The recorded fixture options are read at construction. Match the original qualification recipe
+        # without changing solver defaults or the physical gates.
         q = qualification_module()
         original_build = q.build_scene
         original_solver = q.newton.solvers.SolverFeatherPGS

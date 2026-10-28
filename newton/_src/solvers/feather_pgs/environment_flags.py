@@ -128,7 +128,6 @@ _READ = (
         ("resolved_worlds",),
         "Values other than 1 stop skipping worlds whose candidate rows all separate at the predictor.",
     ),
-    ("FEATHER_PGS_ROWS_MASKED", "experiment", _SOLVER, "=1 builds contact rows with one thread per contact and DOF."),
     ("FEATHER_PGS_ROWS_THREADS_X", "policy", _SOLVER, "Multiplier of the row-build thread budget (default 4)."),
     (
         "FEATHER_PGS_ROW_PACKETS",
