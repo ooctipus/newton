@@ -9182,8 +9182,6 @@ class SolverFeatherPGS(SolverBase):
                         max_blocks=self._contact_capacity_blocks,
                     )
 
-        self._link_friction_patches(contacts)
-
         # Rigid-body velocity limits are matrix-free rows, not post-solve
         # clamps, in the MF path. Allocate after contacts so they occupy the
         # last MF slots; the fused PGS kernel also solves row_type=4 in a
@@ -9255,6 +9253,8 @@ class SolverFeatherPGS(SolverBase):
             )
         if self._keyed_rows is not None:
             self._keyed_rows.finish_rows()
+        # The patch link runs after every row producer: the keyed rows' general worlds take their records last.
+        self._link_friction_patches(contacts)
         self._finalize_constraint_status(contacts)
         if self._sparse_diagonal_contact_triples or self._sparse_diagonal_contact_units:
             schedule = self._build_independent_sparse_contact_groups_kernel

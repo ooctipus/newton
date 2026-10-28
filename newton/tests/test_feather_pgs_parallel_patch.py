@@ -1784,12 +1784,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertTrue(record["keyed_rows"]["enabled"], record["keyed_rows"]["reason"])
                     self.assertEqual(routes["sweep"]["tiers"]["family"], "keyed_parallel")
                     self.assertEqual((record["producer"], record["law"]), ("keyed_rows", law))
-                    layout = solver._keyed_rows.layout
-                    scatter = "scatter_contact_keys"
-                    fallback = keyed_rows.get_fallback_kernel(layout, patch=law == "patch")
                     builder = {
                         "method": "keyed_rows",
-                        "kernels": [scatter, fallback.key],
+                        "kernels": ["scatter_contact_keys", "materialize_general_rows"],
                         "law": law,
                         "direct_rows": "routes.sweep.tiers",
                     }

@@ -179,8 +179,6 @@ def factory_calls():
         return factory(*args, **kwargs)
 
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
-    yield "keyed_rows.get_fallback_kernel", _unwrapped(keyed_rows.get_fallback_kernel), (layout,), {}
-    yield "keyed_rows.get_fallback_kernel", _unwrapped(keyed_rows.get_fallback_kernel), (layout,), {"patch": True}
     for rows, min_rows in ((32, 0), (48, 32)):
         kwargs = {
             "rows": rows,

@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, friction_patches, keyed_rows, path_selection
+from newton._src.solvers.feather_pgs import environment_flags, friction_patches, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
@@ -618,7 +618,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for law in ("point", "patch"):
             point = law == "point"
             masked = ["contact_row_prelude", "populate_world_J_masked"]
-            fallback = keyed_rows.get_fallback_kernel(layout, patch=not point).key
             diagonal = {
                 "_sparse_diagonal_contact_solve": True,
                 "_sparse_diagonal_response_size": 108,
@@ -642,7 +641,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
                     (16, 6),
                     "keyed_rows",
-                    same((16, 6), "keyed_rows", ["scatter_contact_keys", fallback]),
+                    same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
                 ),
                 (
                     {"_compact_contact_boundary": True, **diagonal, **schedule},

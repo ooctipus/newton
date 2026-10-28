@@ -210,8 +210,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
     def test_key_scatters_take_the_recorded_blocks(self):
         """Launch the key scatters over the route record's block count, solving as on the capped default grid.
 
-        Point friction scatters its keys after the fallback counts and patch friction before the
-        patch link. A solver forced to one block strides that block over the whole 1,024-slot
+        Both laws scatter their keys once the counts are final, before the patch link. A solver
+        forced to one block strides that block over the whole 1,024-slot
         buffer, four iterations whose later ones hold only empty slots, and solves the same rows
         as the default grid. This tripod has far fewer than 256 live contacts, so every live one
         falls in the first iteration; test_key_scatters_match_on_a_capped_grid in

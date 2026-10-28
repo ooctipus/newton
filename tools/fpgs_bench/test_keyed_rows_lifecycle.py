@@ -265,7 +265,7 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
         for n in (6, 16):
             count = int(candidate.constraint_count.numpy()[0])
             # Original end-of-step maintenance has already cleared its J;
-            # compare final physics above, and require complete native fallback
+            # compare final physics above, and require complete fallback
             # materialization here (including all previously poisoned entries).
             current_j = candidate.J_by_size[n].numpy()[:, :count]
             self.assertTrue(np.isfinite(current_j).all())

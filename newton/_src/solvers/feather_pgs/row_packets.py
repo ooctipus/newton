@@ -37,7 +37,6 @@ from .contact_laws import (
     contact_points,
     contact_row_frame,
     contact_tangent_basis,
-    jacobian_entry,
     prescribed_target,
 )
 from .device_preludes import (
@@ -57,7 +56,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from .prefix_rows import LAW, limits, prefix_rows
-from .row_build import _contact_in_sizes, populate_contact_J
+from .row_build import _contact_in_sizes, endpoint_projection, incident_projection, populate_contact_J
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
 from .step_plan import first_failed
@@ -343,32 +342,6 @@ def materialize_general_prefix(
                         if prefix.dofs[world, row, component] == dof:
                             value += prefix.weights[world, row, component]
                 J[group, row, dof] = value
-
-
-@wp.func
-def endpoint_projection(
-    data: ContactInput, body: int, art: int, size: int, dof: int, point: wp.vec3, direction: wp.vec3
-):
-    """Read current response masks and current world-origin motion columns."""
-    value = float(0.0)
-    if body >= 0 and art >= 0 and data.response_dofs[art] == size:
-        if (data.body_mask[body] & (wp.uint32(1) << wp.uint32(dof))) != wp.uint32(0):
-            value = jacobian_entry(data.motion[data.dof_start[art] + dof], direction, point, data.origin[art])
-    return value
-
-
-@wp.func
-def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3, direction: wp.vec3):
-    """Use the frozen incident velocity, not the live output velocity."""
-    result = float(0.0)
-    if art >= 0 and body >= 0:
-        size = data.response_dofs[art]
-        for dof in range(size):
-            result += (
-                endpoint_projection(data, body, art, size, dof, point, direction)
-                * data.incident[data.dof_start[art] + dof]
-            )
-    return result
 
 
 @wp.kernel(enable_backward=False)

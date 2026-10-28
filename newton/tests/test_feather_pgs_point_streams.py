@@ -289,7 +289,6 @@ def _patch_only_factory_labels():
     """Labels of the factory-built kernels only patch friction launches."""
     for name, args, kwargs in _linked_tier_calls():
         yield _label(name, args, kwargs)
-    yield _label("keyed_rows.get_fallback_kernel", (_keyed_layout(),), {"patch": True})
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
     for size, kwargs, patch_only in _suite_sparse_sweeps():
@@ -424,7 +423,12 @@ def _dense_build_calls():
 
 def _solver_factory_calls():
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_diag, sweep_routes_local, sweep_routes_tiers  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        sweep_routes,
+        sweep_routes_diag,
+        sweep_routes_local,
+        sweep_routes_tiers,
+    )
 
     name = "solver_feather_pgs."
     for triples, batches in itertools.product((False, True), repeat=2):
@@ -660,11 +664,9 @@ def _keyed_row_calls():
         return keyed_rows.get_parallel_factory.__wrapped__(sweep_routes_tiers.parallel_kernel, layout)(*args, **kwargs)
 
     layout = _keyed_layout()
-    yield "keyed_rows.get_fallback_kernel", keyed_rows.get_fallback_kernel.__wrapped__, (layout,), {}
     for kwargs in _keyed_tier_kwargs(linked=False):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     # The persistent patch row law of the same rows.
-    yield "keyed_rows.get_fallback_kernel", keyed_rows.get_fallback_kernel.__wrapped__, (layout,), {"patch": True}
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
     for args, kwargs in _keyed_last_word_calls():
@@ -837,7 +839,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "sweep_routes.incremental_kernel",
             "sweep_routes_tiers.parallel_kernel",
             "sweep_routes_local.paired_factor_kernel",
-            "keyed_rows.get_fallback_kernel",
             "keyed_rows.get_parallel_factory",
             "kernels.allocate_world_contact_slots",
             "row_packets.produce_contacts",

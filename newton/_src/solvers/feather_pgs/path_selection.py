@@ -388,11 +388,10 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "keyed_rows":
         from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        owner = solver._keyed_rows
-        patch = bool(owner.patch)
+        patch = bool(solver._keyed_rows.patch)
         # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
         # materializes the rows of every other world.
-        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.get_fallback_kernel(owner.layout, patch=patch))
+        kernels = (keyed_rows.scatter_contact_keys, keyed_rows.materialize_general_rows)
     elif method == "compact_contact_boundary":
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 

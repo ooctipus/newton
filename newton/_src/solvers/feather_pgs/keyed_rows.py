@@ -21,17 +21,18 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import field_group
-from .contact_input import ContactInput
-from .contact_laws import CONTACT_LAW, contact_friction
-from .device_preludes import dual_native, lane_group
+from .contact_input import ContactInput, contact_frame
+from .contact_laws import CONTACT_LAW, contact_friction, contact_row_frame
+from .device_preludes import warp_stride
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
-from .kernel_template import WORLDS, KernelTemplate, substitute
+from .kernel_template import substitute
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
+from .row_build import endpoint_projection, write_contact_row
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 
@@ -100,17 +101,16 @@ ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
 """Device preludes of the row source: the contact and row laws it calls (``ContactLaw::...``, ``RowLaw::...``)."""
 
 
-def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
-    """Share row geometry and metadata between direct ingestion and the fallback.
+def _row_source(*, layout, patch=False):
+    """Decode a dense row from its key into the parallel tiers' row ``Zi`` and its records.
 
-    A contact row takes its geometry, frame, target, materials and Jacobian entries
-    from the contact laws and its rhs from the row laws (:data:`ROW_PRELUDES`). ``patch`` writes the persistent
-    patch row law: tangent rows act at the patch friction location for both the
-    Jacobian and the prescribed target, carry the anchor's tangential phi and
-    correct it with ``patch_law.beta``; every row's type, parent and coefficient
-    stay as :func:`scatter_contact_keys` and the patch link left them.
+    A prefix row's key ``~(2 d + side)`` gives a unit coefficient. A contact row takes its geometry, frame, target,
+    materials and Jacobian entries from the contact laws and its rhs from the row laws (:data:`ROW_PRELUDES`).
+    ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
+    Jacobian and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
+    every row's type, parent and coefficient stay as :func:`scatter_contact_keys` and the patch link left them.
     """
-    dofs = layout.dofs
+    dofs, output = layout.dofs, "Zi[q * ZS]"
     prefix = substitute(
         """
         const int token = ~key, d = token / 2;
@@ -170,9 +170,7 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
             "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
             "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n"
         )
-    if not private_metadata:
-        metadata = ""
-    elif patch:
+    if patch:
         metadata = "built_rhs = rhs;"
     else:
         metadata = (
@@ -235,60 +233,58 @@ ${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
     )
 
 
-def _fallback_source(layout, *, patch=False):
-    primary = layout.primary
-    secondary = layout.secondary
+@wp.kernel(enable_backward=False)
+def materialize_general_rows(
+    z: KineticRows,
+    data: ContactInput,
+    law: PatchRowLaw,
+    counts: wp.array[int],
+    mf_counts: wp.array[int],
+    parallel_rows: int,
+    primary: int,
+    secondary: int,
+    primary_offset: int,
+    secondary_offset: int,
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
+):
+    """Write the rows of the worlds the parallel tiers leave to the general sweep: those of more rows than the tiers
+    hold or with matrix-free rows. A warp per world (its lanes over the row coefficients) writes every coefficient,
+    a prefix row's unit coefficient from its key ``~(2 d + side)`` and a contact row's Jacobian entry at its row
+    frame (:func:`.row_build.endpoint_projection`), and a contact row's records and rhs
+    (:func:`.row_build.write_contact_row`)."""
+    world, lane = wp.tid()
+    count = counts[world]
+    if count <= parallel_rows and mf_counts[world] == 0:
+        return
     dofs = primary + secondary
-    limit = layout.parallel_rows
-    primary_test = layout.primary_test("q")
-    local_a = f"q - {layout.primary_offset}"
-    local_b = f"q - {layout.secondary_offset}"
-    source = substitute(
-        """
-    if (counts.data[world] <= $LIMIT && mf_counts.data[world] == 0) return;
-    const int ga = z.maps.groups.data[world * 2], gb = z.maps.groups.data[world * 2 + 1];
-    for (int row = LANE; row < counts.data[world]; row += STRIDE) {
-        float Jr[$DOFS];
-$ROW
-        #pragma unroll
-        for (int q = 0; q < $DOFS; ++q) {
-            if ($PRIMARY_TEST) J16.data[(ga * J16.shape[1] + row) * $NA + $LOCAL_A] = Jr[q];
-            else J6.data[(gb * J6.shape[1] + row) * $NB + $LOCAL_B] = Jr[q];
-        }
-    }
-""",
-        ROW=_row_source(layout=layout, patch=patch),
-        LIMIT=limit,
-        DOFS=dofs,
-        PRIMARY_TEST=primary_test,
-        NA=primary,
-        NB=secondary,
-        LOCAL_A=local_a,
-        LOCAL_B=local_b,
-    )
-    # A warp per world on CUDA (launched in blocks of 32), one thread on the CPU.
-    return dual_native(source, preludes=(lane_group(32), *ROW_PRELUDES))
-
-
-_FALLBACK_PARAMS = (
-    ("z", KineticRows),
-    ("counts", wp.array[int]),
-    ("mf_counts", wp.array[int]),
-    ("J16", wp.array3d[float]),
-    ("J6", wp.array3d[float]),
-)
-"""The fallback's operands; the patch fallback takes the patch row law after the rows."""
-
-
-@cache
-def get_fallback_kernel(layout, patch=False):
-    """Materialize current physical rows in one pass over fallback worlds only.
-
-    ``patch`` writes the persistent patch row law, whose struct the kernel takes after the rows.
-    """
-    params = (_FALLBACK_PARAMS[0], ("patch_law", PatchRowLaw), *_FALLBACK_PARAMS[1:]) if patch else _FALLBACK_PARAMS
-    name = "keyed_rows_patch_fallback" if patch else "keyed_rows_fallback"
-    return KernelTemplate(name, params, _fallback_source(layout, patch=patch), WORLDS, composed=True).kernel()
+    for coefficient in range(lane, count * dofs, warp_stride()):
+        row, q = coefficient // dofs, coefficient % dofs
+        size, local = primary, q - primary_offset
+        if q < primary_offset or q >= primary_offset + primary:
+            size, local = secondary, q - secondary_offset
+        key = z.rowkeys[world, row]
+        value = float(0.0)
+        if key < 0:
+            token = -1 - key
+            if q == token // 2:
+                value = wp.where(token % 2 == 0, 1.0, -1.0)
+        else:
+            c, r = key // 4, key % 4
+            body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
+                data, law, c
+            )
+            direction, p0, p1 = contact_row_frame(
+                r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            value = endpoint_projection(data, body_a, data.art0[c], size, local, p0, direction)
+            value -= endpoint_projection(data, body_b, data.art1[c], size, local, p1, direction)
+            if q == 0:
+                write_contact_row(data, law, c, r)
+        if size == primary:
+            J_a[z.maps.groups[world, 0], row, local] = value
+        else:
+            J_b[z.maps.groups[world, 1], row, local] = value
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
@@ -322,7 +318,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
             const auto& z = kinetic_rows;
             {built}
     """
-        + _row_source(layout=layout, output="Zi[q * ZS]", private_metadata=True, patch=patch)
+        + _row_source(layout=layout, patch=patch)
         + f"""
             if ({key} >= 0) {publish}
     """
@@ -385,7 +381,6 @@ class KeyedRows:
         # The placeholders of absent prefix tables, allocated before any capture.
         solver._arrays.placeholder(wp.int32)
         solver._arrays.placeholder(wp.float32)
-        self._dummy_factor = wp.zeros((1, 1, 1), dtype=float, device=dev)
         self._signature = _signature(solver)
         # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
         self.patch = bool(solver._friction_anchors_enabled)
@@ -424,49 +419,49 @@ class KeyedRows:
         wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
     def produce_contacts(self, contact_input):
-        """Defer current contact construction (the step's bound contact input) until final fallback counts are known.
-
-        Under patch friction the contact keys are scattered now, with the type,
-        parent and undivided coefficient the patch link reads and rewrites.
-        """
+        """Bind the step's contact input; :meth:`finish_rows` writes the rows once the counts are final."""
         self.contact_input = contact_input
         self.data.contact = self.contact_input
         # Like the other row producers, bind the anchor coefficient and the patch view (which
         # contact-pool growth replaces) every step.
         self.law = patch_row_law(self.solver)
-        if self.patch:
-            self._scatter_keys()
 
     def finish_rows(self):
-        """Publish current direct rows and fully materialize only fallback worlds."""
-        s = self.solver
-        if self.contact_input is not None and not self.patch:
-            self._scatter_keys()
-        na, nb = self.layout.primary, self.layout.secondary
-        fallback = get_fallback_kernel(self.layout, patch=self.patch)
+        """Scatter the contact keys, then write the general worlds' rows (:func:`materialize_general_rows`).
+
+        Under patch friction the keys carry each row's type, parent and undivided coefficient, and the general
+        worlds' records the same; the patch link, which runs after every row producer, links and divides them.
+        """
+        s, layout = self.solver, self.layout
+        na, nb = layout.primary, layout.secondary
+        if self.contact_input is not None:
+            pool = s._contact_pool
+            pool.launch(
+                scatter_contact_keys,
+                pool.launch_rows(),
+                inputs=[self.contact_input, self.data, self.law],
+                extent=self.contact_input.count,
+                max_blocks=s._contact_capacity_blocks,
+            )
         wp.launch_tiled(
-            fallback,
+            materialize_general_rows,
             dim=[s.world_count],
             inputs=[
-                *self.parallel_arguments(),
+                self.data,
+                self.data.contact,
+                self.law,
                 s.constraint_count,
                 s.mf_constraint_count,
+                layout.parallel_rows,
+                na,
+                nb,
+                layout.primary_offset,
+                layout.secondary_offset,
                 s.J_by_size[na],
-                s.J_by_size[nb] if nb else self._dummy_factor,
+                s.J_by_size[nb or na],
             ],
             block_dim=32,
             device=s.model.device,
-        )
-
-    def _scatter_keys(self):
-        """Scatter the contact keys: under patch friction before the patch link, else with the final counts."""
-        pool = self.solver._contact_pool
-        pool.launch(
-            scatter_contact_keys,
-            pool.launch_rows(),
-            inputs=[self.contact_input, self.data, self.law],
-            extent=self.contact_input.count,
-            max_blocks=self.solver._contact_capacity_blocks,
         )
 
     def parallel_arguments(self):
