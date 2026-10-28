@@ -2430,15 +2430,15 @@ def _free(device):
 
 
 def _replace_first_stream(twin, order):
-    """Free a twin's first contact stream and copy its frame, reordered by ``order``, into a new one.
+    """Drop a twin's first contact stream and copy its frame, reordered by ``order``, into a new one.
 
-    Returns whether the new stream's generation counter sits at the freed counter's
-    address. The memory pool usually gives the new ``Contacts`` that block; when it
-    places the counter elsewhere, the new stream is freed again and fresh counters
-    are allocated, the misses kept alive, until one lands there and replaces its own.
+    The new ``Contacts`` takes a generation counter that aliases the dropped counter's memory, which stays alive on
+    the twin: a new stream at a freed stream's counter address, the case a memory pool that hands the block to the
+    next ``Contacts`` produces, built directly instead of left to where the pool places the allocation. Returns
+    whether the new counter sits at the dropped counter's address, which holds by construction.
     """
     stream = twin.streams[0]
-    freed = stream.contact_generation.ptr
+    twin.dropped_counter = counter = stream.contact_generation
     frame = SimpleNamespace(
         rigid_contact_max=stream.rigid_contact_max,
         **{name: wp.clone(value, device="cpu") for name, value in vars(stream).items() if isinstance(value, wp.array)},
@@ -2446,20 +2446,12 @@ def _replace_first_stream(twin, order):
     twin.streams[0] = stream = None
     _free(twin.model.device)
     replacement = twin.pipeline.contacts()
-    if replacement.contact_generation.ptr != freed:
-        replacement = None
-        _free(twin.model.device)
-        misses = []
-        for _ in range(512):
-            counter = wp.zeros(1, dtype=wp.int32, device=twin.model.device)
-            if counter.ptr == freed:
-                break
-            misses.append(counter)
-        replacement = twin.pipeline.contacts()
-        replacement.contact_generation = counter
+    replacement.contact_generation = wp.array(
+        ptr=counter.ptr, dtype=counter.dtype, shape=counter.shape, device=counter.device
+    )
     twin.streams[0] = replacement
     _permute_contacts(frame, replacement, order)
-    return replacement.contact_generation.ptr == freed
+    return replacement.contact_generation.ptr == counter.ptr
 
 
 def _falling_boxes(device):
@@ -2858,7 +2850,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graphs_sort_a_stream_allocated_at_a_freed_address(self):
-        """Sort the first captured build over a Contacts the allocator placed where a freed one was."""
+        """Sort the first captured build over a new Contacts whose generation counter sits where a dropped one was."""
         rng = np.random.default_rng(8)
         graph = _graph_twin(jaws=True)
         eager = _SolverTwin("cuda:0", jaws=True)
