@@ -614,8 +614,7 @@ def check_compact_records(test, solvers, law):
                 "6": ("compact_jacobian", [metadata, "populate_world_J_for_compact_size"]),
             }
         else:
-            p = "patch_" if law == "patch" else ""
-            produce = [f"produce_{p}contacts"]
+            produce = ["produce_contacts"]
             expected = {
                 "108": ("compact_contact_boundary", [*produce, marker]),
                 "6": ("compact_contact_boundary", ["clear_contact_response", *produce]),

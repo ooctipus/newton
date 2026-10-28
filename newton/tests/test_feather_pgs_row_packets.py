@@ -25,6 +25,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_history_close,
     assert_rows_close,
     contact_rows,
+    point_row_law,
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 from newton.tests.test_feather_pgs_compact_contact import assert_patch_tangent_law
@@ -421,7 +422,7 @@ class _PatchRowTwins:
                 data, layout = _patch_fixture(self.device, shared=shared, friction_shared=friction_shared)
                 general, jacobians, bias = _run_general(data, layout, beta)
                 packet = _packet(layout.device)
-                _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+                _launch(rp.produce_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
                 owned = _owned_rows(data)
                 # The general route writes the metadata of allocated rows alone; the producer also seeds their
                 # diagonals with cfm and, with contact_w 1, leaves row_w alone. Other rows keep their poison.
@@ -485,7 +486,7 @@ class _PatchRowTwins:
                             group = groups[2 * w + int(size == SECONDARY)]
                             values[group] = expected[group] = np.nan
                         J = wp.array(values, dtype=float, device=layout.device)
-                        _launch(rp.materialize_patch_fallback, data, layout, law, owner, size, layout.groups, J)
+                        _launch(rp.materialize_fallback, data, layout, law, owner, size, layout.groups, J)
                         self.assert_same(J.numpy(), expected, err_msg=f"size {size}")
 
     def test_patch_tangent_rows_replace_the_point_law(self):
@@ -500,8 +501,9 @@ class _PatchRowTwins:
         data, layout = _patch_fixture(self.device)
         point, _ = _patch_fixture(self.device)
         packet, point_packet = _packet(layout.device), _packet(layout.device)
-        _launch(rp.produce_patch_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
-        _launch(rp.produce_contacts, point, layout, point_packet, PRIMARY, SECONDARY)
+        _launch(rp.produce_contacts, data, layout, _law(layout.view, beta), packet, PRIMARY, SECONDARY)
+        point_law = point_row_law(layout.device, layout.view.phi.shape[0])
+        _launch(rp.produce_contacts, point, layout, point_law, point_packet, PRIMARY, SECONDARY)
         phi = layout.view.phi.numpy()
         moved = 0.0
         for c, w, first, count in _contact_rows(data):
@@ -539,8 +541,8 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
     def test_patch_producers_share_one_row_law(self):
         """Write patch rows through the contact row frame law and the patch tangent row in the packet and compact producers."""
         producers = (
-            rp.produce_patch_contacts,
-            rp.materialize_patch_fallback,
+            rp.produce_contacts,
+            rp.materialize_fallback,
             compact_contact.produce_contacts,
         )
         for kernel in producers:
@@ -548,14 +550,14 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
             called = _called_functions(kernel)
             self.assertIn(contact_laws.contact_row_frame, called, name)
             # The fallback writes Jacobians alone; the producers also write the tangent rows' metadata.
-            if kernel is not rp.materialize_patch_fallback:
+            if kernel is not rp.materialize_fallback:
                 self.assertIn(friction_patches.patch_tangent_row, called, name)
 
     def test_owner_launches_the_friction_law_it_was_built_with(self):
-        """Launch the patch producer and fallback exactly under anchors, with the solver's patch view and beta.
+        """Launch the producer and fallback with the solver's patch view and beta under either friction law.
 
-        The law is fixed when the owner is built; ``friction_anchor_beta`` is read at each launch, as the
-        general route reads it, so a change after construction reaches the next step's rows.
+        Point friction is the patch law with beta 0 and a disabled view. ``friction_anchor_beta`` is read at
+        each launch, as the general route reads it, so a change after construction reaches the next step's rows.
         """
         device = "cpu"
         for anchors in (False, True):
@@ -563,7 +565,6 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                 solver = _owner_solver(device, anchors=anchors, beta=0.375 if anchors else 0.0)
                 with mock.patch.object(rp, "topology_signature", return_value=()):
                     owner = rp.LocalRowPackets(solver, PRIMARY, SECONDARY, 0)
-                self.assertEqual(owner.patch_friction, anchors)
                 for beta in (0.5, 0.125) if anchors else (0.0,):
                     solver.friction_anchor_beta = beta
                     contact_input = rp.ContactInput()
@@ -574,8 +575,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                         owner.produce_contacts(contact_input)
                         owner.finish_rows()
                     self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
-                    producer = rp.produce_patch_contacts if anchors else rp.produce_contacts
-                    fallback = rp.materialize_patch_fallback if anchors else rp.materialize_fallback
+                    producer, fallback = rp.produce_contacts, rp.materialize_fallback
                     self.assertEqual(
                         [call.args[0] for call in tiled.call_args_list],
                         [producer, rp.materialize_general_prefix, fallback, rp.materialize_general_prefix, fallback],
@@ -584,17 +584,16 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                     for call in (tiled.call_args_list[0], *tiled.call_args_list[2::2]):
                         inputs = call.kwargs["inputs"]
                         self.assertIs(inputs[1], contact_input)
-                        # The patch row law follows the contact input; the point kernels take none.
-                        self.assertEqual(isinstance(inputs[2], rp.PatchRowLaw.cls), anchors)
+                        # The row law follows the contact input.
+                        self.assertIsInstance(inputs[2], rp.PatchRowLaw.cls)
                         laws.append(inputs[2])
-                    self.assertIs(tiled.call_args_list[0].kwargs["inputs"][2 + int(anchors)], owner.packet)
-                    if anchors:
-                        view = solver._friction_patches.view
-                        for law in laws:
-                            self.assertEqual(law.beta, beta)
-                            self.assertEqual(law.patches.enabled, 1)
-                            for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
-                                self.assertIs(getattr(law.patches, name), getattr(view, name), name)
+                    self.assertIs(tiled.call_args_list[0].kwargs["inputs"][3], owner.packet)
+                    view = solver._friction_patches.view
+                    for law in laws:
+                        self.assertEqual(law.beta, beta)
+                        self.assertEqual(law.patches.enabled, int(anchors))
+                        for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                            self.assertIs(getattr(law.patches, name), getattr(view, name), name)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "The packet producers split each contact over a warp on CUDA")
@@ -709,7 +708,6 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertIsNone(plain_solver._row_packets)
         solver, poses = _rollout(model, packets=True, **kwargs)
         self.assertIsInstance(solver._row_packets, rp.LocalRowPackets)
-        self.assertEqual(solver._row_packets.patch_friction, solver._friction_anchors_enabled)
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
@@ -752,7 +750,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PRESS) for enabled in (False, True))
         self.assertIsNone(plain.solver._row_packets)
         self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
-        self.assertTrue(packets.solver._row_packets.patch_friction)
+        self.assertTrue(packets.solver._friction_anchors_enabled)
         routes = packets.solver.get_path_selection()["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["contact_rows"]["producer"], "local_packets")
@@ -760,7 +758,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         # The packets' patch producer and the fallback materialization of the general worlds, for every size.
         builder = {
             "method": "local_packets",
-            "kernels": ["produce_patch_contacts", "materialize_patch_fallback"],
+            "kernels": ["produce_contacts", "materialize_fallback"],
             "law": "patch",
         }
         builders = routes["contact_rows"]["builder_by_dof"]
@@ -807,7 +805,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PADS) for enabled in (False, True))
         self.assertIsNone(plain.solver._row_packets)
         self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
-        self.assertTrue(packets.solver._row_packets.patch_friction)
+        self.assertTrue(packets.solver._friction_anchors_enabled)
         self._step_pad_rings(plain, packets)
 
     def _step_pad_rings(self, plain, packets):
@@ -854,7 +852,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         ):
             with self.subTest(**kwargs):
                 solver = self._compare(_build(wp.get_device("cuda:0"), **kwargs), friction_anchor_beta=0.2)
-                self.assertTrue(solver._row_packets.patch_friction)
+                self.assertTrue(solver._friction_anchors_enabled)
                 self.assertEqual((solver._row_packets.primary, solver._row_packets.mimics), layout)
 
 

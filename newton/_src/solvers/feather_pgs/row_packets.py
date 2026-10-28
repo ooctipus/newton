@@ -434,181 +434,19 @@ def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3,
 
 
 @wp.kernel(enable_backward=False)
-def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData, primary: int, secondary: int):
-    """Cooperatively project current contacts into physical packets after allocation."""
-    worker, _logical_lane = wp.tid()
-    lane = warp_lane()
-    stride = warp_stride()
-    capacity = packet.jacobian.shape[1]
-    width = primary + secondary
-    total = data.count[0]
-    for contact in range(worker, total, workers):
-        if data.path[contact] != 0 or data.slot[contact] < 0:
-            continue
-        world = data.world[contact]
-        slot = data.slot[contact]
-        rows = data.slots_needed[contact]
-        art0 = data.art0[contact]
-        art1 = data.art1[contact]
-        body0, body1 = contact_bodies(data.shape0[contact], data.shape1[contact], data.shape_body)
-        normal = wp.vec3()
-        point0 = wp.vec3()
-        point1 = wp.vec3()
-        separation = float(0.0)
-        tangent0 = wp.vec3()
-        tangent1 = wp.vec3()
-        if lane == 0:
-            normal, point0, point1, separation = contact_points(
-                data.normal[contact],
-                data.point0[contact],
-                data.point1[contact],
-                data.margin0[contact],
-                data.margin1[contact],
-                body0,
-                body1,
-                data.body_q,
-            )
-            tangent0, tangent1 = contact_tangent_basis(normal)
-        normal = warp_broadcast(normal)
-        point0 = warp_broadcast(point0)
-        point1 = warp_broadcast(point1)
-        tangent0 = warp_broadcast(tangent0)
-        tangent1 = warp_broadcast(tangent1)
-        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
-        for coefficient in range(lane, rows * width, stride):
-            row = coefficient // width
-            coordinate = coefficient % width
-            output_row = slot + row
-            if output_row < capacity:
-                size = primary
-                dof = coordinate
-                if coordinate >= primary:
-                    size = secondary
-                    dof -= primary
-                direction, p0, p1 = contact_row_frame(
-                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-                )
-                value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
-                value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
-                packet.jacobian[world, output_row, coordinate] = value
-        warp_sync()
-        if lane == 0:
-            mu, restitution = contact_materials(
-                data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
-            )
-            friction_mu = mu * data.friction_scale
-            inv_dt = 1.0 / data.dt
-            for row in range(rows):
-                output_row = slot + row
-                direction, p0, p1 = contact_row_frame(
-                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-                )
-                target = prescribed_target(
-                    body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
-                )
-                phi = float(0.0)
-                beta = float(0.0)
-                row_restitution = float(0.0)
-                row_mu = friction_mu
-                kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
-                parent = slot
-                rhs = -target
-                weight = float(1.0)
-                if row == 0:
-                    phi = separation
-                    beta = data.beta
-                    row_restitution = restitution
-                    row_mu = mu
-                    kind = PGS_CONSTRAINT_TYPE_CONTACT
-                    parent = -1
-                    rhs, weight = contact_rhs(
-                        phi, beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
-                    )
-                    if restitution > 0.0:
-                        relative = incident_projection(data, body0, art0, p0, direction)
-                        relative -= incident_projection(data, body1, art1, p1, direction)
-                        relative -= target
-                        fires, bounce = contact_restitution_rhs(
-                            phi, relative, target, restitution, data.dt, data.restitution_threshold
-                        )
-                        if fires:
-                            rhs = bounce
-                            weight = 1.0
-                data.row_type[world, output_row] = kind
-                data.row_parent[world, output_row] = parent
-                data.row_mu[world, output_row] = row_mu
-                data.row_beta[world, output_row] = beta
-                data.row_cfm[world, output_row] = data.cfm
-                data.phi[world, output_row] = phi
-                data.target[world, output_row] = target
-                data.restitution[world, output_row] = row_restitution
-                data.rhs[world, output_row] = rhs
-                data.diag[world, output_row] = data.cfm
-                if data.contact_w < 1.0:
-                    data.row_w[world, output_row] = weight
-                if output_row < capacity:
-                    packet.row_contact[world, output_row] = contact * 3 + row
-        warp_sync()
-
-
-@wp.kernel(enable_backward=False)
-def materialize_fallback(
-    workers: int,
-    data: ContactInput,
-    owner: wp.array[int],
-    target_size: int,
-    groups: wp.array[int],
-    J: wp.array3d[float],
-):
-    """Reproject every general-world endpoint, including rows outside the local bound."""
-    worker, _logical_lane = wp.tid()
-    lane = warp_lane()
-    stride = warp_stride()
-    total = data.count[0]
-    for contact in range(worker, total, workers):
-        if data.path[contact] != 0 or data.slot[contact] < 0:
-            continue
-        world = data.world[contact]
-        if owner[world] != 0:
-            continue
-        body0, body1, normal, point0, point1, _separation = contact_geometry_of(data, contact)
-        tangent0, tangent1 = contact_tangent_basis(normal)
-        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
-        art0, art1 = data.art0[contact], data.art1[contact]
-        group0, group1 = int(-1), int(-1)
-        if art0 >= 0 and data.response_dofs[art0] == target_size:
-            group0 = groups[art0]
-        if art1 >= 0 and data.response_dofs[art1] == target_size:
-            group1 = groups[art1]
-        for coefficient in range(lane, data.slots_needed[contact] * target_size, stride):
-            row = coefficient // target_size
-            dof = coefficient % target_size
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-            )
-            value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)
-            value1 = -endpoint_projection(data, body1, art1, target_size, dof, p1, direction)
-            output_row = data.slot[contact] + row
-            if group0 >= 0:
-                J[group0, output_row, dof] = value0 + value1 if group0 == group1 else value0
-            if group1 >= 0 and group1 != group0:
-                J[group1, output_row, dof] = value1
-
-
-@wp.kernel(enable_backward=False)
-def produce_patch_contacts(
+def produce_contacts(
     workers: int, data: ContactInput, law: PatchRowLaw, packet: ContactPacketData, primary: int, secondary: int
 ):
-    """Project current contacts into physical packets with the persistent patch friction law.
+    """Cooperatively project current contacts into physical packets after allocation.
 
-    The normal row's metadata and packet are those of :func:`produce_contacts`. Tangent rows, present
-    only when the contact owns an anchor, follow the patch row law that the compact producer shares
-    (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): they act at the patch friction location, carry
-    the anchor's tangential phi with ``law.beta`` and keep the undivided coefficient. Every rhs is the
-    row law's (``row_laws``), as the general route's, so the rows equal it bitwise. A bouncing normal row sums its incident
-    velocity per body, as :func:`produce_contacts` does, instead of per world coordinate. It agrees
-    with the general route's to rounding, unless the incident velocity lies within a rounding of a
-    bounce threshold, where the two routes can disagree on whether the row bounces.
+    Tangent rows act at the friction location and follow the row law that the compact producer shares
+    (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): under persistent patches at the patch
+    friction location with the anchor's tangential phi, ``law.beta`` and the undivided coefficient; under point
+    friction (beta 0, a disabled view with a zero phi) at the contact's friction points. Every rhs is the row
+    law's (``row_laws``), as the general route's, so the rows equal it bitwise. A bouncing normal row sums its
+    incident velocity per body instead of per world coordinate. It agrees with the general route's to rounding,
+    unless the incident velocity lies within a rounding of a bounce threshold, where the two routes can
+    disagree on whether the row bounces.
     """
     worker, _logical_lane = wp.tid()
     lane = warp_lane()
@@ -648,7 +486,9 @@ def produce_patch_contacts(
         point1 = warp_broadcast(point1)
         tangent0 = warp_broadcast(tangent0)
         tangent1 = warp_broadcast(tangent1)
-        friction0, friction1 = patch_friction_location(law.patches, contact)
+        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
+        if law.patches.enabled != 0:
+            friction0, friction1 = patch_friction_location(law.patches, contact)
         for coefficient in range(lane, rows * width, stride):
             row = coefficient // width
             coordinate = coefficient % width
@@ -725,7 +565,7 @@ def produce_patch_contacts(
 
 
 @wp.kernel(enable_backward=False)
-def materialize_patch_fallback(
+def materialize_fallback(
     workers: int,
     data: ContactInput,
     law: PatchRowLaw,
@@ -734,7 +574,8 @@ def materialize_patch_fallback(
     groups: wp.array[int],
     J: wp.array3d[float],
 ):
-    """Reproject every general-world endpoint as :func:`materialize_fallback` does, with the patch law."""
+    """Reproject every general-world endpoint, including rows outside the local bound, at the row law's
+    friction location."""
     worker, _logical_lane = wp.tid()
     lane = warp_lane()
     stride = warp_stride()
@@ -747,7 +588,9 @@ def materialize_patch_fallback(
             continue
         body0, body1, normal, point0, point1, _separation = contact_geometry_of(data, contact)
         tangent0, tangent1 = contact_tangent_basis(normal)
-        friction0, friction1 = patch_friction_location(law.patches, contact)
+        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
+        if law.patches.enabled != 0:
+            friction0, friction1 = patch_friction_location(law.patches, contact)
         art0, art1 = data.art0[contact], data.art1[contact]
         group0, group1 = int(-1), int(-1)
         if art0 >= 0 and data.response_dofs[art0] == target_size:
@@ -869,8 +712,6 @@ class LocalRowPackets:
             residual_pair=solver._local_residual_active_secondaries[self.primary],
         )
         self.queue = field_group.bind(QueueData, solver=solver, size=size, status=None)
-        # The friction law is fixed at construction; produce_contacts binds its current arrays.
-        self.patch_friction = bool(solver._friction_anchors_enabled)
         self.contact_input = None
         self.law = None
         self._topology_signature = topology_signature(solver)
@@ -878,10 +719,6 @@ class LocalRowPackets:
 
     def local_factory(self):
         return get_local_factory(self.primary, self.secondary, self.packets)
-
-    def row_law(self):
-        """Bind the persistent patch friction row law, or return ``None`` for point friction."""
-        return patch_row_law(self.solver) if self.patch_friction else None
 
     def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
         """Validate structural changes without reading back numeric-only updates."""
@@ -935,12 +772,12 @@ class LocalRowPackets:
         runs after this producer; :meth:`finish_rows` writes neither row parents nor coefficients.
         """
         self.contact_input = contact_input
-        self.law = self.row_law()
-        kernel, law = (produce_contacts, ()) if self.law is None else (produce_patch_contacts, (self.law,))
+        # The row law binds the patch view, which contact-pool growth replaces, every step.
+        self.law = patch_row_law(self.solver)
         wp.launch_tiled(
-            kernel,
+            produce_contacts,
             dim=[self.workers],
-            inputs=[self.workers, self.contact_input, *law, self.packet, self.primary, self.secondary],
+            inputs=[self.workers, self.contact_input, self.law, self.packet, self.primary, self.secondary],
             block_dim=32,
             device=self.solver.model.device,
         )
@@ -982,16 +819,13 @@ class LocalRowPackets:
                 device=solver.model.device,
             )
             if self.contact_input is not None:
-                kernel, law = (
-                    (materialize_fallback, ()) if self.law is None else (materialize_patch_fallback, (self.law,))
-                )
                 wp.launch_tiled(
-                    kernel,
+                    materialize_fallback,
                     dim=[self.workers],
                     inputs=[
                         self.workers,
                         self.contact_input,
-                        *law,
+                        self.law,
                         queue.owner,
                         size,
                         solver.art_group_idx,

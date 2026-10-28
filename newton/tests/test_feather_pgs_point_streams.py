@@ -54,8 +54,6 @@ _PATCH_ONLY = frozenset(
         # The resolved-world classifier under persistent patch friction.
         "resolved_worlds.check_raw_contact_normals_by_route",
         "resolved_worlds.finalize_resolved_worlds_bounded",
-        "row_packets.materialize_patch_fallback",
-        "row_packets.produce_patch_contacts",
         # Sparse-diagonal schedules over patch contact units.
         "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
         "speculative_contact_batches=False)",

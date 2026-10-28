@@ -638,7 +638,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for law in ("point", "patch"):
             point = law == "point"
             p = "" if point else "patch_"
-            produce = f"produce_{p}contacts"
             masked = ["contact_row_prelude", "populate_world_J_masked"]
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
@@ -655,11 +654,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             cases = (
                 # (attributes, switches, sizes, producer, {size: (method, kernels)})
                 (
-                    {"_row_packets": SimpleNamespace(patch_friction=not point)},
+                    {"_row_packets": SimpleNamespace()},
                     {},
                     (18, 6),
                     "local_packets",
-                    same((18, 6), "local_packets", [produce, f"materialize_{p}fallback"]),
+                    same((18, 6), "local_packets", ["produce_contacts", "materialize_fallback"]),
                 ),
                 (
                     {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},

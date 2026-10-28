@@ -38,9 +38,7 @@ ROW_BUILDER_KERNELS = frozenset(
         "sparse_pair_contact_rows_kernel",
         "clear_contact_response",
         "produce_contacts",
-        "produce_patch_contacts",
         "materialize_fallback",
-        "materialize_patch_fallback",
         "scatter_contact_keys",
         "scatter_patch_contact_keys",
     )
@@ -57,7 +55,6 @@ PER_SIZE_KERNELS = frozenset(
         "populate_world_J_for_size",
         "populate_world_J_for_compact_size",
         "materialize_fallback",
-        "materialize_patch_fallback",
     )
 )
 

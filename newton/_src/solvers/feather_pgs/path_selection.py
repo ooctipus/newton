@@ -384,13 +384,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     if method == "local_packets":
         from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        # The owner fixes its friction law at construction.
-        patch = bool(solver._row_packets.patch_friction)
-        kernels = (
-            (row_packets.produce_patch_contacts, row_packets.materialize_patch_fallback)
-            if patch
-            else (row_packets.produce_contacts, row_packets.materialize_fallback)
-        )
+        kernels = (row_packets.produce_contacts, row_packets.materialize_fallback)
     elif method == "keyed_rows":
         from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
