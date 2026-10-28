@@ -30,7 +30,6 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
-from ...core.environment_flags import retired_notice
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ...sim.articulation import eval_fk
@@ -1599,13 +1598,8 @@ class SolverFeatherPGS(SolverBase):
         self.compliance_skipped_contact_count = 0
         self._compliant_contacts = None
         self._compliant_prepared = False
-        # Read the FEATHER_PGS_* environment once: a retired selector set to 1 raises
-        # before any model access, other retired names warn once per process, and
-        # undeclared names are recorded, not rejected.
+        # Read the FEATHER_PGS_* environment once; undeclared names are recorded, not rejected.
         self._environment_record = _environment_flags.record()
-        retired_warning = retired_notice(self._environment_record)
-        if retired_warning is not None:
-            warnings.warn(retired_warning, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         super().__init__(model)
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         options = check_options(requested_options)
@@ -2757,9 +2751,8 @@ class SolverFeatherPGS(SolverBase):
         ``environment`` records the ``FEATHER_PGS_*`` and
         ``IL_NEWTON_FPGS_*`` variables present at construction: ``applied`` maps
         declared names to their values, ``unknown`` lists undeclared names
-        (recorded, not rejected), ``retired`` lists retired names whose value did
-        not reject construction (each warned about once per process) and
-        ``isaac_lab`` is empty for this family.
+        (recorded, not rejected; removed switches among them), and ``retired`` and
+        ``isaac_lab`` are empty for this family.
         ``routes.diagnostics.stage3_snapshots`` records whether
         ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` or ``pgs_debug`` allocated the stage-3
         snapshots, which every substep then copies.

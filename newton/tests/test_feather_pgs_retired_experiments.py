@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reject removed research selectors and ignore the retired packed sparse-factor route's flags."""
+"""Removed research selectors and the packed sparse-factor route's flags select nothing: unknown names."""
 
 import os
 import unittest
+import warnings
 from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.core import environment_flags as core_flags
 from newton._src.solvers.feather_pgs import environment_flags
 
 RETIRED_FLAGS = (
@@ -116,32 +116,19 @@ def _selection(model, flags):
 
 
 class TestFeatherPGSRetiredExperiments(unittest.TestCase):
-    """Keep an obsolete recipe from silently selecting a different solver."""
+    """Keep removed switches from selecting anything: the record lists them as unknown names."""
 
-    def test_solver_rejects_removed_flags_before_model_access(self):
-        """Reject each retired selector before allocating or reading model data."""
-        for flag in RETIRED_FLAGS:
-            flags = dict.fromkeys(RETIRED_FLAGS, "0") | {flag: "1"}
-            with self.subTest(flag=flag), patch.dict(os.environ, flags):
-                with self.assertRaisesRegex(ValueError, flag + ".*retired"):
-                    newton.solvers.SolverFeatherPGS(None)
-
-    def test_packed_route_flags_run_the_general_route_cpu(self):
-        """Construct a recipe's packed-route flags on the general route, record them as retired and warn about them."""
+    def test_removed_switches_run_the_general_route_cpu(self):
+        """Construct a recipe's removed switches on the general route, list them as unknown and warn about none."""
         model = _humanoids("cpu")
         plain = _selection(model, {})
-        # The solver warns once per process about retired names; report them afresh.
-        with (
-            patch.object(core_flags, "_WARNED_RETIRED", set()),
-            self.assertWarnsRegex(
-                UserWarning,
-                rf"^Ignoring retired environment variables that select nothing: {', '.join(sorted(PACKED_ROUTE_FLAGS))}\.",
-            ),
-        ):
-            recipe = _selection(model, dict.fromkeys(PACKED_ROUTE_FLAGS, "1"))
+        flags = dict.fromkeys(RETIRED_FLAGS + PACKED_ROUTE_FLAGS, "1")
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            recipe = _selection(model, flags)
+        self.assertEqual([str(item.message) for item in seen if "FEATHER_PGS_" in str(item.message)], [])
         self.assertEqual(
-            recipe["environment"],
-            {"applied": {}, "unknown": [], "retired": sorted(PACKED_ROUTE_FLAGS), "isaac_lab": {}},
+            recipe["environment"], {"applied": {}, "unknown": sorted(flags), "retired": [], "isaac_lab": {}}
         )
         self.assertNotIn("research_sparse_factor", recipe["routes"])
         # Everything but the environment record matches a construction without the flags.

@@ -4,11 +4,9 @@
 """Declared ``FEATHER_PGS_*`` environment variables of SolverFeatherPGS.
 
 Each entry names the modules that read it; ``newton/tests/test_environment_flags.py``
-keeps the declarations equal to the read sites. Retired selectors set to 1 are
-rejected here for the solver, except those of :data:`IGNORED_RETIRED`, which
-recipes still set: they select nothing and the record lists them as retired. The
-solver records its environment once at construction, warns once per process about
-each retired name present and records undeclared names instead of rejecting them.
+keeps the declarations equal to the read sites. The solver records its environment
+once at construction; a name nothing reads, a removed switch among them, is
+undeclared and recorded as unknown, not rejected.
 """
 
 from __future__ import annotations
@@ -28,75 +26,6 @@ _CACHE = ("held_tree",)
 def _flag(name: str, kind: FlagKind, modules: tuple[str, ...], meaning: str) -> EnvironmentFlag:
     return EnvironmentFlag(name, kind, tuple(_PACKAGE + module for module in modules), meaning)
 
-
-# Retired selectors that raise when set to 1, in the order the solver has always checked them, each newly
-# retired one last: when several are set, the first one names the error. Nothing reads them.
-_RAISING_RETIRED = (
-    ("FEATHER_PGS_SINGLE_FACTOR", "Retired single-factor owner; =1 raises at construction."),
-    ("FEATHER_PGS_BODY_BASIS_ROWS", "Retired experiment; =1 raises."),
-    ("FEATHER_PGS_SPARSE_PACKETS", "Retired experiment; =1 raises."),
-    ("FEATHER_PGS_SPARSE_PAIRED_GS", "Retired experiment; =1 raises."),
-    ("FEATHER_PGS_COUPLED_CONTACT", "Retired experiment; =1 raises."),
-    ("FEATHER_PGS_COUPLED_JACOBI", "Retired experiment; =1 raises."),
-    ("FEATHER_PGS_DENSE_ROW_REGISTERS", "Retired register-state copy of the 64-row tiled_row sweep; =1 raises."),
-)
-
-# Retired names that are ignored rather than rejected: those Isaac Lab's
-# benchmark recipes still set, namely the packed sparse-factor route's
-# selectors (480f0f44), the chain-scan and keyed-row aliases (d35949d6), the
-# selectors of removed research owners and of the branch-Jacobi sweep
-# (790f9782, aa2f332b), the in-sweep world rows' selector, which keyed rows
-# declined wherever a recipe set it, the lane count of the removed grouped
-# kinematics and torque kernels, and the prismatic opt-ins that scalar
-# branches replaced; and the removed diagnostics and experiment that selected
-# no route of their own: the sweep-input capture (FEATHER_PGS_CAPTURE_*), the
-# row and in-kernel response comparisons (FEATHER_PGS_CHECK_ROWS,
-# FEATHER_PGS_INK_CHECK) and the grouped free-body response
-# (FEATHER_PGS_GROUPED_HINV_FREE); and the switches of the removed
-# grouped_dynamics option (FEATHER_PGS_GROUPED_HINV, FEATHER_PGS_GROUPED_HINV_MAX,
-# FEATHER_PGS_SPARSE_GROUPED_DYNAMICS). Nothing in Newton or Isaac Lab reads them,
-# and recipes are not Newton's to edit, so the general route runs, the
-# construction record lists them as retired and the solver warns once per
-# process.
-_IGNORED_RETIRED = {
-    "FEATHER_PGS_ALLEGRO_KINETIC_ROWS": "Retired alias that turned keyed rows on; ignored (FEATHER_PGS_KEYED_ROWS=0 opts out of them).",
-    "FEATHER_PGS_CAPTURE_COUNT": "Retired substep count of the removed sweep-input capture; ignored.",
-    "FEATHER_PGS_CAPTURE_DIR": "Retired directory of the removed sweep-input capture; ignored.",
-    "FEATHER_PGS_CAPTURE_KERNEL": "Retired capture of the matrix-free sweep's inputs for standalone replay; ignored.",
-    "FEATHER_PGS_CAPTURE_PHASE": "Retired solve phase of the removed sweep-input capture; ignored.",
-    "FEATHER_PGS_CAPTURE_STEP": "Retired first step of the removed sweep-input capture; ignored.",
-    "FEATHER_PGS_CHECK_ROWS": "Retired comparison of the masked contact-row builder with the per-contact builder; ignored.",
-    "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE": "Retired compact workspace of a removed robot-specific owner; ignored.",
-    "FEATHER_PGS_G1_CHAIN_SCAN": "Retired G1 alias of the held-tree chain scan; ignored.",
-    "FEATHER_PGS_GROUPED_HINV": "Retired opt-out of the grouped response solve, which the data now choose; ignored.",
-    "FEATHER_PGS_GROUPED_HINV_FREE": "Retired grouped response solve of free-body size groups, slower than the per-row kernel; ignored.",
-    "FEATHER_PGS_GROUPED_HINV_MAX": "Retired size bound of the grouped response solve, which the data now choose; ignored.",
-    "FEATHER_PGS_GROUP_LANES": "Retired lanes per articulation of the removed grouped kinematics and torque kernels; ignored.",
-    "FEATHER_PGS_INDEPENDENT_COMPONENTS": "Retired independent-components variant of a removed robot-specific owner; ignored.",
-    "FEATHER_PGS_INK_CHECK": "Retired write-back of the in-kernel response and diagonal for comparison; ignored.",
-    "FEATHER_PGS_KUKA_CURRENT_CONTACT": "Retired current-contact geometry of a removed robot-specific owner; ignored.",
-    "FEATHER_PGS_KUKA_JOINT_WORLD": "Retired joint-world prediction of a removed robot-specific owner; ignored.",
-    "FEATHER_PGS_LOCAL_ROW_PACKETS": "Retired row-packet producer of a removed robot-specific owner; ignored (see FEATHER_PGS_ROW_PACKETS).",
-    "FEATHER_PGS_PACKED_TREE_KINETIC_STATE": "Retired tree cache of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_PAIRED_GENERAL_OVERLAP": "Retired overlap of the paired and general solve streams; ignored.",
-    "FEATHER_PGS_PRISMATIC_LINEAR_STATE": "Retired linear state of fixed-root one-body prismatic branches; ignored (scalar branches run them).",
-    "FEATHER_PGS_PRISMATIC_PUBLICATION": "Retired body-parallel publication of fixed-root prismatic stars; ignored (scalar branches run them).",
-    "FEATHER_PGS_SIMPLE_WORLD_ZERO": "Retired simple-world classifier of a removed robot-specific owner; ignored.",
-    "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "Retired branch-Jacobi sparse sweep; ignored, sparse factors keep their ordered sweeps.",
-    "FEATHER_PGS_SPARSE_CONTACT_BLOCK": "Retired contact-block rows of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_SPARSE_FACTOR": "Retired packed sparse-factor route; ignored, the general route (sparse factors where admitted) runs.",
-    "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "Retired opt-out of sparse factors for the removed grouped_dynamics option; ignored.",
-    "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "Retired level-by-level factor update of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_SPARSE_LIMIT_JACOBI": "Retired Jacobi joint-limit solve of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_SPARSE_METRIC_TANGENTS": "Retired metric tangents of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "Retired parallel joint-limit prefix of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS": "Retired spectral tangents of the packed sparse-factor route; ignored.",
-    "FEATHER_PGS_TREE_CHAIN_SCAN": "Retired held-tree chain-scan selector; ignored (the scans' schedules follow from the tree's data).",
-    "FEATHER_PGS_TREE_LANE_PACK": "Retired held-tree lane width selector; ignored (the lanes follow from the tree's data).",
-    "FEATHER_PGS_WORLD_ROWS": "Retired in-sweep world rows, which keyed rows always declined where recipes set it; ignored.",
-    "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "Retired world-scan publication of a removed robot-specific owner; ignored.",
-}
-IGNORED_RETIRED = frozenset(_IGNORED_RETIRED)
 
 # The flags the solver reads: (name, kind, reading modules, meaning).
 _READ = (
@@ -321,29 +250,9 @@ _READ = (
     ),
 )
 
-# The raising retired selectors lead; the ignored ones sit in name order with the read flags.
-FLAGS = declare(
-    *(_flag(name, "retired", ("environment_flags",), meaning) for name, meaning in _RAISING_RETIRED),
-    *sorted(
-        (
-            *(_flag(name, "retired", ("environment_flags",), meaning) for name, meaning in _IGNORED_RETIRED.items()),
-            *(_flag(*flag) for flag in _READ),
-        ),
-        key=lambda flag: flag.name,
-    ),
-)
-
-
-def reject_retired(environ: Mapping[str, str] | None = None) -> None:
-    """Reject obsolete recipes before they silently select a different owner."""
-    environ = os.environ if environ is None else environ
-    for name, flag in FLAGS.items():
-        if flag.kind == "retired" and name not in IGNORED_RETIRED and environ.get(name) == "1":
-            raise ValueError(f"{name} selects a retired experiment; reproduce it from the original research checkout")
+FLAGS = declare(*sorted((_flag(*flag) for flag in _READ), key=lambda flag: flag.name))
 
 
 def record(environ: Mapping[str, str] | None = None) -> dict:
-    """Reject retired selectors, then record the solver's environment once at construction."""
-    environ = os.environ if environ is None else environ
-    reject_retired(environ)
-    return record_environment(FLAGS, PREFIXES, environ)
+    """Record the solver's environment once at construction."""
+    return record_environment(FLAGS, PREFIXES, os.environ if environ is None else environ)

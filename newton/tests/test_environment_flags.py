@@ -29,68 +29,20 @@ _PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_", "NEWTON_")
 _NAME = re.compile(r"(?:FEATHER_PGS|IL_NEWTON_FPGS|NEWTON)_[A-Z0-9](?:[A-Z0-9_]*[A-Z0-9])?")
 _HEAD = re.compile(r"(?:FEATHER_PGS|IL_NEWTON_FPGS|NEWTON)_[A-Z0-9_]*")
 _GETTERS = ("os.environ.get", "os.getenv")
-_RETIRED_ORDER = [
-    "FEATHER_PGS_SINGLE_FACTOR",
-    "FEATHER_PGS_BODY_BASIS_ROWS",
-    "FEATHER_PGS_SPARSE_PACKETS",
-    "FEATHER_PGS_SPARSE_PAIRED_GS",
-    "FEATHER_PGS_COUPLED_CONTACT",
-    "FEATHER_PGS_COUPLED_JACOBI",
-    "FEATHER_PGS_DENSE_ROW_REGISTERS",
-]
-# Retired names that recipes still set: ignored, recorded and warned about, never rejected.
-_RETIRED_IGNORED = [
+# Removed FEATHER_PGS_ switches that stale recipes may still set: undeclared, so the record lists them as unknown.
+_REMOVED_NAMES = [
     "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
-    "FEATHER_PGS_CAPTURE_COUNT",
-    "FEATHER_PGS_CAPTURE_DIR",
-    "FEATHER_PGS_CAPTURE_KERNEL",
-    "FEATHER_PGS_CAPTURE_PHASE",
-    "FEATHER_PGS_CAPTURE_STEP",
-    "FEATHER_PGS_CHECK_ROWS",
-    "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
-    "FEATHER_PGS_G1_CHAIN_SCAN",
+    "FEATHER_PGS_COUPLED_JACOBI",
     "FEATHER_PGS_GROUPED_HINV",
-    "FEATHER_PGS_GROUPED_HINV_FREE",
     "FEATHER_PGS_GROUPED_HINV_MAX",
     "FEATHER_PGS_GROUP_LANES",
-    "FEATHER_PGS_INDEPENDENT_COMPONENTS",
-    "FEATHER_PGS_INK_CHECK",
-    "FEATHER_PGS_KUKA_CURRENT_CONTACT",
     "FEATHER_PGS_KUKA_JOINT_WORLD",
-    "FEATHER_PGS_LOCAL_ROW_PACKETS",
-    "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
-    "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
-    "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
-    "FEATHER_PGS_PRISMATIC_PUBLICATION",
     "FEATHER_PGS_SIMPLE_WORLD_ZERO",
+    "FEATHER_PGS_SINGLE_FACTOR",
     "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
-    "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
     "FEATHER_PGS_SPARSE_FACTOR",
     "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
-    "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
-    "FEATHER_PGS_SPARSE_LIMIT_JACOBI",
-    "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
-    "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
-    "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
-    "FEATHER_PGS_TREE_CHAIN_SCAN",
-    "FEATHER_PGS_TREE_LANE_PACK",
     "FEATHER_PGS_WORLD_ROWS",
-    "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
-]
-# The recipe variables that the first construction record (64d35720) listed as unknown: read nowhere
-# in Newton or Isaac Lab.
-_DEAD_RECIPE_NAMES = [
-    "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
-    "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
-    "FEATHER_PGS_G1_CHAIN_SCAN",
-    "FEATHER_PGS_INDEPENDENT_COMPONENTS",
-    "FEATHER_PGS_KUKA_CURRENT_CONTACT",
-    "FEATHER_PGS_KUKA_JOINT_WORLD",
-    "FEATHER_PGS_LOCAL_ROW_PACKETS",
-    "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
-    "FEATHER_PGS_SIMPLE_WORLD_ZERO",
-    "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
-    "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
 ]
 
 
@@ -311,17 +263,12 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
                             self.assertTrue(reader.startswith("isaaclab"), reader)
                         else:
                             self.assertTrue((_SRC / Path(*reader.split("."))).with_suffix(".py").is_file(), reader)
-        retired = [name for name, flag in fpgs_flags.FLAGS.items() if flag.kind == "retired"]
-        self.assertEqual([name for name in retired if name not in fpgs_flags.IGNORED_RETIRED], _RETIRED_ORDER)
-        self.assertEqual(sorted(fpgs_flags.IGNORED_RETIRED), _RETIRED_IGNORED)
-        self.assertTrue(fpgs_flags.IGNORED_RETIRED <= set(retired))
+        self.assertEqual([name for name, flag in fpgs_flags.FLAGS.items() if flag.kind == "retired"], [])
 
-    def test_rejected_retired_selectors_lead_the_declarations(self):
-        """Declare the retired selectors that raise first, in check order, and every other name in name order."""
+    def test_solver_declarations_are_in_name_order(self):
+        """Declare the solver's names in name order."""
         names = list(fpgs_flags.FLAGS)
-        self.assertEqual(names[: len(_RETIRED_ORDER)], _RETIRED_ORDER)
-        rest = names[len(_RETIRED_ORDER) :]
-        self.assertEqual(rest, sorted(rest))
+        self.assertEqual(names, sorted(names))
 
     def test_scan_separates_reads_from_citations(self):
         """List literal and constructed names, split environment reads from citations, refuse the rest."""
@@ -387,7 +334,7 @@ class TestEnvironmentRecord(unittest.TestCase):
         environ = {
             "FEATHER_PGS_ROWS_MASKED": "1",
             "FEATHER_PGS_NOT_DECLARED": "0",
-            "FEATHER_PGS_COUPLED_JACOBI": "0",
+            "FEATHER_PGS_COUPLED_JACOBI": "1",
             "IL_NEWTON_FPGS_MF_WARMSTART": "0",
             "NEWTON_NARROW_PHASE_THREADS_X": "4",
             "PATH": "/usr/bin",
@@ -396,8 +343,8 @@ class TestEnvironmentRecord(unittest.TestCase):
             fpgs_flags.record(environ),
             {
                 "applied": {"FEATHER_PGS_ROWS_MASKED": "1", "IL_NEWTON_FPGS_MF_WARMSTART": "0"},
-                "unknown": ["FEATHER_PGS_NOT_DECLARED"],
-                "retired": ["FEATHER_PGS_COUPLED_JACOBI"],
+                "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED"],
+                "retired": [],
                 "isaac_lab": {},
             },
         )
@@ -419,59 +366,29 @@ class TestEnvironmentRecord(unittest.TestCase):
             },
         )
 
-    def test_retired_selector_raises_only_for_one(self):
-        """Raise for a retired selector set to 1, naming the first in the original order; record other values."""
-        message = (
-            "^FEATHER_PGS_SINGLE_FACTOR selects a retired experiment; reproduce it from the original research checkout$"
-        )
-        for check in (fpgs_flags.reject_retired, fpgs_flags.record):
-            with self.subTest(check=check.__name__), self.assertRaisesRegex(ValueError, message):
-                check(dict.fromkeys(_RETIRED_ORDER, "1"))
-        for value in ("0", "", "true"):
-            with self.subTest(value=value):
-                record = fpgs_flags.record({"FEATHER_PGS_COUPLED_CONTACT": value, "FEATHER_PGS_NOT_DECLARED": "1"})
-                self.assertEqual(record["retired"], ["FEATHER_PGS_COUPLED_CONTACT"])
-                self.assertEqual(record["unknown"], ["FEATHER_PGS_NOT_DECLARED"])
-
-    def test_ignored_retired_selectors_record_without_raising(self):
-        """Record the retired selectors that recipes still set, whatever their value, instead of raising."""
+    def test_removed_switches_are_unknown(self):
+        """Record a removed switch as unknown, whatever its value, and never raise."""
         for value in ("1", "0"):
             with self.subTest(value=value):
-                environ = dict.fromkeys(_RETIRED_IGNORED, value)
-                fpgs_flags.reject_retired(environ)
                 self.assertEqual(
-                    fpgs_flags.record(environ),
-                    {"applied": {}, "unknown": [], "retired": _RETIRED_IGNORED, "isaac_lab": {}},
+                    fpgs_flags.record(dict.fromkeys(_REMOVED_NAMES, value)),
+                    {"applied": {}, "unknown": _REMOVED_NAMES, "retired": [], "isaac_lab": {}},
                 )
-        # An ignored selector does not mask a rejected one set beside it.
-        with self.assertRaisesRegex(ValueError, "^FEATHER_PGS_COUPLED_JACOBI selects a retired experiment"):
-            fpgs_flags.record({**environ, "FEATHER_PGS_COUPLED_JACOBI": "1"})
-
-    def test_dead_recipe_names_are_retired_not_unknown(self):
-        """Declare the recipe variables nothing reads as ignored retired names, never unknown ones."""
-        for name in _DEAD_RECIPE_NAMES:
-            with self.subTest(name=name):
-                self.assertEqual(fpgs_flags.FLAGS[name].kind, "retired")
-                self.assertIn(name, fpgs_flags.IGNORED_RETIRED)
-        record = fpgs_flags.record(dict.fromkeys(_DEAD_RECIPE_NAMES, "1") | {"FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0"})
-        self.assertEqual((record["unknown"], record["retired"]), ([], _DEAD_RECIPE_NAMES))
 
     def test_retired_notice_names_each_retired_name_once(self):
         """Return one warning per process for each retired name a record lists, and none for other names."""
         with patch.object(core_flags, "_WARNED_RETIRED", set()):
-            first = fpgs_flags.record(
-                {"FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0", "FEATHER_PGS_KUKA_JOINT_WORLD": "1", "FEATHER_PGS_X": "1"}
+            first = core_flags.record_newton_environment(
+                {"NEWTON_TERRAIN_LAW_RULE_X": "0", "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "1", "NEWTON_X": "1"}
             )
             self.assertEqual(
                 core_flags.retired_notice(first),
-                "Ignoring retired environment variables that select nothing: FEATHER_PGS_KUKA_JOINT_WORLD, "
-                "FEATHER_PGS_SPARSE_BRANCH_SWEEPS. Remove them from the environment; the construction record lists "
+                "Ignoring retired environment variables that select nothing: NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD, "
+                "NEWTON_TERRAIN_LAW_RULE_X. Remove them from the environment; the construction record lists "
                 "them under environment['retired'].",
             )
             self.assertIsNone(core_flags.retired_notice(first))
-            second = fpgs_flags.record({"FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0", "FEATHER_PGS_COUPLED_JACOBI": "0"})
-            self.assertIn(": FEATHER_PGS_COUPLED_JACOBI. Remove", core_flags.retired_notice(second))
-            self.assertIsNone(core_flags.retired_notice(fpgs_flags.record({"FEATHER_PGS_X": "1"})))
+            self.assertIsNone(core_flags.retired_notice(core_flags.record_newton_environment({"NEWTON_X": "1"})))
 
 
 class TestSelectionEnvironment(unittest.TestCase):
@@ -481,20 +398,16 @@ class TestSelectionEnvironment(unittest.TestCase):
             "FEATHER_PGS_RESOLVED_WORLDS": "1",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0",
-            "FEATHER_PGS_COUPLED_JACOBI": "0",
+            "FEATHER_PGS_COUPLED_JACOBI": "1",
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
         }
         model = _cpu_model()
-        with (
-            _environment(flags),
-            patch.object(core_flags, "_WARNED_RETIRED", set()),
-            self.assertWarnsRegex(UserWarning, "FEATHER_PGS_COUPLED_JACOBI, FEATHER_PGS_SPARSE_BRANCH_SWEEPS"),
-        ):
+        with _environment(flags):
             solver = newton.solvers.SolverFeatherPGS(model)
         expected = {
             "applied": {"FEATHER_PGS_RESOLVED_WORLDS": "1"},
-            "unknown": ["FEATHER_PGS_NOT_DECLARED"],
-            "retired": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
+            "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
+            "retired": [],
             "isaac_lab": {},
         }
         selected = solver.get_path_selection()
@@ -504,8 +417,8 @@ class TestSelectionEnvironment(unittest.TestCase):
         with _environment({"FEATHER_PGS_KEYED_ROWS": "0"}):
             self.assertEqual(solver.get_path_selection()["environment"], expected)
 
-    def test_solver_warns_once_per_process_about_retired_names(self):
-        """Warn at the caller once per process for each retired name, keep recording it and never raise.
+    def test_solver_records_removed_switches_silently(self):
+        """Construct without a warning when a recipe sets removed switches, and list them as unknown.
 
         Isaac Lab-owned NEWTON_ variables are not the solver's family and stay silent, also for the
         collision pipeline, which records them apart.
@@ -516,37 +429,15 @@ class TestSelectionEnvironment(unittest.TestCase):
             "FEATHER_PGS_KUKA_JOINT_WORLD": "1",
             "NEWTON_NARROW_PHASE_THREADS_X": "4",
         }
-        with patch.object(core_flags, "_WARNED_RETIRED", set()):
-            with (
-                _environment(recipe),
-                self.assertWarnsRegex(
-                    UserWarning,
-                    r"^Ignoring retired environment variables that select nothing: FEATHER_PGS_KUKA_JOINT_WORLD, "
-                    r"FEATHER_PGS_SPARSE_BRANCH_SWEEPS\.",
-                ) as caught,
-            ):
-                first = newton.solvers.SolverFeatherPGS(model)
-            self.assertEqual(os.path.basename(caught.filename), os.path.basename(__file__))
-            with (
-                _environment(recipe | {"FEATHER_PGS_LOCAL_ROW_PACKETS": "1"}),
-                warnings.catch_warnings(record=True) as seen,
-            ):
-                warnings.simplefilter("always")
-                second = newton.solvers.SolverFeatherPGS(model)
-                third = newton.solvers.SolverFeatherPGS(model)
-                pipeline = newton.CollisionPipeline(model)
+        with _environment(recipe), warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            solver = newton.solvers.SolverFeatherPGS(model)
+            pipeline = newton.CollisionPipeline(model)
+        self.assertEqual([str(item.message) for item in seen], [])
         self.assertEqual(
-            [str(item.message).split(": ")[1].split(".")[0] for item in seen], ["FEATHER_PGS_LOCAL_ROW_PACKETS"]
-        )
-        self.assertEqual(
-            first.get_path_selection()["environment"]["retired"],
+            solver.get_path_selection()["environment"]["unknown"],
             ["FEATHER_PGS_KUKA_JOINT_WORLD", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
         )
-        for solver in (second, third):
-            self.assertEqual(
-                solver.get_path_selection()["environment"]["retired"],
-                ["FEATHER_PGS_KUKA_JOINT_WORLD", "FEATHER_PGS_LOCAL_ROW_PACKETS", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
-            )
         self.assertEqual(
             pipeline.get_collision_selection()["environment"]["isaac_lab"], {"NEWTON_NARROW_PHASE_THREADS_X": "4"}
         )

@@ -115,8 +115,8 @@ class TestSparseResearchAdmission(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
-    def test_retired_packed_route_flags_reach_general_sparse(self):
-        """Admit the general sparse route under either friction law when a recipe sets the retired flags."""
+    def test_removed_packed_route_flags_reach_general_sparse(self):
+        """Admit the general sparse route under either friction law when a recipe sets the removed flags."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         flags = dict.fromkeys(
             (
