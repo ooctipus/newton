@@ -4,7 +4,7 @@
 
 This API is experimental. It requires CUDA and Python 3.11 or newer. Install Newton's optional `sim` dependencies, including the Apache-2.0 `gpu-components` package. Importing base Newton does not load this optional composition.
 
-The current integration build uses MuJoCo `3.14.1.dev993205559` from `https://py.mujoco.org/`, selected by the repository's uv source and override. MJWarp's current discrete-actuator and `efm` fields are absent from the MuJoCo 3.14.0 release. The application must also select the qualified custom Warp build for recorded counts and allocations.
+The current integration build uses MuJoCo `3.17.1.dev1007121963` from `https://py.mujoco.org/`, selected by the repository's uv source and override. The application must also select the qualified custom Warp build for recorded counts and allocations: [Warp PR #1](https://github.com/ooctipus/warp/pull/1) is merged into `ooctipus/warp:mem_fragmentation` at `3806983b31eff7bc3ec677ee324bc4179c086c33`. Released Warp does not provide the required count-update API. Newton's optional dependency pins select the matching GPU Components and MJWarp revisions; Warp installation remains application-owned.
 
 ## Ownership
 

@@ -1624,7 +1624,7 @@ wheels = [
 [[package]]
 name = "gpu-components"
 version = "0.1.0"
-source = { git = "https://github.com/ooctipus/gpu-components.git?rev=a11d3e88b3b9d90f9c2af38ed91f87d65f1ff0cb#a11d3e88b3b9d90f9c2af38ed91f87d65f1ff0cb" }
+source = { git = "https://github.com/ooctipus/gpu-components.git?rev=5426148600ceac55f5f2d781883f13d8d29060a3#5426148600ceac55f5f2d781883f13d8d29060a3" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-6-newton-torch-cu12' and extra == 'extra-6-newton-torch-cu13')" },
@@ -3149,7 +3149,7 @@ requires-dist = [
     { name = "fast-simplification", marker = "extra == 'importers'", specifier = ">=0.1.11" },
     { name = "gitpython", marker = "extra == 'docs'", specifier = ">=3.1.58" },
     { name = "gitpython", marker = "extra == 'examples'", specifier = ">=3.1.58" },
-    { name = "gpu-components", marker = "extra == 'sim'", git = "https://github.com/ooctipus/gpu-components.git?rev=a11d3e88b3b9d90f9c2af38ed91f87d65f1ff0cb" },
+    { name = "gpu-components", marker = "extra == 'sim'", git = "https://github.com/ooctipus/gpu-components.git?rev=5426148600ceac55f5f2d781883f13d8d29060a3" },
     { name = "imgui-bundle", marker = "extra == 'examples'", specifier = ">=1.92.0" },
     { name = "ipykernel", marker = "extra == 'docs'", specifier = ">=6.0.0,<7.0.0" },
     { name = "jupyter-server-proxy", marker = "extra == 'notebook'", specifier = ">=4.5.0" },
