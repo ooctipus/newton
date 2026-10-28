@@ -40,7 +40,6 @@ ROW_BUILDER_KERNELS = frozenset(
         "produce_contacts",
         "materialize_fallback",
         "scatter_contact_keys",
-        "scatter_patch_contact_keys",
     )
 )
 # Kernels their factories name: the sparse response, the sparse-diagonal schedule marker and the

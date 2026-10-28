@@ -15,6 +15,7 @@ from newton._src.sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_bl
 from newton._src.solvers.feather_pgs import field_group, kernels, keyed_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_patch_parity import point_row_law
 
 # Every launch over the contact capacity that grid-strides over the capped grid.
 _CONSUMERS = (
@@ -95,8 +96,8 @@ def _export_inputs(device, capacity, count, rng):
 _SCATTER_CAPACITY, _SCATTER_WORLDS = 5000, 16
 
 
-def _scatter(kernel, device, count, path, max_blocks):
-    """Launch a keyed-row key scatter over unique per-contact slots and return its outputs."""
+def _scatter(anchors, device, count, path, max_blocks):
+    """Launch the keyed-row key scatter over unique per-contact slots under one friction law; return its outputs."""
     contact = np.arange(_SCATTER_CAPACITY)
     rows = 3 * (-(-_SCATTER_CAPACITY // _SCATTER_WORLDS)) + 3
     data = ContactInput()
@@ -115,7 +116,15 @@ def _scatter(kernel, device, count, path, max_blocks):
     data.row_mu = wp.full((_SCATTER_WORLDS, rows), -9.0, dtype=float, device=device)
     z = keyed_rows.KineticRows()
     z.rowkeys = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
-    wp.launch(kernel, dim=_SCATTER_CAPACITY, inputs=[data, z], device=device, max_blocks=max_blocks)
+    law = point_row_law(device, _SCATTER_CAPACITY)
+    law.patches.enabled = int(anchors)
+    wp.launch(
+        keyed_rows.scatter_contact_keys,
+        dim=_SCATTER_CAPACITY,
+        inputs=[data, z, law],
+        device=device,
+        max_blocks=max_blocks,
+    )
     return [z.rowkeys.numpy(), data.row_type.numpy(), data.row_parent.numpy(), data.row_mu.numpy()]
 
 
@@ -173,9 +182,9 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
             for count in (0, 1, 300, 4000, _SCATTER_CAPACITY):
                 path = np.random.default_rng(count).integers(-1, 3, _SCATTER_CAPACITY)
                 rows = int(slots_needed[(contact < count) & (path == 0)].sum())
-                for kernel in (keyed_rows.scatter_contact_keys, keyed_rows.scatter_patch_contact_keys):
-                    results = [_scatter(kernel, device, count, path, max_blocks) for max_blocks in (0, 1, 3)]
-                    with self.subTest(device=device, count=count, kernel=kernel.key):
+                for anchors in (False, True):
+                    results = [_scatter(anchors, device, count, path, max_blocks) for max_blocks in (0, 1, 3)]
+                    with self.subTest(device=device, count=count, anchors=anchors):
                         for capped in results[1:]:
                             for full, other in zip(results[0], capped, strict=True):
                                 np.testing.assert_array_equal(other, full)

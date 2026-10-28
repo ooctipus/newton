@@ -87,22 +87,12 @@ KineticRows = field_group.struct("KineticRows", KINETIC_ROWS, __name__)
 
 
 @wp.kernel(enable_backward=False)
-def scatter_contact_keys(data: ContactInput, z: KineticRows):
-    """Emit only the original allocated raw contact ID and row direction."""
-    contact = wp.tid()
-    if contact < data.count[0]:
-        if data.path[contact] == 0 and data.slot[contact] >= 0:
-            for direction in range(data.slots_needed[contact]):
-                z.rowkeys[data.world[contact], data.slot[contact] + direction] = contact * 4 + direction
+def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
+    """Emit each allocated contact row's key (raw contact ID and row direction).
 
-
-@wp.kernel(enable_backward=False)
-def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
-    """Emit the contact keys with the type, parent and undivided coefficient of each patch row.
-
-    The patch link runs after this launch and before any row is read: it links
-    each normal row into its patch ring and divides the tangent coefficient
-    among the anchors that received rows.
+    Under persistent patch friction also the type, parent and undivided coefficient of each row: the patch
+    link runs after this launch and before any row is read, links each normal row into its patch ring and
+    divides the tangent coefficient among the anchors that received rows.
     """
     contact = wp.tid()
     if contact < data.count[0]:
@@ -113,14 +103,15 @@ def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
             for direction in range(data.slots_needed[contact]):
                 row = slot + direction
                 z.rowkeys[world, row] = contact * 4 + direction
-                if direction == 0:
-                    data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
-                    data.row_parent[world, row] = -1
-                    data.row_mu[world, row] = mu
-                else:
-                    data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
-                    data.row_parent[world, row] = slot
-                    data.row_mu[world, row] = mu * data.friction_scale
+                if law.patches.enabled != 0:
+                    if direction == 0:
+                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                        data.row_parent[world, row] = -1
+                        data.row_mu[world, row] = mu
+                    else:
+                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                        data.row_parent[world, row] = slot
+                        data.row_mu[world, row] = mu * data.friction_scale
 
 
 ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
@@ -482,31 +473,17 @@ class KeyedRows:
         """
         self.contact_input = contact_input
         self.data.contact = self.contact_input
+        # Like the other row producers, bind the anchor coefficient and the patch view (which
+        # contact-pool growth replaces) every step.
+        self.law = patch_row_law(self.solver)
         if self.patch:
-            # Like the other row producers, bind the anchor coefficient and the patch view (which
-            # contact-pool growth replaces) every step.
-            self.law = patch_row_law(self.solver)
-            pool = self.solver._contact_pool
-            pool.launch(
-                scatter_patch_contact_keys,
-                pool.launch_rows(),
-                inputs=[self.contact_input, self.data],
-                extent=self.contact_input.count,
-                max_blocks=self.solver._contact_capacity_blocks,
-            )
+            self._scatter_keys()
 
     def finish_rows(self):
         """Publish current direct rows and fully materialize only fallback worlds."""
         s = self.solver
         if self.contact_input is not None and not self.patch:
-            pool = s._contact_pool
-            pool.launch(
-                scatter_contact_keys,
-                pool.launch_rows(),
-                inputs=[self.contact_input, self.data],
-                extent=self.contact_input.count,
-                max_blocks=s._contact_capacity_blocks,
-            )
+            self._scatter_keys()
         na, nb = self.layout.primary, self.layout.secondary
         fallback = get_patch_fallback_kernel(self.layout) if self.patch else get_fallback_kernel(self.layout)
         wp.launch_tiled(
@@ -521,6 +498,17 @@ class KeyedRows:
             ],
             block_dim=32,
             device=s.model.device,
+        )
+
+    def _scatter_keys(self):
+        """Scatter the contact keys: under patch friction before the patch link, else with the final counts."""
+        pool = self.solver._contact_pool
+        pool.launch(
+            scatter_contact_keys,
+            pool.launch_rows(),
+            inputs=[self.contact_input, self.data, self.law],
+            extent=self.contact_input.count,
+            max_blocks=self.solver._contact_capacity_blocks,
         )
 
     def parallel_arguments(self):

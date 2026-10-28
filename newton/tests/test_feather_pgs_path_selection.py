@@ -637,7 +637,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         named, methods = set(), set()
         for law in ("point", "patch"):
             point = law == "point"
-            p = "" if point else "patch_"
             masked = ["contact_row_prelude", "populate_world_J_masked"]
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
@@ -665,7 +664,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {},
                     (16, 6),
                     "keyed_rows",
-                    same((16, 6), "keyed_rows", [f"scatter_{p}contact_keys", fallback]),
+                    same((16, 6), "keyed_rows", ["scatter_contact_keys", fallback]),
                 ),
                 (
                     {"_compact_contact_boundary": True, **diagonal, **schedule},

@@ -219,7 +219,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
         test_feather_pgs_capacity_launches covers live contacts in later iterations.
         """
         device = wp.get_device("cuda:0")
-        for beta, scatter in ((0.0, rows.scatter_contact_keys), (0.2, rows.scatter_patch_contact_keys)):
+        scatter = rows.scatter_contact_keys
+        for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
                     wave, single = (
