@@ -185,12 +185,11 @@ class TestContactRecordBuilder(unittest.TestCase):
                 full(response_dofs.shape, 0, int),
                 full(response_dofs.shape, 0, int),
                 f["sparse_mask"],
-                f["patches"],
+                row_law(f["patches"], 0.23),
                 f["indices"].permutation,
                 f["indices"].row_offsets,
                 f["packed"],
                 array(np.eye(6)[None]),
-                0.23,
             ],
             outputs=[
                 full((1, 1, 1), -9, int),

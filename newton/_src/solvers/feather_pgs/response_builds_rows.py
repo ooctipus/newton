@@ -52,13 +52,9 @@ from ...sim import BodyFlags
 from . import field_group, kernel_template
 from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
-    contact_bodies,
     contact_friction,
-    contact_friction_points,
-    contact_points,
     contact_restitution,
     contact_row_frame,
-    contact_tangent_basis,
     free_body_jacobian,
     jacobian_entry,
     prescribed_target,
@@ -66,7 +62,7 @@ from .contact_laws import (
 from .dense_rows import DenseRows, MfBodyMap, MfRows
 from .device_preludes import cuda_native, dual_native, lane_group
 from .field_group import Field
-from .friction_patches import FrictionPatches, PatchRowLaw, patch_friction_location
+from .friction_patches import PatchRowLaw
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -2005,12 +2001,11 @@ def factor_contact_rows_kernel(
         is_free_rigid: wp.array[int],
         articulation_world_dof_offset: wp.array[int],
         body_dof_mask: wp.array[wp.uint64],
-        friction_patches: FrictionPatches,
+        law: PatchRowLaw,
         permutation: wp.array[int],
         factor_row_offsets: wp.array[int],
         inverse_factor: wp.array2d[float],
         free_inverse_factor: wp.array3d[float],
-        friction_anchor_beta: float,
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
         row_free_response: wp.array3d[float],
@@ -2025,52 +2020,35 @@ def factor_contact_rows_kernel(
             row_count = wp.min(data.slots_needed[c], 3)
             if data.path[c] != 0 or data.slot[c] < 0 or row_count <= 0:
                 continue
-            body_a, body_b = contact_bodies(data.shape0[c], data.shape1[c], data.shape_body)
             art_a = data.art0[c]
             art_b = data.art1[c]
-            normal = wp.vec3(0.0)
-            surface_a = wp.vec3(0.0)
-            surface_b = wp.vec3(0.0)
-            point_a = wp.vec3(0.0)
-            point_b = wp.vec3(0.0)
-            friction_point_a = wp.vec3(0.0)
-            friction_point_b = wp.vec3(0.0)
-            tangent0 = wp.vec3(0.0)
-            tangent1 = wp.vec3(0.0)
-            gap = float(0.0)
+            (
+                body_a,
+                body_b,
+                normal,
+                surface_a,
+                surface_b,
+                gap,
+                tangent0,
+                tangent1,
+                friction_point_a,
+                friction_point_b,
+            ) = contact_frame(data, law, c)
             cfm = float(0.0)
             if wp.static(prepare_rows):
                 cfm = data.cfm
-            if wp.static(prepare_rows) or lane == 0:
-                normal, surface_a, surface_b, gap = contact_points(
-                    data.normal[c],
-                    data.point0[c],
-                    data.point1[c],
-                    data.margin0[c],
-                    data.margin1[c],
-                    body_a,
-                    body_b,
-                    data.body_q,
-                )
-                friction_point_a, friction_point_b = contact_friction_points(
-                    surface_a, surface_b, data.shared_anchor, data.friction_shared_anchor
-                )
-                if row_count > 1:
-                    tangent0, tangent1 = contact_tangent_basis(normal)
-                    if friction_patches.enabled != 0:
-                        friction_point_a, friction_point_b = patch_friction_location(friction_patches, c)
-                # The normal row's endpoints.
-                _normal, point_a, point_b = contact_row_frame(
-                    0,
-                    data.shared_anchor,
-                    normal,
-                    tangent0,
-                    tangent1,
-                    surface_a,
-                    surface_b,
-                    friction_point_a,
-                    friction_point_b,
-                )
+            # The normal row's endpoints.
+            _normal, point_a, point_b = contact_row_frame(
+                0,
+                data.shared_anchor,
+                normal,
+                tangent0,
+                tangent1,
+                surface_a,
+                surface_b,
+                friction_point_a,
+                friction_point_b,
+            )
             if wp.static(prepare_rows):
                 if lane < row_count:
                     world = data.world[c]
@@ -2107,9 +2085,9 @@ def factor_contact_rows_kernel(
                     if lane == 0:
                         restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
                     else:
-                        beta = friction_anchor_beta
+                        beta = law.beta
                         # Selected, not indexed by the lane, which would place the pair in local memory.
-                        anchor_phi = friction_patches.phi[c]
+                        anchor_phi = law.patches.phi[c]
                         phi = anchor_phi[0]
                         if lane == 2:
                             phi = anchor_phi[1]

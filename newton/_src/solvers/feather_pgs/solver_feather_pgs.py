@@ -8887,12 +8887,11 @@ class SolverFeatherPGS(SolverBase):
                                 self.is_free_rigid,
                                 self.articulation_world_dof_offset,
                                 self._sparse_body_dof_mask,
-                                self._friction_patches.view,
+                                law,
                                 indices.permutation,
                                 indices.row_offsets,
                                 self._sparse_Linv,
                                 self._sparse_free_factor_dummy,
-                                self.friction_anchor_beta,
                             ],
                             outputs=[
                                 self._sparse_row_dof,
