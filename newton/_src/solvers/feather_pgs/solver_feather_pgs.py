@@ -9741,7 +9741,7 @@ class SolverFeatherPGS(SolverBase):
     def _masked_contact_rows(self) -> bool:
         """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
 
-        Point friction may. Patch friction takes the masked builder's patch-law variants (row_build.py),
+        Point friction may. Patch friction takes the same builder with the patch row law (row_build.py),
         unless torsion or compliance keeps ordinary rows.
 
         This decides only the general builder's method (contact_row_plan). Local row packets, keyed

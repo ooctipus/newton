@@ -127,16 +127,15 @@ PATCH_ROW_LAW = (
 )
 
 PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
-"""Tangent-row law of persistent patches, for producers that write their own friction rows.
+"""The friction row law, for producers that write their own friction rows.
 
-A tangent row acts at its patch's friction location, carries the anchor's tangential
-displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
-the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
-launches ``link_patch_routes``) divides it and links the ring. The compact contact boundary
-and the local row packets apply the law through ``contact_laws.contact_row_frame`` at
-:func:`patch_friction_location` and :func:`patch_tangent_row`; keyed rows write it in their
-native row source (``keyed_rows._patch_row_law``), and the masked row builder
-(``row_build.contact_row_prelude``) as the per-contact builder does.
+Under persistent patches a tangent row acts at its patch's friction location, carries the
+anchor's tangential displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``).
+Point friction is the same law with beta 0 and a disabled view (a zero phi): its tangent rows act
+at the contact's friction points. Producers write the undivided friction coefficient; the patch
+link (``_FrictionPatchState.link``, which launches ``link_patch_routes``) divides it and links the
+ring. The Warp producers apply the law through :func:`.contact_input.contact_frame` and
+:func:`patch_tangent_row`; keyed rows write it in their native row source (``keyed_rows._row_source``).
 """
 
 

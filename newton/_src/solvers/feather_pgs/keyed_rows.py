@@ -127,7 +127,7 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
     patch row law: tangent rows act at the patch friction location for both the
     Jacobian and the prescribed target, carry the anchor's tangential phi and
     correct it with ``patch_law.beta``; every row's type, parent and coefficient
-    stay as :func:`scatter_patch_contact_keys` and the patch link left them.
+    stay as :func:`scatter_contact_keys` and the patch link left them.
     """
     dofs = layout.dofs
     prefix = substitute(
