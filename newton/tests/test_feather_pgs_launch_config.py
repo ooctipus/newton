@@ -215,8 +215,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             "mf_gs_parallel_sweeps",
             "mf_gs_parallel_nesterov",
             "mf_gs_parallel_matrix_free",
-            "grouped_dynamics",
-            "lazy_kinematics",
         ):
             with self.subTest(name=name):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)

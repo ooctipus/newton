@@ -110,7 +110,6 @@ def _selection(model, flags):
             pgs_mode="matrix_free" if model.device.is_cuda else "split",
             pgs_iterations=8,
             enable_joint_limits=True,
-            grouped_dynamics=True,
             friction_anchor_beta=0.0,
         )
     return solver.get_path_selection()

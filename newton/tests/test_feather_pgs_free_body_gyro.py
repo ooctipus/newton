@@ -94,7 +94,6 @@ class TestFreeBodyGyro(unittest.TestCase):
             solver = SolverFeatherPGS(
                 model,
                 angular_damping=0.0,
-                grouped_dynamics=False,
                 pgs_iterations=24,
                 use_parallel_streams=False,
             )

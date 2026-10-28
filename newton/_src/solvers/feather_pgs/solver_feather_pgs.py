@@ -1007,15 +1007,12 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_linked_velocity_limit_pass: bool = False,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
         contact_update: Literal["sequential", "unit"] = "sequential",
-        grouped_dynamics: bool = False,
-        lazy_kinematics: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
         contact_torsion_device: bool = False,
         contact_compliance: bool = False,
-        parallel_tree: bool = False,
         cholesky_kernel: Literal["auto", "tiled", "loop"] = "auto",
         trisolve_kernel: Literal["auto", "tiled", "loop"] = "auto",
         hinv_jt_kernel: Literal["auto", "tiled", "par_row"] = "auto",
@@ -1041,7 +1038,7 @@ class SolverFeatherPGS(SolverBase):
             delassus_kernel: Dense Delassus assembly kernel; explicit choices require split mode.
             sparse_mass_matrix: Experimental native sparse factors: ``auto`` retains topology/resource
                 admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
-                Compatible split sweeps, velocity limits and grouped dynamics compose automatically.
+                Compatible split sweeps and velocity limits compose automatically.
                 Legacy sparse-composition opt-outs apply to ``auto``; ``on`` overrides those gates.
                 This option does not enable research packed-factor owners. Incompatible forced choices
                 raise ValueError; this experimental selector may change without notice.
@@ -1413,13 +1410,6 @@ class SolverFeatherPGS(SolverBase):
                 onto its limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot
                 of a tier its sweep budget stops early. Applies only with ``enable_joint_velocity_limits`` and
                 linked tiers. Experimental. Defaults to False.
-            grouped_dynamics (bool, optional): Solve the contact response ``H^-1 J^T`` of articulations with
-                up to 32 DOFs with one warp per articulation and one lane per row, instead of the planned
-                response kernel (``FEATHER_PGS_GROUPED_HINV=0`` keeps the planned kernel). The request also
-                keeps the local row packets and the compact contact producer off. Kinematics and inverse
-                dynamics keep their kernels. Experimental CUDA option. Defaults to False.
-            lazy_kinematics (bool, optional): Experimental. Every substep publishes the body state, so this
-                option selects nothing and :meth:`publish_kinematics` has no effect. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -1560,9 +1550,6 @@ class SolverFeatherPGS(SolverBase):
                 streaming kernel; a value other than ``None`` warns and has no effect. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
-            parallel_tree: Deprecated: ``True`` warns and has no effect. It selected cooperative
-                branch kernels for the ordinary CUDA dynamics; the held-tree owner evaluates CUDA
-                trees on schedules chosen from their topology. Defaults to False.
             drive_mode (str, optional): Joint target drive implementation.
                 ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
                 that folds drive stiffness into the articulated mass matrix.
@@ -1637,13 +1624,6 @@ class SolverFeatherPGS(SolverBase):
             warnings.warn(
                 "pgs_chunk_size is deprecated and has no effect, and will be removed in a future release; "
                 "it tuned the removed streaming kernel. Omit it.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
-        if parallel_tree:
-            warnings.warn(
-                "parallel_tree is deprecated and has no effect, and will be removed in a future release; "
-                "the held-tree owner schedules CUDA trees from their topology. Omit it.",
                 DeprecationWarning,
                 stacklevel=_CONSTRUCTOR_CALLER,
             )
@@ -1933,8 +1913,6 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_parallel_nesterov = bool(mf_gs_parallel_nesterov)
         self.mf_gs_parallel_matrix_free = bool(mf_gs_parallel_matrix_free)
         self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
-        self.grouped_dynamics = bool(grouped_dynamics)
-        self.lazy_kinematics = bool(lazy_kinematics)
         self._grouped_response = False
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
@@ -4186,12 +4164,8 @@ class SolverFeatherPGS(SolverBase):
         # recipes retain their own admission and fallback, including when their
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
-        if (
-            self.grouped_dynamics
-            and sparse_choice != "on"
-            and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "1") != "1"
-        ) or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1"):
-            self._sparse_selection_reason = "A legacy grouped or free-body option retains ordinary factors."
+        if self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1":
+            self._sparse_selection_reason = "The free-body gyro experiment retains ordinary factors."
             return
         # A parallel tier that serves the active friction law owns the ordinary buffers.
         # Patch friction yields only to a parallel tier, which split mode never builds;
@@ -5627,8 +5601,8 @@ class SolverFeatherPGS(SolverBase):
         self._ink_rows = 0
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
         self._incremental_rows = 0
-        if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
-            # The grouped response solve (_stage4_hinv_jt_grouped) is grouped_dynamics' remaining kernel.
+        if model.device.is_cuda and int(model.articulation_count) > 0:
+            # The grouped response solve (_stage4_hinv_jt_grouped), for the sizes StepPlan gives it from the data.
             self._grouped_response = True
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         if (
@@ -11116,14 +11090,6 @@ class SolverFeatherPGS(SolverBase):
             self._remove_free_root_transport(state_in, state_aug)
             wp.copy(state_out.joint_qd, self.v_out)
             self._stage7_update_kinematics(state_out, state_aug)
-
-    def publish_kinematics(self, state: State) -> None:
-        """Publish body poses and CoM velocities of ``state``; a no-op.
-
-        Every substep publishes the body state, so nothing is left to publish.
-        Callers of ``lazy_kinematics`` may keep calling this method.
-        """
-        del state
 
     def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
         """Publish kinematics and prepare reusable inverse dynamics for the next step."""

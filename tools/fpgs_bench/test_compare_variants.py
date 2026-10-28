@@ -98,19 +98,21 @@ class TestVariantComparison(unittest.TestCase):
                 "--baseline-solver-attr",
                 "pgs_mode=split",
                 "--candidate-solver-attr",
-                "grouped_dynamics=true",
+                "mf_gs_parallel_matrix_free=true",
                 "--candidate-solver-attr",
                 "mf_gs_parallel_rows=128",
             ]
         )
         self.assertEqual(args.solver_recipes["baseline"], {"pgs_mode": "split"})
-        self.assertEqual(args.solver_recipes["candidate"], {"grouped_dynamics": True, "mf_gs_parallel_rows": 128})
+        self.assertEqual(
+            args.solver_recipes["candidate"], {"mf_gs_parallel_matrix_free": True, "mf_gs_parallel_rows": 128}
+        )
         for value in (
             "pgs_iterations=1",
             "num_substeps=1",
             "dense_max_constraints=64",
             "pgs_mode=dense",
-            "grouped_dynamics=1",
+            "mf_gs_parallel_matrix_free=1",
             "mf_gs_parallel_rows=-1",
             "mf_gs_parallel_rows=129",
             "mf_gs_parallel_sweeps=0",
@@ -123,9 +125,9 @@ class TestVariantComparison(unittest.TestCase):
                 [
                     *self.argv,
                     "--candidate-solver-attr",
-                    "lazy_kinematics=true",
+                    "mf_gs_parallel_matrix_free=true",
                     "--candidate-solver-attr",
-                    "lazy_kinematics=false",
+                    "mf_gs_parallel_matrix_free=false",
                 ]
             )
 
@@ -141,7 +143,7 @@ class TestVariantComparison(unittest.TestCase):
                 "--candidate-solver-attr",
                 "pgs_mode=matrix_free",
                 "--candidate-solver-attr",
-                "lazy_kinematics=false",
+                "mf_gs_parallel_matrix_free=false",
             ]
         )
         harness = Path(args.isaaclab) / driver.owner.HARNESS_RELATIVE
@@ -173,7 +175,9 @@ class TestVariantComparison(unittest.TestCase):
                 self.assertEqual(sum(value.startswith("pgs_mode=") for value in run["command"]), 1)
                 if label == "candidate":
                     boolean = next(
-                        value.partition("=")[2] for value in run["command"] if value.startswith("lazy_kinematics=")
+                        value.partition("=")[2]
+                        for value in run["command"]
+                        if value.startswith("mf_gs_parallel_matrix_free=")
                     )
                     self.assertIs(ast.literal_eval(boolean), False)
 
@@ -181,8 +185,6 @@ class TestVariantComparison(unittest.TestCase):
         """Reject ignored requested settings, missing metadata and changed sweep budgets."""
         args = driver.parse_args([*self.argv, "--candidate-solver-attr", "pgs_mode=split"])
         recipe = {
-            "grouped_dynamics": False,
-            "lazy_kinematics": True,
             "pgs_mode": "split",
             "mf_gs_parallel_rows": 64,
             "mf_gs_parallel_matrix_free": False,
@@ -217,8 +219,6 @@ class TestVariantComparison(unittest.TestCase):
         """Require explicitly enabled parallel sweeps, linked tiers' included, to retain the task allowance."""
         args = driver.parse_args([*self.argv, "--candidate-solver-attr", "mf_gs_parallel_rows=128"])
         recipe = {
-            "grouped_dynamics": False,
-            "lazy_kinematics": True,
             "pgs_mode": "matrix_free",
             "mf_gs_parallel_rows": 128,
             "mf_gs_parallel_matrix_free": False,
@@ -256,8 +256,6 @@ class TestVariantComparison(unittest.TestCase):
         """Fingerprint the applied linked budget when no arm selects the tiers, and never the revision's request."""
         args = driver.parse_args(self.argv)
         recipe = {
-            "grouped_dynamics": False,
-            "lazy_kinematics": True,
             "pgs_mode": "matrix_free",
             "mf_gs_parallel_rows": 128,
             "mf_gs_parallel_matrix_free": True,
@@ -364,8 +362,6 @@ class TestVariantComparison(unittest.TestCase):
                         "mf_max_constraints": 32,
                     },
                     "solver_recipe": {
-                        "grouped_dynamics": False,
-                        "lazy_kinematics": True,
                         "pgs_mode": "matrix_free",
                         "mf_gs_parallel_rows": 64,
                         "mf_gs_parallel_matrix_free": False,

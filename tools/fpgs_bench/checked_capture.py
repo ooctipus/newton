@@ -394,8 +394,6 @@ def check_solver(physics: str, solver, entry: dict) -> None:
         entry["solver_recipe"] = {
             name: getattr(solver, name, None)
             for name in (
-                "grouped_dynamics",
-                "lazy_kinematics",
                 "pgs_mode",
                 "mf_gs_parallel_rows",
                 "mf_gs_parallel_matrix_free",

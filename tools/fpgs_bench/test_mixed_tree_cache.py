@@ -106,7 +106,6 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
             enable_joint_limits=True,
             enable_joint_velocity_limits=False,
             update_mass_matrix_interval=2,
-            grouped_dynamics=False,
             double_buffer=False,
             use_parallel_streams=model.device.is_cuda,
             angular_damping=0.05,

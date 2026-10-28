@@ -230,7 +230,6 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
         # changed omega/CFM or warm-start recipe. Only small-scene capacities.
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            grouped_dynamics=True,
             pgs_mode="matrix_free",
             articulated_contact_response="immediate",
             pgs_iterations=8,

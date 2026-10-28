@@ -471,7 +471,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                     pgs_warmstart=False,
                     mf_warmstart=False,
                     dense_max_constraints=capacity,
-                    grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
                     use_parallel_streams=True,
                 )
@@ -830,7 +829,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     pgs_warmstart=False,
                     mf_warmstart=False,
                     dense_max_constraints=192,
-                    grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
                     use_parallel_streams=True,
                 )

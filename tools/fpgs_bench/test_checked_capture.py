@@ -714,8 +714,6 @@ class TestCheckedCapture(unittest.TestCase):
         """Record actual solver representation settings without changing state."""
         solver, entry = fpgs(), {}
         expected = {
-            "grouped_dynamics": True,
-            "lazy_kinematics": False,
             "pgs_mode": "matrix_free",
             "mf_gs_parallel_rows": 96,
             "mf_gs_parallel_matrix_free": True,

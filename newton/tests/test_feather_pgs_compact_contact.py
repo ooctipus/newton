@@ -833,7 +833,6 @@ class TestCompactContact(unittest.TestCase):
             "_mimic_count": 0,
             "_connect_count": 0,
             "_compact_diagonal_mass_size": 108,
-            "grouped_dynamics": False,
             "_debug_buffers_enabled": False,
             "_preelim_active": False,
         }
@@ -852,7 +851,6 @@ class TestCompactContact(unittest.TestCase):
             ("enable_joint_velocity_limits", True),
             ("_mimic_count", 1),
             ("_connect_count", 1),
-            ("grouped_dynamics", True),
             ("_debug_buffers_enabled", True),
             ("_preelim_active", True),
             ("_compact_diagonal_mass_size", None),

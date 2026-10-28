@@ -23,8 +23,6 @@ from pathlib import Path
 import compare_backends as owner
 
 RECIPE_TYPES = {
-    "grouped_dynamics": bool,
-    "lazy_kinematics": bool,
     "pgs_mode": str,
     "mf_gs_parallel_rows": int,
     "mf_gs_parallel_matrix_free": bool,

@@ -52,7 +52,9 @@ _RAISING_RETIRED = (
 # no route of their own: the sweep-input capture (FEATHER_PGS_CAPTURE_*), the
 # row and in-kernel response comparisons (FEATHER_PGS_CHECK_ROWS,
 # FEATHER_PGS_INK_CHECK) and the grouped free-body response
-# (FEATHER_PGS_GROUPED_HINV_FREE). Nothing in Newton or Isaac Lab reads them,
+# (FEATHER_PGS_GROUPED_HINV_FREE); and the switches of the removed
+# grouped_dynamics option (FEATHER_PGS_GROUPED_HINV, FEATHER_PGS_GROUPED_HINV_MAX,
+# FEATHER_PGS_SPARSE_GROUPED_DYNAMICS). Nothing in Newton or Isaac Lab reads them,
 # and recipes are not Newton's to edit, so the general route runs, the
 # construction record lists them as retired and the solver warns once per
 # process.
@@ -66,7 +68,9 @@ _IGNORED_RETIRED = {
     "FEATHER_PGS_CHECK_ROWS": "Retired comparison of the masked contact-row builder with the per-contact builder; ignored.",
     "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE": "Retired compact workspace of a removed robot-specific owner; ignored.",
     "FEATHER_PGS_G1_CHAIN_SCAN": "Retired G1 alias of the held-tree chain scan; ignored.",
+    "FEATHER_PGS_GROUPED_HINV": "Retired opt-out of the grouped response solve, which the data now choose; ignored.",
     "FEATHER_PGS_GROUPED_HINV_FREE": "Retired grouped response solve of free-body size groups, slower than the per-row kernel; ignored.",
+    "FEATHER_PGS_GROUPED_HINV_MAX": "Retired size bound of the grouped response solve, which the data now choose; ignored.",
     "FEATHER_PGS_GROUP_LANES": "Retired lanes per articulation of the removed grouped kinematics and torque kernels; ignored.",
     "FEATHER_PGS_INDEPENDENT_COMPONENTS": "Retired independent-components variant of a removed robot-specific owner; ignored.",
     "FEATHER_PGS_INK_CHECK": "Retired write-back of the in-kernel response and diagonal for comparison; ignored.",
@@ -81,6 +85,7 @@ _IGNORED_RETIRED = {
     "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "Retired branch-Jacobi sparse sweep; ignored, sparse factors keep their ordered sweeps.",
     "FEATHER_PGS_SPARSE_CONTACT_BLOCK": "Retired contact-block rows of the packed sparse-factor route; ignored.",
     "FEATHER_PGS_SPARSE_FACTOR": "Retired packed sparse-factor route; ignored, the general route (sparse factors where admitted) runs.",
+    "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "Retired opt-out of sparse factors for the removed grouped_dynamics option; ignored.",
     "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "Retired level-by-level factor update of the packed sparse-factor route; ignored.",
     "FEATHER_PGS_SPARSE_LIMIT_JACOBI": "Retired Jacobi joint-limit solve of the packed sparse-factor route; ignored.",
     "FEATHER_PGS_SPARSE_METRIC_TANGENTS": "Retired metric tangents of the packed sparse-factor route; ignored.",
@@ -126,18 +131,6 @@ _READ = (
         "experiment",
         _SOLVER,
         "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
-    ),
-    (
-        "FEATHER_PGS_GROUPED_HINV",
-        "policy",
-        ("step_plan",),
-        "=0 keeps the tiled response solve instead of the grouped one.",
-    ),
-    (
-        "FEATHER_PGS_GROUPED_HINV_MAX",
-        "policy",
-        ("step_plan",),
-        "Largest DOF size that uses the grouped response solve (default 32).",
     ),
     (
         "FEATHER_PGS_INK",
@@ -231,12 +224,6 @@ _READ = (
         "experiment",
         _SOLVER,
         "=1 fuses contact triplets in the sparse sweep: point friction's in the active-row scan, patch friction's anchor units in whichever sweep it runs.",
-    ),
-    (
-        "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
-        "policy",
-        _SOLVER,
-        "Values other than 1 keep grouped-dynamics solvers on ordinary factors instead of automatic sparse ones.",
     ),
     (
         "FEATHER_PGS_SPARSE_LOCAL_FACTORS",

@@ -3,8 +3,7 @@
 
 """Qualify an execution recipe on a warmed live Lab model; never record timing.
 
-By default the candidate enables grouped/lazy execution. An explicit candidate
-PGS mode changes only that mode and preserves the original grouped/lazy settings.
+The candidate changes only the PGS mode (``--candidate-pgs-mode``).
 Replay holds the loaded control fixed and shares reference-generated contacts.
 It tests execution-path closeness, publication and reset invalidation, not
 independent collision trajectories, projection convergence or RL equivalence.
@@ -119,10 +118,10 @@ def qualify(
     *,
     steps: int,
     require_contacts: bool,
-    candidate_pgs_mode: str | None = None,
+    candidate_pgs_mode: str,
 ) -> None:
     """Replay unchanged substep/collision budgets on independent solver histories."""
-    if candidate_pgs_mode not in (None, "split", "matrix_free"):
+    if candidate_pgs_mode not in ("split", "matrix_free"):
         raise ValueError("Candidate PGS mode must be split or matrix_free")
     # Runtime imports must follow the explicit checkout selection in main().
     wp = importlib.import_module("warp")
@@ -130,11 +129,7 @@ def qualify(
 
     model, pipeline = manager._model, manager._collision_pipeline
     kwargs = manager._filter_solver_kwargs(SolverFeatherPGS, solver_cfg)
-    candidate_kwargs = (
-        {**kwargs, "grouped_dynamics": True, "lazy_kinematics": True}
-        if candidate_pgs_mode is None
-        else {**kwargs, "pgs_mode": candidate_pgs_mode}
-    )
+    candidate_kwargs = {**kwargs, "pgs_mode": candidate_pgs_mode}
     # Infinite configuration sentinels are valid; never sanitize numerical results.
     report["solver_kwargs"] = {
         name: {
@@ -148,25 +143,16 @@ def qualify(
         "substeps": manager._num_substeps,
         "collision_decimation": manager._collision_decimation,
     }
-    manager._solver.publish_kinematics(manager._state_0)
     initial = model.state()
     initial.assign(manager._state_0)
     solvers = [SolverFeatherPGS(model, **settings) for settings in (kwargs, candidate_kwargs)]
-    report["paths"] = [
-        {
-            "grouped_dynamics": solver.grouped_dynamics,
-            "lazy_kinematics": solver.lazy_kinematics,
-            "grouped_active": solver._grouped_response,
-            "pgs_mode": solver.pgs_mode,
-        }
-        for solver in solvers
-    ]
+    report["paths"] = [{"grouped_active": solver._grouped_response, "pgs_mode": solver.pgs_mode} for solver in solvers]
     report["recipe_changes"] = {
         key: {"reference": report["paths"][0][key], "candidate": report["paths"][1][key]}
-        for key in ("grouped_dynamics", "lazy_kinematics", "pgs_mode")
+        for key in ("pgs_mode",)
         if report["paths"][0][key] != report["paths"][1][key]
     }
-    if candidate_pgs_mode is not None and report["paths"][1]["pgs_mode"] != candidate_pgs_mode:
+    if report["paths"][1]["pgs_mode"] != candidate_pgs_mode:
         raise RuntimeError("Constructed candidate PGS mode differs from the requested recipe")
     report["grouped_execution_admitted"] = report["paths"][1]["grouped_active"]
     states = [[model.state(), model.state()] for _ in solvers]
@@ -212,9 +198,6 @@ def qualify(
                     and (substep + 1) % manager._collision_decimation == 0
                     and substep + 1 < manager._num_substeps
                 )
-                if mid or substep + 1 == manager._num_substeps:
-                    for solver, pair in zip(solvers, states, strict=True):
-                        solver.publish_kinematics(pair[0])
                 if mid:
                     pipeline.collide(states[0][0], contacts)
             observation = {
@@ -285,7 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--candidate-pgs-mode",
         choices=("split", "matrix_free"),
-        help="Change only the candidate PGS mode; otherwise compare grouped/lazy execution.",
+        required=True,
+        help="The candidate's PGS mode; every other setting is the reference's.",
     )
     parser.add_argument("--require-contacts", action="store_true")
     parser.add_argument("--output", type=Path, required=True)

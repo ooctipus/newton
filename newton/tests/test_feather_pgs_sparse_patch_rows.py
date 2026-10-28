@@ -206,7 +206,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             "articulated_contact_response": "immediate",
             "enable_joint_velocity_limits": False,
             "dense_max_constraints": low,
-            "grouped_dynamics": False,
             "mf_gs_parallel_rows": 0,
         }
         patch_friction = SolverFeatherPGS(model, **options)

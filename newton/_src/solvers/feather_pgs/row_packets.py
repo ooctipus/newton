@@ -1063,7 +1063,6 @@ def decline(solver) -> str | None:
             (not facts.velocity_limits, "Local packets write no joint velocity-limit rows."),
             (solver.enable_joint_limits, "Local packets build the joint-limit prefix: enable_joint_limits is off."),
             (not facts.regularized, "Local packets solve the unregularized law."),
-            (not solver.grouped_dynamics, "grouped_dynamics' response solve replaces the packets' response."),
             (
                 not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
                 "The diagonal-mass contact owner and its fused limits own these worlds.",

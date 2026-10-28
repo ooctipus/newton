@@ -47,7 +47,6 @@ def supported(solver) -> bool:
         and solver._mimic_count == 0
         and solver._connect_count == 0
         and solver._compact_diagonal_mass_size == solver._sparse_diagonal_response_size
-        and not solver.grouped_dynamics
         and not solver._debug_buffers_enabled
         and not solver._preelim_active
     )

@@ -18,7 +18,7 @@ from tools.fpgs_bench.forest_row_order import RowOrder
 from tools.fpgs_bench.public_state_oracle import public_state
 
 
-def make_case(enabled, *, permuted=False, motion=False, lazy=False):
+def make_case(enabled, *, permuted=False, motion=False):
     """Build group maps before any operator, publication or row allocation."""
     setup = SolverFeatherPGS._setup_size_grouping
 
@@ -43,7 +43,6 @@ def make_case(enabled, *, permuted=False, motion=False, lazy=False):
             dense_max_constraints=96,
             mf_max_constraints=64,
             enable_joint_velocity_limits=motion,
-            lazy_kinematics=lazy,
         )
     state, output, control = model.state(), model.state(), model.control()
     control.joint_f.assign(np.random.default_rng(517).normal(0.0, 0.04, model.joint_dof_count).astype(np.float32))
@@ -103,45 +102,6 @@ class TestTreeForestSteps(unittest.TestCase):
                     ):
                         coupled |= bodies[a] >= 0 and bodies[b] >= 0 and arts[bodies[a]] != arts[bodies[b]]
                 self.assertTrue(coupled, "Fixture must contact between independent responsive trees")
-
-    def test_lazy_kinematics_is_inert_on_the_sparse_route(self):
-        """Step lazy and eager publication bit for bit without the owner, and admit the owner with lazy publication."""
-        inspector = native.TestFeatherPGSSparseSolver()
-        cases = [make_case(False), make_case(False, lazy=True), make_case(True, lazy=True)]
-        self.assertIsNone(cases[1][1]._tree_kinetic_state)
-        self.assertIsNotNone(cases[2][1]._tree_kinetic_state)
-        for arm, case in enumerate(cases):
-            self.assertIsNotNone(case[1]._sparse_mass_matrix_size)
-            # The route record the GPU gates grade: sparse factors, the owner where admitted, and a
-            # lazy request that applies nothing on this route.
-            selected = case[1].get_path_selection()
-            self.assertEqual(selected["sparse_mass_matrix"], "on")
-            self.assertEqual(selected["routes"]["held_tree"]["owner"], "tree" if arm == 2 else None)
-            self.assertEqual(selected["cached_prediction"], "tree" if arm == 2 else None)
-            lazy_option = selected["options"]["lazy_kinematics"]
-            self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (arm > 0, False))
-        for index in range(24):
-            orders = []
-            for arm, case in enumerate(cases):
-                solver = case[1]
-                if index in (5, 13, 19):
-                    mask = wp.array([index != 13, index == 13], dtype=wp.bool, device=case[0].device)
-                    solver.reset(case[2], world_mask=mask)
-                solve = solver._launch_matrix_free_gs_solve
-
-                def ordered(*args, _case=case, _solve=solve, _orders=orders, **kwargs):
-                    _orders.append(inspector._order_multi_articulation_rows(_case))
-                    return _solve(*args, **kwargs)
-
-                with patch.object(solver, "_launch_matrix_free_gs_solve", side_effect=ordered):
-                    cases[arm] = step(case)
-            self.assertEqual(orders[0], orders[1])
-            self.assertEqual(orders[0], orders[2])
-            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
-                eager, lazy = (getattr(case[2], name).numpy() for case in cases[:2])
-                np.testing.assert_array_equal(lazy, eager, err_msg=name)
-            inspector.assert_states_close(cases[1][2], cases[2][2])
-            public_state(self, cases[2][0], cases[2][2])
 
     def test_complete_graph_replay_and_dynamic_reset_mask(self):
         """Publish both trees after captured reset masks and held-factor cycles."""

@@ -320,18 +320,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         )
         for name in ("use_parallel_streams", "propagation_cached_response"):
             self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
-        # The deprecated parallel_tree warns and selects nothing.
-        with self.assertWarnsRegex(DeprecationWarning, "parallel_tree is deprecated and has no effect"):
-            solver = SolverFeatherPGS(
-                model,
-                angular_damping=0.1,
-                friction_anchor_beta=0.0,
-                pgs_iterations=7,
-                parallel_tree=True,
-                grouped_dynamics=True,
-                lazy_kinematics=True,
-                mf_gs_parallel_rows=48,
-            )
+        solver = SolverFeatherPGS(
+            model, angular_damping=0.1, friction_anchor_beta=0.0, pgs_iterations=7, mf_gs_parallel_rows=48
+        )
         selected = solver.get_path_selection()
         options = selected["options"]
         self.assertEqual(
@@ -340,11 +331,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
         )
-        # Each request resolves to no owner (CPU keeps ordinary dynamics).
-        for name in ("parallel_tree", "grouped_dynamics", "lazy_kinematics"):
-            self.assertEqual(
-                options[name], {"applied": False, "requested": True, "default": False, "source": "argument"}
-            )
         self.assertEqual(
             options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
         )
@@ -538,19 +524,20 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(point["routes"]["contact_rows"]["law"], "point")
 
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
-        """Label the sizes the grouped response would serve, with their reasons, from the step plan's table."""
+        """Label the sizes the grouped response serves from the data, with their reasons, from the step plan's table:
+        every size up to 32 coordinates whose worlds' in-kernel tier rows it skips, and no other."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
         # A stand-in for the CUDA-only grouped response: the plan reads host state only, and the record its table.
         solver._grouped_response = True
-        solver._plan = StepPlan.build(solver)
-        selected = solver.get_path_selection()
-        json.dumps(selected, allow_nan=False)
-        response = selected["routes"]["stages"]["response"]
-        self.assertEqual(response["1"]["route"], "grouped")
-        self.assertIn("Grouped", response["1"]["reason"])
-        # The free box's six-coordinate size keeps its planned kernel.
-        self.assertEqual(response["6"]["route"], "rows")
-        self.assertIn("Free-body sizes keep the per-row kernel", response["6"]["reason"])
+        for skip, route in ((0, "rows"), (8, "grouped")):
+            with self.subTest(skip_rows=skip), patch.object(solver, "_ink_skip_rows", lambda skip=skip: skip):
+                solver._plan = StepPlan.build(solver)
+                selected = solver.get_path_selection()
+                json.dumps(selected, allow_nan=False)
+                response = selected["routes"]["stages"]["response"]
+                self.assertEqual({entry["route"] for entry in response.values()}, {route})
+                reason = "in-kernel tiers need the grouped kernel" if skip else "No in-kernel tier rows to skip"
+                self.assertTrue(all(reason in entry["reason"] for entry in response.values()), response)
 
     def test_cpu_route_record_matches_launched_kernels(self):
         """Tie the record's sweep driver, row builders and root clamp to the kernels one CPU step launches."""
@@ -949,8 +936,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
                 {"free_count": 2},
             ),
-            ({"grouped_dynamics": True}, {}),
-            ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
+            ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
             # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers; opted
             # out it builds none, whatever the requested budget.
@@ -960,26 +946,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # resident, under either friction law.
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320, "friction_anchor_beta": 0.0}, {}),
-            # lazy_kinematics defers no publication, under either friction law.
-            (
-                {
-                    "grouped_dynamics": True,
-                    "lazy_kinematics": True,
-                    "sparse_mass_matrix": "off",
-                    "cached_dynamics": "off",
-                    "friction_anchor_beta": 0.0,
-                },
-                {},
-            ),
-            (
-                {
-                    "grouped_dynamics": True,
-                    "lazy_kinematics": True,
-                    "sparse_mass_matrix": "off",
-                    "cached_dynamics": "off",
-                },
-                {},
-            ),
+            # Ordinary dynamics under either friction law.
+            ({"sparse_mass_matrix": "off", "cached_dynamics": "off", "friction_anchor_beta": 0.0}, {}),
+            ({"sparse_mass_matrix": "off", "cached_dynamics": "off"}, {}),
         )
         built = opted_out = resident_rows = 0
         for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "0")]:
@@ -1035,12 +1004,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     # Every tier sweeps the automatic budget, at least mf_gs_parallel_sweeps.
                     self.assertEqual(tiers["sweeps_rule"], "auto")
                     self.assertTrue(all(t["sweeps"] >= applied["mf_gs_parallel_sweeps"] for t in tiers["tiers"]))
-                self.assertEqual(applied["grouped_dynamics"], solver._grouped_response)
-                self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
-                # Only grouped dynamics routes a size's response to the grouped kernel.
-                if not solver._grouped_response:
+                # The grouped kernel serves only sizes whose worlds' in-kernel tier rows it skips.
+                if solver._ink_skip_rows() == 0:
                     self.assertNotIn("grouped", {entry["route"] for entry in routes["stages"]["response"].values()})
         self.assertGreaterEqual(built, 8)
         self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
@@ -1114,18 +1081,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_auto_composes_existing_execution_choices(self):
-        """Select qualified split, velocity-limit and grouped paths without private switches."""
+        """Select qualified split and velocity-limit paths without private switches."""
         model = _build_model()
-        flags = (
-            "FEATHER_PGS_SPARSE_SPLIT",
-            "FEATHER_PGS_SPARSE_VELOCITY_LIMITS",
-            "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
-        )
-        cases = (
-            {"pgs_mode": "split"},
-            {"enable_joint_velocity_limits": True},
-            {"grouped_dynamics": True},
-        )
+        flags = ("FEATHER_PGS_SPARSE_SPLIT", "FEATHER_PGS_SPARSE_VELOCITY_LIMITS")
+        cases = ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True})
         with patch.dict(os.environ):
             for name in flags:
                 os.environ.pop(name, None)
@@ -1161,24 +1120,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         for choice in ("on", "typo"):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
                 SolverFeatherPGS(model, cached_dynamics=choice)
-
-    def test_lazy_kinematics_defers_no_publication(self):
-        """Publish every substep with lazy kinematics under either friction law; publish_kinematics changes nothing."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                solver = SolverFeatherPGS(_cpu_model(), friction_anchor_beta=beta, lazy_kinematics=True)
-                selected = solver.get_path_selection()
-                self.assertEqual(selected["publication"], "ordinary")
-                self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
-                self.assertEqual(
-                    selected["options"]["lazy_kinematics"],
-                    {"applied": False, "requested": True, "default": False, "source": "argument"},
-                )
-                state = solver.model.state()
-                published = state.body_q.numpy().copy(), state.body_qd.numpy().copy()
-                solver.publish_kinematics(state)
-                np.testing.assert_array_equal(state.body_q.numpy(), published[0])
-                np.testing.assert_array_equal(state.body_qd.numpy(), published[1])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):

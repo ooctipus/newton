@@ -129,26 +129,6 @@ class TestArgumentsAndHelpers(unittest.TestCase):
         recipes["cartpole"][2]["FEATHER_PGS_EXISTING"] = "modified-copy"
         self.assertEqual(capture.RECIPES, before)
 
-    def test_grouped_sparse_overlay_preserves_physical_recipe(self):
-        """Override implementation choices without changing task budgets or Lab metadata."""
-        original = {
-            "ant": (
-                "Isaac-Ant",
-                ("grouped_dynamics=False", "pgs_iterations=7", "dense_max_constraints=48"),
-                {"FEATHER_PGS_EXISTING": "1"},
-            ),
-            "cartpole": ("Isaac-Cartpole", ("grouped_dynamics=False",), {}),
-        }
-        before = copy.deepcopy(original)
-        with patch.object(driver, "GROUPED_SPARSE_TASKS", frozenset({"ant"}), create=True):
-            recipes = driver.recipe_map(SimpleNamespace(RECIPES=original))
-        task, attributes, flags = recipes["ant"]
-        self.assertEqual(task, "Isaac-Ant")
-        self.assertEqual(attributes, ("pgs_iterations=7", "dense_max_constraints=48", "grouped_dynamics=True"))
-        self.assertEqual(flags, {"FEATHER_PGS_EXISTING": "1", "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"})
-        self.assertEqual(recipes["cartpole"], before["cartpole"])
-        self.assertEqual(original, before)
-
     def test_go2_rough_capacity_covers_observed_request(self):
         """Retain all 195 rows observed in the checked 16K-world task replay."""
         task, attributes, _ = driver.recipe_map(SimpleNamespace(RECIPES={}))["go2-rough"]
@@ -660,7 +640,7 @@ class TestCompleteDriver(unittest.TestCase):
                 "ant": ("Isaac-Ant", (), {}),
                 "anymald": (
                     "Isaac-Velocity-Flat-AnymalD",
-                    ("grouped_dynamics=True", "mf_gs_parallel_rows=48"),
+                    ("mf_gs_parallel_matrix_free=True", "mf_gs_parallel_rows=48"),
                     {"FEATHER_PGS_INK": "1"},
                 ),
             },
@@ -1060,14 +1040,7 @@ class TestCompleteDriver(unittest.TestCase):
                     env.get("FEATHER_PGS_MF_EXACT_ROWSUM"),
                     "1" if env["GPU"] == "GPU-0" else None,
                 )
-                grouped_ant = command[4] == "Isaac-Ant" and "ant" in driver.GROUPED_SPARSE_TASKS
-                self.assertEqual(
-                    "--solver-attr" in command,
-                    command[4] == "Isaac-Velocity-Flat-AnymalD" or grouped_ant,
-                )
-                self.assertEqual(env.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS"), "1" if grouped_ant else None)
-                if grouped_ant:
-                    self.assertEqual(command.count("grouped_dynamics=True"), 1)
+                self.assertEqual("--solver-attr" in command, command[4] == "Isaac-Velocity-Flat-AnymalD")
         manifest = json.loads((self.output / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
         self.assertTrue(manifest["hostname"])

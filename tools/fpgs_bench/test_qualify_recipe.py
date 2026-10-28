@@ -96,9 +96,7 @@ class TestErrors(unittest.TestCase):
         class Solver:
             def __init__(self, model, **kwargs):
                 self.kwargs = kwargs
-                self.grouped_dynamics = kwargs.get("grouped_dynamics", False)
-                self.lazy_kinematics = kwargs.get("lazy_kinematics", False)
-                self._grouped_response = self.grouped_dynamics
+                self._grouped_response = False
                 self.pgs_mode = kwargs["pgs_mode"]
                 self.resets = 0
                 created.append(self)
@@ -107,19 +105,17 @@ class TestErrors(unittest.TestCase):
                 calls.append((id(source), id(control), id(contacts), dt))
                 target.assign(source)
                 target.joint_q.values += dt * source.joint_qd.values
-                target.body_q.values[:] = -999  # Must be repaired by explicit publication.
-
-            def publish_kinematics(self, state):
-                state.body_q.values[:] = 0
-                state.body_q.values[:, 0] = state.joint_q.values
-                state.body_q.values[:, 6] = 1
+                # Every substep publishes the body state.
+                target.body_q.values[:] = 0
+                target.body_q.values[:, 0] = target.joint_q.values
+                target.body_q.values[:, 6] = 1
 
             def reset(self, state):
                 self.resets += 1
 
             def update_contacts(self, contacts):
                 contacts.rigid_contact_force.values[:] = [100, 0, 0]
-                if self.grouped_dynamics:
+                if self.pgs_mode == "split":
                     contacts.rigid_contact_force.values[:, 1] += force_delta
 
         model = SimpleNamespace(
@@ -167,12 +163,18 @@ class TestErrors(unittest.TestCase):
             patch.object(qualify.checked, "check_collision") as check_collision,
         ):
             qualify.qualify(
-                manager, object(), report, lambda: json.dumps(report, allow_nan=False), steps=6, require_contacts=True
+                manager,
+                object(),
+                report,
+                lambda: json.dumps(report, allow_nan=False),
+                steps=6,
+                require_contacts=True,
+                candidate_pgs_mode="split",
             )
         self.assertTrue(report["qualified"])
         self.assertTrue(report["loaded_contacts_observed"])
         self.assertEqual(created[1].kwargs, kwargs)
-        self.assertEqual(created[2].kwargs, {**kwargs, "grouped_dynamics": True, "lazy_kinematics": True})
+        self.assertEqual(created[2].kwargs, {**kwargs, "pgs_mode": "split"})
         for branch in report["solver_kwargs"].values():
             self.assertEqual(branch["contact_friction_gap_threshold"], "inf")
             self.assertEqual(branch["test_negative_sentinel"], "-inf")
@@ -184,15 +186,9 @@ class TestErrors(unittest.TestCase):
         self.assertEqual(check_solver.call_count, 24)
         self.assertEqual(check_collision.call_count, 12)
 
-        # An explicit mode candidate must not also enable grouped/lazy execution.
-        for reference_mode, candidate_mode, grouped, lazy in (
-            ("split", "matrix_free", False, False),
-            ("matrix_free", "split", True, False),
-        ):
-            with (
-                self.subTest(candidate_mode=candidate_mode),
-                patch.dict(kwargs, pgs_mode=reference_mode, grouped_dynamics=grouped, lazy_kinematics=lazy),
-            ):
+        # The candidate changes only its PGS mode.
+        for reference_mode, candidate_mode in (("split", "matrix_free"), ("matrix_free", "split")):
+            with self.subTest(candidate_mode=candidate_mode), patch.dict(kwargs, pgs_mode=reference_mode):
                 report = {"qualified": False}
                 with (
                     patch.dict(sys.modules, modules),
@@ -216,8 +212,6 @@ class TestErrors(unittest.TestCase):
                     {"pgs_mode": {"reference": reference_mode, "candidate": candidate_mode}},
                 )
                 self.assertEqual([entry["pgs_mode"] for entry in report["paths"]], [reference_mode, candidate_mode])
-                self.assertEqual([entry["grouped_dynamics"] for entry in report["paths"]], [grouped, grouped])
-                self.assertEqual([entry["lazy_kinematics"] for entry in report["paths"]], [lazy, lazy])
                 self.assertEqual(check_solver.call_count, 24)
                 self.assertEqual(check_collision.call_count, 12)
                 self.assertEqual([solver.resets for solver in created[-2:]], [1, 1])
@@ -231,7 +225,9 @@ class TestErrors(unittest.TestCase):
             patch.object(qualify.checked, "check_collision"),
             self.assertRaisesRegex(RuntimeError, "after complete loaded/reset replay"),
         ):
-            qualify.qualify(manager, object(), report, lambda: None, steps=6, require_contacts=True)
+            qualify.qualify(
+                manager, object(), report, lambda: None, steps=6, require_contacts=True, candidate_pgs_mode="split"
+            )
         self.assertEqual(len(report["observations"]), 12)
         self.assertEqual(
             [(item["phase"], item["step"]) for item in report["observations"]],

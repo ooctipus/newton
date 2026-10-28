@@ -71,7 +71,6 @@ def _eligible_solver():
         _connect_count=0,
         _has_loop_joints=False,
         _sparse_diagonal_contact_solve=False,
-        grouped_dynamics=False,
         _has_free_rigid_bodies=False,
         mf_gs_parallel_rows=0,
         mf_gs_incremental_rows=32,
@@ -172,17 +171,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
         ):
             SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
 
-    def test_grouped_dynamics_auto_and_legacy_opt_out(self):
-        """Compose grouped dynamics automatically while retaining its explicit opt-out."""
-        solver = _eligible_solver()
-        solver.grouped_dynamics = True
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "0"}, clear=True):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        self.assertIsNone(solver._sparse_mass_matrix_size)
-
     def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
         """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
@@ -265,7 +253,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     pgs_warmstart=False,
                     mf_warmstart=False,
                     dense_max_constraints=40,
-                    grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
                     use_parallel_streams=True,
                 )

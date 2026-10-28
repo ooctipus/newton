@@ -123,7 +123,6 @@ def make_solver(model, enabled, **overrides):
         "mf_gs_parallel_matrix_free": True,
         "mf_gs_parallel_sweeps": 24,
         "update_mass_matrix_interval": 2,
-        "grouped_dynamics": True,
     }
     options.update(overrides)
     with mode(enabled, patch_friction=options["friction_anchor_beta"] > 0.0):

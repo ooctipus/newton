@@ -70,7 +70,6 @@ def _sparse_tree_solver(**changes):
         _async_augmented_drives=True,
         _parallel_augmented_drive_topology=True,
         _articulation_dynamics_stream=object(),
-        lazy_kinematics=False,
         _debug_buffers_enabled=False,
         _double_buffer=False,
     )
@@ -80,11 +79,9 @@ def _sparse_tree_solver(**changes):
 
 
 class TestSparseTreeAdmission(unittest.TestCase):
-    def test_lazy_kinematics_is_inert_on_the_sparse_route(self):
-        """Admit lazy kinematics on the sparse route, where nothing defers publication."""
-        for lazy in (False, True):
-            with self.subTest(lazy_kinematics=lazy):
-                self.assertIsNone(held_tree.decline(_sparse_tree_solver(lazy_kinematics=lazy)))
+    def test_sparse_route_is_admitted(self):
+        """Admit the sparse factor's held group where every admission term holds."""
+        self.assertIsNone(held_tree.decline(_sparse_tree_solver()))
 
 
 class TestHeldTreeContactLaw(unittest.TestCase):

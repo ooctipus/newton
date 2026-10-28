@@ -490,13 +490,12 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertTrue(np.all(final[:, 0, 2] > 0.2))
         self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
 
-    def test_grouped_dynamics_scenes_are_owned(self):
-        """Scenes with grouped dynamics (the quadruped recipes' setting) hand their dynamics to the owner."""
+    def test_quadruped_scenes_are_owned(self):
+        """Quadruped scenes (the legged recipes' class) hand their dynamics to the owner."""
         model = _build(wp.get_device("cuda:0"), quadruped=True)
-        recipe = {"grouped_dynamics": True}
-        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256, attrs=recipe)
+        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
         self.assertIsNone(plain_owner)
-        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256, attrs=recipe)
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256)
         self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())

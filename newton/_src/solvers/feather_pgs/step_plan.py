@@ -18,16 +18,12 @@ in it changes after construction.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
 __all__ = ["FACTOR_READS_MASS", "AdmissionFacts", "Route", "SolveRoute", "StepPlan", "first_failed"]
 
-# Import-time switches of the grouped response solve (grouped_dynamics).
-_GROUPED_HINV_OFF = os.environ.get("FEATHER_PGS_GROUPED_HINV") == "0"
-_GROUPED_HINV_MAX = int(os.environ.get("FEATHER_PGS_GROUPED_HINV_MAX", "32"))
 _GROUPED_VERIFIED_DOFS = 32
 
 
@@ -297,18 +293,16 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
 
 
 def _grouped(solver, size: int) -> tuple[bool, str]:
-    """Whether grouped dynamics' response solve serves a size, and why."""
+    """Whether the grouped response solve (a warp per articulation, a lane per row) serves a size, and why.
+
+    The data choose it: where the in-kernel tiers own rows, the response must skip each world's tier rows,
+    which only the grouped kernel does. It solves the planned kernels' response, summed in its own order.
+    """
     if int(size) > _GROUPED_VERIFIED_DOFS:
         return False, f"The grouped response solve is verified up to {_GROUPED_VERIFIED_DOFS} DOFs only."
     if solver._ink_skip_rows() > 0:
         return True, "Grouped: the in-kernel tiers need the grouped kernel's per-world row skip."
-    if _GROUPED_HINV_OFF:
-        return False, "FEATHER_PGS_GROUPED_HINV=0 keeps the planned response kernel."
-    if int(size) > _GROUPED_HINV_MAX:
-        return False, f"Above FEATHER_PGS_GROUPED_HINV_MAX={_GROUPED_HINV_MAX}."
-    if size in solver._free_body_inertia_sizes:
-        return False, "Free-body sizes keep the per-row kernel, which is faster there."
-    return True, f"Grouped: sizes up to FEATHER_PGS_GROUPED_HINV_MAX={_GROUPED_HINV_MAX} take the grouped kernel."
+    return False, "No in-kernel tier rows to skip: the planned response kernel."
 
 
 def _delassus(solver, solve: SolveRoute, response: Mapping[int, Route]) -> dict[int, Route]:

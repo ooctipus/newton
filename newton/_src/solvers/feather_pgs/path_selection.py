@@ -101,10 +101,6 @@ _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     # Deprecated: selects nothing.
-    "parallel_tree": lambda solver: False,
-    "grouped_dynamics": lambda solver: solver._grouped_response,
-    # Every substep publishes: the request selects nothing.
-    "lazy_kinematics": lambda solver: False,
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
@@ -144,9 +140,7 @@ def applied_options(solver, init, arguments: dict) -> dict:
     construction's gates and clamps: an option whose owner, tier or stream was
     not built reports its off value (``False``, ``0`` or ``"off"``), and a row
     budget reports the rows the built tier serves. ``requested`` keeps the
-    request, which can still decline other owners when its own mechanism does
-    not engage (for example ``grouped_dynamics``);
-    ``routes`` names the owners. ``source`` is ``"environment"`` when an
+    request; ``routes`` names the owners. ``source`` is ``"environment"`` when an
     ``IL_NEWTON_FPGS_*`` legacy alias or a ``FEATHER_PGS_*`` override changed
     the applied value, ``"argument"`` when the requested value differs from the
     declared default and ``"default"`` otherwise; Python cannot tell an omitted

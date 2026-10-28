@@ -92,32 +92,26 @@ class TestFeatherPGSSprings(unittest.TestCase):
                 builder.joint_velocity_limit[0] = 2.0
                 model = builder.finalize()
                 control = model.control()
-                results = []
-                for grouped in (False, True):
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model,
-                        pgs_mode="matrix_free",
-                        pgs_iterations=8,
-                        dense_max_constraints=32,
-                        enable_joint_velocity_limits=True,
-                        fuse_joint_velocity_limits=False,
-                        drive_mode="augmented",
-                        use_parallel_streams=True,
-                        grouped_dynamics=grouped,
-                    )
-                    state_in, state_out = model.state(), model.state()
-                    state_in.joint_qd.fill_(velocity)
-                    solver.step(state_in, state_out, control, None, 0.001)
-                    solver.check_constraint_capacity()
-                    np.testing.assert_allclose(state_in.joint_qd.numpy(), [velocity], atol=1e-6)
-                    np.testing.assert_allclose(solver.qd_work.numpy(), [min(velocity, 2.0)], atol=1e-6)
-                    # Z-axis gravity and centripetal forces exert no hinge torque.
-                    np.testing.assert_allclose(
-                        solver._last_debug_state_aug.joint_tau.numpy(), [-damping * velocity], atol=2e-5
-                    )
-                    results.append((state_out.joint_q.numpy(), state_out.joint_qd.numpy()))
-                for original, other in zip(results[0], results[1], strict=True):
-                    np.testing.assert_allclose(other, original, rtol=2e-5, atol=2e-6)
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=8,
+                    dense_max_constraints=32,
+                    enable_joint_velocity_limits=True,
+                    fuse_joint_velocity_limits=False,
+                    drive_mode="augmented",
+                    use_parallel_streams=True,
+                )
+                state_in, state_out = model.state(), model.state()
+                state_in.joint_qd.fill_(velocity)
+                solver.step(state_in, state_out, control, None, 0.001)
+                solver.check_constraint_capacity()
+                np.testing.assert_allclose(state_in.joint_qd.numpy(), [velocity], atol=1e-6)
+                np.testing.assert_allclose(solver.qd_work.numpy(), [min(velocity, 2.0)], atol=1e-6)
+                # Z-axis gravity and centripetal forces exert no hinge torque.
+                np.testing.assert_allclose(
+                    solver._last_debug_state_aug.joint_tau.numpy(), [-damping * velocity], atol=2e-5
+                )
 
 
 if __name__ == "__main__":
