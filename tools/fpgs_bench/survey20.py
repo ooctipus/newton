@@ -60,7 +60,7 @@ RECIPES = {
     # The original keyboard recipe's prismatic opt-ins are retired; scalar
     # branches run its keys.
     "keyboard-so101": (
-        flags("SPARSE_CONTACT_DIRECT", "COMPACT_CONTACT_BOUNDARY"),
+        flags("SPARSE_CONTACT_DIRECT"),
         {"rigid_contact_max": 147456, "dense_max_constraints": 704},
     ),
     **{

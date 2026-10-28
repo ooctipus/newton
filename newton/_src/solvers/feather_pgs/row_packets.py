@@ -880,10 +880,6 @@ def decline(solver) -> str | None:
                 not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
                 "The diagonal-mass contact owner and its fused limits own these worlds.",
             ),
-            (
-                not source._COMPACT_CONTACT_BOUNDARY,
-                "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY selects the compact producer.",
-            ),
             (not solver._paired_factor_coordinates, "The paired factor-coordinate sweep owns these worlds."),
             (
                 all(

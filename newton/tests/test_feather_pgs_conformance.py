@@ -116,6 +116,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import math
 import os
 import time
@@ -152,7 +153,8 @@ class Route:
     environment: dict = dataclasses.field(default_factory=dict)
     """``FEATHER_PGS_*`` variables set while the solver is constructed and stepped."""
     module: dict = dataclasses.field(default_factory=dict)
-    """Import-time switches of the solver module (``_INK_ON`` and the like), patched for the whole run."""
+    """Attributes patched for the whole run: the solver module's import-time switches (``_INK_ON`` and the like), or
+    ``"module.attribute"`` of another FeatherPGS module."""
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
 
@@ -185,8 +187,10 @@ def route_context(route: Route):
         for name in names:
             del os.environ[name]
         os.environ.update(route.environment)
-        if route.module:
-            stack.enter_context(mock.patch.multiple(solver_module, **route.module))
+        for name, value in route.module.items():
+            owner, _, attribute = name.rpartition(".")
+            target = importlib.import_module(f"newton._src.solvers.feather_pgs.{owner}") if owner else solver_module
+            stack.enter_context(mock.patch.object(target, attribute, value))
         yield
 
 
@@ -1315,10 +1319,20 @@ PAIRED_FOREST = Route(
         "contact_rows.producer": "general",
     },
 )
+
+
+def _unsupported(solver) -> bool:
+    return False
+
+
+# The sparse-diagonal producers write the rows of a dense articulation other than six coordinates (franka-cabinet's
+# nine); on the keyboard the compact boundary would own them, so these routes withhold its admission.
+_SPARSE_DIAGONAL_ROWS = {"compact_contact.supported": _unsupported}
 SPARSE_DIAGONAL = Route(
     "sparse_diagonal_scalar",
     "cuda",
     options=_MF,
+    module=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "sparse_diagonal",
@@ -1331,6 +1345,7 @@ SPARSE_DIAGONAL_TREE = Route(
     # The franka-cabinet route: sparse-diagonal rows with the diagonal-mass group in a held tree.
     options=_MF,
     environment={"FEATHER_PGS_SCALAR_BRANCHES": "0"},
+    module=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "sparse_diagonal",
@@ -1341,9 +1356,8 @@ SPARSE_DIAGONAL_TREE = Route(
 COMPACT_BOUNDARY = Route(
     "compact_contact_boundary",
     "cuda",
-    # The keyboard recipe's route (FEATHER_PGS_COMPACT_CONTACT_BOUNDARY, an import-time switch).
+    # The keyboard recipe's route: the compact boundary owns a six-coordinate dense articulation's rows.
     options=_MF,
-    module={"_COMPACT_CONTACT_BOUNDARY": True},
     expect={
         "sweep.route": "sparse_diagonal",
         "contact_rows.producer": "compact_contact_boundary",

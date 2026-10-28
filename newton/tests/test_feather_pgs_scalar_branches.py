@@ -30,6 +30,7 @@ from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_compact_contact import compact_boundary
 from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
 
 DT = 1.0 / 240.0
@@ -265,7 +266,7 @@ def recipe_solver(model, *, scalar, compact=True, **options):
         **options,
     }
     with (
-        mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
+        compact_boundary(compact),
         mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
         # Read at construction, so an exported value cannot change the route.
         mock.patch.dict(os.environ, {"FEATHER_PGS_SCALAR_BRANCHES": str(int(scalar))}),

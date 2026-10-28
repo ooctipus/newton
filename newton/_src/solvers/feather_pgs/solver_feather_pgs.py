@@ -270,7 +270,6 @@ from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
-_COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"  # parallel tiers form Y = H^-1 J^T and the diagonal in-kernel
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
@@ -2582,27 +2581,23 @@ class SolverFeatherPGS(SolverBase):
             self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         )
 
-        # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
-        declined = first_failed(
-            (
-                (_COMPACT_CONTACT_BOUNDARY, "Off: FEATHER_PGS_COMPACT_CONTACT_BOUNDARY is an import-time opt-in."),
-                (
-                    self._law_agnostic_contact_paths,
-                    "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows.",
-                ),
-            )
-        )
-        if declined is None:
-            from .compact_contact import supported  # noqa: PLC0415
+        # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
+        # six-coordinate dense articulation. It writes the point and the patch row law; torsion and compliance keep
+        # ordinary rows.
+        from .compact_contact import supported  # noqa: PLC0415
 
-            if not supported(self):
-                declined = (
-                    "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
-                )
+        if not self._law_agnostic_contact_paths:
+            declined = (
+                "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows."
+            )
+        elif not supported(self):
+            declined = (
+                "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
+            )
+        else:
+            declined = None
         self._compact_contact_boundary = declined is None
-        self._compact_contact_reason = declined or (
-            "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
-        )
+        self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
 
         from .held_tree import install as install_held_tree  # noqa: PLC0415
 

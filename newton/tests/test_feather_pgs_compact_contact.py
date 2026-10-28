@@ -438,6 +438,18 @@ def geometry_reference(data):
     return results
 
 
+def _unsupported(solver) -> bool:
+    return False
+
+
+def compact_boundary(enabled: bool):
+    """Admit the compact contact boundary where the data supports it, or withhold it from the sparse-diagonal owner.
+
+    Withheld, the sparse-diagonal producers write the rows, as for a dense articulation other than six coordinates.
+    """
+    return mock.patch.object(compact, "supported", compact.supported if enabled else _unsupported)
+
+
 def build_solver_fixture(device):
     """Actual admitted two-world sparse108 + serial-six model with live contact shapes."""
     template = newton.ModelBuilder()
@@ -816,7 +828,7 @@ class TestCompactContact(unittest.TestCase):
                 response = np.linalg.solve(factor.T, np.linalg.solve(factor, dense))
                 np.testing.assert_allclose(data.Y.numpy()[group, row], response, rtol=5e-6, atol=4e-6)
 
-    def test_default_off_and_exact_mode_admission(self):
+    def test_exact_mode_admission(self):
         """Reject incomplete mode compositions before any contact ownership changes."""
         valid = {
             "model": SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
@@ -867,8 +879,7 @@ class TestCompactContact(unittest.TestCase):
         contacts = newton.Contacts(8, 0, device=model.device)
         install_contacts(model, state, contacts)
         self.assertEqual(contacts.rigid_contact_count.numpy()[0], 6)
-        with mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", True):
-            solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=64)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=64)
         self.assertFalse(solver._compact_contact_boundary)
 
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
@@ -885,7 +896,7 @@ class TestCompactContact(unittest.TestCase):
             solvers = []
             for enabled in (False, True):
                 with (
-                    mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
+                    compact_boundary(enabled),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(
@@ -972,7 +983,7 @@ class TestCompactContact(unittest.TestCase):
             solvers = []
             for enabled in (False, True):
                 with (
-                    mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
+                    compact_boundary(enabled),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(

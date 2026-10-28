@@ -32,7 +32,11 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
-from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture, install_patch_contacts
+from newton.tests.test_feather_pgs_compact_contact import (
+    build_solver_fixture,
+    compact_boundary,
+    install_patch_contacts,
+)
 from newton.tests.test_feather_pgs_response_diagonal import _mark_patch_units, _patch_unit_cases, _unit_schedule_oracle
 
 _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
@@ -392,7 +396,7 @@ def _differing_worlds(first, second):
 def _record_schedules(model, device, *, anchors, compact, steps=6):
     """Step a solver over the patch fixture's contacts; return each schedule build's rows before and outputs after."""
     with (
-        mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
+        compact_boundary(compact),
         mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
     ):
         solver = newton.solvers.SolverFeatherPGS(

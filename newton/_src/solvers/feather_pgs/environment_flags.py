@@ -29,12 +29,6 @@ def _flag(name: str, kind: FlagKind, modules: tuple[str, ...], meaning: str) -> 
 
 # The flags the solver reads: (name, kind, reading modules, meaning).
 _READ = (
-    (
-        "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY",
-        "experiment",
-        _SOLVER,
-        "=1 selects the complete contact producer for the dense-six plus sparse solve.",
-    ),
     ("FEATHER_PGS_CONTACT_THREADS_X", "policy", _SOLVER, "Multiplier of the contact-build thread budget (default 1)."),
     (
         "FEATHER_PGS_CONTACT_UPDATE",

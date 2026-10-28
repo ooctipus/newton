@@ -513,7 +513,6 @@ def create_owner(solver):
         and not solver._paired_factor_coordinates
         and not solver._has_loop_joints
         and not solver._fused_diagonal_joint_limits
-        and not source._COMPACT_CONTACT_BOUNDARY
         and not solver._sparse_diagonal_contact_solve
         and not solver._mimic_count
         and not solver._connect_count
