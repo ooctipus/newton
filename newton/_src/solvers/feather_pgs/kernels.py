@@ -21,6 +21,8 @@ from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .contact_input import ContactInput, ContactRoutes, contact_frame, write_row_record
 from .contact_laws import (
     contact_endpoints,
+    contact_friction_points,
+    contact_geometry,
     contact_materials,
     contact_points,
     contact_responds,
@@ -41,7 +43,14 @@ from .device_preludes import (
     warp_sum,
     warp_sync,
 )
-from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, PatchRowLaw, patch_normal_load, patch_tangent_row
+from .friction_patches import (
+    CONTACT_PATH_RESOLVED,
+    FrictionPatches,
+    PatchRowLaw,
+    patch_friction_location,
+    patch_normal_load,
+    patch_tangent_row,
+)
 from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     disk,
@@ -2156,6 +2165,7 @@ def allocate_world_contact_slots(
     total_contacts = data.count[0]
 
     for c in range(thread, total_contacts, total_num_threads):
+        resolved = False
         if resolved_worlds.shape[0] > 0:
             _body_a, _body_b, art_a, art_b, world = contact_endpoints(
                 data.shape0[c], data.shape1[c], data.shape_body, body_to_articulation, art_to_world
@@ -2169,22 +2179,9 @@ def allocate_world_contact_slots(
                 data.slot[c] = -1
                 data.path[c] = -1
                 data.slots_needed[c] = 0
-                if friction_patches.enabled != 0:
-                    admitted, _art_a, _art_b, _world, _phi = _admit_contact(
-                        c,
-                        data,
-                        body_to_articulation,
-                        art_to_world,
-                        body_flags,
-                        body_has_response_dofs,
-                        is_free_rigid,
-                        contact_gap_gate,
-                        same_articulation_contact_gap_gate,
-                        articulation_pair_contact_gap_gate,
-                    )
-                    if admitted:
-                        data.path[c] = CONTACT_PATH_RESOLVED
-                continue
+                if friction_patches.enabled == 0:
+                    continue
+                resolved = True
         admitted, art_a, art_b, world, phi = _admit_contact(
             c,
             data,
@@ -2197,6 +2194,10 @@ def allocate_world_contact_slots(
             same_articulation_contact_gap_gate,
             articulation_pair_contact_gap_gate,
         )
+        if resolved:
+            if admitted:
+                data.path[c] = CONTACT_PATH_RESOLVED
+            continue
         if not admitted:
             data.slot[c] = -1
             data.path[c] = -1
@@ -2537,9 +2538,28 @@ def populate_world_J_for_compact_size(
     for c in range(worker, total_contacts, total_num_workers):
         if data.path[c] != 0 or data.slot[c] < 0 or row >= data.slots_needed[c]:
             continue
-        body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-            data, law, c
+        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
+            c,
+            data.shape0,
+            data.shape1,
+            data.point0,
+            data.point1,
+            data.normal,
+            data.margin0,
+            data.margin1,
+            data.shape_body,
+            data.body_q,
         )
+        # A normal-row lane needs no tangent basis (contact_frame computes it for every row).
+        tangent0 = wp.vec3(0.0)
+        tangent1 = wp.vec3(0.0)
+        if row > 0:
+            tangent0, tangent1 = contact_tangent_basis(normal)
+        friction_a, friction_b = contact_friction_points(
+            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
+        )
+        if law.patches.enabled != 0:
+            friction_a, friction_b = patch_friction_location(law.patches, c)
         direction, p0, p1 = contact_row_frame(
             row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
         )

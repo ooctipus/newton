@@ -410,15 +410,14 @@ class TestResolvedWorlds(unittest.TestCase):
             np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
 
     def test_patch_release_repeats_the_allocator_admission(self):
-        """Mark a resolved contact by the allocator's own admission: both calls take the same arguments."""
+        """Mark a resolved contact by the allocator's own admission: the kernel admits every contact once."""
         allocator = _definition(kernels.allocate_world_contact_slots)
         admissions = [
             node
             for node in ast.walk(allocator)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == "_admit_contact"
         ]
-        self.assertEqual(len(admissions), 2)
-        self.assertEqual(ast.dump(admissions[0]), ast.dump(admissions[1]))
+        self.assertEqual(len(admissions), 1)
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""
