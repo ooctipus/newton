@@ -116,7 +116,7 @@ class TestTreeForestCache(unittest.TestCase):
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 solver._last_step_dt = reference._last_step_dt = dt
                 ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-                _, velocity = reference._stage1_fk_id(state, ref_aug, model.state())
+                velocity = reference._stage1_fk_id(state, ref_aug, model.state())
                 reference._stage1_drives(state, ref_aug, control, dt)
                 rhs = ref_aug.joint_tau.numpy().reshape(arts, count).astype(float)
                 physical = physical_mass(model, state)

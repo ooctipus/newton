@@ -184,7 +184,7 @@ class _Stages:
 
     def mass_matrices(self) -> list:
         self.solver._stage1_fk_id(self.state, self.aug, self.out)
-        self.solver._stage1_crba(self.aug, None, None)
+        self.solver._stage1_crba(self.aug, None)
         return [self.solver.H_by_size[size] for size in self.solver.size_groups]
 
 

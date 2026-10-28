@@ -81,7 +81,7 @@ def _is_default(value, default) -> bool:
 def _streams_created(solver) -> bool:
     # Every stream use_parallel_streams gates: size groups, local owners, the compact inertia
     # refresh, asynchronous augmented drives and the paired overlap. CPU builds none.
-    names = ("_local_internal_stream", "_global_inertia_stream", "_articulation_dynamics_stream")
+    names = ("_local_internal_stream", "_articulation_dynamics_stream")
     streams = (
         *solver._size_streams.values(),
         *(getattr(solver, name, None) for name in names),
@@ -1027,8 +1027,6 @@ def _dynamics(solver) -> dict:
     return {
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
-        "parallel_composite_inertia": bool(solver._parallel_composite_inertia),
-        "compact_inertia_refresh": bool(solver._compact_inertia_refresh),
         # Response layout: whether J/Y are gathered per world or already world-indexed.
         "jy_world_aliased": bool(solver._jy_world_aliased),
         "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),

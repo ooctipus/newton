@@ -28,17 +28,12 @@ body-indexed arrays the solver holds: a joint's slot is its child body and its
 parent slot its parent body (``joint_parent``).
 """
 
-import functools
-
 import warp as wp
 
 from ...sim import BodyFlags
 from . import field_group
-from .device_preludes import lane_group
 from .field_group import Field
-from .kernel_template import KernelTemplate, params
 from .spatial_laws import (
-    INERTIA_CHANNELS,
     body_wrench,
     inertia_apply,
     inertia_at,
@@ -53,9 +48,7 @@ from .spatial_laws import (
     unpack_inertia,
     wrench_shift,
 )
-from .tree_plan import TreePlan
-from .tree_scan import TRANSFORM, TWIST, Direction, Group, PlanAccess, Schedule, Storage, add, serial_path, serial_scan
-from .tree_scan import tree_scan as scan_source
+from .tree_scan import TRANSFORM, TWIST, Direction, Group, add, serial_path, serial_scan
 
 __all__ = [
     "DYNAMICS",
@@ -63,7 +56,6 @@ __all__ = [
     "DynamicsData",
     "body_dynamics",
     "composite_inertia",
-    "composite_inertia_lanes",
     "crba_fill",
     "diagonal_inverse_mass",
     "fk_id",
@@ -162,8 +154,6 @@ a fixed 16 (1.1-1.7 times four's time) and the joint forces at 256 (1.2-3.4 time
 eight lost up to 1.6 times on 13-body trees at 65536 articulations."""
 
 
-# The serial scans of a joint range need no tree literal: a parent-first plan stands for every range.
-_SERIAL_PLAN = TreePlan.build([-1])
 _SUM = add(Group("value", 1))
 
 
@@ -614,57 +604,3 @@ def diagonal_inverse_mass(
         if stiffness > 0.0:
             mass += stiffness
     inverse[coordinate] = 1.0 / mass
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Composite inertia, one warp per articulation (the solver's CUDA form)
-# ---------------------------------------------------------------------------------------------------------------------
-
-_RECORD = add(Group("inertia", INERTIA_CHANNELS))
-_ARTICULATION_JOINTS = PlanAccess(
-    parent="(joint_ancestor.data[start+({node})]>=start?joint_ancestor.data[start+({node})]-start:-1)"
-)
-_RECORDS = Storage({"inertia": "body_I_c.data[joint_child.data[start+({node})]].c[{k}]"})
-
-
-@functools.cache
-def composite_inertia_lanes(warps_per_block: int) -> wp.Kernel:
-    """The CUDA composite inertia of listed articulations: a warp per articulation, lanes over the 13 record
-    channels (SERIAL up with channel lanes). Launch ``launch_tiled(dim=[blocks], block_dim=32 * warps)``."""
-    scan = scan_source(
-        _SERIAL_PLAN,
-        _RECORD,
-        Direction.UP,
-        Schedule.SERIAL,
-        storage=_RECORDS,
-        access=_ARTICULATION_JOINTS,
-        sizes={"nodes": "(end-start)"},
-        channel_lanes=True,
-    )
-    source = f"""    const int candidate = block * {warps_per_block} + SUB;
-    if (candidate >= composite_articulation_count) return;
-    const int articulation = composite_articulations.data[candidate];
-    const int start = articulation_start.data[articulation];
-    const int end = articulation_joint_end.data[articulation];
-    for (int joint = start; joint < end; ++joint) {{
-        const int body = joint_child.data[joint];
-        for (int k = LANE; k < {INERTIA_CHANNELS}; k += STRIDE)
-            body_I_c.data[body].c[k] = body_inertia_terms.data[body].c[k];
-    }}
-    SYNC();
-{scan.cuda}"""
-    return KernelTemplate(
-        f"composite_inertia_warp{warps_per_block}",
-        params(
-            ("composite_articulation_count", int),
-            ("composite_articulations", wp.array[int]),
-            ("articulation_start", wp.array[int]),
-            ("articulation_joint_end", wp.array[int]),
-            ("joint_ancestor", wp.array[int]),
-            ("joint_child", wp.array[int]),
-            ("body_inertia_terms", wp.array[inertia_record]),
-            ("body_I_c", wp.array[inertia_record]),
-        ),
-        source + "#endif\n",
-        preludes=(lane_group(32),),
-    ).kernel()

@@ -124,7 +124,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     if reference._fk_id_cache_enabled:
                         reference._fk_id_cache_valid.zero_()
                     ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-                    _, motion = reference._stage1_fk_id(state, ref_aug, model.state())
+                    motion = reference._stage1_fk_id(state, ref_aug, model.state())
                     reference._stage1_drives(state, ref_aug, control, dt)
                     rhs = ref_aug.joint_tau.numpy().reshape(2, count).astype(float)
                     actual_motion = motion.numpy()

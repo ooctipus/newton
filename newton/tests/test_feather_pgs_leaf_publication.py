@@ -238,16 +238,13 @@ class TestLeafPublication(unittest.TestCase):
         step, and dense inertia only for free rigid bodies."""
         model, _, leaves = _build_model(locked_d6=True, leaves=108)
         solver = _solver(model)
-        for step, compact in ((0, False), (1, False), (1, True)):
+        for step in (0, 1):
             state = model.state()
             solver._step = step
-            # Only the identity check is consumed by Stage 7, no stream is used.
-            solver._global_inertia_stream = object() if compact else None
             for name, array in _fields(solver, state).items():
                 array.fill_(-123 if name == "valid" else -123.25)
             solver._stage7_update_kinematics(state, solver)
             snapshot = {name: array.numpy().copy() for name, array in _fields(solver, state).items()}
-            solver._global_inertia_stream = None
             np.testing.assert_array_equal(snapshot["valid"], np.ones(model.articulation_count))
             np.testing.assert_array_equal(snapshot["a"][leaves], 0.0)
             np.testing.assert_array_equal(snapshot["I"][leaves], -123.25)

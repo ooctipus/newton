@@ -474,7 +474,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                     _mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
                 )
-                SolverFeatherPGS._stage1_crba(owner, owner, None, None)
+                SolverFeatherPGS._stage1_crba(owner, owner, None)
                 self.assertEqual(calls, [owner])
                 np.testing.assert_array_equal(owner.mass_update_mask.numpy(), expected)
                 np.testing.assert_array_equal(owner._mass_update_requested.numpy(), [0, 0, 0])
@@ -491,7 +491,6 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._local_internal_stream = local
         solver._local_residual_stream = residual
         solver._local_pair_stream = local
-        solver._global_inertia_stream = None
         solver._articulation_dynamics_stream = dynamics
         solver._memset_stream = memset
         solver._size_streams = {3: local, 6: size}

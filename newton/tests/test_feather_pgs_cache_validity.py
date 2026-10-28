@@ -1859,7 +1859,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 patch.object(wp, "launch_tiled", launch),
                 patch.object(wp.array, "zero_", zero),
             ):
-                solver._stage1_crba(state_aug, None, None)
+                solver._stage1_crba(state_aug, None)
             return [array for array in matrices if any(item is array for item in touched)]
 
         refreshed = []

@@ -591,7 +591,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     solver.qd_work.fill_(_UNWRITTEN)
                     destinations = []
                     with _recording_copies(destinations):
-                        _, stage3_qd = solver._stage1_fk_id(state, solver, following)
+                        stage3_qd = solver._stage1_fk_id(state, solver, following)
                     self.assertIs(stage3_qd, solver.qd_work)
                     self.assertFalse(any(destination is solver.qd_work for destination in destinations))
                     expected = _serial(

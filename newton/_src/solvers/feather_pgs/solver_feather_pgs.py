@@ -265,7 +265,6 @@ from .tree_passes import (
     SERIAL_BLOCK_DIM,
     DynamicsData,
     composite_inertia,
-    composite_inertia_lanes,
     crba_fill,
     diagonal_inverse_mass,
     fk_id,
@@ -306,7 +305,6 @@ _ROWS_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_ROWS_THREADS_X", "4")))
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
 _CONTACT_JACOBIAN_MAX_DOF = 10
-_COMPOSITE_INERTIA_WARPS_PER_BLOCK = 4
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
 _FACTOR_DENSE_MAX_DOF = 64
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
@@ -2281,19 +2279,6 @@ class SolverFeatherPGS(SolverBase):
             else "No world holds one non-free articulation of at most "
             f"{_LOCAL_INTERNAL_MAX_DOF} DOFs whose local staging fits the device."
         )
-        response_dof_count = self._model_plan.response_dof_count
-        response_articulations = response_dof_count > 0
-        direct_body_inertia = np.isin(response_dof_count, tuple(self._free_body_inertia_sizes))
-        composite_articulations = np.flatnonzero(response_articulations & ~direct_body_inertia).astype(
-            np.int32, copy=False
-        )
-        self._composite_articulation_count = int(composite_articulations.size)
-        # The warp-per-articulation composite is native code without an adjoint: the gradient route keeps the
-        # serial Warp pass.
-        self._parallel_composite_inertia = bool(
-            model.device.is_cuda and not model.requires_grad and np.any(response_articulations)
-        )
-        self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
         # Drives are prepared apart from inverse dynamics (per coordinate where the topology allows) on CUDA without
         # gradients; use_parallel_streams only decides whether that preparation overlaps on a stream of its own.
         self._async_augmented_drives = bool(
@@ -2301,14 +2286,6 @@ class SolverFeatherPGS(SolverBase):
             and not model.requires_grad
             and self.drive_mode == "augmented"
             and self.articulation_max_dofs > 0
-        )
-        self._composite_articulations = (
-            wp.array(composite_articulations, dtype=wp.int32, device=model.device)
-            if self._parallel_composite_inertia
-            else None
-        )
-        self._composite_inertia_warp_kernel = (
-            composite_inertia_lanes(_COMPOSITE_INERTIA_WARPS_PER_BLOCK) if self._composite_articulation_count else None
         )
 
         # All inactive weight arguments alias this one element. Their producer
@@ -2428,6 +2405,7 @@ class SolverFeatherPGS(SolverBase):
                 else:
                     self.Hinv_by_size[response_size] = wp.zeros_like(self.L_by_size[response_size])
             if self._paired_factor_coordinates:
+                response_dof_count = self._model_plan.response_dof_count
                 primary_arts = np.flatnonzero(response_dof_count == response_pair[0])
                 secondary_arts = np.flatnonzero(response_dof_count == response_pair[1])
                 primary_groups = np.empty(self.world_count, dtype=np.int32)
@@ -5875,7 +5853,6 @@ class SolverFeatherPGS(SolverBase):
             and self._pgs_solve_local_pair_kernels
             else None
         )
-        self._global_inertia_stream = wp.Stream(model.device) if self._compact_inertia_refresh else None
         self._articulation_dynamics_stream = (
             wp.Stream(model.device) if self._async_augmented_drives and self.use_parallel_streams else None
         )
@@ -6750,7 +6727,7 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
-            global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
+            stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
             if model.articulation_count:
                 inverse_dynamics_ready = self._stage1_complete_joint_tau(
@@ -6759,7 +6736,7 @@ class SolverFeatherPGS(SolverBase):
             else:
                 inverse_dynamics_ready = None
 
-            self._stage1_crba(state_aug, global_inertia_ready, drive_rows_ready)
+            self._stage1_crba(state_aug, drive_rows_ready)
         # ══════════════════════════════════════════════════════════════
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
@@ -7670,30 +7647,6 @@ class SolverFeatherPGS(SolverBase):
             DynamicsData, model=self.model, solver=self, state=state, aug=state_aug, control=control, **values
         )
 
-    def _launch_parallel_composite_inertia(self) -> None:
-        """Composite inertia records of the listed articulations, a warp per articulation."""
-        if not self._composite_articulation_count:
-            return
-        wp.launch_tiled(
-            self._composite_inertia_warp_kernel,
-            dim=[
-                (self._composite_articulation_count + _COMPOSITE_INERTIA_WARPS_PER_BLOCK - 1)
-                // _COMPOSITE_INERTIA_WARPS_PER_BLOCK
-            ],
-            inputs=[
-                self._composite_articulation_count,
-                self._composite_articulations,
-                self.model.articulation_start,
-                self.articulation_joint_end,
-                self.model.joint_ancestor,
-                self.model.joint_child,
-                self._body_inertia_terms,
-                self.body_I_c,
-            ],
-            block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
-            device=self.model.device,
-        )
-
     def _launch_velocity_prescale(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
         """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
         model = self.model
@@ -7715,7 +7668,8 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> tuple[wp.Event | None, wp.array]:
+    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> wp.array:
+        """Forward kinematics and inverse-dynamics terms; returns the predictor's velocity (prescaled when limited)."""
         model = self.model
 
         # evaluate joint inertias, motion vectors, and forces
@@ -7739,8 +7693,7 @@ class SolverFeatherPGS(SolverBase):
             self._tree_kinetic_state.begin(
                 state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite, state_out=state_out
             )
-            return None, stage3_qd
-        parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
+            return stage3_qd
         # A refresh step places every body's inertia record for the composite inertia.
         dynamics = self._dynamics(
             state_in,
@@ -7752,15 +7705,6 @@ class SolverFeatherPGS(SolverBase):
         wp.launch(
             fk_id, dim=model.articulation_count, inputs=[dynamics], block_dim=SERIAL_BLOCK_DIM, device=model.device
         )
-        global_inertia_ready = None
-        if parallel_global_refresh:
-            inertia_stream = self._global_inertia_stream
-            inertia_stream.wait_event(wp.get_stream(model.device).record_event())
-            with wp.ScopedStream(inertia_stream, sync_enter=False):
-                self._launch_parallel_composite_inertia()
-            global_inertia_ready = inertia_stream.record_event()
-        elif self._parallel_composite_inertia and refresh_composite:
-            self._launch_parallel_composite_inertia()
         if model.body_count and not self._fk_id_cache_enabled:
             wp.launch(
                 update_body_qd_from_featherstone,
@@ -7775,7 +7719,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[state_out.body_qd],
                 device=model.device,
             )
-        return global_inertia_ready, stage3_qd
+        return stage3_qd
 
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float
@@ -7934,7 +7878,6 @@ class SolverFeatherPGS(SolverBase):
     def _stage1_crba(
         self,
         state_aug: State,
-        global_inertia_ready: wp.Event | None,
         drive_rows_ready: wp.Event | None,
     ):
         model = self.model
@@ -7978,25 +7921,19 @@ class SolverFeatherPGS(SolverBase):
                 refresh_body_inertia, dim=model.joint_count, inputs=[dynamics], block_dim=128, device=model.device
             )
 
-        if global_inertia_ready is not None:
-            wp.get_stream(model.device).wait_event(global_inertia_ready)
-
         # The immutable drive layout gives CRBA direct DOF-to-row ownership.
         # Make the dynamic coefficients visible before any fused mass write.
         if drive_rows_ready is not None and self._parallel_augmented_drive_topology:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
 
-        # Global refreshes were accumulated by the warp-parallel launch next
-        # to inverse dynamics, while the link inertias were still hot. Keep the
-        # masked scalar path for device-selected limit changes on reuse steps.
-        if not (self._parallel_composite_inertia and global_flag):
-            wp.launch(
-                composite_inertia,
-                dim=model.articulation_count,
-                inputs=[dynamics],
-                device=model.device,
-                block_dim=SERIAL_BLOCK_DIM,
-            )
+        # The composite inertia of the articulations the mass mask selects.
+        wp.launch(
+            composite_inertia,
+            dim=model.articulation_count,
+            inputs=[dynamics],
+            device=model.device,
+            block_dim=SERIAL_BLOCK_DIM,
+        )
 
         # Zeroing H is hygiene, not a correctness requirement: H is only read
         # by the Cholesky kernels, which early-exit when mass_update_mask is 0,
