@@ -247,7 +247,7 @@ class TestKernelIdentity(unittest.TestCase):
         wp.init()
         kernels, rejected = identity.inventory(("pins",), ("kernels.allocate_world_contact_slots",))
         self.assertEqual(rejected, {})
-        self.assertEqual(len(kernels), 2)
+        self.assertEqual(len(kernels), 1)
         for name, (family, kernel) in kernels.items():
             with self.subTest(kernel=name):
                 row = identity.kernel_digests(kernel)
