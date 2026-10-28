@@ -60,7 +60,7 @@ from .prefix_rows import LAW, limits, prefix_rows
 from .row_build import _contact_in_sizes, populate_contact_J
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
-from .step_plan import AdmissionFacts, first_failed
+from .step_plan import first_failed
 
 WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
@@ -784,22 +784,19 @@ def decline(solver) -> str | None:
     """Why the local packet law does not admit the solver, or ``None`` when it may (its topology decides next).
 
     The owner writes the solver's friction law: point rows, or persistent patch rows when friction
-    anchors are on. The solver admits neither contact torsion nor compliance here.
+    anchors are on. The solver admits neither contact torsion nor compliance here; the local owners' admission
+    carries CUDA, the matrix-free plain sweep and no velocity limits.
     """
-    facts = solver._facts
     return first_failed(
         (
             (solver._local_internal_fast_path, "Local packets serve the local owners' worlds; none is built."),
             (solver._hinv_jt_writes_world, "Local packets need the response written in world layout."),
-            (facts.forward_cuda, "Local packets need CUDA without gradient recording."),
             (
                 solver.dense_max_constraints >= solver._local_residual_max_rows,
                 "dense_max_constraints is below the local residual owner's rows.",
             ),
-            (facts.matrix_free and facts.plain_sweep, f"Local packets need matrix-free {AdmissionFacts.PLAIN_SWEEP}."),
-            (not facts.velocity_limits, "Local packets write no joint velocity-limit rows."),
             (solver.enable_joint_limits, "Local packets build the joint-limit prefix: enable_joint_limits is off."),
-            (not facts.regularized, "Local packets solve the unregularized law."),
+            (not solver._facts.regularized, "Local packets solve the unregularized law."),
             (
                 not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
                 "The diagonal-mass contact owner and its fused limits own these worlds.",

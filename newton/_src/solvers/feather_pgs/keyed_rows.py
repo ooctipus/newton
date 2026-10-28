@@ -475,27 +475,22 @@ class KeyedRows:
 
 
 def create_owner(solver):
-    """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
+    """Admit one bounded complete numerical law where the in-kernel parallel tiers (``_ink_sizes``) take the rows."""
     facts = solver._facts
     supported = (
-        facts.forward_cuda
-        and facts.matrix_free
+        solver._ink_sizes is not None
+        and facts.forward_cuda
         and facts.plain_sweep
-        and not facts.regularized
         and solver.enable_joint_limits
-        and 0 < solver.mf_gs_parallel_rows <= 128
+        and solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
         and solver.pgs_iterations > 0
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
-        and not solver.fuse_joint_velocity_limits
-        and not solver._paired_factor_coordinates
         and not solver._has_loop_joints
         and not solver._fused_diagonal_joint_limits
-        and not solver._sparse_diagonal_contact_solve
         and not solver._mimic_count
         and not solver._connect_count
-        and solver._ink_sizes is not None
     )
     if not supported:
         return None
