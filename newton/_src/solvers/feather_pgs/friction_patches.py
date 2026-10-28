@@ -211,7 +211,7 @@ def _local_point(q: wp.array[wp.transform], body: int, point: wp.vec3):
 
 
 @wp.func
-def _prepare_contact(
+def _prepare_contact_fields(
     c: int,
     live: int,
     shape0: wp.array[int],
@@ -237,8 +237,11 @@ def _prepare_contact(
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
-    frame.indices[c] = c
-    frame.keys[c] = wp.int64(0x7FFFFFFFFFFFFFFF)
+    """Prepare contact ``c``'s frame record, all but slot ``c``'s pair key and index; return the pair key.
+
+    Past ``live`` the record is empty and the key the empty key. A build stores the key and the index in
+    slot ``c``; a build that reuses sorted pairs can leave the slots' keys and indices untouched.
+    """
     frame.owner[c] = -1
     frame.valid[c] = 0
     frame.used[c] = 0
@@ -249,7 +252,7 @@ def _prepare_contact(
     patches.next_contact[c] = -1
     patches.phi[c] = wp.vec2(0.0)
     if c >= live:
-        return
+        return wp.int64(0x7FFFFFFFFFFFFFFF)
     sa = shape0[c]
     sb = shape1[c]
     a, b = contact_bodies(sa, sb, shape_body)
@@ -301,149 +304,30 @@ def _prepare_contact(
         sa = sb
         sb = t
         n = -n
+    frame.body_a[c] = a
+    frame.body_b[c] = b
+    frame.shape_a[c] = sa
+    frame.shape_b[c] = sb
+    frame.flipped[c] = flip
+    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
+    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
+    frame.center[c] = 0.5 * (pa + pb)
+    frame.normal[c] = n
+    mu_a = float(0.0)
+    mu_b = float(0.0)
+    if sa >= 0:
+        mu_a = shape_mu[sa]
+    if sb >= 0:
+        mu_b = shape_mu[sb]
+    frame.mu[c] = wp.vec2(mu_a, mu_b)
+    r = float(1.0e10)
+    if a >= 0:
+        r = wp.min(r, body_radius[a])
+    if b >= 0:
+        r = wp.min(r, body_radius[b])
+    frame.radius[c] = wp.max(r, 1.0e-4)
     # ka and kb are below key_stride, so the key orders pairs as (ka, kb) does
     # and occupies only the low bits that build() sorts.
-    frame.keys[c] = wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
-    frame.body_a[c] = a
-    frame.body_b[c] = b
-    frame.shape_a[c] = sa
-    frame.shape_b[c] = sb
-    frame.flipped[c] = flip
-    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
-    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
-    frame.center[c] = 0.5 * (pa + pb)
-    frame.normal[c] = n
-    mu_a = float(0.0)
-    mu_b = float(0.0)
-    if sa >= 0:
-        mu_a = shape_mu[sa]
-    if sb >= 0:
-        mu_b = shape_mu[sb]
-    frame.mu[c] = wp.vec2(mu_a, mu_b)
-    r = float(1.0e10)
-    if a >= 0:
-        r = wp.min(r, body_radius[a])
-    if b >= 0:
-        r = wp.min(r, body_radius[b])
-    frame.radius[c] = wp.max(r, 1.0e-4)
-
-
-@wp.func
-def _prepare_contact_fields(
-    c: int,
-    live: int,
-    shape0: wp.array[int],
-    shape1: wp.array[int],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-    shape_body: wp.array[int],
-    shape_mu: wp.array[float],
-    shape_gap: wp.array[float],
-    body_radius: wp.array[float],
-    q: wp.array[wp.transform],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
-    contact_gap_gate: float,
-    same_articulation_gap_gate: float,
-    articulation_pair_gap_gate: float,
-    friction_gap: float,
-    friction_articulation_pairs_only: int,
-    key_stride: int,
-    frame: _PatchFrame,
-    patches: FrictionPatches,
-):
-    """Prepare contact ``c`` as :func:`_prepare_contact` does, except slot ``c``'s pair key and index.
-
-    Returns the pair key :func:`_prepare_contact` stores in slot ``c``, the
-    empty key past ``live``, so a build that reuses sorted pairs can leave the
-    slots' keys and indices untouched. Keep the arithmetic in step with
-    :func:`_prepare_contact`; the frame-reuse tests compare the two bitwise.
-    """
-    frame.owner[c] = -1
-    frame.valid[c] = 0
-    frame.used[c] = 0
-    frame.source[c] = -1
-    frame.eligible[c] = 0
-    frame.tangent_impulse[c] = wp.vec3(0.0)
-    patches.weight[c] = 0.0
-    patches.next_contact[c] = -1
-    patches.phi[c] = wp.vec2(0.0)
-    if c >= live:
-        return wp.int64(0x7FFFFFFFFFFFFFFF)
-    sa = shape0[c]
-    sb = shape1[c]
-    a, b = contact_bodies(sa, sb, shape_body)
-    ka = a + 1
-    kb = b + 1
-    if a < 0:
-        ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
-    if b < 0:
-        kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
-    n, pa, pb, gap = contact_points(normal[c], point0[c], point1[c], margin0[c], margin1[c], a, b, q)
-    art_a = int(-1)
-    art_b = int(-1)
-    if a >= 0 and a < body_to_articulation.shape[0]:
-        art_a = body_to_articulation[a]
-    if b >= 0 and b < body_to_articulation.shape[0]:
-        art_b = body_to_articulation[b]
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-    support_gap_limit = float(0.0)
-    if sa >= 0:
-        support_gap_limit += shape_gap[sa]
-    if sb >= 0:
-        support_gap_limit += shape_gap[sb]
-    normal_gap_limit = contact_normal_gap_limit(
-        a_non_free,
-        b_non_free,
-        art_a == art_b,
-        contact_gap_gate,
-        articulation_pair_gap_gate,
-        same_articulation_gap_gate,
-    )
-    support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
-    eligible = gap <= normal_gap_limit and contact_friction_eligible(
-        gap, a_non_free, b_non_free, friction_articulation_pairs_only, friction_gap
-    )
-    frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
-    frame.eligible[c] = int(eligible)
-    flip = int(ka > kb)
-    if flip != 0:
-        t = a
-        a = b
-        b = t
-        t = ka
-        ka = kb
-        kb = t
-        t = sa
-        sa = sb
-        sb = t
-        n = -n
-    frame.body_a[c] = a
-    frame.body_b[c] = b
-    frame.shape_a[c] = sa
-    frame.shape_b[c] = sb
-    frame.flipped[c] = flip
-    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
-    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
-    frame.center[c] = 0.5 * (pa + pb)
-    frame.normal[c] = n
-    mu_a = float(0.0)
-    mu_b = float(0.0)
-    if sa >= 0:
-        mu_a = shape_mu[sa]
-    if sb >= 0:
-        mu_b = shape_mu[sb]
-    frame.mu[c] = wp.vec2(mu_a, mu_b)
-    r = float(1.0e10)
-    if a >= 0:
-        r = wp.min(r, body_radius[a])
-    if b >= 0:
-        r = wp.min(r, body_radius[b])
-    frame.radius[c] = wp.max(r, 1.0e-4)
     return wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
 
 
@@ -507,7 +391,8 @@ def _prepare(
     if thread == 0:
         _publish_extent(extent, end, live)
     for c in range(thread, end, threads):
-        _prepare_contact(
+        frame.indices[c] = c
+        frame.keys[c] = _prepare_contact_fields(
             c,
             live,
             shape0,
