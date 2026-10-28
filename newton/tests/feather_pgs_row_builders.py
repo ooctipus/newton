@@ -42,15 +42,9 @@ ROW_BUILDER_KERNELS = frozenset(
 _GENERATED_PREFIXES = ("factor_contact_rows_", "mark_independent_sparse_contact_candidates")
 _GENERATED_SUFFIXES = ("keyed_rows_fallback", "keyed_rows_patch_fallback")
 # Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
-# the sizes that name it in one launch per step (the row metadata, a producer's contact kernels, a combined
-# masked launch), except the masked builder's per-size method, "masked".
-PER_SIZE_KERNELS = frozenset(
-    (
-        "populate_world_J_for_size",
-        "populate_world_J_for_compact_size",
-        "materialize_fallback",
-    )
-)
+# the sizes that name it in one launch per step (the row metadata, a producer's contact kernels and fallback, a
+# combined masked launch), except the masked builder's per-size method, "masked".
+PER_SIZE_KERNELS = frozenset(("populate_world_J_for_size", "populate_world_J_for_compact_size"))
 
 
 def is_row_builder(key) -> bool:

@@ -479,16 +479,23 @@ class _PatchRowTwins:
             for owners in ((0, 2, 0), (0, 0, 0)):
                 with self.subTest(shared=shared, friction_shared=friction_shared, owners=owners):
                     owner = wp.array(owners, dtype=int, device=layout.device)
+                    J, expected = {}, {}
                     for size in (PRIMARY, SECONDARY):
                         # materialize_general_prefix has cleared the general worlds' rows; a local world's are stale.
                         values = np.zeros((WORLDS, ROWS, size), dtype=np.float32)
-                        expected = jacobians[size].numpy().copy()
+                        expected[size] = jacobians[size].numpy().copy()
                         for w in np.flatnonzero(owners):
                             group = groups[2 * w + int(size == SECONDARY)]
-                            values[group] = expected[group] = np.nan
-                        J = wp.array(values, dtype=float, device=layout.device)
-                        _launch(rp.materialize_fallback, data, layout, law, owner, size, layout.groups, J)
-                        self.assert_same(J.numpy(), expected, err_msg=f"size {size}")
+                            values[group] = expected[size][group] = np.nan
+                        J[size] = wp.array(values, dtype=float, device=layout.device)
+                    wp.launch(
+                        rp.materialize_fallback,
+                        dim=128,
+                        inputs=[128, data, law, owner, PRIMARY, SECONDARY, layout.groups, J[PRIMARY], J[SECONDARY]],
+                        device=layout.device,
+                    )
+                    for size in (PRIMARY, SECONDARY):
+                        self.assert_same(J[size].numpy(), expected[size], err_msg=f"size {size}")
 
     def test_patch_tangent_rows_replace_the_point_law(self):
         """Keep the point law's normal rows and move only the tangent rows to the patch law.
@@ -575,14 +582,16 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                     ):
                         owner.produce_contacts(contact_input)
                         owner.finish_rows()
-                    self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
-                    producer, fallback = rp.produce_contacts, rp.materialize_fallback
+                    fallback = rp.materialize_fallback
+                    self.assertEqual(
+                        [call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue, fallback]
+                    )
                     self.assertEqual(
                         [call.args[0] for call in tiled.call_args_list],
-                        [producer, rp.materialize_general_prefix, fallback, rp.materialize_general_prefix, fallback],
+                        [rp.produce_contacts, rp.materialize_general_prefix, rp.materialize_general_prefix],
                     )
                     laws = []
-                    for call in (tiled.call_args_list[0], *tiled.call_args_list[2::2]):
+                    for call in (tiled.call_args_list[0], launch.call_args_list[1]):
                         inputs = call.kwargs["inputs"]
                         self.assertIs(inputs[1], contact_input)
                         # The row law follows the contact input.

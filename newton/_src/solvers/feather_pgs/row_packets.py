@@ -29,7 +29,7 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import field_group, sweep_routes_local
-from .contact_input import ContactInput, contact_frame
+from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
     contact_friction_points,
@@ -57,6 +57,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from .prefix_rows import LAW, limits, prefix_rows
+from .row_build import _contact_in_sizes, populate_contact_J
 from .row_inputs import CompactLocalRows, RowArgument
 from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
 from .step_plan import AdmissionFacts, first_failed
@@ -503,48 +504,26 @@ def produce_contacts(
 
 @wp.kernel(enable_backward=False)
 def materialize_fallback(
-    workers: int,
+    threads: int,
     data: ContactInput,
     law: PatchRowLaw,
     owner: wp.array[int],
-    target_size: int,
+    size_a: int,
+    size_b: int,
     groups: wp.array[int],
-    J: wp.array3d[float],
+    J_a: wp.array3d[float],
+    J_b: wp.array3d[float],
 ):
-    """Reproject every general-world endpoint, including rows outside the local bound, at the row law's
-    friction location."""
-    worker, _logical_lane = wp.tid()
-    lane = warp_lane()
-    stride = warp_stride()
-    total = data.count[0]
-    for contact in range(worker, total, workers):
-        if data.path[contact] != 0 or data.slot[contact] < 0:
+    """Write the general worlds' contact Jacobian with the masked builder's lanes (:mod:`.row_build`): one thread per
+    (contact, coordinate) of the larger size, every row at the row law's friction location."""
+    tid = wp.tid()
+    lanes = wp.max(size_a, size_b)
+    for c in range(tid // lanes, data.count[0], threads // lanes):
+        if data.path[c] != 0 or data.slot[c] < 0 or owner[data.world[c]] != 0:
             continue
-        world = data.world[contact]
-        if owner[world] != 0:
-            continue
-        body0, body1, normal, point0, point1, _separation, tangent0, tangent1, friction0, friction1 = contact_frame(
-            data, law, contact
-        )
-        art0, art1 = data.art0[contact], data.art1[contact]
-        group0, group1 = int(-1), int(-1)
-        if art0 >= 0 and data.response_dofs[art0] == target_size:
-            group0 = groups[art0]
-        if art1 >= 0 and data.response_dofs[art1] == target_size:
-            group1 = groups[art1]
-        for coefficient in range(lane, data.slots_needed[contact] * target_size, stride):
-            row = coefficient // target_size
-            dof = coefficient % target_size
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-            )
-            value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)
-            value1 = -endpoint_projection(data, body1, art1, target_size, dof, p1, direction)
-            output_row = data.slot[contact] + row
-            if group0 >= 0:
-                J[group0, output_row, dof] = value0 + value1 if group0 == group1 else value0
-            if group1 >= 0 and group1 != group0:
-                J[group1, output_row, dof] = value1
+        a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
+        flags = 1 | wp.where(data.slots_needed[c] == 3, 2, 0) | wp.where(a_in, 4, 0) | wp.where(b_in, 8, 0)
+        populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, J_a, J_b)
 
 
 def topology_signature(solver):
@@ -751,22 +730,15 @@ class LocalRowPackets:
                 block_dim=32,
                 device=solver.model.device,
             )
-            if self.contact_input is not None:
-                wp.launch_tiled(
-                    materialize_fallback,
-                    dim=[self.workers],
-                    inputs=[
-                        self.workers,
-                        self.contact_input,
-                        self.law,
-                        queue.owner,
-                        size,
-                        solver.art_group_idx,
-                        solver.J_by_size[size],
-                    ],
-                    block_dim=32,
-                    device=solver.model.device,
-                )
+        if self.contact_input is not None:
+            size_b = self.secondary or self.primary
+            wp.launch(
+                materialize_fallback,
+                dim=self.workers * 32,
+                inputs=[self.workers * 32, self.contact_input, self.law, queue.owner, self.primary, size_b],
+                outputs=[solver.art_group_idx, solver.J_by_size[self.primary], solver.J_by_size[size_b]],
+                device=solver.model.device,
+            )
 
     def response(self, size):
         """Run the held-L response on the compact general-world queue."""

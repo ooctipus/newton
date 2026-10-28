@@ -138,22 +138,22 @@ def populate_world_J_masked(
     lane = tid % lanes
     total_contacts = data.count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
-        _populate_world_J_masked_one(c, lane, data, size_a, art_group_idx, law, pre_flags, J_group_a, J_group_b)
+        populate_contact_J(c, lane, data, size_a, art_group_idx, law, pre_flags[c], J_group_a, J_group_b)
 
 
 @wp.func
-def _populate_world_J_masked_one(
+def populate_contact_J(
     c: int,
     lane: int,
     data: ContactInput,
     size_a: int,
     art_group_idx: wp.array[int],
     law: PatchRowLaw,
-    pre_flags: wp.array[int],
+    flags: int,
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
 ):
-    flags = pre_flags[c]
+    """Write coordinate ``lane`` of contact ``c``'s rows when its flags mark it active (:func:`contact_row_prelude`)."""
     if (flags & 1) == 0:
         return
     body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
