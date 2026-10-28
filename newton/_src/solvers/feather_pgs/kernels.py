@@ -2521,12 +2521,11 @@ def clear_sparse_diagonal_response_prefix(
         sparse_row_dof[world, row, 1] = -1
 
 
-@wp.kernel
-def apply_sparse_diagonal_contact_restitution_matrix_free(
-    rows: DenseRows,
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    world_incident_velocity: wp.array[float],
+@wp.func
+def sparse_diagonal_row_dot(
+    world: int,
+    row: int,
+    velocity: wp.array[float],
     world_dof_indices: wp.array2d[int],
     dense_offsets: wp.array[int],
     dense_groups: wp.array[int],
@@ -2534,42 +2533,24 @@ def apply_sparse_diagonal_contact_restitution_matrix_free(
     dense_J: wp.array3d[float],
     sparse_row_dof: wp.array3d[int],
     sparse_row_jy: wp.array3d[float],
-    dt: float,
-    restitution_velocity_threshold: float,
 ):
-    """Apply restitution from a compact dense component plus two sparse response coordinates."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    row = tid - world * max_constraints
-    if row >= world_constraint_count[world] or rows.row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-
-    restitution = rows.restitution[world, row]
-    if restitution <= 0.0:
-        return
-
-    relative_incident = float(0.0)
+    """Dot one sparse-diagonal row (its compact dense component and two sparse response coordinates) with a global
+    velocity state."""
+    out = float(0.0)
     dense_offset = dense_offsets[world]
     dense_group = dense_groups[world]
     for local_dof in range(dense_dofs):
         world_dof = dense_offset + local_dof
         global_dof = world_dof_indices[world, world_dof]
         if global_dof >= 0:
-            relative_incident += dense_J[dense_group, row, local_dof] * world_incident_velocity[global_dof]
+            out += dense_J[dense_group, row, local_dof] * velocity[global_dof]
     for sparse_slot in range(2):
         world_dof = sparse_row_dof[world, row, sparse_slot]
         if world_dof >= 0:
             global_dof = world_dof_indices[world, world_dof]
             if global_dof >= 0:
-                relative_incident += sparse_row_jy[world, row, sparse_slot * 2] * world_incident_velocity[global_dof]
-
-    target_vel = rows.target[world, row]
-    relative_incident -= target_vel
-    fires, bounce = contact_restitution_rhs(
-        rows.phi[world, row], relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
-    )
-    if fires:
-        rows.rhs[world, row] = bounce
+                out += sparse_row_jy[world, row, sparse_slot * 2] * velocity[global_dof]
+    return out
 
 
 @wp.func
@@ -2817,12 +2798,21 @@ def compute_world_contact_bias(
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
     contact_w: float,
+    velocity_pass: int,
+    world_dof_count: wp.array[int],
+    world_dof_indices: wp.array2d[int],
+    world_J: wp.array3d[float],
+    world_position_velocity: wp.array[float],
+    world_incident_velocity: wp.array[float],
+    restitution_velocity_threshold: float,
 ):
-    """Compute the RHS bias term for world-level PGS solve: each row's position law (:func:`.row_laws.row_rhs`).
+    """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
 
-    The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's
-    Baumgarte term ``bias_scale * beta * phi / dt`` is negative and leads to positive
-    impulses when resolved by PGS. ``J*v`` is added later.
+    The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
+    ``bias_scale * beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS. In the
+    ``velocity_pass`` (the velocity iterations, bias scales 0) a closing contact rebounds by restitution
+    (:func:`.row_laws.contact_restitution_rhs`, its incident velocity from its world-layout row), and a separated one
+    keeps its speculative bias while the position solution's end gap stays open.
 
     One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
@@ -2830,25 +2820,49 @@ def compute_world_contact_bias(
     tid = wp.tid()
     world = tid // max_constraints
     i = tid - world * max_constraints
-    m = world_constraint_count[world]
-
+    if i >= world_constraint_count[world]:
+        return
     inv_dt = 1.0 / dt
-
-    if i < m:
-        rhs, row_w = row_rhs(
-            rows.row_type[world, i],
-            rows.phi[world, i],
-            rows.row_beta[world, i],
-            rows.target[world, i],
-            inv_dt,
-            bias_scale,
-            contact_speculative_scale,
-            joint_limit_speculative_scale,
-            contact_w,
-        )
+    kind = rows.row_type[world, i]
+    phi = rows.phi[world, i]
+    target = rows.target[world, i]
+    if velocity_pass != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        fires = bool(False)
+        bounce = float(0.0)
+        restitution = rows.restitution[world, i]
+        if restitution > 0.0:
+            relative_incident = (
+                world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
+                - target
+            )
+            fires, bounce = contact_restitution_rhs(
+                phi, relative_incident, target, restitution, dt, restitution_velocity_threshold
+            )
+        rhs = bounce
+        if not fires:
+            end_gap = float(0.0)
+            if phi > 0.0:
+                jv_position = world_contact_row_dot(
+                    world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
+                )
+                end_gap = phi + dt * (jv_position - target)
+            rhs, _row_w = contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
         rows.rhs[world, i] = rhs
-        if contact_w < 1.0:
-            rows.row_w[world, i] = row_w
+        return
+    rhs, row_w = row_rhs(
+        kind,
+        phi,
+        rows.row_beta[world, i],
+        target,
+        inv_dt,
+        bias_scale,
+        contact_speculative_scale,
+        joint_limit_speculative_scale,
+        contact_w,
+    )
+    rows.rhs[world, i] = rhs
+    if contact_w < 1.0:
+        rows.row_w[world, i] = row_w
 
 
 @wp.kernel
@@ -2860,37 +2874,56 @@ def apply_world_contact_restitution_matrix_free(
     world_incident_velocity: wp.array[float],
     world_dof_indices: wp.array2d[int],
     world_J: wp.array3d[float],
+    sparse_diagonal: int,
+    dense_offsets: wp.array[int],
+    dense_groups: wp.array[int],
+    dense_dofs: int,
+    dense_J: wp.array3d[float],
+    sparse_row_dof: wp.array3d[int],
+    sparse_row_jy: wp.array3d[float],
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
 ):
-    """Replace a matrix-free contact bias with a one-shot restitution target."""
+    """Replace a matrix-free contact bias with a one-shot restitution target.
+
+    The row's incident velocity is its world-layout Jacobian row's (:func:`world_contact_row_dot`), or under the
+    ``sparse_diagonal`` owner its compact dense component's plus its two sparse slots'
+    (:func:`sparse_diagonal_row_dot`). Matrix-free GS adds live J*v itself, so the row stores only
+    ``-target + e*u_incident``.
+    """
     tid = wp.tid()
     world = tid // max_constraints
     i = tid - world * max_constraints
-    m = world_constraint_count[world]
-    if i >= m:
+    if i >= world_constraint_count[world] or rows.row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
         return
-    if rows.row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-
     restitution = rows.restitution[world, i]
     if restitution <= 0.0:
         return
-
-    phi = rows.phi[world, i]
+    relative_incident = float(0.0)
+    if sparse_diagonal != 0:
+        relative_incident = sparse_diagonal_row_dot(
+            world,
+            i,
+            world_incident_velocity,
+            world_dof_indices,
+            dense_offsets,
+            dense_groups,
+            dense_dofs,
+            dense_J,
+            sparse_row_dof,
+            sparse_row_jy,
+        )
+    else:
+        relative_incident = world_contact_row_dot(
+            world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i
+        )
     target_vel = rows.target[world, i]
-    relative_incident = (
-        world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
-        - target_vel
-    )
-
+    relative_incident -= target_vel
     fires, bounce = contact_restitution_rhs(
-        phi, relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
+        rows.phi[world, i], relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
     )
     if fires:
-        # Matrix-free GS adds live J*v itself, so store only
-        # -target + e*u_incident as the row bias.
         rows.rhs[world, i] = bounce
         if write_row_w != 0:
             rows.row_w[world, i] = 1.0
@@ -2931,67 +2964,6 @@ def apply_world_contact_restitution_accumulated(
         rows.rhs[world, i] = (1.0 + restitution) * relative_incident
         if write_row_w != 0:
             rows.row_w[world, i] = 1.0
-
-
-@wp.kernel
-def compute_world_contact_velocity_bias(
-    rows: DenseRows,
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    world_dof_count: wp.array[int],
-    world_position_velocity: wp.array[float],
-    world_incident_velocity: wp.array[float],
-    world_dof_indices: wp.array2d[int],
-    world_J: wp.array3d[float],
-    dt: float,
-    apply_restitution: int,
-    restitution_velocity_threshold: float,
-):
-    """Build the velocity-pass RHS from the position solution's end gap."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
-        return
-    inv_dt = 1.0 / dt
-
-    phi = rows.phi[world, i]
-    row_type = rows.row_type[world, i]
-    target_vel = rows.target[world, i]
-    rhs = -target_vel
-
-    # The velocity pass keeps no Baumgarte term: a closing contact rebounds by restitution, a separated one keeps
-    # its speculative bias while the position solution's end gap stays open, a limit allows motion up to its bound.
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        fires = bool(False)
-        bounce = float(0.0)
-        restitution = float(0.0)
-        if apply_restitution != 0:
-            restitution = rows.restitution[world, i]
-        if restitution > 0.0:
-            relative_incident = (
-                world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
-                - target_vel
-            )
-            fires, bounce = contact_restitution_rhs(
-                phi, relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
-            )
-        if fires:
-            rhs = bounce
-        else:
-            end_gap = float(0.0)
-            if phi > 0.0:
-                jv_position = world_contact_row_dot(
-                    world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
-                )
-                end_gap = phi + dt * (jv_position - target_vel)
-            rhs, _row_w = contact_rhs(phi, 0.0, target_vel, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
-    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
-        rhs = limit_rhs(phi, 0.0, target_vel, inv_dt, 0.0, 1.0)
-    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-        rhs = 0.0
-
-    rows.rhs[world, i] = rhs
 
 
 @wp.kernel
@@ -3711,19 +3683,10 @@ def spatial_matrix_block_inverse(M: wp.spatial_matrix):
 
 @wp.kernel
 def compute_mf_rhs_bias(
+    rows: MfRows,
     mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_dof_a: wp.array2d[int],
-    mf_dof_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    world_dof_indices: wp.array2d[int],
-    mf_phi: wp.array2d[float],
-    mf_row_type: wp.array2d[int],
-    mf_target_velocity: wp.array2d[float],
-    mf_row_restitution: wp.array2d[float],
     has_target_velocity: int,
+    world_dof_indices: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
     dt: float,
@@ -3735,10 +3698,8 @@ def compute_mf_rhs_bias(
     apply_restitution: int,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
-    # outputs
-    mf_rhs: wp.array2d[float],
 ):
-    """Compute only the MF contact RHS bias for a previously-built contact set."""
+    """Compute only the MF contact RHS bias (``rows.rhs``) for a previously-built contact set."""
     tid = wp.tid()
     world = tid // mf_max_constraints
     i = tid % mf_max_constraints
@@ -3747,24 +3708,24 @@ def compute_mf_rhs_bias(
 
     target = float(0.0)
     if has_target_velocity != 0:
-        target = mf_target_velocity[world, i]
+        target = rows.target[world, i]
     inv_dt = 1.0 / dt
     rhs = -target
-    row_type = mf_row_type[world, i]
+    row_type = rows.row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi_val = mf_phi[world, i]
+        phi_val = rows.phi[world, i]
         fires = bool(False)
         bounce = float(0.0)
         restitution = float(0.0)
         if apply_restitution != 0:
-            restitution = mf_row_restitution[world, i]
+            restitution = rows.restitution[world, i]
         if restitution > 0.0:
             relative_incident = (
                 mf_contact_row_dot(
-                    mf_J_a,
-                    mf_J_b,
-                    mf_dof_a[world, i],
-                    mf_dof_b[world, i],
+                    rows.J_a,
+                    rows.J_b,
+                    rows.dof_a[world, i],
+                    rows.dof_b[world, i],
                     world_dof_indices,
                     incident_velocity,
                     world,
@@ -3783,10 +3744,10 @@ def compute_mf_rhs_bias(
             end_gap = float(0.0)
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
                 jv_position = mf_contact_row_dot(
-                    mf_J_a,
-                    mf_J_b,
-                    mf_dof_a[world, i],
-                    mf_dof_b[world, i],
+                    rows.J_a,
+                    rows.J_b,
+                    rows.dof_a[world, i],
+                    rows.dof_b[world, i],
                     world_dof_indices,
                     position_velocity,
                     world,
@@ -3794,17 +3755,17 @@ def compute_mf_rhs_bias(
                 )
                 end_gap = phi_val + dt * (jv_position - target)
             cap = contact_depenetration_cap(
-                mf_body_a[world, i], mf_body_b[world, i], rigid_body_max_depenetration_velocity
+                rows.body_a[world, i], rows.body_b[world, i], rigid_body_max_depenetration_velocity
             )
             rhs, _row_w = contact_rhs(
                 phi_val, pgs_beta, target, inv_dt, bias_scale, speculative_scale, 1.0, cap, end_gap
             )
     elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
         # The row builder pre-multiplies the anchor gain into phi.
-        rhs, _w = row_rhs(row_type, mf_phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
+        rhs, _w = row_rhs(row_type, rows.phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        rhs = mf_phi[world, i] - target
-    mf_rhs[world, i] = rhs
+        rhs = rows.phi[world, i] - target
+    rows.rhs[world, i] = rhs
 
 
 @wp.kernel

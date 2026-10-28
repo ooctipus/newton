@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     compute_world_contact_bias,
 )
+from newton.tests.feather_pgs_law_harness import position_pass
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
@@ -396,7 +397,17 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
         wp.launch(
             compute_world_contact_bias,
             dim=1,
-            inputs=[rows, wp.array([1], dtype=wp.int32, device=device), 1, DT, 1.0, 1.0, 1.0, 0.5],
+            inputs=[
+                rows,
+                wp.array([1], dtype=wp.int32, device=device),
+                1,
+                DT,
+                1.0,
+                1.0,
+                1.0,
+                0.5,
+                *position_pass(device),
+            ],
             device=device,
         )
         test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)

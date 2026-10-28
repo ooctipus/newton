@@ -366,10 +366,13 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             rhs=rhs,
             row_w=zeros3(),
         )
+        # The position pass: no velocity-pass operands are read.
+        none = wp.zeros((1, 1), dtype=wp.int32, device=device)
+        velocity = wp.zeros((1,), dtype=wp.float32, device=device)
         wp.launch(
             compute_world_contact_bias,
             dim=3,
-            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0],
+            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0, 0, count, none, zJ(), velocity, velocity, 0.5],
             device=device,
         )
     elif family == "mf_setup":
@@ -409,36 +412,42 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             device=device,
         )
     elif family == "mf_velocity":
+        mf_rows = field_group.upload(
+            MfRows,
+            device,
+            body_a=neg1,
+            body_b=neg1,
+            dof_a=neg1,
+            dof_b=neg1,
+            J_a=zJ(),
+            J_b=zJ(),
+            phi=phi_arr,
+            row_type=row_type,
+            target=zeros3(),
+            restitution=zeros3(),
+            rhs=rhs,
+        )
+        velocity = wp.zeros((1,), dtype=wp.float32, device=device)
         wp.launch(
             compute_mf_rhs_bias,
             dim=3,
             inputs=[
+                mf_rows,
                 count,
-                neg1,
-                neg1,
-                neg1,
-                neg1,
-                zJ(),
-                zJ(),
-                wp.zeros((1, 1), dtype=wp.int32, device=device),
-                phi_arr,
-                row_type,
-                zeros3(),
-                zeros3(),
                 0,
+                wp.zeros((1, 1), dtype=wp.int32, device=device),
                 inf,
                 pgs_beta,
                 dt,
                 bias_scale,
                 1.0,
-                wp.zeros((1,), dtype=wp.float32, device=device),
-                wp.zeros((1,), dtype=wp.float32, device=device),
+                velocity,
+                velocity,
                 0,
                 0,
                 0.5,
                 3,
             ],
-            outputs=[rhs],
             device=device,
         )
     else:

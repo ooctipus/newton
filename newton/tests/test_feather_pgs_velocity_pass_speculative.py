@@ -22,6 +22,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import MfRows
 from newton._src.solvers.feather_pgs.kernels import compute_mf_rhs_bias
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
@@ -213,23 +215,29 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     def classify(normal_velocity, target=0.0, has_target=0):
         position_velocity.assign(np.array([normal_velocity, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
         target_velocity.assign(np.array([[target]], dtype=np.float32))
+        rows = field_group.upload(
+            MfRows,
+            device,
+            body_a=body_a,
+            body_b=body_b,
+            dof_a=dof_a,
+            dof_b=dof_b,
+            J_a=J_a,
+            J_b=J_b,
+            phi=phi,
+            row_type=row_type,
+            target=target_velocity,
+            restitution=row_restitution,
+            rhs=rhs,
+        )
         wp.launch(
             compute_mf_rhs_bias,
             dim=1,
             inputs=[
+                rows,
                 count,
-                body_a,
-                body_b,
-                dof_a,
-                dof_b,
-                J_a,
-                J_b,
-                world_dofs,
-                phi,
-                row_type,
-                target_velocity,
-                row_restitution,
                 has_target,
+                world_dofs,
                 max_depenetration_velocity,
                 0.2,
                 0.5,
@@ -242,7 +250,6 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
                 0.5,
                 1,
             ],
-            outputs=[rhs],
             device=device,
         )
         return float(rhs.numpy()[0, 0])

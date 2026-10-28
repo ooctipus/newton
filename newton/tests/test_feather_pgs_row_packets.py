@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -223,7 +224,10 @@ def _run_general(data, layout, beta):
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
-        inputs=[records, layout.counts, ROWS, data.dt, data.bias_scale, data.speculative_scale, 1.0, data.contact_w],
+        inputs=[
+            *(records, layout.counts, ROWS, data.dt, data.bias_scale, data.speculative_scale, 1.0, data.contact_w),
+            *position_pass(device),
+        ],
         device=device,
     )
     bias = rows.rhs.numpy().copy()
@@ -235,6 +239,7 @@ def _run_general(data, layout, beta):
             data.incident,
             wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
             wp.array(world_jacobian, dtype=float, device=device),
+            *world_restitution_layout(device),
             *(data.dt, data.restitution_threshold, 0),
         ],
         device=device,

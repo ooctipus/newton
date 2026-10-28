@@ -601,6 +601,34 @@ def contact_input(values, device):
     return bind_struct(ContactInput, values, device)
 
 
+def position_pass(device) -> list:
+    """The trailing operands of ``kernels.compute_world_contact_bias``'s position pass: no velocity pass (0), whose
+    world layout, velocities and restitution threshold it then never reads."""
+    return [
+        0,
+        wp.zeros(1, dtype=wp.int32, device=device),
+        wp.zeros((1, 1), dtype=wp.int32, device=device),
+        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
+        wp.zeros(1, dtype=wp.float32, device=device),
+        wp.zeros(1, dtype=wp.float32, device=device),
+        0.0,
+    ]
+
+
+def world_restitution_layout(device) -> list:
+    """The sparse-diagonal operands of ``kernels.apply_world_contact_restitution_matrix_free`` after ``world_J``,
+    for a world-layout row (``sparse_diagonal`` 0): never read."""
+    return [
+        0,
+        wp.zeros(1, dtype=wp.int32, device=device),
+        wp.zeros(1, dtype=wp.int32, device=device),
+        0,
+        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
+        wp.full((1, 1, 2), -1, dtype=wp.int32, device=device),
+        wp.zeros((1, 1, 4), dtype=wp.float32, device=device),
+    ]
+
+
 def call(kernel, dim, device, **values):
     """Launch ``kernel`` with arguments by name; numpy inputs become arrays of the argument's dtype.
 

@@ -109,7 +109,6 @@ from .kernels import (
     apply_augmented_mass_diagonal_grouped,
     apply_free_root_transport_to_predictor,
     apply_free_root_velocity_corrections,
-    apply_sparse_diagonal_contact_restitution_matrix_free,
     apply_world_contact_restitution_accumulated,
     apply_world_contact_restitution_matrix_free,
     build_joint_limit_rows_for_size,
@@ -129,7 +128,6 @@ from .kernels import (
     compute_physx_pgs_drive_desc,
     compute_velocity_predictor,
     compute_world_contact_bias,
-    compute_world_contact_velocity_bias,
     eval_rigid_tau_and_augmented_drives,
     finalize_constraint_counts_with_status,
     gather_dense_warmstart,
@@ -2515,6 +2513,7 @@ class SolverFeatherPGS(SolverBase):
         # stand in at world width, and allocate_world_contact_slots writes none of them when has_free_rigid == 0.
         placeholder = self._arrays.placeholder
         self._dummy_contact_impulses = placeholder(wp.float32, (1, 1))
+        self._dummy_world_J = placeholder(wp.float32, (1, 1, 1))
         self._dummy_is_free_rigid = placeholder(wp.int32, (1,))
         self._dummy_mf_slot_counter = placeholder(wp.int32, (self.world_count,))
         self._dummy_mf_impulses = placeholder(wp.float32, (1, 1))
@@ -6458,7 +6457,6 @@ class SolverFeatherPGS(SolverBase):
             bias_scale=0.0,
             contact_speculative_scale=0.0,
             preserve_unreached_speculative=True,
-            apply_restitution=True,
             joint_limit_speculative_scale=1.0,
             output=self.rhs_unbiased,
         )
@@ -9964,59 +9962,46 @@ class SolverFeatherPGS(SolverBase):
         bias_scale: float = 1.0,
         contact_speculative_scale: float = 1.0,
         preserve_unreached_speculative: bool = False,
-        apply_restitution: bool = False,
         joint_limit_speculative_scale: float = 1.0,
         output=None,
     ):
+        """Each dense row's rhs bias (``compute_world_contact_bias``); ``preserve_unreached_speculative`` is the velocity
+        pass, which also applies restitution."""
         if self._sparse_prepare_contacts:
             return  # The admitted sparse path has a single position pass.
         if self._row_packets is not None or self._keyed_rows is not None:
             if (
                 output is not None
                 or preserve_unreached_speculative
-                or apply_restitution
                 or bias_scale != 1.0
                 or joint_limit_speculative_scale != 1.0
                 or contact_speculative_scale != self.contact_speculative_scale
             ):
                 raise RuntimeError("Private rows require the original single position pass")
             return
-        model = self.model
-        rows = bind_dense_rows(self) if output is None else bind_dense_rows(self, rhs=output)
-        if preserve_unreached_speculative:
-            wp.launch(
-                compute_world_contact_velocity_bias,
-                dim=self.world_count * self.dense_max_constraints,
-                inputs=[
-                    rows,
-                    self.constraint_count,
-                    self.dense_max_constraints,
-                    self.world_dof_count,
-                    self.v_out_snap,
-                    self.v_hat,
-                    self.world_dof_indices,
-                    self.J_world,
-                    dt,
-                    int(apply_restitution),
-                    self._effective_restitution_velocity_threshold,
-                ],
-                device=model.device,
-            )
-            return
+        velocity = bool(preserve_unreached_speculative)
         wp.launch(
             compute_world_contact_bias,
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
-                rows,
+                bind_dense_rows(self) if output is None else bind_dense_rows(self, rhs=output),
                 self.constraint_count,
                 self.dense_max_constraints,
                 dt,
                 bias_scale,
                 contact_speculative_scale,
                 joint_limit_speculative_scale,
-                self._contact_w,
+                1.0 if velocity else self._contact_w,
+                int(velocity),
+                # The velocity pass's world layout (matrix-free); the position pass reads none of it.
+                self.world_dof_count if velocity else self._dummy_is_free_rigid,
+                self.world_dof_indices if velocity else self._dummy_contact_row_type,
+                self.J_world if velocity else self._dummy_world_J,
+                self.v_out_snap if velocity else self.v_hat,
+                self.v_hat,
+                self._effective_restitution_velocity_threshold,
             ],
-            device=model.device,
+            device=self.model.device,
         )
 
     def _stage4_accumulate_rhs_world(self, size: int, velocity=None):
@@ -10049,28 +10034,8 @@ class SolverFeatherPGS(SolverBase):
         if self._row_packets is not None or self._keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
-            if self._sparse_diagonal_contact_solve:
-                wp.launch(
-                    apply_sparse_diagonal_contact_restitution_matrix_free,
-                    dim=self.world_count * self.dense_max_constraints,
-                    inputs=[
-                        bind_dense_rows(self),
-                        self.constraint_count,
-                        self.dense_max_constraints,
-                        self.v_hat,
-                        self.world_dof_indices,
-                        self._sparse_diagonal_dense_offsets,
-                        self._sparse_diagonal_dense_groups,
-                        self._sparse_diagonal_dense_size,
-                        self.J_by_size[self._sparse_diagonal_dense_size],
-                        self._sparse_diagonal_row_dof,
-                        self._sparse_diagonal_row_jy,
-                        dt,
-                        self._effective_restitution_velocity_threshold,
-                    ],
-                    device=self.model.device,
-                )
-                return
+            sparse = self._sparse_diagonal_contact_solve
+            dense_size = self._sparse_diagonal_dense_size if sparse else 0
             wp.launch(
                 apply_world_contact_restitution_matrix_free,
                 dim=self.world_count * self.dense_max_constraints,
@@ -10081,7 +10046,14 @@ class SolverFeatherPGS(SolverBase):
                     self.world_dof_count,
                     self.v_hat,
                     self.world_dof_indices,
-                    self.J_world,
+                    self._dummy_world_J if sparse else self.J_world,
+                    int(sparse),
+                    self._sparse_diagonal_dense_offsets,
+                    self._sparse_diagonal_dense_groups,
+                    dense_size,
+                    self.J_by_size[dense_size] if sparse else self._dummy_world_J,
+                    self._sparse_diagonal_row_dof,
+                    self._sparse_diagonal_row_jy,
                     dt,
                     self._effective_restitution_velocity_threshold,
                     int(self._regularization_enabled),
@@ -10372,19 +10344,10 @@ class SolverFeatherPGS(SolverBase):
             compute_mf_rhs_bias,
             dim=self.world_count * self.mf_max_constraints,
             inputs=[
+                bind_mf_rows(self, rhs=output),
                 self.mf_constraint_count,
-                self.mf_body_a,
-                self.mf_body_b,
-                self.mf_dof_a,
-                self.mf_dof_b,
-                self.mf_J_a,
-                self.mf_J_b,
-                self.world_dof_indices,
-                self.mf_phi,
-                self.mf_row_type,
-                self.mf_target_velocity,
-                self.mf_row_restitution,
                 int(self._has_prescribed_response),
+                self.world_dof_indices,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,
@@ -10397,7 +10360,6 @@ class SolverFeatherPGS(SolverBase):
                 self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
-            outputs=[output],
             device=self.model.device,
         )
 

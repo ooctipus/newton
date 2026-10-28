@@ -46,6 +46,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import position_pass
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     assert_loaded_anchors,
@@ -869,7 +870,17 @@ def _general_bias(solver, rows, dt):
     wp.launch(
         compute_world_contact_bias,
         dim=rhs.shape[0] * rhs.shape[1],
-        inputs=[records, count, rhs.shape[1], dt, 1.0, solver.contact_speculative_scale, 1.0, 1.0],
+        inputs=[
+            records,
+            count,
+            rhs.shape[1],
+            dt,
+            1.0,
+            solver.contact_speculative_scale,
+            1.0,
+            1.0,
+            *position_pass(device),
+        ],
         device=device,
     )
     return rhs.numpy()

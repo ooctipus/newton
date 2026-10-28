@@ -94,6 +94,13 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 contact_speculative_scale=contact_spec,
                 joint_limit_speculative_scale=limit_spec,
                 contact_w=contact_w,
+                velocity_pass=0,
+                world_dof_count=np.zeros(worlds, dtype=np.int32),
+                world_dof_indices=np.zeros((worlds, 1), dtype=np.int32),
+                world_J=np.zeros((worlds, rows, 1), dtype=np.float32),
+                world_position_velocity=np.zeros(1, dtype=np.float32),
+                world_incident_velocity=np.zeros(1, dtype=np.float32),
+                restitution_velocity_threshold=0.0,
                 mf_constraint_count=np.zeros(worlds, dtype=np.int32),
                 owned_rows_le=0,
                 world_rhs=np.zeros((worlds, rows), dtype=np.float32),
@@ -495,12 +502,12 @@ def _law_velocity_pass(
     rhs[world, i] = value
 
 
-def test_velocity_pass_matches_world_contact_velocity_bias(test, device):
-    """Equal ``compute_world_contact_velocity_bias`` (the dense velocity pass).
+def test_velocity_pass_matches_world_contact_bias(test, device):
+    """Equal ``compute_world_contact_bias``'s velocity pass (the dense rows' velocity iterations).
 
     The pass is the contact law with no Baumgarte and no speculative scale, keeping
     a separated row's bias while its end gap is open, and the limit law with no
-    Baumgarte.
+    Baumgarte: the row law with its bias scales at 0.
     """
     rng = np.random.default_rng(15)
     worlds, rows, dofs = 8, 32, 12
@@ -518,18 +525,24 @@ def test_velocity_pass_matches_world_contact_velocity_bias(test, device):
         "restitution_velocity_threshold": 0.2,
     }
     out = call(
-        kernels.compute_world_contact_velocity_bias,
+        kernels.compute_world_contact_bias,
         worlds * rows,
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
+        world_row_beta=rng.uniform(0.0, 1.0, (worlds, rows)).astype(np.float32),
+        bias_scale=0.0,
+        contact_speculative_scale=0.0,
+        joint_limit_speculative_scale=1.0,
+        contact_w=1.0,
+        velocity_pass=1,
         world_rhs=np.zeros((worlds, rows), dtype=np.float32),
         **common,
     )
     law = call(_law_velocity_pass, (worlds, rows), device, rhs=np.zeros((worlds, rows), dtype=np.float32), **common)
     np.testing.assert_array_equal(out["world_rhs"].numpy(), law["rhs"].numpy())
     unified(
-        "dense velocity pass (compute_world_contact_velocity_bias), signs of zero",
+        "dense velocity pass (compute_world_contact_bias), signs of zero",
         out["world_rhs"].numpy().ravel(),
         law["rhs"].numpy().ravel(),
         np.abs(phi.ravel()) * 60.0 + np.abs(target.ravel()),
@@ -596,6 +609,13 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
         write_row_w=1,
+        sparse_diagonal=0,
+        dense_offsets=np.zeros(worlds, dtype=np.int32),
+        dense_groups=np.zeros(worlds, dtype=np.int32),
+        dense_dofs=0,
+        dense_J=np.zeros((1, 1, 1), dtype=np.float32),
+        sparse_row_dof=np.full((1, 1, 2), -1, dtype=np.int32),
+        sparse_row_jy=np.zeros((1, 1, 4), dtype=np.float32),
         mf_constraint_count=np.zeros(worlds, dtype=np.int32),
         owned_rows_le=0,
         world_rhs=rhs0.copy(),

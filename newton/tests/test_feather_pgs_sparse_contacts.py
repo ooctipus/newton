@@ -28,6 +28,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton.tests.feather_pgs_law_harness import position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -534,7 +535,10 @@ class TestSparseContacts(unittest.TestCase):
                     wp.launch(
                         compute_world_contact_bias,
                         dim=9,
-                        inputs=[reference_rows, count, 9, 0.01, 1.0, law["speculative_scale"], 1.0, 1.0],
+                        inputs=[
+                            *(reference_rows, count, 9, 0.01, 1.0, law["speculative_scale"], 1.0, 1.0),
+                            *position_pass(device),
+                        ],
                         device=device,
                     )
                     geometric_rhs = reference_rhs.numpy().copy()
@@ -549,6 +553,7 @@ class TestSparseContacts(unittest.TestCase):
                             f["velocity"],
                             array([np.arange(6)], int),
                             dense,
+                            *world_restitution_layout(device),
                             0.01,
                             law["restitution_threshold"],
                             0,
@@ -656,6 +661,7 @@ class TestSparseContacts(unittest.TestCase):
                 1.0,
                 1.0,
                 1.0,
+                *position_pass(device),
             ],
             device=device,
         )
@@ -909,6 +915,7 @@ class TestSparseContacts(unittest.TestCase):
                 _array(incident.numpy()[0]),
                 _array([np.arange(row_count)], int),
                 _array(np.eye(row_count)[None]),
+                *world_restitution_layout("cpu"),
                 0.01,
                 0.1,
                 0,
