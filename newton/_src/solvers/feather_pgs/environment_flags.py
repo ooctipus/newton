@@ -55,12 +55,6 @@ _READ = (
         _SOLVER,
         "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
     ),
-    (
-        "FEATHER_PGS_INK",
-        "experiment",
-        _SOLVER,
-        "=1 lets the parallel sweep form the response H^-1 J^T and its diagonal in-kernel.",
-    ),
     ("FEATHER_PGS_KEYED_ROWS", "policy", _SOLVER, "=0 disables the topology-generated keyed contact rows."),
     (
         "FEATHER_PGS_MFGS_STREAM_LAMBDA",

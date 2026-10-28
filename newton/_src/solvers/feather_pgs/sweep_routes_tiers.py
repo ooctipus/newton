@@ -101,6 +101,12 @@ def _phase_admission() -> str:
     )
 
 
+def inkernel_response_fits(max_world_dofs: int, rows: int, matrix_free: bool) -> bool:
+    """Whether a tier of ``rows`` rows can form its worlds' response in-kernel: the A-based (not matrix-free) form
+    keeps the padded ``Z`` scratch in its response block."""
+    return matrix_free or max_world_dofs * (rows + 4) <= rows * (rows + 1)
+
+
 def _operands(
     max_constraints: int,
     max_world_dofs: int,
@@ -126,7 +132,7 @@ def _operands(
     NA, NB, OA, OB = groups
     if ink and (NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D)):
         raise ValueError("inkernel_response needs group sizes within the world DOF count")
-    if ink and not matrix_free and D * (AM + 4) > AM * (AM + 1):
+    if ink and not inkernel_response_fits(D, AM, matrix_free):
         raise ValueError("in-kernel response (A-based) needs the response block storage to hold the padded Z scratch")
     if AM % 4 != 0:
         raise ValueError("rows must be a multiple of 4")

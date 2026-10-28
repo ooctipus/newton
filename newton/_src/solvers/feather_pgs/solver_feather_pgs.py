@@ -270,7 +270,6 @@ from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
-_INK_ON = os.environ.get("FEATHER_PGS_INK") == "1"  # parallel tiers form Y = H^-1 J^T and the diagonal in-kernel
 _SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
     os.environ.get("FEATHER_PGS_MF_EXACT_ROWSUM") == "1"
@@ -2451,6 +2450,7 @@ class SolverFeatherPGS(SolverBase):
         )
         self._allocate_debug_buffers(model)
         self._scatter_armature_to_groups()
+        self._plan_tier_rows()
         # Worlds of one limited articulation and at most one other get their
         # limit prefix and contact packets built in place for the local solve
         # owners (row_packets.py), with the point or the patch row law;
@@ -2501,8 +2501,8 @@ class SolverFeatherPGS(SolverBase):
             self._keyed_rows_reason = (
                 "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
                 if self._keyed_rows is not None
-                else "Keyed rows need the opt-in in-kernel parallel sweep (FEATHER_PGS_INK=1 with "
-                "mf_gs_parallel_rows and mf_gs_parallel_matrix_free) and a plain matrix-free policy."
+                else "Keyed rows need matrix-free parallel tiers (mf_gs_parallel_rows and mf_gs_parallel_matrix_free) "
+                "that build the response in-kernel (routes.sweep.tiers) and a plain matrix-free policy."
             )
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
@@ -5500,23 +5500,11 @@ class SolverFeatherPGS(SolverBase):
         )
         # The tier sweeps ahead of the matrix-free sweep (SweepTier): parallel tiers or incremental tiers.
         self._mf_gs_tiers = []
-        self._ink_sizes = None
-        self._ink_rows = 0
-        # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
-        self._incremental_rows = 0
         if model.device.is_cuda and int(model.articulation_count) > 0:
             # The grouped response solve (_stage4_hinv_jt_grouped), for the sizes StepPlan gives it from the data.
             self._grouped_response = True
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
-        if (
-            self.pgs_mode == "matrix_free"
-            and not self._sparse_diagonal_contact_solve
-            and self._sparse_mass_matrix_size is None
-            and hasattr(self, "mf_meta_packed")
-            and self.world_count > 0
-            and getattr(self, "max_world_dofs", 0) > 0
-            and self.mf_max_constraints > 0
-        ):
+        if self._mf_sweeps:
             has_drive_rows = self.drive_mode == "physx_pgs"
             # Preserve the explicit diagnostic override without hiding it in a
             # cached factory: storage is part of the kernel specialization key.
@@ -5546,31 +5534,7 @@ class SolverFeatherPGS(SolverBase):
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self._mfgs_storage = storage
-            incremental_rows = 0
-            # The incremental kernel loads the whole row prefix and pools each
-            # friction pair's ring of normal loads, so it serves patch friction.
-            if (
-                self.mf_gs_incremental_rows > 0
-                and self._law_agnostic_contact_paths
-                and not self.fuse_joint_velocity_limits
-                and not self._paired_factor_coordinates
-            ):
-                incremental_rows = min(int(self.dense_max_constraints), int(self.mf_gs_incremental_rows), 64)
-            parallel_rows = 0
-            # The linked tiers pool each friction pair's cone over its patch ring.
-            if (
-                self.mf_gs_parallel_rows > 0
-                and self._parallel_contact_paths
-                and not self.fuse_joint_velocity_limits
-                and not self._paired_factor_coordinates
-            ):
-                parallel_rows = min(
-                    int(self.dense_max_constraints),
-                    int(self.mf_gs_parallel_rows),
-                    128 if self.mf_gs_parallel_matrix_free else 96,
-                )
-                parallel_rows -= parallel_rows % 4
-                incremental_rows = 0
+            parallel_rows, incremental_rows = self._ink_rows, self._incremental_rows
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -5621,10 +5585,6 @@ class SolverFeatherPGS(SolverBase):
                     velocity_limit_law=self._velocity_limit_kernel_law(),
                     **mf_gs_options,
                 )
-            self._mf_gs_tiers = []
-            self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
-            self._ink_rows = int(parallel_rows)
-            self._incremental_rows = int(incremental_rows)
             if parallel_rows > 0:
                 parallel_factory = sweep_routes_tiers.parallel_kernel
                 if self._keyed_rows is not None:
@@ -9627,21 +9587,56 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _build_inkernel_response_meta(self) -> tuple[int, int] | None:
-        """Per-world (group index, DOF offset) of up to two size groups for the in-kernel response solve.
+    def _plan_tier_rows(self) -> None:
+        """Set the tier sweeps' row budgets and whether the parallel tiers form the response in-kernel.
 
-        Returns the (primary, secondary) group sizes, or None when the model does not fit (more than two size
-        groups, a world with two articulations of one size, or no world-layout response).
+        ``_ink_rows`` and ``_incremental_rows`` are the parallel and incremental tiers' row budgets (0 without them;
+        an admitted parallel tier replaces the incremental one). Wherever the model and the tiers fit
+        (:meth:`_build_inkernel_response_meta`, :func:`.sweep_routes_tiers.inkernel_response_fits` of the smallest
+        tier), the parallel tiers form each world's response ``Y = H^-1 J^T`` and its diagonal in the kernel, and the
+        response stage skips their rows; ``_ink_reason`` says why or why not (``routes.sweep.tiers``). The local
+        packets and the keyed rows read this before the tiers are built.
         """
+        self._mf_sweeps = bool(
+            self.pgs_mode == "matrix_free"
+            and not self._sparse_diagonal_contact_solve
+            and self._sparse_mass_matrix_size is None
+            and hasattr(self, "mf_meta_packed")
+            and self.world_count > 0
+            and getattr(self, "max_world_dofs", 0) > 0
+            and self.mf_max_constraints > 0
+        )
+        tiers = self._mf_sweeps and not self.fuse_joint_velocity_limits and not self._paired_factor_coordinates
+        self._ink_rows = self._incremental_rows = 0
+        # The incremental kernel loads the whole row prefix and pools each friction pair's ring of normal loads, so
+        # it serves patch friction; the linked parallel tiers pool each friction pair's cone over its patch ring.
+        if tiers and self.mf_gs_parallel_rows > 0 and self._parallel_contact_paths:
+            cap = 128 if self.mf_gs_parallel_matrix_free else 96
+            self._ink_rows = min(int(self.dense_max_constraints), int(self.mf_gs_parallel_rows), cap)
+            self._ink_rows -= self._ink_rows % 4
+        elif tiers and self.mf_gs_incremental_rows > 0 and self._law_agnostic_contact_paths:
+            self._incremental_rows = min(int(self.dense_max_constraints), int(self.mf_gs_incremental_rows), 64)
+        self._ink_sizes, self._ink_reason = None, "No parallel tier is built."
+        if self._ink_rows > 0 and not sweep_routes_tiers.inkernel_response_fits(
+            self.max_world_dofs, min(32, self._ink_rows), self.mf_gs_parallel_matrix_free
+        ):
+            self._ink_reason = (
+                f"The response block of the A-based tiers cannot hold the padded Z scratch of {self.max_world_dofs} "
+                "world coordinates; matrix-free tiers (mf_gs_parallel_matrix_free) need none."
+            )
+        elif self._ink_rows > 0:
+            self._ink_sizes, self._ink_reason = self._build_inkernel_response_meta()
 
-        def _off(reason: str):
-            print(f"[feather_pgs] in-kernel response disabled: {reason}")
-            return None
+    def _build_inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
+        """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.
 
+        The parallel tiers form the response of up to two size groups, one articulation of each size per world with
+        a primary in every world, at one world DOF offset per size when the response is written in world layout.
+        """
         if self.art_to_world is None:
-            return _off("no articulation->world map")
+            return None, "No articulation->world map."
         if not (1 <= len(self.size_groups) <= 2):
-            return _off(f"{len(self.size_groups)} size groups")
+            return None, f"{len(self.size_groups)} size groups; the in-kernel response takes one or two."
         sizes = sorted((int(s) for s in self.size_groups), reverse=True)
         art_to_world = self.art_to_world.numpy()
         dof_off = self.articulation_world_dof_offset.numpy()
@@ -9651,21 +9646,24 @@ class SolverFeatherPGS(SolverBase):
             g2a = self.group_to_art[size].numpy()
             worlds = art_to_world[g2a]
             if np.unique(worlds).size != worlds.size:
-                return _off(f"a world has several articulations of size {size}")
+                return None, f"A world has several articulations of size {size}."
             off = dof_off[g2a] if self._hinv_jt_writes_world else np.zeros(g2a.size, dtype=np.int32)
             if off.size and np.any(off != off[0]):
-                return _off(f"non-uniform world DOF offsets for size {size}")  # register row uses compile-time offsets
+                # The register rows use compile-time offsets.
+                return None, f"The world DOF offsets of size {size} differ."
             offsets[col] = int(off[0]) if off.size else 0
             meta[worlds, 2 * col] = np.arange(g2a.size, dtype=np.int32)
             meta[worlds, 2 * col + 1] = off
         if np.any(meta[:, 0] < 0):
-            return _off("a world has no primary articulation")
+            return None, "A world has no primary articulation."
         nb = sizes[1] if len(sizes) > 1 else 0
         if offsets[0] + sizes[0] > self.max_world_dofs or (nb and offsets[1] + nb > self.max_world_dofs):
-            return _off("group DOFs exceed the world DOF count")
+            return None, "The group DOFs exceed the world DOF count."
         self._ink_meta = wp.array(meta.reshape(-1), dtype=wp.int32, device=self.model.device)
         self._ink_dummy3 = wp.zeros((1, 1, 1), dtype=wp.float32, device=self.model.device)
-        return (sizes[0], nb, offsets[0], offsets[1])
+        return (sizes[0], nb, offsets[0], offsets[1]), (
+            f"The parallel tiers form the response of sizes {sizes} in-kernel; the response stage skips their rows."
+        )
 
     def _allocate_tier_placeholders(self) -> None:
         """Allocate the in-kernel response inputs the parallel tiers take when built without it.

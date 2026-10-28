@@ -1126,6 +1126,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _par_sweeps_reason="auto: ...",
                 _ink_rows=64,
                 _ink_sizes=None,
+                _ink_reason="A world has several articulations of size 12.",
                 _keyed_rows=None,
                 _friction_anchors_enabled=anchors,
                 enable_joint_velocity_limits=limits,
@@ -1767,13 +1768,13 @@ class TestPatchParallelRoutes(unittest.TestCase):
     def test_keyed_rows_record_names_the_launched_builders(self):
         """Name in the route record the keyed-row builders one step launches, under both laws.
 
-        The in-kernel parallel sweep (FEATHER_PGS_INK=1) admits keyed rows on CUDA, for patch friction
-        by default; the test sets FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out cannot
-        change the route. The keyed parallel tiers build the direct rows in the sweep, which every entry
+        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA, for patch
+        friction by default; the test sets FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out
+        cannot change the route. The keyed parallel tiers build the direct rows in the sweep, which every entry
         points to; the scatter and the fallback are the row builders a step launches outside it.
         """
         model = standing_model()
-        with patch.object(source, "_INK_ON", True), patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ, {_SWITCH: "1"}):
             os.environ.pop("FEATHER_PGS_KEYED_ROWS", None)
             for law, beta in (("point", 0.0), ("patch", 0.2)):
                 with self.subTest(law=law):
@@ -1814,10 +1815,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         dt = 1.0 / 240.0
         replays = {}
         for reuse in (None, "0"):
-            with (
-                patch.object(source, "_INK_ON", True),
-                patch.dict(os.environ, {_SWITCH: "1"}),
-            ):
+            with patch.dict(os.environ, {_SWITCH: "1"}):
                 for name in ("FEATHER_PGS_KEYED_ROWS", "FEATHER_PGS_PATCH_FRAME_REUSE"):
                     os.environ.pop(name, None)
                 if reuse is not None:

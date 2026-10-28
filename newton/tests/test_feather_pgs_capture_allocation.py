@@ -4,7 +4,6 @@
 """Allocate the inputs a captured step reads before the capture."""
 
 import contextlib
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,7 +12,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
@@ -22,21 +20,19 @@ from newton.tests.test_feather_pgs_parallel_patch import _matrix_free_solver
 DT = 1.0 / 240.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
-# Module switches and environment of each tier configuration: the default point tiers, and the
-# in-kernel response of the general tier (keyed rows declined).
+# Solver methods patched for each tier configuration: the point tiers forming the response in-kernel, which the
+# standing model fits, and the placeholder inputs of tiers built without it (a model it does not fit).
 _CONFIGURATIONS = {
-    "default": ({}, {}),
-    "in_kernel_response": ({"_INK_ON": True}, {"FEATHER_PGS_KEYED_ROWS": "0"}),
+    "in_kernel_response": {},
+    "placeholders": {"_build_inkernel_response_meta": lambda solver: (None, "The test declines it.")},
 }
 
 
 def _tier_solver(model, name):
     """The named tier configuration."""
-    switches, environment = _CONFIGURATIONS[name]
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.dict(os.environ, environment))
-        for switch, value in switches.items():
-            stack.enter_context(patch.object(source, switch, value))
+        for method, value in _CONFIGURATIONS[name].items():
+            stack.enter_context(patch.object(SolverFeatherPGS, method, value))
         return _matrix_free_solver(model, beta=0.0, parallel_rows=32)
 
 
@@ -104,8 +100,7 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                 self.assertTrue(tiers)
                 self.assertTrue(all(tier.response_inputs for tier in tiers))
                 tier_kernels = [tier.kernel for tier in tiers]
-                if name == "in_kernel_response":
-                    self.assertIsNotNone(captured.solver._ink_sizes, "The in-kernel response must be admitted")
+                self.assertEqual(captured.solver._ink_sizes is None, name == "placeholders")
                 allocated, tier_inputs = [], []
                 zeros, launch_tiled = wp.zeros, wp.launch_tiled
 

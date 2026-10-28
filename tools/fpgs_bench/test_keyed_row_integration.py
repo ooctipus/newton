@@ -42,7 +42,6 @@ def make_case(
         model.rigid_contact_max = rigid_contact_max
     with (
         patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled)))}),
-        patch.object(source, "_INK_ON", True),
         patch.object(source, "_MF_EXACT_ROWSUM", exact),
     ):
         # Patch friction sets the switch that admits it to the parallel tiers and keyed rows (its default);

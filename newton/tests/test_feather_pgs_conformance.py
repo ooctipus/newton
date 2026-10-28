@@ -153,8 +153,8 @@ class Route:
     environment: dict = dataclasses.field(default_factory=dict)
     """``FEATHER_PGS_*`` variables set while the solver is constructed and stepped."""
     module: dict = dataclasses.field(default_factory=dict)
-    """Attributes patched for the whole run: the solver module's import-time switches (``_INK_ON`` and the like), or
-    ``"module.attribute"`` of another FeatherPGS module."""
+    """Attributes patched for the whole run: the solver module's import-time switches (``_MF_EXACT_ROWSUM`` and the
+    like), or ``"module.attribute"`` of another FeatherPGS module."""
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
 
@@ -1202,18 +1202,11 @@ MF_PARALLEL_MATRIX_FREE = Route(
     module={"_MF_EXACT_ROWSUM": True},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel", "sweep.tiers.matrix_free": True},
 )
-KEYED_PARALLEL = Route(
+# The allegro and anymal-D recipes: matrix-free parallel tiers that form the response in-kernel take keyed rows on a
+# model they fit (the legged scene).
+KEYED_PARALLEL = MF_PARALLEL_MATRIX_FREE.but(
     "keyed_parallel",
-    "cuda",
-    # The allegro and anymal-D recipes: in-kernel response (FEATHER_PGS_INK) over matrix-free parallel tiers.
-    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
-    module={"_INK_ON": True, "_MF_EXACT_ROWSUM": True},
-    expect={
-        "sweep.route": "matrix_free_gs",
-        "sweep.tiers.family": "keyed_parallel",
-        "contact_rows.producer": "keyed_rows",
-        "held_tree.owner": "mixed",
-    },
+    expect={"sweep.tiers.family": "keyed_parallel", "contact_rows.producer": "keyed_rows", "held_tree.owner": "mixed"},
 )
 SPARSE = Route(
     "sparse",
@@ -1447,7 +1440,7 @@ def cuda_groups() -> list:
     groups = []
     for law in _laws():
         legged = [SPARSE, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL]
-        legged += [MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, KEYED_PARALLEL]
+        legged += [MF_PARALLEL, KEYED_PARALLEL]
         if law == "point":
             legged.insert(1, SPARSE_TRIPLETS)
         groups += [

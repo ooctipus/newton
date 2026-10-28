@@ -860,8 +860,6 @@ def decline(solver) -> str | None:
     The owner writes the solver's friction law: point rows, or persistent patch rows when friction
     anchors are on. The solver admits neither contact torsion nor compliance here.
     """
-    from . import solver_feather_pgs as source  # noqa: PLC0415
-
     facts = solver._facts
     return first_failed(
         (
@@ -889,7 +887,7 @@ def decline(solver) -> str | None:
                 ),
                 "A size takes the tiled or diagonal response, which local packets do not write.",
             ),
-            (not source._INK_ON, "FEATHER_PGS_INK builds the response in the parallel tiers."),
+            (solver._ink_sizes is None, "The parallel tiers form these worlds' response in-kernel."),
         )
     )
 

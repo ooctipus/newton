@@ -495,8 +495,6 @@ class KeyedRows:
 
 def create_owner(solver):
     """Admit one bounded complete numerical law; leave unsupported solvers ordinary."""
-    from . import solver_feather_pgs as source  # noqa: PLC0415
-
     facts = solver._facts
     supported = (
         facts.forward_cuda
@@ -516,7 +514,7 @@ def create_owner(solver):
         and not solver._sparse_diagonal_contact_solve
         and not solver._mimic_count
         and not solver._connect_count
-        and source._INK_ON
+        and solver._ink_sizes is not None
     )
     if not supported:
         return None

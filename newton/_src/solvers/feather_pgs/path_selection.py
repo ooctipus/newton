@@ -794,8 +794,9 @@ def _tiers(solver) -> dict | None:
     if solver._ink_rows > 0:
         return {
             "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
-            # FEATHER_PGS_INK: the tier kernels build their world's response in-kernel.
+            # The tier kernels form their worlds' response in-kernel wherever the model fits, and why.
             "inkernel_response": solver._ink_sizes is not None,
+            "inkernel_response_reason": solver._ink_reason,
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(tier.linked_rows for tier in tiers),
             # The last-word velocity-limit pass after the final sweep (mf_gs_parallel_linked_velocity_limit_pass).

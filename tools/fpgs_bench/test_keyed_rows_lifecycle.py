@@ -26,17 +26,14 @@ from tools.fpgs_bench.test_keyed_rows_capture import captures
 
 @contextmanager
 def mode(enabled, *, patch_friction=False):
-    """Bind the existing INK recipe and the new flag before construction.
+    """Bind the keyed-row switch before construction.
 
     Patch friction sets ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` explicitly (its
     default admits it to keyed rows and the parallel tiers too); point friction runs
     with the switch unset. Either way the exported environment cannot change the
     route.
     """
-    with (
-        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled))}),
-        patch.object(source, "_INK_ON", True),
-    ):
+    with patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": str(int(enabled))}):
         os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
         if patch_friction:
             os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = "1"
