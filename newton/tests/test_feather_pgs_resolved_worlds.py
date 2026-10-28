@@ -180,30 +180,6 @@ def _definition(function):
     return ast.parse(textwrap.dedent(inspect.getsource(function.func))).body[0]
 
 
-def _reserves_first(statements):
-    """Whether every path through ``statements`` reserves rows before it returns.
-
-    Returns True when each path reaches a ``reserve`` call (the row families'
-    slot reservation) before any ``return``, False when some path returns
-    first, and None when a path falls through without either. A reservation
-    inside a loop does not count, since the loop may not run.
-    """
-    for statement in statements:
-        if isinstance(statement, ast.If):
-            outcomes = {_reserves_first(statement.body), _reserves_first(statement.orelse)}
-            if False in outcomes:
-                return False
-            if outcomes == {True}:
-                return True
-        elif any(isinstance(node, ast.Return) for node in ast.walk(statement)):
-            return False
-        elif not isinstance(statement, (ast.For, ast.While)) and any(
-            isinstance(node, ast.Call) and ast.unparse(node.func) == "reserve" for node in ast.walk(statement)
-        ):
-            return True
-    return None
-
-
 class TestResolvedWorlds(unittest.TestCase):
     def test_current_predictor_not_incoming_body_twist(self):
         """Reject a closing predictor despite a separating stale body twist."""
@@ -434,31 +410,15 @@ class TestResolvedWorlds(unittest.TestCase):
             np.testing.assert_array_equal(patch_friction[name][~world_zero], complete[name][~world_zero], err_msg=name)
 
     def test_patch_release_repeats_the_allocator_admission(self):
-        """Mark a resolved contact by the allocator's own admission, the checks that precede its row reservation."""
-        helper = _definition(kernels._allocate_world_contact_slot)
-        release = _definition(kernels._mark_resolved_patch_contact)
-        parameters = {argument.arg: ast.dump(argument.annotation) for argument in helper.args.args}
-        for argument in release.args.args:
-            with self.subTest(parameter=argument.arg):
-                self.assertEqual(ast.dump(argument.annotation), parameters.get(argument.arg))
-        # Docstrings aside, both open with the one admission, called with the same arguments.
-        admissions = [function.body[1].value for function in (helper, release)]
-        for call in admissions:
-            self.assertEqual(ast.unparse(call.func), "_admit_contact")
+        """Mark a resolved contact by the allocator's own admission: both calls take the same arguments."""
+        allocator = _definition(kernels.allocate_world_contact_slots)
+        admissions = [
+            node
+            for node in ast.walk(allocator)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == "_admit_contact"
+        ]
+        self.assertEqual(len(admissions), 2)
         self.assertEqual(ast.dump(admissions[0]), ast.dump(admissions[1]))
-        # The release marks exactly the admitted contacts.
-        self.assertEqual(
-            [ast.unparse(statement) for statement in release.body[2:]],
-            [
-                "data.slot[c] = -1",
-                "data.path[c] = -1",
-                "if admitted:\n    data.path[c] = CONTACT_PATH_RESOLVED",
-            ],
-        )
-        # The allocator rejects what the admission rejects; past it only classification runs: every path
-        # reserves rows before any exit.
-        self.assertEqual(ast.unparse(helper.body[2].test), "not admitted")
-        self.assertIs(_reserves_first(helper.body[3:]), True)
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""

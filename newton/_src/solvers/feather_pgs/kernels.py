@@ -2097,156 +2097,6 @@ def _admit_contact(
     return admitted, art_a, art_b, world, phi
 
 
-@wp.func
-def _allocate_world_contact_slot(
-    c: int,
-    data: ContactInput,
-    body_to_articulation: wp.array[int],
-    art_to_world: wp.array[int],
-    body_flags: wp.array[wp.int32],
-    body_has_response_dofs: wp.array[int],
-    is_free_rigid: wp.array[int],
-    has_free_rigid: int,
-    contact_gap_gate: float,
-    same_articulation_contact_gap_gate: float,
-    articulation_pair_contact_gap_gate: float,
-    max_constraints: int,
-    mf_max_constraints: int,
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
-    contact_friction_articulation_pairs_only: int,
-    row_capacity_telemetry: int,
-    friction_patches: FrictionPatches,
-    # outputs
-    world_slot_counter: wp.array[int],
-    mf_slot_counter: wp.array[int],
-    dense_dropped_contact_rows: wp.array[int],
-    mf_dropped_contact_rows: wp.array[int],
-    dense_first_rejected_slot: wp.array[int],
-    mf_first_rejected_slot: wp.array[int],
-):
-    """Classify and allocate rows for one active contact.
-
-    Allocates world-level constraint slots for each contact and records
-    which articulations are involved. Contacts where both sides are free
-    rigid bodies (or ground) are routed to the matrix-free path.
-
-    Each contact reserves 1 slot for the normal row and, when enabled below the
-    friction gap threshold, 2 adjacent slots for Coulomb friction rows.
-    A positive contact gap gate excludes wider speculative contacts before any
-    route reserves slots; zero disables the gate.
-
-    """
-    admitted, art_a, art_b, world, phi = _admit_contact(
-        c,
-        data,
-        body_to_articulation,
-        art_to_world,
-        body_flags,
-        body_has_response_dofs,
-        is_free_rigid,
-        contact_gap_gate,
-        same_articulation_contact_gap_gate,
-        articulation_pair_contact_gap_gate,
-    )
-    if not admitted:
-        data.slot[c] = -1
-        data.path[c] = -1
-        return
-    a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
-    b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-
-    # Classify: MF path if both sides are free rigid or ground.
-    is_mf = 0
-    if has_free_rigid != 0:
-        a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
-        b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
-        if a_is_mf_compatible and b_is_mf_compatible:
-            is_mf = 1
-
-    # Every normal survives; only the selected patch anchors receive tangent rows.
-    slots_needed = 1
-    add_friction = enable_friction != 0 and contact_friction_eligible(
-        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
-    )
-    if friction_patches.enabled != 0:
-        add_friction = add_friction and friction_patches.weight[c] > 0.0
-    if add_friction:
-        slots_needed = 3
-    data.slots_needed[c] = slots_needed
-
-    if is_mf != 0:
-        # Matrix-free path
-        slot = reserve(mf_slot_counter, world, slots_needed, mf_max_constraints, mf_first_rejected_slot)
-        if slot < 0:
-            if row_capacity_telemetry != 0:
-                wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
-            data.slot[c] = -1
-            data.path[c] = -1
-            return
-        data.world[c] = world
-        data.slot[c] = slot
-        data.art0[c] = art_a
-        data.art1[c] = art_b
-        data.path[c] = 1
-    else:
-        # Dense path
-        slot = reserve(world_slot_counter, world, slots_needed, max_constraints, dense_first_rejected_slot)
-        if slot < 0:
-            if row_capacity_telemetry != 0:
-                wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
-            data.slot[c] = -1
-            data.path[c] = -1
-            return
-        data.world[c] = world
-        data.slot[c] = slot
-        data.art0[c] = art_a
-        data.art1[c] = art_b
-        data.path[c] = 0
-
-
-@wp.func
-def _mark_resolved_patch_contact(
-    c: int,
-    data: ContactInput,
-    body_to_articulation: wp.array[int],
-    art_to_world: wp.array[int],
-    body_flags: wp.array[wp.int32],
-    body_has_response_dofs: wp.array[int],
-    is_free_rigid: wp.array[int],
-    contact_gap_gate: float,
-    same_articulation_contact_gap_gate: float,
-    articulation_pair_contact_gap_gate: float,
-    # outputs
-):
-    """Mark a contact of a resolved world that the row allocator would reserve rows for.
-
-    Repeats the allocator's checks before any reservation: a responding
-    endpoint, one world and the normal gap limit. Such a contact gets
-    CONTACT_PATH_RESOLVED and no slot; persistent patch friction releases its
-    anchor at the finish, as the complete path releases an anchor whose rows
-    solve zero load. Every other contact keeps path -1, and its anchor history.
-    """
-    admitted, _art_a, _art_b, _world, _phi = _admit_contact(
-        c,
-        data,
-        body_to_articulation,
-        art_to_world,
-        body_flags,
-        body_has_response_dofs,
-        is_free_rigid,
-        contact_gap_gate,
-        same_articulation_contact_gap_gate,
-        articulation_pair_contact_gap_gate,
-    )
-    data.slot[c] = -1
-    data.path[c] = -1
-    if admitted:
-        data.path[c] = CONTACT_PATH_RESOLVED
-
-
 @wp.kernel
 def allocate_world_contact_slots(
     data: ContactInput,
@@ -2276,7 +2126,13 @@ def allocate_world_contact_slots(
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
 ):
-    """Allocate active contacts with work proportional to the materialized prefix.
+    """Classify and allocate the rows of every active contact, with work proportional to the materialized prefix.
+
+    A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
+    friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
+    rows. Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
+    dense rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
+    zero disables the gate.
 
     A collision pass clamps :paramref:`contact_count` to the rows its writers
     filled, every one of them, and flags an overflow in its own capacity
@@ -2289,6 +2145,11 @@ def allocate_world_contact_slots(
     no accepted contact can hold a slot at or beyond the count. Rolling back
     raced with concurrent reservations and left accepted rows past the count,
     which the friction patch links then chained into.
+
+    In a world the resolved-world classifier skips, no contact gets rows. Under persistent patch friction, a
+    contact the allocator would give rows there takes CONTACT_PATH_RESOLVED and no slot, so the patch finish
+    releases its anchor, as the complete path releases an anchor whose rows solve zero load; every other contact
+    keeps path -1, and its anchor history.
     """
     thread = wp.tid()
     # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
@@ -2309,9 +2170,7 @@ def allocate_world_contact_slots(
                 data.path[c] = -1
                 data.slots_needed[c] = 0
                 if friction_patches.enabled != 0:
-                    # Persistent patch friction releases the anchors of the contacts the complete
-                    # path would give rows (CONTACT_PATH_RESOLVED).
-                    _mark_resolved_patch_contact(
+                    admitted, _art_a, _art_b, _world, _phi = _admit_contact(
                         c,
                         data,
                         body_to_articulation,
@@ -2323,8 +2182,10 @@ def allocate_world_contact_slots(
                         same_articulation_contact_gap_gate,
                         articulation_pair_contact_gap_gate,
                     )
+                    if admitted:
+                        data.path[c] = CONTACT_PATH_RESOLVED
                 continue
-        _allocate_world_contact_slot(
+        admitted, art_a, art_b, world, phi = _admit_contact(
             c,
             data,
             body_to_articulation,
@@ -2332,24 +2193,57 @@ def allocate_world_contact_slots(
             body_flags,
             body_has_response_dofs,
             is_free_rigid,
-            has_free_rigid,
             contact_gap_gate,
             same_articulation_contact_gap_gate,
             articulation_pair_contact_gap_gate,
-            max_constraints,
-            mf_max_constraints,
-            enable_friction,
-            contact_friction_gap_threshold,
-            contact_friction_articulation_pairs_only,
-            row_capacity_telemetry,
-            friction_patches,
-            world_slot_counter,
-            mf_slot_counter,
-            dense_dropped_contact_rows,
-            mf_dropped_contact_rows,
-            dense_first_rejected_slot,
-            mf_first_rejected_slot,
         )
+        if not admitted:
+            data.slot[c] = -1
+            data.path[c] = -1
+            continue
+        a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
+        b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
+        a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
+        b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
+
+        # Classify: MF path if both sides are free rigid or ground.
+        is_mf = 0
+        if has_free_rigid != 0:
+            a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
+            b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
+            if a_is_mf_compatible and b_is_mf_compatible:
+                is_mf = 1
+
+        # Every normal survives; only the selected patch anchors receive tangent rows.
+        slots_needed = 1
+        add_friction = enable_friction != 0 and contact_friction_eligible(
+            phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
+        )
+        if friction_patches.enabled != 0:
+            add_friction = add_friction and friction_patches.weight[c] > 0.0
+        if add_friction:
+            slots_needed = 3
+        data.slots_needed[c] = slots_needed
+
+        # The matrix-free or the dense family's counter.
+        slot = int(-1)
+        if is_mf != 0:
+            slot = reserve(mf_slot_counter, world, slots_needed, mf_max_constraints, mf_first_rejected_slot)
+            if slot < 0 and row_capacity_telemetry != 0:
+                wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
+        else:
+            slot = reserve(world_slot_counter, world, slots_needed, max_constraints, dense_first_rejected_slot)
+            if slot < 0 and row_capacity_telemetry != 0:
+                wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
+        if slot < 0:
+            data.slot[c] = -1
+            data.path[c] = -1
+            continue
+        data.world[c] = world
+        data.slot[c] = slot
+        data.art0[c] = art_a
+        data.art1[c] = art_b
+        data.path[c] = is_mf
 
 
 # The allocator above reserves each contact's rows with an atomic on its world's counter, so on CUDA a
