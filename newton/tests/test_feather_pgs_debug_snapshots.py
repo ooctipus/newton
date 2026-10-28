@@ -658,13 +658,15 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
         compares the arms after the warm-up substep and after every replay.
         """
         device = wp.get_device("cuda:0")
-        # Each arm steps its own model: the fields a solver adds to a model's contact pool lower the pool's
-        # bound, and a capture sizes its sort merges by the bound, so arms sharing a model could differ in them.
-        models = {snapshots: _compared_scene(device) for snapshots in (False, True)}
         for label, options in _modes_and_laws(device).items():
             with self.subTest(configuration=label):
-                off = _graph_rollout(models[False], snapshots=False, **options)
-                on = _graph_rollout(models[True], snapshots=True, **options)
+                # A capture sizes its sort merges by its model's contact pool bound, which the fields of every
+                # solver and pipeline built on the model lower until the collector frees them. Each arm steps a
+                # model of its own, new for each configuration, so both arms' pools hold the same fields and the
+                # flag is all that differs between them.
+                off = _graph_rollout(_compared_scene(device), snapshots=False, **options)
+                on = _graph_rollout(_compared_scene(device), snapshots=True, **options)
+                self.assertEqual(on["solver"]._contact_pool.bound, off["solver"]._contact_pool.bound)
                 self.assertGreater(min(off["contact_counts"]), 0)
                 self.assertLessEqual(
                     max(off["contact_counts"]), WARP_SIZE, "the compared contacts must fit in one warp"
