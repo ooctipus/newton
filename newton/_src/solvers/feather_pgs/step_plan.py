@@ -24,7 +24,7 @@ from types import MappingProxyType
 
 from ...sim import ModelFlags
 
-__all__ = ["AdmissionFacts", "Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
+__all__ = ["Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
 
 _GROUPED_VERIFIED_DOFS = 32
 
@@ -32,43 +32,6 @@ _GROUPED_VERIFIED_DOFS = 32
 def first_failed(checks) -> str | None:
     """The reason of the first ``(holds, reason)`` check that fails, or ``None`` when every check holds."""
     return next((reason for holds, reason in checks if not holds), None)
-
-
-@dataclass(frozen=True)
-class AdmissionFacts:
-    """The facts the owners' admissions test, computed once from the resolved options, the model and the device."""
-
-    forward_cuda: bool
-    """CUDA without gradient recording: native kernels without adjoints may run."""
-    matrix_free: bool
-    plain_sweep: bool
-    """The interleaved schedule with augmented drives and no velocity iterations, warm start, debug rows or bilateral
-    pre-elimination: the sweep policy the specialized owners assume."""
-    regularized: bool
-    velocity_limits: bool
-
-    PLAIN_SWEEP = (
-        "the interleaved schedule with augmented drives and no velocity iterations, warm start, debug rows or "
-        "bilateral pre-elimination"
-    )
-
-    @classmethod
-    def build(cls, solver) -> AdmissionFacts:
-        """Read the facts from a solver whose options, preelimination plan and regularization are resolved."""
-        return cls(
-            forward_cuda=bool(solver.model.device.is_cuda and not solver.model.requires_grad),
-            matrix_free=solver.pgs_mode == "matrix_free",
-            plain_sweep=bool(
-                solver.pgs_schedule == "interleaved"
-                and solver.drive_mode == "augmented"
-                and solver.pgs_velocity_iterations == 0
-                and not solver.pgs_warmstart
-                and not solver.pgs_debug
-                and not solver._preelim_active
-            ),
-            regularized=bool(solver._regularization_enabled),
-            velocity_limits=bool(solver.enable_joint_velocity_limits),
-        )
 
 
 NUMERIC_PROPERTIES = (

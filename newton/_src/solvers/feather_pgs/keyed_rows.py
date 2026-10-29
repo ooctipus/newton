@@ -33,6 +33,7 @@ from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
+from .route_table import capable
 from .row_build import endpoint_projection, write_contact_row
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
@@ -461,21 +462,15 @@ class KeyedRows:
 
 
 def create_owner(solver):
-    """Admit one bounded complete numerical law where the in-kernel parallel tiers (``_ink_sizes``) take the rows."""
-    facts = solver._facts
+    """Admit one bounded complete numerical law where the in-kernel parallel tiers (``_ink_sizes``) take the rows: the
+    laws keyed rows implement (``route_table.CAPABILITIES``), then their fit."""
     supported = (
-        solver._ink_sizes is not None
-        and facts.forward_cuda
-        and facts.plain_sweep
-        and solver.enable_joint_limits
+        capable("keyed_rows", solver._laws) is None
+        and solver._ink_sizes is not None
         and solver.mf_gs_parallel_matrix_free
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
-        and solver.pgs_iterations > 0
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
-        and not solver._has_loop_joints
         and not solver._fused_diagonal_joint_limits
-        and not solver._mimic_count
-        and not solver._connect_count
     )
     if not supported:
         return None

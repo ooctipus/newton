@@ -45,7 +45,7 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         seeds its factor delta with the carried impulses' response.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        warm_starts = ({}, {"pgs_warmstart": True}, {"_mf_warmstart_enabled": True})
+        warm_starts = ({}, {"pgs_warmstart": True})
         for patches, warm_start in itertools.product((False, True), warm_starts):
             solver = _eligible_solver()
             solver.enable_joint_velocity_limits = True
@@ -66,7 +66,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         for changes in (
             {"_route_pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "_has_free_rigid_bodies": True},
-            {"_mf_warmstart_enabled": True, "_has_free_rigid_bodies": True},
             {"_has_free_rigid_bodies": True},
             {"drive_mode": "physx_pgs"},
             {"pgs_schedule": "contact_then_internal"},

@@ -152,6 +152,8 @@ def route_selection(solver) -> dict:
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
+        # The row laws every owner's admission reads (route_table.Laws).
+        "laws": solver._laws.record(),
         # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
@@ -378,7 +380,7 @@ def _row_builder(solver, plan, size, source) -> dict:
 
 
 def _contact_rows(solver, source) -> dict:
-    point = bool(solver._point_contact_paths)
+    point = bool(solver._laws.point)
     # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
     # contact row; the general builder serves only solvers no earlier producer took.
     plan = contact_row_plan(solver)
@@ -915,7 +917,7 @@ def _friction(solver) -> dict:
         if not solver._parallel_contact_paths and not solver._regularization_enabled:
             owners.append("keyed rows and parallel matrix-free tiers")
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
-        if not solver._patch_dense_paths:
+        if not solver._laws.patch:
             owners.append("the resolved-world classifier")
         if owners:
             reason += f" Point-contact owners ({', '.join(owners)}) need point friction."

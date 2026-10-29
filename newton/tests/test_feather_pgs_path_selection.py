@@ -44,6 +44,7 @@ from newton.tests.feather_pgs_row_builders import (
     is_row_builder,
     launched_kernels,
 )
+from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver, _over_budget_rows
 from newton.tests.unittest_utils import assert_host_only
 
@@ -155,8 +156,7 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
     """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
     values = {
         "_friction_anchors_enabled": law == "patch",
-        "_point_contact_paths": law == "point",
-        "_patch_dense_paths": law == "patch",
+        "_laws": plain_laws(contact=law),
         "size_groups": list(sizes),
         "_row_packets": None,
         "_keyed_rows": None,
@@ -285,7 +285,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = SolverFeatherPGS(_cpu_model())
         with assert_host_only():
             selected = solver.get_path_selection()
-        self.assertIn("CPU", selected["reasons"]["sparse_mass_matrix"])
+        self.assertIn("CUDA", selected["reasons"]["sparse_mass_matrix"])
         self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
         self.assertIn("CPU", selected["routes"]["stages"]["factor"]["1"]["reason"])
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
@@ -412,8 +412,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         masked = {"method": method, "kernels": ["contact_row_prelude", "populate_world_J_masked"], "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": masked, "1": masked})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
-        # Patch friction reaches the packet owner, which serves the local owners' worlds (CUDA only): none here.
-        self.assertIn("local owners' worlds; none is built", routes["contact_rows"]["row_packets"]["reason"])
+        # The packet producer implements patch friction; its laws need the joint-limit rows this model lacks.
+        self.assertIn("Local packets need joint-limit rows", routes["contact_rows"]["row_packets"]["reason"])
         self.assertIn("CUDA", routes["local_solve"]["reason"])
         self.assertFalse(routes["resolved_worlds"]["enabled"])
         self.assertIn("matrix-free route", routes["resolved_worlds"]["reason"])
@@ -430,7 +430,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertNotIn("local packets", routes["friction"]["reason"])
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
-        self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
+        self.assertIn("CUDA", routes["sparse_mass_matrix"]["reason"])
         self.assertEqual({entry["route"] for entry in routes["stages"]["response"].values()}, {"rows"})
         self.assertEqual(selected["measurements"], {})
         separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
@@ -1073,7 +1073,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("Ordinary dynamics retained", solver.get_path_selection()["reasons"]["cached_dynamics"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
-    def test_free_body_worlds_keep_the_dense_route_for_both_laws(self):
+    def test_free_body_worlds_keep_the_dense_route_for_bothplain_laws(self):
         """A branched arm with a free body per world stays dense with the tree cache, under patch friction too.
 
         Sparse factors admit the arm alone. On the dense route patch friction keeps the bundle that makes

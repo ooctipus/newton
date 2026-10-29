@@ -654,8 +654,8 @@ def decline(solver) -> str | None:
     """Why the local packet law does not admit the solver, or ``None`` when it may (its topology decides next).
 
     The owner writes the solver's friction law: point rows, or persistent patch rows when friction
-    anchors are on. The solver admits neither contact torsion nor compliance here; the local owners' admission
-    carries CUDA, the matrix-free plain sweep and no velocity limits.
+    anchors are on; the laws it implements are its capability (``route_table.CAPABILITIES``), and the local
+    owners' admission carries CUDA, the matrix-free plain sweep and no velocity limits. These are its fit.
     """
     return first_failed(
         (
@@ -669,8 +669,6 @@ def decline(solver) -> str | None:
                 solver.dense_max_constraints >= solver._local_residual_max_rows,
                 "dense_max_constraints is below the local residual owner's rows.",
             ),
-            (solver.enable_joint_limits, "Local packets build the joint-limit prefix: enable_joint_limits is off."),
-            (not solver._facts.regularized, "Local packets solve the unregularized law."),
             (
                 not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
                 "The diagonal-mass contact owner and its fused limits own these worlds.",

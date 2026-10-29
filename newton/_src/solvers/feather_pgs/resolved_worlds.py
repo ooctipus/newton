@@ -656,7 +656,7 @@ def decline(solver) -> str | None:
     connect, drives, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
-    facts = solver._facts
+    laws = solver._laws
     exact = {
         "_mimic_count": 0,
         "_connect_count": 0,
@@ -680,7 +680,6 @@ def decline(solver) -> str | None:
         "body_has_response_dofs",
         "_joint_limit_q_index",
     )
-    law = getattr(solver, "_point_contact_paths", False) or getattr(solver, "_patch_dense_paths", False)
     return first_failed(
         (
             (
@@ -688,22 +687,18 @@ def decline(solver) -> str | None:
                 "A test pin drops the resolved-world claim.",
             ),
             (
-                facts.matrix_free and solver.model.device.is_cuda,
+                laws.matrix_free and solver.model.device.is_cuda,
                 "The classifier evaluates the CUDA matrix-free route only.",
             ),
-            (
-                getattr(solver, "_law_agnostic_contact_paths", True),
-                "Contact torsion and compliance rows are outside the contact laws it classifies.",
-            ),
+            (laws.agnostic, "Contact torsion and compliance rows are outside the contact laws it classifies."),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
-                facts.forward_cuda
-                and facts.plain_sweep
-                and not facts.regularized
-                and not facts.velocity_limits
+                laws.forward_cuda
+                and laws.plain
+                and not laws.regularized
+                and not laws.velocity_limits
                 and all(getattr(solver, name, object()) == value for name, value in exact.items())
                 and all(getattr(solver, name, None) is False for name in false)
-                and law
                 and (getattr(solver, "max_world_dofs", 33) or 33) <= 32
                 and all(getattr(solver, name, None) is not None for name in required),
                 "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
@@ -729,7 +724,7 @@ class ResolvedWorlds:
         self.solver = solver
         declined = decline(solver)
         self.enabled = declined is None
-        if self.enabled and not getattr(solver, "_point_contact_paths", False):
+        if self.enabled and not solver._laws.point:
             self.reason = (
                 "Admitted: interleaved matrix-free patch-friction rows whose kinds are all unilateral; a world "
                 "resolves only if its checked rows fit every contact route."
@@ -746,7 +741,7 @@ class ResolvedWorlds:
         # matrix-free capacities (finalize_resolved_worlds_bounded); point friction
         # keeps no such bound.
         self.row_bound = None
-        if self.enabled and not getattr(solver, "_point_contact_paths", False):
+        if self.enabled and not solver._laws.point:
             self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
         device = solver.model.device
         worlds = solver.world_count if self.enabled else 0

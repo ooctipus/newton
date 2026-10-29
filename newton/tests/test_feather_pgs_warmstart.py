@@ -293,7 +293,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 newton.solvers.SolverFeatherPGS(model, pgs_warmstart_decay=value)
 
         solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True, pgs_warmstart_decay=0.25)
-        self.assertEqual(solver._mf_warmstart_decay, solver.pgs_warmstart_decay)
+        self.assertEqual(solver.pgs_warmstart_decay, 0.25)
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
@@ -434,7 +434,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         model = _build_press()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=4)
         self.assertTrue(solver.pgs_warmstart)
-        self.assertTrue(solver._mf_warmstart_enabled)
+        self.assertTrue(solver.pgs_warmstart)
 
 
 if __name__ == "__main__":

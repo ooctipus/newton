@@ -22,6 +22,7 @@ from . import host_index
 from .device_proof import DeviceProof
 from .response_builds_dense import factor_warps_kernel, leaf_index
 from .response_builds_rows import sparse_factor_kernel
+from .route_table import capable
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan
@@ -70,10 +71,9 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
     if compact is None:
         compact = getattr(solver, "_compact_diagonal_mass_size", None)
     model = solver.model
-    if not model.device.is_cuda:
-        return "The held tree runs on CUDA."
-    if model.requires_grad:
-        return "Gradients keep the differentiable serial passes."
+    reason = capable("held", solver._laws)
+    if reason is not None:
+        return reason
     if model.particle_count:
         return "Particles are outside the held tree."
     if sparse is not None:
@@ -85,20 +85,12 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
         ):
             return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
     else:
-        if not solver.size_groups:
-            return "No articulation has response coordinates."
         # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the
         # solver pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body
         # twists every group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
         # Split mode composes its rows from the same held factors the owner refreshes.
-        if solver.pgs_mode not in ("matrix_free", "split"):
-            return "The held tree serves the matrix-free and split modes."
-        if solver.drive_mode != "augmented":
-            return "PhysX drive rows keep the ordinary dynamics."
-        if solver.pgs_velocity_iterations != 0:
-            return "Velocity iterations keep the ordinary dynamics."
-    if solver._connect_count or solver._has_loop_joints:
-        return "Loop closures keep the serial passes."
+        if not solver.size_groups:
+            return "No articulation has response coordinates."
     if sparse is not None and solver._has_prescribed_response:
         return "The sparse factor's group holds no prescribed articulations."
     if not solver._fk_id_cache_available:
@@ -107,8 +99,6 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
         return "The sparse factor's group serves the matrix-free and sparse split sweeps."
     if not solver._parallel_augmented_drive_topology:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
-    if solver._debug_buffers_enabled:
-        return "Debug buffers keep the ordinary dynamics."
     if sparse is not None:
         return None
     # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32

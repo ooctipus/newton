@@ -22,7 +22,8 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
-from .step_plan import AdmissionFacts, first_failed
+from .route_table import capable
+from .step_plan import first_failed
 
 PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),
@@ -57,21 +58,16 @@ PAIRED_COMPONENT_THREADS = 128
 
 
 def decline(solver) -> str | None:
-    """Why the solver's paired worlds cannot be split into components, or ``None`` when they can."""
-    facts = solver._facts
-    return first_failed(
+    """Why the solver's paired worlds cannot be split into components, or ``None`` when they can: the laws
+    components implement (``route_table.CAPABILITIES``), then their fit."""
+    return capable("components", solver._laws) or first_failed(
         (
-            (facts.forward_cuda, "Components need CUDA without gradient recording."),
             (solver._paired_factor_coordinates, "Components need the paired factor-coordinate sweep."),
             (
                 solver._paired_response_secondary_size == FREE_BODY_DOFS
                 and 1 <= (solver._paired_response_primary_size or 0) <= 32,
                 "Components pair an articulation of at most 32 DOFs with one free body per world.",
             ),
-            (facts.plain_sweep, f"Components need {AdmissionFacts.PLAIN_SWEEP}."),
-            (not facts.regularized, "Components solve the unregularized law."),
-            (not solver.contact_compliance, "Components do not solve compliant contacts."),
-            (solver._mimic_count == 0 and solver._connect_count == 0, "Components do not split bilateral rows."),
         )
     )
 

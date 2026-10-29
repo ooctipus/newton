@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.route_table import Laws
 from newton.solvers import SolverFeatherPGS
 
 
@@ -25,24 +26,34 @@ class _AdmissionProbe(SimpleNamespace):
         # Stop after admission, before any factor planning or device allocation.
         raise _TopologyReached
 
-    # The solver defines both contact-law predicates before route selection;
-    # derive them from the probe's law fields as it does.
+    # The row laws, from the probe's fields as Laws.build reads a solver's (a CUDA model without gradients).
     @property
-    def _law_agnostic_contact_paths(self):
-        return not (self._contact_torsion_enabled or self.contact_compliance)
-
-    @property
-    def _point_contact_paths(self):
-        return self._law_agnostic_contact_paths and not self._friction_anchors_enabled
+    def _laws(self):
+        return Laws(
+            contact="patch" if self._friction_anchors_enabled else "point",
+            regularized=self._regularization_enabled,
+            torsion=self._contact_torsion_enabled,
+            compliance=self.contact_compliance,
+            limits=True,
+            velocity_limits=self.enable_joint_velocity_limits,
+            drives=self.drive_mode,
+            schedule=self.pgs_schedule,
+            velocity_pass=self.pgs_velocity_iterations != 0,
+            warm_start=self.pgs_warmstart,
+            debug_rows=self._debug_buffers_enabled,
+            preelimination=self._preelim_active,
+            mimic=bool(self._mimic_count),
+            connect=bool(self._connect_count),
+            loops=self._has_loop_joints,
+            iterations=self.pgs_iterations > 0,
+            forward_cuda=True,
+            matrix_free=self.pgs_mode == "matrix_free",
+        )
 
     # Patch friction may run the parallel tiers, as point friction may.
     @property
     def _parallel_contact_paths(self):
-        return self._law_agnostic_contact_paths
-
-    @property
-    def _patch_dense_paths(self):
-        return self._law_agnostic_contact_paths and self._friction_anchors_enabled
+        return self._laws.agnostic
 
 
 def _eligible_solver():
@@ -57,7 +68,6 @@ def _eligible_solver():
         pgs_velocity_iterations=0,
         enable_joint_velocity_limits=False,
         pgs_warmstart=False,
-        _mf_warmstart_enabled=False,
         _debug_buffers_enabled=False,
         _regularization_enabled=False,
         _preelim_active=False,

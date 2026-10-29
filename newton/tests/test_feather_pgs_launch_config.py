@@ -231,7 +231,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for beta, point in ((None, False), (0.0, True)):
             with self.subTest(beta=beta):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                self.assertEqual(solver._point_contact_paths, point)
+                self.assertEqual(solver._laws.point, point)
                 plan = contact_row_plan(solver)
                 self.assertEqual(plan.producer, "general")
                 self.assertEqual(plan.methods, {12: "masked_combined"})

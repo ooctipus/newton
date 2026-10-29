@@ -57,6 +57,7 @@ from newton.tests.feather_pgs_row_builders import (
     install_cpu_keyed_rows,
     launched_kernels,
 )
+from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_velocity_limit_law import _HAND_LIMIT, _limited_hand
 
@@ -1033,9 +1034,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                 self.assertNotIn("point contacts", keyed["reason"])
         # Torsion and compliance (CUDA-only laws here) keep ordinary rows.
-        other_law = SimpleNamespace(
-            _regularization_enabled=False, _point_contact_paths=False, _law_agnostic_contact_paths=False
-        )
+        other_law = SimpleNamespace(_laws=plain_laws(torsion=True))
         admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
         self.assertFalse(admitted)
         self.assertIn("torsion", reason)
@@ -1059,9 +1058,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
             (True, 0.0, "accumulated", "physx_grasp", False),  # the grasp schedule keeps PhysX's clamp
         ):
             probe = SimpleNamespace(
-                _regularization_enabled=False,
-                _point_contact_paths=False,
-                _law_agnostic_contact_paths=True,
+                _laws=plain_laws(contact="patch", velocity_limits=limits, schedule=schedule),
                 pgs_mode="matrix_free",
                 pgs_schedule=schedule,
                 enable_joint_velocity_limits=limits,

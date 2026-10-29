@@ -20,9 +20,9 @@ from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.step_plan import AdmissionFacts
 from newton.tests.feather_pgs_law_harness import contact_input
 from newton.tests.feather_pgs_patch_parity import assert_history_close
+from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
 
@@ -378,10 +378,11 @@ class TestResolvedWorlds(unittest.TestCase):
 
     def test_unsupported_constructor_has_empty_mask(self):
         """Keep unsupported solvers disabled without raising or launching."""
-        facts = AdmissionFacts(
-            forward_cuda=False, matrix_free=False, plain_sweep=True, regularized=False, velocity_limits=False
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=wp.get_device("cpu")),
+            _laws=plain_laws(forward_cuda=False, matrix_free=False),
+            _route_pins={},
         )
-        solver = SimpleNamespace(model=SimpleNamespace(device=wp.get_device("cpu")), _facts=facts, _route_pins={})
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)
         self.assertEqual(classifier.resolved.shape, (0,))
@@ -467,9 +468,9 @@ class TestResolvedWorlds(unittest.TestCase):
         """Admit persistent patch friction on the dense route, not under torsion or compliance."""
         solver = _admissible_solver()
         self.assertTrue(rw.supported(solver))
-        solver._point_contact_paths = False
+        solver._laws = plain_laws(torsion=True)
         self.assertFalse(rw.supported(solver))
-        solver._patch_dense_paths = True
+        solver._laws = plain_laws(contact="patch")
         self.assertTrue(rw.supported(solver))
         solver._sparse_mass_matrix_size = 23
         self.assertFalse(rw.supported(solver))
@@ -515,17 +516,13 @@ class TestResolvedWorlds(unittest.TestCase):
 def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     solver = SimpleNamespace(
-        _facts=AdmissionFacts(
-            forward_cuda=True, matrix_free=True, plain_sweep=True, regularized=False, velocity_limits=False
-        ),
+        _laws=plain_laws(),
         _mimic_count=0,
         _connect_count=0,
         _preelim_count=0,
         _sparse_mass_matrix_size=None,
         _keyed_rows=None,
         drive_slot=None,
-        _point_contact_paths=True,
-        _patch_dense_paths=False,
         model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
         max_world_dofs=29,
         world_dof_indices=1,

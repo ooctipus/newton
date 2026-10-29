@@ -175,6 +175,7 @@ from .path_selection import (
     options_selection,
     route_selection,
 )
+from .route_table import Laws, capable
 from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import ROW_LAW
 from .solve_policy import SolvePolicy, SolveReadoutRecord
@@ -243,7 +244,7 @@ from .sparse_mass_matrix import (
     row_supports,
 )
 from .staging import STATIC_SHARED_BYTES, arch_budget
-from .step_plan import AdmissionFacts, StepPlan, first_failed
+from .step_plan import StepPlan, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES, CONTACT_TRANSACTIONS
 from .tree_passes import (
     SERIAL_BLOCK_DIM,
@@ -1517,10 +1518,6 @@ class SolverFeatherPGS(SolverBase):
                 "pre-solve zeroing pass for skipped friction rows"
             )
 
-        # MF contacts are one route owned by the unified mode. The internal
-        # names remain because the MF buffers and kernels predate that API.
-        self._mf_warmstart_enabled = self.pgs_warmstart
-        self._mf_warmstart_decay = self.pgs_warmstart_decay
         # Allocated lazily in :meth:`_allocate_mf_buffers` only when enabled.
         self._ws_prev_mf_impulses = None
         self._ws_prev_dt = 0.0
@@ -1675,18 +1672,12 @@ class SolverFeatherPGS(SolverBase):
         configure_contact_torsion(
             self, contact_torsion_radius, contact_torsion_shape_indices, contact_torsion_shape_patterns
         )
-        # The facts the owners' admissions test, computed once (step_plan.AdmissionFacts).
-        self._facts = facts = AdmissionFacts.build(self)
+        # Axis 2 of the route table, the row laws, which every owner's admission reads (route_table.capable).
+        self._laws = laws = Laws.build(self)
         self._setup_passive_joint_forces(model)
         if self.pgs_mode == "matrix_free":
             self._compute_world_response_dof_mapping(model)
         self._setup_fused_diagonal_joint_limits(model)
-        # Owners and consumers that neither write friction rows nor project
-        # friction without the linked normal ring serve point and patch
-        # friction. Producers that write their own friction rows stay
-        # point-only until they write the patch row law. Defined before route
-        # selection so admission can read both.
-        self._law_agnostic_contact_paths = not (self._contact_torsion_enabled or self.contact_compliance)
         # The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
         # on CUDA without gradients wherever each coordinate has one owning drive row. The held tree's admission,
         # which the representations only it evaluates (the compact diagonal, the native sparse factor) read before
@@ -1810,15 +1801,10 @@ class SolverFeatherPGS(SolverBase):
         self._local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.dense_max_constraints)
         self._local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.mf_max_constraints)
         local_budget = arch_budget(model.device.arch) if model.device.is_cuda else 0
-        local_decline = first_failed(
+        local_decline = capable("local", laws) or first_failed(
             (
-                (facts.forward_cuda, "Local owners need CUDA without gradient recording."),
                 (self._has_free_rigid_bodies, "Local owners serve worlds with free rigid bodies; there are none."),
-                (facts.matrix_free, "Local owners solve in matrix-free mode only."),
-                (facts.plain_sweep, f"Local owners need {AdmissionFacts.PLAIN_SWEEP}."),
-                (not facts.velocity_limits, "Local owners do not solve joint velocity-limit rows."),
                 (self._local_solve_max_rows > 0, "dense_max_constraints leaves the local owners no row."),
-                (not self._contact_torsion_enabled, "Local owners do not solve the appended torsion row."),
                 (self._route_pins.get("placement") != "general", "A test pin keeps the general placement."),
             )
         )
@@ -1970,15 +1956,10 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = self._arrays.placeholder(wp.float32, (1, 1), 1.0)
-        self._point_contact_paths = self._law_agnostic_contact_paths and not self._friction_anchors_enabled
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
         # ring and keyed rows write the patch row law, so both can serve point and patch
         # friction (Jacobi sweeps, not the serial patch sweep).
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
-        # Patch friction on the dense route: the paired factor sweep walks patch
-        # contact units, the resolved-world classifier skips worlds whose rows
-        # all separate, and worlds with free rigid bodies keep the dense route.
-        self._patch_dense_paths = bool(self._law_agnostic_contact_paths and self._friction_anchors_enabled)
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -2041,13 +2022,8 @@ class SolverFeatherPGS(SolverBase):
             (
                 (response_pair is not None, "No paired response."),
                 (not self._local_internal_fast_path, "Local owners claim the paired worlds."),
-                (facts.plain_sweep, f"The factor-coordinate sweep needs {AdmissionFacts.PLAIN_SWEEP}."),
-                (not facts.regularized, "The factor-coordinate sweep solves the unregularized law."),
-                (self.pgs_iterations > 0, "The factor-coordinate sweep needs a positive iteration budget."),
-                (not facts.velocity_limits, "The factor-coordinate sweep solves no joint velocity-limit rows."),
-                (not self._contact_torsion_enabled, "The factor-coordinate owner does not solve the torsion row."),
             )
-        )
+        ) or capable("paired_factor", laws)
         self._paired_factor_coordinates = self._factor_coordinates_reason is None
         # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
         # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
@@ -2061,7 +2037,7 @@ class SolverFeatherPGS(SolverBase):
         # Patch contacts are units of one row, or three when they own an anchor;
         # the factor sweep walks them with the generic path's row order and
         # arithmetic, solving each tangent pair once.
-        self._factor_coordinate_contact_units = bool(self._paired_factor_coordinates and self._patch_dense_paths)
+        self._factor_coordinate_contact_units = bool(self._paired_factor_coordinates and laws.patch)
         self._paired_factor_primary_groups_by_world = None
         self._paired_factor_secondary_groups_by_world = None
         self._paired_factor_primary_offsets_by_world = None
@@ -2134,19 +2110,19 @@ class SolverFeatherPGS(SolverBase):
         from . import row_packets  # noqa: PLC0415
 
         self._row_packets = None
-        self._row_packets_reason = first_failed(
-            (
-                (self._sparse_mass_matrix_size is None, "Native sparse factors own the contact rows."),
+        self._row_packets_reason = (
+            first_failed(
                 (
-                    self._law_agnostic_contact_paths,
-                    "Local packets implement the point and patch row laws; torsion and compliance keep ordinary rows.",
-                ),
-                (
-                    self._route_pins.get("producer") in (None, "local_packets"),
-                    "A test pin selects another contact-row producer.",
-                ),
+                    (self._sparse_mass_matrix_size is None, "Native sparse factors own the contact rows."),
+                    (
+                        self._route_pins.get("producer") in (None, "local_packets"),
+                        "A test pin selects another contact-row producer.",
+                    ),
+                )
             )
-        ) or row_packets.decline(self)
+            or capable("row_packets", laws)
+            or row_packets.decline(self)
+        )
         if self._row_packets_reason is None:
             self._row_packets = row_packets.create_owner(self)
             self._row_packets_reason = (
@@ -2256,10 +2232,9 @@ class SolverFeatherPGS(SolverBase):
         # ordinary rows.
         from .compact_contact import supported  # noqa: PLC0415
 
-        if not self._law_agnostic_contact_paths:
-            declined = (
-                "Compact contacts implement the point and patch row laws; torsion and compliance keep ordinary rows."
-            )
+        declined = capable("compact", self._laws)
+        if declined is not None:
+            pass
         elif not supported(self):
             declined = (
                 "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
@@ -3280,7 +3255,7 @@ class SolverFeatherPGS(SolverBase):
             and self.enable_contact_friction
             and not self.enable_joint_velocity_limits
             and not self.pgs_warmstart
-            and not self._mf_warmstart_enabled
+            and not self.pgs_warmstart
             and not self._preelim_active
             and not self._has_free_rigid_bodies
             and not self._debug_buffers_enabled
@@ -3715,50 +3690,38 @@ class SolverFeatherPGS(SolverBase):
         velocity_candidate = (
             self.pgs_mode == "matrix_free" and self.enable_joint_velocity_limits and not self._has_free_rigid_bodies
         )
-        for supported, reason in (
+        declined = capable("packed", self._laws) or first_failed(
             (
-                self._route_pins.get("storage") != "dense",
-                "A test pin keeps dense storage (storage='dense').",
-            ),
-            (model.device.is_cuda, "CPU uses ordinary factors; native sparse factors require CUDA."),
-            (not model.requires_grad, "Gradient recording requires ordinary factors."),
-            (
-                self.pgs_mode == "matrix_free" or split_candidate,
-                "Solver policy or legacy options do not admit the sparse split-row composition.",
-            ),
-            (self.pgs_schedule == "interleaved", "Sparse factors require the interleaved row schedule."),
-            (self.drive_mode == "augmented", "Sparse factors require augmented drives."),
-            (self._parallel_augmented_drive_topology, "Drive topology is not supported by native sparse factors."),
-            (self.pgs_iterations > 0, "Native sparse solving requires a positive iteration budget."),
-            (self.pgs_velocity_iterations == 0, "Separate velocity iterations retain ordinary factors."),
-            (
-                not self.enable_joint_velocity_limits or velocity_candidate,
-                "Velocity-limit policy or legacy options do not admit the sparse velocity-row composition.",
-            ),
-            (
-                not self.pgs_warmstart or not self._has_free_rigid_bodies,
-                "PGS warm starting with free rigid bodies requires the ordinary factor/row composition.",
-            ),
-            (
-                not self._mf_warmstart_enabled or not self._has_free_rigid_bodies,
-                "Matrix-free warm starting requires ordinary factors.",
-            ),
-            (not self._debug_buffers_enabled, "Debug row snapshots require ordinary factors."),
-            (not self._regularization_enabled, "Contact regularization requires ordinary factors."),
-            (not self._preelim_active, "Bilateral pre-elimination requires ordinary factors."),
-            (not self._contact_torsion_enabled, "Contact torsion requires ordinary factors."),
-            (not self.contact_compliance, "Contact compliance requires ordinary factors."),
-            (not self._mimic_count or velocity_candidate, "Mimic rows require the sparse velocity-row composition."),
-            (not self._connect_count, "Connect rows require ordinary factors."),
-            (not self._has_loop_joints, "Loop-joint topology requires ordinary factors."),
-            (
-                not self._sparse_diagonal_contact_solve,
-                "The independent-coordinate contact owner already owns response.",
-            ),
-        ):
-            if not supported:
-                self._sparse_selection_reason = reason
-                return
+                (
+                    self._route_pins.get("storage") != "dense",
+                    "A test pin keeps dense storage (storage='dense').",
+                ),
+                (
+                    self.pgs_mode == "matrix_free" or split_candidate,
+                    "Split mode's sparse rows need the tiled-row sweep and no free bodies.",
+                ),
+                (self._parallel_augmented_drive_topology, "Drive topology is not supported by native sparse factors."),
+                (
+                    not self.enable_joint_velocity_limits or velocity_candidate,
+                    "Velocity-limit rows need matrix-free mode without free bodies on native sparse factors.",
+                ),
+                (
+                    not self.pgs_warmstart or not self._has_free_rigid_bodies,
+                    "PGS warm starting with free rigid bodies requires the ordinary factor/row composition.",
+                ),
+                (
+                    not self._mimic_count or velocity_candidate,
+                    "Mimic rows require the sparse velocity-row composition.",
+                ),
+                (
+                    not self._sparse_diagonal_contact_solve,
+                    "The independent-coordinate contact owner already owns response.",
+                ),
+            )
+        )
+        if declined is not None:
+            self._sparse_selection_reason = declined
+            return
         # Decide ownership before omitting dense buffers. Explicit research
         # recipes retain their own admission and fallback, including when their
         # requested owner later declines the topology. They cannot acquire
@@ -3769,7 +3732,7 @@ class SolverFeatherPGS(SolverBase):
         # not the tier: a paired factor sweep admitted there later excludes the tiers and
         # keyed rows under both laws (_init_tiled_kernels, keyed_rows).
         parallel_tier = self.mf_gs_parallel_rows > 0 and (
-            self._point_contact_paths or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
+            self._laws.point or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
         )
         if parallel_tier:
             self._sparse_selection_reason = "A competing parallel tier reserves the ordinary buffers."
@@ -4800,7 +4763,7 @@ class SolverFeatherPGS(SolverBase):
         # the sorted index, so next step's ``rigid_contact_match_index`` (which
         # references the previous frame's *sorted* index) indexes directly into
         # this table — no matcher permutation access required.
-        if self._mf_warmstart_enabled:
+        if self.pgs_warmstart:
             arrays.allocate(MF_WARMSTART, world=worlds, mf_row=rows)
             pool = getattr(self, "_contact_pool", None)
             if pool is None:
@@ -6461,7 +6424,7 @@ class SolverFeatherPGS(SolverBase):
                 set_output_to_delta=True,
                 body_map_ready=True,
             )
-            if self._mf_warmstart_enabled:
+            if self.pgs_warmstart:
                 # Split stores dense constraints in impulse space, so its RHS
                 # must include the velocity represented by the cached MF
                 # lambdas before the first interleaved dense iteration.
@@ -6571,7 +6534,7 @@ class SolverFeatherPGS(SolverBase):
                     self._ws_prev_dense_row_type.fill_(-1)
                     self._ws_prev_dense_row_parent.fill_(-1)
 
-        if self._mf_warmstart_enabled and self._has_free_rigid_bodies:
+        if self.pgs_warmstart and self._has_free_rigid_bodies:
             with wp.ScopedTimer("S7_MF_Warmstart_Carry", print=False, use_nvtx=self._nvtx, synchronize=self._nvtx):
                 wp.copy(self._ws_prev_mf_impulses, self.mf_impulses)
                 wp.copy(self._ws_prev_mf_row_type, self.mf_row_type)
@@ -7696,7 +7659,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_parent,
                 self.mf_row_mu,
                 self.mf_impulses,
-                self._mf_warmstart_decay if self._mf_warmstart_enabled else 0.0,
+                self.pgs_warmstart_decay if self.pgs_warmstart else 0.0,
             )
 
     def _finalize_constraint_status(self, contacts: Contacts | None) -> None:
@@ -8520,7 +8483,7 @@ class SolverFeatherPGS(SolverBase):
                 # returns early in the gather); here we gather matched contacts'
                 # previous impulses into their current slots by identity. The
                 # carry itself lives in _ws_prev_mf_impulses.
-                if self._mf_warmstart_enabled:
+                if self.pgs_warmstart:
                     match_index = getattr(contacts, "rigid_contact_match_index", None)
                     if match_index is None:
                         raise NotImplementedError(
@@ -8542,7 +8505,7 @@ class SolverFeatherPGS(SolverBase):
                             self._ws_prev_mf_row_parent,
                             self.mf_constraint_count,
                             self._ws_prev_contact_normal,
-                            self._mf_warmstart_decay,
+                            self.pgs_warmstart_decay,
                             # Carried support impulses are proportional to dt, so
                             # rescale by the exact step-size ratio (1 at fixed dt).
                             dt / self._ws_prev_dt if self._ws_prev_dt > 0.0 else 1.0,
@@ -9002,7 +8965,7 @@ class SolverFeatherPGS(SolverBase):
                 self._ink_sizes, self._ink_reason = self._build_inkernel_response_meta()
             if self._ink_sizes is not None:
                 self._ink_rows = rows
-        if not self._ink_rows and tiers and self.mf_gs_incremental_rows > 0 and self._law_agnostic_contact_paths:
+        if not self._ink_rows and tiers and self.mf_gs_incremental_rows > 0 and self._laws.agnostic:
             self._incremental_rows = min(int(self.dense_max_constraints), int(self.mf_gs_incremental_rows), 64)
 
     def _build_inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
@@ -9069,14 +9032,15 @@ class SolverFeatherPGS(SolverBase):
         solve the unregularized law, so the worlds they own would drop
         ``pgs_contact_regularization`` while the serial sweeps apply it.
         """
-        if self._regularization_enabled:
+        laws = self._laws
+        if laws.regularized:
             return False, (
                 "Contact regularization keeps serial sweeps and ordinary rows: the parallel tiers, which keyed rows "
                 "feed, solve the unregularized law, and the serial sweeps apply pgs_contact_regularization."
             )
-        if self._point_contact_paths:
+        if laws.point:
             return True, "Point friction: parallel tiers and keyed rows serve it."
-        if not self._law_agnostic_contact_paths:
+        if not laws.agnostic:
             return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
@@ -9683,7 +9647,7 @@ class SolverFeatherPGS(SolverBase):
         body_map_ready: bool = False,
     ) -> None:
         """Install cached MF impulse response into a live velocity state."""
-        if not self._mf_warmstart_enabled or not self._has_free_rigid_bodies:
+        if not self.pgs_warmstart or not self._has_free_rigid_bodies:
             return
         if not body_map_ready:
             self._build_mf_body_map()

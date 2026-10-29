@@ -161,9 +161,9 @@ def torsion_neutral_route(solver):
     """Return a solver's route record without the entries that name its torsion configuration.
 
     A zero-radius solver and a positive-radius solver with no shape selected differ by construction
-    only in the torsion options, the friction record's torsion flag, the point-contact flag and the
-    parallel-row admission that torsion clears, and the torsion specialization of the matrix-free
-    sweep kernel. Reasons are text and lane timings are measurements; every other selection and
+    only in the torsion options, the friction record's torsion flag, the point-contact flag, the
+    laws record's torsion law and the law-agnostic flag it clears, the parallel-row admission that
+    torsion clears, and the torsion specialization of the matrix-free sweep kernel. Reasons are text and lane timings are measurements; every other selection and
     applied option must match. Of the parallel-row record only the admission flag is dropped: the
     zero-radius arm's is admitted under either friction law, and
     :func:`assert_torsion_neutral_routes` requires the torsion arm's to be False.
@@ -176,6 +176,8 @@ def torsion_neutral_route(solver):
     del routes["friction"]["torsion"]
     del routes["friction"]["parallel_rows"]["admitted"]
     del routes["contact_rows"]["point_contact_paths"]
+    for name in ("torsion", "agnostic"):
+        del routes["laws"][name]
     if routes["sweep"]["mf_gs"] is not None:
         routes["sweep"]["mf_gs"] = routes["sweep"]["mf_gs"].replace("_torsion", "")
     return record

@@ -42,6 +42,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.route_table import Laws
 
 GRAVITY = 9.81
 """Magnitude of the default gravity [m/s²]."""
@@ -52,6 +53,32 @@ step's travel in every scene but the drop, whose shapes widen it, and bounds the
 
 SELF = -1
 """Collision group of an articulation's shapes: they collide with everything except each other."""
+
+
+def plain_laws(**changes) -> Laws:
+    """The row laws of a CUDA matrix-free solver with joint limits and point friction (the plain sweep), with
+    ``changes``: the laws a stand-in solver of the admission tests carries."""
+    laws = {
+        "contact": "point",
+        "regularized": False,
+        "torsion": False,
+        "compliance": False,
+        "limits": True,
+        "velocity_limits": False,
+        "drives": "augmented",
+        "schedule": "interleaved",
+        "velocity_pass": False,
+        "warm_start": False,
+        "debug_rows": False,
+        "preelimination": False,
+        "mimic": False,
+        "connect": False,
+        "loops": False,
+        "iterations": True,
+        "forward_cuda": True,
+        "matrix_free": True,
+    }
+    return Laws(**{**laws, **changes})
 
 
 @dataclasses.dataclass(frozen=True)
