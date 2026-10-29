@@ -33,7 +33,7 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
@@ -1006,7 +1006,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = s_impulse[i];
 #endif
 """
-    preludes = (lane_group(L), RING, *law_preludes(PROJECTION_LAW), *sweep.policy.preludes)
+    preludes = (lane_group(L), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *sweep.policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 

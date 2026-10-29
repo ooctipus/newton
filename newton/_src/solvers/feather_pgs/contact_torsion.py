@@ -23,6 +23,7 @@ import warp as wp
 
 from ...geometry import GeoType
 from ...utils.selection import match_labels
+from .capture_joins import capturing
 from .dense_rows import RowSupport
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -297,7 +298,7 @@ def _group_budget(solver, group, row_mu):
 def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
     _validate_torsion_mode(solver)
-    if wp.get_stream(solver.model.device).is_capturing:
+    if capturing(solver.model.device):
         device = getattr(solver, "_device_torsion", None)
         if device is None or not device.deferred_errors:
             raise RuntimeError("Contact torsion graph capture requires device preparation with deferred validation")

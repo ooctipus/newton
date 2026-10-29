@@ -128,7 +128,7 @@ class TestLocalOwnedRoute(unittest.TestCase):
         body, _ = sweep_routes_local.local_owned_source(
             192, 9, 9, lanes_per_world=8, contact_capable=False, warps_per_block=2
         )
-        self.assertIn("__shared__ LocalScratch localscratch[8];", body)
+        self.assertIn("SHARED LocalScratch localscratch[8];", body)
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
         self.assertIn("#undef s_A", body)
         # Every local owner stages the factor's reciprocal diagonal and multiplies by it, contactless ones included.

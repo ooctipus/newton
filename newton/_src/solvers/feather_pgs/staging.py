@@ -8,8 +8,8 @@ its row metadata) in shared memory. :class:`Staging` declares that set once,
 buffer by buffer, and everything a launch site needs follows from the
 declaration instead of being mirrored by hand:
 
-- :meth:`Staging.declarations` writes the ``__shared__`` declarations, one
-  array per buffer, or, for several lane groups per block, one struct per group
+- :meth:`Staging.declarations` writes the declarations in ``SHARED`` storage
+  (CUDA's shared memory, the stack of the CPU's one thread), one array per buffer, or, for several lane groups per block, one struct per group
   with an alias per buffer (``#define name scratch[group].name``), or (the
   ``arrays`` layout) one array per buffer of every group's copies with a
   pointer to the group's own, so the body reads every buffer by its own name;
@@ -60,6 +60,10 @@ __all__ = [
 STATIC_SHARED_BYTES = 48 * 1024
 """Static shared memory a block may declare in an offline build [B]: ptxas 13.2 rejects more on every architecture
 (0xc000)."""
+
+CPU_STAGING_BYTES = 4 * 1024 * 1024
+"""The working set a CPU block may declare [B]: the CPU's one thread runs the block and keeps it on its stack (an
+automatic array), so no shared-memory budget applies; this bound keeps a block well inside a thread's stack."""
 
 RESERVED_SHARED_BYTES = 1024
 """Shared memory the driver reserves in every block [B] (sm_80 and later), out of the opt-in maximum per block."""
@@ -156,13 +160,23 @@ def static_budget(arch: int) -> int:
     return STATIC_SHARED_BYTES
 
 
+def factor_budget(device) -> int:
+    """The static working set a block of a factor build may declare on ``device`` [B]: the offline limit, or less on a
+    CUDA device that loads less; :data:`CPU_STAGING_BYTES` on the CPU."""
+    if not device.is_cuda:
+        return CPU_STAGING_BYTES
+    return min(STATIC_SHARED_BYTES, int(device.max_shared_memory_per_block))
+
+
 def arch_budget(device_arch) -> int:
-    """:func:`static_budget` of a kernel factory's ``device_arch`` (a CUDA architecture number, or none for the CPU)."""
+    """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`static_budget` of a CUDA
+    architecture number, :data:`CPU_STAGING_BYTES` for the CPU (architecture 0) and :data:`STATIC_SHARED_BYTES` for an
+    offline build that names none."""
     try:
         arch = int(str(device_arch).removeprefix("sm_"))
     except (TypeError, ValueError):
         return STATIC_SHARED_BYTES
-    return static_budget(arch) if arch > 0 else STATIC_SHARED_BYTES
+    return static_budget(arch) if arch > 0 else CPU_STAGING_BYTES
 
 
 def resident_blocks(block_bytes: int, device_arch=None) -> int:
@@ -268,9 +282,9 @@ class Staging:
                 f"{int(limit)}-byte limit"
             )
 
-    def declarations(self, indent: str = "    ", *, group: str = "SUB", storage: str = "__shared__") -> str:
-        """The declarations of the working set, in ``storage`` (CUDA's ``__shared__``; ``SHARED`` for a body that
-        also runs on the CPU, where :data:`.device_preludes.SHARED_STORAGE` makes it the stack of the one thread).
+    def declarations(self, indent: str = "    ", *, group: str = "SUB") -> str:
+        """The declarations of the working set in ``SHARED`` storage: CUDA's shared memory, or the stack of the CPU's
+        one thread. A body that declares them declares the prelude :data:`.device_preludes.SHARED_STORAGE`.
 
         One array per buffer; with several lane groups per block, one struct of
         the buffers per group, indexed by ``group``, and an alias per buffer
@@ -281,7 +295,7 @@ class Staging:
         if not self.buffers:
             return ""
         if self.groups == 1:
-            return "\n".join(f"{indent}{storage} {buffer.declaration()}" for buffer in self.buffers)
+            return "\n".join(f"{indent}SHARED {buffer.declaration()}" for buffer in self.buffers)
         if self.layout == "arrays":
             arrays = (
                 dataclasses.replace(buffer, name=f"{buffer.name}_storage", count=buffer.count * self.groups)
@@ -291,14 +305,14 @@ class Staging:
                 f"{indent}{buffer.ctype}* {buffer.name} = {buffer.name}_storage + {group} * {buffer.count};"
                 for buffer in self.buffers
             )
-            return "\n".join((*(f"{indent}{storage} {array.declaration()}" for array in arrays), *views))
+            return "\n".join((*(f"{indent}SHARED {array.declaration()}" for array in arrays), *views))
         members = "\n".join(f"{indent}    {buffer.declaration()}" for buffer in self.buffers)
         aliases = "\n".join(
             f"#define {buffer.name} {self.name.lower()}[{group}].{buffer.name}" for buffer in self.buffers
         )
         return (
             f"{indent}struct {self.name} {{\n{members}\n{indent}}};\n"
-            f"{indent}{storage} {self.name} {self.name.lower()}[{self.groups}];\n{aliases}"
+            f"{indent}SHARED {self.name} {self.name.lower()}[{self.groups}];\n{aliases}"
         )
 
     def undefine(self) -> str:

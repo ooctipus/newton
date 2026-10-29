@@ -23,7 +23,7 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
@@ -317,6 +317,7 @@ def local_owned_source(
 """
     preludes = (
         lane_group(L),
+        SHARED_STORAGE,
         *((RING,) if contact_capable else ()),
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW),
@@ -647,7 +648,7 @@ def paired_factor_source(
 {staging.undefine()}
 #endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 

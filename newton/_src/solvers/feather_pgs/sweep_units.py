@@ -41,7 +41,7 @@ import numpy as np
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import cuda_native, lane_group
+from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
@@ -522,7 +522,7 @@ def build_units_kernel(
     return KernelTemplate(
         f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}",
         params,
-        cuda_native(source, preludes=(lane_group(32),)),
+        cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
         dispatch=kernel_template.WORLDS,
         composed=True,
         native_name="sweep_units_native",

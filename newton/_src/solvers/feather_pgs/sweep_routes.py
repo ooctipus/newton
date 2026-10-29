@@ -16,7 +16,7 @@ import warp as wp
 
 from . import kernel_template, sweep_units
 from .contact_torsion import torque_sweep_source
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .law_source import law_preludes
@@ -840,7 +840,14 @@ def mf_gs_source(
     }}
 {end_first_warp}#endif
 """
-    preludes = (lane_group(32), RING, PACKED_SIDES, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    preludes = (
+        lane_group(32),
+        SHARED_STORAGE,
+        RING,
+        PACKED_SIDES,
+        *law_preludes(PROJECTION_LAW),
+        *solve_policy.preludes,
+    )
     return cuda_native(body, preludes=preludes), staging
 
 

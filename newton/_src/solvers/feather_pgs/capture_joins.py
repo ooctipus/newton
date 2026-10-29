@@ -3,10 +3,21 @@
 
 """Ask which graph capture records a stream.
 
-:func:`capture_id` names the capture a host decision was recorded in.
+:func:`capturing` tells whether a device's current stream records a graph, and :func:`capture_id` names the capture
+a host decision was recorded in. The CPU records none.
 """
 
 import warp as wp
+
+
+def capturing(device) -> bool:
+    """Whether ``device``'s current stream records a CUDA graph (never on the CPU, which has no stream).
+
+    Args:
+        device: The Warp device whose current stream may be capturing.
+    """
+    device = wp.get_device(device)
+    return bool(device.is_cuda and wp.get_stream(device).is_capturing)
 
 
 def capture_id(device) -> int:

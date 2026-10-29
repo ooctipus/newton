@@ -22,7 +22,7 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
@@ -236,7 +236,13 @@ def parallel_source(
 #endif
 """
     row_preludes = operands.preludes if operands is not None else ()
-    preludes = (lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes, *law_preludes(PROJECTION_LAW))
+    preludes = (
+        lane_group(NT),
+        SHARED_STORAGE,
+        *((RING,) if linked_rows else ()),
+        *row_preludes,
+        *law_preludes(PROJECTION_LAW),
+    )
     return cuda_native(body, preludes=(*preludes, *solve_policy.preludes)), staging
 
 

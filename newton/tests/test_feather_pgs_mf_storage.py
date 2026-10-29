@@ -75,7 +75,7 @@ def _row_metadata_read_globally(source):
     ``s_meta_dense[r] & mask`` reads ``world_row_type[r]`` and ``(s_meta_dense[r] >> bits) - 1``
     reads ``world_row_parent[r]``. The declaration and the load-time packing then go.
     """
-    source = re.sub(r"\n\s*__shared__ int s_meta_dense\[\d+\];\n", "\n", source)
+    source = re.sub(r"\n\s*SHARED int s_meta_dense\[\d+\];\n", "\n", source)
     source = re.sub(
         r"\s*int row_type = world_row_type\.data\[off_dense \+ i\];"
         r"\s*int row_parent = world_row_parent\.data\[off_dense \+ i\];"
@@ -321,7 +321,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 resident = _streamed_source(**options, resident_row_metadata=True)
                 rows = options.get("max_constraints", _LARGE_STREAMED_SHAPE["max_constraints"])
                 self.assertNotIn("s_meta_dense", streamed)
-                self.assertEqual(resident.count(f"__shared__ int s_meta_dense[{rows}];"), 1)
+                self.assertEqual(resident.count(f"SHARED int s_meta_dense[{rows}];"), 1)
                 self.assertIn("int row_type = s_meta_dense[i] &", resident)
                 # The limit scans' row-type reads stay global, as in the streamed source.
                 self.assertNotIn("(s_meta_dense[i] &", resident)
@@ -331,7 +331,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 )
                 # The float metadata streams in both.
                 shared = ["s_v", "s_lam_dense"] + ([] if options.get("stream_mf_impulses") else ["s_lam_mf"])
-                self.assertEqual(re.findall(r"__shared__ float\s+(\w+)", resident), shared)
+                self.assertEqual(re.findall(r"SHARED float\s+(\w+)", resident), shared)
                 self.assertEqual(_row_metadata_read_globally(resident), streamed)
         # Patch rings walk the resident array.
         self.assertIn("return ((s_meta_dense[patch_row] >> 3) - 1);", _streamed_source(resident_row_metadata=True))
@@ -371,7 +371,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         resident = factory(*shape, shared_metadata=False, resident_row_metadata=True, **options)
         self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_skiptier32")
         self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_smeta_skiptier32")
-        self.assertEqual(max(_native_snippets(resident), key=len).count("__shared__ int s_meta_dense[2304];"), 1)
+        self.assertEqual(max(_native_snippets(resident), key=len).count("SHARED int s_meta_dense[2304];"), 1)
         self.assertEqual(
             list(inspect.signature(resident.func).parameters), list(inspect.signature(streamed.func).parameters)
         )
@@ -423,7 +423,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 )
                 source = max(_native_snippets(kernel), key=len)
                 self.assertIn("_glambda", kernel.key)
-                self.assertNotIn("__shared__ float s_lam_mf", source)
+                self.assertNotIn("SHARED float s_lam_mf", source)
                 self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
                 self.assertIn("READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
                 for line in source.splitlines():

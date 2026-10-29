@@ -69,6 +69,7 @@ from . import (
 )
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
+from .capture_joins import capturing
 from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
@@ -244,7 +245,7 @@ from .sparse_mass_matrix import (
     factor_indices,
     row_supports,
 )
-from .staging import STATIC_SHARED_BYTES, arch_budget
+from .staging import arch_budget, factor_budget
 from .step_plan import StepPlan, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES, CONTACT_TRANSACTIONS
 from .tree_passes import (
@@ -2175,7 +2176,7 @@ class SolverFeatherPGS(SolverBase):
         if self._tree_kinetic_state is None:
             self._parallel_augmented_drive_topology = False
         self._articulation_dynamics_stream = (
-            wp.Stream(model.device) if self._parallel_augmented_drive_topology else None
+            wp.Stream(model.device) if self._parallel_augmented_drive_topology and model.device.is_cuda else None
         )
 
         # Worlds whose every candidate row separates at the predictor skip row
@@ -2329,7 +2330,7 @@ class SolverFeatherPGS(SolverBase):
         preparation = getattr(self, "_device_torsion", None)
         if preparation is None:
             raise RuntimeError("Contact torsion graph capture requires the device-resident torsion preparation")
-        if wp.get_stream(self.model.device).is_capturing:
+        if capturing(self.model.device):
             raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
         preparation.validate()
         preparation.deferred_errors = True
@@ -2345,7 +2346,7 @@ class SolverFeatherPGS(SolverBase):
         """
         preparation = getattr(self, "_device_torsion", None)
         if preparation is not None:
-            if wp.get_stream(self.model.device).is_capturing:
+            if capturing(self.model.device):
                 raise RuntimeError("Validate contact torsion outside CUDA graph capture")
             preparation.validate()
 
@@ -3753,7 +3754,7 @@ class SolverFeatherPGS(SolverBase):
             )
             return
         # The factor build's warps share a block within the offline static budget.
-        shared_limit = min(STATIC_SHARED_BYTES, int(model.device.max_shared_memory_per_block))
+        shared_limit = factor_budget(model.device)
         shared_bytes_per_warp = 4 * (2 * plan.nonzero_count + 6 * size)
         self._sparse_factor_warps_per_block = min(
             _CRBA_CHOLESKY_WARPS_PER_BLOCK,
@@ -6474,7 +6475,7 @@ class SolverFeatherPGS(SolverBase):
 
         if self._contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
             self._device_torsion.end_step(state_out)
-            if self._device_torsion.deferred_errors and not wp.get_stream(self.model.device).is_capturing:
+            if self._device_torsion.deferred_errors and not capturing(self.model.device):
                 self.validate_contact_torsion()
         self._step += 1
         return state_out
@@ -6878,7 +6879,7 @@ class SolverFeatherPGS(SolverBase):
         dynamics_stream = self._articulation_dynamics_stream
         if dynamics_stream is not None:
             dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
-        with wp.ScopedStream(dynamics_stream or wp.get_stream(model.device), sync_enter=False):
+        with wp.ScopedStream(dynamics_stream, sync_enter=False):
             scalar = getattr(self._tree_kinetic_state, "scalar", None)
             if scalar is not None:
                 # Scalar branches evaluate their drives in their predict.

@@ -230,6 +230,10 @@ def factor_coordinates_kernel() -> wp.Kernel:
 _WARP_FACTOR = """
     const int group = tid >> 5;
     if (group >= n_arts) return;
+#if !defined(__CUDA_ARCH__)
+    // The CPU runs a warp's lanes on its first thread: the launch's other threads of the warp have no work.
+    if ((tid & 31) != 0) return;
+#endif
 
     const int articulation = group_to_art.data[group];
     if (mass_update_mask.data[articulation] == 0) return;
@@ -319,7 +323,7 @@ def factor_warps_kernel(
         DOFS=size,
         ELEMENTS=elements,
         LOWER=size * (size + 1) // 2,
-        STAGING=staging.declarations(storage="SHARED"),
+        STAGING=staging.declarations(),
         GEOMETRY_ROW=row,
         GEOMETRY_STRIDE=geometric_stride or max(geometric_index) + 1,
         FACTOR=_indent(factor.factor(), "        "),
@@ -607,7 +611,7 @@ for (int d = 0; d < N_; ++d) {
         f"dense_response_warps_{N}_{M}{suffix}",
         params,
         body,
-        preludes=(lane_group(32),),
+        preludes=(lane_group(32), SHARED_STORAGE),
         native_name="grouped_hinv_jt_native",
     ).kernel()
 

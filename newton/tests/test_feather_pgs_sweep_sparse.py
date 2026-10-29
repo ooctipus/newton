@@ -117,8 +117,8 @@ def _variant(name: str, prefix: str) -> str:
 
 
 def _shared_arrays(snippet: str) -> list:
-    """The ``(type, elements)`` of a snippet's ``__shared__`` arrays, sorted."""
-    arrays = re.findall(r"__shared__ ((?:unsigned |signed )?\w+) \w+\[(\d+)\];", snippet)
+    """The ``(type, elements)`` of a snippet's ``SHARED`` arrays (its staging), sorted."""
+    arrays = re.findall(r"SHARED ((?:unsigned |signed )?\w+) \w+\[(\d+)\];", snippet)
     return sorted((ctype, int(count)) for ctype, count in arrays)
 
 

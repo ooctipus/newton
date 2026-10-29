@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, ContactPool
+from .capture_joins import capturing
 from .contact_laws import contact_bodies, contact_points_oracle, oracle_dot3
 from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
 from .dense_rows import RowSupport, jacobian_row
@@ -495,7 +496,7 @@ class DeviceTorsionPreparation:
             return
         names = ("body_q", "body_qd", "body_qdd", "joint_q", "joint_qd", "particle_q", "particle_qd")
         if self._saved_state is None:
-            if self.solver.model.device.is_cuda and wp.get_stream(self.solver.model.device).is_capturing:
+            if capturing(self.solver.model.device):
                 raise RuntimeError("Warm up device torsion state buffers before graph capture")
             self._saved_state = {
                 name: wp.empty_like(getattr(state_in, name))
@@ -544,7 +545,7 @@ class DeviceTorsionPreparation:
         Unlike the host oracle, device preparation does not refresh Python
         dictionaries each step. Return a fresh snapshot only when requested.
         """
-        if self.solver.model.device.is_cuda and wp.get_stream(self.solver.model.device).is_capturing:
+        if capturing(self.solver.model.device):
             raise RuntimeError("Read torsion statistics outside graph capture")
         self.validate()
         names = ("world", "slot", "group", "spin_row", "lead", "anchor", "shape_a", "shape_b", "gap", "coefficient")
@@ -701,7 +702,7 @@ def enable_device_torsion(solver, *, deferred_errors=False):
     """
     if not solver._contact_torsion_enabled:
         raise ValueError("Enable a positive contact_torsion_radius before device preparation")
-    if wp.get_stream(solver.model.device).is_capturing:
+    if capturing(solver.model.device):
         raise RuntimeError("Configure device torsion before CUDA graph capture")
     solver._device_torsion = DeviceTorsionPreparation(solver, deferred_errors=deferred_errors)
     solver._torsion_stats = {"device_resident": True, "rows": None, "groups": None}

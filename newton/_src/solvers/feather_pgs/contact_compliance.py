@@ -20,6 +20,8 @@ import math
 import numpy as np
 import warp as wp
 
+from .capture_joins import capturing
+
 
 def material_coefficients(stiffness, damping, friction_scale, *, shape_friction=0.0):
     """Resolve one hydro contact's material fields with explicit SI semantics.
@@ -83,7 +85,7 @@ def validate_configuration(model, settings):
 
 def validate_step(solver):
     """Reject unqualified combinations before any contact preprocessing."""
-    if wp.get_stream(solver.model.device).is_capturing:
+    if capturing(solver.model.device):
         raise RuntimeError("contact_compliance does not support CUDA graph capture")
     if getattr(solver, "contact_torsion_radius", 0.0) > 0:
         raise ValueError("contact_compliance is not validated with contact_torsion_radius > 0")

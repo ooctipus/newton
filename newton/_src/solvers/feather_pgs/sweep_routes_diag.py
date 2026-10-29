@@ -18,7 +18,7 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
@@ -484,7 +484,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {limit_stores}
 #endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 
