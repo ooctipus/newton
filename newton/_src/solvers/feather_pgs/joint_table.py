@@ -38,35 +38,78 @@ JOINTS = (
     Field("art_to_world", wp.int32, ("articulation",)),
 )
 """The model's joint topology and effort limits, the drive gains and velocity and position limits the solver's rows
-read (its kinematic state's effective arrays: none on a prescribed coordinate), and the solver's articulation
-coordinate starts, coordinate counts and worlds."""
+read (the effective row data it publishes every step, :func:`publish_effective`: none on a prescribed coordinate), and
+the solver's articulation coordinate starts, coordinate counts and worlds."""
 
 JointTable = field_group.struct("JointTable", JOINTS, __name__)
 
-EFFECTIVE = {
-    "joint_limit_lower": lambda values: np.full_like(values, -np.inf),
-    "joint_limit_upper": lambda values: np.full_like(values, np.inf),
-    "joint_velocity_limit": np.zeros_like,  # a non-positive velocity limit is no limit (row_laws.velocity_limit_active)
-    "joint_target_ke": np.zeros_like,
-    "joint_target_kd": np.zeros_like,
-}
-"""The per-coordinate row data a prescribed (kinematic) coordinate gives no row: each model array's value there
-(infinite position limits; no velocity limit; no drive). The solver holds them as private copies (``_name``)."""
+EFFECTIVE = ("joint_limit_lower", "joint_limit_upper", "joint_velocity_limit", "joint_target_ke", "joint_target_kd")
+"""The per-coordinate row data the rows read: the model's arrays, but none on a prescribed (kinematic) coordinate
+(:func:`publish_effective`). The solver holds them as private arrays (``_name``)."""
 
 
-def effective(model, prescribed: np.ndarray | None = None) -> dict[str, np.ndarray]:
-    """The effective row data of :data:`EFFECTIVE` the model holds, by name: its arrays with the values of a prescribed
-    coordinate where ``prescribed`` (a coordinate mask) is set."""
-    data = {}
-    for name, value in EFFECTIVE.items():
-        source = getattr(model, name, None)
-        if source is None:
-            continue
-        values = source.numpy().copy()
-        if prescribed is not None:
-            mask = np.asarray(prescribed) != 0
-            values[mask] = value(values[mask])
-        data[name] = values
+@wp.kernel
+def _publish_effective_kernel(
+    prescribed: wp.array[wp.int32],
+    lower: wp.array[wp.float32],
+    upper: wp.array[wp.float32],
+    velocity_limit: wp.array[wp.float32],
+    ke: wp.array[wp.float32],
+    kd: wp.array[wp.float32],
+    effective_lower: wp.array[wp.float32],
+    effective_upper: wp.array[wp.float32],
+    effective_velocity_limit: wp.array[wp.float32],
+    effective_ke: wp.array[wp.float32],
+    effective_kd: wp.array[wp.float32],
+):
+    dof = wp.tid()
+    if prescribed[dof] != 0:
+        # Infinite position limits, no velocity limit (a non-positive limit is none,
+        # row_laws.velocity_limit_active) and no drive: no row on this coordinate alone.
+        effective_lower[dof] = float(-wp.inf)
+        effective_upper[dof] = float(wp.inf)
+        effective_velocity_limit[dof] = 0.0
+        effective_ke[dof] = 0.0
+        effective_kd[dof] = 0.0
+    else:
+        effective_lower[dof] = lower[dof]
+        effective_upper[dof] = upper[dof]
+        effective_velocity_limit[dof] = velocity_limit[dof]
+        effective_ke[dof] = ke[dof]
+        effective_kd[dof] = kd[dof]
+
+
+def publish_effective(model, prescribed: wp.array, effective: dict[str, wp.array]) -> None:
+    """Write the effective row data of :data:`EFFECTIVE` into ``effective`` (by name) from the model's live arrays.
+
+    A prescribed (kinematic) coordinate is outside the solver's unknowns: a row supported on it alone (a position or
+    velocity limit, a PhysX drive) has a response of the 1e10 armature's size against its cfm and no fixed point, as
+    its impulse grows with every sweep. Where ``prescribed`` (the kinematic coordinate mask) is set, the position
+    limits are therefore infinite and the velocity limit and drive gains zero (unlimited, undriven); rows that couple
+    it with dynamic coordinates (contacts, mimic, connect) stay. Elsewhere the model's values pass through, so the
+    solver, which publishes every step, reads a write to the model without a notification.
+    """
+    if not model.joint_dof_count:
+        return
+    wp.launch(
+        _publish_effective_kernel,
+        dim=model.joint_dof_count,
+        inputs=[prescribed, *(getattr(model, name) for name in EFFECTIVE)],
+        outputs=[effective[name] for name in EFFECTIVE],
+        device=model.device,
+    )
+
+
+def effective(model, prescribed=None) -> dict[str, wp.array]:
+    """New arrays of the effective row data of :data:`EFFECTIVE`, published once from the model (with ``prescribed``,
+    a coordinate mask, else no prescribed coordinate): what a joint table bound from a model rather than from a solver
+    takes."""
+    if prescribed is None:
+        prescribed = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
+    elif not isinstance(prescribed, wp.array):
+        prescribed = wp.array(np.asarray(prescribed, dtype=np.int32), dtype=wp.int32, device=model.device)
+    data = {name: wp.empty_like(getattr(model, name)) for name in EFFECTIVE}
+    publish_effective(model, prescribed, data)
     return data
 
 

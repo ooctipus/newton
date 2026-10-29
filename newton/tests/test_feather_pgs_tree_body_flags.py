@@ -553,7 +553,8 @@ def _held_operator(model, arts, parents, counts, **attributes):
 
 
 class TestEffectiveRowData(unittest.TestCase):
-    """The per-coordinate row data a prescribed coordinate gives no row (joint_table.effective), on the host."""
+    """The per-coordinate row data the rows read, published from the live model arrays (joint_table.publish_effective):
+    none on a prescribed coordinate."""
 
     def test_a_prescribed_coordinate_gives_no_limit_or_drive(self):
         """A kinematic link's coordinate takes infinite position limits, no velocity limit and no drive gains."""
@@ -567,7 +568,7 @@ class TestEffectiveRowData(unittest.TestCase):
         model = scene.finalize(device="cpu")
         prescribed = np.zeros(model.joint_dof_count, dtype=np.int32)
         prescribed[6] = 1
-        data = joint_table.effective(model, prescribed)
+        data = {name: array.numpy() for name, array in joint_table.effective(model, prescribed).items()}
         self.assertEqual((data["joint_limit_lower"][6], data["joint_limit_upper"][6]), (-np.inf, np.inf))
         self.assertEqual(
             (data["joint_velocity_limit"][6], data["joint_target_ke"][6], data["joint_target_kd"][6]), (0.0, 0.0, 0.0)
@@ -575,7 +576,7 @@ class TestEffectiveRowData(unittest.TestCase):
         np.testing.assert_array_equal(data["joint_limit_lower"][:6], model.joint_limit_lower.numpy()[:6])
 
     def test_a_model_source_must_pass_the_effective_data(self):
-        """The joint table reads the solver's private copies: an upload from a model raises unless it passes them."""
+        """The joint table reads the solver's published row data: an upload from a model raises unless it passes it."""
         scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         link = scene.add_link(mass=1.0, inertia=INERTIA)
         scene.add_articulation([scene.add_joint_revolute(-1, link, axis=newton.Axis.Y, limit_lower=-0.2)])
@@ -584,6 +585,61 @@ class TestEffectiveRowData(unittest.TestCase):
             field_group.upload(joint_table.JointTable, "cpu", model)
         table = field_group.upload(joint_table.JointTable, "cpu", model, **joint_table.effective(model))
         self.assertAlmostEqual(float(table.joint_limit_lower.numpy()[0]), -0.2, places=6)
+
+    def test_model_writes_reach_the_rows_without_a_notification(self):
+        """Gains and limits written to the model mid-run reach the rows at the next step, with no notification.
+
+        Each step publishes the row data from the live model arrays, so a write the model change flags do not
+        announce (a velocity limit) or that the caller does not announce (Isaac Lab's runtime gain writes) is read;
+        a prescribed coordinate keeps no limit and no drive whatever the model holds.
+        """
+        written = {
+            "joint_limit_lower": [-0.3, -0.2, -0.1],
+            "joint_limit_upper": [0.1, 0.2, 0.3],
+            "joint_velocity_limit": [1.5, 2.5, 3.5],
+            "joint_target_ke": [7.0, 8.0, 9.0],
+            "joint_target_kd": [0.7, 0.8, 0.9],
+        }
+        none = {
+            "joint_limit_lower": -np.inf,
+            "joint_limit_upper": np.inf,
+            "joint_velocity_limit": 0.0,
+            "joint_target_ke": 0.0,
+            "joint_target_kd": 0.0,
+        }
+        for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
+            with self.subTest(device=device):
+                # A chain of three hinges whose root link is kinematic: its coordinate is prescribed.
+                scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                links = [scene.add_link(mass=1.0, inertia=INERTIA, is_kinematic=index == 0) for index in range(3)]
+                joints = [
+                    scene.add_joint_revolute(
+                        links[index - 1] if index else -1,
+                        link,
+                        axis=newton.Axis.Y,
+                        limit_lower=-0.5,
+                        limit_upper=0.5,
+                        target_ke=4.0,
+                        target_kd=0.5,
+                    )
+                    for index, link in enumerate(links)
+                ]
+                scene.add_articulation(joints)
+                model = scene.finalize(device=device)
+                solver = SolverFeatherPGS(model, angular_damping=0.0)
+                state, out, control = model.state(), model.state(), model.control()
+                solver.step(state, out, control, None, 1.0e-3)
+                for name, values in written.items():
+                    getattr(model, name).assign(np.asarray(values, np.float32))
+                solver.step(out, state, control, None, 1.0e-3)
+                table = joint_table.bind(solver)
+                for name, values in written.items():
+                    published = getattr(solver, "_" + name)
+                    # The joint table the rows read holds the published array: none on the prescribed coordinate,
+                    # the written values on the dynamic ones.
+                    self.assertEqual(getattr(table, name).ptr, published.ptr, name)
+                    self.assertEqual(float(published.numpy()[0]), none[name], name)
+                    np.testing.assert_allclose(published.numpy()[1:], values[1:], rtol=1.0e-6, err_msg=name)
 
 
 class TestTreePlanKinematicBodies(unittest.TestCase):

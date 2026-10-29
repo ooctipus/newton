@@ -1572,12 +1572,13 @@ class SolverFeatherPGS(SolverBase):
         self._joint_forest = _joint_forest(model)
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
-        # The per-coordinate gains and limits the rows read (_kinematic_state): the model's, with none on a prescribed
-        # coordinate.
-        for name in joint_table.EFFECTIVE:
-            source = getattr(model, name, None)
-            setattr(self, "_" + name, None if source is None else wp.clone(source))
+        # The per-coordinate gains and limits the rows read: the model's live arrays, with none on a prescribed
+        # coordinate, published every step (joint_table.publish_effective).
+        self._effective_rows = {name: wp.empty_like(getattr(model, name)) for name in joint_table.EFFECTIVE}
+        for name, array in self._effective_rows.items():
+            setattr(self, "_" + name, array)
         self._apply_kinematic_state(self._kinematic_state())
+        joint_table.publish_effective(model, self._kinematic_dof_mask, self._effective_rows)
         # Prescribed-response elision removes fully-kinematic free bases from
         # the compact response mapping of the matrix-free rows.
         self._model_plan = _FeatherPGSModelPlan.build(
@@ -2352,22 +2353,17 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Validate contact torsion outside CUDA graph capture")
             preparation.validate()
 
-    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor, dict[str, np.ndarray]]:
-        """Derive the kinematic masks, effective joint armature and effective row data from the body flags, changing
-        nothing.
+    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
+        """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
 
         The effective armature also holds the least armature that keeps the mass matrix of a deep
         articulation within float32 factorization (:func:`conditioning_armature`).
 
-        A prescribed (kinematic) coordinate is outside the solver's unknowns: a row supported on it alone (a position
-        or velocity limit, a PhysX drive) has a response of the 1e10 armature's size against its cfm and no fixed
-        point, as its impulse grows with every sweep. Its effective position limits are therefore infinite and its
-        velocity limit and drive gains zero (unlimited, undriven), so no producer builds such a row; rows that couple
-        it with dynamic coordinates (contacts, mimic, connect) stay.
+        The coordinate mask also decides the effective row data each step publishes
+        (:func:`.joint_table.publish_effective`): none on a prescribed coordinate.
 
         Returns:
-            ``(armature, joint_mask, dof_mask, floor, effective)`` for :meth:`_apply_kinematic_state`; ``effective``
-            maps each of :data:`.joint_table.EFFECTIVE` the model holds to its per-coordinate values.
+            ``(armature, joint_mask, dof_mask, floor)`` for :meth:`_apply_kinematic_state`.
 
         Raises:
             RuntimeError: If the flags make a DOF of a sparse split or
@@ -2406,15 +2402,11 @@ class SolverFeatherPGS(SolverBase):
                         "reconstruct the solver and recapture its CUDA graph."
                     )
         armature, floor = conditioning_armature(model, armature, self._joint_forest)
-        effective = joint_table.effective(model, dof_mask)
-        return armature, joint_mask, dof_mask, floor, effective
+        return armature, joint_mask, dof_mask, floor
 
-    def _apply_kinematic_state(
-        self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor, dict[str, np.ndarray]]
-    ) -> None:
-        """Publish derived kinematic masks, armature and effective row data in place, where captured graphs read
-        them."""
-        armature, joint_mask, dof_mask, floor, effective = kinematic
+    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
+        """Publish derived kinematic masks and armature in place, where captured graphs read them."""
+        armature, joint_mask, dof_mask, floor = kinematic
         if floor.coordinates and floor != getattr(self, "_armature_floor", None):
             warnings.warn(
                 f"SolverFeatherPGS adds joint armature, up to {floor.largest:.3g}, to {floor.coordinates} "
@@ -2428,8 +2420,6 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
         self._kinematic_dof_mask.assign(dof_mask)
-        for name, data in effective.items():
-            getattr(self, "_" + name).assign(data)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -6687,6 +6677,9 @@ class SolverFeatherPGS(SolverBase):
 
         if not getattr(state_aug, "_featherstone_augmented", False):
             self._allocate_state_aux_vars(model, state_aug, requires_grad)
+        # The step's row data from the live model arrays: a write to the model's gains or limits reaches the rows
+        # without a notification.
+        joint_table.publish_effective(model, self._kinematic_dof_mask, self._effective_rows)
 
         return state_aug
 
