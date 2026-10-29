@@ -182,7 +182,7 @@ class TestKernelSass(unittest.TestCase):
         blocks = {
             key: block for keys, block in sass._module_groups(kernels, sass.launch_blocks(("pins",))) for key in keys
         }
-        self.assertEqual(len(blocks), 6)
+        self.assertEqual(len(blocks), 4)
         self.assertEqual(blocks.pop("scalar_branches.repair_scalar_branches"), 128)
         self.assertEqual(scalar_branches._REPAIR_BLOCK_DIM, 128)
         self.assertEqual(set(blocks.values()), {256})

@@ -166,7 +166,7 @@ def factory_calls():
         {"fuse_vel_limits": True},
         {"contact_torsion": True},
         {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
-        {"skip_incremental_rows": 32},
+        {"skip_tier_rows": 32},
         {"factor_coordinates": True},
         {"factor_coordinates": True, "independent_components": True},
     )
@@ -184,9 +184,7 @@ def factory_calls():
             "rows": rows,
             "min_rows": min_rows,
             "sweeps": 24,
-            "matrix_free": True,
             "inkernel_response": (18, 0, 0, 0),
-            "exact_row_sums": True,
             "linked_rows": True,
         }
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
@@ -194,7 +192,6 @@ def factory_calls():
     dense = "response_builds_dense."
     warps = _unwrapped(response_builds_dense.factor_warps_kernel)
     tiles = _unwrapped(response_builds_dense.factor_tiles_kernel)
-    lanes = _unwrapped(response_builds_dense.inverse_lanes_kernel)
     for size in (6, 9, 16):
         index = Named(f"range({size * size})", tuple(range(size * size)))
         yield dense + "factor_warps_kernel", warps, (size, index), {}
@@ -204,10 +201,7 @@ def factory_calls():
             (size, index),
             {"geometric_stride": size * size + 1, "geometric_group": True},
         )
-        for kwargs in ({}, {"inverse": True}):
-            yield dense + "factor_tiles_kernel", tiles, (size,), kwargs
-        yield dense + "inverse_lanes_kernel", lanes, (size,), {}
-        yield dense + "inverse_lanes_kernel", lanes, (size,), {"lower_only": True}
+        yield dense + "factor_tiles_kernel", tiles, (size,), {}
         yield name + "_get_triangular_solve_kernel", _unwrapped(solver._get_triangular_solve_kernel), (size, ARCH), {}
     yield from held_factor_calls()
 
@@ -469,8 +463,8 @@ def census_calls():
     the product of each factory's flags at fixed shapes: matrix-free
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
-    local owners plain and over packet rows, sparse diagonal, incremental,
-    parallel and keyed parallel tiers. Every factory that takes a velocity-limit
+    local owners plain and over packet rows, sparse diagonal, parallel and
+    keyed parallel tiers. Every factory that takes a velocity-limit
     law is crossed with both laws, and the matrix-free Gauss-Seidel sweep with
     resident row metadata.
     """
@@ -496,7 +490,7 @@ def census_calls():
         ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         _axis("contact_torsion"),
         _axis("factor_coordinates"),
-        _axis("skip_incremental_rows", (0, 32)),
+        _axis("skip_tier_rows", (0, 32)),
         _axis("independent_components"),
         _axis("resident_row_metadata"),
         laws,
@@ -558,31 +552,17 @@ def census_calls():
             (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
         ),
         (
-            "sweep_routes.incremental_kernel",
-            sweep_routes.incremental_kernel,
-            ((64, 32, 12, ARCH),),
-            (
-                ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
-                _axis("has_drive_rows", (True, False)),
-                _axis("has_dense_velocity_limit_rows", (True, False)),
-                _axis("skip_local_internal_worlds"),
-                laws,
-            ),
-        ),
-        (
             "sweep_routes_tiers.parallel_kernel",
             sweep_routes_tiers.parallel_kernel,
             ((192, 32, 18, ARCH),),
             (
-                tuple({"rows": rows, "min_rows": low, "sweeps": 24} for rows, low in ((32, 0), (48, 32), (128, 96))),
-                _axis("nesterov", (True, False)),
-                _axis("matrix_free"),
+                tuple(
+                    {"rows": rows, "min_rows": low, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+                    for rows, low in ((32, 0), (48, 32), (128, 96))
+                ),
                 _axis("has_drive_rows"),
-                _axis("has_dense_velocity_limit_rows"),
-                _axis("skip_local_internal_worlds"),
-                _axis("inkernel_response", (None, (18, 0, 0, 0))),
-                _axis("exact_row_sums"),
                 _axis("linked_rows"),
+                _axis("velocity_limit_pass"),
             ),
         ),
         (
@@ -595,16 +575,13 @@ def census_calls():
                         "rows": rows,
                         "min_rows": low,
                         "sweeps": 24,
-                        "matrix_free": True,
                         "inkernel_response": (16, 6, 0, 16),
                     }
                     for rows, low in ((32, 0), (64, 32), (96, 64), (128, 96))
                 ),
-                _axis("nesterov", (True, False)),
-                _axis("exact_row_sums"),
                 _axis("has_drive_rows"),
-                _axis("skip_local_internal_worlds"),
                 _axis("linked_rows"),
+                _axis("velocity_limit_pass"),
             ),
         ),
     )
@@ -643,7 +620,7 @@ def census(select=(), skip=()):
             # Generators also refuse a combination when a source seam guard fails.
             rejected.setdefault(name, []).append((key, f"{type(error).__name__}: {error}"))
             continue
-        rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
+        rows[key] = {"family": "census", **kernel_digests(getattr(built, "kernel", built), codegen=False)}
     summaries = {}
     for name, entries in rejected.items():
         messages = collections.Counter(message for _, message in entries)
@@ -691,6 +668,8 @@ def inventory(families, select=()):
             except (ValueError, NotImplementedError) as error:
                 rejected[key] = f"{type(error).__name__}: {error}"
                 continue
+            # A tier factory returns its launch descriptor, which holds the kernel.
+            built = getattr(built, "kernel", built)
             if isinstance(built, wp.Kernel):
                 kernels[key] = (family, built)
             else:
