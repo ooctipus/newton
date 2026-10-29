@@ -209,14 +209,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         parameters = inspect.signature(SolverFeatherPGS).parameters
         names = list(parameters)
         self.assertEqual(names[names.index("velocity_limit_activation_fraction") + 1], "pgs_iterations")
-        for name in (
-            "pgs_solve_readout",
-            "mf_gs_incremental_rows",
-            "mf_gs_parallel_rows",
-            "mf_gs_parallel_sweeps",
-            "mf_gs_parallel_nesterov",
-            "mf_gs_parallel_matrix_free",
-        ):
+        for name in ("pgs_solve_readout", "velocity_limit_law", "contact_update"):
             with self.subTest(name=name):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
 

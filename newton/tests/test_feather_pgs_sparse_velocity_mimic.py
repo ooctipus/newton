@@ -228,7 +228,6 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
             mf_max_constraints=32,
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
-            **({} if enabled else velocity_tests.ORDINARY_ROUTE),
         )
     state, out, control = model.state(), model.state(), model.control()
     velocity = state.joint_qd.numpy().copy().reshape(2, -1)

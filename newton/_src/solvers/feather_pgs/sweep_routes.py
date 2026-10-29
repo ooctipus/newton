@@ -22,14 +22,13 @@ from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Block, CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
-from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
+from .response_operator import CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
+from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
     DRIVE,
-    DRIVE_DATA,
     FRICTION,
     JOINT_LIMIT,
     VELOCITY_LIMIT,
@@ -37,9 +36,7 @@ from .sweep import (
     RowContext,
     RowLaws,
     WorldRows,
-    change_vote,
     dense_rows_block,
-    dense_tier_world,
     end_sweep,
     free_body_rows_block,
     fused_clamp_pass,
@@ -593,7 +590,7 @@ def mf_gs_source(
     skip_local_internal_worlds: bool = False,
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
-    skip_incremental_rows: int = 0,
+    skip_tier_rows: int = 0,
     independent_components: bool = False,
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
@@ -681,8 +678,8 @@ def mf_gs_source(
         skips.append("    if (m_mf == 0) return;")
     if skip_local_internal_worlds:
         skips.append(f"    if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;")
-    if skip_incremental_rows > 0:
-        skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_incremental_rows)}) return;")
+    if skip_tier_rows > 0:
+        skips.append(f"    if (m_mf == 0 && m_dense <= {int(skip_tier_rows)}) return;")
     mapped = ""
     if colored or colored_worlds:
         # The worlds of the other mapping, as the unit builder assigned them at the pack.
@@ -867,7 +864,7 @@ def mf_gs_kernel(
     local_internal_max_constraints: int = 0,
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
-    skip_incremental_rows: int = 0,
+    skip_tier_rows: int = 0,
     independent_components: bool = False,
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
@@ -892,7 +889,7 @@ def mf_gs_kernel(
         skip_local_internal_worlds=skip_local_internal_worlds,
         contact_torsion=contact_torsion,
         factor_coordinates=factor_coordinates,
-        skip_incremental_rows=skip_incremental_rows,
+        skip_tier_rows=skip_tier_rows,
         independent_components=independent_components,
         velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
@@ -911,7 +908,7 @@ def mf_gs_kernel(
         + (f"_local_fallback{local_internal_max_constraints}" if skip_local_internal_worlds else "")
         + ("_torsion" if contact_torsion else "")
         + ("_factor" if factor_coordinates else "")
-        + (f"_skipinc{int(skip_incremental_rows)}" if skip_incremental_rows > 0 else "")
+        + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
         + ("_components" if independent_components else "")
         + ("_cw" if colored_worlds and not colored else "")
         + solve_policy.suffix
@@ -925,308 +922,4 @@ def mf_gs_kernel(
         composed=True,
         native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",
         launch_bounds=(COLORED_THREADS, 1) if colored else None,
-    ).kernel()
-
-
-def packed_block(support: int, rows: str, stride: int, pad: str) -> str:
-    """Native statements: the column-major response block ``s_A[i * stride + r] = Z_r . Z_i`` of the packed rows
-    ``[0, rows)`` and their residuals ``s_res[i] = s_rhs[i] + Z_i . u`` (the velocity ``s_v`` in factor coordinates),
-    lane-strided. An entry pairs the two rows' entries of one coordinate, summed in the second row's entry order from
-    zero; a row's residual sums its entries in order from its right-hand side."""
-    lines = [
-        f"for (int pair = lane; pair < ({rows}) * ({rows}); pair += 32) {{",
-        f"    const int i = pair / ({rows});",
-        f"    const int r = pair - i * ({rows});",
-        "    const wp::vec2i sides_i = row_sides.data[off_dense + i];",
-        "    const wp::vec2i sides_r = row_sides.data[off_dense + r];",
-        f"    const float* z_i = &packed_Z.data[packed_base + (size_t)i * {support}];",
-        f"    const float* z_r = &packed_Z.data[packed_base + (size_t)r * {support}];",
-        "    float a = 0.0f;",
-        f"    for (int e = 0; e < {support}; ++e) {{",
-        "        const int d = PACKED_COORDINATE(sides_i, e);",
-        "        if (d < 0) continue;",
-        f"        for (int f = 0; f < {support}; ++f) {{",
-        "            if (PACKED_COORDINATE(sides_r, f) == d) {",
-        "                a += z_r[f] * z_i[e];",
-        "                break;",
-        "            }",
-        "        }",
-        "    }",
-        f"    s_A[i * {stride} + r] = a;",
-        "}",
-        f"for (int i = lane; i < {rows}; i += 32) {{",
-        "    float r = s_rhs[i];",
-        f"    for (int e = 0; e < {support}; ++e) {{",
-        "        const int d = PACKED_COORDINATE(row_sides.data[off_dense + i], e);",
-        f"        if (d >= 0) r += packed_Z.data[packed_base + (size_t)i * {support} + e] * s_v[d];",
-        "    }",
-        "    s_res[i] = r;",
-        "}",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def packed_publish(support: int, rows: str, dofs: int, pad: str) -> str:
-    """Native statements: ``u += Z_i applied_i`` of the packed rows ``[0, rows)`` in row order (a row's coordinates
-    are distinct, so its lanes never collide), the marked articulations leave factor coordinates
-    (:class:`FactorCoordinates`), and the world's velocity is written through its coordinate map."""
-    lines = [
-        f"for (int i = 0; i < {rows}; ++i) {{",
-        "    const float a = s_app[i];",
-        "    if (a != 0.0f) {",
-        f"        for (int e = lane; e < {support}; e += 32) {{",
-        "            const int d = PACKED_COORDINATE(row_sides.data[off_dense + i], e);",
-        f"            if (d >= 0) s_v[d] += packed_Z.data[packed_base + (size_t)i * {support} + e] * a;",
-        "        }",
-        "    }",
-        "    SYNC();",
-        "}",
-        FACTOR_COORDINATES.convert_all(dofs, "lane", "32", "SYNC();", enter=False),
-        f"for (int d = lane; d < {dofs}; d += 32) {{",
-        "    const int global_dof = world_dof_indices.data[dof_map_base + d];",
-        "    if (global_dof >= 0) v_out.data[global_dof] = s_v[d];",
-        "}",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def incremental_source(
-    max_constraints: int,
-    max_world_dofs: int,
-    *,
-    incremental_rows: int,
-    max_row_dofs: int | None = None,
-    has_drive_rows: bool = True,
-    has_dense_velocity_limit_rows: bool = True,
-    skip_local_internal_worlds: bool = False,
-    min_rows: int = 0,
-    velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-) -> tuple[str, Staging]:
-    """The Gauss-Seidel sweep of a world's dense rows (at most ``incremental_rows``) over their response block.
-
-    For worlds without free-body rows: the warp holds the articulations the rows touch in factor coordinates
-    (:class:`FactorCoordinates`), builds ``A = Z^T Z`` and the residuals ``rhs + Z^T u`` once from the packed rows
-    (:func:`packed_block`), compacts the rows this phase visits in row order, and solves them with the shared row law
-    on the block (:class:`.Block`); the velocity ``u + Z applied`` leaves factor coordinates and is published once
-    after the sweeps.
-    """
-    _validate_dense_metadata_encoding(max_constraints)
-    accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated"
-    M_D, D, AM, MIN_ROWS = max_constraints, max_world_dofs, int(incremental_rows), int(min_rows)
-    S = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
-    if AM <= 0 or AM > M_D or AM > 64:
-        raise ValueError("incremental_rows must be in [1, min(max_constraints, 64)]")
-    if MIN_ROWS < 0 or MIN_ROWS >= AM:
-        raise ValueError("min_rows must be in [0, incremental_rows)")
-    lanes = Lanes(32)
-    laws = RowLaws(
-        drive=has_drive_rows,
-        velocity_limit_law="accumulated" if accumulated else "stateless",
-        regularize=True,
-        policy=solve_policy,
-    )
-    op = Block(D, AM, lanes, diagonal=lambda row: f"s_diag[{row}]", inverse=lambda row: f"s_inv_diag[{row}]")
-    drive = DRIVE_DATA if has_drive_rows else {}
-    staging = Staging(
-        (
-            Buffer("s_v", "float", D),
-            *FACTOR_COORDINATES.buffers(D),
-            *(
-                Buffer(name, "float", AM)
-                for name in ("s_lam", "s_app", "s_rhs", "s_diag", "s_inv_diag", "s_res", "s_w")
-            ),
-            Buffer("s_mu", "float", AM),
-            Buffer("s_parent", "int", AM),
-            Buffer("s_type", "int", AM),
-            Buffer("s_A", "float", AM * AM),
-            Buffer("s_rows", "int", AM),
-            Buffer("s_vlim_rows", "int", AM),
-            *(Buffer(name, "float", AM) for name, _ in drive.values()),
-        ),
-        threads=32,
-    )
-    ctx = RowContext(
-        row="i",
-        kind="row_type",
-        operator=op,
-        load=lambda row: f"s_lam[{row}]",
-        store=lambda row, value: lanes.first(f"s_lam[{row}] = {value};"),
-        rhs=lambda row: f"s_rhs[{row}]",
-        mu=lambda row: f"s_mu[{row}]",
-        weight=lambda row: f"s_w[{row}]",
-        parent="parent",
-        ring_load=lambda parent: (
-            f"RING_LOAD(s_lam[{parent}], {parent}, {AM},\n"
-            "    [&](int r) { return s_parent[r]; }, [&](int r) { return s_lam[r]; })"
-        ),
-        lanes=lanes,
-        drive_data=(lambda name, row: f"{DRIVE_DATA[name][0]}[{row}]") if has_drive_rows else None,
-        inline_velocity_limit=True,
-        record=lambda row, delta: lanes.first(f"s_app[{row}] += {delta};"),
-    )
-    # The compaction admitted the rows on their diagonals.
-    row_loop = "\n".join(
-        [
-            "        for (int k = 0; k < n_active; k++) {",
-            "            const int i = s_rows[k];",
-            "            const int row_type = s_type[i];",
-            row_visit(ctx, laws, parent="s_parent[i]", check=None, pad="            "),
-            "        }",
-        ]
-    )
-    vlim_old = "s_lam[i]" if accumulated else "0.0f"
-    vlim_rhs = ctx.rhs("i")
-    vlim_bound = op.bound(vlim_rhs, op.terms("residual_vlim", vlim_rhs, whole=op.residual_includes_rhs), vlim_old, "i")
-    vlim_change = op.change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "i")
-    vlim_pass = ""
-    if has_dense_velocity_limit_rows:
-        vlim_pass = f"""
-        if (row_phase == 0 || row_phase == 2) {{
-            for (int k = 0; k < n_vlim; k++) {{
-                const int i = s_vlim_rows[k];
-                const float residual_vlim = s_res[i];
-                const float bound_vlim = {vlim_bound};
-                const auto vlim = ProjectionLaw::velocity_limit_update({vlim_old}, residual_vlim, {op.scale("residual_vlim", "i")}, {int(accumulated)});
-                const float delta_impulse_vlim = vlim.v1;
-                SYNC();
-                if (lane == 0) {{
-                    s_lam[i] = vlim.v0;
-                    s_app[i] += delta_impulse_vlim;
-                }}
-                if (delta_impulse_vlim != 0.0f) {{
-{change_vote(laws, (vlim_change,), " " * 20)}
-{op.apply_row("i", "delta_impulse_vlim", "                    ")}
-                }}
-                SYNC();
-            }}
-        }}"""
-    sweep_end = end_sweep(solve_policy, iteration="iter")
-    drive_loads = "".join(f"\n        {name}[i] = {source}.data[off_dense + i];" for name, source in drive.values())
-    admit_drive = "1" if has_drive_rows else f"(row_type != {DRIVE})"
-    phase_filters = "\n".join(
-        f"            if (row_phase == {phase} && "
-        + " && ".join(f"row_type != {kind}" for kind in kinds)
-        + ") admit = 0;"
-        for phase, kinds in _PHASE_DENSE_KINDS.items()
-    )
-    body = f"""    const int lane = LANE;
-
-{dense_tier_world(AM, MIN_ROWS, D, M_D, local=skip_local_internal_worlds, rows="n_rows_total", support=S)}
-
-{staging.declarations("    ")}
-
-    for (int i = lane; i < n_rows_total; i += 32) {{
-        s_lam[i] = world_impulses.data[off_dense + i];
-        s_app[i] = 0.0f;
-        s_rhs[i] = rhs_bias.data[off_dense + i];
-        const float diag = world_diag.data[off_dense + i];
-        s_diag[i] = diag;
-        s_inv_diag[i] = diag > 0.0f ? 1.0f / diag : 0.0f;
-        s_type[i] = world_row_type.data[off_dense + i] & {_DENSE_META_ROW_TYPE_MASK};
-        s_parent[i] = world_row_parent.data[off_dense + i];
-        s_mu[i] = world_row_mu.data[off_dense + i];
-        s_w[i] = regularize ? world_row_w.data[off_dense + i] : 1.0f;{drive_loads}
-    }}
-    for (int d = lane; d < {D}; d += 32) {{
-        const int global_dof = world_dof_indices.data[dof_map_base + d];
-        s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
-    }}
-{indent(FACTOR_COORDINATES.clear(D, "lane"), "    ")}
-    SYNC();
-{indent(FACTOR_COORDINATES.mark_sides("n_rows_total", "lane", "32"), "    ")}
-    SYNC();
-{indent(FACTOR_COORDINATES.convert_all(D, "lane", "32", "SYNC();", enter=True), "    ")}
-
-    // The rows this phase visits, in row order; the phase's velocity-limit rows for the end pass.
-    int n_active = 0;
-    int n_vlim = 0;
-    for (int base = dense_lo; base < dense_hi; base += 32) {{
-        const int row = base + lane;
-        int admit = 0;
-        int vlim = 0;
-        if (row < dense_hi && (s_inv_diag[row] > 0.0f || s_type[row] == {FRICTION})) {{
-            const int row_type = s_type[row];
-            admit = {admit_drive};
-{phase_filters}
-            if ((row_phase == 0 || row_phase == 2) && row_type == {VELOCITY_LIMIT}) {{
-                admit = 0;
-                vlim = 1;
-            }}
-            if (freeze_drive_rows != 0 && row_type == {DRIVE}) admit = 0;
-        }}
-        const int slot = ORDERED(n_active, admit != 0);
-        if (admit) s_rows[slot] = row;
-        const int vlim_slot = ORDERED(n_vlim, vlim != 0);
-        if (vlim) s_vlim_rows[vlim_slot] = row;
-    }}
-
-{packed_block(S, "n_rows_total", AM, "    ")}
-    SYNC();
-
-    for (int iter = 0; iter < iterations; iter++) {{
-        const int global_iter = iteration_offset + iter;
-        int iteration_changed = 0;
-{row_loop}
-{vlim_pass}
-{sweep_end}    }}
-
-{packed_publish(S, "n_rows_total", D, "    ")}
-    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
-        world_impulses.data[off_dense + i] = s_lam[i];
-    }}
-#endif
-"""
-    preludes = (lane_group(32), RING, PACKED_SIDES, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
-    return cuda_native(body, preludes=preludes), staging
-
-
-@cache
-def incremental_kernel(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    device_arch: str,
-    *,
-    incremental_rows: int,
-    max_row_dofs: int | None = None,
-    has_drive_rows: bool = True,
-    has_dense_velocity_limit_rows: bool = True,
-    skip_local_internal_worlds: bool = False,
-    min_rows: int = 0,
-    velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = DEFAULT_POLICY,
-) -> wp.Kernel:
-    """The incremental tier's kernel (the matrix-free sweep's ABI); its working set fits the static budget of
-    ``device_arch``."""
-    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
-    snippet, staging = incremental_source(
-        max_constraints,
-        max_world_dofs,
-        max_row_dofs=max_row_dofs,
-        incremental_rows=incremental_rows,
-        has_drive_rows=has_drive_rows,
-        has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
-        skip_local_internal_worlds=skip_local_internal_worlds,
-        min_rows=min_rows,
-        velocity_limit_law=velocity_limit_law,
-        solve_policy=solve_policy,
-    )
-    staging.check("the incremental tier", arch_budget(device_arch))
-    name = (
-        f"sweep_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_s{max_row_dofs}"
-        f"_rows{int(incremental_rows)}"
-        f"_min{int(min_rows)}_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
-        + velocity_limit_law_suffix(velocity_limit_law)
-        + ("_local_fallback" if skip_local_internal_worlds else "")
-        + solve_policy.suffix
-    )
-    return KernelTemplate.from_abi(
-        name,
-        MF_GS_ABI,
-        snippet,
-        kernel_template.WORLD_QUEUE,
-        extra=solve_policy.arguments,
-        composed=True,
-        native_name="sweep_incremental_native",
     ).kernel()

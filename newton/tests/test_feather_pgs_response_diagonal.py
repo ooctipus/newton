@@ -151,7 +151,9 @@ def _run_mixed_response(
         static_plane=static_plane,
         **(model_kwargs or {}),
     )
-    with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": kernel}):
+    # The arms compare serial owners: the pin keeps the Jacobi tiers (case K4, a tree beside a free body) off the
+    # worlds no other owner claims.
+    with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": kernel, "tiers": 0}):
         solver = SolverFeatherPGS(
             model,
             pgs_warmstart=warmstart,

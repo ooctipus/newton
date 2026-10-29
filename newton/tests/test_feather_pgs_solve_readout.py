@@ -413,8 +413,7 @@ def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
 def _matrix_free_route():
     """Contacting tripods beside free spheres: the matrix-free Gauss-Seidel sweep owns their worlds.
 
-    The spheres' ground contacts are matrix-free rows, which the incremental tier leaves to the
-    general sweep (``_incremental_route`` covers the tier).
+    The spheres' ground contacts are matrix-free rows, which the general sweep solves.
     """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
@@ -427,19 +426,19 @@ def _matrix_free_route():
             "mf_max_constraints": 64,
         },
         "overrides": {"storage": "dense"},
-        "labels": {"mf_gs", "mf_gs_incremental"},
-        "owners": ({"mf_gs", "mf_gs_incremental"},),
+        "labels": {"mf_gs"},
+        "owners": ({"mf_gs"},),
         "solving": {"mf_gs"},
     }
 
 
-def _incremental_route():
-    """Contacting tripods without free bodies: every world holds only dense rows, which the incremental tier owns.
+def _dense_route():
+    """Contacting tripods without free bodies: every world holds only dense rows, which the general sweep owns.
 
-    Each world's three feet start in the ground and one leg beyond its limit, within the tier's 32 rows;
-    without free bodies no world has matrix-free rows or a local owner. Pushed out of the ground by the
-    first step, the tripods rise for a few steps, in which every row of their worlds separates at the
-    predictor: the resolved-world classifier leaves those worlds without rows, and no sweep enters them.
+    Each world's three feet start in the ground and one leg beyond its limit; without free bodies no
+    world has matrix-free rows or a local owner. Pushed out of the ground by the first step, the
+    tripods rise for a few steps, in which every row of their worlds separates at the predictor: the
+    resolved-world classifier leaves those worlds without rows, and no sweep enters them.
     """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
@@ -452,22 +451,21 @@ def _incremental_route():
             "mf_max_constraints": 64,
         },
         "overrides": {"storage": "dense"},
-        "labels": {"mf_gs_incremental"},
-        "owners": ({"mf_gs_incremental"},),
-        "solving": {"mf_gs_incremental"},
+        "labels": {"mf_gs"},
+        "owners": ({"mf_gs"},),
+        "solving": {"mf_gs"},
     }
 
 
 def _velocity_limit_route():
-    """The incremental route's tripods with velocity-limited legs under the accumulated velocity-limit law.
+    """The dense route's tripods with velocity-limited legs under the accumulated velocity-limit law.
 
     Each leg joint is limited to 1 rad/s and starts at 2 rad/s, so the velocity-limit rows bind
     from the first step, and the accumulated law keeps each row's total across sweeps, which the
     votes measure as the change of that total. The rows start from half the limit and add at most
-    two per leg to a world's rows; the matrix-free sweep stands among the owners in case a world
-    outgrows the incremental tier's 32 rows.
+    two per leg to a world's rows.
     """
-    route = _incremental_route()
+    route = _dense_route()
     model = route["model"]
     joint_type, starts = model.joint_type.numpy(), model.joint_qd_start.numpy()
     legs = starts[np.flatnonzero(joint_type == int(newton.JointType.REVOLUTE))]
@@ -488,8 +486,8 @@ def _velocity_limit_route():
     }
     route.update(
         name="velocity_limits",
-        labels={"mf_gs_incremental", "mf_gs"},
-        owners=({"mf_gs_incremental", "mf_gs"},),
+        labels={"mf_gs"},
+        owners=({"mf_gs"},),
         solving=set(),
         prepare=prepare,
     )
@@ -497,33 +495,21 @@ def _velocity_limit_route():
 
 
 def _tier_route():
-    """Two tripod worlds, each with a free sphere, and the parallel tiers of ``mf_gs_parallel_rows`` built.
+    """The dense route's tripods with the Jacobi tiers a test pin builds (``tiers``): 32 rows.
 
-    Each world holds one tripod and one free body, which the tiers' in-kernel rows need. In the first the
-    sphere floats clear of the ground: its world holds only dense rows (24 while the tripod's feet touch the
-    ground: six contacts and six joint-limit rows), within the tiers' bound, so the tiers solve and count it
-    and the matrix-free sweep returns before its first sweep there; in the second the sphere rests on the
-    ground, and its matrix-free rows keep its world on the counted matrix-free sweep. The tiled response keeps
-    the local owners out: the automatic choice gives the tripod's 9 DOFs the parallel-row response, which makes
-    a world with one small non-free articulation, in a model with free bodies, a local-owner candidate, and its
-    counted local sweep would claim the world whenever it holds at most 9 rows of one phase.
+    Each tripod's world holds only dense rows (24 while its feet touch the ground: six contacts and
+    six joint-limit rows), within the tiers' bound, so the tiers solve and count it and the
+    matrix-free sweep returns before its first sweep there; a world that outgrows the bound keeps the
+    counted matrix-free sweep.
     """
-    from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
-
-    return {
-        "model": _build_model(free_count=1, free_heights=(1.0, 0.05)),
-        "options": {
-            "friction_anchor_beta": 0.0,
-            "enable_joint_limits": True,
-            "dense_max_constraints": 96,
-            "mf_max_constraints": 64,
-            "mf_gs_parallel_rows": 32,
-        },
-        "overrides": {"hinv_jt_kernel": "tiled", "storage": "dense"},
-        "labels": {"mf_gs", "parallel_tier"},
-        "owners": ({"mf_gs", "parallel_tier"},),
-        "solving": {"mf_gs", "parallel_tier"},
-    }
+    route = _dense_route()
+    route.update(
+        overrides={"storage": "dense", "tiers": 32},
+        labels={"mf_gs", "parallel_tier"},
+        owners=({"mf_gs", "parallel_tier"},),
+        solving={"parallel_tier"},
+    )
+    return route
 
 
 _LOCAL = {"local_internal", "local_pair", "local_residual"}
@@ -535,7 +521,7 @@ def _local_route():
         "par_row",
         13,
         {*_LOCAL, "mf_gs"},
-        owners=({*_LOCAL, "mf_gs", "mf_gs_incremental"},),
+        owners=({*_LOCAL, "mf_gs"},),
         solving={"local_pair"},
     )
 
@@ -546,11 +532,11 @@ def _paired_route():
 
 
 def _policy_routes():
-    """The routes whose local, paired, matrix-free and incremental sweeps compile the velocity law and trace.
+    """The routes whose local, paired and matrix-free sweeps compile the velocity law and trace.
 
     The last one binds velocity-limit rows under the accumulated velocity-limit law.
     """
-    return (_local_route(), _paired_route(), _matrix_free_route(), _incremental_route(), _velocity_limit_route())
+    return (_local_route(), _paired_route(), _matrix_free_route(), _dense_route(), _velocity_limit_route())
 
 
 def _route_name(route):
@@ -699,15 +685,14 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Count the matrix-free Gauss-Seidel sweep without changing the trajectory, every world-solve once."""
         self._lockstep(_matrix_free_route())
 
-    def test_incremental_route_counts_without_changing_results(self):
-        """Count the incremental tier's sweeps without changing the trajectory, and the solves of resolved worlds.
+    def test_dense_route_counts_without_changing_results(self):
+        """Count the dense rows' sweeps without changing the trajectory, and the solves of resolved worlds.
 
         While the tripods rise, the resolved-world classifier leaves their worlds without rows and no
-        sweep enters them; the readout counts those solves as skipped, so with the tier's slot they
+        sweep enters them; the readout counts those solves as skipped, so with the sweep's slot they
         cover every world at every solve.
         """
-        solver, summary, model = self._lockstep(_incremental_route())
-        self.assertTrue(solver._mf_gs_tiers)
+        solver, summary, model = self._lockstep(_dense_route())
         self.assertTrue(solver.get_path_selection()["routes"]["resolved_worlds"]["enabled"])
         (skipped,) = summary["skipped"]
         self.assertEqual(skipped["pass"], "position")
@@ -742,8 +727,8 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_parallel_tiers_count_their_worlds(self):
         """Count the parallel tiers' world-solves in their own slots, every world-solve once, none twice.
 
-        The tiers solve the tripod's world, the matrix-free sweep the free body's: their slots and the
-        skip counter must add up to every world at every step.
+        The tiers solve the tripods' worlds within their bound, the matrix-free sweep any other: their
+        slots and the skip counter must add up to every world at every step.
         """
         route, steps = _tier_route(), 4
         solver, summary, _ = self._lockstep(route, steps=steps)
@@ -751,7 +736,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertFalse(solver._local_internal_fast_path)
         sweep = solver.get_path_selection()["routes"]["sweep"]
         tier_kernels = {tier["kernel"] for tier in sweep["tiers"]["tiers"]}
-        self.assertEqual(sweep["tiers"]["family"], "parallel")
+        self.assertIn(sweep["tiers"]["family"], ("parallel", "keyed_parallel"))
         self.assertLessEqual(tier_kernels, set(sweep["readout"]["counted"]))
         tiers = sum(slot["solves"] for slot in summary["slots"] if slot["route"] == "parallel_tier")
         self.assertGreater(tiers, 0)
@@ -780,7 +765,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
 
     def test_velocity_pass_counts_in_its_own_slots(self):
         """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
-        route, steps = _incremental_route(), 4
+        route, steps = _dense_route(), 4
         (solver,) = self._solvers(route, [{"pgs_solve_readout": "sweeps", "pgs_velocity_iterations": 2}])
         rowless = 0
         for _ in self._steps(route, [solver], steps):
@@ -795,7 +780,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual([entry["pass"] for entry in summary["skipped"]], list(SOLVE_PASSES))
         for solve_pass, budget in (("position", BUDGET), ("velocity", 2)):
             with self.subTest(solve_pass=solve_pass):
-                slot = slots[("mf_gs_incremental", solve_pass)]
+                slot = slots[("mf_gs", solve_pass)]
                 self.assertEqual(slot["budget"], budget)
                 # Both passes sweep the same rows: a world without rows skips both.
                 self.assertEqual(_skipped(summary, solve_pass), rowless)

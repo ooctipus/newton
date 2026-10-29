@@ -301,11 +301,6 @@ def _solve_data(sign, *, contact, iterations, omega):
     return data, physical, factor
 
 
-# The reference arm's ordinary route: neither the held-tree owner nor the incremental matrix-free tier,
-# both of which serve either friction law.
-ORDINARY_ROUTE = {"mf_gs_incremental_rows": 0}
-
-
 def _assert_ordinary_route(test, case):
     """Require the reference arm to run ordinary factors, dynamics and matrix-free sweeps."""
     selected = case[1].get_path_selection()
@@ -346,7 +341,6 @@ def _case(
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
             velocity_limit_law=velocity_limit_law,
-            **({} if enabled else ORDINARY_ROUTE),
         )
     state, out, control = model.state(), model.state(), model.control()
     qd = state.joint_qd.numpy().copy().reshape(2, -1)

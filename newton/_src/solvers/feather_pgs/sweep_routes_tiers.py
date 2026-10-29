@@ -7,13 +7,10 @@
 descriptor (:class:`.kernel_template.SweepTier`).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
-(:class:`.sweep.JacobiRows`). The rows step together under the Jacobi law with Nesterov momentum
-(:func:`.sweep.jacobi_sweeps`) over one of two response operators, each fed by rows whitened in the kernel
-(:class:`.response_operator.WhitenedRows`, from the group Jacobians or the keyed rows):
-
-- the response block ``A = Z^T Z`` in row layout (:class:`.response_operator.Block`), the rows published to the
-  world's packed rows (:mod:`.packed_rows`: the packed build's rows, rewritten in the tier's rounding);
-- matrix-free, ``Z`` in registers and staged transposed (:class:`.response_operator.TransposedResponse`).
+(:class:`.sweep.JacobiRows`). The rows are whitened in the kernel (:class:`.response_operator.WhitenedRows`, from the
+group rows or the keyed rows) and step together under the Jacobi law with Nesterov momentum
+(:func:`.sweep.jacobi_sweeps`) over the matrix-free response, ``Z`` in registers and staged transposed
+(:class:`.response_operator.TransposedResponse`).
 """
 
 from __future__ import annotations
@@ -29,7 +26,7 @@ from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Block, Lanes, TransposedResponse, WhitenedRows
+from .response_operator import Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
 from .staging import Buffer, Staging, arch_budget
@@ -74,23 +71,24 @@ keyed rows insert theirs after ``world_row_cfm``."""
 TIER_SWEEPS_PER_ITERATION = Fraction(7, 2)
 """Sweeps of a 32-row tier per serial iteration (:func:`tier_sweeps`)."""
 TIER_SWEEPS_CAP = 128
-"""The largest automatic tier budget, unless the minimum is larger."""
+"""The largest tier budget."""
+TIER_MAX_ROWS = 128
+"""The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
 
 
-def tier_sweeps(rows: int, iterations: int, sweeps: int) -> int:
-    """The automatic sweep budget of a parallel tier serving up to ``rows`` rows.
+def tier_sweeps(rows: int, iterations: int) -> int:
+    """The sweep budget of a parallel tier serving up to ``rows`` rows: the equal-accuracy rule.
 
     ``ceil(c * iterations * sqrt(rows / 32))`` for the factor ``c = p / q``
-    (:data:`TIER_SWEEPS_PER_ITERATION`), at least ``sweeps`` and at most
-    :data:`TIER_SWEEPS_CAP` unless ``sweeps`` is larger, and never fewer than
-    one. The ceiling is exact: the least ``n`` with ``32 q^2 n^2 >= (p
-    iterations)^2 rows``.
+    (:data:`TIER_SWEEPS_PER_ITERATION`), at most :data:`TIER_SWEEPS_CAP` and
+    never fewer than one. The ceiling is exact: the least ``n`` with ``32 q^2
+    n^2 >= (p iterations)^2 rows``.
     """
     factor = TIER_SWEEPS_PER_ITERATION
     numerator = (factor.numerator * int(iterations)) ** 2 * int(rows)
     square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
-    return max(1, int(sweeps), min(raw, TIER_SWEEPS_CAP))
+    return max(1, min(raw, TIER_SWEEPS_CAP))
 
 
 def _phase_admission() -> str:
@@ -101,50 +99,33 @@ def _phase_admission() -> str:
     )
 
 
-def inkernel_response_fits(max_world_dofs: int, rows: int, matrix_free: bool) -> bool:
-    """Whether a tier of ``rows`` rows can form its worlds' rows in the kernel: the A-based (not matrix-free) form
-    whitens them in its response block."""
-    return matrix_free or max_world_dofs * (rows + 4) <= rows * (rows + 1)
-
-
 def _operands(
     max_constraints: int,
     max_world_dofs: int,
     *,
     rows: int,
     min_rows: int,
-    matrix_free: bool,
     has_drive_rows: bool,
-    inkernel_response,
-    exact_row_sums: bool,
+    inkernel_response: tuple[int, int, int, int],
     row_inputs,
 ):
     """Validate the tier's options; return the in-kernel response's group sizes and offsets and the keyed rows'
     operands (``None`` without)."""
     _validate_dense_metadata_encoding(max_constraints)
     M_D, D, AM = max_constraints, max_world_dofs, int(rows)
-    if AM <= 0 or AM > M_D or AM > 128:
-        raise ValueError("rows must be in [1, min(max_constraints, 128)]")
-    if AM > 96 and not matrix_free:
-        raise ValueError("rows above 96 need the matrix-free variant (the response block exceeds shared memory)")
-    if inkernel_response is None:
-        raise ValueError("a parallel tier forms its worlds' rows in the kernel: inkernel_response is required")
+    if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
+        raise ValueError(f"rows must be in [1, min(max_constraints, {TIER_MAX_ROWS})]")
     groups = tuple(int(v) for v in inkernel_response)
     NA, NB, OA, OB = groups
     if NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D):
         raise ValueError("inkernel_response needs group sizes within the world DOF count")
-    if not inkernel_response_fits(D, AM, matrix_free):
-        raise ValueError("in-kernel response (A-based) needs the response block storage to hold the padded Z scratch")
     if AM % 4 != 0:
         raise ValueError("rows must be a multiple of 4")
     if int(min_rows) < 0 or int(min_rows) >= AM:
         raise ValueError("min_rows must be in [0, rows)")
     operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
-    if operands is not None:
-        if not matrix_free or has_drive_rows:
-            raise ValueError("generated factor rows require the ordinary matrix-free parallel law")
-        if operands.stage is not None and matrix_free and exact_row_sums:
-            raise ValueError("preprojected row staging does not implement exact row sums")
+    if operands is not None and has_drive_rows:
+        raise ValueError("generated factor rows require the parallel law without drive rows")
     return groups, operands
 
 
@@ -154,13 +135,9 @@ def parallel_source(
     *,
     rows: int,
     sweeps: int,
-    nesterov: bool = True,
-    min_rows: int = 0,
-    matrix_free: bool = False,
-    has_drive_rows: bool = False,
-    skip_local_internal_worlds: bool = False,
     inkernel_response: tuple[int, int, int, int],
-    exact_row_sums: bool = False,
+    min_rows: int = 0,
+    has_drive_rows: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -169,13 +146,12 @@ def parallel_source(
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row.
 
-    The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the response operator: the block
-    ``A = Z^T Z`` (row layout; ``rows`` above 96 need ``matrix_free``) or, ``matrix_free``, ``Z`` in registers and
-    staged transposed, its step scale bounded by the exact row sums (``exact_row_sums``) or the column sums. The rows
-    are whitened in the kernel (:class:`.WhitenedRows`) for the groups ``inkernel_response = (NA, NB, OA, OB)``, from
-    the group Jacobians or the keyed rows' operands (``row_inputs``: their metadata, physical rows and arguments). It
-    runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: momentum with ``nesterov``, pairs projected on
-    their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
+    The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then whitens the rows in the kernel
+    (:class:`.WhitenedRows`, ``inkernel_response = (NA, NB, OA, OB)``), from the group Jacobians or the keyed rows'
+    operands (``row_inputs``: their metadata, physical rows and arguments), into the matrix-free response
+    (:class:`.TransposedResponse`: ``Z`` in registers and staged transposed, its step scale bounded by the column
+    sums). It runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected
+    on their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
     ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses.
 
     Returns the body and its staging.
@@ -185,10 +161,8 @@ def parallel_source(
         max_world_dofs,
         rows=rows,
         min_rows=min_rows,
-        matrix_free=matrix_free,
         has_drive_rows=has_drive_rows,
         inkernel_response=inkernel_response,
-        exact_row_sums=exact_row_sums,
         row_inputs=row_inputs,
     )
     M_D, D, AM = max_constraints, max_world_dofs, int(rows)
@@ -209,11 +183,8 @@ def parallel_source(
         read=operands.physical_row if operands is not None else None,
         staged=operands.stage if operands is not None else None,
     )
-    if matrix_free:
-        op = TransposedResponse(D, AM, lanes, exact=bool(exact_row_sums), whitened=whitened)
-    else:
-        op = Block(D, AM + 1, lanes, rows="n_rows", layout="row", whitened=whitened)
-    dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 and nesterov else ()
+    op = TransposedResponse(D, AM, whitened, lanes)
+    dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 else ()
     # A block of several warps reduces the trace's largest change over its warps.
     trace_reduction, trace = "", ()
     if solve_policy.traces and NT > 32:
@@ -241,7 +212,7 @@ def parallel_source(
 
     last_word = jacobi_limit_pass(store, op, laws) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
-{dense_tier_world(AM, int(min_rows), D, M_D, local=skip_local_internal_worlds, rows="n_rows", support=D)}
+{dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D)}
 
 {staging.declarations("    ")}{trace_reduction}
 {op.registers("    ")}
@@ -255,7 +226,7 @@ def parallel_source(
 
 {op.jacobi_stage(store.padding(), scale, "    ")}
 
-{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), momentum=bool(nesterov), pooled=bool(linked_rows))}
+{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows))}
 
 {last_word}
 {op.publish(indent="    ", applied=lambda row: f"s_x[{row}] - s_lam0[{row}]")}
@@ -278,13 +249,9 @@ def parallel_kernel(
     *,
     rows: int,
     sweeps: int,
-    nesterov: bool = True,
-    min_rows: int = 0,
-    matrix_free: bool = False,
-    has_drive_rows: bool = False,
-    skip_local_internal_worlds: bool = False,
     inkernel_response: tuple[int, int, int, int],
-    exact_row_sums: bool = False,
+    min_rows: int = 0,
+    has_drive_rows: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -296,15 +263,13 @@ def parallel_kernel(
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as accumulated
     unilateral rows whatever the serial sweeps' law. Its worlds' packed rows (:mod:`.packed_rows`) lie at their
-    coordinates, ``max_world_dofs`` entries a row: the A-based tier rewrites them with its own.
+    coordinates, ``max_world_dofs`` entries a row.
     """
     options = {
         "rows": rows,
         "min_rows": min_rows,
-        "matrix_free": matrix_free,
         "has_drive_rows": has_drive_rows,
         "inkernel_response": inkernel_response,
-        "exact_row_sums": exact_row_sums,
         "row_inputs": row_inputs,
     }
     snippet, staging = parallel_source(
@@ -312,8 +277,6 @@ def parallel_kernel(
         max_world_dofs,
         **options,
         sweeps=sweeps,
-        nesterov=nesterov,
-        skip_local_internal_worlds=skip_local_internal_worlds,
         linked_rows=linked_rows,
         velocity_limit_pass=velocity_limit_pass,
         solve_policy=solve_policy,
@@ -324,10 +287,8 @@ def parallel_kernel(
     NT = 32 * ((AM + 31) // 32)
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
-        f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nes{int(bool(nesterov))}"
-        f"_nt{NT}_mf{int(bool(matrix_free))}_ink{NA}_{NB}_o{OA}_{OB}"
-        f"_hd{int(bool(has_drive_rows))}_z{int(not matrix_free)}_ex{int(bool(matrix_free and exact_row_sums))}"
-        + ("_local_fallback" if skip_local_internal_worlds else "")
+        f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
+        f"_hd{int(bool(has_drive_rows))}"
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
         + solve_policy.suffix

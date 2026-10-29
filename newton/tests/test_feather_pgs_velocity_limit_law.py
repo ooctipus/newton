@@ -67,15 +67,6 @@ _GENERATORS = {
         {"has_drive_rows": True, "shared_metadata": False, "fuse_vel_limits": True},
         (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
-    "incremental": (
-        sweep_routes.incremental_kernel.__wrapped__,
-        (64, 32, 12, "120"),
-        {"incremental_rows": 32},
-        (
-            "ProjectionLaw::velocity_limit_update(old_impulse, residual, residual * s_inv_diag[i], 1)",
-            "ProjectionLaw::velocity_limit_update(s_lam[i], residual_vlim, residual_vlim * s_inv_diag[i], 1)",
-        ),
-    ),
     "sparse_limits": (
         sparse_kernel.__wrapped__,
         (48, 18, 12),
@@ -174,7 +165,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
                 ):
                     factories.add(f"{module_name}.{name}")
         self.assertLessEqual(
-            {"sweep_routes.mf_gs_kernel", "sweep_routes.incremental_kernel", "sweep_routes_sparse.sparse_kernel"},
+            {"sweep_routes.mf_gs_kernel", "sweep_routes_sparse.sparse_kernel"},
             factories,
         )
 
@@ -448,9 +439,6 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         arch = str(device.arch)
         factories = {
             "mf_gs": lambda law: sweep_routes.mf_gs_kernel(4, 1, 2, arch, has_drive_rows=False, velocity_limit_law=law),
-            "incremental": lambda law: sweep_routes.incremental_kernel(
-                4, 1, 2, arch, incremental_rows=4, has_drive_rows=False, velocity_limit_law=law
-            ),
         }
         for (name, factory), law, row_phase in itertools.product(
             factories.items(), ("stateless", "accumulated"), (0, 5)
@@ -474,15 +462,7 @@ def _pushed_arm(device, limit):
     return model
 
 
-# Matrix-free routes that sweep dense velocity-limit rows. Sparse factors roll out in
-# test_feather_pgs_sparse_velocity_limits.
-_DENSE_ROUTES = {
-    "mf_gs": {"mf_gs_incremental_rows": 0},
-    "incremental": {"mf_gs_incremental_rows": 32},
-}
-
-
-def _matrix_free_solver(model, law, **options):
+def _matrix_free_solver(model, law, *, pins=None, **options):
     settings = {
         "enable_joint_velocity_limits": True,
         "friction_anchor_beta": 0.0,
@@ -492,7 +472,7 @@ def _matrix_free_solver(model, law, **options):
         "velocity_limit_law": law,
     }
     settings.update(options)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary"}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary", **(pins or {})}):
         return SolverFeatherPGS(model, **settings)
 
 
@@ -501,23 +481,18 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
     def test_constant_torque_never_pushes_past_the_limit(self):
         """Hold a revolute DOF that a constant torque pushes past its limit at the limit under either law.
 
-        Every sweep kernel of the route is built with the requested law: the
-        matrix-free GS kernel and the incremental tiers.
+        The matrix-free GS kernel of the route is built with the requested law.
         """
         limit, dt = 1.0, 1.0 / 240.0
         model = _pushed_arm("cuda:0", limit)
-        for (route, options), law in itertools.product(_DENSE_ROUTES.items(), ("stateless", "accumulated")):
-            with self.subTest(route=route, law=law):
-                solver = _matrix_free_solver(model, law, **options)
+        for law in ("stateless", "accumulated"):
+            with self.subTest(law=law):
+                solver = _matrix_free_solver(model, law)
                 routes = solver.get_path_selection()["routes"]
                 self.assertEqual(routes["velocity_limits"]["law"], law)
-                tiers = routes["sweep"]["tiers"]
-                self.assertEqual(tiers is not None and tiers["family"] == "incremental", route == "incremental")
-                kernels = [routes["sweep"]["mf_gs"]]
-                if route == "incremental":
-                    kernels += [tier["kernel"] for tier in tiers["tiers"]]
-                for key in kernels:
-                    self.assertEqual("_vacc" in key, law == "accumulated", key)
+                self.assertIsNone(routes["sweep"]["tiers"])
+                key = routes["sweep"]["mf_gs"]
+                self.assertEqual("_vacc" in key, law == "accumulated", key)
                 state, out, control = model.state(), model.state(), model.control()
                 control.joint_f.assign(np.array([120.0], np.float32))  # 0.5 rad/s per step
                 speeds = []
@@ -534,39 +509,27 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         A palm joint carries three two-link fingers, every joint velocity-limited.
         One step from rest with torques that push some joints past their limits and
         leave others inside couples the limit rows through the hand's mass matrix.
-        The parallel tier (tolerance 0, 2000 sweeps) solves the complementarity
-        problem; at 2000 iterations the matrix-free GS kernel and the incremental
-        tier match it to 1e-5 under the accumulated law. The stateless serial
-        sweep converges more than 1e-4 away (1.1e-3 in a float64 reference), so
-        a route built with the stateless law cannot pass.
+        The parallel tier (a test pin: 2000 sweeps) solves the complementarity
+        problem; at 2000 iterations the matrix-free GS kernel matches it to 1e-5
+        under the accumulated law. The stateless serial sweep converges more than
+        1e-4 away (1.1e-3 in a float64 reference), so a route built with the
+        stateless law cannot pass.
         """
         model = _limited_hand("cuda:0")
         # Unconstrained step velocities (0.05, 0.33, -1.42, -0.45, 2.07, -0.46, 0.62) rad/s: three limits bind at
         # the solution, and the coupling keeps four joints inside theirs.
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
-        converged = {"pgs_iterations": 2000, "mf_gs_parallel_sweeps": 2000}
         velocities = {}
-        for name, law, options in (
-            ("serial_stateless", "stateless", {"mf_gs_incremental_rows": 0}),
-            ("serial", "accumulated", {"mf_gs_incremental_rows": 0}),
-            ("incremental", "accumulated", {"mf_gs_incremental_rows": 32}),
-            ("tier", "accumulated", {"mf_gs_incremental_rows": 0, "mf_gs_parallel_rows": 32}),
-            (
-                "tier_matrix_free",
-                "accumulated",
-                {"mf_gs_incremental_rows": 0, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
-            ),
+        for name, law, pins in (
+            ("serial_stateless", "stateless", {}),
+            ("serial", "accumulated", {}),
+            ("tier", "accumulated", {"tiers": 32, "tier_sweeps": 2000}),
         ):
-            solver = _matrix_free_solver(model, law, **converged, **options)
-            self.assertEqual(solver._ink_rows, 32 if name.startswith("tier") else 0)
-            # Each serial route sweeps the hand's rows with kernels of the requested law.
-            if name == "incremental":
-                route_kernels = [tier.kernel for tier in solver._mf_gs_tiers]
-                self.assertTrue(route_kernels)
-            else:
-                route_kernels = [solver._pgs_solve_mf_gs_kernel]
-            for kernel in route_kernels:
-                self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
+            solver = _matrix_free_solver(model, law, pins=pins, pgs_iterations=2000)
+            self.assertEqual(solver._ink_rows, 32 if name == "tier" else 0)
+            # Each serial route sweeps the hand's rows with a kernel of the requested law.
+            kernel = solver._pgs_solve_mf_gs_kernel
+            self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
             state, out, control = model.state(), model.state(), model.control()
             control.joint_f.assign(torques)
             solver.step(state, out, control, None, 1.0 / 240.0)
@@ -579,13 +542,12 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         stateless_gap = float(np.max(np.abs(velocities["serial_stateless"] - velocities["tier"])))
         # The comparison below discriminates the laws only while the stateless law lands elsewhere.
         self.assertGreater(stateless_gap, 1.0e-4)
-        for route in ("serial", "incremental", "tier_matrix_free"):
-            np.testing.assert_allclose(
-                velocities[route],
-                velocities["tier"],
-                atol=1.0e-5,
-                err_msg=f"{route}; the stateless serial sweep lies {stateless_gap:.3e} from the tier",
-            )
+        np.testing.assert_allclose(
+            velocities["serial"],
+            velocities["tier"],
+            atol=1.0e-5,
+            err_msg=f"the stateless serial sweep lies {stateless_gap:.3e} from the tier",
+        )
 
 
 _HAND_LIMIT = 0.5

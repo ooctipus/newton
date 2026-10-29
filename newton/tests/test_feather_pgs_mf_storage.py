@@ -38,7 +38,7 @@ _LARGE_STREAMED_SHAPE = {
     "max_world_dofs": 75,
     "has_drive_rows": False,
     "has_dense_velocity_limit_rows": False,
-    "skip_incremental_rows": 32,
+    "skip_tier_rows": 32,
 }
 # Streamed-metadata option sets the resident row metadata must leave otherwise unchanged.
 _STREAMED_OPTIONS = (
@@ -46,14 +46,14 @@ _STREAMED_OPTIONS = (
     {"has_drive_rows": True, "has_dense_velocity_limit_rows": True},
     {"has_drive_rows": True, "fuse_vel_limits": True},
     {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True},
-    {"skip_incremental_rows": 0, "contact_torsion": True},
+    {"skip_tier_rows": 0, "contact_torsion": True},
     {"stream_mf_impulses": True},
     {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
     {
         "has_dense_velocity_limit_rows": False,
         "factor_coordinates": True,
         "independent_components": True,
-        "skip_incremental_rows": 0,
+        "skip_tier_rows": 0,
     },
     {"max_constraints": 1024, "mf_max_constraints": 4096, "max_world_dofs": 604},
     # The accumulated velocity-limit law, in the dense limit pass and in streamed free-body totals.
@@ -366,11 +366,11 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         """Name the resident variant apart from the streamed kernel, whose name stays as it was."""
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         shape = (2304, 2304, 75, "120")
-        options = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_incremental_rows": 32}
+        options = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
         streamed = factory(*shape, shared_metadata=False, **options)
         resident = factory(*shape, shared_metadata=False, resident_row_metadata=True, **options)
-        self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_skipinc32")
-        self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_smeta_skipinc32")
+        self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_skiptier32")
+        self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_smeta_skiptier32")
         self.assertEqual(max(_native_snippets(resident), key=len).count("__shared__ int s_meta_dense[2304];"), 1)
         self.assertEqual(
             list(inspect.signature(resident.func).parameters), list(inspect.signature(streamed.func).parameters)
@@ -703,7 +703,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("Select a CUDA device for native MF-GS execution")
-        contacts = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_incremental_rows": 32}
+        contacts = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
         limits = {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True}
         cases = (
             ("large_capacity", (2304, 48, 75), contacts, (220, 300)),
@@ -857,7 +857,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             "enable_joint_limits": True,
             "dense_max_constraints": 320,
             "mf_max_constraints": 32,
-            "mf_gs_incremental_rows": 0,
         }
         for schedule, phases in (("interleaved", {0}), ("physx_grasp", {3, 4, 5})):
             with (
@@ -916,7 +915,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         options = {
             "dense_max_constraints": 320,
             "mf_max_constraints": 12288,
-            "mf_gs_incremental_rows": 0,
         }
         solvers = {}
         for request in ("0", "1"):

@@ -18,7 +18,7 @@ STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
 
 def _tier_solver(model):
-    """The point tiers, whitening their rows in the kernel (the standing model fits)."""
+    """The point tiers of 32 rows (a test pin), forming the response in-kernel, which the standing model fits."""
     return _matrix_free_solver(model, beta=0.0, parallel_rows=32)
 
 
@@ -38,55 +38,54 @@ class _Scene:
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestFeatherPGSCaptureAllocation(unittest.TestCase):
-    def test_tier_placeholders_precede_a_captured_first_step(self):
+    def test_tier_inputs_precede_a_captured_first_step(self):
         """Give a first step captured right after construction tier inputs that existed before the capture.
 
-        Allocated at the tiers' first launch, inside the capture, each ``wp.zeros`` would be a memset node
-        that every replay runs again. The captured step then matches the same first step taken eagerly.
+        The tiers' in-kernel response inputs are allocated with their construction. Allocated at
+        their first launch, inside the capture, each ``wp.zeros`` would be a memset node that every
+        replay runs again. The captured step then matches the same first step taken eagerly.
         """
         device = wp.get_device("cuda:0")
-        for name in ("in_kernel_response",):
-            with self.subTest(configuration=name):
-                model = standing_model()
-                captured = _Scene(model, _tier_solver(model))
-                tiers = captured.solver._mf_gs_tiers
-                self.assertTrue(tiers)
-                self.assertTrue(all(tier.response_inputs for tier in tiers))
-                tier_kernels = [tier.kernel for tier in tiers]
-                self.assertIsNotNone(captured.solver._ink_sizes)
-                allocated, tier_inputs = [], []
-                zeros, launch_tiled = wp.zeros, wp.launch_tiled
+        model = standing_model()
+        captured = _Scene(model, _tier_solver(model))
+        tiers = captured.solver._mf_gs_tiers
+        self.assertTrue(tiers)
+        self.assertTrue(all(tier.response_inputs for tier in tiers))
+        tier_kernels = [tier.kernel for tier in tiers]
+        self.assertIsNotNone(captured.solver._ink_sizes)
+        allocated, tier_inputs = [], []
+        zeros, launch_tiled = wp.zeros, wp.launch_tiled
 
-                def allocate(*args, allocated=allocated, zeros=zeros, **kwargs):
-                    array = zeros(*args, **kwargs)
-                    allocated.append(array)
-                    return array
+        def allocate(*args, allocated=allocated, zeros=zeros, **kwargs):
+            array = zeros(*args, **kwargs)
+            allocated.append(array)
+            return array
 
-                def launch(
-                    kernel,
-                    *args,
-                    tier_inputs=tier_inputs,
-                    tier_kernels=tier_kernels,
-                    launch_tiled=launch_tiled,
-                    **kwargs,
-                ):
-                    if any(kernel is tier_kernel for tier_kernel in tier_kernels):
-                        tier_inputs.extend(kwargs.get("inputs", ()))
-                    return launch_tiled(kernel, *args, **kwargs)
+        def launch(
+            kernel,
+            *args,
+            tier_inputs=tier_inputs,
+            tier_kernels=tier_kernels,
+            launch_tiled=launch_tiled,
+            **kwargs,
+        ):
+            if any(kernel is tier_kernel for tier_kernel in tier_kernels):
+                tier_inputs.extend(kwargs.get("inputs", ()))
+            return launch_tiled(kernel, *args, **kwargs)
 
-                with patch.object(wp, "zeros", allocate), patch.object(wp, "launch_tiled", launch):
-                    with wp.ScopedCapture(device=device) as capture:
-                        captured.step()
-                self.assertTrue(tier_inputs, "The captured step must launch the tiers")
-                late = [array for array in allocated if any(array is value for value in tier_inputs)]
-                self.assertEqual(late, [], "Tier inputs were allocated inside the capture")
-                wp.capture_launch(capture.graph)
-                eager = _Scene(model, _tier_solver(model))
-                eager.step()
-                for field in STATE_FIELDS:
-                    expected, actual = getattr(eager.out, field).numpy(), getattr(captured.out, field).numpy()
-                    self.assertTrue(np.isfinite(actual).all(), field)
-                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2e-6, err_msg=field)
+        with patch.object(wp, "zeros", allocate), patch.object(wp, "launch_tiled", launch):
+            with wp.ScopedCapture(device=device) as capture:
+                captured.step()
+        self.assertTrue(tier_inputs, "The captured step must launch the tiers")
+        late = [array for array in allocated if any(array is value for value in tier_inputs)]
+        self.assertEqual(late, [], "Tier inputs were allocated inside the capture")
+        wp.capture_launch(capture.graph)
+        eager = _Scene(model, _tier_solver(model))
+        eager.step()
+        for field in STATE_FIELDS:
+            expected, actual = getattr(eager.out, field).numpy(), getattr(captured.out, field).numpy()
+            self.assertTrue(np.isfinite(actual).all(), field)
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2e-6, err_msg=field)
 
 
 if __name__ == "__main__":

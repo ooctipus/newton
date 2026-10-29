@@ -258,12 +258,11 @@ from .tree_passes import (
 from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
 
-_MF_EXACT_ROWSUM = (
-    os.environ.get("FEATHER_PGS_MF_EXACT_ROWSUM") == "1"
-)  # experiment: matrix-free sweep with the exact A-based step scale
 # Parallel tiers grid-stride over per-tier world lists from this many tiers on: one classify launch against
 # (tiers - 1) x worlds idle block entries.
 _TIER_LIST_MIN_TIERS = 3
+# The largest articulation the tiers whiten in-kernel: its factor is staged in the block (case K4).
+_INKERNEL_MAX_DOF = 32
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
@@ -851,7 +850,8 @@ class SolverFeatherPGS(SolverBase):
     # (routes.pins). Keys:
     #   storage "dense": no packed (native sparse) factor.     evaluator "ordinary": no held tree.
     #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
-    #   producer "compact_jacobian": no local packets.         claims: the runtime claims kept, of ("resolved_worlds",).
+    #   producer "compact_jacobian" or "general": no local packets or keyed rows.
+    #   claims: the runtime claims kept, of ("resolved_worlds",).
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
     #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
@@ -859,6 +859,8 @@ class SolverFeatherPGS(SolverBase):
     #   velocity_limit_clamp False: dedicated rows for driven velocity limits.
     #   torsion_preparation "host": the host reference of the torsion rows.
     #   double_buffer False: one set of mass matrices and Jacobians, whose rows stay readable after a step.
+    #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
+    #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
     #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel: a dense kernel (CUDA).
     _route_pins: ClassVar[dict[str, object]] = {}
 
@@ -972,12 +974,6 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
-        mf_gs_incremental_rows: int = 32,
-        mf_gs_parallel_rows: int = 0,
-        mf_gs_parallel_sweeps: int = 24,
-        mf_gs_parallel_nesterov: bool = True,
-        mf_gs_parallel_matrix_free: bool = False,
-        mf_gs_parallel_linked_velocity_limit_pass: bool = False,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
         contact_update: Literal["sequential", "unit"] = "sequential",
         bilateral_preelimination_include_mimics: bool = True,
@@ -1252,50 +1248,6 @@ class SolverFeatherPGS(SolverBase):
                 ``"sequential"``; ``get_path_selection()`` records which sweep runs which law under
                 ``routes.sweep.contact_update``, and construction warns when a requested ``"unit"`` reaches only
                 some sweeps. Experimental. Defaults to ``"sequential"``.
-            mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
-                matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
-                most this many rows solve through a shared-memory response block instead of
-                re-evaluating ``J v`` per row. Capped at 64. ``0`` disables the kernel. Defaults to 32.
-            mf_gs_parallel_rows (int, optional): Row budget of the scaled parallel projection sweep. Worlds with
-                only dense articulated rows and at most this many rows are solved by the parallel kernel (all rows
-                updated at once with per-row step scaling and Nesterov momentum) instead of the row-serial kernels.
-                ``0`` disables it. Requires the same conditions as ``mf_gs_incremental_rows`` and takes precedence.
-                Consider small contact sets, such as an arm against fixed geometry; worlds with mixed/free-body
-                rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
-                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Each tangent pair
-                takes one isotropic step, the serial pair solve's friction law, so a sliding pair converges to
-                maximal dissipation; under persistent patch friction it projects on its patch's pooled normal
-                load. Each
-                tier's sweep budget follows ``mf_gs_parallel_sweeps``. The tiers accumulate joint velocity-limit rows
-                (``routes.sweep.tiers.velocity_limit_law``). The worlds they decline keep the serial sweep and its
-                ``velocity_limit_law``, ``"stateless"`` by default, so tier and serial worlds share one fixed point
-                under ``velocity_limit_law="accumulated"`` or without joint velocity limits. The tiers solve the
-                unregularized contact law, so regularized contacts (``pgs_contact_regularization``) keep the serial
-                kernels.
-            mf_gs_parallel_sweeps (int, optional): Minimum sweep budget of each parallel tier
-                (``mf_gs_parallel_rows``). Jacobi sweeps need more passes than the serial sweep's Gauss-Seidel
-                iterations to reach its accuracy, the more so the more rows couple through one body, so every tier,
-                under either friction law, sweeps ``ceil(7/2 * pgs_iterations * sqrt(R / 32))`` times for its row
-                bound ``R``, at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is
-                larger, from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the
-                accuracy to match. The factor is fit, by interpolating each world's error between measured sweep
-                caps, so that each evaluated row bucket of contact-rich point- and patch-friction workloads reaches
-                the serial sweep's accuracy. A world stops earlier under the sweeps' exit law, once its rows'
-                changes are at the rounding floor.
-                ``get_path_selection()`` reports each tier's budget and its rule under ``routes.sweep.tiers``.
-                Defaults to 24.
-            mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
-            mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
-                ``Y^T y`` and ``J . dv`` from staged rows; row-sum-bound step scale). With ``m`` rows and ``D`` DOFs,
-                the block costs ``O(m^2 D)`` to build plus ``O(m^2)`` per sweep; matrix-free costs ``O(m D)`` per
-                sweep. Consider matrix-free when block construction dominates, such as contact-rich hands;
-                small row sets or many sweeps may favor the block. Compare total cost at the required convergence.
-            mf_gs_parallel_linked_velocity_limit_pass (bool, optional): Give the joint velocity limits the last word
-                in the parallel tiers that serve persistent patch friction, as the serial sweeps' end-of-iteration
-                pass gives it to them: after the final sweep one warp pushes every violated velocity-limit row back
-                onto its limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot
-                of a tier its sweep budget stops early. Applies only with ``enable_joint_velocity_limits`` and
-                linked tiers. Experimental. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -1549,13 +1501,6 @@ class SolverFeatherPGS(SolverBase):
             and not np.isinf(self.velocity_limit_activation_fraction)
             and getattr(model, "joint_velocity_limit", None) is not None
         )
-        # Row budget of the incremental-residual matrix-free GS kernel; 0 disables it.
-        self.mf_gs_incremental_rows = int(mf_gs_incremental_rows)
-        self.mf_gs_parallel_rows = int(mf_gs_parallel_rows)
-        self.mf_gs_parallel_sweeps = int(mf_gs_parallel_sweeps)
-        self.mf_gs_parallel_nesterov = bool(mf_gs_parallel_nesterov)
-        self.mf_gs_parallel_matrix_free = bool(mf_gs_parallel_matrix_free)
-        self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
         self._grouped_response = False
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
@@ -2140,8 +2085,7 @@ class SolverFeatherPGS(SolverBase):
             self._keyed_rows_reason = (
                 "Admitted: the in-kernel parallel sweep builds keyed rows for its bounded worlds."
                 if self._keyed_rows is not None
-                else "Keyed rows need matrix-free parallel tiers (mf_gs_parallel_rows and mf_gs_parallel_matrix_free) "
-                "that build the response in-kernel (routes.sweep.tiers) and a plain matrix-free policy."
+                else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
             )
         self._init_tiled_kernels(model)
         self._init_size_group_streams(model)
@@ -3691,6 +3635,7 @@ class SolverFeatherPGS(SolverBase):
                     self._route_pins.get("storage") != "dense",
                     "A test pin keeps dense storage (storage='dense').",
                 ),
+                (not self._route_pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
                 (self._parallel_augmented_drive_topology, "Drive topology is not supported by native sparse factors."),
                 (
                     not self.enable_joint_velocity_limits or velocity_candidate,
@@ -3717,22 +3662,12 @@ class SolverFeatherPGS(SolverBase):
         # recipes retain their own admission and fallback, including when their
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
-        # A parallel tier that serves the active friction law owns the ordinary buffers.
-        # Patch friction yields only to a parallel tier that admits it; point friction keeps its unconditional
-        # yield. The yield reserves the dense route, not the tier: a paired factor sweep admitted there later
-        # excludes the tiers and keyed rows under both laws (_init_tiled_kernels, keyed_rows).
-        parallel_tier = self.mf_gs_parallel_rows > 0 and (self._laws.point or self._parallel_contact_paths)
-        if parallel_tier:
-            self._sparse_selection_reason = "A competing parallel tier reserves the ordinary buffers."
-            return
         if self._has_free_rigid_bodies:
             # A world that pairs an articulation with free rigid bodies is served
             # by the held-tree owner and the paired response on the dense route
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
-            # sweep and keeps the resolved-world classifier. A parallel tier that
-            # mf_gs_parallel_rows requests declines sparse factors first (above), so native sparse factors never
-            # serve free rigid bodies.
+            # sweep and keeps the resolved-world classifier. Native sparse factors never serve free rigid bodies.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
@@ -4951,7 +4886,7 @@ class SolverFeatherPGS(SolverBase):
         self._mf_gs_block_count = int(
             self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
         )
-        # The tier sweeps ahead of the matrix-free sweep (SweepTier): parallel tiers or incremental tiers.
+        # The Jacobi tiers ahead of the matrix-free sweep (SweepTier).
         self._mf_gs_tiers = []
         if model.device.is_cuda and int(model.articulation_count) > 0:
             # The grouped response solve (_stage4_hinv_jt_grouped), for the sizes StepPlan gives it from the data.
@@ -4981,7 +4916,7 @@ class SolverFeatherPGS(SolverBase):
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self._mfgs_storage = storage
-            parallel_rows, incremental_rows = self._ink_rows, self._incremental_rows
+            parallel_rows = self._ink_rows
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -5003,7 +4938,7 @@ class SolverFeatherPGS(SolverBase):
                 "local_internal_max_constraints": self._dense_internal_max_rows,
                 "contact_torsion": self._contact_torsion_enabled,
                 "factor_coordinates": self._paired_factor_coordinates,
-                "skip_incremental_rows": max(incremental_rows, parallel_rows),
+                "skip_tier_rows": parallel_rows,
                 "independent_components": self._paired_components is not None,
                 "colored_worlds": colored,
                 "max_row_dofs": self._packed_support,
@@ -5068,40 +5003,13 @@ class SolverFeatherPGS(SolverBase):
                         readout_budget=sweeps_,
                         rows=rows_,
                         sweeps=sweeps_,
-                        nesterov=self.mf_gs_parallel_nesterov,
                         min_rows=min_rows_,
-                        matrix_free=self.mf_gs_parallel_matrix_free,
-                        skip_local_internal_worlds=self._local_internal_fast_path,
                         inkernel_response=self._ink_sizes,
                         has_drive_rows=has_drive_rows,
-                        exact_row_sums=_MF_EXACT_ROWSUM,
                         linked_rows=self._friction_anchors_enabled,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                     )
                     self._mf_gs_tiers.append(dataclasses.replace(tier, tier=tier_index))
-            if incremental_rows > 0:
-                # Two tiers above 32 rows: the 32-row instance keeps its 4 KB response block and
-                # occupancy; the wider instance (two rows per lane) takes worlds with 33..N rows.
-                tiers = [(min(32, incremental_rows), 0)]
-                if incremental_rows > 32:
-                    tiers.append((incremental_rows, 32))
-                for rows, min_rows in tiers:
-                    kernel = self._sweep_kernel(
-                        "mf_gs_incremental",
-                        sweep_routes.incremental_kernel,
-                        self.dense_max_constraints,
-                        self.mf_max_constraints,
-                        self.max_world_dofs,
-                        device_arch,
-                        incremental_rows=rows,
-                        max_row_dofs=self._packed_support,
-                        has_drive_rows=has_drive_rows,
-                        has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
-                        skip_local_internal_worlds=self._local_internal_fast_path,
-                        min_rows=min_rows,
-                        velocity_limit_law=self._velocity_limit_kernel_law(),
-                    )
-                    self._mf_gs_tiers.append(SweepTier(kernel, velocity_limit_law=self._velocity_limit_kernel_law()))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self._solve_readout.register_skipped(
                 world_count=int(self.world_count),
@@ -5701,8 +5609,8 @@ class SolverFeatherPGS(SolverBase):
                     int(phase_iteration_offset),
                     int(freeze_drive_rows),
                 ]
-                # The incremental kernel owns worlds with only dense rows inside its row
-                # budget; the legacy kernel returns early for those and solves the rest.
+                # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns
+                # early for those and solves the rest.
                 tier_lists = getattr(self, "_tier_worlds", None) is not None
                 if tier_lists:
                     self._tier_counts.zero_()
@@ -8800,44 +8708,50 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _plan_tier_rows(self) -> None:
-        """Set the tier sweeps' row budgets and whether the parallel tiers form the response in-kernel.
+        """Choose the Jacobi tiers from the class (case K4): their row bound and their in-kernel response.
 
-        ``_ink_rows`` and ``_incremental_rows`` are the parallel and incremental tiers' row budgets (0 without them;
-        an admitted parallel tier replaces the incremental one). A parallel tier whitens each world's rows and forms
-        their diagonals in the kernel: it is built wherever the model and the tiers fit
-        (:meth:`_build_inkernel_response_meta`, :func:`.sweep_routes_tiers.inkernel_response_fits` of the smallest
-        tier), and the incremental tier serves elsewhere; ``_ink_reason`` says why or why not
+        The tiers serve the dense rows of a tree beside a free body where no other placement claims the class: not
+        packed factors or the sparse diagonal (no matrix-free sweep then), the local owners (case K3) or factor
+        coordinates (case K5), nor the fused velocity clamp of drive rows. They form each world's response in the
+        kernel, which bounds the class (:meth:`_build_inkernel_response_meta`: one articulation of each of one or two
+        sizes per world, at most ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement
+        (:meth:`_admit_parallel_contact_paths`). Their row bound is the dense row capacity, at most
+        :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
+        response they form. ``_ink_rows`` is 0 without tiers and ``_ink_reason`` says why or why not
         (``routes.sweep.tiers``). The local packets and the keyed rows read this before the tiers are built.
         """
-        tiers = self._mf_sweeps and not self.fuse_joint_velocity_limits and not self._paired_factor_coordinates
-        self._ink_rows = self._incremental_rows = 0
-        self._ink_sizes, self._ink_reason = None, "No parallel tier is built."
-        # The incremental kernel loads the whole row prefix and pools each friction pair's ring of normal loads, so
-        # it serves patch friction; the linked parallel tiers pool each friction pair's cone over its patch ring.
-        # A parallel tier whitens its worlds' rows in the kernel, where they fit; elsewhere the incremental tier
-        # serves as it does without one.
-        if tiers and self.mf_gs_parallel_rows > 0 and self._parallel_contact_paths:
-            rows = min(
-                int(self.dense_max_constraints),
-                int(self.mf_gs_parallel_rows),
-                128 if self.mf_gs_parallel_matrix_free else 96,
+        pinned = self._route_pins.get("tiers")
+        self._ink_rows, self._ink_sizes = 0, None
+        self._ink_reason = first_failed(
+            (
+                (self._mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
+                (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
+                (self._route_pins.get("placement") != "general", "A test pin keeps the general placement."),
+                (
+                    not self._preelim_active,
+                    "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew.",
+                ),
+                (
+                    not self.fuse_joint_velocity_limits,
+                    "The fused velocity clamp of drive rows keeps the serial sweeps.",
+                ),
+                (not self._paired_factor_coordinates, "Factor coordinates serve the tree and its body (case K5)."),
+                (not self._local_internal_fast_path, "Local owners serve the small tree and its body (case K3)."),
+                (
+                    bool(pinned) or (self._has_free_rigid_bodies and self._has_non_free_articulations),
+                    "The tiers serve a tree beside a free body (case K4).",
+                ),
+                (self._parallel_contact_paths, self._parallel_contact_paths_reason),
             )
+        )
+        if self._ink_reason is None:
+            sizes, self._ink_reason = self._build_inkernel_response_meta()
+            rows = min(int(self.dense_max_constraints), int(pinned or sweep_routes_tiers.TIER_MAX_ROWS))
             rows -= rows % 4
-            if self._preelim_active:
-                self._ink_reason = "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew."
-            elif not sweep_routes_tiers.inkernel_response_fits(
-                self.max_world_dofs, min(32, rows), self.mf_gs_parallel_matrix_free
-            ):
-                self._ink_reason = (
-                    f"The response block of the A-based tiers cannot whiten {self.max_world_dofs} world coordinates "
-                    "in place; matrix-free tiers (mf_gs_parallel_matrix_free) need no such scratch."
-                )
-            else:
-                self._ink_sizes, self._ink_reason = self._build_inkernel_response_meta()
-            if self._ink_sizes is not None:
-                self._ink_rows = rows
-        if not self._ink_rows and tiers and self.mf_gs_incremental_rows > 0 and self._laws.agnostic:
-            self._incremental_rows = min(int(self.dense_max_constraints), int(self.mf_gs_incremental_rows), 64)
+            if sizes is not None and rows > 0:
+                self._ink_sizes, self._ink_rows = sizes, rows
+            elif sizes is not None:
+                self._ink_reason = f"The dense row capacity {self.dense_max_constraints} holds no tier of four rows."
 
     def _build_inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
         """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.
@@ -8850,6 +8764,8 @@ class SolverFeatherPGS(SolverBase):
         if not (1 <= len(self.size_groups) <= 2):
             return None, f"{len(self.size_groups)} size groups; the in-kernel response takes one or two."
         sizes = sorted((int(s) for s in self.size_groups), reverse=True)
+        if sizes[0] > _INKERNEL_MAX_DOF:
+            return None, f"Size {sizes[0]} exceeds the in-kernel whitening's {_INKERNEL_MAX_DOF} coordinates."
         art_to_world = self.art_to_world.numpy()
         dof_off = self.articulation_world_dof_offset.numpy()
         meta = -np.ones((self.world_count, 4), dtype=np.int32)
@@ -8889,8 +8805,7 @@ class SolverFeatherPGS(SolverBase):
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
 
         They pool each friction pair's cone over its patch ring and write the patch
-        row law, so patch friction honors ``mf_gs_parallel_rows`` and keyed rows as
-        point friction does. Every tier steps each friction pair
+        row law, so they serve patch friction as they serve point friction. Every tier steps each friction pair
         isotropically, so a sliding pair converges to the serial pair solve's maximal
         dissipation under either law; with per-row steps it did not, which moved
         body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction workloads, and
@@ -8914,7 +8829,7 @@ class SolverFeatherPGS(SolverBase):
         if not laws.agnostic:
             return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
         return True, (
-            "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
+            "Patch friction: parallel tiers and keyed rows serve it. In the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
             "one isotropic step per pair, the serial pair solve's friction law. "
             f"{self._parallel_velocity_limit_agreement()}"
@@ -8947,30 +8862,30 @@ class SolverFeatherPGS(SolverBase):
     def _parallel_velocity_limit_pass(self) -> bool:
         """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
 
-        ``mf_gs_parallel_linked_velocity_limit_pass`` requests it for the linked (patch)
-        tiers; it has rows to push only with joint velocity limits.
+        The linked (patch) tiers give the joint velocity limits the last word, as the serial sweeps' end-of-iteration
+        pass gives it to them: after the final sweep one warp pushes every violated velocity-limit row back onto its
+        limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot of a tier its
+        sweep budget stops early; it has rows to push only with joint velocity limits.
         """
-        return bool(
-            self.mf_gs_parallel_linked_velocity_limit_pass
-            and self._friction_anchors_enabled
-            and self.enable_joint_velocity_limits
-        )
+        return bool(self._friction_anchors_enabled and self.enable_joint_velocity_limits)
 
     def _parallel_tier_sweeps(self, tiers) -> tuple[list[int], str, str]:
         """Return each parallel tier's sweep budget, the rule that set it, and why (``routes.sweep.tiers``).
 
-        ``tiers`` lists ``(rows, min_rows)`` per tier. Every tier, under either friction
-        law, sweeps :func:`.sweep_routes_tiers.tier_sweeps` of its row bound, at least
-        ``mf_gs_parallel_sweeps``. A world stops earlier under the sweeps' exit law.
+        ``tiers`` lists ``(rows, min_rows)`` per tier. Every tier, under either friction law, sweeps
+        :func:`.sweep_routes_tiers.tier_sweeps` of its row bound: the equal-accuracy rule, from ``pgs_iterations``
+        at construction. A world stops earlier under the sweeps' exit law. A test pin (``tier_sweeps``) sets every
+        tier's budget.
         """
-        sweeps = int(self.mf_gs_parallel_sweeps)
+        pinned = self._route_pins.get("tier_sweeps")
+        if pinned is not None:
+            return [int(pinned)] * len(tiers), "pinned", f"A test pin sets every tier's budget (tier_sweeps={pinned})."
         reason = (
-            f"auto: a tier serving up to R rows sweeps ceil({sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION} * pgs_iterations * "
-            f"sqrt(R / 32)) times with pgs_iterations={int(self.pgs_iterations)}, at least "
-            f"mf_gs_parallel_sweeps={sweeps} and at most {sweep_routes_tiers.TIER_SWEEPS_CAP} unless mf_gs_parallel_sweeps is larger; "
-            "a world stops earlier under the sweeps' exit law."
+            f"auto: a tier serving up to R rows sweeps ceil({sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION} * "
+            f"pgs_iterations * sqrt(R / 32)) times with pgs_iterations={int(self.pgs_iterations)}, at most "
+            f"{sweep_routes_tiers.TIER_SWEEPS_CAP}; a world stops earlier under the sweeps' exit law."
         )
-        return [sweep_routes_tiers.tier_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
+        return [sweep_routes_tiers.tier_sweeps(rows, self.pgs_iterations) for rows, _ in tiers], "auto", reason
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
         """Return the law the serial matrix-free sweep kernels give velocity-limit rows, and why.
@@ -9016,9 +8931,7 @@ class SolverFeatherPGS(SolverBase):
         return arr if arr is not None else self._dummy_is_free_rigid
 
     def _ink_skip_rows(self) -> int:
-        """Dense-row budget of the in-kernel-response sweep kernels (0 when they are not active)."""
-        if getattr(self, "_ink_sizes", None) is None:
-            return 0
+        """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""
         return int(getattr(self, "_ink_rows", 0))
 
     def _stage4_hinv_jt_lanes(self, size: int) -> None:

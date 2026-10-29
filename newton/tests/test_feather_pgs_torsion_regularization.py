@@ -11,7 +11,6 @@ from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VE
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
     TORSION_OFF_PINS,
-    TORSION_OFF_ROUTE,
     assert_torsion_neutral_routes,
     fixture,
 )
@@ -102,7 +101,7 @@ class TestTorsionRegularization(unittest.TestCase):
         """Preserve excluded/radius-zero controls and forbid spin without compressive load."""
         for regularization in (0.0, 0.01, 0.02):
             with self.subTest(regularization=regularization):
-                pinned = {"pgs_contact_regularization": regularization, "pins": TORSION_OFF_PINS, **TORSION_OFF_ROUTE}
+                pinned = {"pgs_contact_regularization": regularization, "pins": TORSION_OFF_PINS}
                 base, reference, *_ = fixture(0.0, **pinned)
                 excluded, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **pinned)
                 assert_torsion_neutral_routes(self, reference, selected_out)

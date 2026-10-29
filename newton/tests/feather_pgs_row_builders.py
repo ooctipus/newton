@@ -78,7 +78,7 @@ def install_cpu_keyed_rows(solver):
     solver.max_world_dofs = int(model.joint_dof_count) // solver.world_count
     solver.articulation_world_dof_offset = wp.zeros(model.articulation_count, dtype=int, device=model.device)
     solver.mf_constraint_count = wp.zeros(solver.world_count, dtype=int, device=model.device)
-    solver.mf_gs_parallel_rows = 4
+    solver._ink_rows = 4
     solver._keyed_rows = keyed_rows.KeyedRows(solver)
 
 

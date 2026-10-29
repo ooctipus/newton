@@ -78,13 +78,6 @@ def _is_default(value, default) -> bool:
 
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
-    # Tier budgets after their gates and clamps.
-    "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
-    "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
-    "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
-    "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
-        solver._ink_rows > 0 and any(tier.velocity_limit_pass for tier in solver._mf_gs_tiers)
-    ),
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in the CPU's split mode,
     # which builds no matrix-free sweep and applies no law.
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
@@ -713,41 +706,30 @@ def _tiers(solver) -> dict | None:
     tiers = list(solver._mf_gs_tiers)
     if not tiers:
         return None
-    if solver._ink_rows > 0:
-        return {
-            "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
-            # The tier kernels form their worlds' response in-kernel wherever the model fits, and why.
-            "inkernel_response": solver._ink_sizes is not None,
-            "inkernel_response_reason": solver._ink_reason,
-            # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
-            "linked_rows": all(tier.linked_rows for tier in tiers),
-            # The last-word velocity-limit pass after the final sweep (mf_gs_parallel_linked_velocity_limit_pass).
-            "velocity_limit_pass": all(tier.velocity_limit_pass for tier in tiers),
-            # The tiers accumulate joint velocity-limit rows whatever the serial sweeps' law
-            # (routes.velocity_limits.law), so the two can differ in the worlds the tiers own.
-            "velocity_limit_law": _tier_velocity_limit_law(solver, tiers),
-            "nesterov": bool(solver.mf_gs_parallel_nesterov),
-            "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
-            # The largest tier budget; each tier records its own. Every tier sweeps the automatic budget, at least
-            # mf_gs_parallel_sweeps (rule "auto").
-            "sweeps": max(tier.sweeps for tier in tiers),
-            "sweeps_rule": solver._par_sweeps_rule,
-            "sweeps_reason": solver._par_sweeps_reason,
-            "tiers": [
-                {
-                    "rows": int(rows),
-                    "min_rows": int(min_rows),
-                    "sweeps": tier.sweeps,
-                    "kernel": _key(tier.kernel),
-                }
-                for (rows, min_rows), tier in zip(solver._par_tiers, tiers, strict=False)
-            ],
-        }
     return {
-        "family": "incremental",
-        # The incremental tiers are built with the serial sweeps' law.
+        "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
+        # Why the class takes the tiers (case K4: the in-kernel response's shape).
+        "inkernel_response_reason": solver._ink_reason,
+        # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
+        "linked_rows": all(tier.linked_rows for tier in tiers),
+        # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
+        "velocity_limit_pass": all(tier.velocity_limit_pass for tier in tiers),
+        # The tiers accumulate joint velocity-limit rows whatever the serial sweeps' law
+        # (routes.velocity_limits.law), so the two can differ in the worlds the tiers own.
         "velocity_limit_law": _tier_velocity_limit_law(solver, tiers),
-        "tiers": [{"kernel": _key(tier.kernel)} for tier in tiers],
+        # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
+        "sweeps": max(tier.sweeps for tier in tiers),
+        "sweeps_rule": solver._par_sweeps_rule,
+        "sweeps_reason": solver._par_sweeps_reason,
+        "tiers": [
+            {
+                "rows": int(rows),
+                "min_rows": int(min_rows),
+                "sweeps": tier.sweeps,
+                "kernel": _key(tier.kernel),
+            }
+            for (rows, min_rows), tier in zip(solver._par_tiers, tiers, strict=True)
+        ],
     }
 
 

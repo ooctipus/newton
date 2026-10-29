@@ -15,12 +15,11 @@ Routes
     the whole run. Every run reads
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
-    Owners that claim worlds at run time (sparse factors, the incremental and
-    parallel tiers, local owners, the paired and sparse-diagonal sweeps) also
-    get an ownership test that reads the solve readout. Covered on CUDA: native
-    sparse factors (with contact triplets), the matrix-free Gauss-Seidel sweep
-    with its incremental, parallel, matrix-free parallel and keyed-parallel
-    tiers, local owners (row packets and owned rows), the paired factor sweep
+    Owners that claim worlds at run time (sparse factors, the parallel tiers,
+    local owners, the paired and sparse-diagonal sweeps) also get an ownership
+    test that reads the solve readout. Covered on CUDA: native sparse factors
+    (with contact triplets), the matrix-free Gauss-Seidel sweep with its
+    parallel and keyed-parallel tiers, local owners (row packets and owned rows), the paired factor sweep
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
     boundary); on CPU, split mode. Dynamics owners: ``TreeSparseOperator``,
     ``TreeHeldOperator``, ``ForestHeldOperator``, scalar branches and ordinary
@@ -153,8 +152,8 @@ class Route:
     pins: dict = dataclasses.field(default_factory=dict)
     """Axis values the route fixes where the rules would choose others (``SolverFeatherPGS._route_pins``)."""
     module: dict = dataclasses.field(default_factory=dict)
-    """Attributes patched for the whole run: the solver module's import-time switches (``_MF_EXACT_ROWSUM`` and the
-    like), or ``"module.attribute"`` of another FeatherPGS module."""
+    """Attributes patched for the whole run: the solver module's import-time switches, or ``"module.attribute"`` of
+    another FeatherPGS module."""
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
 
@@ -1137,7 +1136,7 @@ REFERENCE_CUDA = Route(
     "cuda",
     # The plain matrix-free Gauss-Seidel sweep over ordinary dynamics and rows: the general placement declines the
     # local, paired and sparse-diagonal owners, and every world is solved (no resolved-world claim).
-    options={**_MF, "mf_gs_incremental_rows": 0},
+    options=_MF,
     pins={**_ORDINARY, "hinv_jt_kernel": "tiled", "placement": "general", "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
@@ -1160,21 +1159,21 @@ CPU_SPLIT_UNIT = CPU_SPLIT.but(
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 MF_GENERAL = Route(
-    "mf_incremental_ordinary",
+    "mf_general",
     "cuda",
-    # The clutter scenes' route: incremental tier over ordinary dynamics.
+    # The clutter scenes' route: the matrix-free sweep over ordinary dynamics.
     options=_MF,
     pins=_ORDINARY,
-    expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "incremental", "held_tree.owner": None},
+    expect={"sweep.route": "matrix_free_gs", "sweep.tiers": None, "held_tree.owner": None},
 )
 MF_HELD = Route(
-    "mf_incremental_held",
+    "mf_held",
     "cuda",
     options=_MF,
     pins={"storage": "dense"},
     expect={
         "sweep.route": "matrix_free_gs",
-        "sweep.tiers.family": "incremental",
+        "sweep.tiers": None,
         "held_tree.owner": "mixed",
         "held_tree.groups.0.operator": "TreeHeldOperator",
     },
@@ -1182,21 +1181,23 @@ MF_HELD = Route(
 MF_PARALLEL = Route(
     "mf_parallel",
     "cuda",
-    options={**_MF, "mf_gs_parallel_rows": 32},
-    expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel", "sweep.tiers.matrix_free": False},
+    # The Jacobi tiers that a test pin builds on any class whose response they form, over the group rows.
+    options=_MF,
+    pins={"tiers": 32, "producer": "general"},
+    expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel"},
 )
-MF_PARALLEL_MATRIX_FREE = Route(
-    "mf_parallel_matrix_free",
-    "cuda",
-    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
-    module={"_MF_EXACT_ROWSUM": True},
-    expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel", "sweep.tiers.matrix_free": True},
-)
-# The allegro and anymal-D recipes: matrix-free parallel tiers that form the response in-kernel take keyed rows on a
-# model they fit (the legged scene).
-KEYED_PARALLEL = MF_PARALLEL_MATRIX_FREE.but(
+# The allegro recipe: the tiers take keyed rows on a model they fit (the legged scene).
+KEYED_PARALLEL = Route(
     "keyed_parallel",
-    expect={"sweep.tiers.family": "keyed_parallel", "contact_rows.producer": "keyed_rows", "held_tree.owner": "mixed"},
+    "cuda",
+    options=_MF,
+    pins={"tiers": 32},
+    expect={
+        "sweep.route": "matrix_free_gs",
+        "sweep.tiers.family": "keyed_parallel",
+        "contact_rows.producer": "keyed_rows",
+        "held_tree.owner": "mixed",
+    },
 )
 SPARSE = Route(
     "sparse",
@@ -1449,16 +1450,10 @@ def cuda_groups() -> list:
                 (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY),
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
-            # The tiers whiten their rows in the kernel: the response block's scratch holds 29 coordinates a row at
-            # 32 rows, so the 66-coordinate sprawl and the 106-coordinate snake take the matrix-free tier.
-            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE)),
-            # The parallel tiers cannot own the snake's 303-row world either: requesting them must leave its
-            # serial sweep undisturbed.
-            Group(
-                _physics(scenes.long_chain(), law, 64),
-                ref,
-                (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE),
-            ),
+            # The tiers form the response in-kernel, which bounds an articulation at 32 coordinates: the sprawl (66)
+            # and the snake (106) take no tier, even pinned.
+            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT,)),
+            Group(_physics(scenes.long_chain(), law, 64), ref, (MF_DEFAULT,)),
             # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
             # armature it needs near the head, the same on every route.
             Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT,)),
@@ -1764,12 +1759,10 @@ _add_group_tests(TestFeatherPGSConformanceCUDA, cuda_groups())
 OWNERSHIP = (
     # (scene, law, iterations, route, owners that together solve every world and each solve one, counted owners that
     # must solve none). A sweep without counters (the parallel tiers) owns a world when no counted sweep solves it.
-    (scenes.legged, "point", 32, MF_HELD, ("mf_gs_incremental",), ("mf_gs",)),
-    (scenes.legged, "point", 32, SPARSE, ("sparse_pgs",), ("mf_gs", "mf_gs_incremental")),
-    (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
-    (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
-    # The snake's world exceeds every tier's row bound: the serial sweep keeps it.
-    (scenes.long_chain, "patch", 64, MF_PARALLEL_MATRIX_FREE, ("mf_gs",), ()),
+    (scenes.legged, "point", 32, MF_HELD, ("mf_gs",), ()),
+    (scenes.legged, "point", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
+    (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs",)),
+    (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
     (scenes.gripper, "point", 32, LOCAL_PACKETS, ("local_pair|local_residual|local_internal",), ()),
     (scenes.gripper, "patch", 32, LOCAL_OWNED, ("local_pair|local_residual|local_internal",), ()),
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.

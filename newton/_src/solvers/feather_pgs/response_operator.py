@@ -1268,189 +1268,27 @@ class WhitenedRows:
 
 
 @dataclass(frozen=True)
-class Block(ResidualBlock):
-    """The response block ``A = Z^T Z`` of a world's whitened rows, staged.
-
-    ``layout`` places the block in ``s_A``. ``"column"``: ``s_A[i * stride + r]
-    = A[i][r]``, column ``i`` (the response of every row's residual to row
-    ``i``'s impulse) contiguous, for a Gauss-Seidel sweep that maintains each
-    row's whole residual: ``s_res[r]`` holds ``rhs + J_r v`` at entry and a
-    change ``delta`` of row ``i`` adds ``A[i][r] delta`` to every row ``r`` of
-    the ``rows`` the block holds (the incremental tier, which builds it from the
-    packed rows: :func:`.sweep_routes.packed_block`). ``"row"``: ``s_A[i *
-    stride + j] = Z_i . Z_j``, row ``i`` contiguous (``stride`` pads it), for a
-    Jacobi sweep that forms each row's residual from the impulses
-    (:meth:`jacobi_residual`).
-
-    The row layout holds ``whitened`` rows (:class:`WhitenedRows`), built in
-    the kernel: each lane keeps its row ``Z_i`` in registers and publishes it
-    to the world's packed rows (:mod:`.packed_rows`, at their coordinates:
-    rows of ``dofs`` entries from ``packed_base``), where every entry, a sum
-    over the world's coordinates in order from zero (:meth:`assemble`), reads
-    the other rows. The velocity is published once, after the sweeps, from the
-    impulses each row applied (:meth:`publish`). A Gauss-Seidel sweep stages
-    the diagonal and its inverse (``s_diag``, ``s_inv_diag``).
-    """
-
-    dofs: int
-    stride: int
-    lanes: Lanes = Lanes()
-    rows: str = "n_rows_total"
-    layout: str = "column"
-    whitened: WhitenedRows | None = None
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
-    name = "block"
-
-    LAYOUTS = ("column", "row")
-
-    def __post_init__(self):
-        if self.layout not in self.LAYOUTS:
-            raise ValueError(f"layout must be one of {self.LAYOUTS}")
-        if (self.layout == "row") != (self.whitened is not None):
-            raise ValueError("the row layout holds whitened rows, the column layout none")
-
-    def entry(self, source: str, target: str) -> tuple[str, str]:
-        if self.layout == "row":
-            return "", f"{target} * {self.stride} + {source}"
-        return "", f"{source} * {self.stride} + {target}"
-
-    def assemble(self, indent: str = "    ") -> str:
-        """Build ``A``'s entries of rows ``[0, rows)``: ``Z_i . Z_r`` summed in coordinate order from zero, a lane per
-        storage row ``i`` (its ``Z_i`` in registers), the other rows read from the world's packed rows."""
-        lane, width, D, rows = self.lanes.lane, self.lanes.width, self.dofs, self.rows
-        lines = [
-            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
-            f"    for (int r = 0; r < {rows}; ++r) {{",
-            f"        const float* Zr = &packed_Z.data[packed_base + (size_t)r * {D}];",
-            "        float a = 0.0f;",
-            "        #pragma unroll",
-            f"        for (int d = 0; d < {D}; ++d) a += Jr[d] * Zr[d];",
-            f"        s_A[i * {self.stride} + r] = a;",
-            "    }",
-            "}",
-        ]
-        return _lines(lines, indent)
-
-    def publish(self, indent: str = "    ", *, applied: Callable[[str], str] = lambda row: f"s_app[{row}]") -> str:
-        """``v = v_in + P^T L^-T sum_i Z_i applied_i`` in row order, written through the world's coordinate map."""
-        return self.whitened.publish(lambda row: self._z(row, "d"), applied, indent)
-
-    # -- Jacobi actions (row layout): every row at once, one thread per row ---------------------------------------
-
-    def _row(self, row: str, column: str) -> str:
-        """``A[row][column]``: the response of row ``row`` to row ``column``'s impulse."""
-        return f"s_A[{self.entry(column, row)[1]}]"
-
-    def registers(self, indent: str) -> str:
-        """Declare the lanes' row registers (``Jr``), which hold each lane's ``Z_i``."""
-        return self.whitened.registers(indent)
-
-    def jacobi_stage(self, padding: str, scale: Callable[[str, str, str], str], indent: str) -> str:
-        """Whiten and publish the rows, build ``A``, start every row's residual at zero impulse and set each row's
-        step scale.
-
-        ``s_rhs[i]`` becomes ``b'_i = rhs_i + J_i v - (A lambda_0)_i``, the residual at zero impulse (``J_i v`` folded
-        in at staging), its product with ``lambda_0`` summed in column order; each row's storage is padded with zeros
-        to a multiple of four columns, and ``padding`` pads the rows' impulses. ``scale(aii, bound, indent)`` sets an
-        admitted row's step from ``A_ii`` and its absolute sum over the admitted columns, ``sum_j |A_ij|`` (in column
-        order).
-        """
-        lane, width, rows = self.lanes.lane, self.lanes.width, self.rows
-        stage = [self.whitened.stage("s_A", publish=True, indent=indent), f"{indent}SYNC();", self.assemble(indent)]
-        lines = [
-            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
-            f"    for (int j = {rows}; j < (({rows} + 3) & ~3); ++j) {self._row('i', 'j')} = 0.0f;",
-            "}",
-            padding,
-            "SYNC();",
-            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
-            "    float acc = 0.0f;",
-            f"    for (int j = 0; j < {rows}; ++j) acc += {self._row('i', 'j')} * s_lam0[j];",
-            "    s_rhs[i] -= acc;",
-            "}",
-            "SYNC();",
-            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
-            "    if (s_kind[i] >= 0) {",
-            "        float rowsum = 0.0f;",
-            f"        for (int j = 0; j < {rows}; ++j) if (s_kind[j] >= 0) rowsum += fabsf({self._row('i', 'j')});",
-            f"        const float aii = {self._row('i', 'i')};",
-            scale("aii", "rowsum", "        "),
-            "    }",
-            "}",
-            "SYNC();",
-        ]
-        return "\n".join([*stage, _lines(lines, indent)])
-
-    def jacobi_residual(self, out: str, indent: str) -> str:
-        """``const float out = b'_i + (A y)_i``: four accumulators over the float4 groups of ``y`` (the rows padded
-        with zeros to a multiple of four), the first from ``b'_i``, joined pairwise."""
-        lines = [
-            f"const float* Ai = &s_A[i * {self.stride}];",
-            "const float4* y4 = reinterpret_cast<const float4*>(s_y);",
-            "float r0 = s_rhs[i], r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;",
-            f"const int n4 = ({self.rows} + 3) >> 2;",
-            "for (int j4 = 0; j4 < n4; ++j4) {",
-            "    const float4 yv = y4[j4];",
-            "    const int j = 4 * j4;",
-            "    r0 += Ai[j] * yv.x;",
-            "    r1 += Ai[j + 1] * yv.y;",
-            "    r2 += Ai[j + 2] * yv.z;",
-            "    r3 += Ai[j + 3] * yv.w;",
-            "}",
-            f"const float {out} = (r0 + r1) + (r2 + r3);",
-        ]
-        return _lines(lines, indent)
-
-    def push_prologue(self, indent: str) -> str:
-        """Before the pushes of the last word: ``w = Z^T x``."""
-        return self.whitened.push_prologue(self._z, indent)
-
-    def push_velocity(self, out: str, lanes: Lanes, indent: str) -> str:
-        """``float out = Z_i w`` and ``zz = |Z_i|^2`` over ``lanes``: the residual's impulse term."""
-        return self.whitened.push_velocity(out, self._z, lanes, indent)
-
-    def push_apply(self, delta: str, lanes: Lanes, indent: str) -> str:
-        """After a push of row ``i``: ``w += Z_i delta``."""
-        return self.whitened.push_apply(delta, self._z, lanes, indent)
-
-    def push_diagonal(self) -> str:
-        """``A_ii`` of a pushed row, formed from its row."""
-        return self.whitened.push_diagonal()
-
-    def _z(self, row: str, coordinate: str) -> str:
-        """``Z`` at ``(coordinate, row)``: the whitened rows live in the world's packed rows."""
-        return f"packed_Z.data[packed_base + (size_t)({row}) * {self.dofs} + ({coordinate})]"
-
-    def buffers(self, capacity: int) -> tuple[Buffer, ...]:
-        """The block of ``capacity`` rows (row layout: padded by its stride), then the whitened rows' factors."""
-        whitened = self.whitened.buffers(velocity=True) if self.whitened is not None else ()
-        return (Buffer("s_A", "float", capacity * self.stride), *whitened)
-
-
-@dataclass(frozen=True)
 class TransposedResponse(ResponseOperator):
     """Whitened rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row.
 
-    Each lane holds its row ``Z_i`` in registers (``Jr``); the block stages
-    them coordinate-major, ``s_Yt[d * stride + i] = Z_i[d]`` (``stride =
-    capacity + 4``: past the rows by a float4, so that neighbouring
-    coordinates fall in different banks), with zero columns up to a multiple
-    of four rows. Each sweep forms ``w = Y^T y`` once (:meth:`gather`): a lane
-    per coordinate and chunk of the rows' float4 groups (``chunks`` of them,
-    as many as the lanes cover), four accumulators joined pairwise, the chunks
-    summed in order; a row's residual is then ``b'_i + J_i w`` in coordinate
-    order. The step scale's bound is ``A``'s exact absolute row sum
-    (``exact``, each entry ``J_i Y_j`` summed in coordinate order) or the
-    column-sum bound ``sum_d |J_id| sum_j |Y_jd|``. The rows are ``whitened`` in the kernel
-    (:class:`WhitenedRows`): ``Z`` serves as both ``J^T`` and ``Y``.
+    The rows are whitened in the kernel (:class:`WhitenedRows`), so ``Z``
+    serves as both ``J^T`` and ``Y``. Each lane holds its row in registers
+    (``Jr``); the block stages ``Z`` coordinate-major, ``s_Yt[d * stride + i]
+    = Z_i[d]`` (``stride = capacity + 4``: past the rows by a float4, so that
+    neighbouring coordinates fall in different banks), with zero columns up to
+    a multiple of four rows. Each sweep forms ``w = Z y`` once
+    (:meth:`gather`): a lane per coordinate and chunk of the rows' float4
+    groups (``chunks`` of them, as many as the lanes cover), four accumulators
+    joined pairwise, the chunks summed in order; a row's residual is then
+    ``b'_i + Z_i w`` in coordinate order. The step scale's bound is the
+    column-sum bound ``sum_d |Z_id| sum_j |Z_jd|``, the bound the tiers' sweep
+    budget was fit with (:data:`.sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION`).
     """
 
     dofs: int
     capacity: int
+    whitened: WhitenedRows
     lanes: Lanes = Lanes()
-    exact: bool = False
-    whitened: WhitenedRows | None = None
     rows: str = "n_rows"
 
     def __post_init__(self):
@@ -1476,14 +1314,11 @@ class TransposedResponse(ResponseOperator):
     def buffers(self, capacity: int) -> tuple[Buffer, ...]:
         """The staged block, the column sums of the bound, ``w`` and the chunks' partial ``w``, the whitened factors."""
         D = self.dofs
-        buffers = [Buffer("s_Yt", "float", self.stride * D, align=16)]
-        if not self.exact:
-            buffers.append(Buffer("s_colsum", "float", D))
+        buffers = [Buffer("s_Yt", "float", self.stride * D, align=16), Buffer("s_colsum", "float", D)]
         buffers.append(Buffer("s_dv", "float", (D + 3) & ~3, align=16))
         if self.chunks > 1:
             buffers.append(Buffer("s_dvp", "float", self.chunks * D))
-        buffers += self.whitened.buffers(velocity=False)
-        return tuple(buffers)
+        return (*buffers, *self.whitened.buffers(velocity=False))
 
     def registers(self, indent: str) -> str:
         """Declare each lane's row registers ``Jr``, zero."""
@@ -1493,32 +1328,12 @@ class TransposedResponse(ResponseOperator):
     def jacobi_stage(self, padding: str, scale: Callable[[str, str, str], str], indent: str) -> str:
         """Whiten and stage the rows, start every row's residual at zero impulse and set each step scale.
 
-        ``w_0 = -Z^T lambda_0`` (``J_i v`` was folded in at staging) is
-        summed per coordinate in row order, then ``s_rhs[i]`` becomes ``b'_i = rhs_i + J_i w_0``; ``padding`` pads the
-        rows' impulses. ``scale(aii, bound, indent)`` sets an admitted row's step.
+        ``w_0 = -Z lambda_0`` (``Z_i v`` was folded in at staging) is summed per coordinate in row order, then
+        ``s_rhs[i]`` becomes ``b'_i = rhs_i + Z_i w_0``; ``padding`` pads the rows' impulses. ``scale(aii, bound,
+        indent)`` sets an admitted row's step.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
         stage = [self.whitened.stage("s_Yt", publish=False, indent=indent)]
-        column = [] if self.exact else ["    if (s_kind[j] >= 0) csum += fabsf(yv);"]
-        if self.exact:
-            bound = [
-                f"        for (int j = 0; j < {rows}; ++j) {{",
-                "            if (s_kind[j] < 0) continue;",
-                "            float acc = 0.0f;",
-                "            #pragma unroll",
-                f"            for (int d = 0; d < {D}; ++d) acc += Ji[d] * {self._yt('j', 'd')};",
-                "            if (j == i) aii = acc;",
-                "            bound += fabsf(acc);",
-                "        }",
-            ]
-        else:
-            bound = [
-                "        #pragma unroll",
-                f"        for (int d = 0; d < {D}; ++d) {{",
-                f"            aii += Ji[d] * {self._yt('i', 'd')};",
-                "            bound += fabsf(Ji[d]) * s_colsum[d];",
-                "        }",
-            ]
         lines = [
             f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
             "    const int d = e >> 2;",
@@ -1527,14 +1342,14 @@ class TransposedResponse(ResponseOperator):
             "}",
             "SYNC();",
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
-            "    float acc = 0.0f;" if self.exact else "    float acc = 0.0f, csum = 0.0f;",
+            "    float acc = 0.0f, csum = 0.0f;",
             f"    for (int j = 0; j < {rows}; ++j) {{",
             f"        const float yv = {self._yt('j', 'd')};",
             "        acc += yv * s_lam0[j];",
-            *("    " + line for line in column),
+            "        if (s_kind[j] >= 0) csum += fabsf(yv);",
             "    }",
             "    s_dv[d] = 0.0f - acc;",
-            *([] if self.exact else ["    s_colsum[d] = csum;"]),
+            "    s_colsum[d] = csum;",
             "}",
             "SYNC();",
             f"for (int i = {lane}; i < {rows}; i += {width}) {{",
@@ -1545,7 +1360,11 @@ class TransposedResponse(ResponseOperator):
             "    s_rhs[i] = b;",
             "    if (s_kind[i] >= 0) {",
             "        float aii = 0.0f, bound = 0.0f;",
-            *bound,
+            "        #pragma unroll",
+            f"        for (int d = 0; d < {D}; ++d) {{",
+            f"            aii += Ji[d] * {self._yt('i', 'd')};",
+            "            bound += fabsf(Ji[d]) * s_colsum[d];",
+            "        }",
             scale("aii", "bound", "        "),
             "    }",
             "}",

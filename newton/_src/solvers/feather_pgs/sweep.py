@@ -44,7 +44,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
-    PGS_LOCAL_SOLVE_OWNER_GENERAL,
 )
 from .response_operator import Lanes, ResponseOperator
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
@@ -1009,26 +1008,22 @@ def dense_tier_world(
     dofs: int,
     max_constraints: int,
     *,
-    local: bool,
     rows: str,
     support: int,
     pad: str = "    ",
 ) -> str:
     """Enter a world of a dense-row tier, or return: one without free-body rows and with more than ``min_rows`` and
-    at most ``capacity`` dense rows (and, with ``local``, one the local owners leave to the general sweeps).
+    at most ``capacity`` dense rows.
 
     Declares ``m_dense``, ``m_mf``, the row phase's range ``[dense_lo, dense_hi)`` (returning for an empty one),
     ``rows`` (the rows the tier holds, ``[0, dense_hi)``), ``dof_map_base``, ``off_dense``, and the world's first
     packed row entry ``packed_base`` (rows of ``support`` entries: :mod:`.packed_rows`).
     """
     base = f"const size_t packed_base = (size_t)world * {max_constraints * int(support)};"
-    local_skip = (
-        f"\n{pad}if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;" if local else ""
-    )
     return f"""{pad}int m_dense = world_constraint_count.data[world];
 {pad}const int m_mf = mf_constraint_count.data[world];
 {pad}if (m_dense == 0 || m_mf != 0) return;
-{pad}if (m_dense > {capacity} || m_dense <= {min_rows}) return;{local_skip}
+{pad}if (m_dense > {capacity} || m_dense <= {min_rows}) return;
 
 {pad}int dense_lo = 0;
 {pad}int dense_hi = m_dense;
@@ -1183,7 +1178,7 @@ class JacobiRows:
 
 def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
     """Set admitted row ``i``'s Jacobi step: ``omega w_i / (A_ii + cfm)`` with ``w_i = min(A_ii / bound, 1)`` (zero
-    for a zero bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
+    for a zero bound), ``bound`` a bound of the row's absolute sum ``sum_j |A_ij|``.
 
     ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
     the simultaneous steps from diverging where many rows couple through one body. The diagonal ``A_ii + cfm`` (the
@@ -1337,12 +1332,10 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _jacobi_momentum(rows: JacobiRows, *, momentum: bool, pad: str) -> str:
+def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
     """Nesterov's extrapolation factor ``beta`` with adaptive restart: the momentum restarts (``t_k = 1``) when the
     last step points against it, ``(y - x_new) . (x_new - x_old) > 0`` summed over the rows (per warp, then over the
-    warps in order). Without ``momentum`` ``beta`` is zero."""
-    if not momentum:
-        return f"{pad}const float beta = 0.0f;"
+    warps in order)."""
     lines = [
         "float dot_local = 0.0f;",
         f"if (lane < {rows.rows}) dot_local = (s_y[lane] - x_new) * (x_new - x_old);",
@@ -1368,9 +1361,7 @@ def _jacobi_momentum(rows: JacobiRows, *, momentum: bool, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def jacobi_sweeps(
-    rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, momentum: bool, pooled: bool, pad: str = "    "
-) -> str:
+def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, pad: str = "    ") -> str:
     """The Jacobi sweeps of a world's rows over the response operator ``op`` (its Jacobi actions), at most ``sweeps``.
 
     Both tangents of a friction pair first take one step (:func:`isotropic_pair_step`). Each sweep, every admitted
@@ -1379,7 +1370,7 @@ def jacobi_sweeps(
     ``y_i - s_step_i r`` clamped at zero for a unilateral row, zero for a friction row while friction is delayed, or
     the PhysX drive law on ``y_i`` and the row's ``J v = r - rhs``. Each friction row is then projected radially onto
     its pair's disk (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
-    momentum and adaptive restart (``momentum``), each row votes its change under the exit law (:func:`change_vote`:
+    momentum and adaptive restart, each row votes its change under the exit law (:func:`change_vote`:
     its step from the extrapolated impulse over its step size, which is the row's residual there for an unclamped row,
     against its floor; the trace names it by the row's staged type, :attr:`JacobiRows.types`), and the sweep ends
     under the policy (:func:`end_sweep`, the budget ``sweeps``; a block of several warps reduces the trace with
@@ -1400,14 +1391,14 @@ def jacobi_sweeps(
         f"{pad}const float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
         # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
         f"{pad}const float row_share = row_diag * row_step;",
-        f"{pad}float t_k = 1.0f;" if momentum else "",
+        f"{pad}float t_k = 1.0f;",
         f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
         f"{inner}const int global_iter = iteration_offset + sweep;",
         op.gather(inner),
         _jacobi_step(rows, op, inner),
         f"{inner}int iteration_changed = 0;",
         _jacobi_projection(rows, pooled=pooled, pad=inner),
-        _jacobi_momentum(rows, momentum=momentum, pad=inner),
+        _jacobi_momentum(rows, pad=inner),
         f"{inner}{{",
         f"{inner}    const int i = lane;",
         f"{inner}    if (i < {rows.rows}) {{",

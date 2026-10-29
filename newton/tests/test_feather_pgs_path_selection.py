@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, friction_patches, path_selection
+from newton._src.solvers.feather_pgs import environment_flags, friction_patches, path_selection, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
@@ -249,7 +249,7 @@ def _first_patch_step(model, cached_dynamics):
         patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}),
         patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached_dynamics == "off" else {}),
     ):
-        solver = _make_solver(model, False, mf_gs_incremental_rows=0)
+        solver = _make_solver(model, False)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=True)
@@ -308,13 +308,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         )
         self.assertEqual(options["contact_friction_gap_threshold"]["applied"], "inf")
         self.assertEqual(options["joint_limit_activation_gap"]["default"], "inf")
-        # Split mode builds no matrix-free tier.
-        self.assertEqual(
-            options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
-        )
-        solver = SolverFeatherPGS(
-            model, angular_damping=0.1, friction_anchor_beta=0.0, pgs_iterations=7, mf_gs_parallel_rows=48
-        )
+        solver = SolverFeatherPGS(model, angular_damping=0.1, friction_anchor_beta=0.0, pgs_iterations=7)
         selected = solver.get_path_selection()
         options = selected["options"]
         self.assertEqual(
@@ -323,9 +317,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
         )
-        self.assertEqual(
-            options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
-        )
+        # Split mode builds no matrix-free tier.
         self.assertIsNone(selected["routes"]["sweep"]["tiers"])
         self.assertNotIn("grouped", {r["route"] for r in selected["routes"]["stages"]["response"].values()})
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
@@ -843,20 +835,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_route_record_is_json_across_routes(self):
         """Build a JSON-compliant record for every major admitted construction route.
 
-        Patch friction takes the parallel tiers it requests, as point friction does.
+        A tree beside one free body with joint velocity limits takes the Jacobi tiers (case K4) under patch
+        friction, as under point friction.
         """
-        # One free body beside the tripod: the tiers whiten a world's rows in the kernel for one articulation of
-        # each size.
-        patch_parallel = ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 1})
+        patch_parallel = ({"enable_joint_velocity_limits": True}, {"free_count": 1})
         cases = (
             ({}, {}),
             ({"friction_anchor_beta": 0.0}, {}),
             ({}, {}),
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {"free_count": 2}),
-            (
-                {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
-                {"free_count": 1},
-            ),
+            ({"enable_joint_velocity_limits": True, "friction_anchor_beta": 0.0}, {"free_count": 1}),
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
             # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
@@ -908,8 +896,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 # Applied routing options agree with the routes they request.
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
-                self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
-                # Patch friction is admitted to the parallel tiers, and the case that requests them builds them:
+                self.assertEqual(solver._ink_rows, tiers["tiers"][-1]["rows"] if parallel else 0)
+                # Patch friction is admitted to the parallel tiers, and the case whose class they serve builds them:
                 # ring-pooled (linked) tiers, where point friction builds point tiers.
                 patch_law = routes["friction"]["law"] == "patch"
                 self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
@@ -917,13 +905,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(parallel, options is patch_parallel[0])
                 if parallel:
                     self.assertEqual(tiers["linked_rows"], patch_law)
-                    # Every tier steps each friction pair isotropically; linked tiers also pool the ring.
+                    # Every tier steps each friction pair isotropically; linked tiers also pool the ring, and with
+                    # joint velocity limits they take the last word.
+                    last_word = patch_law and bool(applied["enable_joint_velocity_limits"])
                     for tier in tiers["tiers"]:
-                        self.assertEqual(tier["kernel"].endswith("_linked"), bool(patch_law), tier)
                         self.assertEqual("_linked" in tier["kernel"], patch_law, tier)
-                    # Every tier sweeps the automatic budget, at least mf_gs_parallel_sweeps.
+                        self.assertEqual(tier["kernel"].endswith("_lw"), last_word, tier)
+                    self.assertEqual(tiers["velocity_limit_pass"], last_word)
+                    # Every tier sweeps the equal-accuracy budget.
                     self.assertEqual(tiers["sweeps_rule"], "auto")
-                    self.assertTrue(all(t["sweeps"] >= applied["mf_gs_parallel_sweeps"] for t in tiers["tiers"]))
+                    for tier in tiers["tiers"]:
+                        expected = sweep_routes_tiers.tier_sweeps(tier["rows"], applied["pgs_iterations"])
+                        self.assertEqual(tier["sweeps"], expected)
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # The grouped kernel serves only sizes whose worlds' in-kernel tier rows it skips.
@@ -1158,29 +1151,26 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         )
 
     @unittest.skipUnless(wp.is_cuda_available(), "The paired factor sweep requires CUDA")
-    def test_paired_factor_sweep_excludes_a_requested_patch_tier(self):
-        """Serve a free-body world with the paired factor sweep even when a requested patch tier declined sparse factors.
+    def test_paired_factor_sweep_serves_the_tree_and_its_body_without_tiers(self):
+        """Serve a tree beside a free body with the paired factor sweep (case K5), never the Jacobi tiers.
 
-        Patch friction admits a tier that mf_gs_parallel_rows requests, and the tier declines
-        sparse factors before the free-body rule does, as the friction record says. The paired factor sweep then
-        admitted on the dense route excludes the tiers and keyed rows, so it walks the patch contact units and no
-        tier is built.
+        Patch friction is admitted to the tiers, but the paired factor sweep admitted on the dense route claims the
+        class, so it walks the patch contact units and no tier or keyed row is built.
         """
         model = _branched_arm_and_box()
-        solver = _make_solver(
-            model, True, dense_max_constraints=96, mf_gs_parallel_rows=32, mf_gs_parallel_matrix_free=True
-        )
+        solver = _make_solver(model, True, dense_max_constraints=96)
         selected = solver.get_path_selection()
         routes = selected["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
         self.assertEqual(selected["sparse_mass_matrix"], "off")
-        self.assertIn("competing", selected["reasons"]["sparse_mass_matrix"])
+        self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
         self.assertTrue(routes["paired_response"]["factor_coordinates"])
         self.assertTrue(routes["paired_response"]["contact_units"])
         self.assertIsNone(routes["sweep"]["tiers"])
         self.assertFalse(routes["contact_rows"]["keyed_rows"]["enabled"])
-        self.assertEqual(selected["options"]["mf_gs_parallel_rows"]["applied"], 0)
+        self.assertEqual(solver._ink_rows, 0)
+        self.assertIn("case K5", solver._ink_reason)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_contact_graph_and_reset(self):
@@ -1215,8 +1205,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         degrees of freedom), so they do not compare across routes.
         """
         model = standing_model()
-        # Without the owner this is the ordinary patch route: the incremental tier, which also serves
-        # patch friction, stays off in both arms so that they differ by the owner alone.
+        # Without the owner this is the ordinary patch route, so that the arms differ by the owner alone.
         first = [_first_patch_step(model, choice) for choice in ("off", "on")]
         self.assertIsNone(first[0][0].get_path_selection()["cached_prediction"])
         self.assertEqual(first[1][0].get_path_selection()["cached_prediction"], "tree")
@@ -1260,9 +1249,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             assert_loaded_anchors(solver, contacts, reset_worlds=(0,))
 
         runs = [
-            _graph_and_reset_rollout(
-                model, False, choice, deterministic=True, after_reset=reset_restarts_world_0, mf_gs_incremental_rows=0
-            )
+            _graph_and_reset_rollout(model, False, choice, deterministic=True, after_reset=reset_restarts_world_0)
             for choice in ("off", "on")
         ]
         self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])

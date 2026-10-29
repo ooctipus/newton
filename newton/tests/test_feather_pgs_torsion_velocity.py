@@ -12,7 +12,6 @@ from newton.tests.feather_pgs_law_harness import row_support, unpacked_rows
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
     TORSION_OFF_PINS,
-    TORSION_OFF_ROUTE,
     assert_torsion_neutral_routes,
     fixture,
 )
@@ -224,7 +223,6 @@ class TestTorsionVelocitySolve(unittest.TestCase):
                 options = {
                     "pgs_velocity_iterations": velocity,
                     "pins": TORSION_OFF_PINS,
-                    **TORSION_OFF_ROUTE,
                     **PATCH_OPTIONS,
                 }
                 expected, reference, *_ = fixture(0.0, **options)

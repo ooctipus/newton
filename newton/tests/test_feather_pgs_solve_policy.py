@@ -95,11 +95,6 @@ _SCALED_VOTES = {
         "fabsf(sib_delta) * (s_diag_dense[sib])",
         "fabsf(delta_lambda) * (limit_denom)",
     ),
-    "incremental": (
-        "fabsf(delta_impulse) * (s_diag[i])",
-        "fabsf(sib_delta) * (s_diag[sib])",
-        "fabsf(delta_impulse_vlim) * (s_diag[i])",
-    ),
 }
 
 
@@ -143,12 +138,6 @@ def _factory_calls():
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
             {"speculative_contact_batches": True, "contact_units": True},
-        ),
-        (
-            "incremental",
-            sweep_routes.incremental_kernel.__wrapped__,
-            (64, 32, 12, "120"),
-            {"incremental_rows": 32},
         ),
     )
 
@@ -222,7 +211,7 @@ def _vote_census():
                 _axis("fuse_vel_limits"),
                 ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
-                _axis("skip_incremental_rows", (0, 32)),
+                _axis("skip_tier_rows", (0, 32)),
                 _axis("independent_components"),
                 _axis("resident_row_metadata"),
                 laws,
@@ -241,18 +230,6 @@ def _vote_census():
             sweep_routes_diag.sparse_diagonal_kernel.__wrapped__,
             (64, 10, 9, "120"),
             (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
-        ),
-        (
-            "incremental",
-            sweep_routes.incremental_kernel.__wrapped__,
-            (64, 32, 12, "120"),
-            (
-                ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
-                _axis("has_drive_rows"),
-                _axis("has_dense_velocity_limit_rows"),
-                _axis("skip_local_internal_worlds"),
-                laws,
-            ),
         ),
     )
     for name, factory, args, axes in specs:
@@ -511,7 +488,6 @@ class TestExitLaw(unittest.TestCase):
                 "local": 24,
                 "packets": 24,
                 "sparse_diagonal": 5,
-                "incremental": 32,
             },
         )
 
@@ -674,7 +650,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
         record = SolveReadoutRecord(SWEEPS)
         counted = SimpleNamespace(key="counted_kernel")
         record.register(
-            counted, "mf_gs_incremental", readout="sweeps", world_count=4, budget=4, device="cpu", velocity_budget=2
+            counted, "parallel_tier", readout="sweeps", world_count=4, budget=4, device="cpu", velocity_budget=2
         )
         record.register_skipped(world_count=4, device="cpu", velocity_budget=2)
         # World 0 holds dense rows and world 2 matrix-free rows; worlds 1 and 3 have none.

@@ -135,12 +135,11 @@ def fixture(
 
 
 # The one route both arms of a zero-radius versus selected-out torsion comparison take: ordinary
-# factors, no held-tree owner and the legacy matrix-free sweep. A positive radius keeps a solver on
+# factors, no held-tree owner and the serial matrix-free sweep. A positive radius keeps a solver on
 # it even with no shape selected (torsion requires ordinary factors and is not law-agnostic), while a
-# zero radius admits native sparse velocity-limit factors, the held-tree owner and the incremental
-# tier wherever they fit; these differ from the legacy route in float order only.
-TORSION_OFF_ROUTE = {"mf_gs_incremental_rows": 0}
-TORSION_OFF_PINS = {**HOST_TORSION, "storage": "dense", "evaluator": "ordinary"}
+# zero radius admits native sparse velocity-limit factors, the held-tree owner and the Jacobi tiers
+# wherever they fit; these differ from the serial route in float order or in law.
+TORSION_OFF_PINS = {**HOST_TORSION, "storage": "dense", "evaluator": "ordinary", "tiers": 0}
 
 
 def _without_reasons(record):
@@ -399,7 +398,7 @@ class TestTorsionNeutralRoute(unittest.TestCase):
         out of: the zero-radius arm is admitted, the selected-out arm is not.
         """
         model = pads("cpu")
-        split = {"friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
+        split = {"friction_anchor_beta": 0.0, "pgs_warmstart": False}
         for law, options in (("point", {}), ("patch", PATCH_OPTIONS)):
             with (
                 self.subTest(law=law),
@@ -422,10 +421,8 @@ class TestContactTorsion(unittest.TestCase):
 
     def test_default_off_equivalent(self):
         """Keep the zero-radius option exactly equivalent to prefeature output."""
-        reference, reference_solver, *_ = fixture(0.0, pins=TORSION_OFF_PINS, **TORSION_OFF_ROUTE)
-        actual, selected_out, *_ = fixture(
-            0.01, contact_torsion_shape_indices=(), pins=TORSION_OFF_PINS, **TORSION_OFF_ROUTE
-        )
+        reference, reference_solver, *_ = fixture(0.0, pins=TORSION_OFF_PINS)
+        actual, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), pins=TORSION_OFF_PINS)
         assert_torsion_neutral_routes(self, reference_solver, selected_out)
         for key in reference:
             np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)

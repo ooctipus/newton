@@ -35,12 +35,6 @@ _READ = (
         "=1 copies the stage-3 joint velocity, acceleration and predicted velocity every substep for NaN dumps.",
     ),
     (
-        "FEATHER_PGS_MF_EXACT_ROWSUM",
-        "experiment",
-        _SOLVER,
-        "=1 uses the exact A-based step scale in the matrix-free parallel sweep.",
-    ),
-    (
         "FEATHER_PGS_PATCH_FRAME_REUSE",
         "policy",
         _SOLVER,

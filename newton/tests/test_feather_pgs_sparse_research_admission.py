@@ -77,8 +77,6 @@ def _eligible_solver():
         _has_loop_joints=False,
         _sparse_diagonal_contact_solve=False,
         _has_free_rigid_bodies=False,
-        mf_gs_parallel_rows=0,
-        mf_gs_incremental_rows=32,
     )
 
 
@@ -166,46 +164,26 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver._friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
-    def test_explicit_schedules_keep_their_solve_budget(self):
-        """Do not silently replace a requested parallel solve."""
+    def test_a_tier_pin_keeps_dense_storage(self):
+        """Keep the dense storage the Jacobi tiers need where a test pin builds them on a single tree."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
-            solver.mf_gs_parallel_rows = 32
+            solver._route_pins = {"tiers": 32}
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIn("Jacobi tiers", solver._sparse_selection_reason)
 
-    def test_patch_friction_yields_to_a_parallel_tier_it_runs(self):
-        """Keep the ordinary buffers for a patch parallel tier.
-
-        Patch friction runs the recipe's parallel tier as point friction does, so the
-        tier's request declines sparse factors.
-        """
+    def test_patch_free_body_worlds_keep_the_dense_route(self):
+        """Keep a patch-friction world with free rigid bodies on the dense route, as the free-body rule says."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
             solver._friction_anchors_enabled = True
-            solver.mf_gs_parallel_rows = 48
+            solver._has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
-            self.assertIn("competing", solver._sparse_selection_reason)
-
-    def test_patch_route_claims_follow_the_recorded_precedence(self):
-        """Claim a patch free-body world for a requested tier, then for the dense route.
-
-        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests declines
-        sparse factors first; without it the free-body rule keeps the world dense.
-        """
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for rows, declined in ((48, "competing"), (0, "free rigid bodies")):
-            with self.subTest(parallel_rows=rows), mock.patch.dict(os.environ, {}, clear=True):
-                solver = _eligible_solver()
-                solver._friction_anchors_enabled = True
-                solver._has_free_rigid_bodies = True
-                solver.mf_gs_parallel_rows = rows
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertIn(declined, solver._sparse_selection_reason)
+            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):
@@ -220,12 +198,10 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=40,
-                    mf_gs_parallel_rows=0,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)
                 self.assertEqual(solver._sparse_mass_matrix_plan.nonzero_count, nonzeros)
                 self.assertEqual(solver._sparse_row_factor.shape[2], support)
-                self.assertEqual(solver.mf_gs_incremental_rows, 32)
                 self.assertIsNone(solver._pgs_solve_mf_gs_kernel)
                 self.assertEqual(solver._mf_gs_tiers, [])
                 self.assertIsNone(solver._ink_sizes)

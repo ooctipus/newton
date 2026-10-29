@@ -175,14 +175,9 @@ def _mixed_scene(device, *, arm, totes):
     control = model.control()
     control.joint_target_q.fill_(0.1)
     # One route for every scene. The held-tree owner refuses the arm's revolute root but would take
-    # the totes-only scene, and each scene would key its own incremental tier by its world width;
-    # none of these scenes has a constraint row for the tier to solve.
+    # the totes-only scene; none of these scenes has a constraint row.
     with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            mf_gs_incremental_rows=0,
-        )
+        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
     return model, solver, control, [state, output]
 
 

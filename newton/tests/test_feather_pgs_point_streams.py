@@ -106,19 +106,15 @@ def _label(name, args, kwargs):
 def _linked_tier_calls():
     """Patch-only parallel tiers, whose friction pairs pool their patch ring's normal impulses.
 
-    Each also with the opt-in last-word velocity-limit pass
-    (``mf_gs_parallel_linked_velocity_limit_pass``).
+    Each also with the last-word velocity-limit pass, which the solver builds for linked tiers with joint velocity
+    limits.
     """
-    for tier, matrix_free, inkernel, last_word in itertools.product(
-        ((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0),), (False, True)
-    ):
+    for tier, last_word in itertools.product(((32, 0), (48, 32)), (False, True)):
         kwargs = {
             "rows": tier[0],
             "min_rows": tier[1],
             "sweeps": 24,
-            "matrix_free": matrix_free,
-            "inkernel_response": inkernel,
-            "exact_row_sums": matrix_free,
+            "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
         if last_word:
@@ -142,14 +138,7 @@ def _keyed_layout(*, velocity_limits=False):
 def _keyed_tier_kwargs(*, linked):
     """Keyed parallel tiers; ``linked`` selects the patch row law and the ring-pooled projection."""
     for rows, min_rows in ((32, 0), (64, 32), (96, 64), (128, 96)):
-        kwargs = {
-            "rows": rows,
-            "min_rows": min_rows,
-            "sweeps": 24,
-            "matrix_free": True,
-            "inkernel_response": (16, 6, 0, 16),
-            "exact_row_sums": True,
-        }
+        kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": (16, 6, 0, 16)}
         if linked:
             kwargs["linked_rows"] = True
         yield kwargs
@@ -204,8 +193,8 @@ def _suite_diagonal_sweeps():
 def _keyed_last_word_calls():
     """Linked keyed tiers of a velocity-limited layout with the last-word pass (patch-only).
 
-    The solver builds the pass (``mf_gs_parallel_linked_velocity_limit_pass``) only with
-    joint velocity limits, so these tiers read a layout that plans velocity-limit rows.
+    The solver builds the pass for linked tiers only with joint velocity limits, so these
+    tiers read a layout that plans velocity-limit rows.
     """
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield (_keyed_layout(velocity_limits=True), 128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
@@ -215,7 +204,7 @@ def _readout_calls():
     """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs, patch_only)``.
 
     ``pgs_solve_readout="sweeps"`` builds these variants of the sparse, sparse-diagonal,
-    matrix-free Gauss-Seidel, paired factor, local-packet and incremental sweeps.
+    matrix-free Gauss-Seidel, paired factor and local-packet sweeps.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         row_packets,
@@ -270,14 +259,6 @@ def _readout_calls():
         ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
     ):
         yield "row_packets.get_local_factory(9, 6, 40)", packets, args, {**kwargs, **readout}, False
-    factory = sweep_routes.incremental_kernel.__wrapped__
-    yield (
-        "sweep_routes.incremental_kernel",
-        factory,
-        (64, 32, 12, _ARCH),
-        {"incremental_rows": 32, **readout},
-        False,
-    )
 
 
 def _patch_only_factory_labels():
@@ -453,19 +434,9 @@ def _solver_factory_calls():
     for dofs in (1, 2):
         factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {"units": True}
-    for tier, drives, velocity, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 3)):
-        kwargs = {
-            "incremental_rows": tier[0],
-            "min_rows": tier[1],
-            "has_drive_rows": drives,
-            "has_dense_velocity_limit_rows": velocity,
-            "skip_local_internal_worlds": local,
-        }
-        factory = sweep_routes.incremental_kernel.__wrapped__
-        yield "sweep_routes.incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for skip_rows, drives, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
-            "skip_incremental_rows": skip_rows,
+            "skip_tier_rows": skip_rows,
             "has_drive_rows": drives,
             "factor_coordinates": coordinates,
             "independent_components": components,
@@ -480,13 +451,13 @@ def _solver_factory_calls():
             "resident_row_metadata": True,
             "has_drive_rows": drives,
             "has_dense_velocity_limit_rows": drives,
-            "skip_incremental_rows": 0 if drives else 32,
+            "skip_tier_rows": 0 if drives else 32,
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The accumulated velocity-limit law of the serial sweeps; the stateless law keeps the pins above.
     for skip_rows, drives in itertools.product((0, 32), (False, True)):
-        kwargs = {"skip_incremental_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
+        kwargs = {"skip_tier_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The resident row metadata cases above, under the accumulated law.
@@ -496,22 +467,11 @@ def _solver_factory_calls():
             "resident_row_metadata": True,
             "has_drive_rows": drives,
             "has_dense_velocity_limit_rows": drives,
-            "skip_incremental_rows": 0 if drives else 32,
+            "skip_tier_rows": 0 if drives else 32,
             "velocity_limit_law": "accumulated",
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    for tier, drives, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 2)):
-        kwargs = {
-            "incremental_rows": tier[0],
-            "min_rows": tier[1],
-            "has_drive_rows": drives,
-            "has_dense_velocity_limit_rows": True,
-            "skip_local_internal_worlds": local,
-            "velocity_limit_law": "accumulated",
-        }
-        factory = sweep_routes.incremental_kernel.__wrapped__
-        yield "sweep_routes.incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
         yield "sweep_routes_local.paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
@@ -521,22 +481,10 @@ def _solver_factory_calls():
         args = (192, 29, 23, 6, _ARCH, False, components)
         yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True}
 
-    def tier_without_world_rows(*args, world_rows, **kwargs):
-        # These pins were recorded with world_rows=False in their labels, before the in-sweep world rows went.
-        return sweep_routes_tiers.parallel_kernel(*args, **kwargs)
-
-    # Parallel tiers: one articulation per world, its rows whitened in the kernel.
-    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0),)):
-        kwargs = {
-            "rows": tier[0],
-            "min_rows": tier[1],
-            "sweeps": 24,
-            "matrix_free": matrix_free,
-            "inkernel_response": inkernel,
-            "world_rows": False,
-            "exact_row_sums": matrix_free,
-        }
-        yield ("sweep_routes_tiers.parallel_kernel", tier_without_world_rows, (64, 32, 18, _ARCH), kwargs)
+    # Parallel tiers: one articulation per world, its response formed in-kernel.
+    for tier in ((32, 0), (48, 32)):
+        kwargs = {"rows": tier[0], "min_rows": tier[1], "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
+        yield "sweep_routes_tiers.parallel_kernel", sweep_routes_tiers.parallel_kernel, (64, 32, 18, _ARCH), kwargs
     for label, args, kwargs in _linked_tier_calls():
         yield label, sweep_routes_tiers.parallel_kernel, args, kwargs
 
@@ -589,10 +537,10 @@ def _suite_shape_calls():
     factory = sweep_routes.mf_gs_kernel.__wrapped__
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
-        ((192, 64, 22, _ARCH), {"has_drive_rows": False, "skip_incremental_rows": 128}),
+        ((192, 64, 22, _ARCH), {"has_drive_rows": False, "skip_tier_rows": 128}),
         ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
-        ((72, 32, 18, _ARCH), {**no_drives, "skip_incremental_rows": 48}),
+        ((72, 32, 18, _ARCH), {**no_drives, "skip_tier_rows": 48}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__
@@ -611,21 +559,13 @@ def _suite_shape_calls():
     # The tiers read only a layout's coordinate blocks; its limit masks shape the limit rows.
     limited = KeyedLayout(16, 6, 0, 16, 128, True, 0xFFFF, 0xFFFF)
     single = KeyedLayout(18, 0, 0, 0, 48, False, 0)
-    for layout, shape, tiers, exact in (
-        (limited, (192, 64, 22, _ARCH), ((32, 0), (64, 32), (96, 64), (128, 96)), False),
-        (single, (72, 32, 18, _ARCH), ((32, 0), (48, 32)), True),
+    for layout, shape, tiers in (
+        (limited, (192, 64, 22, _ARCH), ((32, 0), (64, 32), (96, 64), (128, 96))),
+        (single, (72, 32, 18, _ARCH), ((32, 0), (48, 32))),
     ):
         blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
         for rows, min_rows in tiers:
-            kwargs = {
-                "rows": rows,
-                "min_rows": min_rows,
-                "sweeps": 24,
-                "matrix_free": True,
-                "inkernel_response": blocks,
-            }
-            if exact:
-                kwargs["exact_row_sums"] = True
+            kwargs = {"rows": rows, "min_rows": min_rows, "sweeps": 24, "inkernel_response": blocks}
             yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
     yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
     factory = response_builds_rows.sparse_factor_kernel.__wrapped__
@@ -821,7 +761,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "sweep_routes_diag.sparse_diagonal_kernel",
             "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel",
             "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel",
-            "sweep_routes.incremental_kernel",
             "sweep_routes_tiers.parallel_kernel",
             "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_parallel_factory",
@@ -852,7 +791,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             {
                 "sweep_routes_sparse.sparse_kernel",
                 "sweep_routes.mf_gs_kernel",
-                "sweep_routes.incremental_kernel",
             },
         )
         # The MF-GS kernels that keep row metadata resident are pinned under both laws.

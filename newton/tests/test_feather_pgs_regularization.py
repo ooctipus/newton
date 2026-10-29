@@ -5,6 +5,7 @@
 
 import inspect
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -518,15 +519,14 @@ def test_regularization_keeps_parallel_tiers_off(test: unittest.TestCase, device
     The parallel tiers solve the unregularized contact law: their kernels take the row weights
     but never apply them, so the worlds they own would drop ``pgs_contact_regularization``
     while the serial sweeps apply it. Admission is decided at construction on every device;
-    only the matrix-free route, which needs CUDA, builds the tiers it admits.
+    only the matrix-free route, which needs CUDA, builds the tiers it admits. A test pin
+    (``tiers``) asks for them on this scene.
     """
-    with wp.ScopedDevice(device):
+    with wp.ScopedDevice(device), mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"tiers": 32}):
         model = _build_scissor_model(device)
         for beta, g in ((0.0, 0.0), (0.0, 0.02), (0.2, 0.02)):
             with test.subTest(friction_anchor_beta=beta, g=g):
-                solver = newton.solvers.SolverFeatherPGS(
-                    model, friction_anchor_beta=beta, mf_gs_parallel_rows=32, pgs_contact_regularization=g
-                )
+                solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta, pgs_contact_regularization=g)
                 selected = solver.get_path_selection()
                 routes = selected["routes"]
                 parallel_rows = routes["friction"]["parallel_rows"]
@@ -536,7 +536,7 @@ def test_regularization_keeps_parallel_tiers_off(test: unittest.TestCase, device
                 if not regularized:
                     continue
                 test.assertNotIn((routes["sweep"]["tiers"] or {}).get("family"), ("parallel", "keyed_parallel"))
-                test.assertEqual(selected["options"]["mf_gs_parallel_rows"]["applied"], 0)
+                test.assertEqual(solver._ink_rows, 0)
                 keyed = routes["contact_rows"]["keyed_rows"]
                 test.assertFalse(keyed["enabled"])
                 test.assertIn("regularization", keyed["reason"])

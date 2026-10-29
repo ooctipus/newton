@@ -467,8 +467,6 @@ def create_owner(solver):
     supported = (
         capable("keyed_rows", solver._laws) is None
         and solver._ink_sizes is not None
-        and solver.mf_gs_parallel_matrix_free
-        and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
         and not solver._fused_diagonal_joint_limits
     )

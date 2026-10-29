@@ -800,7 +800,6 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 enable_joint_limits=True,
                 dense_max_constraints=56,
                 friction_anchor_beta=0.0,
-                mf_gs_incremental_rows=0,
             )
         self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["unknown"]))
         self.assertIsNotNone(solver._sparse_mass_matrix_size)
