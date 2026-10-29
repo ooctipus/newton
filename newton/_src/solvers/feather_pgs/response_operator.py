@@ -233,26 +233,38 @@ class CholeskySolve:
             {self._at(output, "row")}={self._finish()};{post}
         }}"""
 
-    def enter(self, rhs: Vector, output: Vector) -> str:
-        """Enter factor coordinates: ``x = L^T P rhs`` in increasing row order, each row's terms from zero, ascending (the output may alias the
-        input: row ``r`` reads rows ``r`` on). With ``reciprocal`` the staged diagonal holds ``1 / L_ii``: the diagonal
-        term divides by it (a staged zero, a zero pivot, adds zero)."""
-        rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
+    def _coordinate(self, rhs: Vector, row: str, pad: str, unroll: bool) -> str:
+        """Factor coordinate ``row`` of ``L^T P rhs`` into ``value``: the diagonal term (with ``reciprocal`` divided by
+        the staged ``1 / L_ii``: a staged zero, a zero pivot, adds zero), then the terms below it, ascending."""
         if self.reciprocal:
-            terms = _unrolled(f"for(int k=row+1;k<{self.size};++k)", "            ", self.unroll)
-            diagonal = self._entry("row", "row")
-            first = f"{diagonal}!=0.0f?{self._at(rhs, 'row')}/{diagonal}:0.0f"
-            return f"""{rows}
-            float value={first};
-            {terms}value+={self._entry("k", "row")}*{self._at(rhs, "k")};
-            {self._at(output, "row")}=value;
-        }}"""
-        terms = _unrolled(f"for(int k=row;k<{self.size};++k)", "            ", self.unroll)
+            diagonal = self._entry(row, row)
+            value, first = f"{diagonal}!=0.0f?{self._at(rhs, row)}/{diagonal}:0.0f", f"{row}+1"
+        else:
+            value, first = "0.0f", row
+        terms = _unrolled(f"for(int k={first};k<{self.size};++k)", pad, unroll)
+        return f"float value={value};\n{pad}{terms}value+={self._entry('k', row)}*{self._at(rhs, 'k')};"
+
+    def enter(self, rhs: Vector, output: Vector) -> str:
+        """Enter factor coordinates: ``x = L^T P rhs`` in increasing row order (the output may alias the input: row
+        ``r`` reads rows ``r`` on)."""
+        rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
         return f"""{rows}
-            float value=0.0f;
-            {terms}value+={self._entry("k", "row")}*{self._at(rhs, "k")};
+            {self._coordinate(rhs, "row", "            ", self.unroll)}
             {self._at(output, "row")}=value;
         }}"""
+
+    def enter_lanes(self, rhs: Vector, output: Vector, lane: str, width: int, name: str) -> tuple[str, str]:
+        """Enter factor coordinates with the lanes: lane ``l`` forms coordinates ``l``, ``l + width``... of ``x = L^T P
+        rhs`` in registers (``name_t``) with :meth:`enter`'s arithmetic. The caller synchronizes the lanes between the
+        two returned statement lists, forming and storing (the output may then alias the input)."""
+        n, w = int(self.size), int(width)
+        form, store = [], []
+        for t in range((n + w - 1) // w):
+            row = f"({lane} + {t * w})" if t else lane
+            form += [f"float {name}_{t} = 0.0f;", f"if ({row} < {n}) {{"]
+            form += [f"    {self._coordinate(rhs, row, '    ', False)}", f"    {name}_{t} = value;", "}"]
+            store.append(f"if ({row} < {n}) {self._at(output, row)} = {name}_{t};")
+        return "\n".join(form), "\n".join(store)
 
     def stage_inverse(self, lane: str) -> str:
         """Stage the reciprocal diagonal of :attr:`inverse`, one row per lane (the lanes cover the rows)."""
@@ -1777,26 +1789,33 @@ class LocalBlock(ResidualBlock):
         if offset != self.dofs:
             raise ValueError(f"the factor blocks span {offset} coordinates, the block {self.dofs}")
 
-    def _convert(self, indent: str, *, enter: bool) -> str:
-        """Every factor block of the velocity ``s_v`` enters (``u = L^T P v``) or leaves (``v = P^T L^-T u``) factor
-        coordinates in place, block ``b`` on lane ``b``."""
-        lane, lines = self.lanes.lane, []
-        for block, (solve, offset) in enumerate(self._blocks()):
+    def _velocity(self, offset: int):
+        def velocity(i):
+            return f"s_v[{offset} + {i}]" if offset else f"s_v[{i}]"
 
-            def velocity(i, offset=offset):
-                return f"s_v[{offset} + {i}]" if offset else f"s_v[{i}]"
-
-            action = solve.enter if enter else solve.leave
-            lines += [f"if ({lane} == {block}) {{", action(velocity, velocity), "}"]
-        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
+        return velocity
 
     def enter(self, indent: str) -> str:
-        """The staged velocity enters factor coordinates, block by block (one lane each)."""
-        return self._convert(indent, enter=True)
+        """The staged velocity enters factor coordinates, ``u = L^T P v`` block by block, a lane per coordinate
+        (:meth:`.CholeskySolve.enter_lanes`): every block's coordinates are formed, the lanes synchronize, then
+        stored in place."""
+        forms, stores = [], []
+        for block, (solve, offset) in enumerate(self._blocks()):
+            velocity = self._velocity(offset)
+            form, store = solve.enter_lanes(velocity, velocity, self.lanes.lane, self.lanes.width, f"entered_{block}")
+            forms.append(form)
+            stores.append(store)
+        lines = [*forms, self.lanes.sync(), *stores]
+        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
 
     def leave(self, indent: str) -> str:
-        """The committed velocity leaves factor coordinates, block by block (one lane each)."""
-        return self._convert(indent, enter=False)
+        """The committed velocity leaves factor coordinates, ``v = P^T L^-T u`` in place, block ``b``'s back
+        substitution on lane ``b``."""
+        lane, lines = self.lanes.lane, []
+        for block, (solve, offset) in enumerate(self._blocks()):
+            velocity = self._velocity(offset)
+            lines += [f"if ({lane} == {block}) {{", solve.leave(velocity, velocity), "}"]
+        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
 
     def respond(self, reads: tuple[str, ...], indent: str) -> str:
         """Stage row ``row``'s whitened entries ``Z`` in ``s_Z``, in the caller's loop over ``row``.

@@ -70,6 +70,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 # The coupled rows: every lane stores what it computes; the warp synchronizes after the apply only.
                 self.assertIn("s_lam_dense[i] = new_impulse;", text)
                 self.assertNotIn("if (lane == 0) s_lam_dense", text)
+                # The dense articulation enters factor coordinates a lane per coordinate.
+                self.assertIn(f"if (lane < {dense}) s_v[dense_offset + ({dense}-1-(lane))] = entered_0;", text)
 
     def test_sparse_diagonal_schedules(self):
         triples, _ = routes.sparse_diagonal_source(32, 14, 6, contact_triples=True, speculative_contact_batches=True)

@@ -421,6 +421,8 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     def dense_velocity(position):
         return f"s_v[dense_offset + {position}]"
 
+    dense_enter = dense_solve.enter_lanes(dense_velocity, dense_velocity, "lane", 32, "entered")
+
     sweep_end = end_sweep(solve_policy, iteration="iteration")
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
@@ -449,11 +451,11 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     }}
 {limit_loads}
     SYNC();
-    // The dense articulation enters factor coordinates, u = L^T P v.
+    // The dense articulation enters factor coordinates, u = L^T P v, a lane per coordinate.
     const float* dense_factor = &dense_L.data[(size_t)dense_group * {P * P}];
-    if (lane == 0) {{
-{indent(dense_solve.enter(dense_velocity, dense_velocity), "        ")}
-    }}
+{indent(dense_enter[0], "    ")}
+    SYNC();
+{indent(dense_enter[1], "    ")}
     SYNC();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{

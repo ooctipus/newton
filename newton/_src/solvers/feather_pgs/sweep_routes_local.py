@@ -282,7 +282,7 @@ def local_owned_source(
         s_v[d] = v_out.data[dof];
     }}
     SYNC();
-    // The velocity enters factor coordinates, u = L^T P v, block by block.
+    // The velocity enters factor coordinates, u = L^T P v, a lane per coordinate.
 {op.enter("    ")}
     SYNC();
 

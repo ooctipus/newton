@@ -190,6 +190,14 @@ class TestResponseOperators(unittest.TestCase):
         entered = solve.enter(out, out)
         self.assertIn("float value=(s_L)[row*3+row]!=0.0f?x[(3-1-(row))]/(s_L)[row*3+row]:0.0f;", entered)
         self.assertIn("for(int k=row+1;k<3;++k)", entered)
+        # A lane per coordinate: the same terms in the same order, formed in registers, then stored.
+        form, store = solve.enter_lanes(out, out, "lane", 2, "u")
+        self.assertIn("float value=(s_L)[lane*3+lane]!=0.0f?x[(3-1-(lane))]/(s_L)[lane*3+lane]:0.0f;", form)
+        self.assertIn("for(int k=lane+1;k<3;++k)value+=(s_L)[k*3+lane]*x[(3-1-(k))];", form)
+        self.assertIn("for(int k=(lane + 2)+1;k<3;++k)", form)
+        self.assertEqual(
+            store, "if (lane < 3) x[(3-1-(lane))] = u_0;\nif ((lane + 2) < 3) x[(3-1-((lane + 2)))] = u_1;"
+        )
 
     def test_local_block_views_and_packed_entries(self):
         block = LocalBlock(15, (CholeskySolve(9, "s_L"), CholeskySolve(6, "s_S")), Lanes(32), free=FreeBodyZ(Lanes(32)))
@@ -217,6 +225,11 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
         self.assertIn("u += mf_Z_a.data[row6 + d - row_a] * applied;", commit)
         self.assertIn("if (lane == 1) {", block.leave(""))
+        # Entering factor coordinates: every block's coordinates formed on the lanes, then stored after a barrier.
+        entered = block.enter("")
+        self.assertIn("for(int k=lane;k<6;++k)value+=(s_S)[k*6+lane]*s_v[9 + (6-1-(k))];", entered)
+        self.assertLess(entered.index("SYNC();"), entered.index("if (lane < 9) s_v[(9-1-(lane))] = entered_0_0;"))
+        self.assertNotIn("lane ==", entered)
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
