@@ -6,10 +6,10 @@
 Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
 
 - :func:`local_owned_kernel`: one lane group (8, 16 or 32 lanes) per candidate articulation, or articulation and
-  free body, with several groups per block. The group stages the factors and rows, builds each row's response in
-  the kernel and solves the rows over the packed response block (:class:`.response_operator.LocalBlock`), its
-  residuals maintained and the velocity committed after the sweeps. The residual owner's free-body rows follow the
-  dense rows in the block.
+  free body, with several groups per block. The group stages the factors and rows, whitens each row in the kernel
+  and solves the rows over the packed Gram block ``A = Z^T Z`` (:class:`.response_operator.LocalBlock`) in factor
+  coordinates, its residuals maintained and the velocity committed after the sweeps. The residual owner's free-body
+  rows follow the dense rows in the block.
 - :func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
   (:class:`.response_operator.FactorRows`), the velocity mapped in and out per component, under one of three
   schedules: row by row, contact triples after a prefix, or contact units.
@@ -120,8 +120,8 @@ def local_staging(
     contact_capable: bool = True,
     local_mf_max_constraints: int = 0,
 ) -> Staging:
-    """The shared working set of a local owner's block: per lane group the factors, the rows' Jacobians, responses,
-    impulses and metadata, the velocity, the paired free body's impulses and the packed response block.
+    """The shared working set of a local owner's block: per lane group the factors, the rows' whitened entries,
+    impulses and metadata, the velocity, the paired free body's impulses and the packed Gram block.
 
     The solver admits an owner, and sizes its blocks, from it (:meth:`.Staging.fits` against
     :func:`.staging.arch_budget`).
@@ -138,8 +138,7 @@ def local_staging(
         (
             Buffer("s_L", "float", P * P),
             *((Buffer("s_L_secondary", "float", S * S),) if S else ()),
-            Buffer("s_J", "float", R * T),
-            Buffer("s_Y", "float", R * T),
+            Buffer("s_Z", "float", R * T),
             Buffer("s_v", "float", T),
             *(Buffer(name, "float", R) for name in ("s_lam", "s_rhs", "s_inv_diag")),
             Buffer("s_type", "int", R),
@@ -173,11 +172,12 @@ def local_owned_source(
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel.
 
-    The group stages the factors, the rows' impulses, right-hand sides and metadata and the velocity; solves each
-    row's response ``Y = H^-1 J^T`` from its Jacobian (``row_inputs``' packets, or the group's ``J``); stores the
-    effective diagonal ``J Y + cfm`` back to ``world_diag`` and stages its inverse; builds the block and the
-    residuals (:class:`.LocalBlock`); then runs the sweeps with the shared row law, the dense rows in slot order
-    and then the free-body rows, and commits the velocity and the impulses of the rows with a Jacobian.
+    The group stages the factors, the rows' impulses, right-hand sides and metadata and the velocity, which enters
+    factor coordinates; whitens each row, ``Z = L^-1 P J^T``, from its Jacobian (``row_inputs``' packets, or the
+    group's ``J``); stores the effective diagonal ``|Z|^2 + cfm`` back to ``world_diag`` and stages its inverse;
+    builds the Gram block and the residuals (:class:`.LocalBlock`); then runs the sweeps with the shared row law, the
+    dense rows in slot order and then the free-body rows, commits the velocity, which leaves factor coordinates, and
+    the impulses of the rows with a Jacobian.
 
     Returns the body and its staging.
     """
@@ -196,10 +196,6 @@ def local_owned_source(
         lanes,
         dense="row_count",
         free=free,
-        # The paired free body's held factor, unstaged: its staged copy keeps reciprocal pivots for the solves.
-        free_factor=(lambda r, c: f"secondary_L_group.data[secondary_group_l_base + ({r}) * {S} + ({c})]")
-        if MFR
-        else None,
         inverse=lambda row: "inverse_diagonal" if row == "i" else f"s_inv_diag[{row}]",
     )
     staging = local_staging(
@@ -286,8 +282,11 @@ def local_owned_source(
         s_v[d] = v_out.data[dof];
     }}
     SYNC();
+    // The velocity enters factor coordinates, u = L^T P v, block by block.
+{op.enter("    ")}
+    SYNC();
 
-    // Each row's response Y = H^-1 J^T, its effective diagonal J Y + cfm (stored back) and its inverse.
+    // Each row whitened, Z = L^-1 P J^T, its effective diagonal |Z|^2 + cfm (stored back) and its inverse.
     for (int row = lane; row < row_count; row += {L}) {{
 {sides}{op.respond(reads, "        ")}
         s_active[row] = active;
@@ -302,6 +301,9 @@ def local_owned_source(
 {sweeps}
 
 {op.commit("    ")}
+    SYNC();
+    // The velocity leaves factor coordinates, v = P^T L^-T u, block by block.
+{op.leave("    ")}
     SYNC();
     for (int d = lane; d < {T}; d += {L}) {{
         const int dof = {dof};

@@ -186,6 +186,10 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("for(int step=0;step<3;++step)", transposed)
         self.assertIn("const int row=3-1-step;", transposed)
         self.assertNotIn("1.0f / factor", CholeskySolve(3, "s_L").stage(lambda i: f"L[{i}]", "lane", 32))
+        # Entering factor coordinates with the staged reciprocal divides the diagonal term by it (a zero gives zero).
+        entered = solve.enter(out, out)
+        self.assertIn("float value=(s_L)[row*3+row]!=0.0f?x[(3-1-(row))]/(s_L)[row*3+row]:0.0f;", entered)
+        self.assertIn("for(int k=row+1;k<3;++k)", entered)
 
     def test_local_block_views_and_packed_entries(self):
         block = LocalBlock(15, (CholeskySolve(9, "s_L"), CholeskySolve(6, "s_S")), Lanes(32), free=FreeBodyZ(Lanes(32)))
@@ -198,6 +202,21 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("s_A[hi * (hi + 1) / 2 + lo]", coupling)
         with self.assertRaises(ValueError):
             LocalBlock(16, block.factors, Lanes(32)).respond(("a", "b"), "")
+        # Whitened rows: the forward solve only, the Gram block A = Z^T Z, the commit in factor coordinates.
+        respond = block.respond(("a", "b"), "")
+        # Whitened in registers, stored once.
+        self.assertIn("whitened_0[i] = jacobian;", respond)
+        self.assertIn("s_Z[staged + 9 + i] = whitened_1[i];", respond)
+        self.assertIn("row_diagonal += whitened_1[i] * whitened_1[i];", respond)
+        self.assertNotIn("step", respond)
+        assembled = block.assemble(lambda r: f"rhs[{r}]", "")
+        self.assertIn("a += s_Z[hi * 15 + d] * s_Z[lo * 15 + d];", assembled)
+        self.assertIn("residual += s_Z[r * 15 + d] * s_v[d];", assembled)
+        self.assertIn("side_term += mf_Z_a.data[row6 + d] * s_Z[lo * 15 + row_a + d];", assembled)
+        commit = block.commit("")
+        self.assertIn("u += s_Z[r * 15 + d] * s_app[r];", commit)
+        self.assertIn("u += mf_Z_a.data[row6 + d - row_a] * applied;", commit)
+        self.assertIn("if (lane == 1) {", block.leave(""))
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
