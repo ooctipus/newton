@@ -8,8 +8,8 @@ velocities stay in global memory, and every row takes the row law (:func:`.sweep
 the world's response operator.
 
 - :func:`loop_kernel`: the assembled Delassus rows (:class:`.Assembled`), in impulse space;
-- :func:`mf_loop_kernel`: the free-body rows (:class:`.FreeBody6` in the loop's order), velocities through the body
-  map (``body_to_articulation``, ``art_dof_start``), each body's speed row in row order;
+- :func:`mf_loop_kernel`: the free-body rows (:class:`.FreeBodyZ` in the loop's order), velocities through the body
+  map (``body_to_articulation``, ``art_dof_start``) in factor coordinates, each body's speed row in row order;
 - :func:`loop_unit_kernel`, :func:`mf_loop_unit_kernel`: the same sweeps with exact contact units
   (``contact_update="unit"``): once friction is active, a contact unit (a point contact, or a patch ring as one ring
   unit or as anchor units) is solved at its first row by the contact-unit law (:mod:`.contact_unit`), every other
@@ -45,9 +45,10 @@ from .contact_unit import (
 )
 from .device_preludes import RING
 from .kernel_template import KernelTemplate
+from .kernels import BodyFactors
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Assembled, FreeBody6, Lanes, ResponseOperator, Velocity
+from .response_operator import Assembled, FreeBodyZ, Lanes, ResponseOperator, Velocity
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .staging import Staging
 from .sweep import (
@@ -104,10 +105,9 @@ _MF_ROWS = kernel_template.params(
     ("mf_constraint_count", wp.array[int]),
     ("mf_body_a", wp.array2d[int]),
     ("mf_body_b", wp.array2d[int]),
-    ("mf_MiJt_a", wp.array3d[float]),
-    ("mf_MiJt_b", wp.array3d[float]),
-    ("mf_J_a", wp.array3d[float]),
-    ("mf_J_b", wp.array3d[float]),
+    ("mf_Z_a", wp.array3d[float]),
+    ("mf_Z_b", wp.array3d[float]),
+    ("factors", BodyFactors),
     ("mf_eff_mass_inv", wp.array2d[float]),
     ("mf_rhs", wp.array2d[float]),
     ("mf_row_type", wp.array2d[int]),
@@ -209,9 +209,10 @@ class LoopSweep:
             them; ``None`` for an operator in impulse space.
         contact_kinds: The unilateral row kinds.
         pair_residual: A friction pair reduces its first tangent's residual again (:attr:`.RowContext.pair_residual`).
-        setup: Declarations of the world's operands.
+        setup: Declarations of the world's operands, and what precedes the sweeps.
         unit_diagonal: Statements returning a unit block's diagonal entry of row ``r``.
         unit_entry: Statements returning a unit block's entry of rows ``r`` and ``c``.
+        finish: What follows the sweeps.
     """
 
     count: str
@@ -227,6 +228,7 @@ class LoopSweep:
     setup: str
     unit_diagonal: str
     unit_entry: str
+    finish: str = ""
 
     def context(self, *, kind: str | None = None, friction: bool = True) -> RowContext:
         rows = self.rows
@@ -290,15 +292,28 @@ def _dense() -> LoopSweep:
 
 
 def _free_body() -> LoopSweep:
-    """The free-body rows in the loop's order: velocities in place, each body at its articulation's coordinates."""
+    """The free-body rows in the loop's order: velocities in place, each body at its articulation's coordinates, in
+    its factor coordinates between the sweeps' entry and exit (each body converted once, at its first row)."""
     rows = LoopRows("c_off", "mf_row_type", "mf_row_parent", "mf_rhs", "mf_row_mu", "mf_row_w")
     stored = functools.partial(rows.at, "mf_eff_mass_inv")
-    op = FreeBody6(
+    op = FreeBodyZ(
         Lanes(1),
         velocity=Velocity("v_out.data"),
         inverse=lambda row: "mf_diag" if row == "i" else stored(row),
         order="loop",
+        factor=lambda first: f"factors.dof_factor.data[{first}]",
     )
+
+    def convert(*, enter: bool) -> str:
+        action = op.enter if enter else op.leave
+        return f"""for (int r = 0; r < m; ++r) {{
+    for (int side = 0; side < 2; ++side) {{
+        if (!FIRST_SEEN(r, side)) continue;
+        const int first = BODY_DOF(side == 0 ? {rows.at("mf_body_a", "r")} : {rows.at("mf_body_b", "r")});
+        const int factor = factors.dof_factor.data[first];
+{indent(action(lambda k: f"v_out.data[first + {k}]", "factor"), "        ")}
+    }}
+}}"""
 
     def bodies(row: str, names: tuple[str, str]) -> str:
         return "\n".join(
@@ -323,10 +338,20 @@ def _free_body() -> LoopSweep:
             "// A body's first velocity coordinate, its articulation's (-1 for no body).\n"
             "const auto BODY_DOF = [&](const int body) -> int {\n"
             "    return body >= 0 ? art_dof_start.data[body_to_articulation.data[body]] : -1;\n"
-            "};"
+            "};\n"
+            "// Whether side `side` (0: a, 1: b) of row `r` holds its body's first appearance in row order.\n"
+            "const auto FIRST_SEEN = [&](const int r, const int side) -> bool {\n"
+            f"    const int body = side == 0 ? {rows.at('mf_body_a', 'r')} : {rows.at('mf_body_b', 'r')};\n"
+            "    if (body < 0) return false;\n"
+            "    for (int q = 0; q < r; ++q)\n"
+            f"        if ({rows.at('mf_body_a', 'q')} == body || {rows.at('mf_body_b', 'q')} == body) return false;\n"
+            f"    return side == 0 || {rows.at('mf_body_a', 'r')} != body;\n"
+            "};\n"
+            "// The world's bodies enter factor coordinates.\n" + convert(enter=True)
         ),
         unit_diagonal=f"return {op.value('r')};",
         unit_entry=f"{bodies('r', ('dof_a', 'dof_b'))}\n{bodies('c', ('column_a', 'column_b'))}\n{entry}\nreturn entry;",
+        finish="// The world's bodies leave factor coordinates.\n" + convert(enter=False),
     )
 
 
@@ -657,8 +682,9 @@ if (friction && {sweep.kind} == {CONTACT}) {{
 
 
 def _speed_rows(sweep: LoopSweep, pad: str, laws: RowLaws) -> str:
-    """A free body's speed row (a velocity-limit row), in row order: the stateless clamp of its linear (``J = e_0``)
-    or angular (``J = e_3``) speed along the velocity (:func:`.sweep.speed_row`); the row keeps its correction."""
+    """A free body's speed row (a velocity-limit row), in row order: the stateless clamp of its linear (axis
+    ``e_0``) or angular (axis ``e_3``) speed along the velocity (:func:`.sweep.speed_row`); the row keeps its
+    correction."""
     rows, op = sweep.rows, sweep.operator
     speed = speed_row_update(
         op,
@@ -675,7 +701,7 @@ def _speed_rows(sweep: LoopSweep, pad: str, laws: RowLaws) -> str:
         f"    {sweep.declare}",
         f"    const int dof_a = BODY_DOF({rows.at('mf_body_a', 'i')});",
         "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
-        f"    const int speed_dof = dof_a + ({op.J_a}.data[{op.base} + i * 6 + 3] != 0.0f ? 3 : 0);",
+        f"    const int speed_axis = {op.Z_a}.data[{op.base} + i * 6 + 3] != 0.0f ? 3 : 0;",
         speed,
         "    continue;",
         "}",
@@ -735,6 +761,7 @@ def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool, solve_policy: So
 {body}
         }}
 {sweep_end}    }}
+{indent(sweep.finish, "    ")}
 """
 
 
@@ -757,8 +784,9 @@ def loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXAC
 def mf_loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXACT_POLICY) -> tuple[str, Staging]:
     """The native body of split mode's loop sweep over a world's free-body rows: one thread per world.
 
-    The rows' impulses and the bodies' velocities are updated in place (:class:`.FreeBody6` with one thread in the
-    loop's order, each body at its articulation's first coordinate). Contact rows are unilateral; a friction pair is
+    The rows' impulses and the bodies' velocities are updated in place (:class:`.FreeBodyZ` with one thread in the
+    loop's order, each body at its articulation's first coordinate, in its factor coordinates between the sweeps'
+    entry and exit). Contact rows are unilateral; a friction pair is
     solved at its first tangent on its patch ring's pooled load, on the residuals and coupling it reduces itself (the
     loop's friction step); a velocity-limit row is its body's speed row; every other row is bilateral. A contact's
     step takes its regularization weight when ``regularize`` is set. With ``contact_units`` a contact unit is solved

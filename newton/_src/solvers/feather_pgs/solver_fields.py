@@ -277,10 +277,8 @@ MF_COUNTERS = FieldGroup(
 MF_ROWS = FieldGroup(
     Field("mf_body_a", wp.int32, ("world", "mf_row"), mirror=True),
     Field("mf_body_b", wp.int32, ("world", "mf_row"), mirror=True),
-    Field("mf_J_a", wp.float32, ("world", "mf_row", 6), mirror=True),
-    Field("mf_J_b", wp.float32, ("world", "mf_row", 6), mirror=True),
-    Field("mf_MiJt_a", wp.float32, ("world", "mf_row", 6), mirror=True),
-    Field("mf_MiJt_b", wp.float32, ("world", "mf_row", 6), mirror=True),
+    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), mirror=True),
+    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), mirror=True),
     Field("mf_rhs", wp.float32, ("world", "mf_row"), mirror=True),
     Field("mf_rhs_unbiased", wp.float32, ("world", "mf_row")),
     Field("mf_impulses", wp.float32, ("world", "mf_row"), mirror=True),
@@ -290,24 +288,26 @@ MF_ROWS = FieldGroup(
     Field("mf_row_mu", wp.float32, ("world", "mf_row"), mirror=True),
     Field("mf_phi", wp.float32, ("world", "mf_row"), mirror=True),
     Field("mf_row_restitution", wp.float32, ("world", "mf_row")),
+    Field("mf_row_incident", wp.float32, ("world", "mf_row")),
     Field("mf_dof_a", wp.int32, ("world", "mf_row"), mirror=True),
     Field("mf_dof_b", wp.int32, ("world", "mf_row"), mirror=True),
     Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), grad=False),
 )
-"""Every world's matrix-free (free-body) rows. Packed metadata: four ints per row (dof pair, inverse effective
-mass, rhs, type and parent)."""
+"""Every world's matrix-free (free-body) rows. Each side's six entries hold the row's Jacobian ``J`` as the writers
+store it and its whitened form ``Z = L^-1 J^T`` once the rows' build has run (``L`` the body's held factor); a
+restitutive contact keeps its incident velocity ``J v_hat``. Packed metadata: four ints per row (dof pair, inverse
+effective mass, rhs, type and parent)."""
 
 MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0, grad=False))
 
 MF_BODY_MAP = FieldGroup(
-    Field("mf_body_Hinv", wp.spatial_matrix, ("body",)),
     Field("mf_body_list", wp.int32, ("world", "mf_body")),
     Field("mf_body_dof_start", wp.int32, ("world", "mf_body")),
     Field("mf_body_count", wp.int32, ("world",)),
     Field("mf_local_body_a", wp.int32, ("world", "mf_row")),
     Field("mf_local_body_b", wp.int32, ("world", "mf_row")),
 )
-"""Body maps and inverse inertia of the tiled matrix-free sweep (split mode)."""
+"""Body maps of the tiled matrix-free sweep (split mode) and of the warm start's publication."""
 
 MF_WARMSTART = FieldGroup(
     Field("_ws_prev_mf_impulses", wp.float32, ("world", "mf_row")),

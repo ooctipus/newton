@@ -27,7 +27,7 @@ from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBody6, Lanes, LocalBlock
+from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
 from .row_metadata import _mf_parent_expression
 from .solve_policy import EXACT_POLICY, SolvePolicy
 from .staging import Buffer, Staging, arch_budget
@@ -73,10 +73,8 @@ LOCAL_ABI = kernel_template.params(
     ("mf_constraint_count", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
     ("mf_impulses", wp.array2d[float]),
-    ("mf_J_a", wp.array3d[float]),
-    ("mf_J_b", wp.array3d[float]),
-    ("mf_MiJt_a", wp.array3d[float]),
-    ("mf_MiJt_b", wp.array3d[float]),
+    ("mf_Z_a", wp.array3d[float]),
+    ("mf_Z_b", wp.array3d[float]),
     ("mf_row_mu", wp.array2d[float]),
     ("regularize", int),
     ("world_row_w", wp.array2d[float]),
@@ -183,7 +181,7 @@ def local_owned_source(
     T, MFS, MFR, L = P + S, int(mf_max_constraints), int(local_mf_max_constraints), int(lanes_per_world)
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
     lanes = Lanes(L)
-    free = FreeBody6(lanes) if MFR else None
+    free = FreeBodyZ(lanes) if MFR else None
     laws = RowLaws(regularize=contact_capable, policy=solve_policy)
     factors = (CholeskySolve(P, "s_L", reciprocal=contact_capable, ascending=True),)
     if S:
@@ -194,6 +192,10 @@ def local_owned_source(
         lanes,
         dense="row_count",
         free=free,
+        # The paired free body's held factor, unstaged: its staged copy keeps reciprocal pivots for the solves.
+        free_factor=(lambda r, c: f"secondary_L_group.data[secondary_group_l_base + ({r}) * {S} + ({c})]")
+        if MFR
+        else None,
         inverse=lambda row: "inverse_diagonal" if row == "i" else f"s_inv_diag[{row}]",
     )
     staging = local_staging(

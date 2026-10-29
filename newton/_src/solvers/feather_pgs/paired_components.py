@@ -4,8 +4,8 @@
 """Split a paired world's rows into independent articulation and free-body components.
 
 A world that pairs one held articulation with one free rigid body solves its
-dense rows (the articulation's) in factor coordinates and its matrix-free
-rows (the body's) in physical coordinates. When no row couples the two, the
+dense rows (the articulation's) in the articulation's factor coordinates and
+its matrix-free rows (the body's) in the body's. When no row couples the two, the
 world is partitioned: the paired factor kernel sweeps the dense component and
 the matrix-free kernel sweeps the body's component, each reading and writing
 only its own coordinates, so the two launches run concurrently instead of the
@@ -41,10 +41,8 @@ PAIRED_COMPONENTS = (
     Field("row_type", wp.int32, ("world", "row")),
     Field("row_parent", wp.int32, ("world", "row")),
     Field("mf_meta", wp.int32, ("world", "mf_meta"), owner="step"),
-    Field("mf_J_a", wp.float32, ("world", "mf_row", 6)),
-    Field("mf_J_b", wp.float32, ("world", "mf_row", 6)),
-    Field("mf_MiJt_a", wp.float32, ("world", "mf_row", 6)),
-    Field("mf_MiJt_b", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6)),
     Field("mf_mu", wp.float32, ("world", "mf_row"), attr="mf_row_mu"),
 )
 """The component classifier's inputs: the dense and matrix-free rows, the pair layout and its own selector."""

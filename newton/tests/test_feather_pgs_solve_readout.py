@@ -213,7 +213,7 @@ class _SparseCase:
             wp.zeros(worlds, dtype=int, device=device),
             wp.zeros((worlds, 4), dtype=int, device=device),
             wp.zeros((worlds, 1), device=device),
-            *[wp.zeros((worlds, 1, 6), device=device) for _ in range(4)],
+            *[wp.zeros((worlds, 1, 6), device=device) for _ in range(2)],
             wp.zeros((worlds, 1), device=device),
         ]
         self.solve = (omega, friction_start, offset)
@@ -291,7 +291,7 @@ class _LocalCase:
             wp.zeros(2, dtype=wp.int32, device=device),
             wp.zeros((2, 4), dtype=wp.int32, device=device),
             wp.zeros((2, 1), dtype=wp.float32, device=device),
-            *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(4)],
+            *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(2)],
             wp.zeros((2, 1), dtype=wp.float32, device=device),
             0,
             wp.zeros((2, rows), dtype=wp.float32, device=device),

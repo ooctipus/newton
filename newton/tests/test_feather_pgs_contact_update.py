@@ -35,6 +35,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import contact_unit, environment_flags, path_selection, sweep_routes_split
 from newton._src.solvers.feather_pgs import kernels as K
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_row_builders import launched_kernels
 from newton.tests.test_feather_pgs_contact_unit import slide_solutions
@@ -369,14 +370,17 @@ class FreeBody:
         # The body's velocity gives each row its residual at zero impulse (the rows carry no bias).
         self.velocity = np.zeros(6, np.float32)
         self.velocity[: J.shape[1]] = np.linalg.lstsq(J, system["rhs"], rcond=None)[0]
+        # Identity mass: the body's factor is the identity, so the whitened rows are the rows.
+        factors = BodyFactors()
+        factors.dof_factor = wp.array([0, -1, -1, -1, -1, -1], dtype=int, device=_CPU)
+        factors.L = wp.array(np.eye(6, dtype=np.float32)[None], dtype=float, device=_CPU)
         self.arrays = [
             wp.array([m], dtype=int, device=_CPU),
             wp.zeros((1, m), dtype=int, device=_CPU),
             wp.full((1, m), -1, dtype=int, device=_CPU),
             wp.array(J6, dtype=float, device=_CPU),
             wp.zeros((1, m, 6), dtype=float, device=_CPU),
-            wp.array(J6, dtype=float, device=_CPU),
-            wp.zeros((1, m, 6), dtype=float, device=_CPU),
+            factors,
             wp.array((1.0 / np.einsum("ij,ij->i", J, J))[None].astype(np.float32), dtype=float, device=_CPU),
             wp.zeros((1, m), dtype=float, device=_CPU),
             wp.array(system["rtype"][None], dtype=int, device=_CPU),

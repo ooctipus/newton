@@ -15,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
@@ -250,6 +251,16 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 np.testing.assert_array_equal(result.numpy(), parents)
 
 
+def _unit_factors(worlds, dofs, device):
+    """Unit mass factors of each world's free body at its first coordinate (so Z = J and u = v)."""
+    factors = BodyFactors()
+    dof_factor = np.full(worlds * dofs, -1, np.int32)
+    dof_factor[np.arange(worlds) * dofs] = np.arange(worlds)
+    factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
+    factors.L = wp.array(np.tile(np.eye(6, dtype=np.float32), (worlds, 1, 1)), dtype=wp.float32, device=device)
+    return factors
+
+
 def _solve_parent_rows(device, parents):
     """Place identical active contact triples at different MF storage offsets."""
     _, values = solve_fixture(device)
@@ -280,10 +291,9 @@ def _solve_parent_rows(device, parents):
         mf_impulses=wp.zeros((worlds, capacity), device=device),
         mf_row_mu=wp.full((worlds, capacity), 0.4, device=device),
         mf_row_w=wp.ones((worlds, capacity), device=device),
-        mf_J_a=wp.array(jacobian, device=device),
-        mf_MiJt_a=wp.array(jacobian, device=device),
-        mf_J_b=wp.zeros((worlds, capacity, 6), device=device),
-        mf_MiJt_b=wp.zeros((worlds, capacity, 6), device=device),
+        mf_Z_a=wp.array(jacobian, device=device),
+        mf_Z_b=wp.zeros((worlds, capacity, 6), device=device),
+        factors=_unit_factors(worlds, 29, device),
         v_out=wp.array(velocity.reshape(-1), device=device),
         general_world_grid_stride=worlds,
         use_general_world_queue=0,

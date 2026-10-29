@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs import field_group, sweep_routes_split
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    BodyFactors,
     compute_world_contact_bias,
 )
 from newton.tests.feather_pgs_law_harness import position_pass
@@ -101,10 +102,9 @@ def _solve_rows(device, n_rows, g, iterations=300):
             wp.array([n_rows], dtype=wp.int32),
             wp.array(body_a, dtype=wp.int32),
             wp.full((1, m), -1, dtype=wp.int32),  # body_b
-            wp.array(J, dtype=wp.float32),  # MiJt_a (unit mass)
-            wp.zeros((1, m, 6), dtype=wp.float32),  # MiJt_b
-            wp.array(J, dtype=wp.float32),  # J_a
-            wp.zeros((1, m, 6), dtype=wp.float32),  # J_b
+            wp.array(J, dtype=wp.float32),  # Z_a (unit mass: Z = J)
+            wp.zeros((1, m, 6), dtype=wp.float32),  # Z_b
+            _unit_factor(),
             wp.array(eff_inv, dtype=wp.float32),
             wp.array(rhs, dtype=wp.float32),
             wp.array(row_type, dtype=wp.int32),
@@ -124,6 +124,14 @@ def _solve_rows(device, n_rows, g, iterations=300):
         device=device,
     )
     return mf_impulses.numpy()[0, :n_rows]
+
+
+def _unit_factor():
+    """The one body's unit mass factor, at its first coordinate."""
+    factors = BodyFactors()
+    factors.dof_factor = wp.array(np.array([0, -1, -1, -1, -1, -1], np.int32), dtype=wp.int32)
+    factors.L = wp.array(np.eye(6, dtype=np.float32)[None], dtype=wp.float32)
+    return factors
 
 
 def test_regularization_fixed_points(test: unittest.TestCase, device):

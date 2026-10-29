@@ -18,10 +18,10 @@ from . import kernel_template, sweep_units
 from .contact_torsion import torque_sweep_source
 from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
+from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Block, DenseJY, DenseSupport, FreeBody6, Lanes, Velocity
+from .response_operator import Block, DenseJY, DenseSupport, FreeBodyZ, Lanes, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
 from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
@@ -102,10 +102,9 @@ MF_GS_ABI = kernel_template.params(
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
     ("mf_impulses", wp.array2d[float]),
-    ("mf_J_a", wp.array3d[float]),
-    ("mf_J_b", wp.array3d[float]),
-    ("mf_MiJt_a", wp.array3d[float]),
-    ("mf_MiJt_b", wp.array3d[float]),
+    ("mf_Z_a", wp.array3d[float]),
+    ("mf_Z_b", wp.array3d[float]),
+    ("factors", BodyFactors),
     ("mf_row_mu", wp.array2d[float]),
     ("mf_row_w", wp.array2d[float]),
     ("iterations", int),
@@ -124,6 +123,97 @@ DENSE_SUPPORT = DenseSupport()
 """Where a matrix-free sweep keeps its dense rows' support (:class:`.response_operator.DenseSupport`)."""
 
 
+class FreeBodyCoordinates:
+    """The free bodies a matrix-free sweep holds in factor coordinates, and their conversions (native).
+
+    The bodies of the launch's free-body rows are marked at their first world coordinate in a bitmap
+    (``s_mf_bodies``), enter factor coordinates ``u = L^T v`` once the velocity is staged and leave them, ``v =
+    L^-T u``, before it is written back (:meth:`.FreeBodyZ.enter`, :meth:`.FreeBodyZ.leave`). The world's dense rows
+    read physical coordinates, so a body they touch too (``s_mf_shared``) leaves around them in every sweep. A
+    body's factor is ``factors.dof_factor`` of its first global coordinate.
+    """
+
+    op = FreeBodyZ()
+
+    @staticmethod
+    def words(dofs: int) -> int:
+        return (int(dofs) + 31) // 32
+
+    @classmethod
+    def buffers(cls, dofs: int) -> tuple[Buffer, ...]:
+        words = cls.words(dofs)
+        return (
+            Buffer("s_mf_bodies", "unsigned", words),
+            Buffer("s_mf_shared", "unsigned", words),
+            Buffer("s_mf_any_shared", "int", 1),
+        )
+
+    def factor(self, first: str) -> str:
+        """The native factor index of the free body whose first world coordinate is ``first``."""
+        return f"{self.op.factors}.dof_factor.data[world_dof_indices.data[dof_map_base + {first}]]"
+
+    @classmethod
+    def clear(cls, dofs: int, lane: str) -> str:
+        """Clear the bitmaps (the first warp, before the loads' barrier)."""
+        return (
+            f"for (int w = {lane}; w < {cls.words(dofs)}; w += 32) {{ s_mf_bodies[w] = 0u; s_mf_shared[w] = 0u; }}\n"
+            f"if ({lane} == 0) s_mf_any_shared[0] = 0;"
+        )
+
+    @staticmethod
+    def mark(first_row: str, rows: str, thread: str, threads: str) -> str:
+        """Mark the bodies of the free-body rows ``[first_row, rows)``."""
+        return f"""for (int i = {first_row} + {thread}; i < {rows}; i += {threads}) {{
+    const int dofs = mf_meta.data[off_meta + i * 4];
+    const int da = dofs >> 16, db = (dofs << 16) >> 16;
+    if (da >= 0) atomicOr(&s_mf_bodies[da >> 5], 1u << (da & 31));
+    if (db >= 0) atomicOr(&s_mf_bodies[db >> 5], 1u << (db & 31));
+}}"""
+
+    @classmethod
+    def _each(cls, bitmap: str, dofs: int, thread: str, threads: str, body: str) -> str:
+        """``body`` on each marked first coordinate ``d`` of ``bitmap``, a thread per word."""
+        return f"""for (int w = {thread}; w < {cls.words(dofs)}; w += {threads}) {{
+    unsigned bits = {bitmap}[w];
+    while (bits != 0u) {{
+        const int d = (w << 5) + __ffs(bits) - 1;
+        bits &= bits - 1u;
+{indent(body, "        ")}
+    }}
+}}"""
+
+    @classmethod
+    def shared(cls, dofs: int, touched: str, thread: str, threads: str, sync: str) -> str:
+        """Mark each body some dense row touches as shared (``touched``: native, true when coordinate ``c`` is)."""
+        body = f"""bool touched = false;
+for (int c = d; c < d + 6 && !touched; ++c) touched = {touched};
+if (touched) {{
+    s_mf_shared[w] |= 1u << (d & 31);
+    s_mf_any_shared[0] = 1;
+}}"""
+        return f"{cls._each('s_mf_bodies', dofs, thread, threads, body)}\n{sync}"
+
+    def convert_all(self, dofs: int, thread: str, threads: str, sync: str, *, enter: bool) -> str:
+        """Every marked body enters (or leaves) factor coordinates, a thread per bitmap word."""
+        action = self.op.enter if enter else self.op.leave
+        body = f"const int factor = {self.factor('d')};\n{action(lambda k: f's_v[d + {k}]', 'factor')}"
+        return f"{self._each('s_mf_bodies', dofs, thread, threads, body)}\n{sync}"
+
+    def convert_shared(self, dofs: int, lane: str, *, enter: bool) -> str:
+        """The shared bodies enter (or leave) factor coordinates on the first warp, between warp barriers."""
+        action = self.op.enter if enter else self.op.leave
+        body = f"const int factor = {self.factor('d')};\n{action(lambda k: f's_v[d + {k}]', 'factor')}"
+        return f"""if (mf_shared) {{
+    SYNC();
+{indent(self._each("s_mf_shared", dofs, lane, "32", body), "    ")}
+    SYNC();
+}}"""
+
+
+FREE_BODY_COORDINATES = FreeBodyCoordinates()
+"""Where a matrix-free sweep keeps its free bodies' coordinates (:class:`FreeBodyCoordinates`)."""
+
+
 def dense_support(max_world_dofs: int, lanes: Lanes = Lanes(32)) -> DenseSupport | None:
     """The dense rows' support of a sweep over worlds of ``max_world_dofs`` coordinates, or None.
 
@@ -132,6 +222,7 @@ def dense_support(max_world_dofs: int, lanes: Lanes = Lanes(32)) -> DenseSupport
     next row's entries while a row is solved (the support's loop reads them at use).
     """
     return DENSE_SUPPORT if int(max_world_dofs) > lanes.width else None
+
 
 MAPPINGS = ("warp", "colored")
 """The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
@@ -166,7 +257,7 @@ color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FI
 
 
 @dataclasses.dataclass(frozen=True)
-class _CachedPairBody6(FreeBody6):
+class _CachedPairBodyZ(FreeBodyZ):
     """The colored unit's operator: a friction pair's coupling feeds only its metric, which the unit's metric cache
     holds (:func:`_colored_metrics`), so the visit forms none."""
 
@@ -174,7 +265,7 @@ class _CachedPairBody6(FreeBody6):
         return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
 
 
-def _colored_pair_metric(op: FreeBody6, pad: str) -> str:
+def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
     """Native statements, after a unit's ``E`` and ``W`` and ``dof_a``, ``dof_b`` are declared: its friction pair's
     metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
     second tangent's diagonal), formed exactly as the visit's pair law forms it."""
@@ -192,7 +283,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's slots) and runs the free-body row law,
     unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
     unit_rows = FreeBodyRows(M_MF, stream=free.stream, lanes=Lanes(1))
-    arrays = {"mf_J_a": 0, "mf_J_b": 1, "mf_MiJt_a": 2, "mf_MiJt_b": 3}
+    arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
 
     def unit_offset(row: str) -> str:
         offsets = {"i": "r", "sib": "2"}
@@ -200,10 +291,10 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             raise ValueError(f"the colored unit reads rows i and sib, not {row!r}")
         return offsets[row]
 
-    unit_op = _CachedPairBody6(
+    unit_op = _CachedPairBodyZ(
         Lanes(1),
         velocity=Velocity("s_v"),
-        entry=lambda array, row, k: f"E[{unit_offset(row)} * 24 + {arrays[array] * 6} + {k}]",
+        entry=lambda array, row, k: f"E[{unit_offset(row)} * 12 + {arrays[array] * 6} + {k}]",
         inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])",
     )
     ring, members = sweep_units.SLOT_RING, sweep_units.RING_MEMBERS
@@ -316,11 +407,11 @@ def _colored_metrics(M_MF: int) -> str:
     three rows) at block stride and stores it in its slot's metric cache (``slot_metric``: scale, the two
     eigenvalues and the larger's axis, field by field across the units), which the pair law reads at every visit."""
     fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
-    arrays = {"mf_J_a": 0, "mf_J_b": 1, "mf_MiJt_a": 2, "mf_MiJt_b": 3}
-    op = FreeBody6(
+    arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
+    op = FreeBodyZ(
         Lanes(1),
         velocity=Velocity("s_v"),
-        entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row]} * 24 + {arrays[array] * 6} + {k}]",
+        entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {arrays[array] * 6} + {k}]",
         inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
     )
     return f"""    {{
@@ -383,6 +474,7 @@ def mf_gs_staging(
     return Staging(
         (
             Buffer("s_v", "float", max_world_dofs),
+            *FREE_BODY_COORDINATES.buffers(max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
             *(support.buffers(max_world_dofs) if support is not None else ()),
@@ -414,7 +506,8 @@ def mf_gs_source(
     solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:class:`.DenseJY`) and its
-    free-body rows (:class:`.FreeBody6`), then its end-of-sweep passes.
+    free-body rows (:class:`.FreeBodyZ`, its bodies in factor coordinates: :class:`FreeBodyCoordinates`), then its
+    end-of-sweep passes.
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
@@ -460,7 +553,8 @@ def mf_gs_source(
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
     support = dense_support(D, lanes)
     dense_op = DenseJY(D, lanes, support=support)
-    free_op = FreeBody6(lanes)
+    bodies = FREE_BODY_COORDINATES
+    free_op = FreeBodyZ(lanes, factor=bodies.factor)
     staging = mf_gs_staging(
         M_D,
         M_MF,
@@ -526,7 +620,12 @@ def mf_gs_source(
         + "\n        }"
     )
     if contact_torsion:
-        passes.append(torque_sweep_source(D, solve_policy))
+        # The torsion pass applies dense rows: their bodies leave factor coordinates around it.
+        passes.append(
+            indent(bodies.convert_shared(D, "lane", enter=False), "        ")
+            + torque_sweep_source(D, solve_policy)
+            + indent(bodies.convert_shared(D, "lane", enter=True), "        ")
+        )
 
     if colored:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
@@ -571,26 +670,44 @@ def mf_gs_source(
         free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_PHASE_ADMISSION, pad="        ")
         offsets = trace_reduction = ""
 
-    # The dense rows' support: the coordinates their J or Y touch, from rows [0, m_dense) (every pass reads them).
-    support_build = (
-        support.build(
+    thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "32")
+    sync = "__syncthreads();" if colored else "SYNC();"
+    # The dense rows' support: the coordinates their J or Y touch, from rows [0, m_dense) (every pass reads them),
+    # which also flags the free bodies the dense rows share.
+    if support is not None:
+        shared = support.build(
             dofs=D,
             rows="m_dense",
             J="J_world",
             Y="Y_world",
             base="jy_world_base",
-            thread="tid" if colored else "lane",
-            threads="(int)blockDim.x" if colored else "32",
+            thread=thread,
+            threads=threads,
             first_warp="warp == 0" if colored else "true",
             lane="lane",
-            sync="__syncthreads();" if colored else "SYNC();",
+            sync=sync,
+            marked=bodies.shared(D, f"(({support.bits}[c >> 5] >> (c & 31)) & 1u) != 0u", thread, threads, sync),
         )
-        if support is not None
-        else ""
-    )
+    else:
+        scan = (
+            "[&]() { for (int r = 0; r < m_dense; ++r) "
+            f"if (J_world.data[jy_world_base + r * {D} + c] != 0.0f || Y_world.data[jy_world_base + r * {D} + c] "
+            "!= 0.0f) return true; return false; }()"
+        )
+        shared = bodies.shared(D, scan, thread, threads, sync)
     metric_build = _colored_metrics(M_MF) if colored else ""
-    # The launch's prologue after the loads: the dense rows' support and the colored units' pair metrics.
-    prologue = "\n".join(part for part in (support_build, metric_build) if part)
+    # The launch's prologue after the loads: the dense rows' support and shared bodies, the free bodies entering
+    # factor coordinates, and the colored units' pair metrics.
+    prologue = "\n".join(
+        part
+        for part in (
+            shared,
+            bodies.convert_all(D, thread, threads, sync, enter=True),
+            "    const bool mf_shared = s_mf_any_shared[0] != 0;",
+            metric_build,
+        )
+        if part
+    )
     body = f"""{head}
 
     {dense_count}
@@ -639,7 +756,13 @@ def mf_gs_source(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
     }}
+{indent(bodies.clear(D, "lane"), "    ")}
 {end_first_warp}    {barrier}
+    // The bodies of the free-body rows this launch visits.
+    if (row_phase != 3 && row_phase != 6) {{
+{indent(bodies.mark("mf_load_lo", "m_mf", thread, threads), "        ")}
+    }}
+    {barrier}
 {prologue}
 {dense_op.pipeline_registers("    ")}
 
@@ -647,7 +770,9 @@ def mf_gs_source(
         int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 
-{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
+{first_warp}{indent(bodies.convert_shared(D, "lane", enter=False), "        ")}
+{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
+{indent(bodies.convert_shared(D, "lane", enter=True), "        ")}
 {end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
 {free_phase}
@@ -656,6 +781,8 @@ def mf_gs_source(
 {first_warp}{chr(10).join(passes)}
 {end_first_warp}{sweep_end}    }}
 
+    {barrier}
+{indent(bodies.convert_all(D, thread, threads, sync, enter=False), "    ")}
 {first_warp}    for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];

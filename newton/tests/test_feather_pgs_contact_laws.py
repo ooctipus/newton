@@ -509,8 +509,8 @@ def _law_mf_jacobian(
     contact_shared_anchor: int,
     friction_patches: kernels.FrictionPatches,
     friction_anchor_beta: float,
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
+    mf_Z_a: wp.array3d[float],
+    mf_Z_b: wp.array3d[float],
     mf_phi: wp.array2d[float],
     mf_row_mu: wp.array2d[float],
     mf_target_velocity: wp.array2d[float],
@@ -549,11 +549,11 @@ def _law_mf_jacobian(
     if body_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
         J = contact_laws.free_body_jacobian(direction, p0, articulation_origin[art_a])
         for k in range(6):
-            mf_J_a[0, slot, k] = J[k]
+            mf_Z_a[0, slot, k] = J[k]
     if body_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
         J = contact_laws.free_body_jacobian(direction, p1, articulation_origin[art_b])
         for k in range(6):
-            mf_J_b[0, slot, k] = -J[k]
+            mf_Z_b[0, slot, k] = -J[k]
     if row == 0:
         mf_phi[0, slot] = phi
         mf_row_mu[0, slot] = mu
@@ -586,7 +586,7 @@ def test_free_body_jacobian_matches_mf_contact_rows(test, device):
         contact_friction_scale=0.7,
         friction_anchor_beta=0.15,
     )
-    outputs = ("mf_J_a", "mf_J_b", "mf_phi", "mf_row_mu", "mf_target_velocity", "mf_row_restitution")
+    outputs = ("mf_Z_a", "mf_Z_b", "mf_phi", "mf_row_mu", "mf_target_velocity", "mf_row_restitution")
     for shared, friction_shared, patched in ((0, 0, 0), (1, 0, 0), (0, 1, 1)):
         with test.subTest(shared_anchor=shared, friction_shared_anchor=friction_shared, patches=patched):
             patches = _patches(rng, contacts, device, patched)
@@ -596,8 +596,8 @@ def test_free_body_jacobian_matches_mf_contact_rows(test, device):
                 "friction_patches": patches,
             }
             buffers = lambda: {  # noqa: E731
-                "mf_J_a": np.zeros((1, rows, 6), dtype=np.float32),
-                "mf_J_b": np.zeros((1, rows, 6), dtype=np.float32),
+                "mf_Z_a": np.zeros((1, rows, 6), dtype=np.float32),
+                "mf_Z_b": np.zeros((1, rows, 6), dtype=np.float32),
                 "mf_phi": np.zeros((1, rows), dtype=np.float32),
                 "mf_row_mu": np.zeros((1, rows), dtype=np.float32),
                 "mf_target_velocity": np.zeros((1, rows), dtype=np.float32),
@@ -622,7 +622,7 @@ def test_free_body_jacobian_matches_mf_contact_rows(test, device):
             )
             law = call(_law_mf_jacobian, (contacts, 3), device, **common, **flags, **buffers())
             length, speed = _term_scales(scene, patches)
-            magnitudes = {"mf_J_a": 1.0 + length, "mf_J_b": 1.0 + length, "mf_phi": length, "mf_target_velocity": speed}
+            magnitudes = {"mf_Z_a": 1.0 + length, "mf_Z_b": 1.0 + length, "mf_phi": length, "mf_target_velocity": speed}
             for name in outputs:
                 assert_reproduces(
                     test,

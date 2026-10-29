@@ -119,9 +119,9 @@ UNIT_FIELDS = FieldGroup(
 )
 """The units and colors of each slot's world (``unit`` capacity: the free-body row capacity; ``color``: one more)."""
 
-SLOT_ENTRIES = 72
-"""Entries a color slot stages per unit: for each of its (up to three) rows ``r``, the six ``J_a``, ``J_b``,
-``MiJt_a`` and ``MiJt_b`` entries, at ``r * 24 + array * 6 + k`` (``array`` in that order)."""
+SLOT_ENTRIES = 36
+"""Entries a color slot stages per unit: for each of its (up to three) rows ``r``, the six ``Z_a`` and ``Z_b``
+entries, at ``r * 12 + side * 6 + k``."""
 
 SLOT_MU, SLOT_WEIGHT = SLOT_ENTRIES, SLOT_ENTRIES + 1
 """The slot's scalars after its entries: the friction coefficient of its first tangent and its normal row's
@@ -162,10 +162,8 @@ def stage_slots(
     unit_count: wp.array[wp.int32],
     color_slot: wp.array3d[wp.int32],
     mf_meta: wp.array2d[wp.int32],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
+    mf_Z_a: wp.array3d[float],
+    mf_Z_b: wp.array3d[float],
     mf_row_mu: wp.array2d[float],
     mf_row_w: wp.array2d[float],
     slot_data: wp.array3d[float],
@@ -182,10 +180,8 @@ def stage_slots(
     for r in range(3):
         if r < rows:
             for k in range(6):
-                slot_data[slot, r * 24 + k, p] = mf_J_a[world, row + r, k]
-                slot_data[slot, r * 24 + 6 + k, p] = mf_J_b[world, row + r, k]
-                slot_data[slot, r * 24 + 12 + k, p] = mf_MiJt_a[world, row + r, k]
-                slot_data[slot, r * 24 + 18 + k, p] = mf_MiJt_b[world, row + r, k]
+                slot_data[slot, r * 12 + k, p] = mf_Z_a[world, row + r, k]
+                slot_data[slot, r * 12 + 6 + k, p] = mf_Z_b[world, row + r, k]
             slot_words[slot, r * 3, p] = mf_meta[world, (row + r) * 4 + 1]
             slot_words[slot, r * 3 + 1, p] = mf_meta[world, (row + r) * 4 + 2]
             slot_words[slot, r * 3 + 2, p] = mf_meta[world, (row + r) * 4 + 3]
@@ -539,10 +535,8 @@ class ColoredUnits:
         mf_constraint_count,
         mf_contact_rows_end,
         mf_meta,
-        mf_J_a,
-        mf_J_b,
-        mf_MiJt_a,
-        mf_MiJt_b,
+        mf_Z_a,
+        mf_Z_b,
         mf_row_mu,
         mf_row_w,
     ) -> None:
@@ -565,10 +559,8 @@ class ColoredUnits:
                 units["unit_count"],
                 units["color_slot"],
                 mf_meta,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
+                mf_Z_a,
+                mf_Z_b,
                 mf_row_mu,
                 mf_row_w,
             ],

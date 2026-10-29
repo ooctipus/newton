@@ -24,7 +24,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import MfRows
-from newton._src.solvers.feather_pgs.kernels import compute_mf_rhs_bias
+from newton._src.solvers.feather_pgs.kernels import BodyFactors, compute_mf_rhs_bias
+from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 SIM_DT = 1.0 / 2000.0
@@ -175,8 +176,12 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     position_impulse = float(lam[contact_rows].max()) if contact_rows.size else 0.0
     max_phi = float(phi[contact_rows].max()) if contact_rows.size else 0.0
     v_position = solver._debug_position_v_out.numpy()
-    J_a = solver._debug_position_mf_J_a.numpy()[0]
-    J_b = solver._debug_position_mf_J_b.numpy()[0]
+    J_a, J_b = (
+        J[0]
+        for J in free_body_jacobians(
+            solver, solver._debug_position_mf_Z_a.numpy(), solver._debug_position_mf_Z_b.numpy()
+        )
+    )
     dof_a = solver._debug_position_mf_dof_a.numpy()[0]
     dof_b = solver._debug_position_mf_dof_b.numpy()[0]
     world_dofs = solver.world_dof_indices.numpy()[0]
@@ -203,7 +208,6 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     dof_b = wp.array([[-1]], dtype=wp.int32, device=device)
     J_a = wp.array([[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]], dtype=wp.float32, device=device)
     J_b = wp.zeros((1, 1, 6), dtype=wp.float32, device=device)
-    world_dofs = wp.array([[0, 1, 2, 3, 4, 5]], dtype=wp.int32, device=device)
     phi = wp.array([[1.0]], dtype=wp.float32, device=device)
     row_type = wp.array([[0]], dtype=wp.int32, device=device)
     target_velocity = wp.zeros((1, 1), dtype=wp.float32, device=device)
@@ -211,6 +215,13 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
     max_depenetration_velocity = wp.array([float("inf")], dtype=wp.float32, device=device)
     position_velocity = wp.zeros((6,), dtype=wp.float32, device=device)
     rhs = wp.zeros((1, 1), dtype=wp.float32, device=device)
+    # The body's unit factor: its whitened row is its Jacobian and its factor coordinates its velocity.
+    factors = BodyFactors()
+    factors.body_to_articulation = wp.array([0], dtype=wp.int32, device=device)
+    factors.factor_index = wp.array([0], dtype=wp.int32, device=device)
+    factors.dof_start = wp.array([0], dtype=wp.int32, device=device)
+    factors.dof_factor = wp.array([0, -1, -1, -1, -1, -1], dtype=wp.int32, device=device)
+    factors.L = wp.array(np.eye(6, dtype=np.float32)[None], dtype=wp.float32, device=device)
 
     def classify(normal_velocity, target=0.0, has_target=0):
         position_velocity.assign(np.array([normal_velocity, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32))
@@ -222,12 +233,13 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
             body_b=body_b,
             dof_a=dof_a,
             dof_b=dof_b,
-            J_a=J_a,
-            J_b=J_b,
+            Z_a=J_a,
+            Z_b=J_b,
             phi=phi,
             row_type=row_type,
             target=target_velocity,
             restitution=row_restitution,
+            incident=row_restitution,
             rhs=rhs,
         )
         wp.launch(
@@ -236,14 +248,13 @@ def test_rhs_classifies_exact_end_gap_without_impulse(test, device):
             inputs=[
                 rows,
                 count,
+                factors,
                 has_target,
-                world_dofs,
                 max_depenetration_velocity,
                 0.2,
                 0.5,
                 0.0,
                 0.0,
-                position_velocity,
                 position_velocity,
                 1,
                 0,

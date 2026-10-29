@@ -15,6 +15,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import paired_components as components
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
 
 
 def pack_endpoints(a, b):
@@ -51,7 +52,7 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
         "mf_mu": np.full((worlds, mf_capacity), 0.4, np.float32),
     }
     host["L"][:, np.arange(23), np.arange(23)] += 1.7
-    for name in ("mf_J_a", "mf_J_b", "mf_MiJt_a", "mf_MiJt_b"):
+    for name in ("mf_Z_a", "mf_Z_b"):
         host[name] = floats((worlds, mf_capacity, 6))
     for world in range(worlds):
         offset, secondary = host["primary_offset"][world], host["secondary_offset"][world]
@@ -73,8 +74,8 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
                 pack_endpoints(parent, kind),
             ]
             side = "a" if endpoint_a >= 0 else "b"
-            host[f"mf_J_{side}"][world, row] = rng.normal(0, 0.2, 6)
-            host[f"mf_MiJt_{side}"][world, row] = host[f"mf_J_{side}"][world, row] * 0.7
+            # Whitened by the body's factor L = I / sqrt(0.7) (the solve fixture's secondary factor): Z = sqrt(0.7) J.
+            host[f"mf_Z_{side}"][world, row] = rng.normal(0, 0.2, 6) * np.sqrt(0.7)
     return host
 
 
@@ -179,12 +180,18 @@ def solve_fixture(device):
         ("factor_rows", "Y"),
         ("mf_row_mu", "mf_mu"),
         ("mf_meta", "mf_meta"),
-        ("mf_J_a", "mf_J_a"),
-        ("mf_J_b", "mf_J_b"),
-        ("mf_MiJt_a", "mf_MiJt_a"),
-        ("mf_MiJt_b", "mf_MiJt_b"),
+        ("mf_Z_a", "mf_Z_a"),
+        ("mf_Z_b", "mf_Z_b"),
     ):
         arrays[target] = getattr(data, field)
+    # Each world's free body holds the secondary factor of its world; its first global coordinate maps to it.
+    factors = BodyFactors()
+    dof_factor = np.full(145, -1, np.int32)
+    for world in range(5):
+        dof_factor[world * 29 + host["secondary_offset"][world]] = world
+    factors.dof_factor = array(dof_factor)
+    factors.L = arrays["secondary_L"]
+    arrays["factors"] = factors
     for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
         arrays[f"world_drive_{name}"] = array(np.zeros((1, 1), np.float32))
     return data, arrays

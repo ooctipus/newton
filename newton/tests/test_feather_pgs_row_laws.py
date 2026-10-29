@@ -163,8 +163,8 @@ def _mf_layout(rng, worlds, rows):
     return {
         "mf_body_a": body_a,
         "mf_body_b": body_b,
-        "mf_J_a": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
-        "mf_J_b": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
+        "mf_Z_a": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
+        "mf_Z_b": rng.normal(size=(worlds, rows, 6)).astype(np.float32),
         "body_to_articulation": np.arange(bodies, dtype=np.int32),
         "articulation_dof_start": (6 * np.arange(bodies)).astype(np.int32),
         "incident_velocity": rng.normal(size=6 * bodies).astype(np.float32),
@@ -172,6 +172,22 @@ def _mf_layout(rng, worlds, rows):
             np.array([0.5, 2.0, 0.0, np.inf, 1.0e30, 0.05], dtype=np.float32), bodies
         ),
     }
+
+
+def _body_factors(rng, bodies, device, *, identity=False):
+    """Each body's factor of an SPD 6x6 mass matrix (``L_by_size[6]``, one per body), its articulation the body."""
+    if identity:
+        lower = np.tile(np.eye(6), (bodies, 1, 1))
+    else:
+        a = rng.normal(size=(bodies, 6, 6))
+        lower = np.linalg.cholesky(a @ np.transpose(a, (0, 2, 1)) + 6.0 * np.eye(6))
+    factors = kernels.BodyFactors()
+    factors.body_to_articulation = wp.array(np.arange(bodies, dtype=np.int32), device=device)
+    factors.factor_index = wp.array(np.arange(bodies, dtype=np.int32), device=device)
+    factors.dof_start = wp.array((6 * np.arange(bodies)).astype(np.int32), device=device)
+    factors.dof_factor = wp.array(np.full(6 * bodies, -1, dtype=np.int32), device=device)
+    factors.L = wp.array(lower.astype(np.float32), dtype=float, device=device)
+    return factors, lower.astype(np.float32).astype(np.float64)
 
 
 @wp.kernel
@@ -263,18 +279,17 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         "contact_speculative_scale": 0.9,
         "restitution_velocity_threshold": 0.2,
     }
-    hinv = np.tile(np.eye(6, dtype=np.float32), (2 * worlds, 1, 1))
+    factors, lower = _body_factors(rng, 2 * worlds, device)
     out = call(
         response_builds_rows.free_body_rows_kernel,
         worlds * rows,
         device,
         mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        mf_body_Hinv=hinv,
+        factors=factors,
         pgs_cfm=1.0e-6,
         mf_max_constraints=rows,
         mf_eff_mass_inv=np.zeros((worlds, rows), dtype=np.float32),
-        mf_MiJt_a=np.zeros((worlds, rows, 6), dtype=np.float32),
-        mf_MiJt_b=np.zeros((worlds, rows, 6), dtype=np.float32),
+        mf_row_incident=np.zeros((worlds, rows), dtype=np.float32),
         mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
         mf_row_w=np.ones((worlds, rows), dtype=np.float32),
         **shared,
@@ -285,8 +300,21 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         device,
         rhs=np.zeros((worlds, rows), dtype=np.float32),
         row_w=np.zeros((worlds, rows), dtype=np.float32),
+        mf_J_a=shared["mf_Z_a"],
+        mf_J_b=shared["mf_Z_b"],
         **shared,
     )
+    # The whitened rows: Z = L^-1 J^T per body (a speed row keeps its axis), and A_ii = cfm + J H^-1 J^T.
+    Z = {side: out[f"mf_Z_{side}"].numpy().astype(np.float64) for side in "ab"}
+    diagonal = np.full((worlds, rows), 1.0e-6)
+    for side, bodies in (("a", layout["mf_body_a"]), ("b", layout["mf_body_b"])):
+        J = shared[f"mf_Z_{side}"].astype(np.float64)
+        for world, row in zip(*np.nonzero(bodies >= 0), strict=True):
+            factor = lower[bodies[world, row]]
+            expected = J[world, row] if kind[world, row] == 4 else np.linalg.solve(factor, J[world, row])
+            np.testing.assert_allclose(Z[side][world, row], expected, rtol=1e-5, atol=1e-5)
+            diagonal[world, row] += J[world, row] @ np.linalg.solve(factor @ factor.T, J[world, row])
+    np.testing.assert_allclose(out["mf_eff_mass_inv"].numpy(), 1.0 / diagonal, rtol=1e-5)
     reference_rhs, law_rhs = out["mf_rhs"].numpy(), law["rhs"].numpy()
     np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())
     magnitude = np.abs(phi) * 60.0 + np.abs(target)
@@ -297,6 +325,28 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.
     untouched = (kind == 4).ravel()
     test.assertFalse(mismatches(reference_rhs.ravel()[untouched, None], law_rhs.ravel()[untouched, None]).any())
+
+
+@wp.func
+def _row_dot(
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
+    dof_a: int,
+    dof_b: int,
+    world_dof_indices: wp.array2d[int],
+    velocity: wp.array[float],
+    world: int,
+    i: int,
+):
+    """``J v`` of one free-body row over a global velocity: body ``a``'s six products, then ``b``'s, from zero."""
+    out = float(0.0)
+    if dof_a >= 0:
+        for k in range(6):
+            out += mf_J_a[world, i, k] * velocity[world_dof_indices[world, dof_a + k]]
+    if dof_b >= 0:
+        for k in range(6):
+            out += mf_J_b[world, i, k] * velocity[world_dof_indices[world, dof_b + k]]
+    return out
 
 
 @wp.kernel
@@ -323,6 +373,7 @@ def _law_mf_pass_rhs(
     apply_restitution: int,
     restitution_velocity_threshold: float,
     rhs: wp.array2d[float],
+    incident: wp.array2d[float],
 ):
     world, i = wp.tid()
     target = mf_target_velocity[world, i]
@@ -333,7 +384,7 @@ def _law_mf_pass_rhs(
     if kind == row_laws.ROW_CONTACT:
         end_gap = float(0.0)
         if preserve_unreached_speculative != 0 and phi > 0.0:
-            jv = kernels.mf_contact_row_dot(
+            jv = _row_dot(
                 mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, position_velocity, world, i
             )
             end_gap = phi + dt * (jv - target)
@@ -347,9 +398,10 @@ def _law_mf_pass_rhs(
         if apply_restitution != 0:
             restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
-            relative_incident = kernels.mf_contact_row_dot(
+            relative_incident = _row_dot(
                 mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, incident_velocity, world, i
             )
+            incident[world, i] = relative_incident
             relative_incident -= target
             fires, bounce = row_laws.contact_restitution_rhs(
                 phi, relative_incident, target, restitution, dt, restitution_velocity_threshold
@@ -383,8 +435,8 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
         "mf_body_b": layout["mf_body_b"],
         "mf_dof_a": dof_a,
         "mf_dof_b": dof_b,
-        "mf_J_a": layout["mf_J_a"],
-        "mf_J_b": layout["mf_J_b"],
+        "mf_J_a": layout["mf_Z_a"],
+        "mf_J_b": layout["mf_Z_b"],
         "world_dof_indices": indices,
         "mf_phi": phi,
         "mf_row_type": kind,
@@ -398,8 +450,10 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
         "restitution_velocity_threshold": 0.1,
     }
     incident = np.abs(common["incident_velocity"]).reshape(worlds, 12)
-    incident_terms = np.where(dof_a >= 0, (np.abs(layout["mf_J_a"]) * incident[:, None, :6]).sum(axis=2), 0.0)
-    incident_terms += np.where(dof_b >= 0, (np.abs(layout["mf_J_b"]) * incident[:, None, 6:]).sum(axis=2), 0.0)
+    incident_terms = np.where(dof_a >= 0, (np.abs(layout["mf_Z_a"]) * incident[:, None, :6]).sum(axis=2), 0.0)
+    incident_terms += np.where(dof_b >= 0, (np.abs(layout["mf_Z_b"]) * incident[:, None, 6:]).sum(axis=2), 0.0)
+    # Body 2w at world coordinates [0, 6), body 2w + 1 at [6, 12): identity factors keep Z = J and u = v.
+    factors, _lower = _body_factors(rng, 2 * worlds, device, identity=True)
     for bias_scale, speculative, preserve, restitution in ((1.0, 0.8, 0, 1), (0.0, 0.0, 1, 1), (0.5, 1.0, 1, 0)):
         with test.subTest(bias_scale=bias_scale, preserve=preserve, restitution=restitution):
             settings = {
@@ -408,6 +462,15 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
                 "preserve_unreached_speculative": preserve,
                 "apply_restitution": restitution,
             }
+            law = call(
+                _law_mf_pass_rhs,
+                (worlds, rows),
+                device,
+                rhs=np.zeros((worlds, rows), dtype=np.float32),
+                incident=np.zeros((worlds, rows), dtype=np.float32),
+                **common,
+                **settings,
+            )
             out = call(
                 kernels.compute_mf_rhs_bias,
                 worlds * rows,
@@ -416,14 +479,10 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
                 has_target_velocity=1,
                 mf_max_constraints=rows,
                 mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
-                **common,
-                **settings,
-            )
-            law = call(
-                _law_mf_pass_rhs,
-                (worlds, rows),
-                device,
-                rhs=np.zeros((worlds, rows), dtype=np.float32),
+                mf_Z_a=common["mf_J_a"],
+                mf_Z_b=common["mf_J_b"],
+                mf_row_incident=law["incident"],
+                factors=factors,
                 **common,
                 **settings,
             )

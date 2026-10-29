@@ -26,6 +26,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 
 # Per route: constraint count, row type, parent, mu, right-hand side, impulse, phi and
 # target arrays. Route 1 (matrix-free rows) folds its target into the right-hand side.
@@ -62,7 +63,8 @@ def route_arrays(solver, route=0):
 def _jacobian(solver, route, world, count):
     """Physical row Jacobians in world coordinates (route 0) or body-space pairs (route 1)."""
     if route == 1:
-        return np.concatenate([solver.mf_J_a.numpy()[world, :count], solver.mf_J_b.numpy()[world, :count]], axis=1)
+        J_a, J_b = free_body_jacobians(solver)
+        return np.concatenate([J_a[world, :count], J_b[world, :count]], axis=1)
     if solver._sparse_mass_matrix_size is not None:
         from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 

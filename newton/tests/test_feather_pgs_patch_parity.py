@@ -86,7 +86,18 @@ def _ring_pool_dropped(solver):
         yield
 
 
-_MF_ROWS = ("mf_row_type", "mf_row_parent", "mf_row_mu", "mf_rhs", "mf_impulses", "mf_phi", "mf_J_a", "mf_J_b")
+_MF_ROWS = (
+    "mf_row_type",
+    "mf_row_parent",
+    "mf_row_mu",
+    "mf_rhs",
+    "mf_impulses",
+    "mf_phi",
+    "mf_Z_a",
+    "mf_Z_b",
+    "mf_body_a",
+    "mf_body_b",
+)
 
 
 def _permuted_slots(solver, contacts, shift):
@@ -125,6 +136,10 @@ def _permuted_slots(solver, contacts, shift):
         _friction_patches=solver._friction_patches,
         _sparse_mass_matrix_size=None,
         pgs_mode=solver.pgs_mode,
+        # The bodies' factors, which whitened the rows.
+        L_by_size=solver.L_by_size,
+        body_to_articulation=solver.body_to_articulation,
+        art_group_idx=solver.art_group_idx,
     )
     return stand_in
 

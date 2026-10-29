@@ -906,7 +906,7 @@ def fused_clamp_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "        
 
 def speed_rows_pass(rows: FreeBodyRows, op, laws: RowLaws, *, pad: str = "            ") -> str:
     """Free-body speed rows (``[mf_contact_end, m_mf)``) after every other row: each bounds the magnitude of its
-    body's linear (``J = e_0``) or angular (``J = e_3``) velocity, along that velocity."""
+    body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`)."""
     lanes = rows.lanes
     lines = [
         "for (int i = mf_contact_end; i < m_mf; i++) {",
@@ -920,8 +920,7 @@ def speed_rows_pass(rows: FreeBodyRows, op, laws: RowLaws, *, pad: str = "      
         "    float mf_diag = __int_as_float(meta.y);",
         "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
         "",
-        f"    int row_mf6 = {op.base} + i * 6;",
-        f"    const int speed_dof = dof_a + ({op.J_a}.data[row_mf6 + 3] != 0.0f ? 3 : 0);",
+        f"    const int speed_axis = {op.Z_a}.data[{op.base} + i * 6 + 3] != 0.0f ? 3 : 0;",
         speed_row(
             op,
             laws,
@@ -946,18 +945,20 @@ def speed_row(
     lanes: Lanes,
     rhs: str,
     inverse: str,
-    first: str = "speed_dof",
+    body: str = "dof_a",
+    axis: str = "speed_axis",
     pad: str = "    ",
 ) -> str:
-    """The update of a free-body speed row on its body's velocity coordinates ``[first, first + 3)``.
+    """The update of a free-body speed row on its body's velocity coordinates ``[axis, axis + 3)``.
 
-    The speed is the coordinates' magnitude in the operator's layout (:meth:`.FreeBody6.speed`); the row's law
-    (:func:`.projection_laws.speed_row`) gives its stored value (``store`` stores ``speed_row[0]``, the row's
-    impulse ``load`` under the accumulated law) and the scale that pushes the velocity back along itself.
-    ``inverse`` is the row's stored inverse diagonal.
+    The body's coordinates from ``body`` hold its factor coordinates; the speed is the magnitude of its physical
+    velocity there (:meth:`.FreeBodyZ.speed`). The row's law (:func:`.projection_laws.speed_row`) gives its stored
+    value (``store`` stores ``speed_row[0]``, the row's impulse ``load`` under the accumulated law) and the scale that
+    pushes the velocity back along itself (:meth:`.FreeBodyZ.scale_speed`). ``inverse`` is the row's stored inverse
+    diagonal.
     """
     accumulated = laws.accumulated
-    lines = [op.speed("speed_mf_vlim", first, pad)]
+    lines = [op.speed("speed_mf_vlim", body, axis, pad)]
     if accumulated:
         lines.append(f"{pad}const float old_mf_vlim = {load};")
     lines.append(
@@ -971,7 +972,7 @@ def speed_row(
         "",
         f"{pad}if (speed_row[2] != 0.0f) {{",
         change_vote(laws, (("speed_row[1]", f"1.0f / {inverse}", str(VELOCITY_LIMIT)),), pad + "    "),
-        op.scale_speed("speed_row[2]", first, pad + "    "),
+        op.scale_speed("speed_row[2]", body, axis, pad + "    "),
         f"{pad}}}",
     ]
     if lanes.sync():

@@ -14,6 +14,7 @@ import newton
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
@@ -79,10 +80,9 @@ class TestFeatherPGSIncremental(unittest.TestCase):
             "mf_contact_rows_end": zero_int,
             "mf_meta": array([[0]], wp.int32),
             "mf_impulses": zero_float,
-            "mf_J_a": zero_spatial,
-            "mf_J_b": zero_spatial,
-            "mf_MiJt_a": zero_spatial,
-            "mf_MiJt_b": zero_spatial,
+            "mf_Z_a": zero_spatial,
+            "mf_Z_b": zero_spatial,
+            "factors": BodyFactors(),
             "mf_row_mu": zero_float,
             "mf_row_w": zero_float,
             "regularize": 1,

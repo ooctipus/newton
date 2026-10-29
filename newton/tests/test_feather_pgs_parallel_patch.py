@@ -1352,9 +1352,11 @@ class TestTierSweeps(unittest.TestCase):
 
 
 def _dummy(arg):
-    """A one-element stand-in for an input the kernel variant never reads."""
+    """A stand-in for an input the kernel variant never reads: a one-element array, an empty struct or zero."""
     if wp.types.is_array(arg.type):
         return wp.zeros((1,) * arg.type.ndim, dtype=arg.type.dtype)
+    if wp.types.type_is_struct(arg.type):
+        return arg.type()
     return arg.type(0)
 
 

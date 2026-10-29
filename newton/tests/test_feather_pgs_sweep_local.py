@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.response_operator import (
     CholeskySolve,
     FactorComponent,
     FactorRows,
-    FreeBody6,
+    FreeBodyZ,
     Lanes,
     LocalBlock,
 )
@@ -184,10 +184,10 @@ class TestResponseOperators(unittest.TestCase):
         self.assertNotIn("1.0f / factor", CholeskySolve(3, "s_L").stage(lambda i: f"L[{i}]", "lane", 32))
 
     def test_local_block_views_and_packed_entries(self):
-        block = LocalBlock(15, (CholeskySolve(9, "s_L"), CholeskySolve(6, "s_S")), Lanes(32), free=FreeBody6(Lanes(32)))
+        block = LocalBlock(15, (CholeskySolve(9, "s_L"), CholeskySolve(6, "s_S")), Lanes(32), free=FreeBodyZ(Lanes(32)))
         self.assertEqual(block.rows, "row_count + mf_count")
         self.assertEqual(block.residual("jv", ""), "float jv = s_res[i];")
-        free = LocalBlock(15, block.factors, Lanes(32), free=FreeBody6(Lanes(32)), first="row_count")
+        free = LocalBlock(15, block.factors, Lanes(32), free=FreeBodyZ(Lanes(32)), first="row_count")
         self.assertEqual(free.residual("jv", ""), "float jv = s_res[row_count + i];")
         coupling = free.coupling("cross", "i", "sib", "")
         self.assertIn("(row_count + sib) > (row_count + i)", coupling)

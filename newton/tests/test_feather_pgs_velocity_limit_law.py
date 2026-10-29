@@ -32,6 +32,7 @@ import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 
@@ -412,10 +413,9 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
         "mf_contact_rows_end": zero_int,
         "mf_meta": array([[0]], wp.int32),
         "mf_impulses": zero_float,
-        "mf_J_a": zero_spatial,
-        "mf_J_b": zero_spatial,
-        "mf_MiJt_a": zero_spatial,
-        "mf_MiJt_b": zero_spatial,
+        "mf_Z_a": zero_spatial,
+        "mf_Z_b": zero_spatial,
+        "factors": BodyFactors(),
         "mf_row_mu": zero_float,
         "mf_row_w": zero_float,
         "iterations": iterations,

@@ -248,7 +248,8 @@ def _free_body_rows(run):
     solver = run.solver
     count = solver.mf_constraint_count.numpy()
     rows = int(count.max())
-    jacobian = solver.mf_J_a.numpy()[:, :rows]
+    # A speed row keeps its axis unwhitened.
+    jacobian = solver.mf_Z_a.numpy()[:, :rows]
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,

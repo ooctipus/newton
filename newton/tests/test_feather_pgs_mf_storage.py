@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    BodyFactors,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
@@ -225,8 +226,9 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
     def test_storage_boundary_and_remaining_state(self):
         """Include tile storage and reject an unrepresentable velocity working set."""
-        # Four streamed metadata arrays leave velocities and two impulse arrays.
-        required = 128 + 4 * (29 + 1024 + 4096)
+        # Four streamed metadata arrays leave velocities, two impulse arrays and the free bodies' two one-word
+        # bitmaps and flag.
+        required = 128 + 4 * (29 + 1024 + 4096) + 4 * (2 * 1 + 1)
         self.assertEqual(_storage((1024, 4096, 29), required)[:2], (False, False))
         self.assertEqual(_storage((1024, 4096, 29), required - 1)[:2], (False, True))
         with self.assertRaisesRegex(ValueError, "MF-GS.*shared memory"):
@@ -261,11 +263,12 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
         large = (2304, 2304, 75)
         # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses, the packed row
-        # metadata and the dense rows' support (3 words of 75 coordinates: 2 * 3 + 1 entries) take
-        # 128 + 4 * (75 + 3 * 2304) + 4 * (2 * 3 + 1) = 28104 bytes; the float metadata streams.
+        # metadata, the dense rows' support (3 words of 75 coordinates: 2 * 3 + 1 entries) and the free bodies'
+        # bitmaps (as many) take 128 + 4 * (75 + 3 * 2304) + 2 * 4 * (2 * 3 + 1) = 28132 bytes; the float metadata
+        # streams.
         storage = select(large, 100352, 128)
         self.assertEqual(storage[:3], (False, False, True))
-        self.assertIn("28104 <= 49152 bytes", storage.reason)
+        self.assertIn("28132 <= 49152 bytes", storage.reason)
         self.assertEqual(select(large, 231424, 128)[:3], (False, False, True))
         # A grid of one block per SM is the largest that cannot lose concurrency to the extra bytes.
         self.assertTrue(select(large, 100352, 188).resident_row_metadata)
@@ -274,26 +277,26 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 storage = select(large, 100352, blocks)
                 self.assertEqual(storage[:3], (False, False, False))
                 self.assertIn(f"{blocks}-block grid exceeds one block per SM (188 SMs)", storage.reason)
-        # 48 KiB of static shared memory: 128 + 4 * (5027 + 2 * 2304 + 2304) + 4 * (2 * 158 + 1) bytes (the
-        # support's 158 words) is exactly the budget.
-        self.assertTrue(select((2304, 2304, 5027), 100352, 128).resident_row_metadata)
-        storage = select((2304, 2304, 5028), 100352, 128)
+        # 48 KiB of static shared memory: 128 + 4 * (4746 + 2 * 2304 + 2304) + 2 * 4 * (2 * 149 + 1) bytes (the
+        # support's and the free bodies' 149 words) is exactly the budget.
+        self.assertTrue(select((2304, 2304, 4746), 100352, 128).resident_row_metadata)
+        storage = select((2304, 2304, 4747), 100352, 128)
         self.assertFalse(storage.resident_row_metadata)
         self.assertIn("49156 bytes of static shared memory, over the 49152-byte budget", storage.reason)
         # A device that exposes less than 48 KiB sets the budget.
-        self.assertTrue(select(large, 28104, 128).resident_row_metadata)
-        self.assertFalse(select(large, 28103, 128).resident_row_metadata)
-        # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) + 4 * (2 * 49 + 1) = 8776 bytes.
+        self.assertTrue(select(large, 28132, 128).resident_row_metadata)
+        self.assertFalse(select(large, 28131, 128).resident_row_metadata)
+        # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) + 2 * 4 * (2 * 49 + 1) = 9172 bytes.
         storage = select((256, 37248, 1551), 100352, 32)
         self.assertEqual(storage[:3], (False, True, True))
-        self.assertIn("8776 <= 49152", storage.reason)
-        # Resident MF impulses do not: 22528 of them hold the block at 98888 bytes.
+        self.assertIn("9172 <= 49152", storage.reason)
+        # Resident MF impulses do not: 22528 of them hold the block at 99284 bytes.
         self.assertEqual(select((256, 22528, 1551), 100352, 32)[:3], (False, False, False))
         # Streaming them on request takes their bytes out of the block before the budget is checked.
         storage = select((256, 22528, 1551), 100352, 32, force_stream_mf_impulses=True)
         self.assertEqual(storage[:3], (False, True, True))
         self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", storage.reason)
-        self.assertIn("8776 <= 49152", storage.reason)
+        self.assertIn("9172 <= 49152", storage.reason)
         # The request changes nothing where capacity streams them already, or where nothing is resident to free.
         for shape, blocks in (((256, 37248, 1551), 32), ((2304, 2304, 75), 16384)):
             with self.subTest(shape=shape, blocks=blocks):
@@ -461,7 +464,8 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
             kernel = sweep_routes.mf_gs_kernel(16, 4096, 128, "cpu", fuse_vel_limits=fused)
             source = max(_native_snippets(kernel), key=len)
             self.assertIn("int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;", source)
-            self.assertEqual(source.count("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"), 2)
+            # The impulses' staging and store, and the flags of the bodies in factor coordinates.
+            self.assertEqual(source.count("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"), 3)
             guard = "if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"
             if fused:
                 self.assertNotIn(guard, source)
@@ -505,10 +509,8 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
         "mf_constraint_count": np.zeros(w_count, np.int32),
         "mf_meta": np.zeros((w_count, 4 * mf_capacity), np.int32),
         "mf_impulses": np.zeros((w_count, mf_capacity), np.float32),
-        "mf_J_a": np.zeros((w_count, mf_capacity, 6), np.float32),
-        "mf_J_b": np.zeros((w_count, mf_capacity, 6), np.float32),
-        "mf_MiJt_a": np.zeros((w_count, mf_capacity, 6), np.float32),
-        "mf_MiJt_b": np.zeros((w_count, mf_capacity, 6), np.float32),
+        "mf_Z_a": np.zeros((w_count, mf_capacity, 6), np.float32),
+        "mf_Z_b": np.zeros((w_count, mf_capacity, 6), np.float32),
         "mf_row_mu": np.zeros((w_count, mf_capacity), np.float32),
         "mf_row_w": rng.uniform(0.6, 1.0, (w_count, mf_capacity)).astype(np.float32),
         "v_out": rng.normal(0.0, 0.3, w_count * dofs).astype(np.float32),
@@ -607,8 +609,7 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
                 np.float32(rhs).view(np.int32),
                 pack_endpoints(parent, mf_types[r]),
             )
-            host["mf_J_a"][w, r] = rng.normal(0.0, 0.3, 6)
-            host["mf_MiJt_a"][w, r] = host["mf_J_a"][w, r] * rng.uniform(0.5, 1.5)
+            host["mf_Z_a"][w, r] = rng.normal(0.0, 0.3, 6) * rng.uniform(0.7, 1.2)
         host["mf_impulses"][w, :row] = np.where(rng.random(row) < 0.3, rng.uniform(0.0, 0.1, row), 0.0)
         host["mf_constraint_count"][w] = row
     host["mf_contact_rows_end"] = host["mf_constraint_count"].copy()
@@ -631,8 +632,28 @@ def _bind_rows(host, device):
         local_solve_owner=array(np.zeros(worlds, np.int32)),
         world_torsion_group=array(np.full((1, 1), -1, np.int32)),
         contact_torsion_radius=0.0,
+        factors=_body_factors(host, device),
     )
     return values
+
+
+def _body_factors(host, device):
+    """Each world's free bodies' factors (a scaled identity per body) and their first global coordinates."""
+    indices = host["world_dof_indices"]
+    dof_factor = np.full(indices.size, -1, np.int32)
+    lower = []
+    for world, count in enumerate(host["mf_constraint_count"]):
+        for row in range(count):
+            packed = int(host["mf_meta"][world, 4 * row])
+            for half in (packed >> 16, ((packed << 16) & 0xFFFFFFFF) >> 16):
+                first = half - 65536 if half >= 32768 else half
+                if first >= 0 and dof_factor[indices[world, first]] < 0:
+                    dof_factor[indices[world, first]] = len(lower)
+                    lower.append(np.eye(6) * (0.8 + 0.1 * (len(lower) % 5)))
+    factors = BodyFactors()
+    factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
+    factors.L = wp.array(np.array(lower or [np.eye(6)], np.float32), dtype=wp.float32, device=device)
+    return factors
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")
@@ -871,14 +892,18 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             with mock.patch.dict(os.environ, {"FEATHER_PGS_MFGS_STREAM_LAMBDA": request}):
                 solvers[request] = fpgs.SolverFeatherPGS(model, **options)
         dofs = solvers["0"].max_world_dofs
-        if 128 + 4 * (dofs + 320 + 12288) > device.max_shared_memory_per_block:
+        # The free bodies' coordinate bitmaps (sweep_routes.FreeBodyCoordinates): two words a 32 coordinates, one flag.
+        bitmaps = 2 * ((dofs + 31) // 32) + 1
+        if 128 + 4 * (dofs + bitmaps + 320 + 12288) > device.max_shared_memory_per_block:
             self.skipTest("The device streams these MF impulses by capacity")
         records = {request: solver.get_path_selection()["routes"]["sweep"] for request, solver in solvers.items()}
         self.assertEqual(
             (records["0"]["mf_gs_storage"]["mf_impulses"], records["0"]["mf_gs_storage"]["row_types_and_parents"]),
             ("resident", "streamed"),
         )
-        self.assertIn(f"declare {128 + 4 * (dofs + 2 * 320 + 12288)} bytes", records["0"]["mf_gs_storage"]["reason"])
+        self.assertIn(
+            f"declare {128 + 4 * (dofs + bitmaps + 2 * 320 + 12288)} bytes", records["0"]["mf_gs_storage"]["reason"]
+        )
         self.assertNotIn("_smeta", records["0"]["mf_gs"])
         self.assertNotIn("_glambda", records["0"]["mf_gs"])
         self.assertEqual(
@@ -887,7 +912,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         )
         reason = records["1"]["mf_gs_storage"]["reason"]
         self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", reason)
-        self.assertIn(f"declares {128 + 4 * (dofs + 2 * 320)} <= 49152 bytes", reason)
+        self.assertIn(f"declares {128 + 4 * (dofs + bitmaps + 2 * 320)} <= 49152 bytes", reason)
         self.assertIn("_gmeta_smeta_glambda", records["1"]["mf_gs"])
 
     def test_streamed_impulses_match_resident_with_friction_and_limits(self):

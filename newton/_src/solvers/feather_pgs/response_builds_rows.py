@@ -7,10 +7,10 @@ A :class:`.response_operator.ResponseOperator` owns the arithmetic a sweep runs 
 forms that response from the row's Jacobian and the mass operator, and its *publication* turns the impulses a solve
 applied into velocities outside the sweeps. This module holds the builds and publications of four representations:
 
-- :class:`.response_operator.FreeBody6` (rows over at most two free bodies): each body's ``H^-1`` (the Schur inverse
-  of its spatial inertia), each row's ``MiJt = H^-1 J^T`` per body and ``1 / A_ii``, the rows' body coordinates in
-  each addressing a mapping reads (a world's local body slots, world and global coordinates, the packed row word),
-  and the publication ``v += M^-1 J^T lambda`` of a world's impulses;
+- :class:`.response_operator.FreeBodyZ` (rows over at most two free bodies): each row whitened per body, ``Z =
+  L^-1 J^T`` through the body's held factor, and ``1 / A_ii``, the rows' body coordinates in each addressing a
+  mapping reads (a world's local body slots, world and global coordinates, the packed row word), and the
+  publication ``v += L^-T sum Z lambda`` of a world's impulses;
 - :class:`.response_operator.SparsePairJY` (a compact dense articulation plus two scalar coordinates): a row's dense
   response through the compact factor, its two sparse slots ``(J, J / m)`` merged when they share a coordinate, and
   its diagonal ``(dense + sparse) + cfm``;
@@ -24,7 +24,7 @@ applied into velocities outside the sweeps. This module holds the builds and pub
 and :class:`BilateralElimination`, the Schur transform of a :class:`.response_operator.DenseJY` build that folds a
 world's bilateral block into the responses of its other rows.
 
-**API.** Each operator class returns its build from ``build()`` (``FreeBody6.build()``, ``SparsePairJY.build()``,
+**API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparsePairJY.build()``,
 ``SparseFactor.build()``, ``FactorRows.build()``): a frozen descriptor whose members are the Warp kernels (or cached
 factories of kernel variants, or a Warp function) of each step of the build and of the publication; the solver's
 launch sites call them directly. The arithmetic of a step is one function per representation and mapping, called by
@@ -32,8 +32,8 @@ every kernel that runs the step:
 
 - the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``bilateral_product``...),
   one expression tree on both devices, with its adjoint;
-- the native kernels call the operator's emitters (:meth:`.FreeBody6.pack` writes the row word that
-  :meth:`.FreeBody6.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
+- the native kernels call the operator's emitters (:meth:`.FreeBodyZ.pack` writes the row word that
+  :meth:`.FreeBodyZ.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
   :class:`.SparseFactor` reads; :meth:`.FactorRows.transposed` is the factor product of a lane per coordinate).
 
 Where two forms of a step differ only by accident (the order of an operation, a guard), the step keeps each form,
@@ -48,7 +48,6 @@ from functools import cache
 
 import warp as wp
 
-from ...sim import BodyFlags
 from . import field_group, kernel_template
 from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
@@ -70,17 +69,20 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
     PREELIM_MAX_ROWS,
+    BodyFactors,
     _preelim_vec,
     dense_cholesky,
     dense_index,
+    factor_leave,
+    factor_whiten,
+    free_body_factor,
     preelim_solve,
-    spatial_matrix_block_inverse,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import PROJECTION_LAW
 from .response_builds_dense import _Vec6, solve_six
-from .response_operator import FactorComponent, FactorRows, FreeBody6, Lanes
+from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import Preelim
@@ -88,14 +90,15 @@ from .sparse_mass_matrix import _SparseMassMatrixIndices, _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Free-body rows (FreeBody6)
+# Free-body rows (FreeBodyZ)
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free-body row acts on at most two free rigid bodies, ``a`` and ``b`` (a negative body for none), through six
-# Jacobian entries each. Its response is ``MiJt = H^-1 J^T`` per body, with ``H`` the body's spatial inertia in
-# articulation-local coordinates (its free root joint's), and the sweeps step by ``1 / A_ii`` with
-# ``A_ii = cfm + J_a MiJt_a + J_b MiJt_b``. A body's six velocity coordinates start at its articulation's first
-# coordinate, in the addressing the mapping reads: global (``articulation_dof_start``), world
+# entries each. A free body is a one-node tree whose mass matrix ``H = L L^T`` the dynamics factor (its held factor,
+# armature included: :class:`.kernels.BodyFactors`), and its rows are whitened: the writers store each side's ``J``
+# and the build replaces it with ``Z = L^-1 J^T``, so ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and the sweeps hold the
+# bodies' velocities in factor coordinates ``u = L^T v``. A body's six velocity coordinates start at its
+# articulation's first coordinate, in the addressing the mapping reads: global (``articulation_dof_start``), world
 # (``articulation_world_dof_offset``) or the world's local body slot (:func:`free_body_slot`).
 
 
@@ -108,77 +111,50 @@ def body_coordinate(body: int, body_to_articulation: wp.array[int], first: wp.ar
 
 
 @wp.func
-def free_body_inverse(inertia: wp.spatial_matrix, kinematic: bool) -> wp.spatial_matrix:
-    """``H^-1`` of a free body: the Schur inverse of its spatial inertia's 3x3 blocks; zero for a kinematic body.
-
-    ``H`` is the spatial inertia alone: a free joint's armature is not part of it (the articulated factors add
-    armature to ``H``'s diagonal).
-    """
-    if kinematic:
-        return wp.spatial_matrix(0.0)
-    return spatial_matrix_block_inverse(inertia)
-
-
-@wp.func
-def free_body_side(inverse: wp.spatial_matrix, jacobian: wp.spatial_vector):
-    """One body's response ``H^-1 J^T`` and its term ``J H^-1 J^T`` of the diagonal (Warp's matrix-vector product:
-    column 0 times ``J_0``, then each later column's product added in order)."""
-    response = inverse * jacobian
-    return response, wp.dot(jacobian, response)
+def free_body_whiten(Z: wp.array3d[float], world: int, row: int, body: int, factors: BodyFactors, store: bool):
+    """Whiten one side of row ``row``, ``Z = L^-1 J^T`` (in place when ``store``), and return its term ``|Z|^2`` of
+    the diagonal (zero for no body)."""
+    if body < 0:
+        return 0.0
+    jacobian = wp.spatial_vector(
+        Z[world, row, 0], Z[world, row, 1], Z[world, row, 2], Z[world, row, 3], Z[world, row, 4], Z[world, row, 5]
+    )
+    z = factor_whiten(factors.L, free_body_factor(body, factors), jacobian)
+    if store:
+        for k in range(6):
+            Z[world, row, k] = z[k]
+    return wp.dot(z, z)
 
 
 @wp.func
 def free_body_response(
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
+    Z_a: wp.array3d[float],
+    Z_b: wp.array3d[float],
     world: int,
     row: int,
     body_a: int,
     body_b: int,
-    inverse: wp.array[wp.spatial_matrix],
+    row_type: int,
+    factors: BodyFactors,
     cfm: float,
-    MiJt_a: wp.array3d[float],
-    MiJt_b: wp.array3d[float],
 ) -> float:
-    """Build row ``row``'s responses ``MiJt_a``, ``MiJt_b`` and return its stored diagonal ``1 / A_ii``.
+    """Whiten row ``row``'s sides and return its stored diagonal ``1 / A_ii``.
 
-    ``A_ii = cfm + J_a MiJt_a + J_b MiJt_b`` adds each present body's term in turn to ``cfm``; a non-positive
-    ``A_ii`` stores zero (the row does not move).
+    ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` adds each present body's term in turn to ``cfm``; a non-positive ``A_ii``
+    stores zero (the row does not move). A speed row keeps its axis ``J = e_k`` unwhitened (its law reads the body's
+    velocity through the factor, not a row) and takes ``A_ii = cfm + |L^-1 e_k|^2``.
     """
-    jacobian_a = wp.spatial_vector(
-        J_a[world, row, 0],
-        J_a[world, row, 1],
-        J_a[world, row, 2],
-        J_a[world, row, 3],
-        J_a[world, row, 4],
-        J_a[world, row, 5],
-    )
-    jacobian_b = wp.spatial_vector(
-        J_b[world, row, 0],
-        J_b[world, row, 1],
-        J_b[world, row, 2],
-        J_b[world, row, 3],
-        J_b[world, row, 4],
-        J_b[world, row, 5],
-    )
+    store = row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
     diagonal = cfm
-    if body_a >= 0:
-        response, term = free_body_side(inverse[body_a], jacobian_a)
-        diagonal += term
-        for k in range(6):
-            MiJt_a[world, row, k] = response[k]
-    if body_b >= 0:
-        response, term = free_body_side(inverse[body_b], jacobian_b)
-        diagonal += term
-        for k in range(6):
-            MiJt_b[world, row, k] = response[k]
+    diagonal += free_body_whiten(Z_a, world, row, body_a, factors, store)
+    diagonal += free_body_whiten(Z_b, world, row, body_b, factors, store)
     if diagonal > 0.0:
         return 1.0 / diagonal
     return 0.0
 
 
 @wp.func
-def free_body_row_velocity(
+def free_body_jacobian_velocity(
     J_a: wp.array3d[float],
     J_b: wp.array3d[float],
     world: int,
@@ -189,7 +165,8 @@ def free_body_row_velocity(
     first: wp.array[int],
     velocity: wp.array[float],
 ) -> float:
-    """``J_row v`` over a velocity in the addressing ``first``: from zero, body ``a``'s six products, then ``b``'s."""
+    """``J_row v`` of the writers' (unwhitened) rows over a velocity in the addressing ``first``: from zero, body
+    ``a``'s six products, then ``b``'s."""
     value = float(0.0)
     if body_a >= 0:
         start = body_coordinate(body_a, body_to_articulation, first)
@@ -204,19 +181,13 @@ def free_body_row_velocity(
 
 @wp.func
 def free_body_row_rhs(
-    J_a: wp.array3d[float],
-    J_b: wp.array3d[float],
-    world: int,
-    row: int,
     body_a: int,
     body_b: int,
     row_type: int,
     phi: float,
     target: float,
     restitution: float,
-    body_to_articulation: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    incident_velocity: wp.array[float],
+    incident: float,
     max_depenetration_velocity: wp.array[float],
     beta: float,
     contact_w: float,
@@ -227,9 +198,10 @@ def free_body_row_rhs(
     """A free-body row's position-pass ``rhs`` and regularization weight, by the row laws (:mod:`.row_laws`).
 
     A contact takes :func:`.row_laws.contact_rhs` with its bodies' depenetration cap, and, when restitutive, the
-    rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity less its target (weight 1); a
-    friction row its anchor law (the row builder folded the anchor gain into ``phi``); a speed row ``phi -
-    target`` (its limit); any other row ``-target``. The sweeps recompute ``J v``: ``rhs`` holds the bias only.
+    rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity ``J v_hat`` less its target
+    (weight 1); a friction row its anchor law (the row builder folded the anchor gain into ``phi``); a speed row
+    ``phi - target`` (its limit); any other row ``-target``. The sweeps recompute ``J v``: ``rhs`` holds the bias
+    only.
     """
     inv_dt = 1.0 / dt
     rhs = -target
@@ -238,12 +210,8 @@ def free_body_row_rhs(
         cap = contact_depenetration_cap(body_a, body_b, max_depenetration_velocity)
         rhs, row_w = contact_rhs(phi, beta, target, inv_dt, 1.0, speculative_scale, contact_w, cap, 0.0)
         if restitution > 0.0:
-            relative_incident = free_body_row_velocity(
-                J_a, J_b, world, row, body_a, body_b, body_to_articulation, articulation_dof_start, incident_velocity
-            )
-            relative_incident -= target
             fires, bounce = contact_restitution_rhs(
-                phi, relative_incident, target, restitution, dt, restitution_threshold
+                phi, incident - target, target, restitution, dt, restitution_threshold
             )
             if fires:
                 rhs = bounce
@@ -290,56 +258,36 @@ def free_body_slot(
 def free_body_publish(
     world: int,
     body: int,
-    component: int,
     count: int,
     local_body_a: wp.array2d[int],
     local_body_b: wp.array2d[int],
-    MiJt_a: wp.array3d[float],
-    MiJt_b: wp.array3d[float],
+    Z_a: wp.array3d[float],
+    Z_b: wp.array3d[float],
+    row_type: wp.array2d[int],
     impulses: wp.array2d[float],
-) -> float:
-    """``(M^-1 J^T lambda)`` at coordinate ``component`` of the world's local body ``body``: the rows in order,
-    each nonzero impulse times the row's response on that body (side ``a``, then ``b``), from zero."""
-    delta = float(0.0)
+) -> wp.spatial_vector:
+    """``sum_i Z_i lambda_i`` on the world's local body ``body``, in factor coordinates: the rows in order, each nonzero
+    impulse times the row's entries on that body (side ``a``, then ``b``), from zero. Speed rows carry no ``Z``."""
+    delta = wp.spatial_vector()
     for i in range(count):
         impulse = impulses[world, i]
-        if impulse == 0.0:
+        if impulse == 0.0 or row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             continue
         if local_body_a[world, i] == body:
-            delta += MiJt_a[world, i, component] * impulse
+            for k in range(6):
+                delta[k] += Z_a[world, i, k] * impulse
         if local_body_b[world, i] == body:
-            delta += MiJt_b[world, i, component] * impulse
+            for k in range(6):
+                delta[k] += Z_b[world, i, k] * impulse
     return delta
-
-
-@wp.kernel(enable_backward=False)
-def free_body_inverse_kernel(
-    free_rigid_body_indices: wp.array[int],
-    body_I_s: wp.array[wp.spatial_matrix],
-    is_free_rigid: wp.array[int],
-    body_to_articulation: wp.array[int],
-    body_flags: wp.array[wp.int32],
-    # outputs
-    mf_body_Hinv: wp.array[wp.spatial_matrix],
-):
-    """Store ``H^-1`` (:func:`free_body_inverse`) of each free rigid body, one thread per body."""
-    b = free_rigid_body_indices[wp.tid()]
-    art = body_to_articulation[b]
-    if art < 0:
-        return
-    if is_free_rigid[art] == 0:
-        return
-    mf_body_Hinv[b] = free_body_inverse(body_I_s[b], (body_flags[b] & BodyFlags.KINEMATIC) != 0)
 
 
 @wp.kernel(enable_backward=False)
 def free_body_rows_kernel(
     mf: MfRows,
     mf_constraint_count: wp.array[int],
-    mf_body_Hinv: wp.array[wp.spatial_matrix],
+    factors: BodyFactors,
     has_target_velocity: int,
-    body_to_articulation: wp.array[int],
-    articulation_dof_start: wp.array[int],
     incident_velocity: wp.array[float],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_cfm: float,
@@ -351,15 +299,13 @@ def free_body_rows_kernel(
     mf_max_constraints: int,
     # outputs
     mf_eff_mass_inv: wp.array2d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
     mf_row_w: wp.array2d[float],
 ):
-    """Build each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
+    """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
 
-    One thread per row slot (``world * mf_max_constraints + row``). The two passes share the launch and the rows'
-    reads; the response depends on the mass and ``J`` alone, the ``rhs`` on the row laws' inputs. The row weight is
-    written only when contacts are regularized (``contact_w < 1``).
+    One thread per row slot (``world * mf_max_constraints + row``). A restitutive contact first stores its incident
+    velocity ``J v_hat`` from the writers' ``J`` (the velocity pass rebounds from it too). The row weight is written
+    only when contacts are regularized (``contact_w < 1``).
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
@@ -368,26 +314,34 @@ def free_body_rows_kernel(
         return
     body_a = mf.body_a[world, i]
     body_b = mf.body_b[world, i]
-    mf_eff_mass_inv[world, i] = free_body_response(
-        mf.J_a, mf.J_b, world, i, body_a, body_b, mf_body_Hinv, pgs_cfm, mf_MiJt_a, mf_MiJt_b
-    )
+    row_type = mf.row_type[world, i]
+    restitution = mf.restitution[world, i]
+    incident = float(0.0)
+    if row_type == PGS_CONSTRAINT_TYPE_CONTACT and restitution > 0.0:
+        incident = free_body_jacobian_velocity(
+            mf.Z_a,
+            mf.Z_b,
+            world,
+            i,
+            body_a,
+            body_b,
+            factors.body_to_articulation,
+            factors.dof_start,
+            incident_velocity,
+        )
+        mf.incident[world, i] = incident
+    mf_eff_mass_inv[world, i] = free_body_response(mf.Z_a, mf.Z_b, world, i, body_a, body_b, row_type, factors, pgs_cfm)
     target = float(0.0)
     if has_target_velocity != 0:
         target = mf.target[world, i]
     rhs, row_w = free_body_row_rhs(
-        mf.J_a,
-        mf.J_b,
-        world,
-        i,
         body_a,
         body_b,
-        mf.row_type[world, i],
+        row_type,
         mf.phi[world, i],
         target,
-        mf.restitution[world, i],
-        body_to_articulation,
-        articulation_dof_start,
-        incident_velocity,
+        restitution,
+        incident,
         rigid_body_max_depenetration_velocity,
         pgs_beta,
         contact_w,
@@ -468,53 +422,61 @@ def free_body_coordinates_kernel(
 def free_body_publish_kernel(
     bodies: MfBodyMap,
     mf_constraint_count: wp.array[int],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
+    mf_Z_a: wp.array3d[float],
+    mf_Z_b: wp.array3d[float],
+    mf_row_type: wp.array2d[int],
     mf_impulses: wp.array2d[float],
+    factors: BodyFactors,
     max_mf_bodies: int,
     set_output_to_delta: int,
     # in/out
     velocity: wp.array[float],
 ):
-    """Publish the velocity change of a world's impulses (:func:`free_body_publish`) onto ``velocity``.
+    """Publish the velocity change of a world's impulses onto ``velocity``: ``v += L^-T sum_i Z_i lambda_i`` per body
+    (:func:`free_body_publish`, then the body's factor).
 
-    One thread per (world, local body, coordinate). The change replaces the velocity (``set_output_to_delta``) or
-    is added to it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
+    One thread per (world, local body). The change replaces the velocity (``set_output_to_delta``) or is added to
+    it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
     """
     tid = wp.tid()
-    component = tid % 6
-    local_body = (tid // 6) % max_mf_bodies
-    world = tid // (6 * max_mf_bodies)
+    local_body = tid % max_mf_bodies
+    world = tid // max_mf_bodies
     if local_body >= bodies.body_count[world]:
         return
-    global_dof = bodies.body_dof_start[world, local_body] + component
-    delta = free_body_publish(
-        world,
-        local_body,
-        component,
-        mf_constraint_count[world],
-        bodies.local_body_a,
-        bodies.local_body_b,
-        mf_MiJt_a,
-        mf_MiJt_b,
-        mf_impulses,
+    first = bodies.body_dof_start[world, local_body]
+    factor = free_body_factor(bodies.body_list[world, local_body], factors)
+    delta = factor_leave(
+        factors.L,
+        factor,
+        free_body_publish(
+            world,
+            local_body,
+            mf_constraint_count[world],
+            bodies.local_body_a,
+            bodies.local_body_b,
+            mf_Z_a,
+            mf_Z_b,
+            mf_row_type,
+            mf_impulses,
+        ),
     )
-    if set_output_to_delta != 0:
-        velocity[global_dof] = delta
-    else:
-        velocity[global_dof] += delta
+    for k in range(6):
+        if set_output_to_delta != 0:
+            velocity[first + k] = delta[k]
+        else:
+            velocity[first + k] += delta[k]
 
 
 @cache
 def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kernel:
-    """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBody6.pack`).
+    """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
     A warp per world (``wp.launch_tiled`` over the worlds, 32 threads), a lane per row; the word holds the rows'
     world coordinates, stored inverse diagonal, right-hand side, type and parent. CUDA only. ``device_arch`` keys
     the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
-    word = FreeBody6().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
+    word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
     body = f"""    int m_mf = mf_constraint_count.data[world];
     int off_mf = world * {mf_max_constraints};
     int off_meta = off_mf * 4;
@@ -552,19 +514,18 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
 
 
 @dataclasses.dataclass(frozen=True)
-class FreeBody6Build:
-    """The build and publication of free-body rows (:class:`.response_operator.FreeBody6`).
+class FreeBodyZBuild:
+    """The build and publication of free-body rows (:class:`.response_operator.FreeBodyZ`).
 
     Attributes:
-        inverse: Each free rigid body's ``H^-1`` (:func:`free_body_inverse_kernel`); one thread per body.
-        rows: Each row's responses, stored inverse diagonal and ``rhs`` (:func:`free_body_rows_kernel`).
+        rows: Each row's whitened entries, stored inverse diagonal, incident velocity and ``rhs``
+            (:func:`free_body_rows_kernel`).
         body_map: Each world's local body list and each row's body slots (:func:`free_body_map_kernel`).
         coordinates: Each row's bodies' first world coordinates (:func:`free_body_coordinates_kernel`).
         meta: The factory of the row-word pack (:func:`free_body_meta_kernel`).
         publish: The velocity change of a world's impulses (:func:`free_body_publish_kernel`).
     """
 
-    inverse: wp.Kernel
     rows: wp.Kernel
     body_map: wp.Kernel
     coordinates: wp.Kernel
@@ -572,15 +533,14 @@ class FreeBody6Build:
     publish: wp.Kernel
 
 
-FREE_BODY6 = FreeBody6Build(
-    inverse=free_body_inverse_kernel,
+FREE_BODY_Z = FreeBodyZBuild(
     rows=free_body_rows_kernel,
     body_map=free_body_map_kernel,
     coordinates=free_body_coordinates_kernel,
     meta=free_body_meta_kernel,
     publish=free_body_publish_kernel,
 )
-"""The free-body rows' build (:meth:`.FreeBody6.build`)."""
+"""The free-body rows' build (:meth:`.FreeBodyZ.build`)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2486,10 +2446,8 @@ _PAIRED_COMPONENTS = r"""
                 }
             }
             for (int d = 0; d < $SECONDARY; ++d) {
-                valid &= wp::isfinite(data.mf_J_a.data[r * $SECONDARY + d])
-                    && wp::isfinite(data.mf_J_b.data[r * $SECONDARY + d])
-                    && wp::isfinite(data.mf_MiJt_a.data[r * $SECONDARY + d])
-                    && wp::isfinite(data.mf_MiJt_b.data[r * $SECONDARY + d]);
+                valid &= wp::isfinite(data.mf_Z_a.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_Z_b.data[r * $SECONDARY + d]);
             }
         }
         if (ALL(valid != 0)) {

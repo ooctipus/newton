@@ -203,10 +203,8 @@ def _run_mixed_response(
                 solver.mf_impulses.numpy()[0, :mf_count].copy(),
                 solver.mf_row_type.numpy()[0, :mf_count].copy(),
                 solver.mf_row_parent.numpy()[0, :mf_count].copy(),
-                solver.mf_J_a.numpy()[0, :mf_count].copy(),
-                solver.mf_J_b.numpy()[0, :mf_count].copy(),
-                solver.mf_MiJt_a.numpy()[0, :mf_count].copy(),
-                solver.mf_MiJt_b.numpy()[0, :mf_count].copy(),
+                solver.mf_Z_a.numpy()[0, :mf_count].copy(),
+                solver.mf_Z_b.numpy()[0, :mf_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
@@ -1656,15 +1654,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         tangent_cross_terms = []
         for sample in local:
             row_type, row_parent = sample[9], sample[10]
-            jacobian_a, jacobian_b = sample[11], sample[12]
-            response_a, response_b = sample[13], sample[14]
+            # The whitened rows: the pair's coupling J_i H^-1 J_s^T is Z_i . Z_s.
+            whitened_a, whitened_b = sample[11], sample[12]
             for row in np.flatnonzero(row_type == PGS_CONSTRAINT_TYPE_FRICTION):
                 parent = row_parent[row]
                 if row != parent + 1:
                     continue
                 sibling = parent + 2
                 tangent_cross_terms.append(
-                    float(jacobian_a[row] @ response_a[sibling] + jacobian_b[row] @ response_b[sibling])
+                    float(whitened_a[row] @ whitened_a[sibling] + whitened_b[row] @ whitened_b[sibling])
                 )
         self.assertTrue(tangent_cross_terms, "scene generated no tangent pair")
         self.assertGreater(max(abs(value) for value in tangent_cross_terms), 1.0e-3)

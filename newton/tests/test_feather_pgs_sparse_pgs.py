@@ -556,8 +556,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             wp.zeros((worlds, 1), device=device),
                             wp.zeros((worlds, 1, 6), device=device),
                             wp.zeros((worlds, 1, 6), device=device),
-                            wp.zeros((worlds, 1, 6), device=device),
-                            wp.zeros((worlds, 1, 6), device=device),
                             wp.zeros((worlds, 1), device=device),
                             8,
                             omega,

@@ -11,6 +11,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 
 
@@ -94,8 +95,8 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
-        jacobian = solver.mf_J_a if int(solver.mf_body_a.numpy()[0, slot]) >= 0 else solver.mf_J_b
-        old_direction = jacobian.numpy()[0, slot + 1, :3].copy()
+        side = 0 if int(solver.mf_body_a.numpy()[0, slot]) >= 0 else 1
+        old_direction = free_body_jacobians(solver)[side][0, slot + 1, :3].copy()
         previous = solver._ws_prev_mf_impulses.numpy()
         previous[0, slot : slot + 3] = (1.0, 0.5, 0.0)
         solver._ws_prev_mf_impulses.assign(previous)
@@ -124,7 +125,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         slot = int(solver.contact_slot.numpy()[0])
         impulses = solver.mf_impulses.numpy()[0, slot : slot + 3]
-        tangent_rows = jacobian.numpy()[0, slot + 1 : slot + 3, :3]
+        tangent_rows = free_body_jacobians(solver)[side][0, slot + 1 : slot + 3, :3]
         world_tangent = impulses[1:] @ tangent_rows
         # Independent world-space projection; solver rows use B-to-A normals.
         n = np.asarray(new_normal)

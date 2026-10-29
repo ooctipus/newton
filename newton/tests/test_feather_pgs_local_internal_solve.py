@@ -33,8 +33,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
-            wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
-            wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             0,
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
@@ -455,12 +453,11 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         initial_velocity = np.array([0.25, -0.1, 0.05, -0.3, 0.2, -0.1, 0.0, 0.0, 0.0], dtype=np.float32)
 
         mf_count = 3
+        # The free body's held factor (the secondary group's) is the identity, so its whitened rows Z = L^-1 J^T are J.
         mf_jacobian = np.zeros((1, max_constraints, 6), dtype=np.float32)
-        mf_response = np.zeros_like(mf_jacobian)
         mf_jacobian[0, 0, 0] = 1.0
         mf_jacobian[0, 1, 1] = 1.0
         mf_jacobian[0, 2, 2] = 1.0
-        mf_response[:] = mf_jacobian
         mf_rhs = np.array([-0.1, 0.0, 0.0], dtype=np.float32)
         mf_types = np.array(
             [PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION],
@@ -523,8 +520,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 mf_impulses,
                 wp.zeros_like(wp.array(mf_jacobian, device=device)),
                 wp.array(mf_jacobian, device=device),
-                wp.zeros_like(wp.array(mf_response, device=device)),
-                wp.array(mf_response, device=device),
                 wp.array([np.pad(mf_mu, (0, 1))], device=device),
                 0,
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),

@@ -23,7 +23,8 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_split as routes
 from newton._src.solvers.feather_pgs.contact_unit import RING_BLOCK_SIZE
-from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBody6, Lanes, Velocity
+from newton._src.solvers.feather_pgs.kernels import BodyFactors
+from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBodyZ, Lanes, Velocity
 from newton._src.solvers.feather_pgs.sweep import FRICTION, RowContext, RowLaws, row_update
 
 CONTACT, DRIVE, LIMIT, VLIMIT, MIMIC, CONNECT, TORSION = 0, 1, 3, 4, 5, 6, 7
@@ -82,7 +83,7 @@ class TestSweepRoutesSplitSources(unittest.TestCase):
     def test_free_bodies_take_the_loop_order(self):
         text = self.sources["mf_loop"][0]
         self.assertIn(
-            "for (int k = 0; k < 6; ++k) jv += mf_J_a.data[mf6_base + i * 6 + k] * v_out.data[dof_a + k];", text
+            "for (int k = 0; k < 6; ++k) jv += mf_Z_a.data[mf6_base + i * 6 + k] * v_out.data[dof_a + k];", text
         )
         self.assertIn("float residual = jv + mf_rhs.data[c_off + i];", text)
         # The friction step sums the pair's first tangent again, per coordinate from its right-hand side.
@@ -117,8 +118,8 @@ class TestSplitOperators(unittest.TestCase):
             Assembled(0, "n", "global", Lanes(1))
 
     def test_free_body_orders(self):
-        loop = FreeBody6(Lanes(1), velocity=Velocity("v"), order="loop")
-        split = FreeBody6(Lanes(1), velocity=Velocity("v"))
+        loop = FreeBodyZ(Lanes(1), velocity=Velocity("v"), order="loop")
+        split = FreeBodyZ(Lanes(1), velocity=Velocity("v"))
         self.assertIn("for (int k = 0; k < 6; ++k) jv +=", loop.residual("jv", ""))
         self.assertNotIn("for (int k", split.residual("jv", ""))
         own = loop.pair_terms("i", "sib", lambda row: f"b[{row}]", "", own=True)
@@ -128,10 +129,10 @@ class TestSplitOperators(unittest.TestCase):
         self.assertLess(coupling.index("if (dof_a == ca)"), coupling.index("if (dof_a == cb)"))
         self.assertLess(coupling.index("if (dof_a == cb)"), coupling.index("if (dof_b == ca)"))
         with self.assertRaisesRegex(ValueError, "order"):
-            FreeBody6(Lanes(1), order="split_loop")
+            FreeBodyZ(Lanes(1), order="split_loop")
 
     def test_the_pair_residual_hook(self):
-        op = FreeBody6(Lanes(1), velocity=Velocity("v"), inverse=lambda row: f"inv[{row}]", order="loop")
+        op = FreeBodyZ(Lanes(1), velocity=Velocity("v"), inverse=lambda row: f"inv[{row}]", order="loop")
 
         def update(**options):
             context = RowContext(
@@ -276,11 +277,16 @@ def _free_body_case(rng, unit):
     articulation = rng.permutation(total).astype(np.int32)
     dof_start = (6 * rng.permutation(total) + 3).astype(np.int32)
     minv = [np.eye(6) * rng.uniform(0.2, 2.0) + 0.05 * (R @ R.T) for R in rng.standard_normal((total, 6, 6))]
+    # Each body's held factor, H = L L^T with H^-1 = minv.
+    lower = np.array([np.linalg.cholesky(np.linalg.inv(m)) for m in minv], np.float32)
+    dof_factor = np.full(6 * total + 9, -1, np.int32)
+    for body in range(total):
+        dof_factor[dof_start[articulation[body]]] = body
     shape = (worlds, capacity)
     data = {"count": np.zeros(worlds, np.int32), "kinds": np.zeros(shape, np.int32)}
     data["parents"] = np.full(shape, -1, np.int32)
     data["body_a"], data["body_b"] = np.full(shape, -1, np.int32), np.full(shape, -1, np.int32)
-    for name in ("MiJt_a", "MiJt_b", "J_a", "J_b"):
+    for name in ("Z_a", "Z_b"):
         data[name] = np.zeros((*shape, 6), np.float32)
     for name in ("inv", "rhs", "mu", "w", "lam"):
         data[name] = np.zeros(shape, np.float32)
@@ -314,12 +320,13 @@ def _free_body_case(rng, unit):
                 J_a[3 * int(rng.integers(0, 2))] = 1.0
             J_b = rng.standard_normal(6) if b >= 0 else np.zeros(6)
             data["body_a"][world, row], data["body_b"][world, row] = a, b
-            data["J_a"][world, row], data["J_b"][world, row] = J_a, J_b
-            data["MiJt_a"][world, row] = minv[a] @ data["J_a"][world, row].astype(np.float64)
-            response = float(data["J_a"][world, row] @ data["MiJt_a"][world, row])
+            # Whitened rows, Z = L^-1 J^T; a speed row keeps its axis.
+            Z_a = np.linalg.solve(lower[a].astype(np.float64), J_a)
+            data["Z_a"][world, row] = J_a if kinds[row] == VLIMIT else Z_a
+            response = float(Z_a @ Z_a)
             if b >= 0:
-                data["MiJt_b"][world, row] = minv[b] @ data["J_b"][world, row].astype(np.float64)
-                response += float(data["J_b"][world, row] @ data["MiJt_b"][world, row])
+                data["Z_b"][world, row] = np.linalg.solve(lower[b].astype(np.float64), J_b)
+                response += float(data["Z_b"][world, row].astype(np.float64) @ data["Z_b"][world, row])
             data["inv"][world, row] = 1.0 / (response + 1e-4)
             data["rhs"][world, row] = rng.uniform(0.05, 1.0) if kinds[row] == VLIMIT else rng.uniform(-1.0, 0.4)
         data["mu"][world, :m] = rng.uniform(0.1, 1.0, m)
@@ -333,7 +340,10 @@ def _free_body_case(rng, unit):
     def launch(kernel):
         a = {name: wp.array(value, device="cpu") for name, value in data.items()}
         v = wp.array(velocity, device="cpu")
-        inputs = [a["count"], a["body_a"], a["body_b"], a["MiJt_a"], a["MiJt_b"], a["J_a"], a["J_b"], a["inv"]]
+        factors = BodyFactors()
+        factors.dof_factor = wp.array(dof_factor, device="cpu")
+        factors.L = wp.array(lower, dtype=float, device="cpu")
+        inputs = [a["count"], a["body_a"], a["body_b"], a["Z_a"], a["Z_b"], factors, a["inv"]]
         inputs += [a["rhs"], a["kinds"], a["parents"], a["mu"], a["w"]]
         inputs += [wp.array(articulation, device="cpu"), wp.array(dof_start, device="cpu")]
         inputs += [options["iterations"], options["omega"], options["regularize"]]

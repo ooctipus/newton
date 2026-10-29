@@ -42,20 +42,22 @@ MF_RECORDS = (
             ("body_b", "mf_body_b"),
             ("dof_a", "mf_dof_a"),
             ("dof_b", "mf_dof_b"),
-            ("J_a", "mf_J_a"),
-            ("J_b", "mf_J_b"),
+            ("Z_a", "mf_Z_a"),
+            ("Z_b", "mf_Z_b"),
             ("row_type", "mf_row_type"),
             ("row_parent", "mf_row_parent"),
             ("row_mu", "mf_row_mu"),
             ("phi", "mf_phi"),
             ("restitution", "mf_row_restitution"),
+            ("incident", "mf_row_incident"),
             ("rhs", "mf_rhs"),
         )
     ),
     Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity"),
 )
-"""Each matrix-free row's bodies, coordinates and Jacobian blocks, and the dense records' kind, friction parent,
-coefficient, gap, restitution, rhs and target, by world and row."""
+"""Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
+by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity
+(``J v_hat`` of a restitutive contact, stored by the build), rhs and target, by world and row."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 

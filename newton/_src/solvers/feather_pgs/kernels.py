@@ -2571,29 +2571,122 @@ def world_contact_row_dot(
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Free bodies in factor coordinates
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
+# velocity) have the 6x6 mass matrix ``H = L L^T`` the dynamics factor, armature included (``L_by_size[6]`` at its
+# articulation's group index, lower, row-major). A free-body row is whitened, ``Z = L^-1 J^T`` per body, and the
+# sweeps hold the body's velocity in factor coordinates ``u = L^T v``: a row's velocity term is ``Z^T u``, its
+# update ``u += Z dlambda``, and ``v = L^-T u`` leaves them. The factor's three actions below take
+# :class:`.response_operator.CholeskySolve`'s orders and its zero-diagonal convention (a zero pivot gives zero),
+# which the native sweeps emit.
+
+
+@wp.struct
+class BodyFactors:
+    """Where each free body's held factor and velocity coordinates live: its articulation, the articulation's index
+    in ``L_by_size[6]`` (``factor_index``, the solver's ``art_group_idx``) and first coordinate (``dof_start``), the
+    factor index of the free body whose coordinates start at each global coordinate (``dof_factor``, -1 elsewhere:
+    the native sweeps' lookup), and the size-6 factors ``L``."""
+
+    body_to_articulation: wp.array[int]
+    factor_index: wp.array[int]
+    dof_start: wp.array[int]
+    dof_factor: wp.array[int]
+    L: wp.array3d[float]
+
+
 @wp.func
-def mf_contact_row_dot(
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    dof_a: int,
-    dof_b: int,
-    world_dof_indices: wp.array2d[int],
-    velocity: wp.array[float],
-    world: int,
-    i: int,
-):
-    """Dot one matrix-free row's two body Jacobians with a global velocity."""
+def free_body_factor(body: int, factors: BodyFactors) -> int:
+    """The index of ``body``'s held factor in ``factors.L``, -1 for no body."""
+    if body < 0:
+        return -1
+    return factors.factor_index[factors.body_to_articulation[body]]
+
+
+@wp.func
+def factor_whiten(L: wp.array3d[float], factor: int, x: wp.spatial_vector) -> wp.spatial_vector:
+    """``z = L^-1 x``: rows ascending, each ``x`` less the earlier rows' terms in order, over its pivot."""
+    z = wp.spatial_vector()
+    for row in range(6):
+        value = x[row]
+        for k in range(row):
+            value -= L[factor, row, k] * z[k]
+        pivot = L[factor, row, row]
+        z[row] = wp.where(pivot != 0.0, value / pivot, 0.0)
+    return z
+
+
+@wp.func
+def factor_enter(L: wp.array3d[float], factor: int, v: wp.spatial_vector) -> wp.spatial_vector:
+    """``u = L^T v``: each coordinate's terms from zero, ascending."""
+    u = wp.spatial_vector()
+    for row in range(6):
+        value = float(0.0)
+        for k in range(row, 6):
+            value += L[factor, k, row] * v[k]
+        u[row] = value
+    return u
+
+
+@wp.func
+def factor_leave(L: wp.array3d[float], factor: int, u: wp.spatial_vector) -> wp.spatial_vector:
+    """``v = L^-T u``: rows descending, each ``u`` less the later rows' terms in order, over its pivot."""
+    v = wp.spatial_vector()
+    for step in range(6):
+        row = 5 - step
+        value = u[row]
+        for k in range(row + 1, 6):
+            value -= L[factor, k, row] * v[k]
+        pivot = L[factor, row, row]
+        v[row] = wp.where(pivot != 0.0, value / pivot, 0.0)
+    return v
+
+
+@wp.func
+def free_body_velocity(body: int, factors: BodyFactors, velocity: wp.array[float]) -> wp.spatial_vector:
+    """``body``'s six coordinates of a velocity in global coordinates."""
+    start = factors.dof_start[factors.body_to_articulation[body]]
+    return wp.spatial_vector(
+        velocity[start],
+        velocity[start + 1],
+        velocity[start + 2],
+        velocity[start + 3],
+        velocity[start + 4],
+        velocity[start + 5],
+    )
+
+
+@wp.func
+def free_body_side_velocity(
+    Z: wp.array3d[float], world: int, row: int, body: int, factors: BodyFactors, velocity: wp.array[float]
+) -> float:
+    """``Z_side^T (L^T v)``: one side of a whitened row over a physical velocity (zero for no body)."""
+    if body < 0:
+        return 0.0
+    u = factor_enter(factors.L, free_body_factor(body, factors), free_body_velocity(body, factors, velocity))
     out = float(0.0)
-    if dof_a >= 0:
-        for k in range(6):
-            global_dof = world_dof_indices[world, dof_a + k]
-            if global_dof >= 0:
-                out += mf_J_a[world, i, k] * velocity[global_dof]
-    if dof_b >= 0:
-        for k in range(6):
-            global_dof = world_dof_indices[world, dof_b + k]
-            if global_dof >= 0:
-                out += mf_J_b[world, i, k] * velocity[global_dof]
+    for k in range(6):
+        out += Z[world, row, k] * u[k]
+    return out
+
+
+@wp.func
+def free_body_row_velocity(
+    Z_a: wp.array3d[float],
+    Z_b: wp.array3d[float],
+    world: int,
+    row: int,
+    body_a: int,
+    body_b: int,
+    factors: BodyFactors,
+    velocity: wp.array[float],
+) -> float:
+    """``J_row v = Z^T u`` of a whitened row over a physical velocity: body ``a``'s side, then ``b``'s."""
+    out = free_body_side_velocity(Z_a, world, row, body_a, factors, velocity)
+    out += free_body_side_velocity(Z_b, world, row, body_b, factors, velocity)
     return out
 
 
@@ -3164,15 +3257,16 @@ def build_mf_contact_rows(
             direction, p0, p1 = contact_row_frame(
                 row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
             )
-            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B.
+            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B. The rows' build
+            # whitens it in place (Z = L^-1 J^T).
             if response_body_a >= 0:
                 J_a = free_body_jacobian(direction, p0, data.origin[art_a])
                 for k in range(6):
-                    mf.J_a[world, row_idx, k] = J_a[k]
+                    mf.Z_a[world, row_idx, k] = J_a[k]
             if response_body_b >= 0:
                 J_b = free_body_jacobian(direction, p1, data.origin[art_b])
                 for k in range(6):
-                    mf.J_b[world, row_idx, k] = -J_b[k]
+                    mf.Z_b[world, row_idx, k] = -J_b[k]
             mf.body_a[world, row_idx] = response_body_a
             mf.body_b[world, row_idx] = response_body_b
             if row == 0:
@@ -3557,10 +3651,11 @@ def populate_rigid_velocity_limit_rows(
         if speed_axis == 1:
             limit = bodies.max_angular_velocity[body]
 
+        # The axis stays unwhitened: the speed law reads the body's velocity through its factor, not a row.
         for k in range(6):
-            mf.J_a[world, slot, k] = 0.0
-            mf.J_b[world, slot, k] = 0.0
-        mf.J_a[world, slot, 3 * speed_axis] = 1.0
+            mf.Z_a[world, slot, k] = 0.0
+            mf.Z_b[world, slot, k] = 0.0
+        mf.Z_a[world, slot, 3 * speed_axis] = 1.0
 
         mf.body_a[world, slot] = body
         mf.body_b[world, slot] = -1
@@ -3572,134 +3667,28 @@ def populate_rigid_velocity_limit_rows(
         mf.phi[world, slot] = limit
 
 
-@wp.func
-def spatial_matrix_block_inverse(M: wp.spatial_matrix):
-    """Invert a 6x6 spatial matrix using 3x3 block inversion.
-
-    Partition M = [A B; C D] into 3x3 blocks, then:
-        S = D - C * A^-1 * B   (Schur complement)
-        M^-1 = [A^-1 + A^-1*B*S^-1*C*A^-1,  -A^-1*B*S^-1]
-               [-S^-1*C*A^-1,                 S^-1]
-    """
-    A = wp.mat33(
-        M[0, 0],
-        M[0, 1],
-        M[0, 2],
-        M[1, 0],
-        M[1, 1],
-        M[1, 2],
-        M[2, 0],
-        M[2, 1],
-        M[2, 2],
-    )
-    B = wp.mat33(
-        M[0, 3],
-        M[0, 4],
-        M[0, 5],
-        M[1, 3],
-        M[1, 4],
-        M[1, 5],
-        M[2, 3],
-        M[2, 4],
-        M[2, 5],
-    )
-    C = wp.mat33(
-        M[3, 0],
-        M[3, 1],
-        M[3, 2],
-        M[4, 0],
-        M[4, 1],
-        M[4, 2],
-        M[5, 0],
-        M[5, 1],
-        M[5, 2],
-    )
-    D = wp.mat33(
-        M[3, 3],
-        M[3, 4],
-        M[3, 5],
-        M[4, 3],
-        M[4, 4],
-        M[4, 5],
-        M[5, 3],
-        M[5, 4],
-        M[5, 5],
-    )
-
-    Ainv = wp.inverse(A)
-    AinvB = Ainv * B
-    S = D - C * AinvB
-    Sinv = wp.inverse(S)
-    SinvCAinv = Sinv * C * Ainv
-
-    # Top-left: Ainv + AinvB * SinvCAinv
-    TL = Ainv + AinvB * SinvCAinv
-    # Top-right: -AinvB * Sinv
-    TR = -AinvB * Sinv
-    # Bottom-left: -SinvCAinv
-    BL = -SinvCAinv
-    # Bottom-right: Sinv
-    BR = Sinv
-
-    return wp.spatial_matrix(
-        TL[0, 0],
-        TL[0, 1],
-        TL[0, 2],
-        TR[0, 0],
-        TR[0, 1],
-        TR[0, 2],
-        TL[1, 0],
-        TL[1, 1],
-        TL[1, 2],
-        TR[1, 0],
-        TR[1, 1],
-        TR[1, 2],
-        TL[2, 0],
-        TL[2, 1],
-        TL[2, 2],
-        TR[2, 0],
-        TR[2, 1],
-        TR[2, 2],
-        BL[0, 0],
-        BL[0, 1],
-        BL[0, 2],
-        BR[0, 0],
-        BR[0, 1],
-        BR[0, 2],
-        BL[1, 0],
-        BL[1, 1],
-        BL[1, 2],
-        BR[1, 0],
-        BR[1, 1],
-        BR[1, 2],
-        BL[2, 0],
-        BL[2, 1],
-        BL[2, 2],
-        BR[2, 0],
-        BR[2, 1],
-        BR[2, 2],
-    )
-
-
 @wp.kernel
 def compute_mf_rhs_bias(
     rows: MfRows,
     mf_constraint_count: wp.array[int],
+    factors: BodyFactors,
     has_target_velocity: int,
-    world_dof_indices: wp.array2d[int],
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
     dt: float,
     bias_scale: float,
     speculative_scale: float,
     position_velocity: wp.array[float],
-    incident_velocity: wp.array[float],
     preserve_unreached_speculative: int,
     apply_restitution: int,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
 ):
-    """Compute only the MF contact RHS bias (``rows.rhs``) for a previously-built contact set."""
+    """Compute only the MF contact RHS bias (``rows.rhs``) for a previously-built contact set.
+
+    A restitutive contact rebounds from the incident velocity ``J v_hat`` its rows' build stored (``rows.incident``);
+    the end gap reads the position solution's ``J v = Z^T (L^T v)`` through each body's held factor ``L``.
+    """
     tid = wp.tid()
     world = tid // mf_max_constraints
     i = tid % mf_max_constraints
@@ -3720,19 +3709,7 @@ def compute_mf_rhs_bias(
         if apply_restitution != 0:
             restitution = rows.restitution[world, i]
         if restitution > 0.0:
-            relative_incident = (
-                mf_contact_row_dot(
-                    rows.J_a,
-                    rows.J_b,
-                    rows.dof_a[world, i],
-                    rows.dof_b[world, i],
-                    world_dof_indices,
-                    incident_velocity,
-                    world,
-                    i,
-                )
-                - target
-            )
+            relative_incident = rows.incident[world, i] - target
             fires, bounce = contact_restitution_rhs(
                 phi_val, relative_incident, target, restitution, dt, restitution_velocity_threshold
             )
@@ -3743,15 +3720,15 @@ def compute_mf_rhs_bias(
             # evaluated with its realized velocity, stays open.
             end_gap = float(0.0)
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
-                jv_position = mf_contact_row_dot(
-                    rows.J_a,
-                    rows.J_b,
-                    rows.dof_a[world, i],
-                    rows.dof_b[world, i],
-                    world_dof_indices,
-                    position_velocity,
+                jv_position = free_body_row_velocity(
+                    rows.Z_a,
+                    rows.Z_b,
                     world,
                     i,
+                    rows.body_a[world, i],
+                    rows.body_b[world, i],
+                    factors,
+                    position_velocity,
                 )
                 end_gap = phi_val + dt * (jv_position - target)
             cap = contact_depenetration_cap(
@@ -4045,6 +4022,7 @@ def pgs_convergence_diagnostic_velocity(
     mf_impulses: wp.array2d[float],
     prev_mf_impulses: wp.array2d[float],
     mf_max_constraints: int,
+    factors: BodyFactors,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 4]
@@ -4115,16 +4093,8 @@ def pgs_convergence_diagnostic_velocity(
         if dl > max_dl:
             max_dl = dl
 
-        # Compute residual: r = J_a * v_a + J_b * v_b + bias
-        dof_a = mf.dof_a[world, i]
-        dof_b = mf.dof_b[world, i]
-        jv = float(0.0)
-        if dof_a >= 0:
-            for k in range(6):
-                jv += mf.J_a[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_a + k)
-        if dof_b >= 0:
-            for k in range(6):
-                jv += mf.J_b[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_b + k)
+        # Compute residual: r = Z^T (L^T v) + bias
+        jv = free_body_row_velocity(mf.Z_a, mf.Z_b, world, i, mf.body_a[world, i], mf.body_b[world, i], factors, v_out)
         residual = jv + mf.rhs[world, i]
 
         rt = mf.row_type[world, i]
@@ -4200,6 +4170,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
     mf_constraint_count: wp.array[int],
     mf_impulses: wp.array2d[float],
     mf_max_constraints: int,
+    factors: BodyFactors,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 6]
@@ -4338,15 +4309,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
         if rt != PGS_CONSTRAINT_TYPE_CONTACT:
             continue
 
-        dof_a = mf.dof_a[world, i]
-        dof_b = mf.dof_b[world, i]
-        u_n = float(0.0)
-        if dof_a >= 0:
-            for k in range(6):
-                u_n += mf.J_a[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_a + k)
-        if dof_b >= 0:
-            for k in range(6):
-                u_n += mf.J_b[world, i, k] * world_response_velocity(v_out, world_dof_indices, world, dof_b + k)
+        u_n = free_body_row_velocity(mf.Z_a, mf.Z_b, world, i, mf.body_a[world, i], mf.body_b[world, i], factors, v_out)
         b_n = mf.rhs[world, i]
         ln = mf_impulses[world, i]
 
@@ -4373,18 +4336,9 @@ def pgs_ncp_residuals_diagnostic_velocity(
             if mf.row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and mf.row_parent[world, i1] == i:
                 lt1 = mf_impulses[world, i1]
                 mu = mf.row_mu[world, i1]
-                dof_a1 = mf.dof_a[world, i1]
-                dof_b1 = mf.dof_b[world, i1]
-                if dof_a1 >= 0:
-                    for k in range(6):
-                        u_t1 += mf.J_a[world, i1, k] * world_response_velocity(
-                            v_out, world_dof_indices, world, dof_a1 + k
-                        )
-                if dof_b1 >= 0:
-                    for k in range(6):
-                        u_t1 += mf.J_b[world, i1, k] * world_response_velocity(
-                            v_out, world_dof_indices, world, dof_b1 + k
-                        )
+                u_t1 = free_body_row_velocity(
+                    mf.Z_a, mf.Z_b, world, i1, mf.body_a[world, i1], mf.body_b[world, i1], factors, v_out
+                )
 
         i2 = i + 2
         if i2 < mf_max_constraints and i2 < m_mf:
@@ -4392,18 +4346,9 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 lt2 = mf_impulses[world, i2]
                 if mu == 0.0:
                     mu = mf.row_mu[world, i2]
-                dof_a2 = mf.dof_a[world, i2]
-                dof_b2 = mf.dof_b[world, i2]
-                if dof_a2 >= 0:
-                    for k in range(6):
-                        u_t2 += mf.J_a[world, i2, k] * world_response_velocity(
-                            v_out, world_dof_indices, world, dof_a2 + k
-                        )
-                if dof_b2 >= 0:
-                    for k in range(6):
-                        u_t2 += mf.J_b[world, i2, k] * world_response_velocity(
-                            v_out, world_dof_indices, world, dof_b2 + k
-                        )
+                u_t2 = free_body_row_velocity(
+                    mf.Z_a, mf.Z_b, world, i2, mf.body_a[world, i2], mf.body_b[world, i2], factors, v_out
+                )
 
         friction_load = ln
         if mu > 0.0:

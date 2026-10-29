@@ -19,7 +19,7 @@ from pathlib import Path
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
-from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBody6, Lanes, SparsePairJY, Velocity
+from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBodyZ, Lanes, SparsePairJY, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.staging import arch_budget
 
@@ -148,7 +148,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             with self.subTest(has_velocity_limit_rows=vlim):
                 text, declared = routes.mf_split_source(512, 64, has_velocity_limit_rows=vlim)
                 _balanced(self, text)
-                self.assertEqual(declared.bytes, 4 * (64 * 6 + 512 + 64) + 4 * 32)
+                # Velocities, impulses, the bodies' first coordinates and their factors' indices.
+                self.assertEqual(declared.bytes, 4 * (64 * 6 + 512 + 64 + 64) + 4 * 32)
                 self.assertEqual("ProjectionLaw::speed_row" in text, vlim)
 
 
@@ -156,33 +157,39 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
     """The operators' layouts emit the order of the sweeps they replace."""
 
     def test_free_body_one_thread(self):
-        op = FreeBody6(Lanes(1), velocity=Velocity("s_vel"), inverse=lambda row: f"inv[{row}]")
+        op = FreeBodyZ(
+            Lanes(1), velocity=Velocity("s_vel"), inverse=lambda row: f"inv[{row}]", factor=lambda f: f"F[{f}]"
+        )
         residual = op.residual("jv", "")
         # Each side's six products as one expression, added to the residual: a's, then b's.
         terms = " + ".join(
-            f"mf_J_a.data[mf6_base + i * 6 + {k}] * s_vel[dof_a{f' + {k}' if k else ''}]" for k in range(6)
+            f"mf_Z_a.data[mf6_base + i * 6 + {k}] * s_vel[dof_a{f' + {k}' if k else ''}]" for k in range(6)
         )
         self.assertIn(f"jv += {terms};", residual)
         self.assertLess(residual.index("dof_a >= 0"), residual.index("dof_b >= 0"))
         # The sibling residual starts from its right-hand side; a and b alternate per coordinate.
         sibling = op.sibling_residual("sibling_residual", "sib", "", "rhs[sib]")
         self.assertIn("float sibling_residual = rhs[sib];", sibling)
-        a = sibling.index("if (dof_a >= 0) sibling_residual += mf_J_a.data[mf6_base + sib * 6 + k] * s_vel[dof_a + k];")
-        b = sibling.index("if (dof_b >= 0) sibling_residual += mf_J_b.data[mf6_base + sib * 6 + k] * s_vel[dof_b + k];")
+        a = sibling.index("if (dof_a >= 0) sibling_residual += mf_Z_a.data[mf6_base + sib * 6 + k] * s_vel[dof_a + k];")
+        b = sibling.index("if (dof_b >= 0) sibling_residual += mf_Z_b.data[mf6_base + sib * 6 + k] * s_vel[dof_b + k];")
         self.assertLess(a, b)
         coupling = op.coupling("cross", "i", "sib", "")
         self.assertIn("float cross = 0.0f;", coupling)
-        self.assertIn("cross += mf_J_a.data[mf6_base + i * 6 + k] * mf_MiJt_a.data[mf6_base + sib * 6 + k];", coupling)
-        speed = op.speed("speed", "f", "")
-        self.assertIn("sqrtf(s_vel[f] * s_vel[f] + s_vel[f + 1] * s_vel[f + 1] + s_vel[f + 2] * s_vel[f + 2])", speed)
+        self.assertIn("cross += mf_Z_a.data[mf6_base + i * 6 + k] * mf_Z_a.data[mf6_base + sib * 6 + k];", coupling)
+        # A speed row reads the body's physical velocity v = L^-T u through its factor, then pushes u by L^T dv.
+        speed = op.speed("speed", "f", "axis", "")
+        self.assertIn("speed_v[k] = s_vel[f + k];", speed)
+        self.assertIn("(factors.L.data + (F[f]) * 36)", speed)
+        self.assertIn("sqrtf((speed_v[axis] * speed_v[axis] + speed_v[axis + 1] * speed_v[axis + 1])", speed)
+        self.assertIn("s_vel[f + k] += speed_dv[k];", op.scale_speed("s", "f", "axis", ""))
         self.assertEqual(op.step("r", "i"), "-r * inv[i]")
 
     def test_free_body_lanes_keep_their_text(self):
-        op = FreeBody6(Lanes(32))
+        op = FreeBodyZ(Lanes(32), factor=lambda f: f"F[{f}]")
         self.assertIn(
             "SUM(sibling_residual);\nsibling_residual += rhs;", op.sibling_residual("sibling_residual", "s", "", "rhs")
         )
-        self.assertIn("READ(speed_sq, 0)", op.speed("speed", "speed_dof", ""))
+        self.assertIn("if (lane == 0) {", op.scale_speed("s", "speed_dof", "axis", ""))
 
     def test_sparse_pair_layouts(self):
         warp = SparsePairJY(6, 32, Lanes(32), diagonal=lambda row: f"d[{row}]")

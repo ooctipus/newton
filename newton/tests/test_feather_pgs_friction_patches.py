@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     contact_friction_residuals,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel
+from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
 
@@ -1066,7 +1067,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         self.assertGreater(np.count_nonzero(solver._friction_patches.current.source.numpy() >= 0), 0)
         count = int(solver.mf_constraint_count.numpy()[0])
         self.assertTrue(np.all(solver.contact_path.numpy()[:4] == 1))
-        solved = np.einsum("ij,i->j", solver.mf_J_a.numpy()[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
+        J_a, _J_b = free_body_jacobians(solver)
+        solved = np.einsum("ij,i->j", J_a[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
         solver.update_contacts(contacts)
         reported = contacts.force.numpy().sum(axis=0)

@@ -8,7 +8,7 @@
   coupled rows in order (plain, contact triples or contact units, optionally with speculative batches);
 - :func:`tiled_row_kernel`: split mode's assembled Delassus rows (:class:`.Assembled`), one warp per world, in
   impulse space;
-- :func:`mf_split_kernel`: split mode's free-body rows (:class:`.FreeBody6` with one thread per row), their bodies'
+- :func:`mf_split_kernel`: split mode's free-body rows (:class:`.FreeBodyZ` with one thread per row), their bodies'
   velocities staged through the world's local body map.
 
 Every kernel's working set fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
@@ -23,9 +23,10 @@ import warp as wp
 from . import kernel_template
 from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate
+from .kernels import BodyFactors
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Assembled, FreeBody6, Lanes, SparsePairJY, Velocity
+from .response_operator import Assembled, FreeBodyZ, Lanes, SparsePairJY, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .staging import Buffer, Staging, arch_budget
@@ -740,10 +741,9 @@ MF_SPLIT_ABI = kernel_template.params(
     ("mf_body_dof_start", wp.array2d[int]),
     ("mf_local_body_a", wp.array2d[int]),
     ("mf_local_body_b", wp.array2d[int]),
-    ("mf_J_a", wp.array3d[float]),
-    ("mf_J_b", wp.array3d[float]),
-    ("mf_MiJt_a", wp.array3d[float]),
-    ("mf_MiJt_b", wp.array3d[float]),
+    ("mf_Z_a", wp.array3d[float]),
+    ("mf_Z_b", wp.array3d[float]),
+    ("factors", BodyFactors),
     ("mf_eff_mass_inv", wp.array2d[float]),
     ("mf_rhs", wp.array2d[float]),
     ("mf_row_type", wp.array2d[int]),
@@ -771,8 +771,9 @@ def mf_split_source(
     """The native body of split mode's free-body Gauss-Seidel sweep: one warp per world, its first lane solving.
 
     The warp stages the world's bodies' velocities (six coordinates per body of the local body map,
-    ``mf_body_dof_start``) and the rows' impulses; lane 0 runs every sweep over the rows in order with
-    :class:`.FreeBody6`'s one-thread layout, each row's bodies at their local slots (``mf_local_body_a``/``_b``).
+    ``mf_body_dof_start``) in factor coordinates (:meth:`.FreeBodyZ.enter`, back with :meth:`.FreeBodyZ.leave` before
+    the write) and the rows' impulses; lane 0 runs every sweep over the rows in order with :class:`.FreeBodyZ`'s
+    one-thread layout, each row's bodies at their local slots (``mf_local_body_a``/``_b``).
     Contact and limit rows are unilateral, a friction pair is solved at its first tangent, every other row is
     bilateral. With ``has_velocity_limit_rows``, a velocity-limit row is its body's speed row
     (:func:`.sweep.speed_row`, stateless), in row order: the rows occupy the tail of the world's rows. A world stops
@@ -783,13 +784,19 @@ def mf_split_source(
     M, B = int(mf_max_constraints), int(max_mf_bodies)
     serial = Lanes(1)
     laws = RowLaws(drive=False, regularize=True, policy=solve_policy)
-    op = FreeBody6(
+    op = FreeBodyZ(
         serial,
         velocity=Velocity("s_vel"),
         inverse=lambda row: "mf_diag" if row == "i" else f"mf_eff_mass_inv.data[c_off + {row}]",
+        factor=lambda first: f"s_factor[({first}) / 6]",
     )
     stage = Staging(
-        (Buffer("s_vel", "float", B * 6), Buffer("s_impulse", "float", M), Buffer("s_dof_start", "int", B)),
+        (
+            Buffer("s_vel", "float", B * 6),
+            Buffer("s_impulse", "float", M),
+            Buffer("s_dof_start", "int", B),
+            Buffer("s_factor", "int", B),
+        ),
         threads=32,
     )
     ctx = RowContext(
@@ -817,7 +824,7 @@ def mf_split_source(
 {pad}    const float mf_diag = mf_eff_mass_inv.data[c_off + i];
 {pad}    const int dof_a = mf_local_body_a.data[c_off + i] * 6;
 {pad}    if (mf_diag <= 0.0f || dof_a < 0) continue;
-{pad}    const int speed_dof = dof_a + (mf_J_a.data[mf6_base + i * 6 + 3] != 0.0f ? 3 : 0);
+{pad}    const int speed_axis = mf_Z_a.data[mf6_base + i * 6 + 3] != 0.0f ? 3 : 0;
 {speed_row(op, laws, load="s_impulse[i]", store="s_impulse[i] = speed_row[0];", lanes=serial, rhs="mf_rhs.data[c_off + i]", inverse="mf_diag", pad=pad + "    ")}
 {pad}    continue;
 {pad}}}"""
@@ -860,8 +867,11 @@ def mf_split_source(
 
     for (int b = lane; b < n_bodies; b += 32) {{
         const int dof = mf_body_dof_start.data[body_off + b];
+        const int factor = factors.dof_factor.data[dof];
         s_dof_start[b] = dof;
+        s_factor[b] = factor;
         for (int k = 0; k < 6; k++) s_vel[b * 6 + k] = v_out.data[dof + k];
+{indent(op.enter(lambda k: f"s_vel[b * 6 + {k}]", "factor"), "        ")}
     }}
     for (int i = lane; i < m; i += 32) s_impulse[i] = mf_impulses.data[c_off + i];
     SYNC();
@@ -881,6 +891,7 @@ def mf_split_source(
 
     for (int b = lane; b < n_bodies; b += 32) {{
         const int dof = s_dof_start[b];
+{indent(op.leave(lambda k: f"s_vel[b * 6 + {k}]", "s_factor[b]"), "        ")}
         for (int k = 0; k < 6; k++) v_out.data[dof + k] = s_vel[b * 6 + k];
     }}
     for (int i = lane; i < m; i += 32) mf_impulses.data[c_off + i] = s_impulse[i];

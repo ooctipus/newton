@@ -105,7 +105,8 @@ class TestFeatherPGSRigidSpeedLimits(unittest.TestCase):
         np.testing.assert_array_equal(count, 2)
         types = solver.mf_row_type.numpy()[:2, :2]
         np.testing.assert_array_equal(types, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-        jacobian = solver.mf_J_a.numpy()[:2, :2]
+        # A speed row keeps its axis unwhitened.
+        jacobian = solver.mf_Z_a.numpy()[:2, :2]
         np.testing.assert_array_equal(np.sort(np.argmax(np.abs(jacobian), axis=2), axis=1), [[0, 3]] * 2)
         np.testing.assert_array_equal(np.abs(jacobian).sum(axis=2), 1.0)
 

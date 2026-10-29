@@ -100,6 +100,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
     RIGID_SPEED_ROWS,
+    BodyFactors,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -2445,6 +2446,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._arrays.allocate(SPARSE_CONTACT_SERIAL, world=1, serial=1)
         self._allocate_mf_buffers(model)
+        self._body_factors_data = self._build_body_factors()
         self.mf_target_velocity = (
             wp.zeros_like(self.mf_rhs, requires_grad=model.requires_grad)
             if self._has_prescribed_response
@@ -5161,7 +5163,7 @@ class SolverFeatherPGS(SolverBase):
         ``m_mf == 0`` and no element is ever read or written; :meth:`_pack_mf_meta`
         skips its launch. The rows then hold one slot per world, the per-world
         counts keep their real width, and the split-only body maps
-        (``mf_body_Hinv``, ``mf_body_list`` et al.) are not allocated, so the
+        (``mf_body_list`` et al.) are not allocated, so the
         tiled MF PGS kernel is not built.
         """
         if not self._has_free_rigid_bodies and self.pgs_mode != "matrix_free" and not self._sparse_split:
@@ -5853,10 +5855,8 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_constraint_count,
                 self.mf_contact_rows_end,
                 self.mf_meta_packed,
-                self.mf_J_a,
-                self.mf_J_b,
-                self.mf_MiJt_a,
-                self.mf_MiJt_b,
+                self.mf_Z_a,
+                self.mf_Z_b,
                 self.mf_row_mu,
                 self.mf_row_w,
             )
@@ -5913,10 +5913,8 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_constraint_count,
                     self.mf_meta_packed,
                     self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
+                    self.mf_Z_a,
+                    self.mf_Z_b,
                     self.mf_row_mu,
                     int(self._regularization_enabled),
                     self.row_w,
@@ -6025,10 +6023,8 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_constraint_count,
                     mf_meta,
                     self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
+                    self.mf_Z_a,
+                    self.mf_Z_b,
                     self.mf_row_mu,
                     iterations,
                     omega,
@@ -6253,10 +6249,9 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_contact_rows_end,
                     mf_meta,
                     self.mf_impulses,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
+                    self.mf_Z_a,
+                    self.mf_Z_b,
+                    self._body_factors(),
                     self.mf_row_mu,
                     self.mf_row_w,
                     phase_iterations,
@@ -6678,7 +6673,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage4_compute_rhs_world(dt, contact_speculative_scale=self.contact_speculative_scale)
                 # NOTE: skip _stage4_accumulate_rhs_world — J*v_hat not baked into rhs
 
-            # MF: compute mf_MiJt, mf_rhs, mf_eff_mass_inv, body maps
+            # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities
             if self._has_free_rigid_bodies:
                 with wp.ScopedTimer("S4_MF_Setup", print=False, use_nvtx=self._nvtx, synchronize=False):
                     with self._sync_timed("s4_mf_setup"):
@@ -6864,6 +6859,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_impulses,
                                 self._diag_prev_mf_impulses,
                                 self.mf_max_constraints,
+                                self._body_factors(),
                                 self.v_out,
                             ],
                             outputs=[self._diag_metrics],
@@ -6899,6 +6895,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.mf_constraint_count,
                                 self.mf_impulses,
                                 self.mf_max_constraints,
+                                self._body_factors(),
                                 self.v_out,
                             ],
                             outputs=[self._diag_ncp_metrics],
@@ -10202,13 +10199,15 @@ class SolverFeatherPGS(SolverBase):
             self._build_mf_body_map()
         wp.launch(
             response_builds_rows.free_body_publish_kernel,
-            dim=self.world_count * self.max_mf_bodies * 6,
+            dim=self.world_count * self.max_mf_bodies,
             inputs=[
                 bind_mf_body_map(self),
                 self.mf_constraint_count,
-                self.mf_MiJt_a,
-                self.mf_MiJt_b,
+                self.mf_Z_a,
+                self.mf_Z_b,
+                self.mf_row_type,
                 self.mf_impulses,
+                self._body_factors(),
                 self.max_mf_bodies,
                 int(set_output_to_delta),
             ],
@@ -10283,25 +10282,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _mf_pgs_setup(self, state_aug: State, dt: float):
-        """MF PGS setup: compute Hinv, compute effective mass and RHS."""
+        """MF PGS setup: whiten the free-body rows through each body's held factor, their diagonals and RHS."""
         model = self.model
-
-        # Compute H^-1 = inverse(body_I_s) for free rigid bodies
-        wp.launch(
-            response_builds_rows.free_body_inverse_kernel,
-            dim=self._free_rigid_body_count,
-            inputs=[
-                self.free_rigid_body_indices,
-                state_aug.body_I_s,
-                self.is_free_rigid,
-                self.body_to_articulation,
-                model.body_flags,
-            ],
-            outputs=[self.mf_body_Hinv],
-            device=model.device,
-        )
-
-        # Compute effective mass and RHS
         self.mf_rhs.zero_()
         self.mf_eff_mass_inv.zero_()
         wp.launch(
@@ -10310,10 +10292,8 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 bind_mf_rows(self),
                 self.mf_constraint_count,
-                self.mf_body_Hinv,
+                self._body_factors(),
                 int(self._has_prescribed_response),
-                self.body_to_articulation,
-                self.articulation_dof_start,
                 self.v_hat,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_cfm,
@@ -10324,9 +10304,35 @@ class SolverFeatherPGS(SolverBase):
                 self._effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
             ],
-            outputs=[self.mf_eff_mass_inv, self.mf_MiJt_a, self.mf_MiJt_b, self.mf_row_w],
+            outputs=[self.mf_eff_mass_inv, self.mf_row_w],
             device=model.device,
         )
+
+    def _build_body_factors(self) -> BodyFactors:
+        """Each free body's held factor and coordinates (:class:`.kernels.BodyFactors`): the dynamics' size-6 factors
+        ``L_by_size[6]`` (armature included), which whiten its rows and map its velocity into factor coordinates, and
+        the lookup of a body's factor by its first global coordinate. Built once with the buffers: a captured step
+        allocates and copies nothing."""
+        device = self.model.device
+        dof_factor = np.full(max(int(self.model.joint_dof_count), 1), -1, dtype=np.int32)
+        if self._has_free_rigid_bodies:
+            free = np.flatnonzero(self._model_plan.is_free_rigid != 0)
+            factor_index = self.art_group_idx.numpy()[free]
+            starts = self.articulation_dof_start.numpy()[free]
+            held = factor_index >= 0
+            dof_factor[starts[held]] = factor_index[held]
+        factors = BodyFactors()
+        factors.body_to_articulation = getattr(self, "body_to_articulation", None)
+        factors.factor_index = getattr(self, "art_group_idx", None)
+        factors.dof_start = getattr(self, "articulation_dof_start", None)
+        factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
+        lower = self.L_by_size.get(6) if self._has_free_rigid_bodies else None
+        factors.L = lower if lower is not None else wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
+        return factors
+
+    def _body_factors(self) -> BodyFactors:
+        """The free bodies' factors and coordinates (:meth:`_build_body_factors`)."""
+        return self._body_factors_data
 
     def _compute_mf_rhs_bias(
         self,
@@ -10345,15 +10351,14 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 bind_mf_rows(self, rhs=output),
                 self.mf_constraint_count,
+                self._body_factors(),
                 int(self._has_prescribed_response),
-                self.world_dof_indices,
                 self.rigid_body_max_depenetration_velocity,
                 self.pgs_beta,
                 dt,
                 bias_scale,
                 speculative_scale,
                 self.v_out_snap,
-                self.v_hat,
                 int(preserve_unreached_speculative),
                 int(apply_restitution),
                 self._effective_restitution_velocity_threshold,
@@ -10390,10 +10395,9 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_body_dof_start,
                     self.mf_local_body_a,
                     self.mf_local_body_b,
-                    self.mf_J_a,
-                    self.mf_J_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
+                    self.mf_Z_a,
+                    self.mf_Z_b,
+                    self._body_factors(),
                     self.mf_eff_mass_inv,
                     self.mf_rhs,
                     self.mf_row_type,
@@ -10429,10 +10433,9 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_constraint_count,
                     self.mf_body_a,
                     self.mf_body_b,
-                    self.mf_MiJt_a,
-                    self.mf_MiJt_b,
-                    self.mf_J_a,
-                    self.mf_J_b,
+                    self.mf_Z_a,
+                    self.mf_Z_b,
+                    self._body_factors(),
                     self.mf_eff_mass_inv,
                     self.mf_rhs,
                     self.mf_row_type,
