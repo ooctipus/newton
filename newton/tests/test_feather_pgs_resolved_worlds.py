@@ -380,7 +380,7 @@ class TestResolvedWorlds(unittest.TestCase):
         """Keep unsupported solvers disabled without raising or launching."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
-            _laws=plain_laws(forward_cuda=False, matrix_free=False),
+            _laws=plain_laws(forward_cuda=False),
             _route_pins={},
         )
         classifier = rw.ResolvedWorlds(solver)
@@ -490,7 +490,7 @@ class TestResolvedWorlds(unittest.TestCase):
         for law, beta, bound in (("patch", None, (48, 24)), ("point", 0.0, None)):
             with self.subTest(law=law):
                 solver = SolverFeatherPGS(
-                    model, pgs_mode="split", dense_max_constraints=48, mf_max_constraints=24, friction_anchor_beta=beta
+                    model, dense_max_constraints=48, mf_max_constraints=24, friction_anchor_beta=beta
                 )
                 # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
                 # which the mocked decision launch never reads.
@@ -568,7 +568,6 @@ def _rollout(
     with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
@@ -797,7 +796,6 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
         with patch.dict(os.environ, env):
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 pgs_iterations=8,
                 enable_joint_limits=True,
                 dense_max_constraints=56,

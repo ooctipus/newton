@@ -38,42 +38,38 @@ def _admission_probe(**changes):
     return probe
 
 
-def _admit(probe, *, split=False, velocity=False, lanes=0):
-    return SolverFeatherPGS._admit_sparse_active_rows(
-        probe, split_candidate=split, velocity_candidate=velocity, small_world_lanes=lanes
-    )
+def _admit(probe, *, velocity=False, lanes=0):
+    return SolverFeatherPGS._admit_sparse_active_rows(probe, velocity_candidate=velocity, small_world_lanes=lanes)
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
     def test_point_admission(self):
-        """Admit point friction's active rows unless split, velocity-limit rows or a pin keep the full sweep."""
-        for pins, split, velocity, lanes in (
-            ({}, False, False, 0),
-            ({}, False, False, 16),
-            ({"active_rows": False}, False, False, 0),
-            ({}, True, False, 8),
-            ({}, False, True, 0),
+        """Admit point friction's active rows unless velocity-limit rows or a pin keep the full sweep."""
+        for pins, velocity, lanes in (
+            ({}, False, 0),
+            ({}, False, 16),
+            ({"active_rows": False}, False, 0),
+            ({}, True, 0),
         ):
-            expected = not pins and not split and not velocity
-            with self.subTest(pins=pins, split=split, velocity=velocity):
+            expected = not pins and not velocity
+            with self.subTest(pins=pins, velocity=velocity):
                 probe = _admission_probe(_route_pins=pins)
-                active, reason = _admit(probe, split=split, velocity=velocity, lanes=lanes)
+                active, reason = _admit(probe, velocity=velocity, lanes=lanes)
                 self.assertEqual(active, expected)
                 if active:
                     self.assertEqual(reason, "Point-contact normal and limit rows are selected at sweep entry.")
 
     def test_patch_admission_follows_small_worlds(self):
         """Select patch rows at sweep entry unless a small world keeps its packed lanes (or a pin the full sweep)."""
-        for pins, lanes, split, expected, phrase in (
-            ({}, 0, False, True, "ring"),
-            ({"active_rows": False}, 0, False, False, "active_rows=False"),
-            ({}, 16, False, False, "16-lane"),
-            ({}, 8, False, False, "8-lane"),
-            ({}, 0, True, False, "Split"),
+        for pins, lanes, expected, phrase in (
+            ({}, 0, True, "ring"),
+            ({"active_rows": False}, 0, False, "active_rows=False"),
+            ({}, 16, False, "16-lane"),
+            ({}, 8, False, "8-lane"),
         ):
-            with self.subTest(pins=pins, lanes=lanes, split=split):
+            with self.subTest(pins=pins, lanes=lanes):
                 probe = _admission_probe(_friction_anchors_enabled=True, _route_pins=pins)
-                active, reason = _admit(probe, split=split, lanes=lanes)
+                active, reason = _admit(probe, lanes=lanes)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
 
@@ -175,7 +171,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         active = staging(low, active_rows=True)
         self.assertFalse(active.fits(budget))
         options = {
-            "pgs_mode": "matrix_free",
             "drive_mode": "augmented",
             "enable_joint_velocity_limits": False,
             "dense_max_constraints": low,

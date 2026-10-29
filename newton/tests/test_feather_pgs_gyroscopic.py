@@ -34,25 +34,21 @@ def _model(device, inertia, omega, *, armature=0.0, mass=1.0):
 
 def test_free_spin_energy(test, device):
     inertia = np.diag([0.001, 0.02, 0.0205])
-    for mode in ("split", "matrix_free"):
-        if mode == "matrix_free" and not wp.get_device(device).is_cuda:
-            continue
-        model, state, output = _model(device, inertia, (100.0, 20.0, 50.0))
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=mode, angular_damping=0.0)
-        control = model.control()
+    model, state, output = _model(device, inertia, (100.0, 20.0, 50.0))
+    solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+    control = model.control()
+    omega = _body_omega(state)
+    energy = 0.5 * omega @ inertia @ omega
+    momentum = np.linalg.norm(inertia @ omega)
+    for step in range(1000):
+        solver.step(state, output, control, None, 1.0 / 240.0)
+        state, output = output, state
         omega = _body_omega(state)
-        energy = 0.5 * omega @ inertia @ omega
-        momentum = np.linalg.norm(inertia @ omega)
-        with test.subTest(mode=mode):
-            for step in range(1000):
-                solver.step(state, output, control, None, 1.0 / 240.0)
-                state, output = output, state
-                omega = _body_omega(state)
-                observed = 0.5 * omega @ inertia @ omega
-                test.assertTrue(np.isfinite(observed), f"nonfinite energy at step {step}")
-                test.assertAlmostEqual(observed / energy, 1.0, delta=1.0e-3, msg=f"step {step}")
-            test.assertAlmostEqual(np.linalg.norm(inertia @ omega) / momentum, 1.0, delta=1.0e-3)
-            np.testing.assert_allclose(state.body_qd.numpy()[0, :3], [0.1, 0.2, 0.3], atol=2.0e-4)
+        observed = 0.5 * omega @ inertia @ omega
+        test.assertTrue(np.isfinite(observed), f"nonfinite energy at step {step}")
+        test.assertAlmostEqual(observed / energy, 1.0, delta=1.0e-3, msg=f"step {step}")
+    test.assertAlmostEqual(np.linalg.norm(inertia @ omega) / momentum, 1.0, delta=1.0e-3)
+    np.testing.assert_allclose(state.body_qd.numpy()[0, :3], [0.1, 0.2, 0.3], atol=2.0e-4)
 
 
 def test_principal_axis_torque(test, device):
@@ -184,7 +180,6 @@ def _mixed_scene(device, *, arm, totes):
     with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split",
             angular_damping=0.0,
             mf_gs_incremental_rows=0,
         )

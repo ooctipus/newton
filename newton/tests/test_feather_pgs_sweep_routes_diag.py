@@ -19,9 +19,8 @@ from pathlib import Path
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
-from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBodyZ, Lanes, SparsePairJY, Velocity
+from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, SparsePairJY, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
-from newton._src.solvers.feather_pgs.staging import arch_budget
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
@@ -51,12 +50,6 @@ class TestSweepRoutesDiagOptions(unittest.TestCase):
                 (32, 30, 15, "sm_120"),
                 {"contact_triples": True, "speculative_contact_batches": True},
             ),
-            (routes.tiled_row_kernel, (32, "sm_120"), {"staging": "dense"}),
-            (routes.tiled_row_kernel, (32, "sm_120"), {"row_budget": 16}),
-            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 24}),
-            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 32, "min_rows": 32}),
-            (routes.tiled_row_kernel, (64, "sm_120"), {"row_budget": 32, "staging": "global"}),
-            (routes.tiled_row_kernel, (64, "sm_120"), {"min_rows": 8}),
         ]
         for factory, args, kwargs in cases:
             with self.subTest(factory=factory.__name__, kwargs=kwargs), self.assertRaises(ValueError):
@@ -113,45 +106,6 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertIn("s_v[scalar_coord] += sib_response * sib_delta;", text)
             self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_response * sib_delta;", text)
 
-    def test_tiled_row_stagings(self):
-        for rows, staging in itertools.product((32, 64, 128), ("shared", "global")):
-            with self.subTest(rows=rows, staging=staging):
-                text, declared = routes.tiled_row_source(rows, staging=staging)
-                _balanced(self, text)
-                # Six row vectors, the packed triangle when shared, and Warp's tile storage of a warp.
-                triangle = rows * (rows + 1) // 2 if staging == "shared" else 0
-                self.assertEqual(declared.bytes, 4 * (6 * rows + triangle + 32))
-                self.assertEqual("s_Ctri" in declared, staging == "shared")
-                # Impulse space: every lane keeps its own impulses, nothing is synchronized in the sweeps.
-                sweeps = text[text.index("for (int iter = 0;") :]
-                self.assertNotIn("SYNC()", sweeps)
-
-    def test_tiled_row_refuses_a_triangle_past_the_static_budget(self):
-        # The triangle's static shared memory against the device's budget (staging.arch_budget): 150 rows fill an
-        # offline build's 48 KiB, 217 the RTX PRO 6000's 100,352 B.
-        budget = arch_budget("sm_120")
-        rows = max(r for r in range(64, 320) if routes.tiled_row_source(r)[1].bytes <= budget)
-        routes.tiled_row_kernel(rows, "sm_120")
-        with self.assertRaisesRegex(ValueError, "static shared memory"):
-            routes.tiled_row_kernel(rows + 1, "sm_120")
-
-    def test_tiled_row_budget_sources(self):
-        for rows, budget, minimum in ((64, 16, 0), (64, 32, 0), (64, 64, 32), (128, 32, 0), (128, 128, 32)):
-            with self.subTest(rows=rows, budget=budget, minimum=minimum):
-                text, declared = routes.tiled_row_source(rows, row_budget=budget, min_rows=minimum)
-                _balanced(self, text)
-                self.assertIn(f"const int off2 = world * {rows * rows};", text)
-                self.assertEqual(declared.bytes, 4 * (6 * budget + budget * (budget + 1) // 2 + 32))
-
-    def test_mf_split_sources(self):
-        for vlim in (False, True):
-            with self.subTest(has_velocity_limit_rows=vlim):
-                text, declared = routes.mf_split_source(512, 64, has_velocity_limit_rows=vlim)
-                _balanced(self, text)
-                # Velocities, impulses, the bodies' first coordinates and their factors' indices.
-                self.assertEqual(declared.bytes, 4 * (64 * 6 + 512 + 64 + 64) + 4 * 32)
-                self.assertEqual("ProjectionLaw::speed_row" in text, vlim)
-
 
 class TestSweepRoutesDiagOperators(unittest.TestCase):
     """The operators' layouts emit the order of the sweeps they replace."""
@@ -204,19 +158,6 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("__fmul_rn(jacobian, s_v[scalar_coord])", scalar.residual("jv", ""))
         self.assertEqual(warp.step("r", "i"), "-r / d[i]")
 
-    def test_assembled_stagings_read_their_entries(self):
-        shared = Assembled(64, "64", "shared")
-        stored = Assembled(64, "64", "global")
-        self.assertIn("j0 <= i ? s_Ctri[base_i + j0] : s_Ctri[jb0 + i]", shared.residual("jv", ""))
-        self.assertIn("world_C.data[row_i + j1]", stored.residual("jv", ""))
-        # The coupling is C(s, i) below the diagonal, the entry both stagings hold.
-        self.assertIn("s_Ctri[((sib * (sib + 1)) >> 1) + i]", shared.coupling("cross", "i", "sib", ""))
-        self.assertIn("world_C.data[off2 + sib * 64 + i]", stored.coupling("cross", "i", "sib", ""))
-        self.assertEqual(shared.apply("d", ""), "")
-        self.assertFalse(shared.applies)
-        with self.assertRaises(ValueError):
-            Assembled(64, "64", "dense")
-
 
 def _assemble(kernel, arch: int = 120) -> dict:
     """Assemble a kernel's module offline (Warp's PTX, then ``ptxas``) and return its entry's resources."""
@@ -252,8 +193,6 @@ class TestSweepRoutesDiagAssembly(unittest.TestCase):
                 (32, 14, 6, "sm_120"),
                 {"contact_triples": True, "speculative_contact_batches": True},
             ),
-            (routes.tiled_row_kernel, (64, "sm_120"), {"staging": "global"}),
-            (routes.mf_split_kernel, (512, 64, "sm_120"), {"has_velocity_limit_rows": True}),
         ]
         for factory, args, kwargs in cases:
             with self.subTest(factory=factory.__name__, kwargs=kwargs):

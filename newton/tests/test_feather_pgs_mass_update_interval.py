@@ -198,9 +198,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         for forced in (False, True):
             model = _build("cuda:0", worlds=3)
             with mock.patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
-                solver = SolverFeatherPGS(
-                    model, update_mass_matrix_interval=2, pgs_mode="split", friction_anchor_beta=0.0
-                )
+                solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, friction_anchor_beta=0.0)
             owner = solver._tree_kinetic_state
             self.assertIsNotNone(owner)
             self.assertTrue(owner.bank_compare)
@@ -238,7 +236,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
         """Keep matrix-free dynamics publication on its validated zero-copy path."""
         model = _build_floating_model("cuda:0")
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
 
         self.assertTrue(solver._fk_id_cache_enabled)
 
@@ -246,7 +244,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = _ordinary_solver(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
+        solver = _ordinary_solver(model, enable_joint_velocity_limits=True)
         self.assertFalse(solver._fk_id_cache_enabled)
         self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
 
@@ -340,14 +338,14 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         before every frame and clears whatever the solver carries across steps; the solver allocates at construction.
         """
         warm_model = _build_model("cuda:0", ground=False)
-        warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        warm_solver = SolverFeatherPGS(warm_model, update_mass_matrix_interval=2)
         warm_solver.step(_make_initial_state(warm_model), warm_model.state(), warm_model.control(), None, DT)
         wp.synchronize_device("cuda:0")
 
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
-        eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
+        graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2)
+        eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()

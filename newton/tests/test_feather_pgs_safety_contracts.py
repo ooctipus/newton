@@ -4,7 +4,6 @@
 """Exercise capacity, dispatch and history contracts on ordinary robot defaults."""
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -30,31 +29,6 @@ def _driven_model(count=1, worlds=1, device="cpu"):
 
 
 class TestFeatherPGSSafety(unittest.TestCase):
-    @unittest.skipUnless(wp.is_cuda_available(), "requires the native tiled CUDA solver")
-    def test_partial_warp_capacity_preserves_world_boundaries(self):
-        """Keep partial-warp loads and stores inside each world's row allocation."""
-        device = wp.get_cuda_device()
-        for capacity in (33, 35, 40):
-            with self.subTest(capacity=capacity):
-                model = _driven_model(worlds=3, device=device)
-                with mock.patch.dict(SolverFeatherPGS._route_pins, {"pgs_kernel": "tiled_row"}):
-                    solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=capacity)
-                initial = np.zeros((3, capacity), dtype=np.float32)
-                initial[2] = 1234.0  # Inactive world must remain untouched.
-                solver.constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))
-                solver.impulses.assign(initial)
-                solver.diag.fill_(2.0)
-                solver.C.assign(np.tile(2.0 * np.eye(capacity, dtype=np.float32), (3, 1, 1)))
-                solver.rhs.fill_(-1.0)
-                solver.row_type.zero_()
-                solver.row_parent.zero_()
-                solver.row_mu.zero_()
-                solver._dispatch_dense_pgs_solve(iterations=1, friction_start_iteration=0)
-                expected = initial.copy()
-                expected[0] = 0.5
-                expected[1, 0] = 0.5
-                np.testing.assert_array_equal(solver.impulses.numpy(), expected)
-
     def test_partial_reset_refreshes_only_selected_mass_factors(self):
         """Preserve factor reuse in worlds outside a partial episode reset."""
         devices = ["cpu", wp.get_cuda_device()] if wp.is_cuda_available() else ["cpu"]

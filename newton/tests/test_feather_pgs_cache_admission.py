@@ -31,7 +31,6 @@ def _held_tree_solver(law):
         _laws=plain_laws(**_CONTACT_LAWS[law]),
         size_groups=[9],
         _sparse_mass_matrix_size=None,
-        pgs_mode="matrix_free",
         _fk_id_cache_available=True,
         _parallel_augmented_drive_topology=True,
         _compact_diagonal_mass_size=None,
@@ -50,8 +49,6 @@ def _sparse_tree_solver(**changes):
         _mimic_valid_np=None,
         _has_prescribed_response=False,
         _fk_id_cache_available=True,
-        pgs_mode="matrix_free",
-        _sparse_split=False,
         _parallel_augmented_drive_topology=True,
     )
     for name, value in changes.items():

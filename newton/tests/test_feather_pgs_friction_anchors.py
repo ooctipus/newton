@@ -92,7 +92,6 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
 
 
 _SQUEEZE_SOLVER = {
-    "pgs_mode": "matrix_free",
     "pgs_iterations": 64,
     "pgs_velocity_iterations": 0,
     "pgs_beta": 0.05,
@@ -155,9 +154,7 @@ def _build_incline(theta_deg: float, mu: float):
 def _run_incline(steps: int, dt: float, **solver_kwargs):
     theta, mu = 30.0, 0.3
     model, box, _rot = _build_incline(theta, mu)
-    solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=32, pgs_beta=0.05, **solver_kwargs
-    )
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=32, pgs_beta=0.05, **solver_kwargs)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
@@ -308,7 +305,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertGreater(c_dense[0], 0)
         # matrix-free route: free box resting on a static slab
         model, _, _ = _build_incline(0.0, 0.5)
-        c_mf = check(model, {"pgs_mode": "matrix_free", "pgs_iterations": 16, "pgs_beta": 0.05})
+        c_mf = check(model, {"pgs_iterations": 16, "pgs_beta": 0.05})
         self.assertGreater(c_mf[1], 0)
 
     def test_graph_capture_replays(self):
@@ -492,7 +489,7 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         device = "cpu"
         model = _build_two_world_free_model(device)
         solver = newton.solvers.SolverFeatherPGS(
-            model, pgs_mode="split", friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
+            model, friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
         )
         self.assertFalse(solver.pgs_warmstart)
         n = solver._friction_patches.previous.valid.shape[0]

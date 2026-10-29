@@ -236,9 +236,6 @@ class Example:
             self.body_pair_reduction = args.solver == "fpgs" and args.scene == "hardware"
         if self.body_pair_reduction and args.solver != "fpgs":
             raise ValueError("Body-pair reduction currently supports FPGS only")
-        free_objects = self.object_count + (args.scene in ("coins", "hardware", "dishes"))
-        if args.solver == "fpgs" and args.pgs_mode == "split" and args.scene != "cube" and free_objects > 64:
-            raise ValueError("This split solver's body map supports at most 64 free objects; use matrix_free")
 
         container_grasp = args.scene in ("coins", "hardware", "dishes")
         # Pull the heavy bin along its handle-to-COM line instead of yawing it.
@@ -334,7 +331,6 @@ class Example:
             )
             self.solver = newton.solvers.SolverFeatherPGS(
                 self.model,
-                pgs_mode=args.pgs_mode,
                 pgs_iterations=args.iterations,
                 dense_max_constraints=args.dense_rows or (2304 if args.scene == "cube" else 256),
                 mf_max_constraints=self.mf_rows,
@@ -490,7 +486,6 @@ class Example:
                 result["container_y_travel_m"] = float(np.ptp(moving[:, 2]))
                 result["container_z_range_m"] = [float(moving[:, 3].min()), float(moving[:, 3].max())]
         if self.args.solver == "fpgs":
-            result["pgs_mode"] = self.args.pgs_mode
             result["mf_row_capacity_per_world"] = self.mf_rows
             result["rows"] = self.solver.constraint_row_watermarks()
         result["body_pair_reduction"] = self.body_pair_reduction
@@ -535,7 +530,6 @@ def create_parser():
         "--dense-rows", type=int, default=None, help="Articulated row storage: cube 2304, otherwise 256."
     )
     parser.add_argument("--mf-rows", type=int, default=None, help="Free-body row storage, independent of raw contacts.")
-    parser.add_argument("--pgs-mode", choices=("split", "matrix_free"), default="matrix_free")
     parser.add_argument(
         "--body-pair-reduction",
         action=argparse.BooleanOptionalAction,

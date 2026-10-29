@@ -203,7 +203,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         build their arms in this order.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owners = {}
         for name, reference, clocked in (
             ("reference", True, False),
@@ -236,7 +236,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         factories' default.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         dt = 1.0 / 240.0

@@ -46,7 +46,7 @@ class TestContactComplianceLaw(unittest.TestCase):
             ("enable_restitution", True),
             ("contact_friction_shared_anchor", True),
         ):
-            kwargs = {"pgs_mode": "matrix_free", "enable_restitution": False, key: value}
+            kwargs = {"enable_restitution": False, key: value}
             with self.assertRaisesRegex(ValueError, key):
                 SolverFeatherPGS(model, contact_compliance=True, **kwargs)
 

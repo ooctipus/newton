@@ -520,11 +520,6 @@ def _solver_factory_calls():
         factory = sweep_routes_local.paired_factor_kernel.__wrapped__
         args = (192, 29, 23, 6, _ARCH, False, components)
         yield "sweep_routes_local.paired_factor_kernel", factory, args, {"contact_units": True}
-    # The split free-body sweep: the plain call (the variant without the free-body velocity-limit law, under
-    # the factory's default label) and the variant with the law.
-    factory = sweep_routes_diag.mf_split_kernel.__wrapped__
-    for kwargs in ({}, {"has_velocity_limit_rows": True}):
-        yield "sweep_routes_diag.mf_split_kernel", factory, (32, 8, _ARCH), kwargs
 
     def tier_without_world_rows(*args, world_rows, **kwargs):
         # These pins were recorded with world_rows=False in their labels, before the in-sweep world rows went.
@@ -553,7 +548,7 @@ def _spliced_sweep_calls():
     an articulation pair and the pair's residual with matrix-free rows. Then the
     tiled-row sweep with and without row budgets and the legacy matrix-free sweep.
     """
-    from newton._src.solvers.feather_pgs import row_packets, sweep_routes_diag, sweep_routes_local  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import row_packets, sweep_routes_local  # noqa: PLC0415
 
     local = sweep_routes_local.local_owned_kernel.__wrapped__
     packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
@@ -566,13 +561,6 @@ def _spliced_sweep_calls():
         kwargs = {**options, "warps_per_block": 2}
         yield "sweep_routes_local.local_owned_kernel", local, args, kwargs
         yield "row_packets.get_local_factory(9, 6, 40)", packets, args, kwargs
-    tiled = sweep_routes_diag.tiled_row_kernel.__wrapped__
-    for capacity in (64, 128):
-        yield "sweep_routes_diag.tiled_row_kernel", tiled, (capacity, _ARCH), {}
-        for budget, minimum in ((32, 0), (capacity, 32)):
-            kwargs = {"row_budget": budget, "min_rows": minimum}
-            yield "sweep_routes_diag.tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
-    yield "sweep_routes_diag.mf_split_kernel", sweep_routes_diag.mf_split_kernel.__wrapped__, (32, 8, _ARCH), {}
 
 
 def _suite_shape_calls():
@@ -884,8 +872,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         for family in (
             "sweep_routes_local.local_owned_kernel",
             "row_packets.get_local_factory",
-            "sweep_routes_diag.tiled_row_kernel",
-            "sweep_routes_diag.mf_split_kernel",
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)

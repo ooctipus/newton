@@ -153,13 +153,13 @@ DENSE_DRIVE_LIMITS = FieldGroup(Field("drive_vel_limit", wp.float32, ("world", "
 """Per-row joint velocity limits of the fused drive-row clamp."""
 
 DENSE_DELASSUS = FieldGroup(Field("C", wp.float32, ("world", "row", "row")))
-"""The assembled Delassus matrices of split mode."""
+"""The assembled Delassus matrices of the CPU's split mode."""
 
 WORLD_RESPONSE = FieldGroup(
     Field("J_world", wp.float32, ("world", "row", "world_dof"), mirror=True),
     Field("Y_world", wp.float32, ("world", "row", "world_dof"), mirror=True),
 )
-"""World-indexed Jacobian and response of matrix-free and sparse split modes."""
+"""World-indexed Jacobian and response of the CUDA (matrix-free) route."""
 
 DENSE_WARMSTART = FieldGroup(
     Field("_ws_prev_dense_impulses", wp.float32, ("world", "row")),
@@ -320,7 +320,7 @@ MF_BODY_MAP = FieldGroup(
     Field("mf_local_body_a", wp.int32, ("world", "mf_row")),
     Field("mf_local_body_b", wp.int32, ("world", "mf_row")),
 )
-"""Body maps of the tiled matrix-free sweep (split mode) and of the warm start's publication."""
+"""Body maps of the free-body warm start's publication."""
 
 MF_WARMSTART = FieldGroup(
     Field("_ws_prev_mf_impulses", wp.float32, ("world", "mf_row")),

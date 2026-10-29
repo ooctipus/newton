@@ -107,7 +107,6 @@ def _selection(model, flags):
         os.environ.update(flags)
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free" if model.device.is_cuda else "split",
             pgs_iterations=8,
             enable_joint_limits=True,
             friction_anchor_beta=0.0,

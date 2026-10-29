@@ -233,7 +233,7 @@ def cpu_solver(model, size):
     drive rows nor the sparse-diagonal response; give it both so that the
     scalar kernels and the head kernels bind the arrays the CUDA route binds.
     """
-    solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True, update_mass_matrix_interval=2)
+    solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
     solver._setup_parallel_augmented_drive_topology(model, True)
     solver._compact_diagonal_mass_size = size
     solver._fk_id_cache_enabled = True
@@ -255,7 +255,6 @@ def same(test, expected, actual, index, name):
 def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
     """The keyboard recipe's solver: compact contacts, plus scalar branches if asked; ``pins`` are more route pins."""
     arguments = {
-        "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
         "update_mass_matrix_interval": 2,
         "enable_joint_limits": True,
@@ -1073,12 +1072,12 @@ class TestScalarBranchRule(unittest.TestCase):
         for leaves in (PRESS_LEAVES, STAR_LEAVES, KEYBOARD_LEAVES):
             with self.subTest(leaves=leaves):
                 model = build_branch_model(worlds=2, leaves=leaves, shapes=True)
-                solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True)
+                solver = SolverFeatherPGS(model, enable_joint_limits=True)
                 self.assertEqual(sorted(solver.size_groups), sorted((leaves, ARM_DOFS)))
                 self.assertEqual(set(solver._diagonal_mass_sizes), {leaves})
         # An arm-sized star joins the arm's group: no diagonal-mass size is left to admit.
         model = build_branch_model(worlds=2, leaves=ARM_DOFS, shapes=True)
-        solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True)
+        solver = SolverFeatherPGS(model, enable_joint_limits=True)
         self.assertEqual((solver.size_groups, set(solver._diagonal_mass_sizes)), ([ARM_DOFS], set()))
 
     def test_other_topologies_are_declined(self):
@@ -1292,7 +1291,7 @@ class TestScalarBranchRule(unittest.TestCase):
 
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
-        record = SolverFeatherPGS(build_branch_model(worlds=2), pgs_mode="split").get_path_selection()
+        record = SolverFeatherPGS(build_branch_model(worlds=2)).get_path_selection()
         json.dumps(record, allow_nan=False)
         self.assertEqual(
             record["routes"]["held_tree"]["scalar_branches"],
@@ -1626,7 +1625,7 @@ class TestGripperContactBound(unittest.TestCase):
                 values = getattr(model, name).numpy()
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
-        solver = recipe_solver(model, scalar=False, pgs_mode="split", pgs_iterations=iterations)
+        solver = recipe_solver(model, scalar=False, pgs_iterations=iterations)
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def _head_and_reference(self):

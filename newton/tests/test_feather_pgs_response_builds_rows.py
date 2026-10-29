@@ -61,7 +61,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         builder.joint_armature[-6:] = [armature] * 6
         builder.add_ground_plane()
         model = builder.finalize(device=DEVICE)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split")
+        solver = newton.solvers.SolverFeatherPGS(model)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state, out = model.state(), model.state()

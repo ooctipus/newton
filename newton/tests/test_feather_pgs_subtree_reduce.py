@@ -82,7 +82,6 @@ def _rollout(model, *, level_loop, steps=60):
     ):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,

@@ -695,7 +695,7 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state_0, contacts)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True)
         with self.assertRaisesRegex(NotImplementedError, "contact_matching"):
             solver.step(state_0, state_1, model.control(), contacts, DT)
 
@@ -1006,7 +1006,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            pgs_mode="matrix_free",
             dense_max_constraints=4,
             mf_max_constraints=4,
         )
@@ -1061,18 +1060,16 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         """Settle identically on/off in every FeatherPGS contact mode.
 
         supports_body_pair_reduced_contacts is class-wide, so the evidence must cover
-        the dense and matrix-free contact paths, not only the default split
-        mode the other tests exercise (matrix-free additionally runs generated
-        native CUDA).
+        the dense and free-body contact paths of the CUDA route (generated native
+        CUDA), not only the CPU route the other tests exercise.
         """
         if not wp.get_device().is_cuda:
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
         configs = [
-            ("split", 16, _prismatic_jointed_foot, "dense"),
-            ("split", 16, _free_jointed_foot, "mf"),
-            # Matrix-free is CUDA-only.
-            ("matrix_free", None, _free_jointed_foot, "mf"),
+            (16, _prismatic_jointed_foot, "dense"),
+            (16, _free_jointed_foot, "mf"),
+            (None, _free_jointed_foot, "mf"),
         ]
         # The dense entries run 16 iterations. The ``None`` entry deliberately
         # omits pgs_iterations and asserts the production default (12), rather
@@ -1082,17 +1079,16 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # redundant near-parallel rows hurt PGS conditioning, the same effect as
         # the stack-collapse case, and reduction itself is what removes it. The
         # comparison must be against a converged baseline.
-        for mode, iters, build_foot, row_path in configs:
-            with self.subTest(pgs_mode=mode, row_path=row_path):
+        for iters, build_foot, row_path in configs:
+            with self.subTest(iterations=iters, row_path=row_path):
 
-                def make_solver(model, mode=mode, iters=iters):
+                def make_solver(model, iters=iters):
                     kwargs = {}
                     if iters is not None:
                         kwargs["pgs_iterations"] = iters
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
                         angular_damping=0.0,
-                        pgs_mode=mode,
                         row_watermark=True,
                         **kwargs,
                     )
@@ -2276,7 +2272,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         plain = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
         contacts = plain.contacts()
         plain.collide(state_0, contacts)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True)
         control = model.control()
         solver.step(state_0, state_1, control, contacts, DT)
         with wp.ScopedCapture(device) as solver_capture:
@@ -3078,7 +3074,6 @@ class TestBodyPairReductionTouchingFootprint(unittest.TestCase):
             contacts = pipeline.contacts()
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 pgs_iterations=16,
                 pgs_beta=0.2,
                 pgs_contact_regularization=0.01,

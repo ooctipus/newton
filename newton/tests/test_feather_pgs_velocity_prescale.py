@@ -559,7 +559,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     model = _solver_model(device)
                     solver = SolverFeatherPGS(
                         model,
-                        pgs_mode="matrix_free",
                         enable_joint_velocity_limits=True,
                         drive_mode=drive_mode,
                     )
@@ -618,7 +617,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         with patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 drive_mode="augmented",
                 enable_joint_limits=True,
                 enable_joint_velocity_limits=True,

@@ -15,8 +15,6 @@ _KERNEL_FACTORIES = {
         "factor_tiles_kernel",
         "response_warps_kernel",
         "response_tiles_kernel",
-        "delassus_stream_kernel",
-        "delassus_tiles_kernel",
     ),
     "response_builds_rows.py": (
         "free_body_meta_kernel",
@@ -25,8 +23,6 @@ _KERNEL_FACTORIES = {
         "paired_components_kernel",
     ),
 }
-# The factories whose kernel depends on the device it is built for: the CPU's serial form, the device's budget.
-_DEVICE_KERNEL_FACTORIES = (("response_builds_dense.py", "delassus_stream_kernel"),)
 
 
 def _top_level_functions(module: str) -> dict:
@@ -68,15 +64,6 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                     self.assertIn(name, functions)
                     decorators = {ast.unparse(decorator) for decorator in functions[name].decorator_list}
                     self.assertTrue(decorators & {"cache", "functools.cache"}, decorators)
-
-    def test_device_dependent_factories_take_the_device(self):
-        for module, name in _DEVICE_KERNEL_FACTORIES:
-            with self.subTest(module=module, factory=name):
-                factory = _top_level_functions(module)[name]
-                parameters = {
-                    arg.arg for arg in [*factory.args.posonlyargs, *factory.args.args, *factory.args.kwonlyargs]
-                }
-                self.assertIn("device_arch", parameters)
 
     def test_plain_response_tiles_kernel_omits_diagonal_output(self):
         factory = _top_level_functions("response_builds_dense.py")["response_tiles_kernel"]

@@ -84,7 +84,6 @@ def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
     pins = {"storage": "dense"} if owner else {"evaluator": "ordinary"}
     pins["grouping"] = "forest" if forest else "per_size"
     settings = {
-        "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
         "enable_joint_limits": True,
         "update_mass_matrix_interval": 2,
@@ -186,7 +185,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         frames, so the FK/ID cache is invalidated.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
         # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
         solver._tree_kinetic_state = owner
@@ -260,7 +259,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         self.assertEqual(validity(), valid)
         model.joint_axis.assign(axes)
         self.assertEqual(invalidating_launches(JOINT), [])
-        ordinary = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        ordinary = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         ordinary._fk_id_cache_enabled = True
         ordinary._fk_id_cache_valid.fill_(1)
         ordinary.notify_model_changed(JOINT)
@@ -275,7 +274,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         old frame.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
         # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
         solver._tree_kinetic_state = owner
@@ -472,7 +471,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     lacks): its groups read prescaled velocities. Each group holds one tree per world.
     """
     model = _build(wp.get_device("cpu"), worlds=worlds)
-    solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
     solver.enable_joint_velocity_limits = motion_velocity
     solver._route_pins.update(pins or {})
     owner = HeldTree(solver)
@@ -1530,7 +1529,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                 with self.subTest(owner=name):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
-                    solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+                    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
                     solver.enable_joint_velocity_limits = motion
                     owner = HeldTree(solver)
                     groups = []
@@ -1819,7 +1818,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         from the factorizations a step runs.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         state_in, state_out = model.state(), model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
         factor = SolverFeatherPGS._stage2_factor
@@ -1836,7 +1835,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         same stage clears and fills H.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         state_in = model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
         state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
@@ -1874,7 +1873,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         Stage 1 of the ordinary route clears H there, so an empty list must not read as "no clears".
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         self.assertIsNone(solver._memset_stream)
         dynamics = solver.get_path_selection()["routes"]["dynamics"]
         self.assertEqual(dynamics["double_buffer_mass_matrix_clear_dofs"], [])

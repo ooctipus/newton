@@ -25,7 +25,7 @@ def _solver(scene, device="cpu"):
     model = scene.build(device)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=384)
+        solver = SolverFeatherPGS(model, dense_max_constraints=384)
     added = [str(warning.message) for warning in caught if "armature" in str(warning.message)]
     return model, solver, added
 

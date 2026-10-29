@@ -24,7 +24,7 @@ from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
-from newton.tests import test_feather_pgs_sparse_split as sparse_split
+from newton.tests import feather_pgs_sparse_scene as sparse_scene
 
 DT = 1.0 / 240.0
 KINEMATIC = int(newton.BodyFlags.KINEMATIC)
@@ -145,15 +145,14 @@ def _kinematic_root_and_box():
 
 
 def _sparse_case(beta, cached, *, kinematic_body=None):
-    """The scene of test_feather_pgs_sparse_split on its native sparse matrix-free route."""
-    model = sparse_split._model()
+    """The branched scene of feather_pgs_sparse_scene on its native sparse route."""
+    model = sparse_scene.branched_model()
     if kinematic_body is not None:
         _set_flag(model, kinematic_body, KINEMATIC)
-    solver = sparse_split._solver(
+    solver = sparse_scene.make_solver(
         model,
         True,
         pins={"evaluator": "ordinary"} if cached == "off" else None,
-        pgs_mode="matrix_free",
         friction_anchor_beta=beta,
     )
     state, out, control = model.state(), model.state(), model.control()
@@ -290,7 +289,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     for cached, load in (("off", wrench), ("auto", wrench), ("auto", 0.0 * wrench)):
                         model, links = _chain(floating=floating)
                         _set_flag(model, links[2], KINEMATIC)
-                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        solver = _solver(model, beta, cached)
                         if cached == "auto":
                             self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                         runs[cached, bool(load.any())] = _Rollout(model, solver, links[2], load).run(40)
@@ -314,7 +313,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     if cached == "auto":
                         self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
                     for _ in range(40):
-                        sparse_split._step(case)
+                        sparse_scene.step(case)
                     runs[cached] = _snapshot(case[2])
                 self.assertTrue(np.isfinite(runs["auto"]["joint_qd"]).all())
                 self._assert_states_close(runs["auto"], runs["off"], what="owner against ordinary")
@@ -328,22 +327,21 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
         """
         wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
         for law, beta in FRICTION_LAWS.items():
-            for mode in ("split", "matrix_free"):
-                with self.subTest(law=law, pgs_mode=mode):
-                    runs = {}
-                    for cached in ("off", "auto"):
-                        model, body = _toggle_scene()
-                        solver = _solver(model, beta, cached, pgs_mode=mode, update_mass_matrix_interval=100)
-                        if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
-                        runs[cached] = self._phases(
-                            model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60
-                        )
-                    self._assert_phases_close(runs["auto"], runs["off"])
-                    held, moved, held_again = (phase["body_q"][body, :3] for phase in runs["auto"])
-                    self.assertLess(float(np.linalg.norm(held)), 1.0e-3)
-                    self.assertGreater(float(moved[0]), 0.05)
-                    self.assertLess(float(np.linalg.norm(held_again - moved)), 1.0e-3)
+            with self.subTest(law=law):
+                runs = {}
+                for cached in ("off", "auto"):
+                    model, body = _toggle_scene()
+                    solver = _solver(model, beta, cached, update_mass_matrix_interval=100)
+                    if cached == "auto":
+                        self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                    runs[cached] = self._phases(
+                        model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60
+                    )
+                self._assert_phases_close(runs["auto"], runs["off"])
+                held, moved, held_again = (phase["body_q"][body, :3] for phase in runs["auto"])
+                self.assertLess(float(np.linalg.norm(held)), 1.0e-3)
+                self.assertGreater(float(moved[0]), 0.05)
+                self.assertLess(float(np.linalg.norm(held_again - moved)), 1.0e-3)
 
     def test_graph_replayed_across_toggles_matches_eager_stepping(self):
         """A step captured before the toggles replays with the inputs each notification re-derives.
@@ -355,24 +353,23 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
         """
         wrench = np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
         for law, beta in FRICTION_LAWS.items():
-            for mode in ("split", "matrix_free"):
-                with self.subTest(law=law, pgs_mode=mode):
-                    runs = {}
-                    for name, cached, graph in (
-                        ("eager ordinary", "off", False),
-                        ("eager owner", "auto", False),
-                        ("replayed owner", "auto", True),
-                    ):
-                        model, body = _toggle_scene()
-                        solver = _solver(model, beta, cached, pgs_mode=mode, update_mass_matrix_interval=100)
-                        runs[name] = self._phases(
-                            model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60, graph=graph
-                        )
-                    replayed = runs["replayed owner"]
-                    self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
-                    self._assert_phases_close(replayed, runs["eager owner"])
-                    self._assert_phases_close(replayed, runs["eager ordinary"])
-                    self.assertGreater(float(replayed[1]["body_q"][body, 0]), 0.05)
+            with self.subTest(law=law):
+                runs = {}
+                for name, cached, graph in (
+                    ("eager ordinary", "off", False),
+                    ("eager owner", "auto", False),
+                    ("replayed owner", "auto", True),
+                ):
+                    model, body = _toggle_scene()
+                    solver = _solver(model, beta, cached, update_mass_matrix_interval=100)
+                    runs[name] = self._phases(
+                        model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60, graph=graph
+                    )
+                replayed = runs["replayed owner"]
+                self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                self._assert_phases_close(replayed, runs["eager owner"])
+                self._assert_phases_close(replayed, runs["eager ordinary"])
+                self.assertGreater(float(replayed[1]["body_q"][body, 0]), 0.05)
 
     def test_forest_and_per_size_groups_absorb_a_probe_toggle(self):
         """Both group forms of a world with a prescribed root keep the owner while its probe toggles."""
@@ -388,7 +385,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     runs = {}
                     for cached in ("off", "auto"):
                         model, box, probe = _pair_scene()
-                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        solver = _solver(model, beta, cached)
                         self.assertTrue(solver._has_prescribed_response)
                         if cached == "auto":
                             groups = solver._tree_kinetic_state.groups
@@ -422,7 +419,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     runs = {}
                     for cached in ("off", "auto"):
                         model, links = _chain(floating=base == "floating")
-                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        solver = _solver(model, beta, cached)
                         if cached == "auto":
                             self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                         runs[cached] = self._phases(
@@ -443,7 +440,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                             if flag is not None:
                                 self._notify(model, solver, body, flag)
                             for _ in range(20):
-                                sparse_split._step(case)
+                                sparse_scene.step(case)
                             phases.append(_snapshot(case[2]))
                         runs[cached] = phases
                     self._assert_phases_close(runs["auto"], runs["off"])
@@ -470,7 +467,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     runs = {}
                     for cached in ("off", "auto"):
                         model, driver, struck = scene()
-                        solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                        solver = _solver(model, beta, cached)
                         if cached == "auto":
                             self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                             classifier = solver._resolved_worlds_owner
@@ -492,7 +489,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
             for cached in ("off", "auto"):
                 with self.subTest(law=law, cached_dynamics=cached):
                     model, box, probe = _pair_scene()
-                    solver = _solver(model, beta, cached, pgs_mode="matrix_free")
+                    solver = _solver(model, beta, cached)
                     owner = solver._tree_kinetic_state
                     self.assertEqual(owner is not None, cached == "auto")
                     _Rollout(model, solver, probe, wrench).run(5)

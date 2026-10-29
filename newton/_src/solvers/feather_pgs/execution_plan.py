@@ -108,13 +108,6 @@ def _select_mfgs_storage(
 
 
 _HINV_JT_MAX_CHUNK_SIZE = 32
-_FUSED_ROW_CHUNK = 16
-
-
-def _fused_response_chunk_size(max_constraints: int) -> int:
-    """Select the streamed fused response width or its nondivisible fallback."""
-    chunk = min(int(max_constraints), _FUSED_ROW_CHUNK)
-    return int(max_constraints) if int(max_constraints) % chunk else chunk
 
 
 def _align_shared_memory(size: int) -> int:
@@ -129,15 +122,10 @@ def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
     return 3 * matrix_bytes + vector_bytes
 
 
-def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, fused: bool, tile_threads: int) -> int:
-    """Estimate the complete tiled H-inverse shared-memory footprint [B]."""
-    if fused:
-        constraint_count = _fused_response_chunk_size(constraint_count)
+def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, tile_threads: int) -> int:
+    """Estimate the complete tiled H-inverse shared-memory footprint [B]: the factor and three row tiles."""
     footprint = _align_shared_memory(4 * n_dofs * n_dofs)
-    # Fusion holds J_i, Z_i, X_i and J_j; the unfused solve has three tiles.
-    footprint += (4 if fused else 3) * _align_shared_memory(4 * n_dofs * constraint_count)
-    if fused:
-        footprint += _align_shared_memory(4 * constraint_count * constraint_count)
+    footprint += 3 * _align_shared_memory(4 * n_dofs * constraint_count)
     return footprint + 4 * tile_threads
 
 
@@ -159,10 +147,7 @@ def _select_hinv_jt_chunk_size(
         if chunk_size in tried:
             continue
         tried.add(chunk_size)
-        if (
-            _estimate_hinv_jt_shared_memory(n_dofs, chunk_size, fused=False, tile_threads=tile_threads)
-            <= max_shared_memory
-        ):
+        if _estimate_hinv_jt_shared_memory(n_dofs, chunk_size, tile_threads=tile_threads) <= max_shared_memory:
             return chunk_size
     return None
 
@@ -175,7 +160,6 @@ class _FeatherPGSExecutionPlan:
     cholesky_tiled_sizes: frozenset[int]
     hinv_jt_tiled_sizes: frozenset[int]
     hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
-    hinv_jt_fused_sizes: frozenset[int]
     reasons: tuple[tuple[int, str, str], ...] = ()
 
     @classmethod
@@ -190,7 +174,6 @@ class _FeatherPGSExecutionPlan:
         small_dof_threshold: int,
         tile_threads: int,
         diagonal_mass_sizes: frozenset[int] = frozenset(),
-        fuse_delassus: bool = True,
     ) -> "_FeatherPGSExecutionPlan":
         """Resolve H-inverse implementations from solver shape and device limits."""
         planned_diagonal_sizes = (
@@ -201,7 +184,6 @@ class _FeatherPGSExecutionPlan:
         cholesky_tiled_sizes: set[int] = set()
         tiled_sizes: set[int] = set()
         chunk_sizes: list[tuple[int, int]] = []
-        fused_sizes: set[int] = set()
         reasons: list[tuple[int, str, str]] = []
         for size in size_groups:
             if size in planned_diagonal_sizes:
@@ -252,13 +234,13 @@ class _FeatherPGSExecutionPlan:
             chunk_size = _select_hinv_jt_chunk_size(size, max_constraints, max_shared_memory, tile_threads)
             if chunk_size is None:
                 if hinv_jt_kernel == "tiled":
-                    required = _estimate_hinv_jt_shared_memory(size, 1, fused=False, tile_threads=tile_threads)
+                    required = _estimate_hinv_jt_shared_memory(size, 1, tile_threads=tile_threads)
                     raise ValueError(
                         f"hinv_jt_kernel='tiled' requires at least {required} "
                         f"bytes of shared memory for DOF size {size}, but the device exposes "
                         f"{max_shared_memory} bytes; use hinv_jt_kernel='auto' or 'par_row'."
                     )
-                required = _estimate_hinv_jt_shared_memory(size, 1, fused=False, tile_threads=tile_threads)
+                required = _estimate_hinv_jt_shared_memory(size, 1, tile_threads=tile_threads)
                 reasons.append(
                     (
                         size,
@@ -274,18 +256,12 @@ class _FeatherPGSExecutionPlan:
             reasons.append(
                 (size, "hinv_jt_kernel", f"Tiled response uses {chunk_size}-row chunks within shared-memory limits.")
             )
-            if fuse_delassus and (
-                _estimate_hinv_jt_shared_memory(size, max_constraints, fused=True, tile_threads=tile_threads)
-                <= max_shared_memory
-            ):
-                fused_sizes.add(size)
 
         return cls(
             planned_diagonal_sizes,
             frozenset(cholesky_tiled_sizes),
             frozenset(tiled_sizes),
             tuple(chunk_sizes),
-            frozenset(fused_sizes),
             tuple(reasons),
         )
 
@@ -311,7 +287,3 @@ class _FeatherPGSExecutionPlan:
     def use_tiled_hinv_jt(self, size: int) -> bool:
         """Return whether a response group uses tiled H-inverse application."""
         return size in self.hinv_jt_tiled_sizes
-
-    def use_fused_hinv_jt(self, size: int) -> bool:
-        """Return whether a response group may fuse H-inverse and Delassus."""
-        return size in self.hinv_jt_fused_sizes

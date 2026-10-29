@@ -198,9 +198,9 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
         configuration launches.
         """
         for device in _devices():
-            configurations = [{"pgs_mode": "split", "pgs_warmstart": True}]
+            configurations = [{"pgs_warmstart": True}]
             if wp.get_device(device).is_cuda:
-                configurations.append({"pgs_mode": "matrix_free", "pgs_warmstart": True})
+                configurations.append({"pgs_warmstart": True})
             for options in configurations:
                 with self.subTest(device=device, **options):
                     model = _press(device)

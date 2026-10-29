@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
-from newton.tests import test_feather_pgs_sparse_split as split_tests
+from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
 
@@ -37,7 +37,6 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
             self.assertRaises(_TopologyReached),
         ):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        self.assertEqual(solver.pgs_mode, "matrix_free")
 
 
 class TestSparseVelocityMimicRows(unittest.TestCase):
@@ -216,7 +215,6 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             drive_mode="augmented",
             friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
@@ -261,8 +259,8 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                 self.assertFalse(candidate[1]._sparse_row_support.enabled)
                 self.assertEqual(candidate[1]._mimic_count, 2)
                 for step in range(4):
-                    split_tests._step(reference)
-                    split_tests._step(candidate)
+                    sparse_scene.step(reference)
+                    sparse_scene.step(candidate)
                     self._assert_state(reference, candidate)
                     if step == 0:
                         self._assert_rows(reference, candidate)
@@ -271,7 +269,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                             for kind in (MIMIC, VELOCITY_LIMIT, CONTACT):
                                 self.assertIn(kind, kinds)
                             row = int(candidate[1].mimic_slot.numpy()[world])
-                            expected = 0.07 * error / split_tests.DT
+                            expected = 0.07 * error / sparse_scene.DT
                             self.assertAlmostEqual(candidate[1].rhs.numpy()[world, row], expected, places=5)
 
     def test_live_coefficients_enabled_graph_and_held_reset(self):
@@ -287,26 +285,26 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
         candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
-            split_tests._step(case)
+            sparse_scene.step(case)
         held = candidate[1]._sparse_Linv.numpy().copy()
         for model, solver, state, *_ in (reference, candidate):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (reference, candidate):
-            split_tests._step(case)
+            sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].mass_update_mask.numpy(), [1, 0])
         np.testing.assert_array_equal(candidate[1]._sparse_Linv.numpy()[1], held[1])
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
-            split_tests._step(candidate)
-            split_tests._step(candidate)
+            sparse_scene.step(candidate)
+            sparse_scene.step(candidate)
         for enabled, offset, scale in ((False, -0.02, 1.7), (True, -0.02, 1.7), (True, 0.03, 0.0), (True, 0.01, -0.7)):
             for model, solver, *_ in (reference, candidate):
                 model.constraint_mimic_enabled.fill_(enabled)
                 model.constraint_mimic_coef0.fill_(offset)
                 model.constraint_mimic_coef1.fill_(scale)
                 solver.notify_model_changed(newton.ModelFlags.CONSTRAINT_PROPERTIES)
-            split_tests._step(reference)
-            split_tests._step(reference)
+            sparse_scene.step(reference)
+            sparse_scene.step(reference)
             wp.capture_launch(capture.graph)
             self._assert_state(reference, candidate)
             self._assert_rows(reference, candidate)

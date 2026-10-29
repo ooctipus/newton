@@ -345,16 +345,15 @@ def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs)
 
 
 def _modes_and_laws(device):
-    """Solver options per PGS mode and friction law: split mode on every device, matrix-free mode on CUDA only."""
-    modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
-    return {f"{mode}_{law}": {"pgs_mode": mode, **options} for mode in modes for law, options in FRICTION_LAWS.items()}
+    """Solver options per friction law; the device chooses the route (split on the CPU, matrix-free on CUDA)."""
+    return {law: dict(options) for law, options in FRICTION_LAWS.items()}
 
 
 def _configurations(device):
     configurations = _modes_and_laws(device)
     if wp.get_device(device).is_cuda:
         # Velocity limits need matrix-free mode; the predictor then starts from the prescaled qd_work.
-        configurations["velocity_limits"] = {"pgs_mode": "matrix_free", "enable_joint_velocity_limits": True}
+        configurations["velocity_limits"] = {"enable_joint_velocity_limits": True}
     return configurations
 
 

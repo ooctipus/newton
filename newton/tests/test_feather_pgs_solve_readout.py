@@ -344,7 +344,7 @@ def _sparse_route():
 
     return {
         "model": model,
-        "options": {"pgs_mode": "split", "friction_anchor_beta": 0.0},
+        "options": {"friction_anchor_beta": 0.0},
         "contacts": contacts,
         "labels": {"sparse_pgs"},
         "owners": ({"sparse_pgs"},),
@@ -368,7 +368,6 @@ def _diagonal_route():
     return {
         "model": _build_sparse_contact_friction_model(device="cuda:0"),
         "options": {
-            "pgs_mode": "matrix_free",
             "dense_max_constraints": 96,
             "mf_max_constraints": 32,
             "enable_joint_limits": True,
@@ -398,7 +397,6 @@ def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
     return {
         "model": _build_mixed_response_model("cuda:0", dof_count=dofs, friction=0.7),
         "options": {
-            "pgs_mode": "matrix_free",
             "enable_joint_limits": True,
             "joint_limit_activation_gap": 0.0,
             "dense_max_constraints": 96,
@@ -423,7 +421,6 @@ def _matrix_free_route():
     return {
         "model": _build_model(free_count=2, robot_count=2),
         "options": {
-            "pgs_mode": "matrix_free",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,
@@ -449,7 +446,6 @@ def _incremental_route():
     return {
         "model": _build_model(),
         "options": {
-            "pgs_mode": "matrix_free",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,
@@ -517,7 +513,6 @@ def _tier_route():
     return {
         "model": _build_model(free_count=1, free_heights=(1.0, 0.05)),
         "options": {
-            "pgs_mode": "matrix_free",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,

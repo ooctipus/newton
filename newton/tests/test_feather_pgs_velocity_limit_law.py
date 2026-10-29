@@ -218,7 +218,7 @@ def _cpu_arm():
 def _law_probe(**changes):
     """A stand-in with the attributes the sweep-law decision reads: a matrix-free solver with joint limits."""
     probe = {
-        "pgs_mode": "matrix_free",
+        "_matrix_free": True,
         "pgs_schedule": "interleaved",
         "enable_joint_velocity_limits": True,
         "_has_rigid_body_velocity_limits": False,
@@ -251,7 +251,7 @@ class TestVelocityLimitLawOption(unittest.TestCase):
                 "velocity_limit_law=",
             ),
             ({"velocity_limit_activation_fraction": float("inf")}, "stateless", "No velocity-limit rows"),
-            ({"pgs_mode": "split"}, None, "Split mode"),
+            ({"_matrix_free": False}, None, "CPU's split sweeps"),
         ):
             with self.subTest(**{key: str(value) for key, value in changes.items()}):
                 probe = _law_probe(**changes)
@@ -260,9 +260,9 @@ class TestVelocityLimitLawOption(unittest.TestCase):
                 self.assertIn(words, reason)
 
     def test_option_records_the_requested_and_the_applied_law(self):
-        """Default to the stateless law, record the request, and apply none in split mode.
+        """Default to the stateless law, record the request, and apply none on the CPU.
 
-        The applied option and ``routes.velocity_limits.law`` agree: split mode builds
+        The applied option and ``routes.velocity_limits.law`` agree: the CPU's split mode builds
         no matrix-free sweep, so it applies neither law.
         """
         model = _cpu_arm()
@@ -283,7 +283,7 @@ class TestVelocityLimitLawOption(unittest.TestCase):
             )
             limits = selected["routes"]["velocity_limits"]
             self.assertIsNone(limits["law"])
-            self.assertIn("Split mode", limits["law_reason"])
+            self.assertIn("CPU's split sweeps", limits["law_reason"])
         with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
             SolverFeatherPGS(model, velocity_limit_law="clamped")
 
@@ -484,7 +484,6 @@ _DENSE_ROUTES = {
 
 def _matrix_free_solver(model, law, **options):
     settings = {
-        "pgs_mode": "matrix_free",
         "enable_joint_velocity_limits": True,
         "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,

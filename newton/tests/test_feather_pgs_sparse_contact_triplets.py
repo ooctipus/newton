@@ -452,7 +452,6 @@ class TestSparseContactTriplets(unittest.TestCase):
             ):
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     drive_mode="augmented",
                     friction_anchor_beta=0.0,
                     enable_joint_velocity_limits=False,
@@ -688,33 +687,31 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 self.assertNotIn("contact_triplets", kernel.key)
 
     def test_patch_triplet_admission_cpu(self):
-        """Fuse patch triplets in the linked active scan or the full sweep; never in packed, split or free sweeps."""
+        """Fuse patch triplets in the linked active scan or the full sweep; never in packed or free sweeps."""
         cases = (
-            # Probe changes, active rows, split, velocity limits, support table, fits; admitted, reason.
-            ({}, True, False, False, True, True, True, "active-row scan"),
-            ({}, False, False, False, True, True, True, "full ordered sweep"),
-            ({"_sparse_solve_lanes": 16}, False, False, False, True, True, False, "16-lane"),
-            ({}, False, True, False, True, True, False, "Split"),
-            ({}, False, False, True, True, True, False, "velocity-limit"),
-            ({"_has_free_rigid_bodies": True}, False, False, False, True, True, False, "free-body"),
-            ({}, True, False, False, False, True, False, "support table"),
-            ({}, True, False, False, True, False, False, "room for the triplet transaction"),
-            ({"_route_pins": {"contact_units": None}}, True, False, False, True, True, False, "contact_units=None"),
+            # Probe changes, active rows, velocity limits, support table, fits; admitted, reason.
+            ({}, True, False, True, True, True, "active-row scan"),
+            ({}, False, False, True, True, True, "full ordered sweep"),
+            ({"_sparse_solve_lanes": 16}, False, False, True, True, False, "16-lane"),
+            ({}, False, True, True, True, False, "Velocity-limit"),
+            ({"_has_free_rigid_bodies": True}, False, False, True, True, False, "free-body"),
+            ({}, True, False, False, True, False, "support table"),
+            ({}, True, False, True, False, False, "room for the triplet transaction"),
+            ({"_route_pins": {"contact_units": None}}, True, False, True, True, False, "contact_units=None"),
             # Point friction keeps its rule: triplets need the active-row scan.
-            ({"_friction_anchors_enabled": False}, False, False, False, True, True, False, "active-row scan"),
-            ({"_friction_anchors_enabled": False}, True, False, False, True, True, True, "point contacts fuse"),
+            ({"_friction_anchors_enabled": False}, False, False, True, True, False, "active-row scan"),
+            ({"_friction_anchors_enabled": False}, True, False, True, True, True, "point contacts fuse"),
         )
-        for changes, active, split, velocity, table, fits, admitted, phrase in cases:
+        for changes, active, velocity, table, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
                 _friction_anchors_enabled=True, _has_free_rigid_bodies=False, _sparse_solve_lanes=32, _route_pins={}
             )
             for name, value in changes.items():
                 setattr(probe, name, value)
-            with self.subTest(changes=changes, active=active, split=split, velocity=velocity, table=table, fits=fits):
+            with self.subTest(changes=changes, active=active, velocity=velocity, table=table, fits=fits):
                 decision, reason = SolverFeatherPGS._admit_sparse_contact_triplets(
                     probe,
                     active_rows=active,
-                    split_candidate=split,
                     velocity_candidate=velocity,
                     use_support_table=table,
                     fits=lambda fits=fits: fits,
@@ -784,7 +781,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ):
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     drive_mode="augmented",
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,

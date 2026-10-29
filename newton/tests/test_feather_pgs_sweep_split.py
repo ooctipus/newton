@@ -106,16 +106,11 @@ class TestSplitOperators(unittest.TestCase):
     """The operators' one-thread layouts and the pair's own residual."""
 
     def test_assembled_one_thread(self):
-        rhs = lambda row: f"b[{row}]"  # noqa: E731
-        serial = Assembled(0, "n", "global", Lanes(1), impulse="x", rhs=rhs)
+        serial = Assembled("n", lambda row: f"b[{row}]", impulse="x")
         self.assertTrue(serial.residual_includes_rhs)
-        self.assertFalse(Assembled(64, "64", "global").residual_includes_rhs)
+        self.assertIn("float r = b[i];", serial.residual("r", ""))
         self.assertIn("float s = b[sib];", serial.sibling_residual("s", "sib", "", "b[sib]"))
         self.assertEqual(serial.coupling("c", "i", "s", ""), "float c = world_C.data[off2 + i * n + s];")
-        shared = Assembled(0, "n", "shared", Lanes(1), rhs=rhs)
-        self.assertIn("s <= i ?", shared.coupling("c", "i", "s", ""))
-        with self.assertRaisesRegex(ValueError, "right-hand side"):
-            Assembled(0, "n", "global", Lanes(1))
 
     def test_free_body_orders(self):
         loop = FreeBodyZ(Lanes(1), velocity=Velocity("v"), order="loop")

@@ -338,16 +338,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 39 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 40th
+        declaration order, so a positional call over the 38 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 39th
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:40]}
-        self.assertEqual((parameters[1].name, parameters[39].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:39]}
+        self.assertEqual((parameters[1].name, parameters[38].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -373,9 +373,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[40].name, "pgs_solve_readout")
-        with self.assertRaisesRegex(TypeError, r"takes at most 41 positional arguments but 42 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[40].default)
+        self.assertEqual(parameters[39].name, "pgs_solve_readout")
+        with self.assertRaisesRegex(TypeError, r"takes at most 40 positional arguments but 41 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[39].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
@@ -817,7 +817,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense", "grouping": "per_size"}):
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 pgs_iterations=8,
                 enable_joint_limits=True,
                 update_mass_matrix_interval=2,
@@ -852,7 +851,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         cases = (
             ({}, {}),
             ({"friction_anchor_beta": 0.0}, {}),
-            ({"pgs_mode": "split"}, {}),
+            ({}, {}),
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {"free_count": 2}),
             (
                 {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
@@ -896,7 +895,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
                 self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
-                self.assertEqual(pack is None, solver.pgs_mode != "matrix_free")
+                self.assertEqual(pack is None, not solver._matrix_free)
                 # The MF-GS kernel's name spells the storage the record reports.
                 mf_gs, storage = routes["sweep"]["mf_gs"], routes["sweep"]["mf_gs_storage"]
                 self.assertEqual(storage is None, mf_gs is None)
@@ -948,8 +947,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ("cholesky_kernel", "tiled"),
             ("trisolve_kernel", "tiled"),
             ("hinv_jt_kernel", "tiled"),
-            ("delassus_kernel", "tiled"),
-            ("pgs_kernel", "tiled_row"),
         ):
             with (
                 self.subTest(name=name, value=value),
@@ -1010,13 +1007,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_sparse_auto_composes_existing_execution_choices(self):
         """Select qualified split and velocity-limit paths without pins."""
         model = _build_model()
-        cases = ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True})
+        cases = ({}, {"enable_joint_velocity_limits": True})
         with patch.dict(SolverFeatherPGS._route_pins):
             for options in cases:
                 with self.subTest(options=options):
                     solver = _make_solver(model, True, friction_anchor_beta=0.0, **options)
                     self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
-            for options in ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True}):
+            for options in ({}, {"enable_joint_velocity_limits": True}):
                 with self.subTest(patch=options):
                     # Default patch friction composes with the same sparse factors and tree cache.
                     selected = _make_solver(model, True, **options).get_path_selection()
@@ -1292,7 +1289,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         model = _build_model()
         outputs = []
         for choice, pins in (("on", {}), ("off", {"storage": "dense"})):
-            solver = _pinned(model, pins, pgs_mode="matrix_free", enable_joint_limits=True, pgs_iterations=32)
+            solver = _pinned(model, pins, enable_joint_limits=True, pgs_iterations=32)
             self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], choice)
             state, output = model.state(), model.state()
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)

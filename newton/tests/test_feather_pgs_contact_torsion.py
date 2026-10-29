@@ -99,7 +99,6 @@ def fixture(
         # Keep this material-law control on the same point-friction baseline
         # whether the optional spin radius is zero or positive.
         "friction_anchor_beta": 0.0,
-        "pgs_mode": "matrix_free",
         "pgs_iterations": 128,
         "pgs_velocity_iterations": 0,
         "pgs_beta": 0.05,
@@ -219,7 +218,6 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         solver = SolverFeatherPGS(
             model,
             contact_torsion_radius=radius,
-            pgs_mode="matrix_free",
             pgs_iterations=64,
             pgs_velocity_iterations=0,
             pgs_beta=0.05,
@@ -401,7 +399,7 @@ class TestTorsionNeutralRoute(unittest.TestCase):
         out of: the zero-radius arm is admitted, the selected-out arm is not.
         """
         model = pads("cpu")
-        split = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
+        split = {"friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
         for law, options in (("point", {}), ("patch", PATCH_OPTIONS)):
             with (
                 self.subTest(law=law),

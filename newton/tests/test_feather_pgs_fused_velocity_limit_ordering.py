@@ -95,7 +95,6 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 drive_mode="physx_pgs",
                 enable_joint_velocity_limits=velocity_limits,
                 enable_contact_friction=False,

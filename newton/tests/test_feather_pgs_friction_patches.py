@@ -19,7 +19,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     contact_friction_residuals,
 )
-from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel
 from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
@@ -52,7 +51,6 @@ def _ground_box(device, **solver_kwargs):
     model = builder.finalize(device=device)
     kwargs = {
         "pgs_iterations": 32,
-        "pgs_mode": "matrix_free" if model.device.is_cuda else "split",
     }
     kwargs.update(solver_kwargs)
     solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
@@ -764,7 +762,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     kwargs.pop("contact_shared_anchor")
                     kwargs.pop("contact_friction_shared_anchor")
                     if not model.device.is_cuda:
-                        kwargs.update(pgs_mode="split", enable_bilateral_preelimination=False)
+                        kwargs.update(enable_bilateral_preelimination=False)
                     if not enabled:
                         kwargs["friction_anchor_beta"] = 0.0
                     solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
@@ -879,7 +877,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=device)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
         self.assertTrue(solver._friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
@@ -947,7 +945,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         builder.replicate(scene, 4, spacing=(spacing, spacing, 0.0))
         builder.add_ground_plane(cfg=cfg)
         model = builder.finalize(device=device)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=8)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
         self.assertTrue(solver._friction_anchors_enabled)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
@@ -1151,15 +1149,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(flag=flag), self.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
                 newton.solvers.SolverFeatherPGS(model, **{flag: True})
 
-    def test_patch_friction_selects_the_loop_kernel(self):
-        """Resolve the automatic split kernel to the loop sweep under patch friction."""
-        builder = newton.ModelBuilder()
-        body = builder.add_body()
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cpu")
-        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2)
-        self.assertEqual(solver.pgs_kernel, "loop")
-
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
         for gate in ("contact_friction_gap_threshold", "contact_gap_gate"):
@@ -1213,7 +1202,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     model,
                     friction_anchor_beta=0.2,
                     pgs_iterations=64,
-                    pgs_mode="matrix_free" if wp.is_cuda_available() else "split",
                 )
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
                 contacts = pipeline.contacts()
@@ -1283,7 +1271,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         ):
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 pgs_iterations=8,
                 enable_joint_limits=True,
                 update_mass_matrix_interval=2,
@@ -1338,15 +1325,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
     def test_pooled_coulomb_budget(self):
         """Share the loaded middle normal's budget across two unloaded anchor normals."""
-        self._check_pooled_projection("cpu", native=False)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
-    def test_native_pooled_coulomb_budget(self):
-        """Use the complete patch's normal load in native CUDA projection."""
-        self._check_pooled_projection("cuda:0", native=True)
-
-    def _check_pooled_projection(self, device, native):
-        capacity = 32  # Native row kernels use a full warp of storage.
+        device = "cpu"
+        capacity = 32
         count = wp.array([7], dtype=int, device=device)
         diag = wp.ones((1, capacity), dtype=float, device=device)
         matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device=device)
@@ -1356,34 +1336,26 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         parents = wp.array([[3, 0, 0, 4, 0, 4, 4] + [-1] * 25], dtype=int, device=device)
         mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25] + [0] * 25], dtype=float, device=device)
         args = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, diag, 0, 0, 0]
-        if native:
-            kernel = tiled_row_kernel(capacity, str(wp.get_device(device).arch))
-            wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
-        else:
-            wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=args, device=device)
+        wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=args, device=device)
         np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
 
     def test_planar_patch_reduces_friction_rows(self):
         """Retain a box face's four normals while using only two friction anchors."""
-        self._check_planar_patch("cpu", "split")
+        self._check_planar_patch("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_planar_patch_reduces_friction_rows(self):
-        """Solve the same patch layout with native split and fused kernels."""
-        for mode in ("split", "matrix_free"):
-            with self.subTest(mode=mode):
-                self._check_planar_patch("cuda:0", mode)
+        """Solve the patch layout with the fused CUDA kernels."""
+        self._check_planar_patch("cuda:0")
 
-    def _check_planar_patch(self, device, mode):
+    def _check_planar_patch(self, device):
         with wp.ScopedDevice(device):
             builder = newton.ModelBuilder()
             builder.add_ground_plane()
             body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.099), wp.quat_identity()))
             builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
             model = builder.finalize()
-            solver = newton.solvers.SolverFeatherPGS(
-                model, friction_anchor_beta=0.2, dense_max_constraints=64, pgs_mode=mode
-            )
+            solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, dense_max_constraints=64)
             pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, contact_matching="latest")
             contacts = pipeline.contacts()
             state = model.state()

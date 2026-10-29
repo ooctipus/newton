@@ -88,7 +88,6 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
 
 def _make_phase_layout_run(
     device,
-    pgs_mode,
     *,
     pgs_iterations=0,
     pgs_schedule="interleaved",
@@ -131,7 +130,6 @@ def _make_phase_layout_run(
     model.joint_velocity_limit.assign(velocity_limits)
     solver = SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
         pgs_schedule=pgs_schedule,
         enable_joint_limits=True,
         enable_joint_velocity_limits=enable_joint_velocity_limits,
@@ -213,7 +211,6 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
     """Run a short PhysX-grasp trajectory with one row builder."""
     model, solver, state_in, state_out, control, contacts = _make_phase_layout_run(
         "cuda:0",
-        "matrix_free",
         pgs_iterations=8,
         pgs_schedule="physx_grasp",
     )
@@ -253,13 +250,13 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
 
     def test_dense_row_families_respect_phase_bounds(self):
         """Keep active position limits before the CPU dense phase-0 bound."""
-        solver = _step_once(_make_phase_layout_run("cpu", "split", enable_joint_velocity_limits=False))
+        solver = _step_once(_make_phase_layout_run("cpu", enable_joint_velocity_limits=False))
         _assert_dense_phase_layout(self, solver, expect_joint_velocity_limits=False)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free row-family layout requires CUDA")
     def test_combined_row_families_respect_phase_bounds(self):
         """Keep dense and matrix-free row families inside their phase ranges."""
-        solver = _step_once(_make_phase_layout_run("cuda:0", "matrix_free"))
+        solver = _step_once(_make_phase_layout_run("cuda:0"))
         _assert_dense_phase_layout(self, solver)
         _assert_mf_phase_layout(self, solver)
 

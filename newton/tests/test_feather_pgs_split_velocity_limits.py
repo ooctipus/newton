@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hold split-mode free rigid bodies to the stateless speed law on every device.
+"""Hold the CPU's split-mode free rigid bodies to the stateless speed law.
 
-Split mode sweeps free-body rows after the dense rows: on the CPU in ``sweep_routes_split.mf_loop_kernel()``, on CUDA in the
-shared-memory sweep of ``mf_split_kernel``. Each finite speed limit of a body owns a speed row at
+Split mode (the CPU's route) sweeps free-body rows after the dense rows in ``sweep_routes_split.mf_loop_kernel()``.
+Each finite speed limit of a body owns a speed row at
 the tail of its world's rows: it bounds the magnitude of the body's linear or angular velocity, as PhysX's
 ``maxLinearVelocity`` and ``maxAngularVelocity`` do, with ``J = e_0`` or ``e_3`` naming which and
 ``rhs = limit``. The stateless law pushes a row only while its speed exceeds the limit, along the velocity,
@@ -21,7 +21,6 @@ ground or a contact row pushes it out of the ground.
 
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -29,10 +28,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from newton._src.solvers.feather_pgs.sweep_routes_diag import mf_split_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 
@@ -123,7 +120,7 @@ def _split_run(builder, device, bodies, *, velocities=None, wrenches=None, **opt
     """
     model = builder.finalize(device=device)
     # Without angular damping, free flight keeps the angular velocity exactly.
-    solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, **options)
+    solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
     state_0, state_1 = model.state(), model.state()
     starts = model.joint_qd_start.numpy()
     joints = [int(np.flatnonzero(model.joint_child.numpy() == body)[0]) for body in bodies]
@@ -314,7 +311,7 @@ def _sweep(device, *, iterations, articulated=False, omega=1.0):
 
 
 class _SplitVelocityLimitChecks:
-    """Checks shared by the CPU and CUDA cases; ``device`` names the device under test."""
+    """Checks of the split free-body sweep; ``device`` names the device under test (the CPU)."""
 
     device = "cpu"
 
@@ -418,7 +415,7 @@ class _SplitVelocityLimitChecks:
         """
         scene = scenes.box_push()
         model = scene.build(self.device)
-        solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=0.0)
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
@@ -494,7 +491,7 @@ class _SplitVelocityLimitChecks:
                 self.assertIn("velocity_limit_law", limits["free_body_sweep_law_reason"])
         builder = _begin_model(None)
         _add_arm(builder)
-        without_free_bodies = SolverFeatherPGS(builder.finalize(device=self.device), pgs_mode="split")
+        without_free_bodies = SolverFeatherPGS(builder.finalize(device=self.device))
         never_activated = _free_boxes(self.device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))], fraction=float("inf"))
         for name, solver, words in (
             ("without_free_bodies", without_free_bodies, "No split free-body sweep"),
@@ -510,7 +507,7 @@ class _SplitVelocityLimitChecks:
                 self.assertNotIn("records the stateless law", limits["law_reason"])
 
     def test_route_records_the_velocity_limit_sweep(self):
-        """Record the stateless free-body law, and on CUDA its ``_vlim`` sweep, wherever limit rows can exist."""
+        """Record the stateless free-body law of the loop sweep wherever limit rows can exist."""
         world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
         for name, options, law, words in (
             ("limits", {}, "stateless", "unrelaxed correction"),
@@ -523,12 +520,7 @@ class _SplitVelocityLimitChecks:
                 routes = solver.get_path_selection()["routes"]
                 self.assertEqual(routes["velocity_limits"]["free_body_sweep_law"], law)
                 self.assertIn(words, routes["velocity_limits"]["free_body_sweep_law_reason"])
-                key = routes["sweep"]["free_body_matrix_free"]
-                if self.device == "cpu":
-                    self.assertEqual(key, "sweep_mf_loop")
-                else:
-                    suffix = "_vlim" if law else ""
-                    self.assertEqual(key, f"sweep_mf_split_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
+                self.assertEqual(routes["sweep"]["free_body_matrix_free"], "sweep_mf_loop")
 
 
 class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCase):
@@ -552,97 +544,6 @@ class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCa
                 self.assertEqual(run.solver._has_free_body_velocity_limit_rows, selected)
                 _step(run)
                 self.assertEqual(int(run.solver.mf_constraint_count.numpy().sum()) > 0, built)
-
-
-@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.TestCase):
-    device = "cuda:0"
-
-    def test_cuda_sweep_and_step_match_the_cpu(self):
-        """Reproduce the CPU free-body sweep and step on CUDA."""
-        for iterations, omega in ((1, 1.0), (1, RELAXED_OMEGA), (12, 1.0)):
-            with self.subTest(sweep_iterations=iterations, omega=omega):
-                cpu = _sweep("cpu", iterations=iterations, omega=omega)
-                cuda = _sweep(self.device, iterations=iterations, omega=omega)
-                _assert_on_limit_scale(cuda.velocity, cpu.velocity)
-                if iterations == 1:
-                    np.testing.assert_allclose(cuda.impulses, cpu.impulses, rtol=RTOL, atol=1.0e-6)
-        worlds = list(BELOW) + [(linear, angular) for linear, angular, _, _ in PAST]
-        wrenches = [np.zeros(6)] * len(BELOW) + [np.concatenate((force, torque)) for _, _, force, torque in PAST]
-        for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                cpu, cuda = (
-                    _free_boxes(device, worlds, articulated=articulated, wrenches=wrenches)
-                    for device in ("cpu", self.device)
-                )
-                for _ in range(3):
-                    _assert_on_limit_scale(_step(cuda), _step(cpu))
-
-    def test_cuda_contact_step_matches_the_cpu(self):
-        """Reproduce on CUDA the CPU steps in which a contact row pushes free bodies past their limits."""
-        for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                cpu, cuda = (_pressed_spheres(device, articulated=articulated) for device in ("cpu", self.device))
-                for _ in range(3):
-                    velocity = _step(cuda)
-                    _assert_on_limit_scale(velocity, _step(cpu), CONTACT_LIMITS)
-                    # Every speed of every body stays within its limit.
-                    speeds = _speeds(velocity)
-                    bound = np.broadcast_to(np.array([CONTACT_LIMIT, ANGULAR_LIMIT]) * (1.0 + RTOL), speeds.shape)
-                    np.testing.assert_array_less(speeds, bound)
-                    expected, actual = _free_body_rows(cpu), _free_body_rows(cuda)
-                    np.testing.assert_array_equal(actual.count, expected.count)
-                    np.testing.assert_array_equal(actual.type, expected.type)
-                    np.testing.assert_allclose(actual.impulses, expected.impulses, rtol=RTOL, atol=1.0e-6)
-
-    def check_sweeps_match_bitwise(self, run, steps):
-        """Run each free-body sweep of ``steps`` steps twice, with the solver's sweep and with the one without the law.
-
-        Both runs of a sweep start from the same rows, impulses and velocities and must leave the same impulses
-        and velocities, bit for bit; the solver's sweep then carries the step on. Returns the row types seen.
-        """
-        solver = run.solver
-        law_sweep = solver._pgs_solve_mf_kernel
-        plain_sweep = mf_split_kernel(solver.mf_max_constraints, solver.max_mf_bodies, solver.model.device.arch)
-        solve = solver._mf_pgs_solve
-        row_types = set()
-
-        def solve_twice(iterations, *args, **kwargs):
-            impulses, velocity = wp.clone(solver.mf_impulses), wp.clone(solver.v_out)
-            solver._pgs_solve_mf_kernel = plain_sweep
-            try:
-                solve(iterations, *args, **kwargs)
-            finally:
-                solver._pgs_solve_mf_kernel = law_sweep
-            expected = solver.mf_impulses.numpy(), solver.v_out.numpy()
-            wp.copy(solver.mf_impulses, impulses)
-            wp.copy(solver.v_out, velocity)
-            solve(iterations, *args, **kwargs)
-            np.testing.assert_array_equal(solver.mf_impulses.numpy(), expected[0])
-            np.testing.assert_array_equal(solver.v_out.numpy(), expected[1])
-            rows = _free_body_rows(run)
-            live = np.arange(rows.type.shape[1])[None, :] < rows.count[:, None]
-            row_types.update(np.unique(rows.type[live]).tolist())
-
-        with mock.patch.object(solver, "_mf_pgs_solve", solve_twice):
-            for _ in range(steps):
-                _step(run)
-        return row_types
-
-    def test_velocity_limit_sweep_keeps_other_rows_bitwise(self):
-        """Sweep contact and friction rows bit for bit like the sweep built without the velocity-limit law.
-
-        Registered but infinite speed limits select the ``_vlim`` sweep although no velocity-limit row is
-        built. Every free-body sweep of tilted boxes landing on the ground runs twice from the same state:
-        with the solver's sweep and with the sweep without the law.
-        """
-        for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                run = _landing_boxes(self.device, articulated=articulated)
-                self.assertTrue(run.solver._pgs_solve_mf_kernel.key.endswith("_vlim"))
-                row_types = self.check_sweeps_match_bitwise(run, steps=45)
-                self.assertLessEqual({PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION}, row_types)
-                self.assertNotIn(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, row_types)
 
 
 if __name__ == "__main__":

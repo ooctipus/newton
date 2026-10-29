@@ -57,17 +57,17 @@ def _diagonal_geometry(
     inverse[dof] = 1.0 / mass
 
 
-def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | None = None) -> str | None:
+def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -> str | None:
     """Why the held tree does not evaluate the solver's dynamics, or ``None`` when it does.
 
     The terms every group needs, then those of the representation: the native sparse factor's group (``sparse``:
-    its ``(velocity_limits, split)``), else the dense size groups with ``compact`` as the compact diagonal size.
+    whether it carries velocity-limit rows), else the dense size groups with ``compact`` as the compact diagonal size.
     Both default to the representation the solver chose; the native sparse factor and the compact diagonal, which
     only the held tree evaluates, pass their candidates (:func:`sparse_decline`, :func:`compact_decline`). A term
     is read only once the earlier ones hold.
     """
     if sparse is None and getattr(solver, "_sparse_mass_matrix_size", None) is not None:
-        sparse = (solver._sparse_velocity_limits, solver._sparse_split)
+        sparse = solver._sparse_velocity_limits
     if compact is None:
         compact = getattr(solver, "_compact_diagonal_mass_size", None)
     model = solver.model
@@ -77,7 +77,7 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
     if model.particle_count:
         return "Particles are outside the held tree."
     if sparse is not None:
-        velocity_limits, split = sparse
+        velocity_limits = sparse
         if solver._has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
         if solver._mimic_count and not (
@@ -88,15 +88,12 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
         # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the
         # solver pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body
         # twists every group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
-        # Split mode composes its rows from the same held factors the owner refreshes.
         if not solver.size_groups:
             return "No articulation has response coordinates."
     if sparse is not None and solver._has_prescribed_response:
         return "The sparse factor's group holds no prescribed articulations."
     if not solver._fk_id_cache_available:
         return "The FK/ID cache is unavailable."
-    if sparse is not None and not (solver.pgs_mode == "matrix_free" or split):
-        return "The sparse factor's group serves the matrix-free and sparse split sweeps."
     if not solver._parallel_augmented_drive_topology:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
     if sparse is not None:
@@ -198,13 +195,13 @@ def _prescribed_group(solver, group_to_art):
     return mass, host, layout
 
 
-def sparse_decline(solver, size, plan, *, velocity_limits, split) -> str | None:
+def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
     """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
     ``None``: :func:`options_decline`, :func:`decline` of the candidate, then its one complete group's fit.
 
     Only the held tree evaluates native sparse factors, so their admission reads this before choosing one.
     """
-    reason = options_decline(solver) or decline(solver, sparse=(velocity_limits, split))
+    reason = options_decline(solver) or decline(solver, sparse=velocity_limits)
     if reason is not None:
         return reason
     view = _plan_view(solver.group_to_art[size], solver.art_to_world, operator_metadata(plan))

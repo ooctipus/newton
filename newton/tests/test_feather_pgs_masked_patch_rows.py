@@ -66,7 +66,7 @@ def _rows(solver, contacts):
     world rows. Split mode keeps each articulation's rows in its size group, so a contact's Jacobian
     concatenates its two articulations' group rows.
     """
-    if solver.pgs_mode == "matrix_free":
+    if solver._matrix_free:
         return contact_rows(solver, contacts, jacobian=True, every_row=True)
     records = contact_rows(solver, contacts, every_row=True)
     count = len(solver.contact_slot.numpy())
@@ -289,7 +289,7 @@ class TestMaskedPatchRows(unittest.TestCase):
             ("three_sizes", _three_size_model("cpu"), 6, "masked"),
         ):
             with self.subTest(scene=name):
-                self._assert_parity(model, steps, method, pgs_mode="split", pgs_iterations=8)
+                self._assert_parity(model, steps, method, pgs_iterations=8)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free dense route requires CUDA")
     def test_cuda_masked_patch_rows_match_the_per_contact_builder(self):
@@ -310,7 +310,6 @@ class TestMaskedPatchRows(unittest.TestCase):
                     model,
                     6,
                     method,
-                    pgs_mode="matrix_free",
                     pgs_iterations=8,
                     enable_joint_limits=True,
                     dense_max_constraints=96,
@@ -330,7 +329,7 @@ class TestMaskedPatchRows(unittest.TestCase):
         releases different anchors. Sparse factors stay off, as they would own a free root's rows.
         """
         model = _conveyor_model(wp.get_device("cuda:0"))
-        options = {"pgs_mode": "matrix_free", "pgs_iterations": 8, "dense_max_constraints": 96}
+        options = {"pgs_iterations": 8, "dense_max_constraints": 96}
         dense = {"storage": "dense"}
         solver, masked, methods = _rollout(model, masked=True, steps=1, pins=dense, **options)
         _, general, general_methods = _rollout(model, masked=False, steps=1, pins=dense, **options)

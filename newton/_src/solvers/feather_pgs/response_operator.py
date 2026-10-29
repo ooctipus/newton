@@ -1847,48 +1847,33 @@ class SparsePairJY(ResponseOperator):
 
 @dataclass(frozen=True)
 class Assembled(ResponseOperator):
-    """The assembled Delassus operator ``C = J H^-1 J^T`` of a world's rows, in impulse space.
+    """The assembled Delassus operator ``C = J H^-1 J^T`` of a world's rows, in impulse space, swept by one thread (the
+    CPU's split mode).
 
-    A row's velocity term is ``C_i lambda``: lane ``l`` sums its columns ``l + 32 k`` in ascending ``k`` from
-    zero and the lanes reduce with ``SUM``. Every lane computes every impulse and stores it, as every other lane
-    does, so each reads only its own stores: nothing is applied or synchronized (:attr:`applies`). ``count`` rows
-    of capacity ``capacity`` are staged; row ``i`` of ``C`` is ``world_C[off2 + i * stride + j]``.
-
-    ``staging`` says where ``C`` is read. ``"shared"``: its packed lower triangle ``s_Ctri[i (i + 1) / 2 + j]``
-    (``j <= i``), staged by :meth:`stage`, read as ``C(i, j)`` for ``j <= i`` and ``C(j, i)`` otherwise.
-    ``"global"``: its rows in global memory, ``C(i, j)`` for every ``j``. ``C`` is assembled in floating point and
-    is not exactly symmetric, so above the diagonal the two stagings read different entries. A pair's coupling is
-    ``C(s, i)`` (``s = i + 1``), an entry both stagings read. Built with the response, ``A_ii`` is stored as a
-    value; the step divides by it.
-
-    With one thread (``Lanes(1)``, the loop sweep's layout) a row's sum starts from its right-hand side ``rhs``,
-    so the residual is whole (:attr:`residual_includes_rhs`), and adds ``C(i, j) lambda_j`` for ``j`` ascending;
-    the coupling of rows ``i`` and ``s`` is row ``i``'s entry ``C(i, s)``, read as row ``i``'s sum reads it. The
-    thread walks the ``count`` rows: ``capacity`` (the lanes' column registers, the shared triangle) is unused.
+    A row's sum starts from its right-hand side ``rhs``, so the residual is whole (:attr:`residual_includes_rhs`),
+    and adds ``C(i, j) lambda_j`` for ``j`` ascending over the ``count`` rows; row ``i`` of ``C`` is
+    ``world_C[off2 + i * stride + j]``. The coupling of rows ``i`` and ``s`` is row ``i``'s entry ``C(i, s)``, read
+    as row ``i``'s sum reads it (``C`` is assembled in floating point and is not exactly symmetric). Built with the
+    response, ``A_ii`` is stored as a value; the step divides by it. Nothing is applied: the impulses are the state.
     """
 
-    capacity: int
     stride: str
-    staging: str = "shared"
-    lanes: Lanes = Lanes()
+    rhs: Callable[[str], str]
+    """The rows' right-hand sides, which the sums start from."""
     impulse: str = "s_lam"
     count: str = "m"
-    rhs: Callable[[str], str] | None = None
-    """The rows' right-hand sides, which one thread's sums start from."""
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
     name = "assembled"
     applies = False
-
-    STAGINGS = ("shared", "global")
+    residual_includes_rhs = True
 
     @staticmethod
     def build(stage: str, mapping: str, **options):
         """The launch that builds stage ``stage`` of the operator's data with the thread mapping ``mapping``.
 
         ``C = J Y^T`` and its diagonal accumulate onto a zeroed ``C`` and diagonal from a size group's response (the
-        dense response build, :data:`.response_builds_dense.DENSE_JY_BUILDS`), or the response and ``C`` are built
-        fused; then the diagonals' ``cfm``. Returns a
+        dense response build, :data:`.response_builds_dense.DENSE_JY_BUILDS`); then the diagonals' ``cfm``. Returns a
         :class:`.response_builds_dense.Build` (:data:`.response_builds_dense.ASSEMBLED_BUILDS` lists the stages and
         mappings).
         """
@@ -1896,135 +1881,29 @@ class Assembled(ResponseOperator):
 
         return ASSEMBLED_BUILDS[stage, mapping](**options)
 
-    def __post_init__(self):
-        if self.staging not in self.STAGINGS:
-            raise ValueError(f"staging must be one of {self.STAGINGS}, got {self.staging!r}")
-        if not self.lanes.parallel and self.rhs is None:
-            raise ValueError("one thread sums a row's residual from its right-hand side: give rhs")
-
-    @property
-    def residual_includes_rhs(self) -> bool:
-        """One thread sums a row's whole residual, from its right-hand side; lanes sum ``C_i lambda``."""
-        return not self.lanes.parallel
-
-    @property
-    def shared(self) -> bool:
-        return self.staging == "shared"
-
-    @property
-    def triangle(self) -> int:
-        """Entries of the packed lower triangle of ``capacity`` rows."""
-        return self.capacity * (self.capacity + 1) // 2
-
-    @property
-    def columns(self) -> int:
-        """Columns per lane."""
-        return (self.capacity + self.lanes.width - 1) // self.lanes.width
-
-    def _column(self, k: int) -> str:
-        return f"{self.lanes.lane} + {k * self.lanes.width}"
-
-    def _entry(self, row: str, column: str, triangle_base: str, row_base: str, column_base: str) -> str:
-        """``C(row, column)`` as the staging reads it, given the row's and the column's triangle bases (shared) or
-        the row's first entry (global)."""
-        if self.shared:
-            return f"{column} <= {row} ? s_Ctri[{triangle_base} + {column}] : s_Ctri[{column_base} + {row}]"
-        return f"world_C.data[{row_base} + {column}]"
-
-    def prepare(self, indent: str) -> str:
-        """Declare each lane's columns ``j_k`` (and their triangle bases ``jb_k``), once before the sweeps."""
-        lines = []
-        for k in range(self.columns):
-            lines.append(f"{indent}const int j{k} = {self._column(k)};")
-            if self.shared:
-                lines.append(f"{indent}const int jb{k} = (j{k} * (j{k} + 1)) >> 1;")
-        return "\n".join(lines)
-
-    def stage(self, indent: str) -> str:
-        """Stage the lower triangle of the active ``count`` rows (shared), each row's columns lane-strided."""
-        if not self.shared:
-            return f"{indent}// Delassus rows stay in global memory: each update reads its row, coalesced across lanes."
-        lane, width = self.lanes.lane, self.lanes.width
-        return (
-            f"{indent}for (int i = 0; i < {self.count}; ++i) {{\n"
-            f"{indent}    const int base = (i * (i + 1)) >> 1;\n"
-            f"{indent}    for (int j = {lane}; j <= i; j += {width}) "
-            f"s_Ctri[base + j] = world_C.data[off2 + i * {self.stride} + j];\n"
-            f"{indent}}}"
-        )
-
     def _row_sum(self, out: str, row: str, start: str, indent: str) -> str:
-        """One thread: ``float out = start``, then ``C(row, j) lambda_j`` added for ``j`` ascending."""
-        base = (
-            f"const int {out}_base = ({row} * ({row} + 1)) >> 1;"
-            if self.shared
-            else f"const int {out}_row = off2 + {row} * {self.stride};"
-        )
-        entry = self._entry(row, "j", f"{out}_base", f"{out}_row", "((j * (j + 1)) >> 1)")
+        """``float out = start``, then ``C(row, j) lambda_j`` added for ``j`` ascending."""
         lines = [
             f"float {out} = {start};",
-            base,
+            f"const int {out}_row = off2 + {row} * {self.stride};",
             f"for (int j = 0; j < {self.count}; ++j) {{",
-            f"    const float c = {entry};",
+            f"    const float c = world_C.data[{out}_row + j];",
             f"    {out} += c * {self.impulse}[j];",
             "}",
         ]
         return "\n".join(indent + line for line in lines)
 
     def residual(self, out: str, indent: str) -> str:
-        """``float out = C_i lambda`` of the visited row ``i`` over the prepared columns (every lane holds it); one
-        thread: the whole residual ``rhs_i + C_i lambda``."""
-        if not self.lanes.parallel:
-            return self._row_sum(out, "i", self.rhs("i"), indent)
-        base = (
-            "const int base_i = (i * (i + 1)) >> 1;" if self.shared else f"const int row_i = off2 + i * {self.stride};"
-        )
-        lines = [f"float {out}_partial = 0.0f;", base]
-        for k in range(self.columns):
-            entry = self._entry("i", f"j{k}", "base_i", "row_i", f"jb{k}")
-            lines += [
-                f"if (j{k} < {self.count}) {{",
-                f"    const float c = {entry};",
-                f"    {out}_partial += c * {self.impulse}[j{k}];",
-                "}",
-            ]
-        lines += [self.lanes.reduce(f"{out}_partial"), f"float {out} = {out}_partial;"]
-        return "\n".join(indent + line for line in lines)
+        """The whole residual ``rhs_i + C_i lambda`` of the visited row ``i``."""
+        return self._row_sum(out, "i", self.rhs("i"), indent)
 
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = C_s lambda + rhs``: the sibling's row, lane-strided over its columns, reduced, then its
-        right-hand side; one thread sums the row from its right-hand side."""
-        if not self.lanes.parallel:
-            return self._row_sum(out, sibling, rhs, indent)
-        lane, width = self.lanes.lane, self.lanes.width
-        base = (
-            f"const int sib_base = ({sibling} * ({sibling} + 1)) >> 1;"
-            if self.shared
-            else f"const int sib_row = off2 + {sibling} * {self.stride};"
-        )
-        entry = self._entry(sibling, "j", "sib_base", "sib_row", "((j * (j + 1)) >> 1)")
-        lines = [
-            f"float {out} = 0.0f;",
-            base,
-            f"for (int j = {lane}; j < {self.count}; j += {width}) {{",
-            f"    const float c = {entry};",
-            f"    {out} += c * {self.impulse}[j];",
-            "}",
-            self.lanes.reduce(out),
-            f"{out} += {rhs};",
-        ]
-        return "\n".join(indent + line for line in lines)
+        """``float out = rhs + C_s lambda``: the sibling's row sum from its right-hand side."""
+        return self._row_sum(out, sibling, rhs, indent)
 
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = C(s, i)``: the pair's off-diagonal entry, below the diagonal (``s > i``); one thread reads
-        ``C(i, s)``, as row ``i``'s sum reads it (any two rows ``i`` and ``s``)."""
-        if not self.lanes.parallel:
-            row_base, sibling_base = (f"(({index} * ({index} + 1)) >> 1)" for index in (row, sibling))
-            entry = self._entry(row, sibling, row_base, f"off2 + {row} * {self.stride}", sibling_base)
-            return f"{indent}float {out} = {entry};"
-        if self.shared:
-            return f"{indent}float {out} = s_Ctri[(({sibling} * ({sibling} + 1)) >> 1) + {row}];"
-        return f"{indent}float {out} = world_C.data[off2 + {sibling} * {self.stride} + {row}];"
+        """``float out = C(i, s)``, as row ``i``'s sum reads it."""
+        return f"{indent}float {out} = world_C.data[off2 + {row} * {self.stride} + {sibling}];"
 
     def apply(self, delta: str, indent: str) -> str:
         """Nothing: the impulses are the state."""

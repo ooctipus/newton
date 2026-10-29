@@ -85,8 +85,8 @@ _EFFECTIVE = {
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
         solver._ink_rows > 0 and any(tier.velocity_limit_pass for tier in solver._mf_gs_tiers)
     ),
-    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in split mode, which
-    # builds no matrix-free sweep and applies no law.
+    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in the CPU's split mode,
+    # which builds no matrix-free sweep and applies no law.
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
     # A readout applies only where a sweep kernel carries its counters.
     "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
@@ -483,7 +483,6 @@ def _sparse_mass_matrix(solver) -> dict:
     record = {
         "size": json_value(size),
         "reason": solver._sparse_selection_reason,
-        "split": bool(solver._sparse_split),
         "velocity_limits": bool(solver._sparse_velocity_limits),
         "active_rows": bool(solver._sparse_active_rows),
         "active_rows_reason": solver._sparse_active_rows_reason,
@@ -517,23 +516,12 @@ def _sweep(solver) -> dict:
     dense_split = solve.assembles_delassus
     dense = None
     if dense_split:
-        if solver.pgs_kernel == "tiled_row":
-            budgets = tuple(solver._pgs_solve_tiled_row_budgets)
-            dense = {
-                "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
-                "row_budgets": bool(budgets),
-                # Where the sweep reads the Delassus operator, chosen from the device's shared memory per block.
-                "staging": solver._tiled_row_staging,
-                "staging_reason": solver._tiled_row_staging_reason,
-            }
-        else:
-            dense = {"kernels": [_key(solver._pgs_solve_loop_kernel)]}
+        dense = {"kernels": [_key(solver._pgs_solve_loop_kernel)]}
     free_body = None
     if dense_split and solver._has_free_rigid_bodies:
-        kernel = solver._pgs_solve_mf_kernel if solver.model.device.is_cuda else solver._pgs_solve_mf_loop_kernel
-        free_body = _key(kernel)
+        free_body = _key(solver._pgs_solve_mf_loop_kernel)
     mf_meta_pack = None
-    if solver.pgs_mode == "matrix_free":
+    if solver._matrix_free:
         # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
         packed = solver._pack_mf_meta_kernel is not None
         mf_meta_pack = {
@@ -674,8 +662,8 @@ def _contact_update(solver, record) -> dict:
         reason = "Every sweep of this route solves each contact unit exactly against its own Delassus block."
     else:
         reason = (
-            "Only the loop sweeps solve contact units: the dense loop sweep of split mode on any device and the split "
-            "free-body sweep on CPU. The other sweeps keep the sequential law."
+            "Only the CPU's loop sweeps solve contact units: its assembled dense rows' sweep and its free-body "
+            "sweep. The other sweeps keep the sequential law."
         )
     return {
         "requested": requested,
@@ -817,7 +805,7 @@ def _velocity_limits(solver) -> dict:
         )
     free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     limits = bool(solver._has_rigid_body_velocity_limits)
-    matrix_free = solver.pgs_mode == "matrix_free"
+    matrix_free = solver._matrix_free
     model = solver.model
     prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
     # The law the matrix-free sweep kernels were built with; the fused drive clamp keeps PhysX's.
@@ -844,15 +832,14 @@ def _velocity_limits(solver) -> dict:
 
 def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
     # Mirrors the free_body_matrix_free sweep of _sweep and the kernel selection of _init_tiled_kernels.
-    if solver.pgs_mode == "matrix_free" or solver._sparse_split or not solver._has_free_rigid_bodies:
-        return None, "No split free-body sweep: matrix-free mode, native sparse split rows or no free rigid bodies."
+    if solver._matrix_free or not solver._has_free_rigid_bodies:
+        return None, "No split free-body sweep: CUDA solves the rows matrix-free, or there are no free rigid bodies."
     if solver._has_free_body_velocity_limit_rows:
         return "stateless", (
             "A free body's speed row bounds the magnitude of its linear or angular velocity: past the limit it "
             "pushes, along the velocity, by its whole unrelaxed correction and keeps that correction instead of "
-            "an accumulated impulse; the rows end every iteration. The CPU loop applies this law and CUDA builds "
-            "the _vlim sweep for it; velocity_limit_law selects the law of the matrix-free sweeps and does not "
-            "apply here."
+            "an accumulated impulse; the rows end every iteration. The CPU's free-body loop applies this law; "
+            "velocity_limit_law selects the law of the matrix-free sweeps and does not apply here."
         )
     if solver._has_rigid_body_velocity_limits:
         return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
@@ -863,7 +850,7 @@ def _free_rigid_bodies(solver) -> dict:
     count = int(solver._free_rigid_body_count)
     owners = []
     if count:
-        if solver.pgs_mode != "matrix_free" and not solver._sparse_split:
+        if not solver._matrix_free:
             owners.append("split_matrix_free_rows")
         else:
             if solver._sparse_mass_matrix_size is not None:

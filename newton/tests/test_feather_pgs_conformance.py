@@ -18,12 +18,11 @@ Routes
     Owners that claim worlds at run time (sparse factors, the incremental and
     parallel tiers, local owners, the paired and sparse-diagonal sweeps) also
     get an ownership test that reads the solve readout. Covered on CUDA: native
-    sparse factors (with contact triplets, and in split mode), the matrix-free
-    Gauss-Seidel sweep with its incremental, parallel, matrix-free parallel and
-    keyed-parallel tiers, local owners (row packets and owned rows), the paired
-    factor sweep, the sparse-diagonal sweep (sparse-diagonal rows and the
-    compact contact boundary), and split mode's loop and default tiled-row
-    sweeps; on CPU, split mode. Dynamics owners: ``TreeSparseOperator``,
+    sparse factors (with contact triplets), the matrix-free Gauss-Seidel sweep
+    with its incremental, parallel, matrix-free parallel and keyed-parallel
+    tiers, local owners (row packets and owned rows), the paired factor sweep
+    and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
+    boundary); on CPU, split mode. Dynamics owners: ``TreeSparseOperator``,
     ``TreeHeldOperator``, ``ForestHeldOperator``, scalar branches and ordinary
     dynamics. Contact-row producers: sparse response, compact Jacobian, general
     (per contact and masked), keyed rows, local packets, sparse diagonal and
@@ -1128,7 +1127,7 @@ def reference(physics: Physics, route: Route, device) -> Reference:
 # Route catalog
 # ---------------------------------------------------------------------------------------------------------------------
 
-_MF = {"pgs_mode": "matrix_free"}
+_MF = {}
 # Dense storage and ordinary dynamics: the route of the general placement's reference.
 _ORDINARY = {"storage": "dense", "evaluator": "ordinary"}
 
@@ -1153,33 +1152,11 @@ REFERENCE_CUDA = Route(
 CPU_SPLIT = Route(
     "cpu_split",
     "cpu",
-    options={"pgs_mode": "split"},
+    options={},
     expect={"sweep.route": "dense_loop", "held_tree.owner": None, "contact_rows.producer": "general"},
 )
 CPU_SPLIT_UNIT = CPU_SPLIT.but(
     "cpu_split_unit", options={"contact_update": "unit"}, expect={"sweep.contact_update.law": "unit"}
-)
-SPLIT_LOOP = Route(
-    "split_loop",
-    "cuda",
-    options={"pgs_mode": "split"},
-    pins={"pgs_kernel": "loop"},
-    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop"]},
-)
-SPLIT_LOOP_UNIT = Route(
-    "split_loop_unit",
-    "cuda",
-    options={"pgs_mode": "split", "contact_update": "unit"},
-    pins={"pgs_kernel": "loop"},
-    expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop_unit"]},
-)
-SPLIT_TILED = Route(
-    "split_tiled_row",
-    "cuda",
-    # The constructor's default mode on CUDA where native sparse factors decline its rows.
-    options={"pgs_mode": "split"},
-    pins={"pgs_kernel": "tiled_row"},
-    expect={"sweep.route": "dense_tiled_row"},
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 MF_GENERAL = Route(
@@ -1241,16 +1218,6 @@ SPARSE_TRIPLETS = Route(
     # The default sparse route of a single tree with the row support table: fused contact triplets.
     options=_MF,
     expect={"sweep.route": "sparse_pgs", "sparse_mass_matrix.contact_triplets": True},
-)
-SPARSE_SPLIT = Route(
-    "sparse_split",
-    "cuda",
-    options={"pgs_mode": "split"},
-    expect={
-        "sweep.route": "sparse_pgs",
-        "sparse_mass_matrix.split": True,
-        "held_tree.groups.0.operator": "TreeSparseOperator",
-    },
 )
 LOCAL_PACKETS = Route(
     "local_packets",
@@ -1457,46 +1424,44 @@ def cuda_groups() -> list:
         # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
         # its contact triplets.
         triplets = [SPARSE_TRIPLETS] if law == "point" else []
-        legged = [SPARSE, *triplets, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL]
+        legged = [SPARSE, *triplets, MF_HELD, MF_GENERAL]
         legged += [MF_PARALLEL, KEYED_PARALLEL]
         groups += [
             Group(
                 _physics(scenes.box_drop(), law, 32),
                 ref,
-                (MF_HELD, MF_GENERAL, SPLIT_LOOP, SPLIT_TILED, SPLIT_LOOP_UNIT),
+                (MF_HELD, MF_GENERAL),
             ),
-            Group(_physics(scenes.box_stack(), law, 32), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP)),
-            Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP, SPLIT_LOOP_UNIT)),
-            Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD, SPLIT_LOOP)),
+            Group(_physics(scenes.box_stack(), law, 32), ref, (MF_HELD, MF_GENERAL)),
+            Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL)),
+            Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
             Group(
                 _physics(scenes.gripper(), law, 32),
                 ref,
-                (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY, SPLIT_LOOP),
+                (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY),
             ),
-            Group(_physics(scenes.gripper(table=True), law, 32), ref, (LOCAL_KINEMATIC, SPLIT_LOOP)),
+            Group(_physics(scenes.gripper(table=True), law, 32), ref, (LOCAL_KINEMATIC,)),
             Group(
                 _physics(scenes.keyboard(), law, 16),
                 ref,
-                (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY, SPLIT_LOOP),
+                (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY),
             ),
-            Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST, SPLIT_LOOP)),
+            Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
             # The tiers whiten their rows in the kernel: the response block's scratch holds 29 coordinates a row at
             # 32 rows, so the 66-coordinate sprawl and the 106-coordinate snake take the matrix-free tier.
-            Group(
-                _physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED)
-            ),
+            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE)),
             # The parallel tiers cannot own the snake's 303-row world either: requesting them must leave its
             # serial sweep undisturbed.
             Group(
                 _physics(scenes.long_chain(), law, 64),
                 ref,
-                (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
+                (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE),
             ),
             # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
             # armature it needs near the head, the same on every route.
-            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT, SPLIT_LOOP, SPLIT_TILED)),
+            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT,)),
             Group(
                 _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
                 ref,
@@ -1513,22 +1478,22 @@ def cuda_groups() -> list:
         Group(
             _physics(scenes.box_stack(contact_matching="latest"), "point", 32),
             ref,
-            (MF_HELD.but("mf_held_warm_start", options=_WARM), SPLIT_LOOP.but("split_loop_warm_start", options=_WARM)),
+            (MF_HELD.but("mf_held_warm_start", options=_WARM),),
         ),
         Group(
             _physics(scenes.legged(contact_matching="latest"), "point", 32),
             ref,
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
-        Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP)),
-        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD, SPLIT_LOOP)),
-        Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL, SPLIT_LOOP)),
+        Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL)),
+        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD,)),
+        Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL)),
         Group(
             _physics(scenes.chain(), None, 16, "physx_drives", drive_mode="physx_pgs"),
             ref,
             (MF_DEFAULT.but("mf_physx_drives", expect={"held_tree.owner": None}),),
         ),
-        Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT, SPLIT_LOOP)),
+        Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
         Group(
             # Pre-elimination solves the iterative connect rows' problem exactly: compare with the iterative reference.
             _physics(scenes.four_bar(), None, 16),
@@ -1542,14 +1507,14 @@ def cuda_groups() -> list:
             ),
             tag="preelimination",
         ),
-        Group(_physics(scenes.mimic_pair(), None, 16), ref, (MF_HELD, SPLIT_LOOP)),
+        Group(_physics(scenes.mimic_pair(), None, 16), ref, (MF_HELD,)),
         Group(
             _physics(scenes.mimic_pair(), None, 16, "velocity_limits", **vlimits),
             ref,
             (SPARSE.but("sparse_velocity_mimic", expect={"sparse_mass_matrix.velocity_limits": True}),),
         ),
         # A one-coordinate arm is diagonal-mass, which the held tree declines.
-        Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_GENERAL, SPLIT_LOOP)),
+        Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_GENERAL,)),
         Group(
             _physics(scenes.pushed_arm(), None, 16, "stateless", **vlimits),
             ref,

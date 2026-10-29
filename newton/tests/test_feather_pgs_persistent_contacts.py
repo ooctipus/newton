@@ -33,7 +33,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
                 body_pair_hysteresis=0.001,
             ),
         )
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True)
+        solver = SolverFeatherPGS(model, pgs_warmstart=True)
         state, output = model.state(), model.state()
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)

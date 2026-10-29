@@ -64,22 +64,8 @@ class TestKit(unittest.TestCase):
         self.assertEqual(unrolled.leave(y, y).count("#pragma unroll"), 2)
 
 
-class TestDelassusStaging(unittest.TestCase):
-    """The streaming Delassus's chunk is its staging's: the largest that fits the device's static budget."""
-
-    def test_chunk(self):
-        for D, M, budget in ((18, 32, 49152), (176, 32, 49152), (97, 64, 49152), (97, 64, 101376), (300, 128, 101376)):
-            with self.subTest(D=D, M=M, budget=budget):
-                chunk = builds.delassus_stream_chunk(D, M, budget)
-                self.assertLessEqual(chunk, M)
-                self.assertTrue(builds.delassus_stream_staging(D, chunk).fits(budget))
-                if chunk < M:
-                    self.assertFalse(builds.delassus_stream_staging(D, chunk + 1).fits(budget))
-        # Small groups stream every row in one chunk, offline too.
-        for D, M in ((18, 32), (43, 64), (12, 128)):
-            self.assertEqual(builds.delassus_stream_chunk(D, M, STATIC_SHARED_BYTES), M)
-        with self.assertRaises(ValueError):
-            builds.delassus_stream_chunk(7000, 8, STATIC_SHARED_BYTES)
+class TestStaticBudget(unittest.TestCase):
+    """The static shared-memory budget of a device architecture."""
 
     def test_budget(self):
         self.assertEqual(static_budget(12345), STATIC_SHARED_BYTES)  # no device of the architecture: offline
@@ -88,8 +74,6 @@ class TestDelassusStaging(unittest.TestCase):
             self.assertEqual(static_budget(12345), 81724)
         finally:
             del STATIC_SHARED_BUDGETS[12345]
-        # 176 DOFs and 32 rows: the staging's chunk is the row capacity, not more.
-        self.assertIn("chunk32", builds.delassus_stream_kernel(176, 32, 12345).key)
 
 
 class TestRegistry(unittest.TestCase):
@@ -111,8 +95,6 @@ class TestRegistry(unittest.TestCase):
     def test_assembled(self):
         build = Assembled.build("delassus", "entries")
         self.assertIs(build.kernel, builds.delassus_entries_kernel())
-        stream = Assembled.build("delassus", "stream", n_dofs=18, max_constraints=32, device_arch=0)
-        self.assertEqual(stream.block_dim, builds.DELASSUS_THREADS)
         with self.assertRaises(KeyError):
             Assembled.build("factor", "articulations")
 

@@ -39,7 +39,7 @@ def _build_hinge(spring_k: float, spring_ref: float, damping: float, limit_upper
 
 def _run(builder, steps: int = 1200, qd0: float = 0.0, **solver_kwargs):
     model = builder.finalize()
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=8, **solver_kwargs)
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     if qd0 != 0.0:
         qd = state_0.joint_qd.numpy()
@@ -94,7 +94,6 @@ class TestFeatherPGSSprings(unittest.TestCase):
                 control = model.control()
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     pgs_iterations=8,
                     dense_max_constraints=32,
                     enable_joint_velocity_limits=True,

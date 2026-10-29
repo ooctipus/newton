@@ -111,7 +111,6 @@ def run(
     model = builder.finalize(device="cuda:0")
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
         pgs_iterations=32,
         pgs_beta=0.05,
         pgs_warmstart=warmstart,

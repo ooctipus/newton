@@ -67,9 +67,7 @@ def _step_chains(model, solver, leader_target: float, steps: int = 600):
 def _run_chain(coef0: float, coef1: float, leader_target: float, steps: int = 600, **solver_kwargs):
     builder, _, _ = _build_two_revolute_chain(coef0, coef1)
     model = builder.finalize()
-    solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
-    )
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1, **solver_kwargs)
     return solver, _step_chains(model, solver, leader_target, steps)
 
 
@@ -100,7 +98,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         builder.replicate(template, world_count=4)
         model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
+        solver = newton.solvers.SolverFeatherPGS(model)
 
         self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
         self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
@@ -110,7 +108,7 @@ class TestFeatherPGSMimic(unittest.TestCase):
         builder, _, _ = _build_two_revolute_chain(0.0, 1.0)
         builder.constraint_mimic_enabled[0] = False
         model = builder.finalize()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16)
         q = _step_chains(model, solver, leader_target=0.5)
         self.assertAlmostEqual(q[0], 0.5, delta=0.05)
         # The undriven follower swings free under gravity; it must NOT sit at the leader angle.

@@ -177,7 +177,6 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         for capacity in (192, 640, 768):
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="split",
                 dense_max_constraints=capacity,
                 pgs_iterations=8,
                 angular_damping=0.0,

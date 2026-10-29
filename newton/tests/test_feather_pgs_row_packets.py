@@ -660,7 +660,6 @@ def _arm(model, *, packets, swing_stride=3, friction_anchor_beta=0.0, swing=1.5,
     with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,

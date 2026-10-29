@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests import test_feather_pgs_sparse_split as split
+from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     SLIDING_ITERATIONS,
@@ -57,7 +57,7 @@ def _standing_cases(count, *, twin=False, iterations=8, **shape):
     """Build dense split standing cases on CPU; with ``twin`` the last one's torsos start one float32 ulp higher."""
     options = {**_DENSE_SPLIT, "pgs_iterations": iterations}
     cases = [
-        split._case(False, options=dict(options), deterministic=True, standing=True, device="cpu", **shape)
+        sparse_scene.make_case(False, options=dict(options), deterministic=True, standing=True, device="cpu", **shape)
         for _ in range(count)
     ]
     if twin:
@@ -135,7 +135,7 @@ def _permuted_slots(solver, contacts, shift):
         contact_slots_needed=solver.contact_slots_needed,
         _friction_patches=solver._friction_patches,
         _sparse_mass_matrix_size=None,
-        pgs_mode=solver.pgs_mode,
+        _matrix_free=solver._matrix_free,
         # The bodies' factors, which whitened the rows.
         L_by_size=solver.L_by_size,
         body_to_articulation=solver.body_to_articulation,
@@ -232,9 +232,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         """Carry ring-linked anchors from step to step on the standing fixture, and restart a reset world's."""
         with wp.ScopedDevice("cpu"):
             model = standing_model("cpu")
-            solver = SolverFeatherPGS(
-                model, pgs_mode="split", friction_anchor_beta=0.2, pgs_iterations=8, dense_max_constraints=32
-            )
+            solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=8, dense_max_constraints=32)
             pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
             contacts, control = pipeline.contacts(), model.control()
             state, output = model.state(), model.state()
@@ -298,9 +296,9 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 for case in cases:
                     case[1].reset(case[2], world_mask=selected)
             for case in cases:
-                split._step(case)
+                sparse_scene.step(case)
             assert_states_close(cases[0][2], cases[1][2], velocity_atol=STANDING_VELOCITY_ATOL)
-            rows = [patch_rows(case[1], case[-1], split.DT) for case in cases]
+            rows = [patch_rows(case[1], case[-1], sparse_scene.DT) for case in cases]
             assert_patch_rows_close(*rows)
             assert_region_impulses_close(*rows, **STANDING_REGION_BOUNDS)
             assert_anchor_sites_close(*(anchor_sites(case[1], case[-1]) for case in cases), tangent=False)
@@ -327,11 +325,11 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         ratios, rejected = [], 0
         for _ in range(24):
             for case in (reference, twin):
-                split._step(case)
+                sparse_scene.step(case)
             with _ring_pool_dropped(unpooled[1]):
-                split._step(unpooled)
+                sparse_scene.step(unpooled)
             assert_states_close(reference[2], twin[2], velocity_atol=STANDING_VELOCITY_ATOL)
-            rows = [patch_rows(case[1], case[-1], split.DT) for case in (reference, twin, unpooled)]
+            rows = [patch_rows(case[1], case[-1], sparse_scene.DT) for case in (reference, twin, unpooled)]
             assert_patch_rows_close(rows[0], rows[1], lifecycle=False)
             assert_region_impulses_close(rows[0], rows[1], **SLIDING_REGION_BOUNDS)
             for case in (reference, twin):
@@ -362,7 +360,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         skipped, runs at half the decay, writes other values than the seeding
         law, or whose seeded rows are overwritten before the sweep fails.
         """
-        case = split._case(
+        case = sparse_scene.make_case(
             False,
             options={**_DENSE_SPLIT, "pgs_warmstart": True},
             contact_matching="latest",
@@ -375,7 +373,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
 
         def seeded_step():
             with recorded_patch_seeds() as seeds:
-                split._step(case)
+                sparse_scene.step(case)
             return seeds
 
         def scale_carried_friction(factor):

@@ -71,13 +71,11 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
         model, masses = _build(device)
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="split",
             pgs_iterations=iterations,
             pgs_warmstart=warmstart,
             friction_anchor_beta=0.0,
         )
         self.assertIsNotNone(solver._sparse_mass_matrix_size, solver._sparse_selection_reason)
-        self.assertTrue(solver._sparse_split)
         self.assertEqual("_warm_start" in solver._pgs_solve_sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()

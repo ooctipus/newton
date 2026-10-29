@@ -265,12 +265,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(solver.tile_threads, 64)
 
     def test_joint_limit_solver_compatibility_validation(self):
-        model = _build_chain_model(num_links=2, num_worlds=1)
+        model = _build_chain_model(num_links=2, num_worlds=1, device="cpu")
 
-        with self.assertRaisesRegex(NotImplementedError, "requires pgs_mode='matrix_free'"):
+        with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
             SolverFeatherPGS(
                 model,
-                pgs_mode="split",
                 enable_joint_velocity_limits=True,
             )
 
@@ -326,48 +325,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 tile_threads=64,
             )
 
-    def test_hinv_fused_estimate_counts_streamed_tiles(self):
-        """Count four response tiles, including the second Jacobian chunk, in fused storage."""
-        # The 27-DOF, 16-row fused launch reports 11,120 bytes: one 2,928-byte
-        # factor, four 1,728-byte response tiles, a 1,024-byte product and
-        # 256 bytes of Warp scratch. Capacity does not enlarge divisible chunks.
-        for capacity, threads, expected in (
-            (128, 64, 11120),
-            (384, 64, 11120),
-            (128, 128, 11376),
-            (15, 64, 10624),
-            (17, 64, 11712),
-            (1, 64, 3648),
-        ):
-            with self.subTest(capacity=capacity, threads=threads):
-                self.assertEqual(
-                    _estimate_hinv_jt_shared_memory(27, capacity, fused=True, tile_threads=threads), expected
-                )
-        self.assertEqual(_estimate_hinv_jt_shared_memory(27, 32, fused=False, tile_threads=64), 13552)
-
-    def test_hinv_fusion_uses_streamed_working_set(self):
-        """Admit fitting streamed fusion and preserve resource fallback at exact boundaries."""
-        for dofs, capacity, shared_memory, expected in (
-            (27, 128, 101376, True),
-            (23, 384, 101376, True),
-            (27, 128, 11119, False),
-            (27, 128, 11120, True),
-            (27, 17, 11120, False),
-            (27, 17, 11712, True),
-            (130, 128, 101376, False),
-        ):
-            with self.subTest(dofs=dofs, capacity=capacity, shared_memory=shared_memory):
-                plan = _FeatherPGSExecutionPlan.build(
-                    [dofs],
-                    max_constraints=capacity,
-                    max_shared_memory=shared_memory,
-                    cholesky_kernel="auto",
-                    hinv_jt_kernel="auto",
-                    small_dof_threshold=12,
-                    tile_threads=64,
-                )
-                self.assertTrue(plan.use_tiled_hinv_jt(dofs))
-                self.assertEqual(plan.use_fused_hinv_jt(dofs), expected)
+    def test_hinv_estimate_counts_three_response_tiles(self):
+        """Count the factor, three response tiles and the Warp scratch of the tiled response."""
+        self.assertEqual(_estimate_hinv_jt_shared_memory(27, 32, tile_threads=64), 13552)
 
     def test_cholesky_execution_plan_respects_shared_memory(self):
         """Fall back for oversized auto tiles and reject forced invalid launches."""
@@ -445,7 +405,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model = _build_sparse_diagonal_pair_model(device="cuda:0")
         optimized = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             dense_max_constraints=64,
             mf_max_constraints=32,
             pgs_iterations=8,
@@ -457,7 +416,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         with mock.patch.dict(SolverFeatherPGS._route_pins, {"placement": "general"}):
             reference = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 dense_max_constraints=64,
                 mf_max_constraints=32,
                 pgs_iterations=8,
@@ -538,7 +496,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         def make_solver(**kwargs):
             return SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 dense_max_constraints=96,
                 mf_max_constraints=32,
                 pgs_iterations=8,
@@ -619,7 +576,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         solvers = {
             radius: SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 dense_max_constraints=64,
                 mf_max_constraints=32,
                 pgs_iterations=8,
@@ -639,7 +595,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model = _build_sparse_diagonal_pair_model(device="cuda:0", revolute_branches=True)
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             dense_max_constraints=64,
             mf_max_constraints=32,
             pgs_iterations=8,
@@ -742,7 +697,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with self.subTest(with_free_body=with_free_body):
                 solver = SolverFeatherPGS(
                     _build_chain_model(num_links=23, num_worlds=1, with_free_body=with_free_body),
-                    pgs_mode="matrix_free",
                     dense_max_constraints=192,
                 )
                 self.assertTrue(solver._packed_response)
@@ -805,10 +759,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model = _build_chain_model(num_links=2, num_worlds=1)
         for kwargs in (
             {},  # neither matrix_free nor velocity limits nor physx drive
-            {"pgs_mode": "matrix_free", "drive_mode": "physx_pgs"},  # no velocity limits
+            {"drive_mode": "physx_pgs"},  # no velocity limits
         ):
             with self.subTest(kwargs=kwargs):
-                if kwargs.get("pgs_mode") == "matrix_free" and model.device.is_cpu:
+                if kwargs.get("drive_mode") == "physx_pgs" and model.device.is_cpu:
                     with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
                         SolverFeatherPGS(model, **kwargs)
                     continue
@@ -819,7 +773,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             # (matrix_free construction requires CUDA).
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="augmented",
             )
@@ -827,7 +780,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             # The applicable combination engages, and the test pin velocity_limit_clamp=False keeps the rows.
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="physx_pgs",
             )
@@ -835,7 +787,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with mock.patch.dict(SolverFeatherPGS._route_pins, {"velocity_limit_clamp": False}):
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     enable_joint_velocity_limits=True,
                     drive_mode="physx_pgs",
                 )
@@ -847,7 +798,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             # disabled.
             solver = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="physx_pgs",
                 velocity_limit_activation_fraction=float("inf"),
@@ -860,7 +810,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             for velocity_drive_mode in ("freeze", "active"):
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     enable_joint_velocity_limits=True,
                     drive_mode="physx_pgs",
                     pgs_velocity_iterations=2,
@@ -888,7 +837,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     drive_mode="physx_pgs",
                     enable_joint_velocity_limits=True,
                     pgs_iterations=64,

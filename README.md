@@ -1028,9 +1028,7 @@ SDF resolution is chosen separately to preserve threads, bores, fork gaps and
 thin ceramic shells. Identical objects share meshes and SDF grids; unchanged
 cooks use Newton's content-addressed disk cache.
 
-FPGS uses `--pgs-mode matrix_free` by default for every scene and requires CUDA
-in this mode. The optional `--pgs-mode split` route is rejected above 64 free
-objects per world because of its current body-map limit.
+FPGS solves every scene matrix-free on CUDA.
 
 Only FPGS hardware enables body-pair contact reduction by default, using 0.04 m
 spatial cells and zero hysteresis. `--body-pair-reduction` and

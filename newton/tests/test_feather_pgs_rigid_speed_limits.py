@@ -66,7 +66,7 @@ def _step_boxes(device, **options):
         bodies.append(body)
         builder.end_world()
     model = builder.finalize(device=device)
-    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", angular_damping=0.0, **options)
+    solver = SolverFeatherPGS(model, angular_damping=0.0, **options)
     state_0, state_1 = model.state(), model.state()
     starts = model.joint_qd_start.numpy()
     joints = [int(np.flatnonzero(model.joint_child.numpy() == body)[0]) for body in bodies]

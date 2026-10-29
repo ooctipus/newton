@@ -47,7 +47,6 @@ class _AdmissionProbe(SimpleNamespace):
             loops=self._has_loop_joints,
             iterations=self.pgs_iterations > 0,
             forward_cuda=True,
-            matrix_free=self.pgs_mode == "matrix_free",
         )
 
     # Patch friction may run the parallel tiers, as point friction may.
@@ -60,7 +59,6 @@ def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
     return _AdmissionProbe(
         _route_pins={},
-        pgs_mode="matrix_free",
         pgs_schedule="interleaved",
         drive_mode="augmented",
         _parallel_augmented_drive_topology=True,
@@ -177,30 +175,20 @@ class TestSparseResearchAdmission(unittest.TestCase):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
 
-    def test_patch_friction_yields_only_to_a_parallel_tier_it_runs(self):
-        """Keep the ordinary buffers for a patch parallel tier, but not for split mode or the default.
+    def test_patch_friction_yields_to_a_parallel_tier_it_runs(self):
+        """Keep the ordinary buffers for a patch parallel tier.
 
         Patch friction runs the recipe's parallel tier as point friction does, so the
-        tier's request declines sparse factors in matrix-free mode. Split mode builds no
-        tier, so patch friction keeps its sparse route there.
+        tier's request declines sparse factors.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for name, changes, declined in (
-            ("parallel", {"mf_gs_parallel_rows": 48}, True),
-            ("split", {"mf_gs_parallel_rows": 48, "pgs_mode": "split", "pgs_kernel": "tiled_row"}, False),
-        ):
-            with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
-                solver = _eligible_solver()
-                solver._friction_anchors_enabled = True
-                for attribute, value in changes.items():
-                    setattr(solver, attribute, value)
-                if declined:
-                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                    self.assertIsNone(solver._sparse_mass_matrix_size)
-                    self.assertIn("competing", solver._sparse_selection_reason)
-                else:
-                    with self.assertRaises(_TopologyReached):
-                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            solver = _eligible_solver()
+            solver._friction_anchors_enabled = True
+            solver.mf_gs_parallel_rows = 48
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIn("competing", solver._sparse_selection_reason)
 
     def test_patch_route_claims_follow_the_recorded_precedence(self):
         """Claim a patch free-body world for a requested tier, then for the dense route.
@@ -227,7 +215,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 model = _branched_model(branches, depth, "cuda:0")
                 solver = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     drive_mode="augmented",
                     friction_anchor_beta=0.0,
                     enable_joint_velocity_limits=False,

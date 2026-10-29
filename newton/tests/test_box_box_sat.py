@@ -168,7 +168,7 @@ def test_box_box_corner_manifold_preserved(test: unittest.TestCase, device):
             box_box_sat=True,
         )
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=8, pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
         s0, s1 = model.state(), model.state()
         control = model.control()
         newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
@@ -209,7 +209,7 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
             speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(),
         )
         contacts = pipeline.contacts()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=8, pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
         s0, s1 = model.state(), model.state()
         control = model.control()
         joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)

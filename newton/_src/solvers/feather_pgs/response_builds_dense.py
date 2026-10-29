@@ -40,11 +40,10 @@ import warp as wp
 
 from . import kernel_template
 from .device_preludes import lane_group, substitute
-from .execution_plan import _fused_response_chunk_size
-from .kernel_template import THREADS, Dispatch, KernelTemplate, python_kernel
+from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
-from .staging import Buffer, Staging, static_budget
+from .staging import Buffer, Staging
 
 __all__ = [
     "ASSEMBLED_BUILDS",
@@ -842,117 +841,6 @@ def cfm_worlds_kernel() -> wp.Kernel:
 # Stage "delassus": C = J Y^T and its diagonal, accumulated onto a zeroed C and diagonal (S17: array clears)
 # ---------------------------------------------------------------------------------------------------------------------
 
-DELASSUS_THREADS = 128
-"""Threads of a streaming Delassus block, one lane group."""
-
-
-def delassus_stream_staging(n_dofs: int, chunk: int) -> Staging:
-    """The streaming Delassus block's working set: ``chunk`` rows of ``J`` and of ``Y`` (and Warp's tile storage)."""
-    return Staging(
-        (Buffer("s_J", "float", chunk * n_dofs), Buffer("s_Y", "float", chunk * n_dofs)), threads=DELASSUS_THREADS
-    )
-
-
-def delassus_stream_chunk(n_dofs: int, max_constraints: int, budget: int) -> int:
-    """The largest row chunk, at most ``max_constraints``, whose staging fits ``budget`` bytes of static shared memory.
-
-    Raises:
-        ValueError: If even one row of ``J`` and of ``Y`` does not fit.
-    """
-    per_row = delassus_stream_staging(n_dofs, 2).bytes - delassus_stream_staging(n_dofs, 1).bytes
-    fixed = delassus_stream_staging(n_dofs, 1).bytes - per_row
-    chunk = min(int(max_constraints), (int(budget) - fixed) // per_row)
-    if chunk < 1:
-        raise ValueError(
-            f"the streaming Delassus of {n_dofs} DOFs needs {fixed + per_row} bytes of static shared memory for one "
-            f"row, over the {budget}-byte budget"
-        )
-    while not delassus_stream_staging(n_dofs, chunk).fits(budget):
-        chunk -= 1
-    return chunk
-
-
-@functools.cache
-def delassus_stream_kernel(n_dofs: int, max_constraints: int, device_arch, chunk_size: int | None = None) -> wp.Kernel:
-    """The Delassus of a size group, one block per articulation streaming row chunks of ``J`` and ``Y`` through
-    shared memory (``launch_tiled(dim=[articulations], block_dim=128)``): every entry ``C_ij = sum_k J_ik Y_jk`` in
-    coordinate order, added atomically when nonzero (and to the diagonal), so the chunk changes no value.
-
-    The chunk is the largest the staging declaration (:func:`delassus_stream_staging`) fits in the static budget of
-    the device the kernel is built for (:func:`.staging.static_budget` of ``device_arch``), at most the row
-    capacity; ``chunk_size`` overrides it.
-    """
-    D, M = int(n_dofs), int(max_constraints)
-    chunk = int(chunk_size) if chunk_size is not None else delassus_stream_chunk(D, M, static_budget(int(device_arch)))
-    staging = delassus_stream_staging(D, chunk)
-
-    def entry(k):
-        return f"s_J[il * TILE_D + {k}]"
-
-    def column(k):
-        return f"s_Y[jl * TILE_D + {k}]"
-
-    snippet = f"""const int TILE_D = {D};
-const int TILE_M = {M};
-const int CHUNK = {chunk};
-
-int art = group_to_art.data[idx];
-int world = art_to_world.data[art];
-int m = world_constraint_count.data[world];
-if (m == 0) return;
-
-{staging.declarations("")}
-
-int num_chunks = (m + CHUNK - 1) / CHUNK;
-
-for (int ci = 0; ci < num_chunks; ci++) {{
-    int i0 = ci * CHUNK, i1 = min(i0 + CHUNK, m);
-
-    for (int t = LANE; t < (i1 - i0) * TILE_D; t += STRIDE)
-        s_J[t] = J_group.data[idx * TILE_M * TILE_D + i0 * TILE_D + t];
-    SYNC();
-
-    for (int cj = 0; cj < num_chunks; cj++) {{
-        int j0 = cj * CHUNK, j1 = min(j0 + CHUNK, m);
-
-        for (int t = LANE; t < (j1 - j0) * TILE_D; t += STRIDE)
-            s_Y[t] = Y_group.data[idx * TILE_M * TILE_D + j0 * TILE_D + t];
-        SYNC();
-
-        for (int e = LANE; e < (i1 - i0) * (j1 - j0); e += STRIDE) {{
-            int il = e / (j1 - j0), jl = e % (j1 - j0);
-{_indent(dot("sum", "TILE_D", entry, column), "            ")}
-            if (sum != 0.0f) {{
-                int ig = i0 + il, jg = j0 + jl;
-                atomicAdd(&world_C.data[world * TILE_M * TILE_M + ig * TILE_M + jg], sum);
-                if (ig == jg) atomicAdd(&world_diag.data[world * TILE_M + ig], sum);
-            }}
-        }}
-        SYNC();
-    }}
-}}
-#endif
-"""
-    return KernelTemplate(
-        f"dense_delassus_stream_{D}_{M}_chunk{chunk}",
-        kernel_template.params(
-            ("J_group", wp.array3d[float]),
-            ("Y_group", wp.array3d[float]),
-            ("group_to_art", wp.array[int]),
-            ("art_to_world", wp.array[int]),
-            ("world_constraint_count", wp.array[int]),
-            ("n_arts", int),
-            ("world_C", wp.array3d[float]),
-            ("world_diag", wp.array2d[float]),
-        ),
-        snippet,
-        dispatch=Dispatch(
-            "idx, _lane = wp.tid()\nif idx < n_arts:\n    $CALL", ("idx",), (("idx", int),), private=("n_arts",)
-        ),
-        preludes=(lane_group(DELASSUS_THREADS),),
-        native_name="delassus_native",
-    ).kernel()
-
 
 @functools.cache
 def delassus_entries_kernel() -> wp.Kernel:
@@ -990,75 +878,6 @@ def delassus_entries_kernel() -> wp.Kernel:
         ("world_diag", wp.array2d[float]),
     )
     return _kernel("dense_delassus_entries", params, body)
-
-
-@functools.cache
-def delassus_tiles_kernel(n_dofs: int, max_constraints: int, tile_threads: int = 64) -> wp.Kernel:
-    """The response and the Delassus fused, one tile per articulation (``launch_tiled(dim=[articulations],
-    block_dim=tile_threads)``), rows in chunks (:func:`.execution_plan._fused_response_chunk_size`): per chunk
-    ``Y_i`` by the tile solves, then ``C_ji = tile_matmul(J_j, X_i)`` stored, the diagonal ``C_tt + cfm`` stored
-    (the primitives' rounding; the leaf-first factor, the coordinates reversed by indexing)."""
-    TILE_DOF_LOCAL = wp.constant(int(n_dofs))
-    TILE_DOF_LAST = wp.constant(int(n_dofs) - 1)
-    chunk = _fused_response_chunk_size(max_constraints)
-    TILE_CHUNK_LOCAL = wp.constant(chunk)
-
-    def hinv_jt_tiled_fused_template(
-        L_group: wp.array3d[float],
-        J_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        world_constraint_count: wp.array[int],
-        row_cfm: wp.array2d[float],
-        world_C: wp.array3d[float],
-        world_diag: wp.array2d[float],
-        Y_group: wp.array3d[float],
-    ):
-        idx, thread = wp.tid()
-        art = group_to_art[idx]
-        world = art_to_world[art]
-        n_constraints = world_constraint_count[world]
-        if n_constraints == 0:
-            return
-        n_chunks = (n_constraints + TILE_CHUNK_LOCAL - 1) // TILE_CHUNK_LOCAL
-
-        L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-        Lt_tile = wp.tile_transpose(L_tile)
-        reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
-
-        for ci in range(n_chunks):
-            row_i = ci * TILE_CHUNK_LOCAL
-            J_i = wp.tile_load(
-                J_group[idx], shape=(TILE_CHUNK_LOCAL, TILE_DOF_LOCAL), offset=(row_i, 0), bounds_check=False
-            )
-            Z_i = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_i[:, reverse]))
-            X_i = wp.tile_upper_solve(Lt_tile, Z_i)[reverse, :]
-            wp.tile_store(Y_group[idx], wp.tile_transpose(X_i), offset=(row_i, 0), bounds_check=False)
-            for cj in range(n_chunks):
-                row_j = cj * TILE_CHUNK_LOCAL
-                J_j = wp.tile_load(
-                    J_group[idx], shape=(TILE_CHUNK_LOCAL, TILE_DOF_LOCAL), offset=(row_j, 0), bounds_check=False
-                )
-                C_ji = wp.tile_zeros(shape=(TILE_CHUNK_LOCAL, TILE_CHUNK_LOCAL), dtype=wp.float32)
-                wp.tile_matmul(J_j, X_i, C_ji)
-                wp.tile_store(world_C[world], C_ji, offset=(row_j, row_i), bounds_check=False)
-                # Publication is spread over the threads so a serial diagonal loop does not extend register
-                # lifetimes across the fused tile operations; a chunk wider than the block publishes on one thread.
-                if wp.static(chunk <= tile_threads):
-                    if ci == cj and thread < TILE_CHUNK_LOCAL:
-                        row = row_i + thread
-                        if row < n_constraints:
-                            world_diag[world, row] = C_ji[thread, thread] + row_cfm[world, row]
-                else:
-                    if ci == cj and thread == 0:
-                        for r in range(TILE_CHUNK_LOCAL):
-                            row = row_i + r
-                            if row < n_constraints:
-                                world_diag[world, row] = C_ji[r, r] + row_cfm[world, row]
-
-    return python_kernel(
-        hinv_jt_tiled_fused_template, f"dense_delassus_tiles_{n_dofs}_{max_constraints}_bd{tile_threads}"
-    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1170,16 +989,9 @@ thread per world row summing its articulations' group diagonals; ``worlds``, a t
 The register response of the six-coordinate group is a device function, :func:`solve_six`."""
 
 ASSEMBLED_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
-    ("delassus", "stream"): _entry(
-        "delassus", "stream", delassus_stream_kernel, ("articulations",), DELASSUS_THREADS, tiled=True
-    ),
     ("delassus", "entries"): _entry("delassus", "entries", delassus_entries_kernel, ("articulations", "rows", "rows")),
-    ("delassus", "tiles"): _entry(
-        "delassus", "tiles", delassus_tiles_kernel, ("articulations",), _tile_threads, tiled=True
-    ),
     ("cfm", "worlds"): _CFM_WORLDS,
 }
-"""The builds of an :class:`.Assembled` operator's data, by ``(stage, mapping)``: ``C = J Y^T`` and its diagonal
-accumulated onto a zeroed ``C`` and diagonal (``stream``: a block per articulation streaming row chunks through
-shared memory; ``entries``: a thread per entry), or with the response fused (``tiles``, which stores ``C`` and the
-diagonal with its ``cfm``), then the diagonals' ``cfm``. The response itself is a :data:`DENSE_JY_BUILDS` build."""
+"""The builds of an :class:`.Assembled` operator's data (the CPU's split mode), by ``(stage, mapping)``: ``C = J Y^T``
+and its diagonal accumulated onto a zeroed ``C`` and diagonal, a thread per entry, then the diagonals' ``cfm``. The
+response itself is a :data:`DENSE_JY_BUILDS` build."""

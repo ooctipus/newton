@@ -92,7 +92,6 @@ class TestFeatherPGSSparseExitLaw(unittest.TestCase):
         model, contacts = _build(device, hip_pitch=hip_pitch)
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="split",
             pgs_iterations=iterations,
             pgs_solve_readout=readout,
             friction_anchor_beta=0.0,

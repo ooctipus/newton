@@ -76,7 +76,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
         model, contacts = _build(device)
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="split",
             dense_max_constraints=16,
             pgs_iterations=6,
             friction_anchor_beta=0.0,

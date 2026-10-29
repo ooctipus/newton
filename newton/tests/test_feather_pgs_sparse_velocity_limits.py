@@ -22,9 +22,9 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
-from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -58,7 +58,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                 self.assertRaises(_TopologyReached),
             ):
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertEqual(solver.pgs_mode, "matrix_free")
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
@@ -80,7 +79,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertFalse(solver._sparse_velocity_limits)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertEqual(solver.pgs_mode, "matrix_free")
 
 
 class TestSparseVelocityLimitRows(unittest.TestCase):
@@ -326,7 +324,7 @@ def _case(
     friction_anchor_beta=0.0,
     velocity_limit_law="stateless",
 ):
-    model = split_tests._model(floating=floating, branches=branches, depth=depth)
+    model = sparse_scene.branched_model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
     limits.reshape(2, -1)[:, -1] = np.inf
     model.joint_velocity_limit.assign(limits)
@@ -335,7 +333,6 @@ def _case(
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             drive_mode="augmented",
             friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
@@ -369,7 +366,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
         for case in (reference, candidate):
             self.assertFalse(case[1].constraint_overflow.numpy().any())
-            for name in split_tests.STATE_FIELDS:
+            for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
         np.testing.assert_array_equal(candidate[1]._sparse_mass_matrix_status.numpy(), 0)
         if candidate[1]._friction_anchors_enabled:
@@ -503,8 +500,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                 for case in (reference, candidate):
                     self.assertEqual(case[1].get_path_selection()["routes"]["velocity_limits"]["law"], "accumulated")
                 for _ in range(4):
-                    split_tests._step(reference)
-                    split_tests._step(candidate)
+                    sparse_scene.step(reference)
+                    sparse_scene.step(candidate)
                     self._assert_state(reference, candidate)
 
     def test_serial_and_branched_dense_reference(self):
@@ -517,11 +514,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                 candidate = _case(True, friction_anchor_beta=beta, **shape)
                 self.assertFalse(reference[1]._sparse_velocity_limits)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
-                self.assertEqual(candidate[1].pgs_mode, "matrix_free")
+                self.assertTrue(candidate[1]._matrix_free)
                 self.assertEqual(candidate[1].pgs_iterations, 8)
                 for step in range(4):
-                    split_tests._step(reference)
-                    split_tests._step(candidate)
+                    sparse_scene.step(reference)
+                    sparse_scene.step(candidate)
                     self._assert_state(reference, candidate)
                     if step == 0:
                         self._assert_rows(reference, candidate)
@@ -542,7 +539,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
-            split_tests._step(case)
+            sparse_scene.step(case)
         held = candidate[1]._sparse_Linv.numpy().copy()
         for model, solver, state, *_ in (reference, candidate):
             q = state.joint_q.numpy().copy()
@@ -551,19 +548,19 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (reference, candidate):
-            split_tests._step(case)
+            sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].mass_update_mask.numpy(), [1, 0])
         np.testing.assert_array_equal(candidate[1]._sparse_Linv.numpy()[1], held[1])
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
-            split_tests._step(candidate)
-            split_tests._step(candidate)
+            sparse_scene.step(candidate)
+            sparse_scene.step(candidate)
         for limit in (np.inf, 0.0, -1.0, 0.2):
             for model, solver, *_ in (reference, candidate):
                 model.joint_velocity_limit.fill_(float(limit))
                 solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-            split_tests._step(reference)
-            split_tests._step(reference)
+            sparse_scene.step(reference)
+            sparse_scene.step(reference)
             wp.capture_launch(capture.graph)
             self._assert_state(reference, candidate)
             for case in (reference, candidate):
@@ -584,8 +581,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                 )
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
                 for _ in range(2):
-                    split_tests._step(reference)
-                    split_tests._step(candidate)
+                    sparse_scene.step(reference)
+                    sparse_scene.step(candidate)
                     self._assert_state(reference, candidate)
                     np.testing.assert_array_equal(
                         candidate[1].velocity_limit_slot.numpy(), reference[1].velocity_limit_slot.numpy()

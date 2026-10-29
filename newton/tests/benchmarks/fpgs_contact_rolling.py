@@ -82,7 +82,6 @@ def run(worlds, objects, kind, warm, reduced, iterations):
     metrics = wp.zeros(6, dtype=wp.float32, device=model.device)
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
         pgs_warmstart=warm,
         pgs_iterations=iterations,
         mf_max_constraints=max(128, objects * 128),

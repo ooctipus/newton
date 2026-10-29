@@ -488,7 +488,6 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 model = builder.finalize(device="cuda:0")
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     pgs_iterations=64,
                     pgs_velocity_iterations=velocity,
                     pgs_contact_regularization=regularization,

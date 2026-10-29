@@ -70,7 +70,7 @@ def _jacobian(solver, route, world, count):
         from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
-    if solver.pgs_mode == "matrix_free":
+    if solver._matrix_free:
         return unpacked_rows(solver)[0][world, :count]
     # Split mode keeps each articulation's columns in its size group; the world's
     # articulations follow in index order (split construction maps no world offsets).
@@ -305,7 +305,7 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     (:func:`assert_patch_rows_close`). ``jacobian`` also records each row's
     physical Jacobian (:func:`contact_rows`).
     """
-    baked = solver.pgs_mode != "matrix_free" and not solver._sparse_split
+    baked = not solver._matrix_free
     rows = contact_rows(solver, contacts, jacobian=baked or jacobian)
     patches = solver._friction_patches
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])

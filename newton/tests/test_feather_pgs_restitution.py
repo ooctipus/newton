@@ -115,13 +115,11 @@ def _make_solver(
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
     pgs_warmstart=False,
-    pgs_mode="matrix_free",
 ):
     """Construct a deterministic frictionless FeatherPGS test solver."""
     kwargs = {
         "angular_damping": 0.0,
         "enable_contact_friction": False,
-        "pgs_mode": pgs_mode,
         "pgs_iterations": pgs_iterations,
         "pgs_velocity_iterations": velocity_iterations,
         "pgs_cfm": 0.0,
@@ -161,7 +159,6 @@ def _step_plane(
     velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
-    pgs_mode="matrix_free",
 ):
     """Run one sphere-plane step and return observable contact and state data."""
     model, body = _build_plane_model(
@@ -179,7 +176,6 @@ def _step_plane(
         enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
         pgs_iterations=pgs_iterations,
-        pgs_mode=pgs_mode,
     )
     state_in, state_out = model.state(), model.state()
     vz = -speed if initial_vertical_velocity is None else initial_vertical_velocity
@@ -320,7 +316,6 @@ def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
                 restitution=restitution,
                 velocity_iterations=0,
                 pgs_iterations=8,
-                pgs_mode="split",
             )
             test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
             test.assertEqual(result["paths"], {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
@@ -694,16 +689,16 @@ def test_every_contact_response_route_enforces_restitution(test, device):
             _assert_velocity(test, result["after"], restitution * speed, speed, scene, rtol=5.0e-3)
 
 
-def test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations(test, device):
-    """Apply restitution in dense and production split rows with explicit zero refinement."""
+def test_dense_and_free_body_rows_enforce_restitution_without_velocity_iterations(test, device):
+    """Apply restitution in dense and free-body rows with explicit zero refinement."""
     restitution = 0.65
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     cases = (
-        ("split/free", "split", "free", PATH_MATRIX_FREE),
-        ("split/articulated", "split", "articulated", PATH_DENSE),
+        ("free", "free", PATH_MATRIX_FREE),
+        ("articulated", "articulated", PATH_DENSE),
     )
-    for label, pgs_mode, scene, expected_path in cases:
+    for label, scene, expected_path in cases:
         with test.subTest(case=label):
             result = _step_plane(
                 device,
@@ -713,7 +708,6 @@ def test_dense_and_production_split_modes_enforce_restitution_without_velocity_i
                 scene=scene,
                 velocity_iterations=0,
                 pgs_iterations=16,
-                pgs_mode=pgs_mode,
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
             test.assertEqual(result["paths"], {expected_path}, f"{label}: wrong route")
@@ -894,12 +888,10 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
     # Both incident speeds used below must cross from this same authored pose.
     separation = IMPACT_FRACTION * 2.0 * DEFAULT_DT
     cases = (
-        ("matrix-free MF", "matrix_free", "free", PATH_MATRIX_FREE),
-        ("matrix-free dense", "matrix_free", "articulated", PATH_DENSE),
-        ("split MF", "split", "free", PATH_MATRIX_FREE),
-        ("split dense", "split", "articulated", PATH_DENSE),
+        ("MF", "free", PATH_MATRIX_FREE),
+        ("dense", "articulated", PATH_DENSE),
     )
-    for label, pgs_mode, scene, expected_path in cases:
+    for label, scene, expected_path in cases:
         with test.subTest(warmstart=label):
             model, body = _build_plane_model(
                 device,
@@ -911,7 +903,6 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
                 model,
                 velocity_iterations=0,
                 pgs_warmstart=True,
-                pgs_mode=pgs_mode,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
             contacts = pipeline.contacts()
@@ -1137,7 +1128,7 @@ for _fn in (
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
-    test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations,
+    test_dense_and_free_body_rows_enforce_restitution_without_velocity_iterations,
     test_multiworld_restitution_keeps_case_data_isolated,
     test_restitution_uses_ordinary_rows_and_validates_configuration,
     test_restitution_can_be_disabled_without_changing_materials,

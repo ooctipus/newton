@@ -473,7 +473,7 @@ def test_kinematic_free_base_prescribed_motion(
             device, kinematic_first=kinematic_first
         )
         solver = solver_fn(model)
-        if isinstance(solver, newton.solvers.SolverFeatherPGS) and solver.pgs_mode == "matrix_free":
+        if isinstance(solver, newton.solvers.SolverFeatherPGS) and solver._matrix_free:
             body_to_articulation = solver.body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
@@ -872,10 +872,8 @@ def test_kinematic_prescribed_response_lifetime(
 devices = get_test_devices()
 solvers = {
     "featherstone": lambda model: newton.solvers.SolverFeatherstone(model, angular_damping=0.0),
-    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split"),
-    "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(
-        model, angular_damping=0.0, pgs_mode="matrix_free"
-    ),
+    "feather_pgs_split": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0),
+    "feather_pgs_matrix_free": lambda model: newton.solvers.SolverFeatherPGS(model, angular_damping=0.0),
     "mujoco_cpu": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=True),
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=5, angular_damping=0.0),

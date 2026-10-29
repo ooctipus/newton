@@ -1059,7 +1059,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
         ):
             probe = SimpleNamespace(
                 _laws=plain_laws(contact="patch", velocity_limits=limits, schedule=schedule),
-                pgs_mode="matrix_free",
+                _matrix_free=True,
                 pgs_schedule=schedule,
                 enable_joint_velocity_limits=limits,
                 velocity_limit_activation_fraction=fraction,
@@ -1434,7 +1434,6 @@ def _matrix_free_solver(model, *, beta, parallel_rows, pins=_DENSE, **options):
     """A matrix-free solver whose sweep is serial (``parallel_rows=0``) or the parallel tiers, on dense storage
     unless ``pins`` (test-only route pins) say otherwise."""
     settings = {
-        "pgs_mode": "matrix_free",
         "friction_anchor_beta": beta,
         "pgs_iterations": 8,
         "dense_max_constraints": 32,

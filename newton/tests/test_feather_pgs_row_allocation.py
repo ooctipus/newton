@@ -151,9 +151,7 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     """
     model = _build_model(free_count=2, robot_count=2, device=device)
     with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense"}):
-        solver = SolverFeatherPGS(
-            model, pgs_mode="matrix_free" if device.is_cuda else "split", **{**_ROUTE_OPTIONS, **options}
-        )
+        solver = SolverFeatherPGS(model, **{**_ROUTE_OPTIONS, **options})
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic)

@@ -53,8 +53,6 @@ class Laws:
     """The position solve has a positive iteration budget."""
     forward_cuda: bool
     """CUDA without gradient recording: native kernels without adjoints may run."""
-    matrix_free: bool
-    """The matrix-free mode (``pgs_mode``)."""
 
     PLAIN = (
         "the interleaved schedule with augmented drives and no velocity iterations, warm start, debug rows or "
@@ -111,7 +109,6 @@ class Laws:
             loops=bool(solver._has_loop_joints),
             iterations=solver.pgs_iterations > 0,
             forward_cuda=bool(model.device.is_cuda and not model.requires_grad),
-            matrix_free=solver.pgs_mode == "matrix_free",
         )
 
     def record(self) -> dict:
@@ -122,7 +119,6 @@ class Laws:
 # Each requirement a placement or schedule may hold: (test of the laws, what it requires).
 _REQUIREMENTS = {
     "forward_cuda": (lambda laws: laws.forward_cuda, "CUDA without gradient recording"),
-    "matrix_free": (lambda laws: laws.matrix_free, "the matrix-free mode"),
     "plain": (lambda laws: laws.plain, Laws.PLAIN),
     "agnostic": (lambda laws: laws.agnostic, "the point or patch row law (no torsion, no compliance)"),
     "unregularized": (lambda laws: not laws.regularized, "the unregularized contact law"),
@@ -160,7 +156,7 @@ CAPABILITIES = {
         "no_loops",
     ),
     # On-chip blocks of a world's rows (local owners), claimed per world at run time.
-    "local": ("forward_cuda", "matrix_free", "plain", "no_velocity_limits", "no_torsion"),
+    "local": ("forward_cuda", "plain", "no_velocity_limits", "no_torsion"),
     # The local owners' row producer: limit prefix and contact packets built in place.
     "row_packets": ("agnostic", "limits", "unregularized"),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).

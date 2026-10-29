@@ -67,7 +67,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     )
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
-                        pgs_mode="matrix_free",
                         drive_mode=drive_mode,
                         enable_joint_limits=False,
                         dense_max_constraints=16,

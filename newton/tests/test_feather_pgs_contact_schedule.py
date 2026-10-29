@@ -400,7 +400,6 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
     ):
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             enable_joint_limits=True,
             dense_max_constraints=64,

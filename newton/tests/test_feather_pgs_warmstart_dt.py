@@ -38,9 +38,7 @@ def _stack(device, restitution=0.0, drop=False):
         deterministic=True,
         contact_matching="latest",
     )
-    solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=8, pgs_velocity_iterations=2, pgs_warmstart=True
-    )
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_velocity_iterations=2, pgs_warmstart=True)
     return model, pipeline, solver
 
 
@@ -210,7 +208,7 @@ def test_warm_carry_no_kick_after_dt_change_on_impact(test: unittest.TestCase, d
             )
             contacts = pipeline.contacts()
             solver = newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="matrix_free", pgs_iterations=8, pgs_velocity_iterations=2, pgs_warmstart=True
+                model, pgs_iterations=8, pgs_velocity_iterations=2, pgs_warmstart=True
             )
             s0, s1 = model.state(), model.state()
             control = model.control()

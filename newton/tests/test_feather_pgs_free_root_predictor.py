@@ -45,15 +45,10 @@ RADIUS = 0.1
 # the contact normal; spin parallel to the slide cannot excite the term.
 OMEGA_Y = 20.0
 SLIDE_VX = 2.0
-# (pgs_mode, pgs_velocity_iterations): the velocity post-pass converts velocity
-# to acceleration at two more patched sites
-SLIDER_CONFIGS = [
-    ("split", 0),
-]
-SLIDER_CONFIGS_CUDA = [
-    ("matrix_free", 0),
-    ("matrix_free", 2),
-]
+# pgs_velocity_iterations of each run: the velocity post-pass (CUDA only) converts velocity to acceleration at two
+# more patched sites
+SLIDER_CONFIGS = [0]
+SLIDER_CONFIGS_CUDA = [2]
 
 
 @wp.kernel
@@ -87,7 +82,7 @@ def _build_slider(device):
     return builder.finalize(device=device)
 
 
-def _slide_heights(model, omega_y, pgs_mode, velocity_iterations=0):
+def _slide_heights(model, omega_y, velocity_iterations=0):
     """Slide the sphere at ``SLIDE_VX`` while spinning at ``omega_y``.
 
     Returns per-step COM heights [m] and the peak live contact count, so the
@@ -104,7 +99,6 @@ def _slide_heights(model, omega_y, pgs_mode, velocity_iterations=0):
     solver = SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode=pgs_mode,
         pgs_velocity_iterations=velocity_iterations,
     )
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
@@ -156,18 +150,18 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         exactly that of the unspun sphere.  A predictor missing the
         ``omega x v`` term feeds the normal rows a phantom vertical velocity of
         ``dt * omega_y * vx`` (0.2 m/s here): the sphere's height diverges by
-        millimetres within the run, in every ``pgs_mode``.  With the conventions
+        millimetres within the run, on every device.  With the conventions
         agreeing the trajectories match to solver precision.
         """
         device = wp.get_device()
         configs = list(SLIDER_CONFIGS)
         if device.is_cuda:
             configs += SLIDER_CONFIGS_CUDA
-        for pgs_mode, vel_iters in configs:
-            with self.subTest(pgs_mode=pgs_mode, velocity_iterations=vel_iters):
+        for vel_iters in configs:
+            with self.subTest(velocity_iterations=vel_iters):
                 model = _build_slider(device)
-                still, contacts_still = _slide_heights(model, 0.0, pgs_mode, vel_iters)
-                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, pgs_mode, vel_iters)
+                still, contacts_still = _slide_heights(model, 0.0, vel_iters)
+                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, vel_iters)
                 # the comparison is vacuous unless both runs really ride on
                 # active contact rows at the rest height
                 self.assertGreater(min(contacts_still, contacts_spin), 0, "no contacts were generated")
@@ -399,7 +393,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         """Keep the final velocity-postpass conversion observable and wired."""
         device = wp.get_device()
         model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="split")
+        solver = SolverFeatherPGS(model, angular_damping=0.0)
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
 
@@ -425,7 +419,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("CUDA graph capture requires a CUDA device")
-        heights_ref, _ = _slide_heights(_build_slider(device), OMEGA_Y, "matrix_free")
+        heights_ref, _ = _slide_heights(_build_slider(device), OMEGA_Y)
 
         model = _build_slider(device)
         state_0, state_1 = model.state(), model.state()
@@ -434,7 +428,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         joint_qd[3:6] = (0.0, OMEGA_Y, 0.0)
         state_0.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_mode="matrix_free")
+        solver = SolverFeatherPGS(model, angular_damping=0.0)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
         control = model.control()

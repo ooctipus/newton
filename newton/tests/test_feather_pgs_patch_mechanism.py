@@ -1113,9 +1113,9 @@ class TestPatchSolverRoutes(unittest.TestCase):
         """Link, seed and finish every route that holds patch rows; seed with its decay times dt over the last dt."""
         # Both modes route the fixed-base arm's contacts through dense rows and the
         # free box's through matrix-free rows; no route builds the third family.
-        configs = [("cpu", {"pgs_mode": "split"}, (1, 1, 0))]
+        configs = [("cpu", {}, (1, 1, 0))]
         if wp.is_cuda_available():
-            configs.append(("cuda:0", {"pgs_mode": "matrix_free"}, (1, 1, 0)))
+            configs.append(("cuda:0", {}, (1, 1, 0)))
         dts = (1.0 / 240.0, 1.0 / 240.0, 1.0 / 120.0, 1.0 / 480.0)
         for (device, mode, enabled), warmstart in itertools.product(configs, (False, True)):
             with self.subTest(device=device, warmstart=warmstart):

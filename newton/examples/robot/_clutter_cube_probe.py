@@ -209,7 +209,6 @@ class Example:
         self.contacts = self.pipeline.contacts()
         self.solver = newton.solvers.SolverFeatherPGS(
             self.model,
-            pgs_mode="matrix_free",
             pgs_iterations=args.iterations,
             dense_max_constraints=args.rows,
             mf_max_constraints=256,

@@ -47,7 +47,6 @@ _NUMBER_RULES = (
 _CHOICE_RULES = (
     ("pgs_solve_readout", SOLVE_READOUTS),
     ("pgs_velocity_drive_mode", ("active", "freeze")),
-    ("pgs_mode", ("split", "matrix_free")),
     ("pgs_schedule", ("interleaved", "contact_then_internal", "physx_grasp")),
     ("drive_mode", ("augmented", "physx_pgs")),
 )
@@ -80,29 +79,22 @@ _CPU_KERNELS = {
     "cholesky_kernel": "loop",
     "trisolve_kernel": "loop",
     "hinv_jt_kernel": "par_row",
-    "delassus_kernel": "par_row_col",
-    "pgs_kernel": "loop",
 }
 _PINNABLE = {
     "cholesky_kernel": ("tiled", "loop"),
     "trisolve_kernel": ("tiled", "loop"),
     "hinv_jt_kernel": ("tiled", "par_row"),
-    "delassus_kernel": ("tiled", "par_row_col"),
-    "pgs_kernel": ("loop", "tiled_row"),
 }
-# Split mode's assembled Delassus is swept by one thread per world up to this many rows (at most 256 floats), by the
-# tiled-row sweep beyond.
-LOOP_SWEEP_MAX_ROWS = 16
 
 
-def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool, split: bool, dense_rows: int):
+def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool):
     """Return each dense kernel's choice and why.
 
-    The CPU runs the loop kernels. On CUDA the factor, triangular-solve, response and Delassus kernels are
-    ``"auto"``: the execution plan maps each size by its resource rule. Split mode's dense sweep is the loop for at
-    most :data:`LOOP_SWEEP_MAX_ROWS` rows per world and the tiled-row sweep beyond; matrix-free mode builds neither.
-    A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where the execution plan maps a size to a
-    dense kernel; it claims no worlds from the other owners (the ``placement`` pin does).
+    The CPU runs the loop kernels (its assembled Delassus rows take a thread per entry and its sweep a thread per
+    world, both fixed). On CUDA the factor, triangular-solve and response kernels are ``"auto"``: the execution plan
+    maps each size by its resource rule. A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where
+    the execution plan maps a size to a dense kernel; it claims no worlds from the other owners (the ``placement``
+    pin does).
 
     Raises:
         ValueError: for a pin that names no kernel of its stage, or a CUDA kernel on the CPU.
@@ -120,14 +112,6 @@ def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool, split: bool, dense_
             choices[name], reasons[name] = _CPU_KERNELS[name], f"The CPU runs {_CPU_KERNELS[name]}."
         elif pinned is not None:
             choices[name], reasons[name] = pinned, f"A test pin selects {name}={pinned!r}."
-        elif name == "pgs_kernel":
-            loop = split and dense_rows <= LOOP_SWEEP_MAX_ROWS
-            choices[name] = "loop" if loop else "tiled_row"
-            reasons[name] = (
-                f"Split mode sweeps at most {LOOP_SWEEP_MAX_ROWS} dense rows per world on one thread."
-                if loop
-                else f"The tiled-row sweep serves more than {LOOP_SWEEP_MAX_ROWS} dense rows per world."
-            )
         else:
             choices[name], reasons[name] = "auto", "Automatic selection by size and device resources."
     return choices, reasons

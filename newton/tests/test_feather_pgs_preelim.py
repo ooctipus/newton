@@ -48,9 +48,7 @@ def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: i
     pre-elimination enforces the closure independently of the sweep budget.
     """
     model = _build_four_bar().finalize()
-    solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=pgs_iterations, pgs_beta=0.1, **solver_kwargs
-    )
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=pgs_iterations, pgs_beta=0.1, **solver_kwargs)
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
@@ -81,9 +79,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
         model = builder.finalize()
         solvers = [
-            newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="matrix_free", pgs_iterations=8, enable_bilateral_preelimination=True, **options
-            )
+            newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, enable_bilateral_preelimination=True, **options)
             for options in ({}, {"bilateral_preelimination_include_mimics": True})
         ]
         states = [(model.state(), model.state()) for _ in solvers]
@@ -117,7 +113,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver_all = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 enable_bilateral_preelimination=True,
             )
         self.assertFalse(solver_all._preelim_active)
@@ -125,7 +120,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             enable_bilateral_preelimination=True,
             bilateral_preelimination_include_mimics=False,
@@ -193,7 +187,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=2,
             pgs_beta=0.1,
             dense_max_constraints=128,
@@ -247,7 +240,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=2,
             pgs_beta=0.1,
             dense_max_constraints=128,
@@ -293,15 +285,13 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
 
     def test_unsupported_mode_warns_and_falls_back(self):
-        """Non-matrix-free modes warn and keep the iterative rows."""
-        model = _build_four_bar().finalize()
+        """The CPU formulation (no matrix-free sweeps) warns and keeps the iterative rows."""
+        model = _build_four_bar().finalize(device="cpu")
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            solver = newton.solvers.SolverFeatherPGS(
-                model, pgs_mode="split", pgs_iterations=16, enable_bilateral_preelimination=True
-            )
+            solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, enable_bilateral_preelimination=True)
         self.assertFalse(solver._preelim_active)
-        self.assertTrue(any("matrix_free" in str(w.message) for w in caught))
+        self.assertTrue(any("requires CUDA" in str(w.message) for w in caught))
 
     def test_velocity_iterations_warn_and_fall_back(self):
         """The TGS velocity pass is unsupported in v1: warn and fall back."""
@@ -310,7 +300,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 pgs_iterations=16,
                 pgs_velocity_iterations=4,
                 enable_bilateral_preelimination=True,

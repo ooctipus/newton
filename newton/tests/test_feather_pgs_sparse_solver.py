@@ -192,7 +192,6 @@ def _over_budget_rows(model) -> int:
 def _make_solver(model, sparse, **overrides):
     """Change only the representation selection between comparison solvers."""
     options = {
-        "pgs_mode": "matrix_free",
         "drive_mode": "augmented",
         "pgs_iterations": 32,
         "enable_joint_limits": True,

@@ -264,13 +264,10 @@ def _dense() -> LoopSweep:
     rows = LoopRows("off1", "world_row_type", "world_row_parent", "world_rhs", "world_row_mu", "world_row_w")
     stored = functools.partial(rows.at, "world_diag")
     op = Assembled(
-        0,
         "capacity",
-        "global",
-        Lanes(1),
+        rows.rhs,
         impulse="lam",
         count="m",
-        rhs=rows.rhs,
         diagonal=lambda row: "denom" if row == "i" else stored(row),
     )
     return LoopSweep(

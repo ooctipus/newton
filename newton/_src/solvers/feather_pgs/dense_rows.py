@@ -128,7 +128,7 @@ MfBodyMap = field_group.struct(
     __name__,
 )
 """Each world's matrix-free bodies in row order, their coordinate starts and count, and every row's two local body
-slots (split mode's tiled sweep)."""
+slots (the free-body warm start's publication)."""
 
 
 def bind_mf_body_map(solver):

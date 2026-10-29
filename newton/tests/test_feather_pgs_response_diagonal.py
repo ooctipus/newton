@@ -154,7 +154,6 @@ def _run_mixed_response(
     with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_warmstart=warmstart,
             enable_bilateral_preelimination=preelimination,
             enable_contact_friction=friction > 0.0,
@@ -1478,7 +1477,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     pgs_iterations=8,
@@ -1488,7 +1486,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 )
             point = SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
                 enable_joint_limits=True,
                 joint_limit_activation_gap=0.0,
                 pgs_iterations=8,
@@ -1733,7 +1730,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
-                    pgs_mode="matrix_free",
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     pgs_iterations=8,

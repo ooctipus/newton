@@ -687,7 +687,7 @@ def decline(solver) -> str | None:
                 "A test pin drops the resolved-world claim.",
             ),
             (
-                laws.matrix_free and solver.model.device.is_cuda,
+                solver.model.device.is_cuda,
                 "The classifier evaluates the CUDA matrix-free route only.",
             ),
             (laws.agnostic, "Contact torsion and compliance rows are outside the contact laws it classifies."),

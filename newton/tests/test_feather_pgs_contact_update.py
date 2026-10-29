@@ -1176,23 +1176,21 @@ class TestContactUpdateCuda(unittest.TestCase):
                         self.assertGreaterEqual(residuals(system, lam)[1][normals].min(), -1.0e-5)
 
     def test_cuda_routes_without_units_keep_the_sequential_law(self):
-        """Keep the sequential law on CUDA sweeps without units, record them and warn; the loop sweep runs units."""
+        """Keep the sequential law on CUDA sweeps, record them and warn; the CPU's loop sweep runs units."""
         with _without_solver_environment():
             builder = newton.ModelBuilder()
             body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
             builder.add_articulation([builder.add_joint_revolute(-1, body)])
             builder.add_shape_sphere(body, radius=0.1)
             builder.add_ground_plane()
-            model = builder.finalize(device="cuda:0")
             with self.assertWarnsRegex(UserWarning, "contact_update='unit' applies only to some sweeps"):
-                tiled = SolverFeatherPGS(model, contact_update="unit")
-            update = tiled.get_path_selection()["routes"]["sweep"]["contact_update"]
+                cuda = SolverFeatherPGS(builder.finalize(device="cuda:0"), contact_update="unit")
+            update = cuda.get_path_selection()["routes"]["sweep"]["contact_update"]
             self.assertEqual(update["law"], "sequential")
             self.assertTrue(update["sequential"])
             with warnings.catch_warnings(record=True) as recorded:
                 warnings.simplefilter("always")
-                with mock.patch.dict(SolverFeatherPGS._route_pins, {"pgs_kernel": "loop"}):
-                    loop = SolverFeatherPGS(model, contact_update="unit")
+                loop = SolverFeatherPGS(builder.finalize(device="cpu"), contact_update="unit")
             self.assertFalse([w for w in recorded if "contact_update" in str(w.message)])
             update = loop.get_path_selection()["routes"]["sweep"]["contact_update"]
             self.assertEqual(update["unit"], ["sweep_loop_unit"])

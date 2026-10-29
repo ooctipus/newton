@@ -853,7 +853,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = _three_size_model(device)
         options = {
-            "pgs_mode": "matrix_free",
             "pgs_iterations": 8,
             "enable_joint_limits": True,
             "dense_max_constraints": 320,
@@ -915,7 +914,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = _three_size_model(device)
         options = {
-            "pgs_mode": "matrix_free",
             "dense_max_constraints": 320,
             "mf_max_constraints": 12288,
             "mf_gs_incremental_rows": 0,

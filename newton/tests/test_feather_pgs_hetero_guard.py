@@ -54,7 +54,7 @@ def _build_model(world_link_counts: list[int], device: str) -> newton.Model:
 
 
 class TestFeatherPGSHeteroGuard(unittest.TestCase):
-    """Heterogeneous and homogeneous models construct on every mode."""
+    """Heterogeneous and homogeneous models construct."""
 
     @classmethod
     def setUpClass(cls):
@@ -67,19 +67,13 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
         # All 3-link chains: per-world DOF counts uniform -> homogeneous.
         cls.homogeneous_model = _build_model([3, 3, 3, 3], cls.device)
 
-    def test_hetero_matrix_free_constructs(self):
-        solver = SolverFeatherPGS(self.hetero_model, pgs_mode="matrix_free")
-        self.assertEqual(solver.pgs_mode, "matrix_free")
+    def test_hetero_constructs(self):
+        solver = SolverFeatherPGS(self.hetero_model)
+        self.assertEqual(solver._matrix_free, self.hetero_model.device.is_cuda)
 
-    def test_hetero_split_constructs(self):
-        solver = SolverFeatherPGS(self.hetero_model, pgs_mode="split")
-        self.assertEqual(solver.pgs_mode, "split")
-
-    def test_homogeneous_all_modes_construct(self):
-        for pgs_mode in ("split", "matrix_free"):
-            with self.subTest(pgs_mode=pgs_mode):
-                solver = SolverFeatherPGS(self.homogeneous_model, pgs_mode=pgs_mode)
-                self.assertEqual(solver.pgs_mode, pgs_mode)
+    def test_homogeneous_constructs(self):
+        solver = SolverFeatherPGS(self.homogeneous_model)
+        self.assertEqual(solver._matrix_free, self.homogeneous_model.device.is_cuda)
 
 
 if __name__ == "__main__":

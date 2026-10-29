@@ -51,7 +51,6 @@ def _run_press(
     steps: int,
     warm_kwargs: dict,
     contact_matching: str | None = "sticky",
-    pgs_mode: str = "matrix_free",
 ):
     """Drive the press to a stall and record per-step contact-impulse sums and speeds.
 
@@ -60,7 +59,6 @@ def _run_press(
     model = _build_press()
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
         pgs_iterations=8,
         pgs_beta=0.1,
         **warm_kwargs,
@@ -282,7 +280,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
     def test_constructor_layout_and_decay_validation(self):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
         start = parameters.index("pgs_warmstart")
-        self.assertEqual(parameters[start : start + 2], ("pgs_warmstart", "pgs_mode"))
+        self.assertEqual(parameters[start : start + 2], ("pgs_warmstart", "pgs_schedule"))
         self.assertGreater(
             parameters.index("pgs_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
         )
@@ -297,12 +295,12 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", pgs_warmstart=True)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True)
         solver.step(model.state(), model.state(), model.control(), None, 1.0 / 60.0)
 
-    def test_split_mode_holds_the_press(self):
-        """The identity carry works on the CPU-supported dense-row route."""
-        impulses, speeds, _ = _run_press(120, {"pgs_warmstart": True}, pgs_mode="split")
+    def test_identity_carry_holds_the_press(self):
+        """The identity carry holds the press on the dense-row route."""
+        impulses, speeds, _ = _run_press(120, {"pgs_warmstart": True})
         self.assertGreater(float(impulses[-1]), 0.0)
         self.assertLess(float(np.ptp(impulses[-10:])), 1.0e-5)
         self.assertLess(float(speeds[-10:].max()), 1.0e-4)
@@ -323,7 +321,6 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             pgs_warmstart=True,
         )
@@ -432,7 +429,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
     def test_single_flag_enables_dense_and_mf_carry(self):
         """pgs_warmstart=True is the single all-contact warm-start mode."""
         model = _build_press()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=4)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=4)
         self.assertTrue(solver.pgs_warmstart)
         self.assertTrue(solver.pgs_warmstart)
 

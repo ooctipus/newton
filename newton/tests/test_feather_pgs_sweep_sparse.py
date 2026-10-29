@@ -8,7 +8,7 @@ every configuration declares a staging that fits a block and one copy of each bu
 lane stores an impulse or a cached metric only after every lane has read it. The kernels compile offline when
 ``ptxas`` and ``cuobjdump`` are on ``PATH``. The sweep's physics is the sparse tests' and the conformance gate's.
 
-The configurations are the conformance routes' (``sparse``, ``sparse_split``, ``sparse_triplets``,
+The configurations are the conformance routes' (``sparse``, ``sparse_triplets``,
 ``sparse_warm_start``, ``sparse_readout``, ``sparse_velocity_limits``, ``sparse_velocity_mimic``), the native
 sparse tasks' under both friction laws, and the transactions, schedules and policies their options select.
 """
@@ -51,7 +51,7 @@ CONFIGURATIONS = (
     ("sparse_triplets", 64, 14, 10, _TRIPLETS, None),
     ("sparse_readout", 64, 14, 10, _ACTIVE, {"readout": "sweeps"}),
     ("sparse_warm_start", 64, 14, 10, {**_ACTIVE, "warm_start": True}, None),
-    ("sparse_split_and_patch", 64, 14, 10, {**_TABLE, "lanes_per_world": 16, "linked_rows": True}, None),
+    ("sparse_patch_small_world", 64, 14, 10, {**_TABLE, "lanes_per_world": 16, "linked_rows": True}, None),
     # The native sparse tasks.
     ("patch_single12", 256, 18, 12, _PATCH, None),
     ("patch_single16", 48, 18, 18, _PATCH, None),
@@ -231,7 +231,12 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             from tools.fpgs_bench import kernel_sass  # noqa: PLC0415
         finally:
             sys.path.remove(root)
-        for label in ("sparse_point", "patch_single12", "sparse_split_and_patch", "sparse_velocity_limits_accumulated"):
+        for label in (
+            "sparse_point",
+            "patch_single12",
+            "sparse_patch_small_world",
+            "sparse_velocity_limits_accumulated",
+        ):
             _, M, D, S, kwargs, policy = next(entry for entry in CONFIGURATIONS if entry[0] == label)
             with self.subTest(label):
                 options = _options(kwargs, policy)

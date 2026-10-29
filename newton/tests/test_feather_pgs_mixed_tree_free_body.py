@@ -246,7 +246,6 @@ def _rollout(
     owner,
     steps=120,
     swing_joint=0,
-    pgs_mode="matrix_free",
     rows=None,
     attrs=None,
     swing_stride=3,
@@ -274,7 +273,6 @@ def _rollout(
     with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode=pgs_mode,
             pgs_iterations=pgs_iterations,
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
@@ -378,28 +376,6 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertTrue(np.all(final[:, 4, 2] > 0.04))
                 self.assertTrue(np.all(final[:, 1, 2] > 0.2))
                 self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
-                self._assert_patch_history(plain_solver, owner_solver)
-
-    def test_split_mode_is_owned_and_matches_the_ordinary_route(self):
-        """Split-mode scenes (Cartpole's class) get the same owner: it refreshes the held factors the split rows use."""
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"))
-                plain_solver, plain_owner, plain, plain_qd = _rollout(
-                    model, owner=False, friction_anchor_beta=beta, pgs_mode="split"
-                )
-                self.assertIsNone(plain_owner)
-                self.assertEqual(plain_solver.pgs_mode, "split")
-                owner_solver, owner, cached, cached_qd = _rollout(
-                    model, owner=True, friction_anchor_beta=beta, pgs_mode="split"
-                )
-                self.assertIsInstance(owner, HeldTree)
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                final = cached[-1].reshape(model.world_count, -1, 7)
-                self.assertTrue(np.all(final[:, 4, 2] > 0.04))
                 self._assert_patch_history(plain_solver, owner_solver)
 
     def test_multi_coordinate_descendant_joints_are_owned(self):
@@ -779,7 +755,7 @@ class TestFeatherPGSMixedTreePatchFixture(unittest.TestCase):
                 valid.append(solver._friction_patches.previous.valid.numpy().copy())
 
             solver, _owner, _trajectory, final_qd = _rollout(
-                model, owner=False, pgs_mode="split", friction_anchor_beta=0.2, observe=observe
+                model, owner=False, friction_anchor_beta=0.2, observe=observe
             )
             self.assertEqual(solver.pgs_iterations, PATCH_PARITY_ITERATIONS)
             histories.append(valid)
@@ -810,7 +786,7 @@ class TestFeatherPGSMixedTreeFrames(unittest.TestCase):
         """
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         roots = _fixed_root_joints(model)

@@ -209,7 +209,7 @@ class TestTreeKineticStages(unittest.TestCase):
     def test_owners_without_alternate_motion_reject_another_velocity(self):
         """Refuse a velocity other than the state's in begin and predict, before any cache changes."""
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
         state, output, control = model.state(), model.state(), model.control()
         augmented = solver._prepare_augmented_state(state, output, control)
@@ -237,7 +237,7 @@ class TestTreeKineticStages(unittest.TestCase):
         device = wp.get_device(device)
         for alternate in (False, True):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
-            solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+            solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             solver.enable_joint_velocity_limits = alternate
             owner = HeldTree(solver)
             state, output, control = model.state(), model.state(), model.control()

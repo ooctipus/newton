@@ -16,8 +16,8 @@ from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
-from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests.feather_pgs_law_harness import articulation_factor
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -132,7 +132,6 @@ def _patch_case(model, incremental_rows, *, iterations=8):
     with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary"}):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=iterations,
             enable_joint_limits=True,
             friction_anchor_beta=0.2,
@@ -182,12 +181,12 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                 ratios = []
                 for index in range(12):
                     for case in (reference, candidate):
-                        split_tests._step(case)
+                        sparse_scene.step(case)
                     # Only float order differs; it compounds through the rollout like other route changes.
                     velocity_atol = 2e-3 if bounds is None else STANDING_VELOCITY_ATOL
                     assert_states_close(reference[2], candidate[2], velocity_atol=velocity_atol)
-                    rows = patch_rows(reference[1], reference[-1], split_tests.DT)
-                    candidate_rows = patch_rows(candidate[1], candidate[-1], split_tests.DT)
+                    rows = patch_rows(reference[1], reference[-1], sparse_scene.DT)
+                    candidate_rows = patch_rows(candidate[1], candidate[-1], sparse_scene.DT)
                     assert_patch_rows_close(rows, candidate_rows, lifecycle=not sliding)
                     if bounds is None:
                         assert_patch_impulses_close(rows, candidate_rows)

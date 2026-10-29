@@ -878,7 +878,7 @@ class TestCompactContact(unittest.TestCase):
         contacts = newton.Contacts(8, 0, device=model.device)
         install_contacts(model, state, contacts)
         self.assertEqual(contacts.rigid_contact_count.numpy()[0], 6)
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=64)
+        solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=64)
         self.assertFalse(solver._compact_contact_boundary)
 
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
@@ -900,7 +900,6 @@ class TestCompactContact(unittest.TestCase):
                     solvers.append(
                         newton.solvers.SolverFeatherPGS(
                             model,
-                            pgs_mode="matrix_free",
                             pgs_iterations=8,
                             friction_anchor_beta=0.0,
                             update_mass_matrix_interval=2,
@@ -985,7 +984,6 @@ class TestCompactContact(unittest.TestCase):
                     solvers.append(
                         newton.solvers.SolverFeatherPGS(
                             model,
-                            pgs_mode="matrix_free",
                             pgs_iterations=8,
                             enable_joint_limits=True,
                             dense_max_constraints=64,

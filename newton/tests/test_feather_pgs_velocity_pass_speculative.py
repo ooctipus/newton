@@ -85,7 +85,6 @@ def _drop(
     solver = newton.solvers.SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode="matrix_free",
         pgs_velocity_iterations=velocity_iterations,
         pgs_warmstart=pgs_warmstart,
     )
@@ -144,7 +143,6 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     solver = newton.solvers.SolverFeatherPGS(
         model,
         angular_damping=0.0,
-        pgs_mode="matrix_free",
         pgs_velocity_iterations=velocity_iterations,
         pgs_debug=True,
     )
@@ -406,7 +404,6 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             angular_damping=0.0,
-            pgs_mode="matrix_free",
             pgs_velocity_iterations=4,
         )
     state_0, state_1 = model.state(), model.state()
@@ -437,7 +434,7 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
     model, _body = _build(device, "free")
 
     def make(**kwargs):
-        return newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=4, **kwargs)
+        return newton.solvers.SolverFeatherPGS(model, pgs_velocity_iterations=4, **kwargs)
 
     make(pgs_warmstart=True)
 

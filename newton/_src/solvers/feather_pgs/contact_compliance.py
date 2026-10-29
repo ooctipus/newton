@@ -62,7 +62,6 @@ def update_compliant_rhs(
 def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
     required = {
-        "pgs_mode": "matrix_free",
         "pgs_schedule": "interleaved",
         "pgs_velocity_iterations": 0,
         "pgs_warmstart": False,

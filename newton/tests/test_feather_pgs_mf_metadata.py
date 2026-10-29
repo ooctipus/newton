@@ -211,12 +211,13 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
             with self.subTest(capacity=capacity):
                 with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
                     response_builds_rows.free_body_meta_kernel(capacity, "cpu")
-                with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
-                    fpgs.SolverFeatherPGS(
-                        newton.ModelBuilder().finalize(device="cpu"),
-                        pgs_mode="matrix_free",
-                        mf_max_constraints=capacity,
-                    )
+                # Only the CUDA sweeps pack the row metadata.
+                if wp.is_cuda_available():
+                    with self.assertRaisesRegex(ValueError, "mf_max_constraints.*65535"):
+                        fpgs.SolverFeatherPGS(
+                            newton.ModelBuilder().finalize(device="cuda:0"),
+                            mf_max_constraints=capacity,
+                        )
 
     def test_patch_links_decode_high_normal_rows(self):
         """Use the same unsigned layout when following normal-load patch links."""
@@ -419,9 +420,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
             with self.subTest(velocity_iterations=velocity_iterations):
                 runs = []
                 for unconditional in (False, True):
-                    solver = fpgs.SolverFeatherPGS(
-                        model, pgs_mode="matrix_free", pgs_iterations=6, pgs_velocity_iterations=velocity_iterations
-                    )
+                    solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=velocity_iterations)
                     self.assertFalse(solver._has_free_rigid_bodies)
                     # The pack kernel is built only where it launches.
                     self.assertIsNone(solver._pack_mf_meta_kernel)
@@ -456,7 +455,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
         builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize(device=wp.get_device("cuda:0"))
-        solver = fpgs.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=6, pgs_velocity_iterations=2)
+        solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=2)
         self.assertTrue(solver._has_free_rigid_bodies)
         steps = 4
         packed, values = _step_matrix_free(model, solver, steps=steps)

@@ -21,10 +21,9 @@ def _build_two_world_free_model(device):
     return builder.finalize(device=device)
 
 
-def _make_solver(model, *, pgs_mode: str, warmstart: bool):
+def _make_solver(model, *, warmstart: bool):
     return SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
         pgs_warmstart=warmstart,
         dense_max_constraints=4,
         mf_max_constraints=4,
@@ -63,7 +62,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_warmstart_clear_does_not_change_fk_cache_source(self):
         """Keep cache-source bookkeeping in reset, independent of impulse clearing."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", warmstart=True)
+        solver = _make_solver(model, warmstart=True)
         state = model.state()
         # Exercise the host cache bookkeeping even when CUDA execution is unavailable.
         solver._fk_id_cache_enabled = True
@@ -87,7 +86,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_model_changes_invalidate_impulses_without_clearing_overflow(self):
         """Invalidate changed-model impulses while retaining invalid-transition status."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", warmstart=True)
+        solver = _make_solver(model, warmstart=True)
         for flags in (
             newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
             newton.ModelFlags.JOINT_DOF_PROPERTIES,
@@ -103,13 +102,13 @@ class TestFeatherPGSReset(unittest.TestCase):
 
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
-            ("selected", "split", (True, False)),
-            ("all", "split", (True, True)),
+            ("selected", (True, False)),
+            ("all", (True, True)),
         )
-        for name, pgs_mode, reset_worlds in cases:
+        for name, reset_worlds in cases:
             with self.subTest(name=name):
                 model = _build_two_world_free_model("cpu")
-                solver = _make_solver(model, pgs_mode=pgs_mode, warmstart=True)
+                solver = _make_solver(model, warmstart=True)
                 specs = _history_specs(solver)
                 _poison(specs)
                 mask = None
@@ -120,7 +119,7 @@ class TestFeatherPGSReset(unittest.TestCase):
 
     def test_reset_validates_mask_before_disabled_noop(self):
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, pgs_mode="split", warmstart=False)
+        solver = _make_solver(model, warmstart=False)
         solver.impulses.fill_(17.0)
         before = solver.impulses.numpy().copy()
 
@@ -137,7 +136,7 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_reset_is_cuda_graph_capturable(self):
         device = wp.get_device("cuda:0")
         model = _build_two_world_free_model(device)
-        solver = _make_solver(model, pgs_mode="split", warmstart=True)
+        solver = _make_solver(model, warmstart=True)
         state = model.state()
         mask = wp.array((True, False), dtype=wp.bool, device=device)
         specs = _history_specs(solver)

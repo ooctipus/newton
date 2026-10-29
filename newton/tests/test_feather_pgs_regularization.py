@@ -5,7 +5,6 @@
 
 import inspect
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -155,7 +154,7 @@ def test_regularization_fixed_points(test: unittest.TestCase, device):
         test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
-def _stack_scene(device, g, pgs_mode="matrix_free", velocity_iterations=2):
+def _stack_scene(device, g, velocity_iterations=2):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.003
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -176,7 +175,6 @@ def _stack_scene(device, g, pgs_mode="matrix_free", velocity_iterations=2):
     )
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
         pgs_iterations=8,
         pgs_velocity_iterations=velocity_iterations,
         pgs_contact_regularization=g,
@@ -200,28 +198,7 @@ def _run(model, pipeline, solver, frames, dt=DT):
     return s0.body_q.numpy(), zs
 
 
-def test_regularization_route_agreement(test: unittest.TestCase, device):
-    """The regularized update must agree across the matrix-free execution
-    routes: the fused MF-GS kernel (matrix_free) and the standalone MF kernel
-    (split): same scene, same g, matching resting poses."""
-    with wp.ScopedDevice(device):
-        results = {}
-        for label, mode, velit in (
-            ("fused", "matrix_free", 2),
-            # velocity iterations are matrix_free-only; split runs without
-            ("standalone", "split", 0),
-        ):
-            model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, pgs_mode=mode, velocity_iterations=velit)
-            body_q, _ = _run(model, pipeline, solver, 120)
-            results[label] = body_q
-        ref = results["fused"]
-        for label, body_q in results.items():
-            np.testing.assert_allclose(
-                body_q[:, :3], ref[:, :3], atol=2.0e-3, err_msg=f"route {label} diverged from fused"
-            )
-
-
-def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
+def _resting_box(device, g, rate, frames, **solver_kwargs):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.01
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -239,7 +216,6 @@ def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
     )
     solver = newton.solvers.SolverFeatherPGS(
         model,
-        pgs_mode=pgs_mode,
         pgs_iterations=12,
         pgs_contact_regularization=g,
         **solver_kwargs,
@@ -259,16 +235,16 @@ def test_regularization_documented_sag(test: unittest.TestCase, device):
     matrix-free route."""
     with wp.ScopedDevice(device):
         for rate in (60, 240):
-            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, pgs_warmstart=True)
+            sag = _resting_box(device, 0.5, rate, 3 * rate, pgs_warmstart=True)
             expected = _sag_formula(0.5, rate)
             test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
 
 
-def test_regularization_split_route_documented_sag(test: unittest.TestCase, device):
-    """The split route's standalone matrix-free kernel carries the same law as the
-    fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
+def test_regularization_cpu_route_documented_sag(test: unittest.TestCase, device):
+    """The CPU's free-body loop sweep carries the same law as the CUDA sweeps, so its
+    resting box sags by the same formula."""
     with wp.ScopedDevice(device):
-        sag = _resting_box(device, 0.5, "split", 60, 180, pgs_warmstart=True)
+        sag = _resting_box(device, 0.5, 60, 180, pgs_warmstart=True)
         expected = _sag_formula(0.5, 60)
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
@@ -309,7 +285,6 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         )
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=8,
             pgs_velocity_iterations=2,
             pgs_contact_regularization=0.02,
@@ -370,8 +345,7 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
-        pgs_mode = "split" if wp.get_device(device).is_cpu else "matrix_free"
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode=pgs_mode)
+        solver = newton.solvers.SolverFeatherPGS(model)
         test.assertFalse(solver._regularization_enabled)
         test.assertIs(solver.row_w, solver._contact_row_w_dummy)
         test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
@@ -381,7 +355,7 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
 def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
     """The standalone MF route must not read its one-element inactive weight argument."""
     with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0, pgs_mode="split", velocity_iterations=0)
+        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0, velocity_iterations=0)
         body_q, _zs = _run(model, pipeline, solver, 1)
         test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
@@ -432,17 +406,15 @@ def test_assembled_dense_regularization_fixed_point(test: unittest.TestCase, dev
     g = 0.5
     with wp.ScopedDevice(device):
         model = _build_scissor_model(device)
-        with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"pgs_kernel": "loop"}):
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_mode="split",
-                pgs_iterations=400,
-                pgs_velocity_iterations=0,
-                pgs_contact_regularization=g,
-                enable_contact_friction=False,
-                dense_max_constraints=64,
-                mf_max_constraints=16,
-            )
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_iterations=400,
+            pgs_velocity_iterations=0,
+            pgs_contact_regularization=g,
+            enable_contact_friction=False,
+            dense_max_constraints=64,
+            mf_max_constraints=16,
+        )
         state_in = model.state()
         state_out = model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -515,7 +487,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free",
             pgs_iterations=16,
             pgs_velocity_iterations=0,
             pgs_contact_regularization=g,
@@ -585,21 +556,15 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_regularization_route_agreement",
-    test_regularization_route_agreement,
-    devices=get_selected_cuda_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
     "test_regularization_documented_sag",
     test_regularization_documented_sag,
     devices=get_selected_cuda_test_devices(),
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_regularization_split_route_documented_sag",
-    test_regularization_split_route_documented_sag,
-    devices=get_test_devices(),
+    "test_regularization_cpu_route_documented_sag",
+    test_regularization_cpu_route_documented_sag,
+    devices=["cpu"],
 )
 add_function_test(
     TestFeatherPGSRegularization,
@@ -641,7 +606,7 @@ add_function_test(
     TestFeatherPGSRegularization,
     "test_assembled_dense_regularization_fixed_point",
     test_assembled_dense_regularization_fixed_point,
-    devices=get_test_devices(),
+    devices=["cpu"],
 )
 add_function_test(
     TestFeatherPGSRegularization,

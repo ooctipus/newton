@@ -92,9 +92,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
         types[0] = int(GeoType.MESH)
         model.shape_type.assign(types)
         with self.assertRaisesRegex(ValueError, "[Uu]nsupported.*shape|shape.*[Uu]nsupported"):
-            SolverFeatherPGS(
-                model, pgs_mode="matrix_free", contact_torsion_radius=0.01, contact_torsion_shape_indices=(0,)
-            )
+            SolverFeatherPGS(model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(0,))
 
     def test_hydro_contact_input_is_rejected(self):
         """Reject actual positive hydro contact stiffness, not a synthetic solver flag."""
