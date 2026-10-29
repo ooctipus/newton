@@ -287,13 +287,13 @@ def ordinary_head(model, *, rows=64, **options):
 
 
 def ordinary_inverse_mass(solver, size):
-    """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its diagonal factor
-    (``L_jj = sqrt(H_jj + R_j)``), for every coordinate (zero outside the group)."""
+    """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its leaf-first diagonal
+    factor (``L_jj = sqrt(H_ii + R_i)``, ``i = n - 1 - j``), for every coordinate (zero outside the group)."""
     factor = solver.L_by_size[size].numpy().astype(np.float64)
     starts = solver.articulation_dof_start.numpy()[solver.group_to_art[size].numpy()]
     inverse = np.zeros(solver.model.joint_dof_count)
     for group, start in enumerate(starts):
-        inverse[start : start + size] = 1.0 / np.diagonal(factor[group]) ** 2
+        inverse[start : start + size] = 1.0 / np.diagonal(factor[group])[::-1] ** 2
     return wp.array(inverse, dtype=wp.float64, device="cpu")
 
 

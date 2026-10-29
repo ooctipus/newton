@@ -175,7 +175,8 @@ def _mf_layout(rng, worlds, rows):
 
 
 def _body_factors(rng, bodies, device, *, identity=False):
-    """Each body's factor of an SPD 6x6 mass matrix (``L_by_size[6]``, one per body), its articulation the body."""
+    """Each body's leaf-first factor of an SPD 6x6 mass matrix (``L_by_size[6]``, one per body: ``P H P^T = L L^T``
+    with ``P`` the coordinates reversed), its articulation the body."""
     if identity:
         lower = np.tile(np.eye(6), (bodies, 1, 1))
     else:
@@ -304,16 +305,18 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         mf_J_b=shared["mf_Z_b"],
         **shared,
     )
-    # The whitened rows: Z = L^-1 J^T per body (a speed row keeps its axis), and A_ii = cfm + J H^-1 J^T.
+    # The whitened rows: Z = L^-1 P J^T per body (factor coordinate i at position 5 - i; a speed row keeps its axis),
+    # and A_ii = cfm + J H^-1 J^T with H = P^T L L^T P.
     Z = {side: out[f"mf_Z_{side}"].numpy().astype(np.float64) for side in "ab"}
     diagonal = np.full((worlds, rows), 1.0e-6)
     for side, bodies in (("a", layout["mf_body_a"]), ("b", layout["mf_body_b"])):
         J = shared[f"mf_Z_{side}"].astype(np.float64)
         for world, row in zip(*np.nonzero(bodies >= 0), strict=True):
             factor = lower[bodies[world, row]]
-            expected = J[world, row] if kind[world, row] == 4 else np.linalg.solve(factor, J[world, row])
+            whitened = np.linalg.solve(factor, J[world, row][::-1])[::-1]
+            expected = J[world, row] if kind[world, row] == 4 else whitened
             np.testing.assert_allclose(Z[side][world, row], expected, rtol=1e-5, atol=1e-5)
-            diagonal[world, row] += J[world, row] @ np.linalg.solve(factor @ factor.T, J[world, row])
+            diagonal[world, row] += J[world, row] @ np.linalg.solve((factor @ factor.T)[::-1, ::-1], J[world, row])
     np.testing.assert_allclose(out["mf_eff_mass_inv"].numpy(), 1.0 / diagonal, rtol=1e-5)
     reference_rhs, law_rhs = out["mf_rhs"].numpy(), law["rhs"].numpy()
     np.testing.assert_array_equal(out["mf_row_w"].numpy(), law["row_w"].numpy())

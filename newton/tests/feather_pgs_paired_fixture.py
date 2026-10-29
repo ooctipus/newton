@@ -59,7 +59,9 @@ def component_fixture(worlds=4, capacity=8, mf_capacity=6):
         factor = host["L"][host["primary_group"][world]].astype(np.float64)
         jacobian = rng.normal(0, 0.2, (capacity, 23)).astype(np.float32)
         host["J"][world, :, offset : offset + 23] = jacobian
-        host["Y"][world, :, offset : offset + 23] = np.linalg.solve(factor @ factor.T, jacobian.T).T
+        # The held factor is leaf-first: P H P^T = L L^T with P the coordinates reversed.
+        mass = (factor @ factor.T)[::-1, ::-1]
+        host["Y"][world, :, offset : offset + 23] = np.linalg.solve(mass, jacobian.T).T
         host["rhs"][world] = rng.normal(0, 0.2, capacity)
         host["row_type"][world, :3] = [0, 2, 2]
         host["row_parent"][world, :3] = [-1, 0, 0]
@@ -132,10 +134,12 @@ def solve_fixture(device):
     for name in ("J", "Y", "rhs", "diag", "mu", "row_type", "row_parent"):
         host[name][:, :4] = host[name][:, [3, 0, 1, 2]]
     host["row_parent"][:, :4] = [-1, -1, 1, 1]
-    # Paired row production already stores factor rows when MF is absent.
+    # Paired row production already stores factor rows when MF is absent: z = L^T P y, factor coordinate i at
+    # position 22 - i.
     for world in (3,):
         offset, group = host["primary_offset"][world], host["primary_group"][world]
-        host["Y"][world, :, offset : offset + 23] = host["Y"][world, :, offset : offset + 23] @ host["L"][group]
+        rows = host["Y"][world, :, offset : offset + 23]
+        host["Y"][world, :, offset : offset + 23] = (rows[:, ::-1] @ host["L"][group])[:, ::-1]
     data = bind_components(host, device)
 
     def array(value):

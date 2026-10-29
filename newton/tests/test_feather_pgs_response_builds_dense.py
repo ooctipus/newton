@@ -20,7 +20,8 @@ class TestKit(unittest.TestCase):
     """The small dense kit's text."""
 
     def test_factor_matches_numpy(self):
-        """The kit's column Cholesky factors a positive definite matrix (float32, against float64)."""
+        """The kit's column Cholesky factors a positive definite matrix leaf-first, ``P H P^T`` with the coordinates
+        reversed (float32, against float64)."""
         rng = np.random.default_rng(0)
         n, arts = 9, 5
         A = rng.standard_normal((arts, n, n)).astype(np.float32)
@@ -32,7 +33,9 @@ class TestKit(unittest.TestCase):
         inputs += [wp.array(np.ones(arts, dtype=np.int32), device=CPU), n]
         wp.launch(builds.factor_articulations_kernel(), arts, inputs=inputs, outputs=[L], device=CPU)
         expected = H.astype(np.float64) + np.einsum("gi,ij->gij", R.astype(np.float64), np.eye(n))
-        np.testing.assert_allclose(np.tril(L.numpy()), np.linalg.cholesky(expected), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(
+            np.tril(L.numpy()), np.linalg.cholesky(expected[:, ::-1, ::-1]), rtol=1e-4, atol=1e-5
+        )
 
     def test_factor_text(self):
         factor = CholeskyFactor(3, lambda r, c: f"f[{r} * 3 + {c}]", unroll=True)

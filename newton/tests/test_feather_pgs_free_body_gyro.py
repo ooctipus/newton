@@ -205,8 +205,9 @@ class TestFreeBodyGyro(unittest.TestCase):
         physical_body = np.diag([4.0, 5.0, 8.0]) * 1.0e-7
         physical_joint = rotation @ physical_body @ rotation.T
         effective = physical_joint + np.eye(3) * 2.0e-7
+        # The leaf-first factor (P H P^T = L L^T, P the coordinates reversed): the angular block first.
         factors = np.tile(np.eye(6), (3, 1, 1))
-        factors[:, 3:, 3:] = np.linalg.cholesky(effective)
+        factors[:, :3, :3] = np.linalg.cholesky(effective[::-1, ::-1])
         # The Cholesky contract defines only its lower triangle.
         factors[:, np.triu_indices(6, k=1)[0], np.triu_indices(6, k=1)[1]] = 123.0
         old = np.tile([0.4, 0.5, 0.6, 20.0, 40.0, 60.0], 3).astype(np.float32)

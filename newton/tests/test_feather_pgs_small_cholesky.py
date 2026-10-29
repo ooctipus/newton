@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.response_builds_dense import factor_warps_kernel
+from newton._src.solvers.feather_pgs.response_builds_dense import factor_warps_kernel, leaf_index
 
 
 class TestSmallCholesky(unittest.TestCase):
@@ -41,7 +41,8 @@ class TestSmallCholesky(unittest.TestCase):
             mass[:, ~present] = 0
         index = np.full((size, size), -1, dtype=np.int32)
         index[present] = np.arange(np.count_nonzero(present))
-        lookup = tuple(map(int, index.ravel()))
+        # The kernel factors leaf-first: factor (row, col) reads physical (n - 1 - row, n - 1 - col).
+        lookup = leaf_index(index)
         geometric = mass[:, present].astype(np.float32)
         regularizer = rng.uniform(1, 2, size=(groups, size)).astype(np.float32)
         drive = np.arange(articulations * size, dtype=np.int32)
@@ -79,8 +80,9 @@ class TestSmallCholesky(unittest.TestCase):
                 np.testing.assert_array_equal(observed[group], -17.0)
                 continue
             lower = np.tril(observed[group])
-            np.testing.assert_allclose(lower, np.linalg.cholesky(expected[group]), atol=2e-4, rtol=2e-5)
-            np.testing.assert_allclose(lower @ lower.T, expected[group], atol=3e-4, rtol=3e-5)
+            leaf_first = expected[group][::-1, ::-1]
+            np.testing.assert_allclose(lower, np.linalg.cholesky(leaf_first), atol=2e-4, rtol=2e-5)
+            np.testing.assert_allclose(lower @ lower.T, leaf_first, atol=3e-4, rtol=3e-5)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Small factor kernels require CUDA")
     def test_geometric_factor_cuda(self):

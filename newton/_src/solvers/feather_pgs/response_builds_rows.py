@@ -2464,7 +2464,7 @@ $CONVERT
 @cache
 def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS) -> wp.Kernel:
     """Qualify each paired world's rows as independent components and move a qualified world's dense rows into the
-    held form ``z = L^T y`` (:meth:`.FactorRows.transposed` of the primary factor, a lane per coordinate of a warp
+    held form ``z = L^T P y`` (:meth:`.FactorRows.transposed` of the primary factor, a lane per coordinate of a warp
     per row; the CPU converts serially). A block of :data:`.paired_components.PAIRED_COMPONENT_THREADS` threads per
     worker strides over the worlds; the signed selector is the dispatch's private metadata."""
     if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
@@ -2481,8 +2481,8 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
                 for (int k = 0; k < {P}; ++k) y[k] = data.Y.data[base + k];
                 for (int d = 0; d < {P}; ++d) {{
                     float z = 0.0f;
-                    for (int k = d; k < {P}; ++k)
-                        z += {held.components[0].element("L", "k", "d")} * y[k];
+                    for (int k = 0; k <= d; ++k)
+                        z += {held.components[0].element("L", f"({P}-1-k)", f"({P}-1-d)")} * y[k];
                     data.Y.data[base + d] = z;
                 }}
 #endif"""

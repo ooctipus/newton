@@ -797,7 +797,7 @@ class TestCompactContact(unittest.TestCase):
             group = candidate.dense_group.numpy()[world]
             L = candidate.factor.numpy()[group].astype(np.float64)
             J = candidate.J.numpy()[group, :count].astype(np.float64)
-            Y = np.linalg.solve(L.T, np.linalg.solve(L, J.T)).T
+            Y = np.linalg.solve((L @ L.T)[::-1, ::-1], J.T).T  # the leaf-first factor: P H P^T = L L^T
             np.testing.assert_allclose(candidate.Y.numpy()[group, :count], Y, rtol=5e-6, atol=3e-6)
             expected = np.sum(J * Y, axis=1)
             sd = candidate.sparse_dof.numpy()[world, :count]
@@ -829,7 +829,7 @@ class TestCompactContact(unittest.TestCase):
                 expected = dense @ velocity[world, :6] + sparse @ velocity[world]
                 self.assertAlmostEqual(actual, expected, delta=1e-5)
                 factor = data.factor.numpy()[group].astype(np.float64)
-                response = np.linalg.solve(factor.T, np.linalg.solve(factor, dense))
+                response = np.linalg.solve((factor @ factor.T)[::-1, ::-1], dense)
                 np.testing.assert_allclose(data.Y.numpy()[group, row], response, rtol=5e-6, atol=4e-6)
 
     def test_exact_mode_admission(self):

@@ -6,7 +6,7 @@
 One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
 (:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
 the native sparse factor, when the solver admitted one, makes one complete group (:class:`TreeSparseOperator`);
-otherwise each size group of the dense factors is a group with its held Cholesky or diagonal response
+otherwise each size group of the dense factors is a group with its held leaf-first Cholesky or diagonal response
 (:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
 group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a solver's
 dynamics stay on the serial passes; :func:`install` installs the owner.
@@ -21,7 +21,7 @@ import warp as wp
 from ...sim import JointType
 from . import host_index
 from .device_proof import DeviceProof
-from .response_builds_dense import factor_warps_kernel
+from .response_builds_dense import factor_warps_kernel, leaf_index
 from .response_builds_rows import sparse_factor_kernel
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
@@ -326,8 +326,9 @@ class TreeHeldOperator:
             self.refresh_kernel = _diagonal_geometry
         else:
             self.data.lower = solver.L_by_size[size]
-            self.geometry_index = wp.array(physical_index.ravel(), dtype=int, device=device)
-            self.refresh_kernel = factor_warps_kernel(size, tuple(map(int, physical_index.ravel())))
+            index = leaf_index(physical_index)
+            self.geometry_index = wp.array(index, dtype=int, device=device)
+            self.refresh_kernel = factor_warps_kernel(size, index)
             self.factor_schedule = wp.array(
                 [row * size + col for row in range(size) for col in range(row + 1)], dtype=int, device=device
             )
@@ -556,25 +557,20 @@ class ForestHeldOperator:
             group = solver.group_to_art[family].numpy()
             position = {int(a): g for g, a in enumerate(group)}
             factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
-            block = physical_index[offset : offset + family, offset : offset + family]
+            index = leaf_index(physical_index[offset : offset + family, offset : offset + family])
             # The family's factor groups read this root's block of their
             # world's geometry record (one record per forest group).
             self.families.append(
                 (
                     r,
                     family,
-                    factor_warps_kernel(
-                        family,
-                        tuple(map(int, block.ravel())),
-                        geometric_stride=self.layout.entries,
-                        geometric_group=True,
-                    ),
+                    factor_warps_kernel(family, index, geometric_stride=self.layout.entries, geometric_group=True),
                     wp.array(
                         [row * family + col for row in range(family) for col in range(row + 1)],
                         dtype=int,
                         device=device,
                     ),
-                    wp.array(block.ravel().astype(np.int32), dtype=int, device=device),
+                    wp.array(index, dtype=int, device=device),
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )

@@ -9,9 +9,11 @@ thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the data 
 :data:`ASSEMBLED_BUILDS` (the data of an :class:`.Assembled` sweep). Each stage's arithmetic comes from one small
 dense kit:
 
-* :class:`.CholeskyFactor`: ``H + diag(R) = L L^T`` by columns on one thread (``factor`` over articulations, and
-  lane 0 of the warp-mapped factor that assembles ``H`` from the held tree's geometry);
-* :class:`.CholeskySolve`: the triangular solves, with the zero-diagonal conventions as named options: a zero
+* :class:`.CholeskyFactor`: the leaf-first factor ``P (H + diag(R)) P^T = L L^T`` (``P`` reverses an
+  articulation's coordinates, :func:`.leaf_first`) by columns on one thread (``factor`` over articulations, and lane
+  0 of the warp-mapped factor that assembles ``H`` from the held tree's geometry);
+* :class:`.CholeskySolve`: the triangular solves (physical vectors in, physical vectors out, the reversal bound in
+  the kit), with the zero-diagonal conventions as named options: a zero
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
   group, the register inverse), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
   response); a diagonal factor divides twice, unguarded (Zdiv, :func:`diagonal_solve`);
@@ -41,7 +43,7 @@ from .device_preludes import lane_group, substitute
 from .execution_plan import _fused_response_chunk_size
 from .kernel_template import THREADS, Dispatch, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from .response_operator import CholeskyFactor, CholeskySolve, Vector
+from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
 from .row_packets import PrefixData, QueueData
 from .staging import Buffer, Staging, static_budget
 
@@ -56,7 +58,8 @@ __all__ = [
 ]
 
 STAGES = ("factor", "inverse", "response", "gather", "diagonal", "cfm", "delassus", "apply")
-"""What a build stage writes: the factor ``L`` of ``H + diag(R)``; an explicit inverse (``L^-1`` or ``H^-1``); the
+"""What a build stage writes: the leaf-first factor ``L`` of ``P (H + diag(R)) P^T``; an explicit inverse (``L^-1`` or
+``H^-1``); the
 response ``Y = H^-1 J^T`` (by size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``);
 the world-layout copy of ``J`` and ``Y``; the world diagonal ``A_ii = J_i Y_i``; its ``cfm``; the Delassus ``C = J
 Y^T`` with its diagonal; the velocity ``v_hat + Y^T lambda``."""
@@ -100,21 +103,24 @@ def _skips(rows: str, world: str) -> str:
 
 
 def _respond_in_place(L: str, J: str, Y: str, group: str, row: str, size: str) -> str:
-    """``Y_row = H^-1 J_row^T`` of a size group's row in global memory: ``L z = J^T`` into ``Y``, then ``L^T y = z``
-    in place, each step ascending in its terms from the right-hand side, a zero diagonal giving zero (Z0).
+    """``Y_row = H^-1 J_row^T`` of a size group's row in global memory: ``L z = P J^T`` into ``Y``, then ``L^T P y =
+    z`` in place (the kit's leaf-first positions), each step ascending in its terms from the right-hand side, a zero
+    diagonal giving zero (Z0).
 
     The row is bound first: the solves' loop variable is ``row``.
     """
     solve = CholeskySolve(size, lambda r, c: _element(L, group, r, c))
-
-    def jacobian(i):
-        return _element(J, group, "response_row", i)
-
-    def response(i):
-        return _element(Y, group, "response_row", i)
-
+    # The row's last coordinates, read backwards: factor coordinate k at physical position size - 1 - k.
+    jacobian = Reversed(lambda k: f"response_J[-{k}]")
+    response = Reversed(lambda k: f"response_Y[-{k}]")
     return "\n".join(
-        (f"const int response_row = {row};", solve.forward(jacobian, response), solve.transpose(response, response))
+        (
+            f"const int response_row = {row};",
+            f"const float* response_J = &{_element(J, group, 'response_row', f'{size} - 1')};",
+            f"float* response_Y = &{_element(Y, group, 'response_row', f'{size} - 1')};",
+            solve.forward(jacobian, response),
+            solve.transpose(response, response),
+        )
     )
 
 
@@ -181,17 +187,18 @@ articulations whose mass changed (``mass_update_mask``)."""
 
 
 def _group_factor() -> CholeskyFactor:
-    """The kit's factor of articulation ``group``'s ``H + diag(R)``: ``A_jj = H_jj + R_j``, ``H`` with its stiffness
-    folded in already, so the diagonal rounds as ``(S F + K) + R``."""
+    """The kit's leaf-first factor of articulation ``group``'s ``H + diag(R)``: ``A = P (H + diag(R)) P^T`` with the
+    coordinates reversed (:func:`.leaf_first`), ``A_jj = H_jj + R_j``, ``H`` with its stiffness folded in already, so
+    the diagonal rounds as ``(S F + K) + R``."""
 
     def H(row, col):
-        return _element("H_group", "group", row, col)
+        return _element("H_group", "group", leaf_first("n_dofs", row), leaf_first("n_dofs", col))
 
     def L(row, col):
         return _element("L_group", "group", row, col)
 
     def diagonal(col):
-        return f"{H(col, col)} + {_element('R_group', 'group', col)}"
+        return f"{H(col, col)} + {_element('R_group', 'group', leaf_first('n_dofs', col))}"
 
     return CholeskyFactor("n_dofs", L, source=H, diagonal=diagonal)
 
@@ -221,8 +228,9 @@ def factor_coordinates_kernel() -> wp.Kernel:
     return _kernel("dense_factor_coordinates", FACTOR_ABI, body)
 
 
-# A warp per articulation reads its H from the held tree's geometry into shared memory, lane 0 factors it with the
-# kit, and the lanes store the lower triangle. The diagonal rounds as (S F + R) + K.
+# A warp per articulation reads its leaf-first H (P H P^T, the coordinates reversed) from the held tree's geometry into
+# shared memory, lane 0 factors it with the kit, and the lanes store the lower triangle. The diagonal rounds as
+# (S F + R) + K.
 _WARP_FACTOR = """
     const int group = tid >> 5;
     if (group >= n_arts) return;
@@ -239,8 +247,9 @@ $STAGING
         const int geometry_entry = geometry_lookup.data[element];
         float value = geometry_entry < 0 ? 0.0f : geometric.data[$GEOMETRY_ROW * $GEOMETRY_STRIDE + geometry_entry];
         if (row == col) {
-            value += R_group.data[group * $DOFS + row];
-            const int drive_row = drive_row_by_dof.data[dof_start + row];
+            const int physical = $DOFS - 1 - row;
+            value += R_group.data[group * $DOFS + physical];
+            const int drive_row = drive_row_by_dof.data[dof_start + physical];
             if (drive_row >= 0) {
                 const float K = row_K.data[drive_row];
                 if (K > 0.0f) value += K;
@@ -278,15 +287,21 @@ _WARP_FACTOR_INPUTS = (
 )
 
 
+def leaf_index(physical_index) -> tuple[int, ...]:
+    """A symmetric physical ``(row, col)`` index grid (a square array) as the leaf-first factor's, flattened: factor
+    ``(row, col)`` reads physical ``(n - 1 - row, n - 1 - col)``."""
+    return tuple(map(int, physical_index[::-1, ::-1].ravel()))
+
+
 @functools.cache
 def factor_warps_kernel(
     size: int, geometric_index, *, warps_per_block: int = 4, geometric_stride: int = 0, geometric_group: bool = False
 ) -> wp.Kernel:
-    """The held tree's factor, one warp per articulation (``dim = articulations * 32``): each lower entry of ``H``
-    read from the held geometry through ``geometric_index`` (the physical ``(row, col)`` entry's geometry slot, ``-1``
-    where structurally zero; rows of ``geometric_stride``, groups mapped to geometry rows with ``geometric_group``),
-    then ``R`` and the augmented drives' ``K`` on the diagonal; lane 0 factors with the kit (:class:`.CholeskyFactor`,
-    unrolled), the lanes store the lower triangle.
+    """The held tree's leaf-first factor, one warp per articulation (``dim = articulations * 32``): each lower entry
+    of ``P H P^T`` read from the held geometry through ``geometric_index`` (the factor ``(row, col)`` entry's geometry
+    slot, :func:`leaf_index`; ``-1`` where structurally zero; rows of ``geometric_stride``, groups mapped to geometry
+    rows with ``geometric_group``), then ``R`` and the augmented drives' ``K`` of the physical coordinate on the
+    diagonal; lane 0 factors with the kit (:class:`.CholeskyFactor`, unrolled), the lanes store the lower triangle.
     """
     size, warps_per_block = int(size), int(warps_per_block)
     if not 1 <= size <= 32 or not 1 <= warps_per_block <= 32:
@@ -326,11 +341,12 @@ def factor_warps_kernel(
 
 @functools.cache
 def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = False) -> wp.Kernel:
-    """The factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
-    ``tile_cholesky(tile_diag_add(H, R))``, the primitive's rounding. With ``inverse`` the factor also materializes
-    ``H^-1 = tile_cholesky_solve(L, I)``.
+    """The leaf-first factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
+    ``tile_cholesky(tile_diag_add(P H P^T, P R))``, the coordinates reversed by indexed loads, the primitive's
+    rounding. With ``inverse`` the factor also materializes the physical ``H^-1 = P^T tile_cholesky_solve(L, I) P``.
     """
     dofs = wp.constant(int(n_dofs))
+    last = wp.constant(int(n_dofs) - 1)
     if inverse:
 
         def cholesky_inverse_tiled_template(
@@ -346,13 +362,14 @@ def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = 
             art = group_to_art[group]
             if mass_update_mask[art] == 0:
                 return
-            H_tile = wp.tile_load(H_group[group], shape=(dofs, dofs), bounds_check=False)
-            armature_tile = wp.tile_load(R_group[group], shape=(dofs,), bounds_check=False)
+            reverse = wp.tile_arange(last, -1, -1, dtype=int)
+            H_tile = wp.tile_load_indexed(H_group[group], indices=reverse, shape=(dofs, dofs), axis=0)[:, reverse]
+            armature_tile = wp.tile_load_indexed(R_group[group], indices=reverse, shape=(dofs,), axis=0)
             identity_tile = wp.tile_load(identity, shape=(dofs, dofs), bounds_check=False)
             L_tile = wp.tile_cholesky(wp.tile_diag_add(H_tile, armature_tile))
             Hinv_tile = wp.tile_cholesky_solve(L_tile, identity_tile, "lower")
             wp.tile_store(L_group[group], L_tile, bounds_check=False)
-            wp.tile_store(Hinv_group[group], Hinv_tile, bounds_check=False)
+            wp.tile_store_indexed(Hinv_group[group], indices=reverse, t=Hinv_tile[:, reverse], axis=0)
 
         return python_kernel(
             cholesky_inverse_tiled_template, f"dense_factor_tiles_inverse_{int(n_dofs)}_bd{int(tile_threads)}"
@@ -369,8 +386,9 @@ def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = 
         art = group_to_art[idx]
         if mass_update_mask[art] == 0:
             return
-        H_tile = wp.tile_load(H_group[idx], shape=(dofs, dofs), bounds_check=False)
-        armature = wp.tile_load(R_group[idx], shape=(dofs,), bounds_check=False)
+        reverse = wp.tile_arange(last, -1, -1, dtype=int)
+        H_tile = wp.tile_load_indexed(H_group[idx], indices=reverse, shape=(dofs, dofs), axis=0)[:, reverse]
+        armature = wp.tile_load_indexed(R_group[idx], indices=reverse, shape=(dofs,), axis=0)
         H_tile = wp.tile_diag_add(H_tile, armature)
         L_tile = wp.tile_cholesky(H_tile)
         wp.tile_store(L_group[idx], L_tile)
@@ -385,21 +403,26 @@ def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = 
 
 @functools.cache
 def inverse_lanes_kernel(n_dofs: int, *, lower_only: bool = False) -> wp.Kernel:
-    """An explicit inverse, one lane per column (``dim = articulations * 32``): lane ``l`` solves ``L x = e_l``
-    (``lower_only``: ``L^-1``) and then ``L^T y = x`` (``H^-1``) in registers with the kit's solves (unrolled, Z0)
-    and stores column ``l``. CUDA only."""
+    """An explicit inverse, one lane per column (``dim = articulations * 32``) with the kit's solves (unrolled, Z0):
+    with ``lower_only`` lane ``l`` solves ``L x = e_l`` and stores column ``l`` of the leaf-first ``L^-1`` (factor
+    coordinates, lower); otherwise it solves ``H y = e_l`` (``L x = P e_l``, then ``L^T`` back) and stores column
+    ``l`` of the physical ``H^-1``. CUDA only."""
     n = int(n_dofs)
     solve = CholeskySolve(
-        n, lambda row, col: f"L_group.data[factor_base + {row} * {n} + {col}]", ascending=True, unroll=True
+        n, lambda row, col: f"L_group.data[factor_base + ({row}) * {n} + ({col})]", ascending=True, unroll=True
     )
 
+    # The kit reads factor coordinate i of a vector at position n - 1 - i: L^-1's unit column sits at n - 1 - l.
+    target = f"{n - 1} - lane" if lower_only else "lane"
+
     def unit(i):
-        return f"{i} == lane ? 1.0f : 0.0f"
+        return f"{i} == {target} ? 1.0f : 0.0f"
 
     def column(i):
         return f"column[{i}]"
 
     backward = "" if lower_only else _indent(solve.transpose(column, column), "    ")
+    row = f"({n - 1} - i)" if lower_only else "i"
     body = f"""    const int lane = tid & 31;
     const int group = tid / 32;
     if (lane >= {n}) return;
@@ -412,7 +435,7 @@ def inverse_lanes_kernel(n_dofs: int, *, lower_only: bool = False) -> wp.Kernel:
 {backward}
 #pragma unroll
     for (int i = 0; i < {n}; ++i)
-        Hinv_group.data[factor_base + i * {n} + lane] = column[i];
+        Hinv_group.data[factor_base + {row} * {n} + lane] = column[i];
 #endif
 """
     return _kernel(
@@ -614,7 +637,8 @@ def solve_six(factor: wp.array3d[float], group: int, jacobian: _Vec6) -> _Vec6:
 @functools.cache
 def response_diagonal_kernel() -> wp.Kernel:
     """The response of a structurally diagonal ``H``, one thread per articulation row (``dim = articulations *
-    max_constraints``): ``y = (j / l) / l`` per coordinate (:func:`diagonal_solve`, Zdiv), written to the group
+    max_constraints``): ``y = (j / l) / l`` per coordinate, ``l`` its leaf-first pivot (:func:`diagonal_solve`,
+    Zdiv), written to the group
     (``write_group``) and the world layout (``write_world``), with the row's diagonal ``sum j y`` in coordinate
     order (``compute_diag``)."""
     J = _element("J_group", "group", "constraint", "dof")
@@ -629,7 +653,7 @@ def response_diagonal_kernel() -> wp.Kernel:
     float diagonal_sum = 0.0f;
     for (int dof = 0; dof < n_dofs; ++dof) {{
         const float jacobian = {J};
-        const float factor = {_element("L_group", "group", "dof", "dof")};
+        const float factor = {_element("L_group", "group", leaf_first("n_dofs", "dof"), leaf_first("n_dofs", "dof"))};
         const float response = {diagonal_solve("jacobian", "factor")};
         if (write_group != 0) {_element("Y_group", "group", "constraint", "dof")} = response;
         if (write_world != 0) {{
@@ -750,12 +774,13 @@ def response_tiles_kernel(
     compute_diag: bool = False,
 ) -> wp.Kernel:
     """The response, one tile per articulation and chunk of rows (``launch_tiled(dim=[articulations, chunks],
-    block_dim=tile_threads)``): ``tile_lower_solve(L, J^T)`` then ``tile_upper_solve(L^T, Z)``, the primitives'
-    rounding; the group copy, the world layout and, with ``compute_diag``, the diagonal ``tile_sum(J * Y, axis=1)``
+    block_dim=tile_threads)``): ``tile_lower_solve(L, P J^T)`` then ``Y^T = P^T tile_upper_solve(L^T, Z)`` (the
+    leaf-first factor, the coordinates reversed by indexing), the primitives' rounding; the group copy, the world layout and, with ``compute_diag``, the diagonal ``tile_sum(J * Y, axis=1)``
     (the kernel then takes ``diag_group``, which a plain kernel does not declare at all: Warp keeps an unused
     output's work).
     """
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+    TILE_DOF_LAST = wp.constant(int(n_dofs) - 1)
     chunk_size = max_constraints if constraint_chunk_size is None else int(constraint_chunk_size)
     if chunk_size <= 0 or chunk_size > max_constraints:
         raise ValueError("constraint_chunk_size must be in [1, max_constraints]")
@@ -797,11 +822,12 @@ def response_tiles_kernel(
                 offset=(row_start, 0),
                 bounds_check=BOUNDS_CHECK,
             )
-            Jt_tile = wp.tile_transpose(J_tile)
+            reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
+            Jt_tile = wp.tile_transpose(J_tile[:, reverse])
             Z_tile = wp.tile_lower_solve(L_tile, Jt_tile)
             Lt_tile = wp.tile_transpose(L_tile)
             X_tile = wp.tile_upper_solve(Lt_tile, Z_tile)
-            Y_out_tile = wp.tile_transpose(X_tile)
+            Y_out_tile = wp.tile_transpose(X_tile[reverse, :])
             if WRITE_GROUP != 0:
                 wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
 
@@ -843,11 +869,12 @@ def response_tiles_kernel(
             offset=(row_start, 0),
             bounds_check=BOUNDS_CHECK,
         )
-        Jt_tile = wp.tile_transpose(J_tile)
+        reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
+        Jt_tile = wp.tile_transpose(J_tile[:, reverse])
         Z_tile = wp.tile_lower_solve(L_tile, Jt_tile)
         Lt_tile = wp.tile_transpose(L_tile)
         X_tile = wp.tile_upper_solve(Lt_tile, Z_tile)
-        Y_out_tile = wp.tile_transpose(X_tile)
+        Y_out_tile = wp.tile_transpose(X_tile[reverse, :])
 
         if WRITE_GROUP != 0:
             wp.tile_store(Y_group[idx], Y_out_tile, offset=(row_start, 0), bounds_check=BOUNDS_CHECK)
@@ -880,29 +907,29 @@ _PAIRED_RESPONSE_FACTOR = """
 #pragma unroll
         for (int k = 0; k < $P; ++k) {
             const float jk = READ(j, k);
-            if (lane < $P && k <= lane)
-                z += s_primary_M[lane * $P + k] * jk;
+            if (lane < $P && k >= lane)
+                z += s_primary_M[($P - 1 - lane) * $P + $P - 1 - k] * jk;
         }
         const int secondary_lane = lane - $P;
 #pragma unroll
         for (int k = 0; k < $S; ++k) {
             const float jk = READ(j, $P + k);
-            if (lane >= $P && lane < $T && k <= secondary_lane)
-                z += s_secondary_M[secondary_lane * $S + k] * jk;
+            if (lane >= $P && lane < $T && k >= secondary_lane)
+                z += s_secondary_M[($S - 1 - secondary_lane) * $S + $S - 1 - k] * jk;
         }
         if (!factor_world) {
 #pragma unroll
             for (int k = 0; k < $P; ++k) {
                 const float zk = READ(z, k);
-                if (lane < $P && k >= lane)
-                    y += s_primary_M[k * $P + lane] * zk;
+                if (lane < $P && k <= lane)
+                    y += s_primary_M[($P - 1 - k) * $P + $P - 1 - lane] * zk;
             }
 #pragma unroll
             for (int k = 0; k < $S; ++k) {
                 const float zk = READ(z, $P + k);
                 if (lane >= $P && lane < $T)
-                    if (k >= secondary_lane)
-                        y += s_secondary_M[k * $S + secondary_lane] * zk;
+                    if (k <= secondary_lane)
+                        y += s_secondary_M[($S - 1 - k) * $S + $S - 1 - secondary_lane] * zk;
             }
         }"""
 
@@ -917,20 +944,20 @@ _PAIRED_CPU_PHYSICAL = """
 
 _PAIRED_CPU_FACTOR = """
         for (int d = 0; d < $P; ++d)
-            for (int k = 0; k <= d; ++k)
-                z[d] += primary_Linv.data[primary_group * $PP + d * $P + k] * j[k];
+            for (int k = d; k < $P; ++k)
+                z[d] += primary_Linv.data[primary_group * $PP + ($P - 1 - d) * $P + $P - 1 - k] * j[k];
         for (int d = 0; d < $S; ++d)
-            for (int k = 0; k <= d; ++k)
+            for (int k = d; k < $S; ++k)
                 z[$P + d] += secondary_Linv.data[secondary_group * $SS
-                    + d * $S + k] * j[$P + k];
+                    + ($S - 1 - d) * $S + $S - 1 - k] * j[$P + k];
         if (!factor_world) {
             for (int d = 0; d < $P; ++d)
-                for (int k = d; k < $P; ++k)
-                    y[d] += primary_Linv.data[primary_group * $PP + k * $P + d] * z[k];
+                for (int k = 0; k <= d; ++k)
+                    y[d] += primary_Linv.data[primary_group * $PP + ($P - 1 - k) * $P + $P - 1 - d] * z[k];
             for (int d = 0; d < $S; ++d)
-                for (int k = d; k < $S; ++k)
+                for (int k = 0; k <= d; ++k)
                     y[$P + d] += secondary_Linv.data[secondary_group * $SS
-                        + k * $S + d] * z[$P + k];
+                        + ($S - 1 - k) * $S + $S - 1 - d] * z[$P + k];
         }"""
 
 _PAIRED = """$STAGING
@@ -1028,8 +1055,8 @@ def response_pairs_kernel(
     """The response of a paired world (an articulation and a free body), a block per pair and a warp per row, a lane
     per coordinate (``launch_tiled(dim=[pairs], block_dim=32 * warps_per_block)``; on the CPU one thread per pair):
     with the explicit inverses ``y = H^-1 j`` per component (physical coordinates), or with ``factor_coordinates``
-    ``z = L^-1 j`` and, in a world with free-body rows, ``y = L^-T z`` (factor coordinates where a world has none,
-    its response ``Z`` and diagonal ``|z|^2``). The products sum in column order; the diagonal ``sum j y + cfm``
+    the leaf-first ``z = L^-1 P j`` (factor coordinate ``i`` on lane ``n - 1 - i``) and, in a world with free-body
+    rows, ``y = P^T L^-T z`` (factor coordinates where a world has none, its response ``Z`` and diagonal ``|z|^2``). The products sum in column order; the diagonal ``sum j y + cfm``
     reduces over the lanes (``SUM``), on the CPU in coordinate order.
     """
     cpu = str(device_arch) == "cpu"
@@ -1455,8 +1482,9 @@ def delassus_tiles_kernel(n_dofs: int, max_constraints: int, tile_threads: int =
     """The response and the Delassus fused, one tile per articulation (``launch_tiled(dim=[articulations],
     block_dim=tile_threads)``), rows in chunks (:func:`.execution_plan._fused_response_chunk_size`): per chunk
     ``Y_i`` by the tile solves, then ``C_ji = tile_matmul(J_j, X_i)`` stored, the diagonal ``C_tt + cfm`` stored
-    (the primitives' rounding)."""
+    (the primitives' rounding; the leaf-first factor, the coordinates reversed by indexing)."""
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+    TILE_DOF_LAST = wp.constant(int(n_dofs) - 1)
     chunk = _fused_response_chunk_size(max_constraints)
     TILE_CHUNK_LOCAL = wp.constant(chunk)
 
@@ -1481,14 +1509,15 @@ def delassus_tiles_kernel(n_dofs: int, max_constraints: int, tile_threads: int =
 
         L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
         Lt_tile = wp.tile_transpose(L_tile)
+        reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
 
         for ci in range(n_chunks):
             row_i = ci * TILE_CHUNK_LOCAL
             J_i = wp.tile_load(
                 J_group[idx], shape=(TILE_CHUNK_LOCAL, TILE_DOF_LOCAL), offset=(row_i, 0), bounds_check=False
             )
-            Z_i = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_i))
-            X_i = wp.tile_upper_solve(Lt_tile, Z_i)
+            Z_i = wp.tile_lower_solve(L_tile, wp.tile_transpose(J_i[:, reverse]))
+            X_i = wp.tile_upper_solve(Lt_tile, Z_i)[reverse, :]
             wp.tile_store(Y_group[idx], wp.tile_transpose(X_i), offset=(row_i, 0), bounds_check=False)
             for cj in range(n_chunks):
                 row_j = cj * TILE_CHUNK_LOCAL

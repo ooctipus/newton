@@ -4,10 +4,19 @@
 """Author response actions independently of force production and publication.
 
 Vector operands are functions from an index expression to the native expression
-of the element at that index. The caller binds physical/factor permutations and
-storage offsets in them. A forward action maps
-force into factor coordinates; its transpose maps back to physical response.
-Cholesky solves retain their dependency order; inverse factors retain products.
+of the element at that index. The caller binds storage offsets in them. A forward
+action maps force into factor coordinates; its transpose maps back to physical
+response. Cholesky solves retain their dependency order; inverse factors retain
+products.
+
+Every dense factor is the tree's leaf-first factor: ``L`` of ``P H P^T`` with ``P``
+the reversal of an articulation's coordinates (factor coordinate ``i`` is physical
+coordinate ``n - 1 - i``). Numbering a tree parent-first makes the reversal
+leaf-first, so ``L`` has no fill (:meth:`.TreePlan.factor`'s order for a
+depth-first numbering). ``L`` is indexed in factor coordinates; a vector the dense
+actions read or write sits in physical positions, its factor coordinate ``i`` at
+position ``n - 1 - i`` (:func:`leaf_first`), so whitened rows and factor
+velocities share their physical vectors' storage and an action may work in place.
 
 These generators allocate no storage and impose no launch boundary. Owners
 supply scratch, lane ownership, synchronization between dependent actions,
@@ -29,6 +38,21 @@ Matrix = Callable[[str, str], str]
 
 def _at(vector: Vector, index: str) -> str:
     return vector(f"({index})")
+
+
+def leaf_first(size: int | str, index: str) -> str:
+    """The position of factor coordinate ``index`` in an ``size``-coordinate vector: ``size - 1 - index`` (the
+    leaf-first factor's coordinate reversal)."""
+    return f"({size}-1-({index}))"
+
+
+@dataclass(frozen=True)
+class Reversed:
+    """A vector operand that names factor coordinate ``k`` itself (``at(k)``): its element at physical position
+    ``size - 1 - k``, typically a pointer to the vector's last element read backwards, so a solve's address steps
+    down with ``k`` instead of recomputing ``size - 1 - k`` per access (the runtime-size loops)."""
+
+    at: Vector
 
 
 def _operand(expression: str) -> str:
@@ -107,8 +131,13 @@ class CholeskyFactor:
 
 @dataclass(frozen=True)
 class CholeskySolve:
-    """Apply L^-1 and L^-T with the owner's zero-diagonal convention.
+    """Apply the leaf-first factor's L^-1 and L^-T with the owner's zero-diagonal convention.
 
+    ``L`` is indexed in factor coordinates and every vector operand in physical
+    positions (:func:`leaf_first`): :meth:`forward` whitens a physical vector
+    (``x = L^-1 P b``), :meth:`transpose` leaves factor coordinates (``P^T L^-T``)
+    and :meth:`transposed_product` enters them (``L^T P v``); both operands of an
+    action keep the same positions, so an action may work in place.
     One lane owns each complete solve. The output may alias the input; an
     optional post-row statement retains per-owner finite-state reporting.
     A zero diagonal produces zero, as in the retained predictor/fallback law.
@@ -152,6 +181,12 @@ class CholeskySolve:
             return self.lower(row, col)
         return f"({self.lower})[{row}*{self.size}+{col}]"
 
+    def _at(self, vector: Vector | Reversed, index: str) -> str:
+        """Factor coordinate ``index`` of a vector operand: its element at position ``size - 1 - index``."""
+        if isinstance(vector, Reversed):
+            return vector.at(f"({index})")
+        return vector(leaf_first(self.size, index))
+
     def _finish(self) -> str:
         if self.inverse is not None:
             return f"value*({self.inverse})[row]"
@@ -168,17 +203,17 @@ class CholeskySolve:
         if self.masked:
             return f"""#pragma unroll 1
         for(int row=0;row<{self.size};++row){{
-            float value={_at(rhs, "row")};
+            float value={self._at(rhs, "row")};
             #pragma unroll
-            for(int k=0;k<{self.size};++k)if(k<row)value-={self._entry("row", "k")}*{_at(output, "k")};{self._diagonal()}
-            {_at(output, "row")}={self._finish()};
+            for(int k=0;k<{self.size};++k)if(k<row)value-={self._entry("row", "k")}*{self._at(output, "k")};{self._diagonal()}
+            {self._at(output, "row")}={self._finish()};
         }}"""
         rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
         terms = _unrolled("for(int k=0;k<row;++k)", "            ", self.unroll)
         return f"""{rows}
-            float value={_at(rhs, "row")};
-            {terms}value-={self._entry("row", "k")}*{_at(output, "k")};{self._diagonal()}
-            {_at(output, "row")}={self._finish()};
+            float value={self._at(rhs, "row")};
+            {terms}value-={self._entry("row", "k")}*{self._at(output, "k")};{self._diagonal()}
+            {self._at(output, "row")}={self._finish()};
         }}"""
 
     def transpose(self, rhs: Vector, output: Vector, *, post_row: str = "") -> str:
@@ -191,9 +226,9 @@ class CholeskySolve:
         post = f"\n            {post_row}" if post_row or self.inverse is None else ""
         terms = _unrolled(f"for(int k=row+1;k<{self.size};++k)", "            ", self.unroll)
         return f"""{_unrolled(head, "        ", self.unroll)}
-            float value={_at(rhs, "row")};
-            {terms}value-={self._entry("k", "row")}*{_at(output, "k")};{self._diagonal()}
-            {_at(output, "row")}={self._finish()};{post}
+            float value={self._at(rhs, "row")};
+            {terms}value-={self._entry("k", "row")}*{self._at(output, "k")};{self._diagonal()}
+            {self._at(output, "row")}={self._finish()};{post}
         }}"""
 
     def transposed_product(self, rhs: Vector, output: Vector) -> str:
@@ -203,8 +238,8 @@ class CholeskySolve:
         terms = _unrolled(f"for(int k=row;k<{self.size};++k)", "            ", self.unroll)
         return f"""{rows}
             float value=0.0f;
-            {terms}value+={self._entry("k", "row")}*{_at(rhs, "k")};
-            {_at(output, "row")}=value;
+            {terms}value+={self._entry("k", "row")}*{self._at(rhs, "k")};
+            {self._at(output, "row")}=value;
         }}"""
 
     def stage_inverse(self, lane: str) -> str:
@@ -231,7 +266,9 @@ class CholeskySolve:
 class LaneCholeskySolve:
     """Apply L^-1 and L^-T with one lane per coordinate and one shuffle per step.
 
-    The same law as :class:`CholeskySolve` (zero diagonal produces zero), with
+    The same law as :class:`CholeskySolve` (zero diagonal produces zero, the
+    leaf-first factor: lane ``i`` owns factor row ``i``, whose right-hand side
+    and solution sit at physical position ``size - 1 - i``), with
     the dependency chain shared across the lanes of one warp group: at step
     ``k`` the lane holding row ``k`` finalizes its coordinate, every lane reads
     it through a shuffle and subtracts its own ``L[i, k]`` term. The forward
@@ -261,7 +298,7 @@ class LaneCholeskySolve:
             #pragma unroll
             for(int k=0;k<{n};++k){{row[k]=Lr[ic*{n}+k];col[k]=Lr[k*{n}+ic];}}
             const float diagonal=Lr[ic*{n}+ic];
-            float value=active?s[{rhs_base}+i]:0.0f;
+            float value=active?s[{rhs_base}+{n - 1}-i]:0.0f;
             float x=0.0f;
             #pragma unroll
             for(int k=0;k<{n};++k){{
@@ -277,7 +314,7 @@ class LaneCholeskySolve:
                 const float zk=__shfl_sync({mask},z,k,{width});
                 if(active&&i<k)value-=col[k]*zk;
             }}
-            if(active)s[{output_base}+i]=z;
+            if(active)s[{output_base}+{n - 1}-i]=z;
         }}"""
 
 
@@ -2603,8 +2640,9 @@ class FactorComponent:
     """One diagonal block of a block-diagonal factor ``L``: ``size`` coordinates from lane ``offset``.
 
     ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes); ``L`` and
-    ``Linv`` hold the block's lower factor and its inverse, row-major from ``base``: Warp arrays, or with
-    ``staged`` the block's own shared arrays.
+    ``Linv`` hold the block's leaf-first lower factor and its inverse in factor coordinates, row-major from
+    ``base``: Warp arrays, or with ``staged`` the block's own shared arrays. A lane's coordinate is a physical
+    position: factor coordinate ``i`` sits on lane ``size - 1 - i`` (:func:`leaf_first`).
     """
 
     size: int
@@ -2618,7 +2656,7 @@ class FactorComponent:
     def element(self, matrix: str, row: str, col: str) -> str:
         """Entry ``(row, col)`` of the block's ``matrix`` (``"L"`` or ``"Linv"``)."""
         data = getattr(self, matrix) if self.staged else f"{getattr(self, matrix)}.data"
-        return f"{data}[{self.base} + {row} * {self.size} + {col}]"
+        return f"{data}[{self.base} + ({row}) * {self.size} + ({col})]"
 
 
 @dataclass(frozen=True)
@@ -2719,14 +2757,16 @@ class FactorRows(ResponseOperator):
     def _factor_product(
         self, matrix: str, source: str, out: str, indent: str, *, transposed: bool, declare: bool
     ) -> str:
-        """``out = M source`` or ``M^T source`` per component, lane ``l`` summing its terms in increasing ``k``."""
+        """``out = M source`` or ``M^T source`` per component in leaf-first positions (factor coordinate ``i`` on
+        lane ``size - 1 - i``), lane ``l`` summing its terms in increasing lane ``k``."""
         lines = [f"{indent}float {out} = 0.0f;"] if declare else []
         for component in self.components:
             size, lane = component.size, component.lane
+            row, col = leaf_first(size, lane), leaf_first(size, "k")
             if transposed:
-                terms, entry = f"{lane} <= k", component.element(matrix, "k", lane)
+                terms, entry = f"k <= {lane}", component.element(matrix, col, row)
             else:
-                terms, entry = f"k <= {lane}", component.element(matrix, lane, "k")
+                terms, entry = f"{lane} <= k", component.element(matrix, row, col)
             lines += [
                 "#pragma unroll",
                 f"{indent}for (int k = 0; k < {size}; ++k) {{",
@@ -2738,13 +2778,15 @@ class FactorRows(ResponseOperator):
         return "\n".join(lines)
 
     def transposed(self, matrix: str, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = M^T source`` per component (``M`` its ``L`` or ``Linv``): lane ``l`` adds ``M[k][l] x_k``, ``k >= l``
-        in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
+        """``out = M^T source`` per component (``M`` its ``L`` or ``Linv``, leaf-first positions): lane ``l`` adds the
+        terms of the lanes ``k <= l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero
+        (``declare``) or given so."""
         return self._factor_product(matrix, source, out, indent, transposed=True, declare=declare)
 
     def forward(self, matrix: str, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = M source`` per component (``M`` its lower ``L`` or ``Linv``): lane ``l`` adds ``M[l][k] x_k``, ``k <=
-        l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
+        """``out = M source`` per component (``M`` its lower ``L`` or ``Linv``, leaf-first positions): lane ``l`` adds
+        the terms of the lanes ``k >= l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared
+        zero (``declare``) or given so."""
         return self._factor_product(matrix, source, out, indent, transposed=False, declare=declare)
 
     def lanes_of(self, indent: str) -> list[str]:
@@ -2752,11 +2794,11 @@ class FactorRows(ResponseOperator):
         return [f"{indent}const int {c.lane} = {self.lanes.lane} - {c.offset};" for c in self.components]
 
     def enter(self, physical: str, indent: str) -> str:
-        """Declare each component's lane and ``velocity = L^T physical`` (the factor velocity)."""
+        """Declare each component's lane and ``velocity = L^T P physical`` (the factor velocity)."""
         return "\n".join([*self.lanes_of(indent), self.transposed("L", physical, self.velocity, indent)])
 
     def leave(self, out: str, indent: str) -> str:
-        """Declare ``out = L^-T velocity`` (this lane's physical velocity)."""
+        """Declare ``out = P^T L^-T velocity`` (this lane's physical velocity)."""
         return self.transposed("Linv", self.velocity, out, indent)
 
 

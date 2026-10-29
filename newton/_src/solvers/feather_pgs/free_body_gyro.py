@@ -72,8 +72,9 @@ def correct_free_body_gyroscopic_predictor(
     ``is_free_rigid`` identifies one FREE root and no descendant joints. Its
     solve origin is the body COM, so linear/angular effective inertia blocks
     decouple. Root angular DOFs use the parent-anchor axes, not body axes.
-    The grouped Cholesky factor includes effective mass additions; the physical
-    COM inertia alone supplies the gyroscopic torque.
+    The grouped leaf-first Cholesky factor (``P H P^T = L L^T``, ``P`` the
+    coordinates reversed) includes effective mass additions; the physical COM
+    inertia alone supplies the gyroscopic torque.
     """
     group = wp.tid()
     articulation = group_to_art[group]
@@ -90,13 +91,14 @@ def correct_free_body_gyroscopic_predictor(
     relative_rotation = wp.quat_to_matrix(wp.quat_inverse(parent_rotation) * body_rotation)
     physical = relative_rotation * body_inertia[body] * wp.transpose(relative_rotation)
 
+    # The angular block of H = P^T L L^T P: physical coordinate 3 + row is factor row 2 - row (leaf-first).
     effective = wp.mat33()
     for row in range(3):
         for column in range(3):
             coefficient = float(0.0)
             for k in range(6):
-                if k <= row + 3 and k <= column + 3:
-                    coefficient += factors[group, row + 3, k] * factors[group, column + 3, k]
+                if k <= 2 - row and k <= 2 - column:
+                    coefficient += factors[group, 2 - row, k] * factors[group, 2 - column, k]
             effective[row, column] = coefficient
 
     old = wp.vec3(joint_qd[dof + 3], joint_qd[dof + 4], joint_qd[dof + 5])

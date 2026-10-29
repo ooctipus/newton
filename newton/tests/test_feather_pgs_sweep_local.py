@@ -177,7 +177,8 @@ class TestResponseOperators(unittest.TestCase):
         staged = solve.stage(lambda i: f"L[{i}]", "lane", 32)
         self.assertIn("if (i % 4 == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;", staged)
         out = lambda i: f"x[{i}]"  # noqa: E731
-        self.assertIn("x[(row)]=value*diagonal;", solve.forward(out, out))
+        # The leaf-first factor: factor row ``row`` writes the vector's physical position ``3 - 1 - row``.
+        self.assertIn("x[(3-1-(row))]=value*diagonal;", solve.forward(out, out))
         transposed = solve.transpose(out, out)
         self.assertIn("for(int step=0;step<3;++step)", transposed)
         self.assertIn("const int row=3-1-step;", transposed)
@@ -207,7 +208,7 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))
         self.assertIn("factor_velocity += sibling_z * d;", rows.apply_row("sib", "d", ""))
         self.assertIn("const int l = lane - o;", rows.enter("v", ""))
-        self.assertIn("Linv.data[b + k * 17 + l]", rows.leave("out", ""))
+        self.assertIn("Linv.data[b + ((17-1-(k))) * 17 + ((17-1-(l)))]", rows.leave("out", ""))
 
 
 def _kernel_sass():

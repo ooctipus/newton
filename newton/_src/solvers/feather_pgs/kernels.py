@@ -534,13 +534,14 @@ def solve_diagonal_mass(
     # output
     joint_qdd: wp.array[float],
 ):
-    """Solve a structurally diagonal generalized mass system."""
+    """Solve a structurally diagonal generalized mass system through its leaf-first pivots."""
     element = wp.tid()
     group = element // n_dofs
     dof = element - group * n_dofs
     art = group_to_art[group]
     global_dof = articulation_dof_start[art] + dof
-    diagonal = L_group[group, dof, dof]
+    pivot = n_dofs - 1 - dof
+    diagonal = L_group[group, pivot, pivot]
     value = joint_tau[global_dof] / diagonal
     joint_qdd[global_dof] = value / diagonal
 
@@ -695,10 +696,12 @@ def _light_apply_free_root_velocity_corrections(
         ):
             return
     group = art_group_index[art]
+    # The angular block of the leaf-first factor P H P^T = L L^T: physical coordinate 3 + r is factor row 2 - r, so
+    # with ``lower[r] = L[2 - r]`` the block is ``lower lower^T``.
     lower = wp.mat33(0.0)
     for r in range(3):
-        for c in range(r + 1):
-            lower[r, c] = cholesky[group, r + 3, c + 3]
+        for c in range(3 - r):
+            lower[r, c] = cholesky[group, 2 - r, c]
     rotation = wp.transform_get_rotation(body_q[body])
     basis = wp.quat_to_matrix(rotation)
     effective = wp.transpose(basis) * (lower * wp.transpose(lower)) * basis
@@ -2576,10 +2579,12 @@ def world_contact_row_dot(
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
-# velocity) have the 6x6 mass matrix ``H = L L^T`` the dynamics factor, armature included (``L_by_size[6]`` at its
-# articulation's group index, lower, row-major). A free-body row is whitened, ``Z = L^-1 J^T`` per body, and the
-# sweeps hold the body's velocity in factor coordinates ``u = L^T v``: a row's velocity term is ``Z^T u``, its
-# update ``u += Z dlambda``, and ``v = L^-T u`` leaves them. The factor's three actions below take
+# velocity) have the 6x6 mass matrix ``H`` the dynamics factor leaf-first, ``P H P^T = L L^T`` with ``P`` the
+# coordinates reversed, armature included (``L_by_size[6]`` at its articulation's group index, lower, row-major). A
+# free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps hold the body's velocity in factor
+# coordinates ``u = L^T P v``: a row's velocity term is ``Z^T u``, its update ``u += Z dlambda``, and ``v = P^T L^-T
+# u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
+# reverses (:func:`.response_operator.leaf_first`). The factor's three actions below take
 # :class:`.response_operator.CholeskySolve`'s orders and its zero-diagonal convention (a zero pivot gives zero),
 # which the native sweeps emit.
 
@@ -2608,40 +2613,40 @@ def free_body_factor(body: int, factors: BodyFactors) -> int:
 
 @wp.func
 def factor_whiten(L: wp.array3d[float], factor: int, x: wp.spatial_vector) -> wp.spatial_vector:
-    """``z = L^-1 x``: rows ascending, each ``x`` less the earlier rows' terms in order, over its pivot."""
+    """``z = L^-1 P x``: rows ascending, each ``x`` less the earlier rows' terms in order, over its pivot."""
     z = wp.spatial_vector()
     for row in range(6):
-        value = x[row]
+        value = x[5 - row]
         for k in range(row):
-            value -= L[factor, row, k] * z[k]
+            value -= L[factor, row, k] * z[5 - k]
         pivot = L[factor, row, row]
-        z[row] = wp.where(pivot != 0.0, value / pivot, 0.0)
+        z[5 - row] = wp.where(pivot != 0.0, value / pivot, 0.0)
     return z
 
 
 @wp.func
 def factor_enter(L: wp.array3d[float], factor: int, v: wp.spatial_vector) -> wp.spatial_vector:
-    """``u = L^T v``: each coordinate's terms from zero, ascending."""
+    """``u = L^T P v``: each coordinate's terms from zero, ascending."""
     u = wp.spatial_vector()
     for row in range(6):
         value = float(0.0)
         for k in range(row, 6):
-            value += L[factor, k, row] * v[k]
-        u[row] = value
+            value += L[factor, k, row] * v[5 - k]
+        u[5 - row] = value
     return u
 
 
 @wp.func
 def factor_leave(L: wp.array3d[float], factor: int, u: wp.spatial_vector) -> wp.spatial_vector:
-    """``v = L^-T u``: rows descending, each ``u`` less the later rows' terms in order, over its pivot."""
+    """``v = P^T L^-T u``: rows descending, each ``u`` less the later rows' terms in order, over its pivot."""
     v = wp.spatial_vector()
     for step in range(6):
         row = 5 - step
-        value = u[row]
+        value = u[5 - row]
         for k in range(row + 1, 6):
-            value -= L[factor, k, row] * v[k]
+            value -= L[factor, k, row] * v[5 - k]
         pivot = L[factor, row, row]
-        v[row] = wp.where(pivot != 0.0, value / pivot, 0.0)
+        v[5 - row] = wp.where(pivot != 0.0, value / pivot, 0.0)
     return v
 
 
@@ -3890,42 +3895,43 @@ def trisolve_loop(
     joint_qdd: wp.array[float],  # [total_dofs]
 ):
     """
-    Solve L * L^T * qdd = tau for grouped articulations using forward/backward substitution.
+    Solve H qdd = tau for grouped articulations by forward/backward substitution with the leaf-first factor
+    ``P H P^T = L L^T`` (factor coordinate ``i`` at physical coordinate ``n_dofs - 1 - i``).
 
     Thread dimension: n_arts_of_size (one thread per articulation in this size group)
     """
     idx = wp.tid()
     art = group_to_art[idx]
-    dof_start = articulation_dof_start[art]
+    last = articulation_dof_start[art] + n_dofs - 1
 
-    # Forward substitution: L * z = tau
+    # Forward substitution: L z = P tau
     # z is stored temporarily in joint_qdd
     for i in range(n_dofs):
-        val = joint_tau[dof_start + i]
+        val = joint_tau[last - i]
         for k in range(i):
             L_ik = L_group[idx, i, k]
-            val -= L_ik * joint_qdd[dof_start + k]
+            val -= L_ik * joint_qdd[last - k]
 
         L_ii = L_group[idx, i, i]
         if L_ii != 0.0:
-            joint_qdd[dof_start + i] = val / L_ii
+            joint_qdd[last - i] = val / L_ii
         else:
-            joint_qdd[dof_start + i] = 0.0
+            joint_qdd[last - i] = 0.0
 
-    # Backward substitution: L^T * qdd = z
+    # Backward substitution: L^T (P qdd) = z
     for i_rev in range(n_dofs):
         i = n_dofs - 1 - i_rev
 
-        val = joint_qdd[dof_start + i]
+        val = joint_qdd[last - i]
         for k in range(i + 1, n_dofs):
             L_ki = L_group[idx, k, i]
-            val -= L_ki * joint_qdd[dof_start + k]
+            val -= L_ki * joint_qdd[last - k]
 
         L_ii = L_group[idx, i, i]
         if L_ii != 0.0:
-            joint_qdd[dof_start + i] = val / L_ii
+            joint_qdd[last - i] = val / L_ii
         else:
-            joint_qdd[dof_start + i] = 0.0
+            joint_qdd[last - i] = 0.0
 
 
 @wp.kernel

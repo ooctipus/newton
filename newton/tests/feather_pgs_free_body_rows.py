@@ -3,9 +3,10 @@
 
 """Read a FeatherPGS solver's free-body rows back in physical coordinates.
 
-The rows' build whitens each side, ``Z = L^-1 J^T`` with the body's held factor ``L`` (``L_by_size[6]`` at its
-articulation's group index), so a test that checks a row against physical velocities recovers ``J = L Z``. A speed
-row keeps its unwhitened axis. The module defines no tests.
+The rows' build whitens each side, ``Z = L^-1 P J^T`` with the body's held leaf-first factor ``L`` (``L_by_size[6]``
+at its articulation's group index, ``P`` the coordinates reversed; factor coordinate ``i`` of ``Z`` at position
+``5 - i``), so a test that checks a row against physical velocities recovers ``J = P^T L Z``. A speed row keeps its
+unwhitened axis. The module defines no tests.
 """
 
 import numpy as np
@@ -32,6 +33,6 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
             (bodies[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
         )
         for world, row in zip(worlds, rows, strict=True):
-            J[world, row] = factors[group[articulation[bodies[world, row]]]] @ J[world, row]
+            J[world, row] = (factors[group[articulation[bodies[world, row]]]] @ J[world, row][::-1])[::-1]
         jacobians.append(J)
     return tuple(jacobians)

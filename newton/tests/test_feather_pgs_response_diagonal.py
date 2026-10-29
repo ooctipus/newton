@@ -1759,7 +1759,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         factors = rng.normal(size=(num_articulations, num_dofs, num_dofs)).astype(np.float32)
         mass = factors @ np.transpose(factors, (0, 2, 1))
         mass += 2.0 * np.eye(num_dofs, dtype=np.float32)[None, :, :]
-        cholesky = wp.array(np.linalg.cholesky(mass).astype(np.float32), device=device)
+        cholesky = wp.array(np.linalg.cholesky(mass[:, ::-1, ::-1]).astype(np.float32), device=device)  # leaf-first
 
         jacobian_np = np.zeros((num_articulations, max_constraints, num_dofs), dtype=np.float32)
         for articulation, world in enumerate(articulation_world_np):

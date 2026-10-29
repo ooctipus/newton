@@ -3,10 +3,10 @@
 
 """Armature that keeps a deep articulation's mass matrix within float32 factorization.
 
-The solver factors each articulation's joint-space mass matrix in float32 (a
-dense Cholesky from the root, or a held or sparse factor from the leaves). A
-pivot of that factorization is the inertia a coordinate keeps once the
-coordinates before it move freely; it is the difference of the coordinate's
+The solver factors each articulation's joint-space mass matrix in float32,
+leaf-first (a dense factor of the reversed coordinates, or the sparse factor in
+:meth:`.TreePlan.factor`'s order). A pivot of that factorization is the inertia
+a coordinate keeps once the coordinates before it move freely; it is the difference of the coordinate's
 diagonal and the terms those coordinates take from it, so float32 resolves it
 only to about ``n`` units in the last place of the diagonal, ``n`` the
 articulation's coordinate count. Along a serial chain the ratio of a pivot to
@@ -70,7 +70,8 @@ def articulation_depths(model, joint_forest: TreePlan) -> np.ndarray:
 
 
 def pivot_floor(mass: np.ndarray, rounding: float = FLOAT32_ROUNDING) -> np.ndarray:
-    """Least diagonal additions that lift every root-first Cholesky pivot of ``mass`` to its floor.
+    """Least diagonal additions that lift every leaf-first Cholesky pivot of ``mass`` to its floor: the pivots of
+    ``P mass P^T`` with the coordinates reversed, the order the dense factors take.
 
     Args:
         mass: Mass matrices with their armature, shape ``[count, n, n]``.
@@ -80,7 +81,7 @@ def pivot_floor(mass: np.ndarray, rounding: float = FLOAT32_ROUNDING) -> np.ndar
         The additions, shape ``[count, n]``: zero wherever a pivot of the
         float64 factorization clears ``PIVOT_FLOOR_FACTOR * n * rounding`` times its diagonal.
     """
-    mass = np.asarray(mass, dtype=np.float64)
+    mass = np.asarray(mass, dtype=np.float64)[:, ::-1, ::-1]
     count, n, _ = mass.shape
     ratio = PIVOT_FLOOR_FACTOR * n * rounding
     lower = np.zeros_like(mass)
@@ -95,7 +96,7 @@ def pivot_floor(mass: np.ndarray, rounding: float = FLOAT32_ROUNDING) -> np.ndar
         lower[:, j + 1 :, j] = (
             mass[:, j + 1 :, j] - np.einsum("bik,bk->bi", lower[:, j + 1 :, :j], lower[:, j, :j])
         ) / root[:, None]
-    return added
+    return added[:, ::-1]
 
 
 def conditioning_armature(model, armature: np.ndarray, joint_forest: TreePlan) -> tuple[np.ndarray, ArmatureFloor]:

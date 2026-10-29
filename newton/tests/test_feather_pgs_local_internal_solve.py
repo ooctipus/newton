@@ -187,7 +187,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         )
         wp.synchronize_device(device)
 
-        mass = lower @ lower.T
+        mass = (lower @ lower.T)[::-1, ::-1]  # the leaf-first factor: P H P^T = L L^T
         response = np.stack([np.linalg.solve(mass, row) for row in jacobian[0, :2]])
         diagonal = np.sum(jacobian[0, :2] * response, axis=1) + cfm[0, :2]
         expected_velocity = velocity[:dof_count].copy()

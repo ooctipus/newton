@@ -10659,9 +10659,11 @@ def _get_joint_limit_warp_kernel(size: int, warps_per_block: int) -> "wp.Kernel"
 def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
     """Build specialized triangular solve kernel for given DOF count.
 
-    Solves L * L^T * x = b for x using tiled forward and backward substitution.
+    Solves H x = b with the leaf-first factor ``P H P^T = L L^T`` by tiled forward and backward substitution, the
+    coordinates reversed by indexed loads and stores.
     """
     TILE_DOF_LOCAL = wp.constant(int(n_dofs))
+    TILE_DOF_LAST = wp.constant(int(n_dofs) - 1)
 
     def trisolve_tiled_template(
         L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
@@ -10669,17 +10671,18 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
         qdd_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
     ):
         idx = wp.tid()
+        reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
         L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-        tau_tile = wp.tile_load(tau_group[idx], shape=(TILE_DOF_LOCAL, 1), bounds_check=False)
+        tau_tile = wp.tile_load_indexed(tau_group[idx], indices=reverse, shape=(TILE_DOF_LOCAL, 1), axis=0)
 
-        # Forward substitution: L * z = tau
+        # Forward substitution: L * z = P tau
         z_tile = wp.tile_lower_solve(L_tile, tau_tile)
 
-        # Backward substitution: L^T * qdd = z
+        # Backward substitution: L^T * (P qdd) = z
         Lt_tile = wp.tile_transpose(L_tile)
         qdd_tile = wp.tile_upper_solve(Lt_tile, z_tile)
 
-        wp.tile_store(qdd_group[idx], qdd_tile)
+        wp.tile_store_indexed(qdd_group[idx], indices=reverse, t=qdd_tile, axis=0)
 
     return python_kernel(trisolve_tiled_template, f"trisolve_tiled_{n_dofs}_bd{tile_threads}")
 

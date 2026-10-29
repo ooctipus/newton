@@ -242,7 +242,7 @@ def parallel_case(seed, *, faces=1, linked=True, warm=False):
     H = np.zeros((_DOFS, _DOFS))
     H[:3, :3] = 2.0 * np.eye(3)
     H[3:, 3:] = angular @ np.diag(rng.uniform(0.02, 0.04, 3)) @ angular.T
-    L = np.linalg.cholesky(H)
+    L = np.linalg.cholesky(H[::-1, ::-1])  # leaf-first: P H P^T = L L^T
     J, kinds, types, parents, mu, rhs = [], [], [], [], [], []
     for face in range(faces):
         directions, points, k, t, p, m, r = _box_contact_rows(rng, len(kinds), linked=linked)
@@ -268,7 +268,7 @@ def parallel_case(seed, *, faces=1, linked=True, warm=False):
     return {
         "J": J,
         "Y": Y,
-        "Z": np.linalg.solve(L, J.T).T,
+        "Z": np.linalg.solve(L, J[:, ::-1].T).T[:, ::-1],
         "L": L,
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
@@ -319,7 +319,7 @@ def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2)
     one, and the pair's coefficient 0.5 makes it slide.
     """
     H = np.diag((masses[0], masses[1], 1.0, 1.0, 1.0, 1.0))
-    L = np.linalg.cholesky(H)
+    L = np.linalg.cholesky(H[::-1, ::-1])  # leaf-first: P H P^T = L L^T
     J = np.zeros((3, _DOFS))
     J[0, 2] = J[1, 0] = 1.0
     if live_tangents == 2:
@@ -329,7 +329,7 @@ def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2)
     return {
         "J": J,
         "Y": Y,
-        "Z": np.linalg.solve(L, J.T).T,
+        "Z": np.linalg.solve(L, J[:, ::-1].T).T[:, ::-1],
         "L": L,
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
@@ -352,7 +352,7 @@ def limited_contact_case(limit=0.5):
     """
     H = np.eye(_DOFS)
     H[3, 3] = 0.2
-    L = np.linalg.cholesky(H)
+    L = np.linalg.cholesky(H[::-1, ::-1])  # leaf-first: P H P^T = L L^T
     J = np.zeros((2, _DOFS))
     J[0, 2], J[0, 3] = 1.0, 0.6
     J[1, 3] = -1.0  # upper limit: limit - qd_3 >= 0
@@ -361,7 +361,7 @@ def limited_contact_case(limit=0.5):
     return {
         "J": J,
         "Y": Y,
-        "Z": np.linalg.solve(L, J.T).T,
+        "Z": np.linalg.solve(L, J[:, ::-1].T).T[:, ::-1],
         "L": L,
         "cfm": cfm,
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,

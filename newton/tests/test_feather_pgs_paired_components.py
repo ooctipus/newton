@@ -39,9 +39,10 @@ class TestPairedComponents(unittest.TestCase):
         for world in np.flatnonzero(expected_selector == -1):
             offset, count = host["primary_offset"][world], host["counts"][world]
             factor = host["L"][host["primary_group"][world]].astype(np.float64)
+            # The held form z = L^T P y of the leaf-first factor, factor coordinate i at position 22 - i.
             expected[world, :count, offset : offset + 23] = (
-                host["Y"][world, :count, offset : offset + 23].astype(np.float64) @ factor
-            )
+                host["Y"][world, :count, offset : offset + 23][:, ::-1].astype(np.float64) @ factor
+            )[:, ::-1]
         np.testing.assert_allclose(data.Y.numpy(), expected, rtol=2e-6, atol=2e-7)
         for name, before in host.items():
             if name not in ("Y", "selector"):
