@@ -218,17 +218,22 @@ def _packed_rows(host, arrays, device):
     as the matrix-free sweep reads them: each world's primary (articulation ``2 w``, 23 coordinates) and its free body
     (``2 w + 1``)."""
     worlds, capacity = host["J"].shape[:2]
-    dof = np.broadcast_to(np.arange(29, dtype=np.int32), (worlds, capacity, 29)).copy()
     sides = np.zeros((worlds, capacity, 2), np.int32)
+    # Each world's articulated side (23 coordinates) and free body (6), at their world coordinates (dense rows).
+    sizes = np.tile(np.array([23, 6], np.int32), worlds)
+    offsets = np.zeros(2 * worlds, np.int32)
     first_art = np.full(145, -1, np.int32)
     blocks = []
     for world in range(worlds):
         primary_offset, secondary_offset = int(host["primary_offset"][world]), int(host["secondary_offset"][world])
         sides[world] = (2 * world, 2 * world + 1)
+        offsets[2 * world], offsets[2 * world + 1] = primary_offset, secondary_offset
         first_art[world * 29 + primary_offset] = 2 * world
         first_art[world * 29 + secondary_offset] = 2 * world + 1
         blocks += [host["L"][host["primary_group"][world]].ravel(), _SECONDARY_FACTOR.astype(np.float32).ravel()]
-    arrays["packed_dof"] = wp.array(dof, dtype=wp.int32, device=device)
+    arrays["response_dofs"] = wp.array(sizes, dtype=wp.int32, device=device)
+    arrays["articulation_world_dof_offset"] = wp.array(offsets, dtype=wp.int32, device=device)
+    arrays["packed_dense"] = 1
     arrays["packed_Z"] = wp.array(host["Y"], dtype=wp.float32, device=device)
     arrays["row_sides"] = wp.array(sides, dtype=wp.vec2i, device=device)
     storage = wp.array(np.concatenate(blocks), dtype=wp.float32, device=device)

@@ -102,6 +102,7 @@ from .kernels import (
     PREELIM_MAX_ROWS,
     RIGID_SPEED_ROWS,
     BodyFactors,
+    RowSupport,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -3476,7 +3477,6 @@ class SolverFeatherPGS(SolverBase):
                 self.constraint_count,
                 self._local_solve_owner,
                 self.row_cfm,
-                self._packed_dof,
             ],
             outputs=[self._packed_Z, self.rhs, self.diag],
             device=self.model.device,
@@ -6161,7 +6161,9 @@ class SolverFeatherPGS(SolverBase):
                     self.diag,
                     self.row_w,
                     self.impulses,
-                    self._packed_dof,
+                    self.articulation_response_dof_count,
+                    self.articulation_world_dof_offset,
+                    int(self._packed_dense),
                     self._packed_Z,
                     self._row_sides,
                     self.row_type,
@@ -6757,7 +6759,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.world_dof_indices,
                                 self.impulses,
                                 self._diag_prev_impulses,
-                                self._packed_dof,
+                                self._row_support(),
                                 self._packed_J,
                                 self.dense_max_constraints,
                                 self.mf_constraint_count,
@@ -6794,7 +6796,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.constraint_count,
                                 self.world_dof_indices,
                                 self.impulses,
-                                self._packed_dof,
+                                self._row_support(),
                                 self._packed_J,
                                 self.dense_max_constraints,
                                 self.mf_constraint_count,
@@ -9295,6 +9297,17 @@ class SolverFeatherPGS(SolverBase):
             self.diag_by_size[size] = self._dummy_hinv_diag
         self._hinv_jt_diag_sizes = frozenset()
 
+    def _row_support(self) -> RowSupport:
+        """Where the packed rows' entries sit (:class:`.kernels.RowSupport`): their sides, the articulations'
+        coordinates and first world coordinates, and the layout. Without the matrix-free sweeps there are no packed
+        rows and no reader runs: the coordinate offsets are a one-entry placeholder."""
+        support = RowSupport()
+        support.sides = self._row_sides
+        support.dofs = self.articulation_response_dof_count
+        support.offset = self.articulation_world_dof_offset if self._mf_sweeps else self._dummy_is_free_rigid
+        support.dense = int(self._packed_dense)
+        return support
+
     def _stage4_pack_rows(self, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
         (:func:`.packed_rows.pack_kernel`, one launch; :meth:`_stage4_compute_matrix_free_diag`)."""
@@ -9326,7 +9339,7 @@ class SolverFeatherPGS(SolverBase):
                 int(self._packed_dense),
                 write_diag,
             ],
-            outputs=[self._packed_dof, self._packed_J, self._packed_Z, self.diag],
+            outputs=[self._packed_J, self._packed_Z, self.diag],
             device=self.model.device,
         )
 
@@ -9705,7 +9718,7 @@ class SolverFeatherPGS(SolverBase):
                 self.constraint_count,
                 self.dense_max_constraints,
                 self.world_dof_indices,
-                self._packed_dof,
+                self._row_support(),
                 self._packed_J,
                 position_delta_velocity,
                 self.drive_stiffness,
@@ -9874,7 +9887,7 @@ class SolverFeatherPGS(SolverBase):
                 int(velocity),
                 # The velocity pass's packed rows (matrix-free); the position pass reads none of them.
                 self.world_dof_indices if velocity else self._dummy_contact_row_type,
-                self._packed_dof,
+                self._row_support(),
                 self._packed_J,
                 self.v_out_snap if velocity else self.v_hat,
                 self.v_hat,
@@ -9924,7 +9937,7 @@ class SolverFeatherPGS(SolverBase):
                     self.dense_max_constraints,
                     self.v_hat,
                     self.world_dof_indices,
-                    self._packed_dof,
+                    self._row_support(),
                     self._packed_J,
                     int(sparse),
                     self._sparse_diagonal_dense_offsets,

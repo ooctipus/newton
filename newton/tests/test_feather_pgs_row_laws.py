@@ -19,8 +19,10 @@ from newton.tests.feather_pgs_law_harness import (
     joint_type,
     mismatches,
     register_device_tests,
+    row_support,
     scalars,
     unified,
+    world_row_support,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -96,7 +98,7 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 contact_w=contact_w,
                 velocity_pass=0,
                 world_dof_indices=np.zeros((worlds, 1), dtype=np.int32),
-                packed_dof=np.full((worlds, rows, 1), -1, dtype=np.int32),
+                row_support=row_support(np.full((worlds, rows, 2), -1, dtype=np.int32), [0], [0], 0, device),
                 packed_J=np.zeros((worlds, rows, 1), dtype=np.float32),
                 world_position_velocity=np.zeros(1, dtype=np.float32),
                 world_incident_velocity=np.zeros(1, dtype=np.float32),
@@ -501,11 +503,11 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
             test.assertLessEqual(worst, 2.0)
 
 
-def _dense_layout(rng, worlds, rows, dofs):
+def _dense_layout(rng, worlds, rows, dofs, device):
     """Packed rows (:mod:`.packed_rows`) over every world coordinate."""
     return {
         "world_dof_indices": (dofs * np.arange(worlds)[:, None] + np.arange(dofs)[None, :]).astype(np.int32),
-        "packed_dof": np.broadcast_to(np.arange(dofs, dtype=np.int32), (worlds, rows, dofs)).copy(),
+        "row_support": world_row_support(worlds, rows, dofs, device),
         "packed_J": rng.normal(size=(worlds, rows, dofs)).astype(np.float32),
     }
 
@@ -513,7 +515,7 @@ def _dense_layout(rng, worlds, rows, dofs):
 @wp.kernel
 def _law_velocity_pass(
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: kernels.RowSupport,
     packed_J: wp.array3d[float],
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
@@ -541,7 +543,7 @@ def _law_velocity_pass(
         if restitution > 0.0:
             relative_incident = (
                 kernels.world_contact_row_dot(
-                    world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i
+                    world_dof_indices, row_support, packed_J, world_incident_velocity, world, i
                 )
                 - target
             )
@@ -554,7 +556,7 @@ def _law_velocity_pass(
             end_gap = float(0.0)
             if phi > 0.0:
                 jv = kernels.world_contact_row_dot(
-                    world_dof_indices, packed_dof, packed_J, world_position_velocity, world, i
+                    world_dof_indices, row_support, packed_J, world_position_velocity, world, i
                 )
                 end_gap = phi + dt * (jv - target)
             value, _w = row_laws.contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
@@ -576,7 +578,7 @@ def test_velocity_pass_matches_world_contact_bias(test, device):
     worlds, rows, dofs = 8, 32, 12
     phi, kind, _, target = _rows(rng, worlds, rows)
     common = {
-        **_dense_layout(rng, worlds, rows, dofs),
+        **_dense_layout(rng, worlds, rows, dofs, device),
         "world_phi": phi,
         "world_row_type": kind,
         "world_target_velocity": target,
@@ -616,7 +618,7 @@ def test_velocity_pass_matches_world_contact_bias(test, device):
 @wp.kernel
 def _law_restitution_matrix_free(
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: kernels.RowSupport,
     packed_J: wp.array3d[float],
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
@@ -633,7 +635,7 @@ def _law_restitution_matrix_free(
         return
     target = world_target_velocity[world, i]
     relative_incident = (
-        kernels.world_contact_row_dot(world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i)
+        kernels.world_contact_row_dot(world_dof_indices, row_support, packed_J, world_incident_velocity, world, i)
         - target
     )
     fires, bounce = row_laws.contact_restitution_rhs(
@@ -656,7 +658,7 @@ def test_restitution_matches_matrix_free_restitution(test, device):
     phi, kind, _, target = _rows(rng, worlds, rows)
     rhs0 = rng.normal(size=(worlds, rows)).astype(np.float32)
     common = {
-        **_dense_layout(rng, worlds, rows, dofs),
+        **_dense_layout(rng, worlds, rows, dofs, device),
         "world_phi": phi,
         "world_row_type": kind,
         "world_target_velocity": target,

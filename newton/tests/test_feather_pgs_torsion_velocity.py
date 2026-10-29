@@ -8,7 +8,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import contact_torsion
-from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_law_harness import row_support, unpacked_rows
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
     TORSION_OFF_ROUTE,
@@ -30,13 +30,13 @@ class TestTorsionVelocityAdmission(unittest.TestCase):
                 velocity = wp.array([(end_gap - initial_gap) / 0.01], dtype=float, device="cpu")
                 indices = wp.array([[0]], dtype=int, device="cpu")
                 # Packed rows (packed_rows): the normal row's one entry at coordinate 0, the spin row's none.
-                packed_dof = wp.array(np.array([[[0], [-1]]], np.int32), dtype=int, device="cpu")
+                support = row_support(np.array([[[0, -1], [-1, -1]]], np.int32), [1], [0], 1, "cpu")
                 jacobian = wp.array(np.array([[[1.0], [0.0]]], np.float32), device="cpu")
                 rhs = wp.array([[3.0, 9.0]], dtype=float, device="cpu")
                 wp.launch(
                     contact_torsion._prepare_velocity_torsion_rows,
                     dim=2,
-                    inputs=[count, 2, types, groups, phi, target, velocity, indices, packed_dof, jacobian, 0.01],
+                    inputs=[count, 2, types, groups, phi, target, velocity, indices, support, jacobian, 0.01],
                     outputs=[rhs],
                     device="cpu",
                 )
@@ -49,7 +49,7 @@ class TestTorsionVelocityAdmission(unittest.TestCase):
                 wp.launch(
                     contact_torsion._prepare_velocity_torsion_rows,
                     dim=2,
-                    inputs=[count, 2, types, groups, phi, target, velocity, indices, packed_dof, jacobian, 0.01],
+                    inputs=[count, 2, types, groups, phi, target, velocity, indices, support, jacobian, 0.01],
                     outputs=[rhs],
                     device="cpu",
                 )

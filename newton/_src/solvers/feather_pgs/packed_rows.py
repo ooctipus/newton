@@ -6,9 +6,9 @@
 A dense row touches at most two articulations, its sides (:func:`.dense_rows.row_sides`): the first by index, then
 the second or none. Packed, a row holds its sides' coordinates in order, the first side's, then the second's: entry
 ``e`` of a side of ``n`` coordinates is the side's coordinate ``e``, world coordinate ``offset + e``, so a row's
-entries ascend with the world's coordinates. Each entry keeps
+entries ascend with the world's coordinates. An entry's world coordinate is not stored: it follows from the row's
+sides (``_row_sides``, :class:`.kernels.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
 
-* its world coordinate (``_packed_dof``; -1 past the row's sides);
 * the row's Jacobian ``J`` (``_packed_J``), which the velocity terms outside the sweeps read with the physical
   velocity (:func:`.kernels.world_contact_row_dot`);
 * its whitened form ``Z = L^-1 P J^T`` (``_packed_Z``) through the side's leaf-first factor ``L``, in the kit's
@@ -40,19 +40,36 @@ import numpy as np
 import warp as wp
 
 from . import kernel_template
+from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup
 from .kernel_template import THREADS, KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, PREELIM_MAX_ROWS
 from .response_operator import CholeskySolve, Reversed
 
-__all__ = ["PACKED_ROWS", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
+__all__ = ["PACKED_ROWS", "PACKED_SIDES", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
 
 PACKED_ROWS = FieldGroup(
-    Field("_packed_dof", wp.int32, ("world", "row", "support"), fill=-1, grad=False),
     Field("_packed_J", wp.float32, ("world", "row", "support"), grad=False),
     Field("_packed_Z", wp.float32, ("world", "row", "support"), grad=False),
 )
 """Each dense row's packed entries: world coordinate, Jacobian and whitened value."""
+
+
+_PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINATE(sides, e) is the world coordinate of entry e of the
+    // row with these sides, -1 past them. Dense: entry e is coordinate e, held inside a side's coordinates; else the
+    // first side's entries, then the second's.
+    const auto PACKED_COORDINATE = [&](const wp::vec2i sides, const int e) {
+        const int a0 = sides[0], a1 = sides[1];
+        const int n0 = a0 >= 0 ? response_dofs.data[a0] : 0, n1 = a1 >= 0 ? response_dofs.data[a1] : 0;
+        const int off0 = a0 >= 0 ? articulation_world_dof_offset.data[a0] : 0;
+        const int off1 = a1 >= 0 ? articulation_world_dof_offset.data[a1] : 0;
+        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
+        return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
+    };"""
+
+PACKED_SIDES = DevicePrelude("packed_sides", _PACKED_SIDES, _PACKED_SIDES)
+"""``PACKED_COORDINATE(sides, e)`` for native sources that take ``response_dofs``, ``articulation_world_dof_offset``
+and ``packed_dense``: a packed row's coordinates from its sides (no stored coordinates)."""
 
 
 def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_count: int) -> int:
@@ -97,7 +114,6 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
         ("world_row_cfm", wp.array2d[float]),
         ("dense", int),
         ("write_diag", int),
-        ("packed_dof", wp.array3d[int]),
         ("packed_J", wp.array3d[float]),
         ("packed_Z", wp.array3d[float]),
         ("world_diag", wp.array2d[float]),
@@ -121,7 +137,7 @@ thread-local row."""
 
 
 def _side(n: int) -> str:
-    """A side of ``n`` coordinates on its row's thread: copy its Jacobian and coordinates, whiten it in registers
+    """A side of ``n`` coordinates on its row's thread: copy its Jacobian, whiten it in registers
     (:class:`.CholeskySolve`, Z0: a zero diagonal gives zero), store it and add its squares to ``norm`` in entry
     order."""
 
@@ -137,7 +153,6 @@ def _side(n: int) -> str:
             {pragma}
             for (int e = 0; e < {n}; ++e) {{
                 const float j = J[e];
-                packed_dof.data[base + e] = offset + e;
                 packed_J.data[base + e] = j;
                 z[e] = j;
             }}
@@ -152,9 +167,9 @@ def _side(n: int) -> str:
 
 @functools.cache
 def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
-    """Pack every world's rows, one thread per world row (``dim = worlds * rows``): copy each side's Jacobian and
-    coordinates, whiten it on the thread (Z0: a zero diagonal gives zero) and store it, each entry once; pad the row
-    past its sides (coordinate -1, zero values); and, in the worlds the general solver owns, store its diagonal by
+    """Pack every world's rows, one thread per world row (``dim = worlds * rows``): copy each side's Jacobian, whiten
+    it on the thread (Z0: a zero diagonal gives zero) and store it, each entry once; pad the row past its sides (zero
+    values); and, in the worlds the general solver owns, store its diagonal by
     ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner adds ``cfm`` after), 2 ``|Z|^2 + cfm``, the squares summed
     in entry order.
 
@@ -188,7 +203,6 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     }}
     for (int e = 0; e < support; ++e) {{
         if ((e >= first[0] && e < first[0] + count[0]) || (e >= first[1] && e < first[1] + count[1])) continue;
-        packed_dof.data[(size_t)tid * support + e] = -1;
         packed_J.data[(size_t)tid * support + e] = 0.0f;
         packed_Z.data[(size_t)tid * support + e] = 0.0f;
     }}

@@ -499,7 +499,9 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
         "world_row_w": rng.uniform(0.6, 1.0, (w_count, capacity)).astype(np.float32),
         "world_impulses": np.zeros((w_count, capacity), np.float32),
         # Packed rows (packed_rows) over every coordinate: an articulated block, then the free body.
-        "packed_dof": np.broadcast_to(np.arange(dofs, dtype=np.int32), (w_count, capacity, dofs)).copy(),
+        "response_dofs": np.tile(np.array([free, 6], np.int32), w_count),
+        "articulation_world_dof_offset": np.tile(np.array([0, free], np.int32), w_count),
+        "packed_dense": 1,
         "packed_Z": np.zeros((w_count, capacity, dofs), np.float32),
         "row_sides": np.stack(
             [
@@ -631,7 +633,12 @@ def _bind_rows(host, device):
         return wp.array(np.ascontiguousarray(value), dtype=dtype, device=device)
 
     worlds = len(host["world_constraint_count"])
-    values = {name: array(value) for name, value in host.items() if name != "row_sides"}
+    # Arrays bind as arrays; the scalars (packed_dense) pass as they are.
+    values = {
+        name: array(value) if isinstance(value, np.ndarray) else value
+        for name, value in host.items()
+        if name != "row_sides"
+    }
     values["row_sides"] = wp.array(np.ascontiguousarray(host["row_sides"]), dtype=wp.vec2i, device=device)
     values.update(
         general_world_count=array(np.array([worlds], np.int32)),

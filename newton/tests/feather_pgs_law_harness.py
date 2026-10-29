@@ -133,7 +133,9 @@ def launch(kernel, n: int, inputs: dict, sig, device):
     args = []
     for name, annotation in sig.parameters.items():
         value = inputs[name]
-        if wp.types.is_array(annotation):
+        if annotation is kernels.RowSupport:
+            args.append(value)
+        elif wp.types.is_array(annotation):
             args.append(
                 value if isinstance(value, wp.array) else wp.array(value, dtype=annotation.dtype, device=device)
             )
@@ -612,7 +614,7 @@ def position_pass(device) -> list:
     return [
         0,
         wp.zeros((1, 1), dtype=wp.int32, device=device),
-        wp.full((1, 1, 1), -1, dtype=wp.int32, device=device),
+        row_support(np.full((1, 1, 2), -1, dtype=np.int32), [0], [0], 0, device),
         wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
         wp.zeros(1, dtype=wp.float32, device=device),
         wp.zeros(1, dtype=wp.float32, device=device),
@@ -620,12 +622,35 @@ def position_pass(device) -> list:
     ]
 
 
+def row_support(sides, dofs, offsets, dense, device) -> kernels.RowSupport:
+    """A :class:`.kernels.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1 for none),
+    each articulation's coordinates and first world coordinate, and the layout (``dense``: entry ``e`` is coordinate
+    ``e``)."""
+    support = kernels.RowSupport()
+    support.sides = wp.array(np.ascontiguousarray(sides, dtype=np.int32), dtype=wp.vec2i, device=device)
+    support.dofs = wp.array(np.asarray(dofs, dtype=np.int32), dtype=wp.int32, device=device)
+    support.offset = wp.array(np.asarray(offsets, dtype=np.int32), dtype=wp.int32, device=device)
+    support.dense = int(dense)
+    return support
+
+
+def world_row_support(worlds: int, rows: int, coordinates: int, device) -> kernels.RowSupport:
+    """Every row on its world's one articulation of ``coordinates`` coordinates, laid out dense: entry ``e`` at
+    coordinate ``e`` (the packed rows of a dense world-layout Jacobian)."""
+    sides = np.full((worlds, rows, 2), -1, dtype=np.int32)
+    sides[..., 0] = np.arange(worlds, dtype=np.int32)[:, None]
+    return row_support(sides, [coordinates] * worlds, [0] * worlds, 1, device)
+
+
 def packed_world_rows(world_jacobian, device) -> list:
     """Packed rows (:mod:`.packed_rows`) of a dense world-layout Jacobian ``[world, row, coordinate]``: every entry at its
-    own coordinate, as ``(packed_dof, packed_J)``."""
+    own coordinate, as ``(row_support, packed_J)``."""
     world_jacobian = np.asarray(world_jacobian, dtype=np.float32)
-    dof = np.broadcast_to(np.arange(world_jacobian.shape[2], dtype=np.int32), world_jacobian.shape).copy()
-    return [wp.array(dof, dtype=wp.int32, device=device), wp.array(world_jacobian, dtype=wp.float32, device=device)]
+    worlds, rows, coordinates = world_jacobian.shape
+    return [
+        world_row_support(worlds, rows, coordinates, device),
+        wp.array(world_jacobian, dtype=wp.float32, device=device),
+    ]
 
 
 _FACTOR_STORAGE = []
@@ -657,11 +682,30 @@ def whitened_rows(jacobian, L) -> np.ndarray:
     return z.reshape(jacobian.shape)
 
 
+def packed_coordinates(solver) -> np.ndarray:
+    """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
+    rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side)."""
+    sides, sizes = solver._row_sides.numpy(), solver.articulation_response_dof_count.numpy()
+    offsets = solver.articulation_world_dof_offset.numpy()
+    dof = np.full((*sides.shape[:2], solver._packed_Z.shape[2]), -1, dtype=np.int32)
+    for world, count in enumerate(solver.constraint_count.numpy()):
+        for row in range(min(int(count), sides.shape[1])):
+            first = 0
+            for art in sides[world, row]:
+                if art < 0:
+                    continue
+                n, offset = int(sizes[art]), int(offsets[art])
+                at = offset if solver._packed_dense else first
+                dof[world, row, at : at + n] = offset + np.arange(n)
+                first += n
+    return dof
+
+
 def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     """The matrix-free sweeps' dense rows over their worlds' coordinates, from the packed rows (:mod:`.packed_rows`),
     float64 ``[world, row, coordinate]``: the Jacobian ``J`` and the response ``H^-1 J^T`` (``P^T L^-T z`` on each
     side, the side's entries found by their coordinates)."""
-    dof = solver._packed_dof.numpy()
+    dof = packed_coordinates(solver)
     J, Z = solver._packed_J.numpy().astype(np.float64), solver._packed_Z.numpy().astype(np.float64)
     sides, sizes = solver._row_sides.numpy(), solver.articulation_response_dof_count.numpy()
     groups, offsets = solver.art_group_idx.numpy(), solver.articulation_world_dof_offset.numpy()

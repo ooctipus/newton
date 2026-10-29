@@ -20,6 +20,7 @@ from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .law_source import law_preludes
+from .packed_rows import PACKED_SIDES
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
@@ -87,7 +88,9 @@ MF_GS_ABI = kernel_template.params(
     ("world_diag", wp.array2d[float]),
     ("world_row_w", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
-    ("packed_dof", wp.array3d[int]),
+    ("response_dofs", wp.array[int]),
+    ("articulation_world_dof_offset", wp.array[int]),
+    ("packed_dense", int),
     ("packed_Z", wp.array3d[float]),
     ("row_sides", wp.array2d[wp.vec2i]),
     ("world_row_type", wp.array2d[int]),
@@ -208,13 +211,16 @@ FACTOR_COORDINATES = FactorCoordinates()
 
 def packed_operator(support: int, lanes: Lanes) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
-    explicit world coordinates and values from the world's first row (``packed_base``), over the factor velocity the
-    sweep stages (``s_v``)."""
+    world coordinates from their sides (``PACKED_COORDINATE``) and values from the world's first row
+    (``packed_base``), over the factor velocity the sweep stages (``s_v``)."""
 
-    def at(array):
-        return lambda row, entry: f"{array}.data[packed_base + ({row}) * {int(support)} + ({entry})]"
+    def coordinate(row, entry):
+        return f"PACKED_COORDINATE(row_sides.data[off_dense + ({row})], {entry})"
 
-    return SparseFactor(int(support), at("packed_dof"), at("packed_Z"), lanes, velocity=Velocity("s_v"))
+    def value(row, entry):
+        return f"packed_Z.data[packed_base + ({row}) * {int(support)} + ({entry})]"
+
+    return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v"))
 
 
 MAPPINGS = ("warp", "colored")
@@ -837,7 +843,7 @@ def mf_gs_source(
     }}
 {end_first_warp}#endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    preludes = (lane_group(32), RING, PACKED_SIDES, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -931,16 +937,16 @@ def packed_block(support: int, rows: str, stride: int, pad: str) -> str:
         f"for (int pair = lane; pair < ({rows}) * ({rows}); pair += 32) {{",
         f"    const int i = pair / ({rows});",
         f"    const int r = pair - i * ({rows});",
-        f"    const int* dof_i = &packed_dof.data[packed_base + (size_t)i * {support}];",
-        f"    const int* dof_r = &packed_dof.data[packed_base + (size_t)r * {support}];",
+        "    const wp::vec2i sides_i = row_sides.data[off_dense + i];",
+        "    const wp::vec2i sides_r = row_sides.data[off_dense + r];",
         f"    const float* z_i = &packed_Z.data[packed_base + (size_t)i * {support}];",
         f"    const float* z_r = &packed_Z.data[packed_base + (size_t)r * {support}];",
         "    float a = 0.0f;",
         f"    for (int e = 0; e < {support}; ++e) {{",
-        "        const int d = dof_i[e];",
+        "        const int d = PACKED_COORDINATE(sides_i, e);",
         "        if (d < 0) continue;",
         f"        for (int f = 0; f < {support}; ++f) {{",
-        "            if (dof_r[f] == d) {",
+        "            if (PACKED_COORDINATE(sides_r, f) == d) {",
         "                a += z_r[f] * z_i[e];",
         "                break;",
         "            }",
@@ -951,7 +957,7 @@ def packed_block(support: int, rows: str, stride: int, pad: str) -> str:
         f"for (int i = lane; i < {rows}; i += 32) {{",
         "    float r = s_rhs[i];",
         f"    for (int e = 0; e < {support}; ++e) {{",
-        f"        const int d = packed_dof.data[packed_base + (size_t)i * {support} + e];",
+        "        const int d = PACKED_COORDINATE(row_sides.data[off_dense + i], e);",
         f"        if (d >= 0) r += packed_Z.data[packed_base + (size_t)i * {support} + e] * s_v[d];",
         "    }",
         "    s_res[i] = r;",
@@ -969,7 +975,7 @@ def packed_publish(support: int, rows: str, dofs: int, pad: str) -> str:
         "    const float a = s_app[i];",
         "    if (a != 0.0f) {",
         f"        for (int e = lane; e < {support}; e += 32) {{",
-        f"            const int d = packed_dof.data[packed_base + (size_t)i * {support} + e];",
+        "            const int d = PACKED_COORDINATE(row_sides.data[off_dense + i], e);",
         f"            if (d >= 0) s_v[d] += packed_Z.data[packed_base + (size_t)i * {support} + e] * a;",
         "        }",
         "    }",
@@ -1171,7 +1177,7 @@ def incremental_source(
     }}
 #endif
 """
-    preludes = (lane_group(32), RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    preludes = (lane_group(32), RING, PACKED_SIDES, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 

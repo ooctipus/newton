@@ -15,6 +15,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_mf_rhs_bias,
     compute_world_contact_bias,
 )
+from newton.tests.feather_pgs_law_harness import row_support
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -369,7 +370,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
         )
         # The position pass: no velocity-pass operands are read.
         none = wp.zeros((1, 1), dtype=wp.int32, device=device)
-        packed = wp.full((1, 3, 6), -1, dtype=wp.int32, device=device)
+        packed = row_support(np.full((1, 3, 2), -1, dtype=np.int32), [0], [0], 0, device)
         velocity = wp.zeros((1,), dtype=wp.float32, device=device)
         wp.launch(
             compute_world_contact_bias,

@@ -27,6 +27,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
+    RowSupport,
     world_contact_row_dot,
 )
 from .row_laws import CONTACT_END_GAP_SLOP
@@ -313,7 +314,7 @@ def _prepare_velocity_torsion_rows(
     target: wp.array2d[float],
     position_velocity: wp.array[float],
     dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     dt: float,
     rhs: wp.array2d[float],
@@ -327,7 +328,7 @@ def _prepare_velocity_torsion_rows(
     touching = bool(False)
     for row in range(count[world]):
         if row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT and group[world, row] == spin:
-            speed = world_contact_row_dot(dof_indices, packed_dof, packed_J, position_velocity, world, row)
+            speed = world_contact_row_dot(dof_indices, row_support, packed_J, position_velocity, world, row)
             end_gap = phi[world, row] + dt * (speed - target[world, row])
             # Retain touching support through rebound, with the existing end-gap
             # slop as the initial touching tolerance. Otherwise require contact
@@ -366,7 +367,7 @@ def prepare_torsion_velocity_pass(solver, dt):
             solver.target_velocity,
             solver.v_out_snap,
             solver.world_dof_indices,
-            solver._packed_dof,
+            solver._row_support(),
             solver._packed_J,
             dt,
         ],

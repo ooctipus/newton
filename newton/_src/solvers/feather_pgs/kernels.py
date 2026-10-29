@@ -1337,13 +1337,25 @@ def populate_physx_drive_J_for_size(
                 world_drive_vel_limit[world, slot] = qdot_max
 
 
+@wp.struct
+class RowSupport:
+    """Where a packed dense row's entries sit (:mod:`.packed_rows`): its sides (``row_sides``: articulation indices,
+    the first by index, -1 for none), each articulation's coordinates and first world coordinate, and the layout
+    (``dense``: entry ``e`` is world coordinate ``e``; else the first side's entries, then the second's)."""
+
+    sides: wp.array2d[wp.vec2i]
+    dofs: wp.array[int]
+    offset: wp.array[int]
+    dense: int
+
+
 @wp.kernel
 def compute_physx_pgs_drive_desc(
     rows: DenseRows,
     world_constraint_count: wp.array[int],
     max_constraints: int,
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     position_delta_velocity: wp.array[float],
     world_drive_stiffness: wp.array2d[float],
@@ -1387,7 +1399,7 @@ def compute_physx_pgs_drive_desc(
         position_delta = float(0.0)
         if position_delta_scale != 0.0:
             position_delta = world_contact_row_dot(
-                world_dof_indices, packed_dof, packed_J, position_delta_velocity, world, i
+                world_dof_indices, row_support, packed_J, position_delta_velocity, world, i
             )
             position_delta = position_delta_scale * dt * position_delta
 
@@ -2563,19 +2575,29 @@ def sparse_diagonal_row_dot(
 @wp.func
 def world_contact_row_dot(
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    support: RowSupport,
     packed_J: wp.array3d[float],
     velocity: wp.array[float],
     world: int,
     i: int,
 ):
     """``J_i v`` of one dense row with a global velocity state: its packed Jacobian entries (:mod:`.packed_rows`)
-    times the velocity at their world coordinates, summed in entry order from zero."""
+    times the velocity at their world coordinates, side by side in entry order from zero (a world's coordinates
+    follow its articulations' order, so this is the rows' entry order)."""
     out = float(0.0)
-    for e in range(packed_dof.shape[2]):
-        d = packed_dof[world, i, e]
-        if d >= 0:
-            out += packed_J[world, i, e] * velocity[world_dof_indices[world, d]]
+    sides = support.sides[world, i]
+    first = int(0)
+    for side in range(2):
+        art = sides[side]
+        if art >= 0:
+            n = support.dofs[art]
+            offset = support.offset[art]
+            at = first
+            if support.dense != 0:
+                at = offset
+            for e in range(n):
+                out += packed_J[world, i, at + e] * velocity[world_dof_indices[world, offset + e]]
+            first += n
     return out
 
 
@@ -2913,7 +2935,7 @@ def compute_world_contact_bias(
     contact_w: float,
     velocity_pass: int,
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     world_position_velocity: wp.array[float],
     world_incident_velocity: wp.array[float],
@@ -2945,7 +2967,7 @@ def compute_world_contact_bias(
         restitution = rows.restitution[world, i]
         if restitution > 0.0:
             relative_incident = (
-                world_contact_row_dot(world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i)
+                world_contact_row_dot(world_dof_indices, row_support, packed_J, world_incident_velocity, world, i)
                 - target
             )
             fires, bounce = contact_restitution_rhs(
@@ -2956,7 +2978,7 @@ def compute_world_contact_bias(
             end_gap = float(0.0)
             if phi > 0.0:
                 jv_position = world_contact_row_dot(
-                    world_dof_indices, packed_dof, packed_J, world_position_velocity, world, i
+                    world_dof_indices, row_support, packed_J, world_position_velocity, world, i
                 )
                 end_gap = phi + dt * (jv_position - target)
             rhs, _row_w = contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
@@ -2985,7 +3007,7 @@ def apply_world_contact_restitution_matrix_free(
     max_constraints: int,
     world_incident_velocity: wp.array[float],
     world_dof_indices: wp.array2d[int],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     sparse_diagonal: int,
     dense_offsets: wp.array[int],
@@ -3029,7 +3051,7 @@ def apply_world_contact_restitution_matrix_free(
         )
     else:
         relative_incident = world_contact_row_dot(
-            world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i
+            world_dof_indices, row_support, packed_J, world_incident_velocity, world, i
         )
     target_vel = rows.target[world, i]
     relative_incident -= target_vel
@@ -4021,7 +4043,7 @@ def pgs_convergence_diagnostic_velocity(
     world_dof_indices: wp.array2d[int],
     impulses: wp.array2d[float],
     prev_impulses: wp.array2d[float],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     max_constraints: int,
     # MF constraints
@@ -4062,7 +4084,7 @@ def pgs_convergence_diagnostic_velocity(
             max_dl = dl
 
         # Compute residual: r_i = J_i * v + bias_i
-        jv = world_contact_row_dot(world_dof_indices, packed_dof, packed_J, v_out, world, i)
+        jv = world_contact_row_dot(world_dof_indices, row_support, packed_J, v_out, world, i)
         residual = jv + rows.rhs[world, i]
 
         rt = rows.row_type[world, i]
@@ -4168,7 +4190,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
     constraint_count: wp.array[int],
     world_dof_indices: wp.array2d[int],
     impulses: wp.array2d[float],
-    packed_dof: wp.array3d[int],
+    row_support: RowSupport,
     packed_J: wp.array3d[float],
     max_constraints: int,
     # MF constraints
@@ -4252,7 +4274,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
             continue
 
         # Normal row velocity (bias-free): u_n = J_n * v
-        u_n = world_contact_row_dot(world_dof_indices, packed_dof, packed_J, v_out, world, i)
+        u_n = world_contact_row_dot(world_dof_indices, row_support, packed_J, v_out, world, i)
         b_n = rows.rhs[world, i]
         ln = impulses[world, i]
 
@@ -4282,7 +4304,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
             if rows.row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION and rows.row_parent[world, i1] == i:
                 lt1 = impulses[world, i1]
                 mu = rows.row_mu[world, i1]
-                u_t1 = world_contact_row_dot(world_dof_indices, packed_dof, packed_J, v_out, world, i1)
+                u_t1 = world_contact_row_dot(world_dof_indices, row_support, packed_J, v_out, world, i1)
 
         i2 = i + 2
         if i2 < max_constraints and i2 < m_dense:
@@ -4290,7 +4312,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
                 lt2 = impulses[world, i2]
                 if mu == 0.0:
                     mu = rows.row_mu[world, i2]
-                u_t2 = world_contact_row_dot(world_dof_indices, packed_dof, packed_J, v_out, world, i2)
+                u_t2 = world_contact_row_dot(world_dof_indices, row_support, packed_J, v_out, world, i2)
 
         # r_cone
         friction_load = ln

@@ -1076,7 +1076,6 @@ def bilateral_correct_kernel(
     constraint_count: wp.array[int],
     local_solve_owner: wp.array[int],
     world_row_cfm: wp.array2d[float],
-    packed_dof: wp.array3d[int],
     # outputs
     packed_Z: wp.array3d[float],
     world_rhs: wp.array2d[float],
@@ -1084,8 +1083,8 @@ def bilateral_correct_kernel(
 ):
     """Correct every other row's sides on the blocks' articulations, ``Z'_i = Z_i - Z_B y_i`` with ``y_i = S^-1 Z_B^T
     Z_i``, take ``y_i^T b_B`` back from its right-hand side and store its diagonal ``|Z'_i|^2 + cfm`` (the squares
-    summed in entry order; in the worlds the general solver owns). One thread per world row, after the right-hand
-    sides are final.
+    summed in entry order, the padding's zeros included; in the worlds the general solver owns). One thread per world
+    row, after the right-hand sides are final.
 
     A side the block does not see (``Z_B^T Z_i`` exactly zero) keeps its entries; the block's rows keep theirs for the
     projection.
@@ -1137,9 +1136,8 @@ def bilateral_correct_kernel(
     if corrected != 0 and local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
         norm = float(0.0)
         for e in range(packed_Z.shape[2]):
-            if packed_dof[world, row, e] >= 0:
-                z = packed_Z[world, row, e]
-                norm += z * z
+            z = packed_Z[world, row, e]
+            norm += z * z
         world_diag[world, row] = norm + world_row_cfm[world, row]
 
 
