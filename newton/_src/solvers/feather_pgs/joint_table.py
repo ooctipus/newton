@@ -9,6 +9,7 @@ step's coordinates and drive targets stay separate arguments, since launches rea
 state, the predicted velocity, the prescaled velocity).
 """
 
+import numpy as np
 import warp as wp
 
 from . import field_group
@@ -41,6 +42,32 @@ read (its kinematic state's effective arrays: none on a prescribed coordinate), 
 coordinate starts, coordinate counts and worlds."""
 
 JointTable = field_group.struct("JointTable", JOINTS, __name__)
+
+EFFECTIVE = {
+    "joint_limit_lower": lambda values: np.full_like(values, -np.inf),
+    "joint_limit_upper": lambda values: np.full_like(values, np.inf),
+    "joint_velocity_limit": np.zeros_like,  # a non-positive velocity limit is no limit (row_laws.velocity_limit_active)
+    "joint_target_ke": np.zeros_like,
+    "joint_target_kd": np.zeros_like,
+}
+"""The per-coordinate row data a prescribed (kinematic) coordinate gives no row: each model array's value there
+(infinite position limits; no velocity limit; no drive). The solver holds them as private copies (``_name``)."""
+
+
+def effective(model, prescribed: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    """The effective row data of :data:`EFFECTIVE` the model holds, by name: its arrays with the values of a prescribed
+    coordinate where ``prescribed`` (a coordinate mask) is set."""
+    data = {}
+    for name, value in EFFECTIVE.items():
+        source = getattr(model, name, None)
+        if source is None:
+            continue
+        values = source.numpy().copy()
+        if prescribed is not None:
+            mask = np.asarray(prescribed) != 0
+            values[mask] = value(values[mask])
+        data[name] = values
+    return data
 
 
 def bind(solver, data=None):

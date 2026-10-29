@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import field_group, joint_table
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
@@ -549,6 +550,40 @@ def _held_operator(model, arts, parents, counts, **attributes):
         art_to_world=wp.array(model.articulation_world.numpy(), dtype=int, device=model.device),
     )
     return SimpleNamespace(plan=plan, host=operator_metadata(mass), **attributes)
+
+
+class TestEffectiveRowData(unittest.TestCase):
+    """The per-coordinate row data a prescribed coordinate gives no row (joint_table.effective), on the host."""
+
+    def test_a_prescribed_coordinate_gives_no_limit_or_drive(self):
+        """A kinematic link's coordinate takes infinite position limits, no velocity limit and no drive gains."""
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        links = [scene.add_link(mass=1.0, inertia=INERTIA) for _ in range(2)]
+        root = scene.add_joint_free(links[0])
+        joint = scene.add_joint_revolute(
+            links[0], links[1], axis=newton.Axis.Y, limit_lower=-0.2, limit_upper=0.2, target_ke=5.0, target_kd=1.0
+        )
+        scene.add_articulation([root, joint])
+        model = scene.finalize(device="cpu")
+        prescribed = np.zeros(model.joint_dof_count, dtype=np.int32)
+        prescribed[6] = 1
+        data = joint_table.effective(model, prescribed)
+        self.assertEqual((data["joint_limit_lower"][6], data["joint_limit_upper"][6]), (-np.inf, np.inf))
+        self.assertEqual(
+            (data["joint_velocity_limit"][6], data["joint_target_ke"][6], data["joint_target_kd"][6]), (0.0, 0.0, 0.0)
+        )
+        np.testing.assert_array_equal(data["joint_limit_lower"][:6], model.joint_limit_lower.numpy()[:6])
+
+    def test_a_model_source_must_pass_the_effective_data(self):
+        """The joint table reads the solver's private copies: an upload from a model raises unless it passes them."""
+        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        link = scene.add_link(mass=1.0, inertia=INERTIA)
+        scene.add_articulation([scene.add_joint_revolute(-1, link, axis=newton.Axis.Y, limit_lower=-0.2)])
+        model = scene.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "_joint_target_ke"):
+            field_group.upload(joint_table.JointTable, "cpu", model)
+        table = field_group.upload(joint_table.JointTable, "cpu", model, **joint_table.effective(model))
+        self.assertAlmostEqual(float(table.joint_limit_lower.numpy()[0]), -0.2, places=6)
 
 
 class TestTreePlanKinematicBodies(unittest.TestCase):

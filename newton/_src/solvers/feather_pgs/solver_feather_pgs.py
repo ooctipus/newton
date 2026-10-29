@@ -53,6 +53,7 @@ from . import execution_plan as _execution_plan
 from . import (
     field_group,
     host_index,
+    joint_table,
     kernel_template,
     packed_rows,
     prefix_rows,
@@ -294,15 +295,6 @@ _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 _PERSISTENT_HINV_JT_MIN_DOF = 17
-# The per-coordinate row data a prescribed (kinematic) coordinate gives no row (_kinematic_state): each model array's
-# effective value there.
-_EFFECTIVE_JOINT_FIELDS = {
-    "joint_limit_lower": lambda values: np.full_like(values, -np.inf),
-    "joint_limit_upper": lambda values: np.full_like(values, np.inf),
-    "joint_velocity_limit": np.zeros_like,  # a non-positive velocity limit is no limit (row_laws.velocity_limit_active)
-    "joint_target_ke": np.zeros_like,
-    "joint_target_kd": np.zeros_like,
-}
 
 
 @wp.kernel
@@ -1582,7 +1574,7 @@ class SolverFeatherPGS(SolverBase):
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         # The per-coordinate gains and limits the rows read (_kinematic_state): the model's, with none on a prescribed
         # coordinate.
-        for name in _EFFECTIVE_JOINT_FIELDS:
+        for name in joint_table.EFFECTIVE:
             source = getattr(model, name, None)
             setattr(self, "_" + name, None if source is None else wp.clone(source))
         self._apply_kinematic_state(self._kinematic_state())
@@ -2375,7 +2367,7 @@ class SolverFeatherPGS(SolverBase):
 
         Returns:
             ``(armature, joint_mask, dof_mask, floor, effective)`` for :meth:`_apply_kinematic_state`; ``effective``
-            maps each of :data:`_EFFECTIVE_JOINT_FIELDS` the model holds to its per-coordinate values.
+            maps each of :data:`.joint_table.EFFECTIVE` the model holds to its per-coordinate values.
 
         Raises:
             RuntimeError: If the flags make a DOF of a sparse split or
@@ -2414,14 +2406,7 @@ class SolverFeatherPGS(SolverBase):
                         "reconstruct the solver and recapture its CUDA graph."
                     )
         armature, floor = conditioning_armature(model, armature, self._joint_forest)
-        prescribed = dof_mask != 0
-        effective = {}
-        for name, value in _EFFECTIVE_JOINT_FIELDS.items():
-            source = getattr(model, name, None)
-            if source is not None:
-                data = source.numpy().copy()
-                data[prescribed] = value(data[prescribed])
-                effective[name] = data
+        effective = joint_table.effective(model, dof_mask)
         return armature, joint_mask, dof_mask, floor, effective
 
     def _apply_kinematic_state(
