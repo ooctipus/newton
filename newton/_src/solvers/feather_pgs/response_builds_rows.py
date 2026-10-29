@@ -17,9 +17,8 @@ applied into velocities outside the sweeps. This module holds the builds and pub
 - :class:`.response_operator.SparseFactor` (rows ``Z = L^-1 P J^T`` packed by support): the internal rows' unit
   columns of ``L^-1`` (position limits, velocity limits, mimic), and the publication ``v = v_hat + P^T L^-T u`` of a
   world's factor-coordinate velocity change;
-- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the held form
-  ``L^T Y`` of physical rows (the rows themselves are the dense response pairs build,
-  :func:`.response_builds_dense.response_pairs_kernel`);
+- :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the packed
+  rows at their world coordinates (:mod:`.packed_rows`);
 
 and :class:`BilateralElimination`, the Schur transform of a dense response build that folds a
 world's bilateral block into the responses of its other rows.

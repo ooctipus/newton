@@ -44,7 +44,6 @@ from .execution_plan import _fused_response_chunk_size
 from .kernel_template import THREADS, Dispatch, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
-from .row_packets import PrefixData, QueueData
 from .staging import Buffer, Staging, static_budget
 
 __all__ = [
@@ -57,11 +56,10 @@ __all__ = [
     "solve_six",
 ]
 
-STAGES = ("factor", "response", "gather", "diagonal", "cfm", "delassus", "apply")
+STAGES = ("factor", "response", "diagonal", "cfm", "delassus", "apply")
 """What a build stage writes: the leaf-first factor ``L`` of ``P (H + diag(R)) P^T``; the response ``Y = H^-1 J^T`` (by
-size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``);
-the world-layout copy of ``J`` and ``Y``; the world diagonal ``A_ii = J_i Y_i``; its ``cfm``; the Delassus ``C = J
-Y^T`` with its diagonal; the velocity ``v_hat + Y^T lambda``."""
+size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``); the world diagonal ``A_ii = J_i
+Y_i``; its ``cfm``; the Delassus ``C = J Y^T`` with its diagonal; the velocity ``v_hat + Y^T lambda``."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -461,65 +459,6 @@ def response_lanes_kernel() -> wp.Kernel:
     return _kernel("dense_response_lanes", params, body)
 
 
-def _queue_dispatch(*fields: tuple[str, str, object]) -> Dispatch:
-    """Warps that walk the general-world queue (``launch_tiled(dim=[workers], block_dim=32)``): the native body takes
-    the worker, its lane and the struct ``fields`` (``(struct, field, type)``) it reads, as arguments of its own."""
-    return Dispatch(
-        "worker, lane = wp.tid()\n$CALL",
-        ("worker", "lane", *(f"{struct}.{field}" for struct, field, _ in fields)),
-        (("worker", int), ("lane", int), *((f"{struct}_{field}", dtype) for struct, field, dtype in fields)),
-        private=tuple(sorted({struct for struct, _, _ in fields})),
-    )
-
-
-_QUEUE = (
-    ("queue", "general_count", wp.array[int]),
-    ("queue", "general", wp.array[int]),
-    ("queue", "count", wp.array[int]),
-)
-
-
-@functools.cache
-def response_queue_kernel() -> wp.Kernel:
-    """The response of the general worlds of the local owners' queue, a warp per worker over the queue's worlds,
-    each world's rows lane-strided (``launch_tiled(dim=[workers], block_dim=32)``), solved in place (Z0) and
-    published to the world layout."""
-    publish = _publish_row("J_world", "Y_world", "J", "Y", "group", "world", "row", "dof_offset", "size")
-    body = f"""    const int general_end = queue_general_count.data[0];
-    for (int entry = worker; entry < general_end; entry += workers) {{
-        const int world = queue_general.data[entry];
-        const int item_end = group_start.data[world + 1];
-        for (int item = group_start.data[world]; item < item_end; ++item) {{
-            const int art = group_art.data[item];
-            const int group = art_group.data[art];
-            const int row_end = queue_count.data[world];
-            for (int row = lane; row < row_end; row += STRIDE) {{
-                {{
-{_indent(_respond_in_place("L", "J", "Y", "group", "row", "size"), "                    ")}
-                }}
-                const int dof_offset = world_offset.data[art];
-{_indent(publish, "                ")}
-            }}
-        }}
-    }}
-"""
-    params = kernel_template.params(
-        ("workers", int),
-        ("queue", QueueData),
-        ("group_start", wp.array[int]),
-        ("group_art", wp.array[int]),
-        ("art_group", wp.array[int]),
-        ("world_offset", wp.array[int]),
-        ("size", int),
-        ("L", wp.array3d[float]),
-        ("J", wp.array3d[float]),
-        ("Y", wp.array3d[float]),
-        ("J_world", wp.array3d[float]),
-        ("Y_world", wp.array3d[float]),
-    )
-    return _kernel("dense_response_queue", params, body, preludes=(lane_group(32),), dispatch=_queue_dispatch(*_QUEUE))
-
-
 _Vec6 = wp.types.vector(length=6, dtype=wp.float32)
 
 
@@ -803,177 +742,6 @@ def response_tiles_kernel(
     return python_kernel(hinv_jt_plain_template, name)
 
 
-_PAIRED = """    const int secondary_group = secondary_group_by_primary.data[primary_group];
-    const int primary_art = primary_group_to_art.data[primary_group];
-    const int secondary_art = secondary_group_to_art.data[secondary_group];
-    const int world = art_to_world.data[primary_art];
-    const bool factor_world = $FACTOR_WORLD;
-    const int n_constraints = wp::min(world_constraint_count.data[world], $M);
-    if (n_constraints <= 0) return;
-    const int primary_offset = articulation_world_dof_offset.data[primary_art];
-    const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
-#if defined(__CUDA_ARCH__)
-    __shared__ float s_primary[$PP];
-    __shared__ float s_secondary[$SS];
-    __shared__ float s_rows[$T * $BLOCK];
-    constexpr int ZS = $BLOCK;
-    for (int element = LANE; element < $PP; element += STRIDE)
-        s_primary[element] = primary_L.data[primary_group * $PP + element];
-    for (int element = LANE; element < $SS; element += STRIDE)
-        s_secondary[element] = secondary_L.data[secondary_group * $SS + element];
-    SYNC();
-#else
-    const float* s_primary = primary_L.data + primary_group * $PP;
-    const float* s_secondary = secondary_L.data + secondary_group * $SS;
-    float s_rows[$T];
-    constexpr int ZS = 1;
-#endif
-    // A row's coordinates, strided by thread (conflict-free), the solves' operands.
-    float* z = s_rows + LANE;
-    for (int row = LANE; row < n_constraints; row += STRIDE) {
-        const int world_row = (world * $M + row) * $D;
-        for (int d = 0; d < $P; ++d) {
-            const float j = primary_J.data[(primary_group * $M + row) * $P + d];
-            J_world.data[world_row + primary_offset + d] = j;
-            z[d * ZS] = j;
-        }
-        for (int d = 0; d < $S; ++d) {
-            const float j = secondary_J.data[(secondary_group * $M + row) * $S + d];
-            J_world.data[world_row + secondary_offset + d] = j;
-            z[($P + d) * ZS] = j;
-        }
-$WHITEN
-        float diagonal = 0.0f;
-        for (int d = 0; d < $T; ++d) diagonal += z[d * ZS] * z[d * ZS];
-        if (!factor_world) {
-$LEAVE
-        }
-        for (int d = 0; d < $T; ++d)
-            Y_world.data[world_row + (d < $P ? primary_offset + d : secondary_offset + d - $P)] = z[d * ZS];
-        world_diag.data[world * $M + row] = diagonal + world_row_cfm.data[world * $M + row];
-    }
-"""
-
-
-@functools.cache
-def response_pairs_kernel(
-    primary_dofs: int,
-    secondary_dofs: int,
-    max_constraints: int,
-    max_world_dofs: int,
-    device_arch,
-    block_dim: int = 128,
-    *,
-    factor_coordinates: bool = False,
-) -> wp.Kernel:
-    """The response of a paired world (an articulation and a free body), a block per pair and a thread per row
-    (``launch_tiled(dim=[pairs], block_dim=block_dim)``; on the CPU one thread per pair over its rows): both
-    components' leaf-first factors and the rows staged in shared memory (a row's coordinates strided by thread), each
-    row whitened in place per component, ``z = L^-1 P j``, by the kit's solves (masked rows, Z0), its diagonal
-    ``|z|^2 = j H^-1 j^T`` (coordinate order) plus ``cfm``, then
-    ``y = P^T L^-T z`` back to physical coordinates, except, with ``factor_coordinates``, in a world without free-body
-    rows, whose response is ``Z`` itself (factor coordinate ``i`` at position ``n - 1 - i``).
-    """
-    cpu = str(device_arch) == "cpu"
-    P, S = int(primary_dofs), int(secondary_dofs)
-    total = P + S
-    if total > 32:
-        raise ValueError("paired response requires at most 32 total DOFs")
-    if block_dim <= 0 or block_dim % 32:
-        raise ValueError("block_dim must be a positive multiple of 32")
-    # The masked whiten holds one row's chain at a time (bounded registers); the operands live in shared memory.
-    primary = CholeskySolve(P, "s_primary", masked=True)
-    secondary = CholeskySolve(S, "s_secondary", masked=True)
-
-    def at(offset):
-        return lambda i: f"z[({offset} + {i}) * ZS]"
-
-    whiten = "\n".join((primary.whiten(at(0), at(0)), secondary.whiten(at(P), at(P))))
-    leave = "\n".join((primary.leave(at(0), at(0)), secondary.leave(at(P), at(P))))
-    snippet = substitute(
-        _PAIRED,
-        P=P,
-        S=S,
-        T=total,
-        PP=P * P,
-        SS=S * S,
-        M=max_constraints,
-        D=max_world_dofs,
-        BLOCK=block_dim,
-        FACTOR_WORLD="world_mf_constraint_count.data[world] == 0" if factor_coordinates else "false",
-        WHITEN=_indent(whiten, "        "),
-        LEAVE=_indent(leave, "            "),
-    )
-    name = f"dense_response_pairs_{P}_{S}_{max_constraints}_bd{block_dim}" + ("_factor" if factor_coordinates else "")
-    return KernelTemplate(
-        name,
-        kernel_template.params(
-            ("primary_L", wp.array3d[float]),
-            ("primary_J", wp.array3d[float]),
-            ("primary_group_to_art", wp.array[int]),
-            ("secondary_L", wp.array3d[float]),
-            ("secondary_J", wp.array3d[float]),
-            ("secondary_group_to_art", wp.array[int]),
-            ("secondary_group_by_primary", wp.array[int]),
-            ("art_to_world", wp.array[int]),
-            ("articulation_world_dof_offset", wp.array[int]),
-            ("world_constraint_count", wp.array[int]),
-            ("world_mf_constraint_count", wp.array[int]),
-            ("world_row_cfm", wp.array2d[float]),
-            ("J_world", wp.array3d[float]),
-            ("Y_world", wp.array3d[float]),
-            ("world_diag", wp.array2d[float]),
-        ),
-        snippet,
-        dispatch=Dispatch(
-            "primary_group, lane = wp.tid()\nif wp.static(cpu):\n    if lane != 0:\n        return\n$CALL",
-            ("primary_group",),
-            (("primary_group", int),),
-            constants=(("cpu", cpu),),
-        ),
-        preludes=(lane_group(block_dim),),
-        dual=True,
-        native_name="paired_hinv_jt_native",
-    ).kernel()
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Stage "gather": the world layout of J and Y
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@functools.cache
-def gather_coordinates_kernel() -> wp.Kernel:
-    """The world layout of a size group's rows, one thread per articulation row coordinate (``dim = articulations *
-    max_constraints * n_dofs``), zeros included."""
-    world = "articulation_world_dof_offset.data[art] + d"
-    body = f"""    const int d = tid % n_dofs;
-    const int remainder = tid / n_dofs;
-    const int c = remainder % max_constraints;
-    const int idx = remainder / max_constraints;
-    if (idx >= n_arts) return;
-    const int art = group_to_art.data[idx];
-    const int world = art_to_world.data[art];
-    if (c >= world_constraint_count.data[world]) return;
-    {_element("J_world", "world", "c", world)} = {_element("J_group", "idx", "c", "d")};
-    {_element("Y_world", "world", "c", world)} = {_element("Y_group", "idx", "c", "d")};
-"""
-    params = kernel_template.params(
-        ("group_to_art", wp.array[int]),
-        ("art_to_world", wp.array[int]),
-        ("articulation_world_dof_offset", wp.array[int]),
-        ("world_constraint_count", wp.array[int]),
-        ("J_group", wp.array3d[float]),
-        ("Y_group", wp.array3d[float]),
-        ("n_dofs", int),
-        ("max_constraints", int),
-        ("n_arts", int),
-        ("J_world", wp.array3d[float]),
-        ("Y_world", wp.array3d[float]),
-    )
-    return _kernel("dense_gather_coordinates", params, body)
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Stages "diagonal" and "cfm": A_ii = J_i Y_i (+ cfm) in the world layout
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1049,41 +817,6 @@ def diagonal_groups_kernel() -> wp.Kernel:
         ("world_diag", wp.array2d[float]),
     )
     return _kernel("dense_diagonal_groups", params, body)
-
-
-@functools.cache
-def diagonal_queue_kernel() -> wp.Kernel:
-    """The diagonal of the general worlds of the local owners' queue, a warp per worker, rows lane-strided
-    (``launch_tiled(dim=[workers], block_dim=32)``): ``sum J Y`` over the world's coordinates in order, plus the
-    row's ``cfm``, stored (the owners' private diagonals stay)."""
-
-    def J(k):
-        return _element("J", "world", "row", k)
-
-    def Y(k):
-        return _element("Y", "world", "row", k)
-
-    diag, cfm = _element("prefix_diag", "world", "row"), _element("prefix_row_cfm", "world", "row")
-    body = f"""    const int general_end = queue_general_count.data[0];
-    for (int entry = worker; entry < general_end; entry += workers) {{
-        const int world = queue_general.data[entry];
-        const int row_end = queue_count.data[world];
-        for (int row = lane; row < row_end; row += STRIDE) {{
-{_indent(dot("value", "world_dofs.data[world]", J, Y, index="dof"), "            ")}
-            {diag} = value + {cfm};
-        }}
-    }}
-"""
-    params = kernel_template.params(
-        ("workers", int),
-        ("prefix", PrefixData),
-        ("queue", QueueData),
-        ("world_dofs", wp.array[int]),
-        ("J", wp.array3d[float]),
-        ("Y", wp.array3d[float]),
-    )
-    fields = (*_QUEUE, ("prefix", "diag", wp.array2d[float]), ("prefix", "row_cfm", wp.array2d[float]))
-    return _kernel("dense_diagonal_queue", params, body, preludes=(lane_group(32),), dispatch=_queue_dispatch(*fields))
 
 
 @functools.cache
@@ -1415,26 +1148,13 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("factor", "tiles"): _entry("factor", "tiles", factor_tiles_kernel, ("articulations",), _tile_threads, tiled=True),
     ("response", "rows"): _entry("response", "rows", response_rows_kernel, ("articulations", "rows")),
     ("response", "lanes"): _entry("response", "lanes", response_lanes_kernel, ("articulations", "32 lanes"), 256),
-    ("response", "queue"): _entry("response", "queue", response_queue_kernel, ("workers",), 32, tiled=True),
     ("response", "diagonal"): _entry("response", "diagonal", response_diagonal_kernel, ("articulations", "rows")),
     ("response", "warps"): _entry("response", "warps", response_warps_kernel, ("articulation quads",), 128, tiled=True),
     ("response", "tiles"): _entry(
         "response", "tiles", response_tiles_kernel, ("articulations", "row chunks"), _tile_threads, tiled=True
     ),
-    ("response", "pairs"): _entry(
-        "response",
-        "pairs",
-        response_pairs_kernel,
-        ("pairs",),
-        lambda options: int(options.get("block_dim", 128)),
-        tiled=True,
-    ),
-    ("gather", "coordinates"): _entry(
-        "gather", "coordinates", gather_coordinates_kernel, ("articulations", "rows", "coordinates")
-    ),
     ("diagonal", "rows"): _entry("diagonal", "rows", diagonal_rows_kernel, ("articulations", "rows")),
     ("diagonal", "groups"): _entry("diagonal", "groups", diagonal_groups_kernel, ("worlds", "rows")),
-    ("diagonal", "queue"): _entry("diagonal", "queue", diagonal_queue_kernel, ("workers",), 32, tiled=True),
     ("cfm", "worlds"): _CFM_WORLDS,
     ("apply", "coordinates"): _entry(
         "apply", "coordinates", apply_coordinates_kernel, ("articulations", "coordinates")

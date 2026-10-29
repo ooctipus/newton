@@ -15,7 +15,6 @@ _KERNEL_FACTORIES = {
         "factor_tiles_kernel",
         "response_warps_kernel",
         "response_tiles_kernel",
-        "response_pairs_kernel",
         "delassus_stream_kernel",
         "delassus_tiles_kernel",
     ),
@@ -27,10 +26,7 @@ _KERNEL_FACTORIES = {
     ),
 }
 # The factories whose kernel depends on the device it is built for: the CPU's serial form, the device's budget.
-_DEVICE_KERNEL_FACTORIES = (
-    ("response_builds_dense.py", "response_pairs_kernel"),
-    ("response_builds_dense.py", "delassus_stream_kernel"),
-)
+_DEVICE_KERNEL_FACTORIES = (("response_builds_dense.py", "delassus_stream_kernel"),)
 
 
 def _top_level_functions(module: str) -> dict:

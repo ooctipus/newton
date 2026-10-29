@@ -285,7 +285,6 @@ _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_CONTACT_THREADS_X", "1")))
 _ROWS_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_ROWS_THREADS_X", "4")))
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
-_PAIRED_RESPONSE_THREADS = 128
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
@@ -5250,7 +5249,6 @@ class SolverFeatherPGS(SolverBase):
         The factor, stage-3 and stage-4 kernels follow the step plan (:meth:`_build_stage_kernels`).
         """
         device_arch = model.device.arch
-        self._paired_response_kernel = None
         from . import paired_components  # noqa: PLC0415
 
         self._paired_components = None
@@ -5267,15 +5265,6 @@ class SolverFeatherPGS(SolverBase):
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
-            self._paired_response_kernel = response_builds_dense.response_pairs_kernel(
-                primary_size,
-                secondary_size,
-                self.dense_max_constraints,
-                self.max_world_dofs,
-                device_arch,
-                _PAIRED_RESPONSE_THREADS,
-                factor_coordinates=self._paired_factor_coordinates,
-            )
             self._paired_factor_solve_kernel = (
                 self._sweep_kernel(
                     "paired_factor",
@@ -6617,8 +6606,7 @@ class SolverFeatherPGS(SolverBase):
                 # Diagonal from J*Y (no full Delassus), or from the packed rows' |Z|^2
                 packed_diag = self._stage4_compute_matrix_free_diag()
                 self._stage4_pack_rows(write_diag=packed_diag)
-                if self._paired_response_primary_size is None:
-                    self._stage4_finalize_world_diag_cfm()
+                self._stage4_finalize_world_diag_cfm()
                 # Reads J_world only when position_delta_scale != 0; under the
                 # J/Y alias (see _detect_jy_world_identity) J_world here holds
                 # the CURRENT step's rows rather than last step's gathered
@@ -6733,28 +6721,6 @@ class SolverFeatherPGS(SolverBase):
             )
         elif solve.family == "matrix_free":
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
-                # Gather J/Y from per-size-group arrays into world-indexed arrays (StepPlan.gather_sizes).
-                # No J_world/Y_world zeroing needed: gather writes all DOFs unconditionally
-                for size in self._plan.gather_sizes:
-                    n_arts = self.n_arts_by_size[size]
-                    wp.launch(
-                        response_builds_dense.gather_coordinates_kernel(),
-                        dim=int(n_arts * self.dense_max_constraints * size),
-                        inputs=[
-                            self.group_to_art[size],
-                            self.art_to_world,
-                            self.articulation_world_dof_offset,
-                            self.constraint_count,
-                            self.J_by_size[size],
-                            self.Y_by_size[size],
-                            size,
-                            self.dense_max_constraints,
-                            n_arts,
-                        ],
-                        outputs=[self.J_world, self.Y_world],
-                        device=self.model.device,
-                    )
-
                 self._stage4_apply_world_contact_restitution(dt, matrix_free=True)
                 if self._preelim_active:
                     # Bilateral pre-elimination: fold mimic/connect coupling into the packed rows, their
@@ -9183,9 +9149,7 @@ class SolverFeatherPGS(SolverBase):
     def _stage4_response(self, size: int) -> None:
         """Build one size's contact response along the plan's stage-4 route (none where an owner publishes it)."""
         route = self._plan.response[size].name
-        if route == "paired":
-            self._stage4_hinv_jt_paired(size, self._paired_response_secondary_size)
-        elif route == "fused":
+        if route == "fused":
             self._stage4_hinv_jt_tiled_fused(size)
         elif route == "diagonal":
             self._stage4_hinv_jt_diagonal(size)
@@ -9193,8 +9157,6 @@ class SolverFeatherPGS(SolverBase):
             self._stage4_hinv_jt_grouped(size)
         elif route == "tiles":
             self._stage4_hinv_jt_tiled(size)
-        elif route == "packets":
-            self._row_packets.response(size)
         elif route == "lanes":
             self._stage4_hinv_jt_lanes(size)
         elif route == "rows":
@@ -9285,32 +9247,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage4_hinv_jt_paired(self, primary_size: int, secondary_size: int) -> None:
-        """Build one world response from its robot and free-body components through their leaf-first factors."""
-        if self._paired_response_kernel is None or self._paired_response_secondary_groups is None:
-            raise RuntimeError("Paired H^-1 J^T kernel is unavailable")
-        wp.launch_tiled(
-            self._paired_response_kernel,
-            dim=[self.n_arts_by_size[primary_size]],
-            inputs=[
-                self.L_by_size[primary_size],
-                self.J_by_size[primary_size],
-                self.group_to_art[primary_size],
-                self.L_by_size[secondary_size],
-                self.J_by_size[secondary_size],
-                self.group_to_art[secondary_size],
-                self._paired_response_secondary_groups,
-                self.art_to_world,
-                self.articulation_world_dof_offset,
-                self.constraint_count,
-                self.mf_constraint_count,
-                self.row_cfm,
-            ],
-            outputs=[self.J_world, self.Y_world, self.diag],
-            block_dim=_PAIRED_RESPONSE_THREADS,
-            device=self.model.device,
-        )
-
     def _stage4_hinv_jt_tiled_fused(self, size: int):
         model = self.model
         n_arts = self.n_arts_by_size[size]
@@ -9371,8 +9307,6 @@ class SolverFeatherPGS(SolverBase):
             return
         if self._paired_factor_coordinates and not self._packed_dense:
             raise RuntimeError("The paired factor-coordinate sweep reads packed rows at their world coordinates")
-        # The packed rows' build serves the paired worlds: no paired response is built.
-        self._paired_response_kernel = None
         self._hinv_jt_writes_world = False
         self._jy_world_aliased = False
         self._arrays.release(WORLD_RESPONSE)
@@ -9759,8 +9693,6 @@ class SolverFeatherPGS(SolverBase):
             return  # The packed rows' build adds CFM with the diagonal.
         if self._sparse_prepare_contacts:
             return  # Contact and limit producers add CFM exactly once.
-        if self._row_packets is not None:
-            return  # Current row owner and general response each add CFM exactly once.
         if self._compact_contact_boundary:
             return  # Both complete owners already add the original row CFM exactly once.
         model = self.model
@@ -9863,9 +9795,6 @@ class SolverFeatherPGS(SolverBase):
             if self._row_packets is None:
                 self.diag.zero_()
             return 2
-        if self._row_packets is not None:
-            self._row_packets.diagonal()
-            return 0
         if self._compact_contact_boundary:
             wp.launch(
                 response_builds_rows.sparse_pair_limit_kernel,
@@ -9885,8 +9814,6 @@ class SolverFeatherPGS(SolverBase):
             return 0
         if self._sparse_mass_matrix_size is not None:
             # Sparse producers write the diagonal; unfused controls add CFM separately.
-            return 0
-        if self._paired_response_primary_size is not None:
             return 0
         self.diag.zero_()
         if self._sparse_diagonal_contact_solve:

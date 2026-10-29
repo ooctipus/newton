@@ -637,45 +637,6 @@ class LocalRowPackets:
                 device=solver.model.device,
             )
 
-    def response(self, size):
-        """Run the held-L response on the compact general-world queue."""
-        from .response_builds_dense import response_queue_kernel  # noqa: PLC0415 - the build reads this module
-
-        solver = self.solver
-        wp.launch_tiled(
-            response_queue_kernel(),
-            dim=[self.workers],
-            inputs=[
-                self.workers,
-                self.queue,
-                solver.world_response_group_art_start[size],
-                solver.world_response_group_to_art[size],
-                solver.art_group_idx,
-                solver.articulation_world_dof_offset,
-                size,
-                solver.L_by_size[size],
-                solver.J_by_size[size],
-                solver.Y_by_size[size],
-                solver.J_world,
-                solver.Y_world,
-            ],
-            block_dim=32,
-            device=solver.model.device,
-        )
-
-    def diagonal(self):
-        """Keep private CFM seeds and finalize only complete general response diagonals."""
-        from .response_builds_dense import diagonal_queue_kernel  # noqa: PLC0415 - the build reads this module
-
-        solver = self.solver
-        wp.launch_tiled(
-            diagonal_queue_kernel(),
-            dim=[self.workers],
-            inputs=[self.workers, self.prefix, self.queue, solver.world_dof_count, solver.J_world, solver.Y_world],
-            block_dim=32,
-            device=solver.model.device,
-        )
-
 
 def decline(solver) -> str | None:
     """Why the local packet law does not admit the solver, or ``None`` when it may (its topology decides next).

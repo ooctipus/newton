@@ -1412,8 +1412,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 self.assertEqual(paired_solver._friction_anchors_enabled, label == "patch")
                 self.assertEqual(paired_solver._paired_response_primary_size, 23)
                 self.assertEqual(paired_solver._paired_response_secondary_size, 6)
-                # The packed rows' build serves the paired worlds: no paired response is built.
-                self.assertIsNone(paired_solver._paired_response_kernel)
                 self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
                 self.assertTrue(paired_solver._paired_factor_coordinates)
                 self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)

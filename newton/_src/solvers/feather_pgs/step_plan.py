@@ -147,15 +147,11 @@ class StepPlan:
     held-tree owner, whose predictor replaces the stage."""
     response: Mapping[int, Route]
     """Stage 4, per size: ``owner`` (a contact owner publishes the response), ``sparse_diagonal``,
-    ``paired_secondary`` (solved with the primary), ``paired``, ``packed`` (only the packed rows' build: none reads
-    the response), ``fused`` (with the Delassus), ``diagonal``, ``grouped``, ``tiles``, ``packets``, ``lanes`` or
-    ``rows``."""
+    ``packed`` (only the packed rows' build: none reads the response), ``fused`` (with the Delassus), ``diagonal``,
+    ``grouped``, ``tiles``, ``lanes`` or ``rows``."""
     delassus: Mapping[int, Route]
     """Stage 4, per size, split mode's Delassus assembly: ``tiles`` or ``entries``; empty where none is assembled."""
     solve: SolveRoute
-    gather_sizes: tuple[int, ...]
-    """Stage 5 of the matrix-free family: the sizes whose group-layout J and Y are gathered into world layout; none
-    where the response is written in world layout, aliases it, or a sparse owner keeps no dense response."""
     unread_mass_sizes: tuple[int, ...]
     """Sizes whose dense mass matrix no stage reads: every size under a held-tree owner, which refreshes the factors
     from its own geometry (stage 2 reads no H). Their end-of-step clear is skipped."""
@@ -177,16 +173,6 @@ class StepPlan:
             response=MappingProxyType(response),
             delassus=MappingProxyType(_delassus(solver, solve, response)),
             solve=solve,
-            gather_sizes=tuple(solver.size_groups)
-            if solve.family == "matrix_free"
-            and not (
-                solver._jy_world_aliased
-                or solver._hinv_jt_writes_world
-                or solver._packed_response
-                or solver._sparse_diagonal_contact_solve
-                or solver._sparse_mass_matrix_size is not None
-            )
-            else (),
             unread_mass_sizes=tuple(solver.size_groups) if held else (),
             jacobian_clear_sizes=()
             if solver._row_packets is not None or solver._keyed_rows is not None
@@ -219,7 +205,6 @@ class StepPlan:
             "response": table(self.response),
             "delassus": table(self.delassus) if self.delassus else None,
             "solve_family": self.solve.family,
-            "gather_dofs": [int(size) for size in self.gather_sizes],
             "unread_mass_dofs": sorted(int(size) for size in self.unread_mass_sizes),
             "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
@@ -297,10 +282,6 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
                 route = Route(
                     "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
                 )
-            elif size == solver._paired_response_secondary_size:
-                route = Route("paired_secondary", "The paired response solves this size with its primary.")
-            elif size == solver._paired_response_primary_size:
-                route = Route("paired", "One articulation and one free body per world share one response.")
         if route is None and plan.use_diagonal_mass(size):
             route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
         if route is None:
@@ -309,8 +290,6 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
                 name = "grouped"
             elif plan.use_tiled_hinv_jt(size):
                 name = "tiles"
-            elif solver._row_packets is not None:
-                name, reason = "packets", f"{reason} Local row packets solve their worlds' response; the rest per row."
             elif solver._local_internal_fast_path:
                 name, reason = "lanes", f"{reason} A warp per articulation, skipping the worlds local owners solve."
             else:
