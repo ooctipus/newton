@@ -23,6 +23,7 @@ from ...sim import ModelFlags
 from . import field_group
 from .contact_input import ContactInput, contact_frame
 from .contact_laws import CONTACT_LAW, contact_friction, contact_row_frame
+from .dense_rows import RowSupport, jacobian_row
 from .device_preludes import warp_stride
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
@@ -247,11 +248,14 @@ def materialize_general_rows(
     secondary: int,
     primary_offset: int,
     secondary_offset: int,
+    support: RowSupport,
     J_a: wp.array3d[float],
     J_b: wp.array3d[float],
 ):
     """Write the rows of the worlds the parallel tiers leave to the general sweep: those of more rows than the tiers
-    hold or with matrix-free rows. A warp per world (its lanes over the row coefficients) writes every coefficient,
+    hold or with matrix-free rows, at each articulation's side (:func:`.dense_rows.jacobian_row`; the packed rows are
+    dense, the parallel tiers read them at their coordinates). A warp per world (its lanes over the row coefficients)
+    writes every coefficient,
     a prefix row's unit coefficient from its key ``~(2 d + side)`` and a contact row's Jacobian entry at its row
     frame (:func:`.row_build.endpoint_projection`), and a contact row's records and rhs
     (:func:`.row_build.write_contact_row`)."""
@@ -284,10 +288,13 @@ def materialize_general_rows(
             value -= endpoint_projection(data, body_b, data.art1[c], size, local, p1, direction)
             if q == 0:
                 write_contact_row(data, law, c, r, True)
+        side = wp.where(size == primary, 0, 1)
+        art = z.maps.arts[world, side]
+        at = jacobian_row(support, z.maps.groups[world, side], art, wp.vec2i(art, -1))
         if size == primary:
-            J_a[z.maps.groups[world, 0], row, local] = value
+            J_a[at[0], row, at[1] + local] = value
         else:
-            J_b[z.maps.groups[world, 1], row, local] = value
+            J_b[at[0], row, at[1] + local] = value
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
@@ -440,8 +447,9 @@ class KeyedRows:
                 nb,
                 layout.primary_offset,
                 layout.secondary_offset,
-                s.J_by_size[na],
-                s.J_by_size[nb or na],
+                s._row_support(),
+                s._jacobian_rows(na),
+                s._jacobian_rows(nb or na),
             ],
             block_dim=32,
             device=s.model.device,

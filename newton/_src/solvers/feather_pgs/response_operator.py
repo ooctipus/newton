@@ -1065,15 +1065,14 @@ def _push_apply(delta: str, column: Callable[[str], str], lanes: Lanes, dofs: in
 @dataclass(frozen=True)
 class Articulation:
     """One articulation's block of a whitened row: ``size`` coordinates from ``offset`` (a constant named
-    ``offset_name``), its factor and Jacobian rows in the size group ``group`` of ``L`` and ``J``, its factor staged
-    from ``first`` in ``s_L`` (its reciprocal diagonal from ``first_inverse`` in ``s_Dinv``)."""
+    ``offset_name``), its factor in the size group ``group`` of ``L``, its factor staged from ``first`` in ``s_L``
+    (its reciprocal diagonal from ``first_inverse`` in ``s_Dinv``)."""
 
     size: int
     offset: int
     offset_name: str
     group: str
     L: str
-    J: str
     first: int
     first_inverse: int
     guard: str = ""
@@ -1100,7 +1099,7 @@ class WhitenedRows:
     (``ink_L_a``, ``ink_L_b``; the world's group indices in ``ink_meta``),
     staged with their reciprocal diagonals. ``A = Z^T Z``, so ``Z`` serves as
     both ``J^T`` and ``Y``. Each lane whitens its row of ``rows``: it stages
-    the row's physical Jacobian, the group rows ``ink_J_a``, ``ink_J_b``
+    the row's physical Jacobian, the world's packed rows ``packed_J``
     (``capacity`` rows a world) or the statements ``read`` (which write
     coordinate ``q`` to ``Zi[q * ZS]``), folds ``J_i v`` into the row's
     right-hand side, solves ``L Z_i = J_i^T`` in place per articulation
@@ -1128,11 +1127,11 @@ class WhitenedRows:
     def articulations(self) -> tuple[Articulation, ...]:
         """The primary articulation, then the secondary (in the worlds that hold one)."""
         na, nb = self.primary, self.secondary
-        primary = Articulation(na, self.primary_offset, "ink_oa", "ink_ga", "ink_L_a", "ink_J_a", 0, 0)
+        primary = Articulation(na, self.primary_offset, "ink_oa", "ink_ga", "ink_L_a", 0, 0)
         if not nb:
             return (primary,)
         secondary = Articulation(
-            nb, self.secondary_offset, "ink_ob", "ink_gb", "ink_L_b", "ink_J_b", na * na, na, guard="ink_gb >= 0"
+            nb, self.secondary_offset, "ink_ob", "ink_gb", "ink_L_b", na * na, na, guard="ink_gb >= 0"
         )
         return primary, secondary
 
@@ -1148,13 +1147,21 @@ class WhitenedRows:
         return f"{indent}float Jr[{D}];\n{indent}#pragma unroll\n{indent}for (int d = 0; d < {D}; ++d) Jr[d] = 0.0f;"
 
     def _read(self) -> str:
-        """Stage the row's physical Jacobian from the articulations' group rows, coordinate ``q`` at ``Zi[q * ZS]``."""
-        lines = []
+        """Stage the row's physical Jacobian from the world's packed rows (:mod:`.packed_rows`, dense: entry ``q`` is
+        coordinate ``q``), coordinate ``q`` at ``Zi[q * ZS]``: each articulation's entries where it is a side of the
+        row (the build leaves these worlds' rows unpadded)."""
+        lines = [
+            "const wp::vec2i sides_i = row_sides.data[(size_t)world * row_sides.shape[1] + i];",
+            "const int first_0 = sides_i[0] >= 0 ? articulation_world_dof_offset.data[sides_i[0]] : -1;",
+            "const int first_1 = sides_i[1] >= 0 ? articulation_world_dof_offset.data[sides_i[1]] : -1;",
+            f"const float* J_row = &packed_J.data[((size_t)world * {self.capacity} + i) * packed_J.shape[2]];",
+        ]
         for art in self.articulations:
             read = [
-                f"const float* {art.J}_row = &{art.J}.data[((size_t){art.group} * {self.capacity} + i) * {art.size}];",
-                "#pragma unroll",
-                f"for (int d = 0; d < {art.size}; ++d) Zi[({art.offset_name} + d) * ZS] = {art.J}_row[d];",
+                f"if (first_0 == {art.offset_name} || first_1 == {art.offset_name}) {{",
+                "    #pragma unroll",
+                f"    for (int d = 0; d < {art.size}; ++d) Zi[({art.offset_name} + d) * ZS] = J_row[{art.offset_name} + d];",
+                "}",
             ]
             lines.append(art.guarded("\n".join(read)))
         return _lines(lines, "        ")

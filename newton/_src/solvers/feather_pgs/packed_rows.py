@@ -7,10 +7,11 @@ A dense row touches at most two articulations, its sides (:func:`.dense_rows.row
 the second or none. Packed, a row holds its sides' coordinates in order, the first side's, then the second's: entry
 ``e`` of a side of ``n`` coordinates is the side's coordinate ``e``, world coordinate ``offset + e``, so a row's
 entries ascend with the world's coordinates. An entry's world coordinate is not stored: it follows from the row's
-sides (``_row_sides``, :class:`.kernels.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
+sides (``_row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
 
-* the row's Jacobian ``J`` (``_packed_J``), which the velocity terms outside the sweeps read with the physical
-  velocity (:func:`.kernels.world_contact_row_dot`);
+* the row's Jacobian ``J`` (``_packed_J``), which the row producers write at the row's sides
+  (:func:`.dense_rows.jacobian_row`) and the velocity terms outside the sweeps read with the physical velocity
+  (:func:`.kernels.world_contact_row_dot`);
 * its whitened form ``Z = L^-1 P J^T`` (``_packed_Z``) through the side's leaf-first factor ``L``, in the kit's
   positions: factor coordinate ``i`` of a side at its entry ``n - 1 - i``
   (:class:`.response_operator.CholeskySolve`).
@@ -25,9 +26,10 @@ The rows' width ``S`` (``support``) comes from the data: the most coordinates tw
 (:func:`support_width`). Where that is every coordinate of the widest world (worlds of one or two articulations), the
 rows are laid out ``dense``: entry ``e`` is world coordinate ``e`` and the coordinates outside the row's sides hold
 zero (coordinate -1), so a row is also its dense row over the world, the form the routes that hold a world's
-coordinates on lanes read. The producers write each row's Jacobian by size group and record its sides; the build
-(:func:`pack_kernel`, one launch) packs and whitens the rows the routes read and forms their diagonals
-(the parallel tiers whiten their worlds' rows in the kernel: the build leaves them without a warm start). The
+coordinates on lanes read. The producers write each row's sides whole, zeros included, and record its sides: the
+rows are never cleared. The build (:func:`pack_kernel`, one launch) whitens the rows the routes read, zeroes their
+entries past the sides and forms their diagonals (the parallel tiers whiten their worlds' rows in the kernel from
+the rows' sides: the build leaves them without a warm start). The
 warm start applies the rows' impulses through them (:func:`apply_kernel`), and bilateral pre-elimination corrects
 them (:data:`.response_builds_rows.ELIMINATION`) and projects the velocity onto its blocks (:func:`project_kernel`).
 """
@@ -65,11 +67,19 @@ _PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINAT
         const int off1 = a1 >= 0 ? articulation_world_dof_offset.data[a1] : 0;
         if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
         return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
+    };
+    // PACKED_FIRST(sides, art): the entry where articulation art's side of a row with these sides starts, -1 when it
+    // is not one of them (dense_rows.jacobian_row).
+    const auto PACKED_FIRST = [&](const wp::vec2i sides, const int art) {
+        if (art < 0 || (art != sides[0] && art != sides[1])) return -1;
+        if (packed_dense != 0) return articulation_world_dof_offset.data[art];
+        return art == sides[0] ? 0 : response_dofs.data[sides[0]];
     };"""
 
 PACKED_SIDES = DevicePrelude("packed_sides", _PACKED_SIDES, _PACKED_SIDES)
-"""``PACKED_COORDINATE(sides, e)`` for native sources that take ``response_dofs``, ``articulation_world_dof_offset``
-and ``packed_dense``: a packed row's coordinates from its sides (no stored coordinates)."""
+"""``PACKED_COORDINATE(sides, e)`` and ``PACKED_FIRST(sides, art)`` for native sources that take ``response_dofs``,
+``articulation_world_dof_offset`` and ``packed_dense``: a packed row's coordinates and sides from its sides (no stored
+coordinates)."""
 
 
 def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_count: int) -> int:
@@ -94,12 +104,10 @@ def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_cou
 
 
 def _pack_abi(sizes: tuple[int, ...]) -> tuple:
-    """The rows' build: each side size's factors and Jacobian rows (``L_<n>``, ``J_<n>``), every row's sides and the
-    articulations' sizes, group indices and first world coordinates, the rows per world and their owners (the worlds
-    other sweeps own skipped: :func:`_skipped`), the rows' ``cfm``, the packed rows and the diagonal."""
-    factors = []
-    for n in sizes:
-        factors += [(f"L_{n}", wp.array3d[float]), (f"J_{n}", wp.array3d[float])]
+    """The rows' build: each side size's factors (``L_<n>``), every row's sides and the articulations' sizes, group
+    indices and first world coordinates, the rows per world and their owners (the worlds other sweeps own skipped:
+    :func:`_skipped`), the rows' ``cfm``, the packed rows and the diagonal."""
+    factors = [(f"L_{n}", wp.array3d[float]) for n in sizes]
     return kernel_template.params(
         *factors,
         ("row_sides", wp.array2d[wp.vec2i]),
@@ -137,7 +145,7 @@ thread-local row."""
 
 
 def _side(n: int) -> str:
-    """A side of ``n`` coordinates on its row's thread: copy its Jacobian, whiten it in registers
+    """A side of ``n`` coordinates on its row's thread: load its Jacobian, whiten it in registers
     (:class:`.CholeskySolve`, Z0: a zero diagonal gives zero), store it and add its squares to ``norm`` in entry
     order."""
 
@@ -148,14 +156,9 @@ def _side(n: int) -> str:
     solve = CholeskySolve(n, L, unroll=n <= _UNROLLED_SIDE)
     pragma = "#pragma unroll" if n <= _UNROLLED_SIDE else "#pragma unroll 1"
     return f"""        if (n == {n}) {{
-            const float* J = &J_{n}.data[((size_t)group * J_{n}.shape[1] + slot) * {n}];
             float z[{n}];
             {pragma}
-            for (int e = 0; e < {n}; ++e) {{
-                const float j = J[e];
-                packed_J.data[base + e] = j;
-                z[e] = j;
-            }}
+            for (int e = 0; e < {n}; ++e) z[e] = packed_J.data[base + e];
 {solve.whiten(lambda i: f"z[{i}]", lambda i: f"z[{i}]")}
             {pragma}
             for (int e = 0; e < {n}; ++e) {{
@@ -167,15 +170,14 @@ def _side(n: int) -> str:
 
 @functools.cache
 def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
-    """Pack every world's rows, one thread per world row (``dim = worlds * rows``): copy each side's Jacobian, whiten
-    it on the thread (Z0: a zero diagonal gives zero) and store it, each entry once; pad the row past its sides (zero
-    values); and, in the worlds the general solver owns, store its diagonal by
+    """Whiten every world's rows, one thread per world row (``dim = worlds * rows``): each side's Jacobian, which its
+    producer wrote packed, whitened on the thread (Z0: a zero diagonal gives zero) and stored, each entry once; pad
+    the row past its sides (zero values); and, in the worlds the general solver owns, store its diagonal by
     ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner adds ``cfm`` after), 2 ``|Z|^2 + cfm``, the squares summed
     in entry order.
 
-    ``sizes`` are the side sizes with a dense factor (each a ``L_<n>``, ``J_<n>`` pair); a side of another size is
-    left as it is. Consecutive threads hold one world's rows, so a side's factor reads are the same address across a
-    warp.
+    ``sizes`` are the side sizes with a dense factor (each a ``L_<n>``); a side of another size is left as it is.
+    Consecutive threads hold one world's rows, so a side's factor reads are the same address across a warp.
     """
     sizes = tuple(int(n) for n in sizes)
     sides = "\n".join(_side(n) for n in sizes)

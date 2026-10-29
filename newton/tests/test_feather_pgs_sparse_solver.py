@@ -536,7 +536,9 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertGreater(solver.J_by_size[9].size, 1)
+                # The existing path: the matrix-free sweeps, whose producers write the packed rows.
+                self.assertTrue(solver._mf_sweeps)
+                self.assertGreater(solver._packed_J.size, 1)
 
     def test_warm_starts_are_admitted(self):
         """Warm starts seed the sparse sweeps from carried impulses on models without free rigid bodies."""

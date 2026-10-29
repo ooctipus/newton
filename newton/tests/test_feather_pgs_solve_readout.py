@@ -46,6 +46,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import local_packed_rows
 
 SWEEPS = SolvePolicy(readout="sweeps")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -200,7 +201,6 @@ class _LocalCase:
         row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
         candidates = wp.array([0, 1], dtype=wp.int32, device=device)
         lower_group = wp.array(np.stack([lower, np.eye(dofs, dtype=np.float32)]), dtype=wp.float32, device=device)
-        jacobian_group = wp.array(jacobian, dtype=wp.float32, device=device)
         # Outputs: the diagonal (initially the compliance), the impulses and the articulations' velocities.
         self.initial = (
             wp.array(cfm, dtype=wp.float32, device=device),
@@ -219,9 +219,8 @@ class _LocalCase:
             wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
             wp.array([2, 1], dtype=wp.int32, device=device),
             lower_group,
-            jacobian_group,
             lower_group,
-            jacobian_group,
+            *local_packed_rows(device, [0, 1], jacobian),
             wp.array(rhs, dtype=wp.float32, device=device),
             wp.array(row_type, dtype=wp.int32, device=device),
             wp.full((2, rows), -1, dtype=wp.int32, device=device),

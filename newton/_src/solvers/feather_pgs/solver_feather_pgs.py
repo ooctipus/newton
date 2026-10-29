@@ -81,9 +81,9 @@ from .contact_torsion import (
     validate_torsion_step,
 )
 from .contact_unit import CONTACT_UNIT_STATE_FIELDS, RING_BLOCK_SIZE, check_contact_update
+from .dense_rows import RowSupport, bind_mf_body_map
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
-from .dense_rows import bind_mf_body_map
 from .device_preludes import lane_group
 from .field_group import SolverArrays
 from .friction_patches import (
@@ -102,7 +102,6 @@ from .kernels import (
     PREELIM_MAX_ROWS,
     RIGID_SPEED_ROWS,
     BodyFactors,
-    RowSupport,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
@@ -3459,7 +3458,7 @@ class SolverFeatherPGS(SolverBase):
                     self.connect_slot if self.connect_slot is not None else self._dummy_is_free_rigid,
                     self._connect_art if self._connect_count else self._dummy_is_free_rigid,
                     int(self._connect_count or 0),
-                    self.J_by_size[size],
+                    self._packed_J,
                     self._packed_Z,
                     size,
                 ],
@@ -4908,7 +4907,8 @@ class SolverFeatherPGS(SolverBase):
                 self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size
             )
             factor = 1 if compact_diagonal_mass else 0
-            response = 1 if sparse_response else 0
+            # The matrix-free sweeps' producers write the packed rows (_jacobian_rows): no size group's Jacobian.
+            response = 1 if sparse_response or self._mf_sweeps else 0
             # The matrix-free sweeps read the packed rows: no route reads a size group's response.
             y = 1 if sparse_response or self._mf_sweeps else 0
             sizes = {
@@ -5836,9 +5836,12 @@ class SolverFeatherPGS(SolverBase):
                     self._local_solve_owner,
                     self.constraint_count,
                     self.L_by_size[primary_size],
-                    self.J_by_size[primary_size],
                     self.L_by_size[secondary_group_size],
-                    self.J_by_size[secondary_group_size],
+                    self._packed_J,
+                    self._row_sides,
+                    self.articulation_response_dof_count,
+                    self.articulation_world_dof_offset,
+                    int(self._packed_dense),
                     dense_rhs,
                     self.row_type,
                     self.row_parent,
@@ -8234,9 +8237,14 @@ class SolverFeatherPGS(SolverBase):
         dense_dropped_rows = self._row_dropped_dense
         mf_dropped_rows = self._row_dropped_mf
         mf_first_rejected_slot = self._mf_first_rejected_slot if mf_active else self._dummy_mf_slot_counter
+        # The packed rows are never cleared: every producer writes its rows' sides whole (dense_rows.clear_side).
         j_buffers_zeroed = (
-            self._sparse_mass_matrix_size is not None or self._row_packets is not None or self._keyed_rows is not None
+            self._mf_sweeps
+            or self._sparse_mass_matrix_size is not None
+            or self._row_packets is not None
+            or self._keyed_rows is not None
         )
+        support = self._row_support()
         if self._compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
 
@@ -8269,7 +8277,7 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
 
-            if self._H_bufs is None:
+            if self._H_bufs is None and not self._mf_sweeps:
                 for size in self.size_groups:
                     self.J_by_size[size].zero_()
                 j_buffers_zeroed = True
@@ -8287,9 +8295,10 @@ class SolverFeatherPGS(SolverBase):
                         self._vel_limit_skip_driven,
                         self.drive_slot,
                         self.group_to_art[size],
+                        support,
                     ],
                     outputs=[
-                        self.J_by_size[size],
+                        self._jacobian_rows(size),
                         dense_rows,
                         self.drive_stiffness,
                         self.drive_damping,
@@ -8377,8 +8386,9 @@ class SolverFeatherPGS(SolverBase):
                         state_in.joint_q,
                         self.pgs_beta,
                         self.pgs_cfm,
+                        support,
                     ],
-                    outputs=[self.J_by_size[size], dense_rows],
+                    outputs=[self._jacobian_rows(size), dense_rows],
                     device=model.device,
                 )
 
@@ -8418,8 +8428,9 @@ class SolverFeatherPGS(SolverBase):
                         self.articulation_origin,
                         self.pgs_beta,
                         self.pgs_cfm,
+                        support,
                     ],
-                    outputs=[self.J_by_size[size], dense_rows],
+                    outputs=[self._jacobian_rows(size), dense_rows],
                     device=model.device,
                 )
 
@@ -8502,8 +8513,9 @@ class SolverFeatherPGS(SolverBase):
                             self.group_to_art[size],
                             self._resolved_worlds,
                             law,
+                            support,
                         ],
-                        outputs=[self.J_by_size[size]],
+                        outputs=[self._jacobian_rows(size)],
                         block_dim=32 * _JOINT_LIMIT_WARPS_PER_BLOCK,
                         device=model.device,
                     )
@@ -8520,8 +8532,14 @@ class SolverFeatherPGS(SolverBase):
                             self.pgs_beta,
                             self.pgs_cfm,
                             self._resolved_worlds,
+                            support,
                         ],
-                        outputs=[self.slot_counter, self._dense_first_rejected_slot, self.J_by_size[size], dense_rows],
+                        outputs=[
+                            self.slot_counter,
+                            self._dense_first_rejected_slot,
+                            self._jacobian_rows(size),
+                            dense_rows,
+                        ],
                         device=model.device,
                     )
 
@@ -8633,8 +8651,9 @@ class SolverFeatherPGS(SolverBase):
                         self.group_to_art[size],
                         self.pgs_cfm,
                         int(size),
+                        support,
                     ],
-                    outputs=[self.J_by_size[size], dense_rows],
+                    outputs=[self._jacobian_rows(size), dense_rows],
                     device=model.device,
                 )
 
@@ -8777,8 +8796,8 @@ class SolverFeatherPGS(SolverBase):
                     pool.launch(
                         populate_world_J_for_compact_size,
                         (contact_jacobian_workers, 32),
-                        inputs=[contact_input, contact_jacobian_workers, size, self.art_group_idx, law],
-                        outputs=[self.J_by_size[size]],
+                        inputs=[contact_input, contact_jacobian_workers, size, self.art_group_idx, law, support],
+                        outputs=[self._jacobian_rows(size)],
                         extent=count,
                         clamp=True,
                     )
@@ -8835,8 +8854,8 @@ class SolverFeatherPGS(SolverBase):
                             jacobian_threads = rows_threads * lanes
                         else:
                             size_a, size_b, lanes, jacobian_threads = size, -1, size, rows_threads * 32
-                        J_a = self.J_by_size[size_a]
-                        J_b = self.J_by_size[size_b] if size_b > 0 else J_a
+                        J_a = self._jacobian_rows(size_a)
+                        J_b = self._jacobian_rows(size_b) if size_b > 0 else J_a
                         pool.launch(
                             contact_row_prelude,
                             rows_threads * 3,
@@ -8849,7 +8868,16 @@ class SolverFeatherPGS(SolverBase):
                         pool.launch(
                             populate_world_J_masked,
                             jacobian_threads,
-                            inputs=[contact_input, jacobian_threads, size_a, size_b, self.art_group_idx, law, flags],
+                            inputs=[
+                                contact_input,
+                                jacobian_threads,
+                                size_a,
+                                size_b,
+                                self.art_group_idx,
+                                law,
+                                flags,
+                                support,
+                            ],
                             outputs=[J_a, J_b],
                             extent=count,
                             scale=lanes,
@@ -8868,8 +8896,9 @@ class SolverFeatherPGS(SolverBase):
                             model.joint_ancestor,
                             model.joint_qd_start,
                             law,
+                            support,
                         ],
-                        outputs=[self.J_by_size[size]],
+                        outputs=[self._jacobian_rows(size)],
                         extent=count,
                         clamp=True,
                     )
@@ -9298,15 +9327,23 @@ class SolverFeatherPGS(SolverBase):
         self._hinv_jt_diag_sizes = frozenset()
 
     def _row_support(self) -> RowSupport:
-        """Where the packed rows' entries sit (:class:`.kernels.RowSupport`): their sides, the articulations'
-        coordinates and first world coordinates, and the layout. Without the matrix-free sweeps there are no packed
-        rows and no reader runs: the coordinate offsets are a one-entry placeholder."""
+        """Where the dense rows' Jacobian entries sit (:class:`.dense_rows.RowSupport`): the matrix-free sweeps' packed
+        rows (their sides, the articulations' coordinates, first world coordinates and worlds, and the layout), or
+        each size group's rows. Without the matrix-free sweeps there are no packed rows: the articulations' offsets and
+        worlds are one-entry placeholders."""
         support = RowSupport()
         support.sides = self._row_sides
         support.dofs = self.articulation_response_dof_count
         support.offset = self.articulation_world_dof_offset if self._mf_sweeps else self._dummy_is_free_rigid
+        support.world = self.art_to_world if self._mf_sweeps else self._dummy_is_free_rigid
         support.dense = int(self._packed_dense)
+        support.packed = int(self._mf_sweeps)
         return support
+
+    def _jacobian_rows(self, size: int) -> wp.array:
+        """The Jacobian rows the producers of a size's rows write (:func:`.dense_rows.jacobian_row`): the packed rows
+        (:mod:`.packed_rows`) under the matrix-free sweeps, else the size group's rows."""
+        return self._packed_J if self._mf_sweeps else self.J_by_size[size]
 
     def _stage4_pack_rows(self, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
@@ -9325,7 +9362,7 @@ class SolverFeatherPGS(SolverBase):
             packed_rows.pack_kernel(sizes),
             dim=self.world_count * self.dense_max_constraints,
             inputs=[
-                *(array for size in sizes for array in (self.L_by_size[size], self.J_by_size[size])),
+                *(self.L_by_size[size] for size in sizes),
                 self._row_sides,
                 self.articulation_response_dof_count,
                 self.art_group_idx,
@@ -9423,11 +9460,11 @@ class SolverFeatherPGS(SolverBase):
 
     def _inkernel_response_inputs(self) -> list:
         """The parallel tiers' in-kernel response operands: the worlds' group indices, the primary and secondary
-        groups' factors and Jacobian rows (the primary's for a model without a secondary), and the rows' cfm."""
+        groups' factors (the primary's for a model without a secondary), the packed rows' Jacobian and the rows'
+        cfm."""
         na, nb = self._ink_sizes[0], self._ink_sizes[1]
         L_b = self.L_by_size[nb] if nb else self.L_by_size[na]
-        J_b = self.J_by_size[nb] if nb else self.J_by_size[na]
-        return [self._ink_meta, self.L_by_size[na], L_b, self.J_by_size[na], J_b, self.row_cfm]
+        return [self._ink_meta, self.L_by_size[na], L_b, self._packed_J, self.row_cfm]
 
     def _admit_parallel_contact_paths(self) -> tuple[bool, str]:
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
@@ -10571,27 +10608,40 @@ _JOINT_LIMIT_WARP_PARAMS = kernel_template.params(
     ("group_to_art", wp.array[int]),
     ("resolved_worlds", wp.array[int]),
     ("law", prefix_rows.PrefixLaw),
+    ("support", RowSupport),
     ("J_group", wp.array3d[float]),
 )
-"""The warp joint-limit row builder's operands."""
+"""The warp joint-limit row builder's operands: the rows' placement and Jacobian rows (:func:`.dense_rows.jacobian_row`:
+the packed rows, by world, or the size group's)."""
 
 
 @cache
 def _get_joint_limit_warp_kernel(size: int, warps_per_block: int) -> "wp.Kernel":
     """Build the general route's joint-limit rows, one warp per articulation (:func:`.prefix_rows.prefix_rows`)."""
+    # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficient), or the size
+    # group's row (cleared each step).
+    sink = f"""            float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
+            if (support.packed != 0) {{
+                for (int e = 0; e < {size}; ++e) J_side[e] = 0.0f;
+            }}
+            J_side[d0] = w0;"""
     rows = prefix_rows.prefix_rows(
         ((prefix_rows.limits(tuple(range(size)), "first_dof + d", "law."),),),
         law="law.",
-        sink=f"            J_group.data[(group * J_group.shape[1] + slot) * {size} + d0] = w0;",
+        sink=sink,
         ordered=False,
         rhs=False,
-        side="group_to_art.data[group]",
+        side="art",
     )
     snippet = f"""    const int group = block * {warps_per_block} + SUB;
     if (group >= articulation_count) return;
-    const int world = art_to_world.data[group_to_art.data[group]];
+    const int art = group_to_art.data[group];
+    const int world = art_to_world.data[art];
     if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
-    const int first_dof = articulation_dof_start.data[group_to_art.data[group]];
+    const int first_dof = articulation_dof_start.data[art];
+    // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
+    const int row_index = support.packed != 0 ? world : group;
+    const int first = support.packed != 0 && support.dense != 0 ? support.offset.data[art] : 0;
 {rows}#endif
 """
     return KernelTemplate(

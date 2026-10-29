@@ -608,7 +608,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             trajectories.append(history)
 
         self.assertEqual(cleared_shapes[id(optimized)], [(2, 64, 3)] * 3)
-        self.assertCountEqual(cleared_shapes[id(reference)], [(2, 64, 16), (2, 64, 3)] * 3)
+        # The reference's matrix-free sweeps read the packed rows, which their producers write whole: no group rows.
+        self.assertEqual(cleared_shapes[id(reference)], [])
 
         first_q, first_qd = trajectories[0][0]
         np.testing.assert_allclose(first_q.reshape(2, 19)[:, :16], -0.104, rtol=0.0, atol=2.0e-6)

@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from newton.tests.feather_pgs_law_harness import group_rows
 from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
 from newton.tests.test_feather_pgs_contact_torsion import PATCH_OPTIONS, fixture
 
@@ -159,6 +160,18 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         group_to_art={size: arr(np.flatnonzero(response_sizes == size).astype(np.int32), int) for size in (3, 6)},
         J_by_size={size: zero((worlds, dense, size)) for size in (3, 6)},
     )
+    # A size-group solver: the producers write each size group's rows (dense_rows.jacobian_row).
+    solver.size_groups = [3, 6]
+    solver.n_arts_by_size = {size: solver.group_to_art[size].shape[0] for size in solver.size_groups}
+    solver._mf_sweeps = False
+
+    def row_support():
+        support = group_rows(model.device)
+        support.sides = solver._row_sides
+        return support
+
+    solver._row_support = row_support
+    solver._jacobian_rows = lambda size: solver.J_by_size[size]
     for name in ("row_beta", "row_cfm", "phi", "target_velocity", "row_restitution"):
         setattr(solver, name, zero((worlds, dense)))
     return solver, state, augmented, contacts

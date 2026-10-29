@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
+from newton.tests.feather_pgs_law_harness import group_rows
 
 
 def _mixed_target_model(coord_layout, device):
@@ -214,6 +215,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         0,
                         wp.array(slots, dtype=int, device=device),
                         wp.array(joints, dtype=int, device=device),
+                        group_rows(device),
                     ],
                     outputs=[
                         wp.zeros((4, 2, 1), dtype=float, device=device),

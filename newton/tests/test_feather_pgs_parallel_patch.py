@@ -1403,7 +1403,12 @@ def _launch_parallel(tier, case, *, device):
     L = case["L"].astype(np.float32)[None]
     values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
     values["ink_L_a"] = wp.array(L, dtype=wp.float32, device=device)
-    values["ink_J_a"] = wp.array(J, dtype=wp.float32, device=device)
+    # The world's packed rows (dense): every row on articulation 0, its coordinates from 0.
+    values["packed_J"] = wp.array(J, dtype=wp.float32, device=device)
+    values["row_sides"] = wp.array(np.tile([0, -1], (1, _CAPACITY, 1)).astype(np.int32), dtype=wp.vec2i, device=device)
+    values["response_dofs"] = wp.array([_DOFS], dtype=wp.int32, device=device)
+    values["articulation_world_dof_offset"] = wp.zeros(1, dtype=wp.int32, device=device)
+    values["packed_dense"] = 1
     arguments = {arg.label: arg for arg in kernel.adj.args}
     inputs = [
         values[name] if name in values else _dummy(arguments[name])

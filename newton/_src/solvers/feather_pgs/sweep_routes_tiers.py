@@ -51,8 +51,7 @@ PARALLEL_ABI = kernel_template.params(
     ("ink_meta", wp.array[int]),
     ("ink_L_a", wp.array3d[float]),
     ("ink_L_b", wp.array3d[float]),
-    ("ink_J_a", wp.array3d[float]),
-    ("ink_J_b", wp.array3d[float]),
+    ("packed_J", wp.array3d[float]),
     ("world_row_cfm", wp.array2d[float]),
     ("v_out", wp.array[float]),
 )

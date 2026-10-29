@@ -28,6 +28,7 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import row_supports
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
+from newton.tests.feather_pgs_law_harness import group_rows
 from newton.tests.feather_pgs_patch_parity import row_law, standing_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_path_selection import _cpu_model
@@ -151,7 +152,7 @@ class TestContactRecordBuilder(unittest.TestCase):
         wp.launch(
             populate_world_J_for_compact_size,
             dim=(1, 32),
-            inputs=[compact, 1, 6, f["group"], row_law(f["patches"])],
+            inputs=[compact, 1, 6, f["group"], row_law(f["patches"]), group_rows(device)],
             outputs=[dense],
             device=device,
         )

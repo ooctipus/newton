@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs import (
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
+from newton.tests.feather_pgs_law_harness import group_rows
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -268,6 +269,8 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "mf_constraint_count": wp.zeros(2, dtype=int, device=aux.device),
         "skip_rows_le": 0,
     }
+
+    values["support"] = group_rows(aux.device)
 
     def launch(kernel, dim):
         args = [values[name] for name in inspect.signature(kernel.func).parameters]

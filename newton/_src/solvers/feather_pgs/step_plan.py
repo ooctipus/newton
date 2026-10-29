@@ -157,8 +157,9 @@ class StepPlan:
     from its own geometry (stage 2 reads no H). Their end-of-step clear is skipped."""
     jacobian_clear_sizes: tuple[int, ...]
     """End of a double-buffered step: the sizes whose active Jacobian rows are cleared for the buffer's next use;
-    none under owners that keep a private Jacobian (local row packets, keyed rows), and never the sparse-diagonal
-    response size (no dense J) or the compact producer's six-coordinate size (complete stores)."""
+    none under the matrix-free sweeps (their producers write the packed rows' sides whole) or owners that keep a
+    private Jacobian (local row packets, keyed rows), and never the sparse-diagonal response size (no dense J) or the
+    compact producer's six-coordinate size (complete stores)."""
 
     @classmethod
     def build(cls, solver) -> StepPlan:
@@ -175,7 +176,7 @@ class StepPlan:
             solve=solve,
             unread_mass_sizes=tuple(solver.size_groups) if held else (),
             jacobian_clear_sizes=()
-            if solver._row_packets is not None or solver._keyed_rows is not None
+            if solver._mf_sweeps or solver._row_packets is not None or solver._keyed_rows is not None
             else tuple(
                 size
                 for size in solver.size_groups

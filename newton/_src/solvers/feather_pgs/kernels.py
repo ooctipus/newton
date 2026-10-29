@@ -32,7 +32,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .dense_rows import DenseRows, MfRows
+from .dense_rows import DenseRows, MfRows, RowSupport, clear_side, jacobian_row, row_sides
 from .device_preludes import (
     dual_native,
     lane_group,
@@ -1264,6 +1264,7 @@ def populate_physx_drive_J_for_size(
     fuse_vel_limits: int,
     drive_slot: wp.array[int],
     group_to_art: wp.array[int],
+    support: RowSupport,
     # outputs
     J_group: wp.array3d[float],
     rows: DenseRows,
@@ -1310,7 +1311,9 @@ def populate_physx_drive_J_for_size(
                 continue
 
             local_dof = dof - dof_start
-            J_group[group_idx, slot, local_dof] = 1.0
+            at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+            clear_side(support, J_group, at, slot, art)
+            J_group[at[0], slot, at[1] + local_dof] = 1.0
 
             stiffness = joints.joint_target_ke[dof]
             damping = joints.joint_target_kd[dof]
@@ -1335,18 +1338,6 @@ def populate_physx_drive_J_for_size(
                 if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
                     qdot_max = float(wp.inf)
                 world_drive_vel_limit[world, slot] = qdot_max
-
-
-@wp.struct
-class RowSupport:
-    """Where a packed dense row's entries sit (:mod:`.packed_rows`): its sides (``row_sides``: articulation indices,
-    the first by index, -1 for none), each articulation's coordinates and first world coordinate, and the layout
-    (``dense``: entry ``e`` is world coordinate ``e``; else the first side's entries, then the second's)."""
-
-    sides: wp.array2d[wp.vec2i]
-    dofs: wp.array[int]
-    offset: wp.array[int]
-    dense: int
 
 
 @wp.kernel
@@ -1446,6 +1437,7 @@ def build_joint_limit_rows_for_size(
     pgs_beta: float,
     pgs_cfm: float,
     resolved_worlds: wp.array[int],
+    support: RowSupport,
     # outputs
     world_slot_counter: wp.array[int],
     first_rejected_slot: wp.array[int],
@@ -1485,7 +1477,9 @@ def build_joint_limit_rows_for_size(
                 if slot < 0:
                     continue
 
-                J_group[group_idx, slot, local_dof] = sign
+                at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+                clear_side(support, J_group, at, slot, art)
+                J_group[at[0], slot, at[1] + local_dof] = sign
                 rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                 rows.sides[world, slot] = wp.vec2i(art, -1)
                 rows.row_parent[world, slot] = -1
@@ -1544,6 +1538,7 @@ def populate_mimic_J_for_size(
     joint_q: wp.array[float],
     pgs_beta: float,
     pgs_cfm: float,
+    support: RowSupport,
     # outputs
     J_group: wp.array3d[float],
     rows: DenseRows,
@@ -1573,8 +1568,10 @@ def populate_mimic_J_for_size(
 
         # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
         # DOFs are guaranteed distinct by the host-side validity mask.
-        J_group[group_idx, slot, mimics.dof0[k] - dof_start] = 1.0
-        J_group[group_idx, slot, mimics.dof1[k] - dof_start] = -c1
+        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+        clear_side(support, J_group, at, slot, art)
+        J_group[at[0], slot, at[1] + mimics.dof0[k] - dof_start] = 1.0
+        J_group[at[0], slot, at[1] + mimics.dof1[k] - dof_start] = -c1
 
         rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
         rows.sides[world, slot] = wp.vec2i(art, -1)
@@ -1645,6 +1642,7 @@ def populate_connect_J_for_size(
     articulation_origin: wp.array[wp.vec3],
     pgs_beta: float,
     pgs_cfm: float,
+    support: RowSupport,
     # outputs
     J_group: wp.array3d[float],
     rows: DenseRows,
@@ -1692,13 +1690,14 @@ def populate_connect_J_for_size(
         p_b = wp.transform_point(body_q[body_c], connects.anchor_c[k])
         origin = articulation_origin[art]
         delta = p_a - p_b
+        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
 
         for axis in range(3):
             slot = base_slot + axis
             # The two ancestor walks below ACCUMULATE (shared ancestors partially cancel),
             # so the row must start from zero regardless of buffer reuse policy.
             for d in range(n_dofs):
-                J_group[group_idx, slot, d] = 0.0
+                J_group[at[0], slot, at[1] + d] = 0.0
             e = wp.vec3(0.0, 0.0, 0.0)
             e[axis] = 1.0
             target = float(0.0)
@@ -1720,7 +1719,7 @@ def populate_connect_J_for_size(
                     joint_S_s,
                     dof_start,
                     n_dofs,
-                    group_idx,
+                    at,
                     slot,
                     J_group,
                 )
@@ -1736,7 +1735,7 @@ def populate_connect_J_for_size(
                 joint_S_s,
                 dof_start,
                 n_dofs,
-                group_idx,
+                at,
                 slot,
                 J_group,
             )
@@ -1749,17 +1748,17 @@ def populate_connect_J_for_size(
             # diagonal; truly degenerate rows are left inert (zero J, zero phi).
             norm_sq = float(0.0)
             for d in range(n_dofs):
-                norm_sq += J_group[group_idx, slot, d] * J_group[group_idx, slot, d]
+                norm_sq += J_group[at[0], slot, at[1] + d] * J_group[at[0], slot, at[1] + d]
             phi_axis = delta[axis]
             if norm_sq > 1.0e-8:
                 inv_norm = 1.0 / wp.sqrt(norm_sq)
                 for d in range(n_dofs):
-                    J_group[group_idx, slot, d] *= inv_norm
+                    J_group[at[0], slot, at[1] + d] *= inv_norm
                 phi_axis *= inv_norm
                 target *= inv_norm
             else:
                 for d in range(n_dofs):
-                    J_group[group_idx, slot, d] = 0.0
+                    J_group[at[0], slot, at[1] + d] = 0.0
                 phi_axis = 0.0
                 target = 0.0
 
@@ -1948,6 +1947,7 @@ def populate_joint_velocity_limit_J_for_size(
     group_to_art: wp.array[int],
     pgs_cfm: float,
     articulation_dof_count_of_size: int,
+    support: RowSupport,
     # outputs
     J_group: wp.array3d[float],
     rows: DenseRows,
@@ -1984,7 +1984,9 @@ def populate_joint_velocity_limit_J_for_size(
     qdot_max = joints.joint_velocity_limit[dof]
     sign = velocity_limit_sign[row_idx]
 
-    J_group[group_idx, slot, local_dof] = sign
+    at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+    clear_side(support, J_group, at, slot, art)
+    J_group[at[0], slot, at[1] + local_dof] = sign
 
     rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
     rows.sides[world, slot] = wp.vec2i(art, -1)
@@ -2418,11 +2420,12 @@ def accumulate_jacobian_row_world(
     joint_S_s: wp.array[wp.spatial_vector],
     art_dof_start: int,
     n_dofs: int,
-    group_idx: int,
+    at: wp.vec2i,
     row: int,
     J_group: wp.array3d[float],
 ):
-    """Accumulate Jacobian contributions by walking up the kinematic tree."""
+    """Accumulate Jacobian contributions by walking up the kinematic tree, into the side at ``at``
+    (:func:`.dense_rows.jacobian_row`) of row ``row``."""
     if body_index < 0:
         return
 
@@ -2432,7 +2435,7 @@ def accumulate_jacobian_row_world(
             local_dof = global_dof - art_dof_start
             if local_dof >= 0 and local_dof < n_dofs:
                 entry = jacobian_entry(joint_S_s[global_dof], direction, point_world, origin)
-                J_group[group_idx, row, local_dof] += sign * entry
+                J_group[at[0], row, at[1] + local_dof] += sign * entry
         curr_joint = joint_ancestor[curr_joint]
 
 
@@ -2459,10 +2462,12 @@ def populate_world_J_for_compact_size(
     target_size: int,
     art_group_idx: wp.array[int],
     law: PatchRowLaw,
+    support: RowSupport,
     # output
     J_group: wp.array3d[float],
 ):
-    """Project one dense contact row/DOF per lane for compact articulations."""
+    """Project one dense contact row/DOF per lane for compact articulations: every coordinate of each side of the
+    size, zeros included."""
     worker, lane = wp.tid()
     total_contacts = data.count[0]
     row = lane // target_size
@@ -2518,13 +2523,16 @@ def populate_world_J_for_compact_size(
                 value_b = -jacobian_entry(motion_b, direction, p1, data.origin[art_b])
 
         slot = data.slot[c] + row
+        sides = row_sides(art_a, art_b)
         if group_a >= 0:
+            at = jacobian_row(support, group_a, art_a, sides)
             if group_b == group_a:
-                J_group[group_a, slot, local_dof] = value_a + value_b
+                J_group[at[0], slot, at[1] + local_dof] = value_a + value_b
             else:
-                J_group[group_a, slot, local_dof] = value_a
+                J_group[at[0], slot, at[1] + local_dof] = value_a
         if group_b >= 0 and group_b != group_a:
-            J_group[group_b, slot, local_dof] = value_b
+            at = jacobian_row(support, group_b, art_b, sides)
+            J_group[at[0], slot, at[1] + local_dof] = value_b
 
 
 @wp.kernel
@@ -2742,14 +2750,15 @@ def populate_world_J_for_size(
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
     law: PatchRowLaw,
+    support: RowSupport,
     # outputs
     J_group: wp.array3d[float],
 ):
     """Populate active dense contacts for one articulation-size group with a capacity-independent launch.
 
     Each contact may contribute to multiple articulations' Jacobian matrices: each endpoint of the size walks its
-    kinematic chain into the pre-cleared Jacobian. Contacts routed to the matrix-free path (contact_path==1) are
-    skipped.
+    kinematic chain into its side of the row, cleared first (:func:`.dense_rows.clear_side`; a size group's rows are
+    pre-cleared). Contacts routed to the matrix-free path (contact_path==1) are skipped.
     """
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
@@ -2767,9 +2776,20 @@ def populate_world_J_for_size(
         rows = 1
         if data.slots_needed[c] >= 3:
             rows = 3
+        sides = row_sides(art_a, art_b)
+        at_a = wp.vec2i(0, 0)
+        at_b = wp.vec2i(0, 0)
+        if a_matches:
+            at_a = jacobian_row(support, art_group_idx[art_a], art_a, sides)
+        if b_matches:
+            at_b = jacobian_row(support, art_group_idx[art_b], art_b, sides)
         for row in range(rows):
             # The row metadata, from the size group of either endpoint, and the row's frame.
             body_a, body_b, direction, p0, p1 = write_contact_row(data, law, c, row, False)
+            if a_matches:
+                clear_side(support, J_group, at_a, slot + row, art_a)
+            if b_matches and not (a_matches and art_b == art_a):
+                clear_side(support, J_group, at_b, slot + row, art_b)
             if a_matches:
                 accumulate_jacobian_row_world(
                     body_a,
@@ -2783,7 +2803,7 @@ def populate_world_J_for_size(
                     data.motion,
                     data.dof_start[art_a],
                     target_size,
-                    art_group_idx[art_a],
+                    at_a,
                     slot + row,
                     J_group,
                 )
@@ -2800,7 +2820,7 @@ def populate_world_J_for_size(
                     data.motion,
                     data.dof_start[art_b],
                     target_size,
-                    art_group_idx[art_b],
+                    at_b,
                     slot + row,
                     J_group,
                 )

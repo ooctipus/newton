@@ -28,7 +28,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import packed_world_rows, position_pass, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -421,7 +421,7 @@ class TestSparseContacts(unittest.TestCase):
                 wp.launch(
                     populate_world_J_for_compact_size,
                     dim=(1, 32),
-                    inputs=[compact, 1, 6, f["group"], row_law(f["patches"])],
+                    inputs=[compact, 1, 6, f["group"], row_law(f["patches"]), group_rows(device)],
                     outputs=[dense],
                     device=device,
                 )

@@ -30,7 +30,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .dense_rows import row_sides
+from .dense_rows import RowSupport, jacobian_row, row_sides
 from .friction_patches import PatchRowLaw, patch_tangent_row
 from .row_laws import ROW_CONTACT, ROW_FRICTION, contact_restitution_rhs, contact_rhs, row_rhs
 
@@ -116,7 +116,9 @@ def populate_world_J_masked(
     art_group_idx: wp.array[int],
     law: PatchRowLaw,
     pre_flags: wp.array[int],
-    # outputs: Jacobian blocks of the two size groups (the second may alias the first when only one group exists)
+    support: RowSupport,
+    # outputs: Jacobian blocks of the two size groups (the second may alias the first when only one group exists;
+    # both are the packed rows under ``support.packed``)
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
 ):
@@ -130,7 +132,7 @@ def populate_world_J_masked(
     lane = tid % lanes
     total_contacts = data.count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
-        populate_contact_J(c, lane, data, size_a, art_group_idx, law, pre_flags[c], J_group_a, J_group_b)
+        populate_contact_J(c, lane, data, size_a, art_group_idx, law, pre_flags[c], support, J_group_a, J_group_b)
 
 
 @wp.func
@@ -142,6 +144,7 @@ def populate_contact_J(
     art_group_idx: wp.array[int],
     law: PatchRowLaw,
     flags: int,
+    support: RowSupport,
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
 ):
@@ -169,6 +172,7 @@ def populate_contact_J(
         data,
         size_a,
         art_group_idx,
+        support,
         J_group_a,
         J_group_b,
     )
@@ -193,10 +197,12 @@ def _write_contact_jacobian_lane(
     data: ContactInput,
     size_a: int,
     art_group_idx: wp.array[int],
+    support: RowSupport,
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
 ):
-    """Write one dof of a contact's normal row and, with flag bit 1, its two tangent rows.
+    """Write one dof of a contact's normal row and, with flag bit 1, its two tangent rows, in each side
+    (:func:`.dense_rows.jacobian_row`).
 
     Each entry is one signed :func:`.contact_laws.jacobian_entry`, or two summed (A's first) when both bodies
     belong to the same articulation. Rows act where :func:`.contact_laws.contact_row_frame` puts them. The three
@@ -216,8 +222,9 @@ def _write_contact_jacobian_lane(
     d2, a2, b2 = contact_row_frame(
         2, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
     )
+    sides = row_sides(art_a, art_b)
     if a_in and lane < data.response_dofs[art_a]:
-        group = art_group_idx[art_a]
+        at = jacobian_row(support, art_group_idx[art_a], art_a, sides)
         origin = data.origin[art_a]
         S = data.motion[data.dof_start[art_a] + lane]
         jn = float(0.0)
@@ -232,17 +239,17 @@ def _write_contact_jacobian_lane(
             jt0 += -jacobian_entry(S, d1, b1, origin)
             jt1 += -jacobian_entry(S, d2, b2, origin)
         if data.response_dofs[art_a] == size_a:
-            J_group_a[group, slot, lane] = jn
+            J_group_a[at[0], slot, at[1] + lane] = jn
             if friction:
-                J_group_a[group, slot + 1, lane] = jt0
-                J_group_a[group, slot + 2, lane] = jt1
+                J_group_a[at[0], slot + 1, at[1] + lane] = jt0
+                J_group_a[at[0], slot + 2, at[1] + lane] = jt1
         else:
-            J_group_b[group, slot, lane] = jn
+            J_group_b[at[0], slot, at[1] + lane] = jn
             if friction:
-                J_group_b[group, slot + 1, lane] = jt0
-                J_group_b[group, slot + 2, lane] = jt1
+                J_group_b[at[0], slot + 1, at[1] + lane] = jt0
+                J_group_b[at[0], slot + 2, at[1] + lane] = jt1
     if b_in and (not a_in or art_b != art_a) and lane < data.response_dofs[art_b]:
-        group = art_group_idx[art_b]
+        at = jacobian_row(support, art_group_idx[art_b], art_b, sides)
         origin = data.origin[art_b]
         S = data.motion[data.dof_start[art_b] + lane]
         jn = float(0.0)
@@ -253,15 +260,15 @@ def _write_contact_jacobian_lane(
             jt0 = -jacobian_entry(S, d1, b1, origin)
             jt1 = -jacobian_entry(S, d2, b2, origin)
         if data.response_dofs[art_b] == size_a:
-            J_group_a[group, slot, lane] = jn
+            J_group_a[at[0], slot, at[1] + lane] = jn
             if friction:
-                J_group_a[group, slot + 1, lane] = jt0
-                J_group_a[group, slot + 2, lane] = jt1
+                J_group_a[at[0], slot + 1, at[1] + lane] = jt0
+                J_group_a[at[0], slot + 2, at[1] + lane] = jt1
         else:
-            J_group_b[group, slot, lane] = jn
+            J_group_b[at[0], slot, at[1] + lane] = jn
             if friction:
-                J_group_b[group, slot + 1, lane] = jt0
-                J_group_b[group, slot + 2, lane] = jt1
+                J_group_b[at[0], slot + 1, at[1] + lane] = jt0
+                J_group_b[at[0], slot + 2, at[1] + lane] = jt1
 
 
 @wp.func

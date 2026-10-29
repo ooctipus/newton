@@ -15,6 +15,7 @@ import warp as wp
 from ...core.contact_pool import ContactField, ContactPool
 from .contact_laws import contact_bodies, contact_points_oracle, oracle_dot3
 from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
+from .dense_rows import RowSupport, jacobian_row
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 # Match the retained host oracle's rounding at angular cancellation and
@@ -382,8 +383,12 @@ def _jacobians(
     ancestor: wp.array[int],
     qd_start: wp.array[int],
     motion: wp.array[wp.spatial_vector],
+    size: int,
+    support: RowSupport,
     jacobian: wp.array3d[float],
 ):
+    """The spin rows' Jacobian at each articulation's side (:func:`.dense_rows.jacobian_row`), zeroed first; in the
+    packed rows only the row's sides write."""
     group, row = wp.tid()
     if work.status[0] != 0:
         return
@@ -392,9 +397,12 @@ def _jacobians(
     rep = work.spin_source[world, row]
     if rep < 0:
         return
-    size = jacobian.shape[2]
+    sides = support.sides[world, row]
+    if support.packed != 0 and art != sides[0] and art != sides[1]:
+        return
+    at = jacobian_row(support, group, art, sides)
     for dof in range(size):
-        jacobian[group, row, dof] = 0.0
+        jacobian[at[0], row, at[1] + dof] = 0.0
     if prescribed[art] != 0:
         return
     lead = work.lead[rep]
@@ -412,7 +420,7 @@ def _jacobians(
                 for global_dof in range(qd_start[joint], qd_start[joint + 1]):
                     local = global_dof - first
                     if local >= 0 and local < size:
-                        jacobian[group, row, local] += sign * oracle_dot3(
+                        jacobian[at[0], row, at[1] + local] += sign * oracle_dot3(
                             work.normal[lead], wp.spatial_bottom(motion[global_dof])
                         )
                 joint = ancestor[joint]
@@ -652,10 +660,11 @@ class DeviceTorsionPreparation:
             ],
             device=device,
         )
-        for size, jacobian in s.J_by_size.items():
+        support = s._row_support()
+        for size in s.size_groups:
             wp.launch(
                 _jacobians,
-                dim=jacobian.shape[:2],
+                dim=(s.n_arts_by_size[size], s.dense_max_constraints),
                 inputs=[
                     w,
                     s.group_to_art[size],
@@ -667,7 +676,9 @@ class DeviceTorsionPreparation:
                     s.model.joint_ancestor,
                     s.model.joint_qd_start,
                     augmented_state.joint_S_s,
-                    jacobian,
+                    int(size),
+                    support,
+                    s._jacobian_rows(size),
                 ],
                 device=device,
             )

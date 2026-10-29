@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
+from newton.tests.feather_pgs_law_harness import group_rows
 
 
 def _outputs(articulation_count: int, max_constraints: int, size: int, device):
@@ -91,6 +92,7 @@ def _scalar_rows(problem, resolved=None):
             0.2,
             1.0e-6,
             _resolved_mask(problem, resolved),
+            group_rows(problem.device),
         ],
         outputs=[counter, first_rejected, rows[0], _dense_rows(outputs, problem.device)],
         device=problem.device,
@@ -126,6 +128,7 @@ def _warp_rows(problem, resolved=None, warps_per_block=4):
             problem.group_to_art,
             _resolved_mask(problem, resolved),
             law,
+            group_rows(problem.device),
         ],
         outputs=[outputs[1]],
         block_dim=32 * warps_per_block,

@@ -37,6 +37,7 @@ from .contact_laws import (
     contact_row_frame,
     contact_tangent_basis,
 )
+from .dense_rows import RowSupport, jacobian_row
 from .device_preludes import (
     lane_group,
     reserved_count,
@@ -320,15 +321,18 @@ def materialize_general_prefix(
     group_art: wp.array[int],
     art_group: wp.array[int],
     size: int,
+    support: RowSupport,
     J: wp.array3d[float],
 ):
-    """Clear and populate only current general-world group rows, including zeros."""
+    """Populate the current general worlds' rows at this size's articulations' coordinates, zeros included: their
+    prefix rows, and zeros the contact rows' producer (:func:`materialize_fallback`) overwrites at their sides
+    (:func:`.dense_rows.jacobian_row`; the packed rows here are dense)."""
     worker, lane = wp.tid()
     for entry in range(worker, queue.general_count[0], workers):
         world = queue.general[entry]
         for item in range(group_start[world], group_start[world + 1]):
             art = group_art[item]
-            group = art_group[art]
+            at = jacobian_row(support, art_group[art], art, wp.vec2i(art, -1))
             for coefficient in range(lane, queue.count[world] * size, warp_stride()):
                 row, dof = coefficient // size, coefficient % size
                 value = float(0.0)
@@ -336,7 +340,7 @@ def materialize_general_prefix(
                     for component in range(PREFIX_WIDTH):
                         if prefix.dofs[world, row, component] == dof:
                             value += prefix.weights[world, row, component]
-                J[group, row, dof] = value
+                J[at[0], row, at[1] + dof] = value
 
 
 @wp.kernel(enable_backward=False)
@@ -429,6 +433,7 @@ def materialize_fallback(
     size_a: int,
     size_b: int,
     groups: wp.array[int],
+    support: RowSupport,
     J_a: wp.array3d[float],
     J_b: wp.array3d[float],
 ):
@@ -441,7 +446,7 @@ def materialize_fallback(
             continue
         a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
         flags = 1 | wp.where(data.slots_needed[c] == 3, 2, 0) | wp.where(a_in, 4, 0) | wp.where(b_in, 8, 0)
-        populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, J_a, J_b)
+        populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, support, J_a, J_b)
 
 
 TOPOLOGY = (*JOINT_TOPOLOGY, "constraint_mimic_joint0", "constraint_mimic_joint1", "constraint_mimic_world")
@@ -610,6 +615,7 @@ class LocalRowPackets:
             ],
             device=solver.model.device,
         )
+        support = solver._row_support()
         for size in solver.size_groups:
             wp.launch_tiled(
                 materialize_general_prefix,
@@ -622,7 +628,8 @@ class LocalRowPackets:
                     solver.world_response_group_to_art[size],
                     solver.art_group_idx,
                     size,
-                    solver.J_by_size[size],
+                    support,
+                    solver._jacobian_rows(size),
                 ],
                 block_dim=32,
                 device=solver.model.device,
@@ -633,7 +640,12 @@ class LocalRowPackets:
                 materialize_fallback,
                 dim=self.workers * 32,
                 inputs=[self.workers * 32, self.contact_input, self.law, queue.owner, self.primary, size_b],
-                outputs=[solver.art_group_idx, solver.J_by_size[self.primary], solver.J_by_size[size_b]],
+                outputs=[
+                    solver.art_group_idx,
+                    support,
+                    solver._jacobian_rows(self.primary),
+                    solver._jacobian_rows(size_b),
+                ],
                 device=solver.model.device,
             )
 
@@ -649,6 +661,10 @@ def decline(solver) -> str | None:
         (
             (solver._local_internal_fast_path, "Local packets serve the local owners' worlds; none is built."),
             (solver._hinv_jt_writes_world, "Local packets need the response written in world layout."),
+            (
+                solver._packed_dense,
+                "Local packets write their general worlds' rows at their coordinates: the packed rows are not dense.",
+            ),
             (
                 solver.dense_max_constraints >= solver._local_residual_max_rows,
                 "dense_max_constraints is below the local residual owner's rows.",

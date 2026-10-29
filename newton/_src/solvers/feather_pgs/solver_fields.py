@@ -113,7 +113,8 @@ SIZE_SYSTEM = FieldGroup(
     Field("H", wp.float32, ("factor_art", "factor_size", "factor_size")),
     Field("J", wp.float32, ("response_art", "response_row", "response_size")),
 )
-"""One size group's mass matrix and Jacobian; double-buffered on CUDA streams."""
+"""One size group's mass matrix and Jacobian; double-buffered on CUDA streams. The matrix-free sweeps' producers write
+the packed rows instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) placeholder."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Dense rows

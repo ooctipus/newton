@@ -29,7 +29,7 @@ factories of kernel variants, or a Warp function) of each step of the build and 
 launch sites call them directly. The arithmetic of a step is one function per representation and mapping, called by
 every kernel that runs the step:
 
-- the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``bilateral_product``...),
+- the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``packed_product``...),
   one expression tree on both devices, with its adjoint;
 - the native kernels call the operator's emitters (:meth:`.FreeBodyZ.pack` writes the row word that
   :meth:`.FreeBodyZ.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
@@ -948,17 +948,6 @@ def packed_product(
 
 
 @wp.func
-def bilateral_product(
-    J: wp.array3d[float], group: int, slot: int, x: wp.array3d[float], row: int, n_dofs: int, start: float
-) -> float:
-    """``start + J_slot . x_row`` over the group's ``n_dofs`` coordinates in order (``x`` a group's rows)."""
-    acc = start
-    for d in range(n_dofs):
-        acc += J[group, slot, d] * x[group, row, d]
-    return acc
-
-
-@wp.func
 def bilateral_rows(
     art: int,
     base: int,
@@ -969,8 +958,9 @@ def bilateral_rows(
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
     n_connect: int,
-    J_group: wp.array3d[float],
-    group: int,
+    packed_J: wp.array3d[float],
+    world: int,
+    first: int,
     n_dofs: int,
     preelim_slots: wp.array[int],
 ) -> int:
@@ -996,7 +986,7 @@ def bilateral_rows(
     count = int(0)
     for p in range(n):
         s = preelim_slots[base + p]
-        if bilateral_product(J_group, group, s, J_group, s, n_dofs, 0.0) > 1.0e-10:
+        if packed_product(packed_J, world, s, first, s, first, n_dofs) > 1.0e-10:
             preelim_slots[base + count] = s
             count += 1
     for p in range(count, PREELIM_MAX_ROWS):
@@ -1018,7 +1008,7 @@ def bilateral_setup_kernel(
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
     n_connect: int,
-    J_group: wp.array3d[float],
+    packed_J: wp.array3d[float],
     packed_Z: wp.array3d[float],
     n_dofs: int,
 ):
@@ -1034,6 +1024,9 @@ def bilateral_setup_kernel(
     if pe < 0:
         return
     base = pe * PREELIM_MAX_ROWS
+    # A block row has one side, the articulation's (dense_rows.jacobian_row).
+    world = art_to_world[art]
+    first = wp.where(dense != 0, articulation_world_dof_offset[art], 0)
     m = bilateral_rows(
         art,
         base,
@@ -1044,16 +1037,15 @@ def bilateral_setup_kernel(
         connect_slot,
         connect_art,
         n_connect,
-        J_group,
-        group,
+        packed_J,
+        world,
+        first,
         n_dofs,
         preelim.slots,
     )
     preelim.nB[pe] = m
     if m == 0:
         return
-    world = art_to_world[art]
-    first = wp.where(dense != 0, articulation_world_dof_offset[art], 0)
     s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
     for p in range(m):
         sp = preelim.slots[base + p]

@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import packed_world_rows, position_pass, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -213,7 +213,7 @@ def _run_general(data, layout, beta):
         wp.launch(
             kernels.populate_world_J_for_compact_size,
             dim=(4, 32),
-            inputs=[general, 4, size, layout.groups, law],
+            inputs=[general, 4, size, layout.groups, law, group_rows(device)],
             outputs=[jacobians[size]],
             device=device,
         )
@@ -375,7 +375,7 @@ def _owner_solver(device, *, anchors, beta=0.0):
             "_local_residual_active_secondaries",
         )
     }
-    return SimpleNamespace(
+    solver = SimpleNamespace(
         model=SimpleNamespace(device=wp.get_device(device), articulation_count=2 * worlds),
         world_count=worlds,
         size_groups=[PRIMARY, SECONDARY],
@@ -399,6 +399,10 @@ def _owner_solver(device, *, anchors, beta=0.0):
         # The owner's placeholders come from the solver's allocator.
         _arrays=SolverArrays(None, wp.get_device(device)),
     )
+    # The producers write the size groups' rows (dense_rows.jacobian_row).
+    solver._row_support = lambda: group_rows(device)
+    solver._jacobian_rows = lambda size: solver.J_by_size[size]
+    return solver
 
 
 class _PatchRowTwins:
@@ -499,7 +503,18 @@ class _PatchRowTwins:
                     wp.launch(
                         rp.materialize_fallback,
                         dim=128,
-                        inputs=[128, data, law, owner, PRIMARY, SECONDARY, layout.groups, J[PRIMARY], J[SECONDARY]],
+                        inputs=[
+                            128,
+                            data,
+                            law,
+                            owner,
+                            PRIMARY,
+                            SECONDARY,
+                            layout.groups,
+                            group_rows(layout.device),
+                            J[PRIMARY],
+                            J[SECONDARY],
+                        ],
                         device=layout.device,
                     )
                     for size in (PRIMARY, SECONDARY):

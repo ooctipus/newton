@@ -811,7 +811,7 @@ def _kernel_ancestor_rows(
         joint_S_s,
         0,
         n_dofs,
-        0,
+        wp.vec2i(0, 0),
         row,
         J_group,
     )

@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import position_pass
+from newton.tests.feather_pgs_law_harness import group_rows, position_pass
 from newton.tests.feather_pgs_patch_parity import row_law
 
 PATH_DENSE = 0
@@ -401,6 +401,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             joint_ancestor,
             joint_qd_start,
             row_law(_disabled_patches(device)),  # point friction
+            group_rows(device),
         ],
         outputs=[serial["J"]],
         device=device,
@@ -417,7 +418,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
     wp.launch(
         populate_world_J_for_compact_size,
         dim=(1, 32),
-        inputs=[compact_input, 1, 3, art_group_idx, row_law(_disabled_patches(device))],
+        inputs=[compact_input, 1, 3, art_group_idx, row_law(_disabled_patches(device)), group_rows(device)],
         outputs=[compact["J"]],
         device=device,
     )

@@ -20,6 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     build_joint_limit_rows_for_size,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import group_rows
 
 
 def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, resolved: bool = False):
@@ -59,6 +60,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
             0.2,
             0.0,
             wp.array([int(resolved)], dtype=wp.int32, device=device),
+            group_rows(device),
         ],
         outputs=[
             world_slot_counter,

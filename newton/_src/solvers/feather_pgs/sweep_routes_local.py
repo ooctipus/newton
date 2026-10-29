@@ -26,6 +26,7 @@ from . import kernel_template
 from .device_preludes import RING, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
+from .packed_rows import PACKED_SIDES
 from .projection_laws import PROJECTION_LAW
 from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
 from .row_metadata import _mf_parent_expression
@@ -63,9 +64,12 @@ LOCAL_ABI = kernel_template.params(
     ("local_solve_owner", wp.array[int]),
     ("world_constraint_count", wp.array[int]),
     ("L_group", wp.array3d[float]),
-    ("J_group", wp.array3d[float]),
     ("secondary_L_group", wp.array3d[float]),
-    ("secondary_J_group", wp.array3d[float]),
+    ("packed_J", wp.array3d[float]),
+    ("row_sides", wp.array2d[wp.vec2i]),
+    ("response_dofs", wp.array[int]),
+    ("articulation_world_dof_offset", wp.array[int]),
+    ("packed_dense", int),
     ("rhs_bias", wp.array2d[float]),
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
@@ -208,10 +212,19 @@ def local_owned_source(
         local_mf_max_constraints=MFR,
     )
 
-    primary_read = f"J_group.data[group_j_base + row * {P} + i]"
-    secondary_read = f"secondary_J_group.data[secondary_group_j_base + row * {S} + i]"
+    # The rows' Jacobians: the producers' packed rows (packed_rows), each articulation's entries where it is a side.
+    sides = ""
+    primary_read = "(first_p >= 0 ? J_row[first_p + i] : 0.0f)"
+    secondary_read = "(first_s >= 0 ? J_row[first_s + i] : 0.0f)"
     if row_inputs is not None:
         primary_read, secondary_read = row_inputs.read(P, S)
+    else:
+        sides = (
+            "        const wp::vec2i sides_r = row_sides.data[world_row_base + row];\n"
+            "        const float* J_row = &packed_J.data[(size_t)(world_row_base + row) * packed_J.shape[2]];\n"
+            "        const int first_p = PACKED_FIRST(sides_r, art);\n"
+            + ("        const int first_s = PACKED_FIRST(sides_r, secondary_art);\n" if S else "")
+        )
     reads = (primary_read, secondary_read)[: len(factors)]
 
     pair = ""
@@ -221,7 +234,6 @@ def local_owned_source(
     const int secondary_art = candidate_secondary_articulations.data[candidate];
     if (articulation_world.data[secondary_art] != world) return;
     const int secondary_group = articulation_group_index.data[secondary_art];
-    const int secondary_group_j_base = secondary_group * {M * S};
     const int secondary_group_l_base = secondary_group * {S * S};"""
         dof = f"d < {P} ? articulation_dof_start.data[art] + d : articulation_dof_start.data[secondary_art] + d - {P}"
     factor_loads = [factors[0].stage(lambda i: f"L_group.data[group_l_base + {i}]", "lane", L)]
@@ -260,7 +272,6 @@ def local_owned_source(
     if (row_count == 0 || row_count > {R}) return;
 
     const int world_row_base = world * {M};
-    const int group_j_base = group * {M * P};
     const int group_l_base = group * {P * P};{pair}
 {staging.declarations("    ")}{mf_setup}
 
@@ -278,7 +289,7 @@ def local_owned_source(
 
     // Each row's response Y = H^-1 J^T, its effective diagonal J Y + cfm (stored back) and its inverse.
     for (int row = lane; row < row_count; row += {L}) {{
-{op.respond(reads, "        ")}
+{sides}{op.respond(reads, "        ")}
         s_active[row] = active;
         const float effective_diagonal = row_diagonal + world_diag.data[world_row_base + row];
         s_inv_diag[row] = effective_diagonal > 0.0f ? 1.0f / effective_diagonal : 0.0f;
@@ -305,6 +316,7 @@ def local_owned_source(
     preludes = (
         lane_group(L),
         *((RING,) if contact_capable else ()),
+        PACKED_SIDES,
         *law_preludes(PROJECTION_LAW),
         *solve_policy.preludes,
     )

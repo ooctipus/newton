@@ -20,7 +20,7 @@ import warp as wp
 from newton._src.sim import JointType
 from newton._src.solvers.feather_pgs import contact_laws, field_group, kernels, law_source, projection_laws, row_laws
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton._src.solvers.feather_pgs.friction_patches import PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
@@ -133,7 +133,7 @@ def launch(kernel, n: int, inputs: dict, sig, device):
     args = []
     for name, annotation in sig.parameters.items():
         value = inputs[name]
-        if annotation is kernels.RowSupport:
+        if annotation is RowSupport:
             args.append(value)
         elif wp.types.is_array(annotation):
             args.append(
@@ -622,24 +622,63 @@ def position_pass(device) -> list:
     ]
 
 
-def row_support(sides, dofs, offsets, dense, device) -> kernels.RowSupport:
-    """A :class:`.kernels.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1 for none),
-    each articulation's coordinates and first world coordinate, and the layout (``dense``: entry ``e`` is coordinate
-    ``e``)."""
-    support = kernels.RowSupport()
+def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:
+    """A packed :class:`.dense_rows.RowSupport` of test rows: ``sides`` ``[world, row, 2]`` articulation indices (-1
+    for none), each articulation's coordinates, first world coordinate and world (``worlds``, default 0), and the
+    layout (``dense``: entry ``e`` is coordinate ``e``)."""
+    support = RowSupport()
     support.sides = wp.array(np.ascontiguousarray(sides, dtype=np.int32), dtype=wp.vec2i, device=device)
     support.dofs = wp.array(np.asarray(dofs, dtype=np.int32), dtype=wp.int32, device=device)
     support.offset = wp.array(np.asarray(offsets, dtype=np.int32), dtype=wp.int32, device=device)
+    worlds = np.zeros(len(dofs), dtype=np.int32) if worlds is None else np.asarray(worlds, dtype=np.int32)
+    support.world = wp.array(worlds, dtype=wp.int32, device=device)
     support.dense = int(dense)
+    support.packed = 1
     return support
 
 
-def world_row_support(worlds: int, rows: int, coordinates: int, device) -> kernels.RowSupport:
+def group_rows(device) -> RowSupport:
+    """The size groups' rows as the producers' placement (:class:`.dense_rows.RowSupport`, not packed): a producer
+    writes an articulation's side of a row at its group, from entry 0."""
+    support = row_support(np.full((1, 1, 2), -1, dtype=np.int32), [0], [0], 0, device)
+    support.packed = 0
+    return support
+
+
+def local_packed_rows(device, art_world, rows_by_art) -> list:
+    """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_J``, ``row_sides``,
+    ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]`` is articulation
+    ``a``'s Jacobian rows ``[rows, n]`` (its size group's); each world's rows hold its articulations' coordinates in
+    articulation order (dense), every row on every articulation of its world, so a row's entries are the group rows'."""
+    art_world = np.asarray(art_world, dtype=np.int32)
+    rows_by_art = [np.asarray(rows, dtype=np.float32) for rows in rows_by_art]
+    dofs = np.array([rows.shape[1] for rows in rows_by_art], dtype=np.int32)
+    worlds, capacity = int(art_world.max()) + 1, rows_by_art[0].shape[0]
+    offsets = np.zeros(len(dofs), dtype=np.int32)
+    width = np.zeros(worlds, dtype=np.int32)
+    for art, world in enumerate(art_world):
+        offsets[art], width[world] = width[world], width[world] + dofs[art]
+    packed = np.zeros((worlds, capacity, int(width.max())), dtype=np.float32)
+    sides = np.full((worlds, capacity, 2), -1, dtype=np.int32)
+    for art, world in enumerate(art_world):
+        packed[world, :, offsets[art] : offsets[art] + dofs[art]] = rows_by_art[art]
+        side = 0 if sides[world, 0, 0] < 0 else 1
+        sides[world, :, side] = art
+    return [
+        wp.array(packed, dtype=wp.float32, device=device),
+        wp.array(sides, dtype=wp.vec2i, device=device),
+        wp.array(dofs, dtype=wp.int32, device=device),
+        wp.array(offsets, dtype=wp.int32, device=device),
+        1,
+    ]
+
+
+def world_row_support(worlds: int, rows: int, coordinates: int, device) -> RowSupport:
     """Every row on its world's one articulation of ``coordinates`` coordinates, laid out dense: entry ``e`` at
     coordinate ``e`` (the packed rows of a dense world-layout Jacobian)."""
     sides = np.full((worlds, rows, 2), -1, dtype=np.int32)
     sides[..., 0] = np.arange(worlds, dtype=np.int32)[:, None]
-    return row_support(sides, [coordinates] * worlds, [0] * worlds, 1, device)
+    return row_support(sides, [coordinates] * worlds, [0] * worlds, 1, device, worlds=np.arange(worlds))
 
 
 def packed_world_rows(world_jacobian, device) -> list:
@@ -749,11 +788,15 @@ def call(kernel, dim, device, **values):
     """Launch ``kernel`` with arguments by name; numpy inputs become arrays of the argument's dtype.
 
     A struct argument of :data:`STRUCT_ARGUMENTS` is bound from the values by the scenes' names
-    (:func:`bind_struct`). Returns every array argument (and every array of such a struct) by name, so a test
-    reads the outputs it needs.
+    (:func:`bind_struct`), and a producer's placement not given is the size groups' rows (:func:`group_rows`).
+    Returns every array argument (and every array of such a struct) by name, so a test reads the outputs it needs.
     """
     args, arrays = [], {}
     for var in kernel.adj.args:
+        if var.type is RowSupport and var.label not in values:
+            # A producer's placement: the size groups' rows the scenes give (group_rows).
+            args.append(group_rows(device))
+            continue
         if var.type in STRUCT_ARGUMENTS and var.label not in values:
             value, struct_arrays = bind_struct(var.type, values, device)
             arrays.update(struct_arrays)

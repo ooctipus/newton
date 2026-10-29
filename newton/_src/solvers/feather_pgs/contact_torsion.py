@@ -23,11 +23,11 @@ import warp as wp
 
 from ...geometry import GeoType
 from ...utils.selection import match_labels
+from .dense_rows import RowSupport
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
-    RowSupport,
     world_contact_row_dot,
 )
 from .row_laws import CONTACT_END_GAP_SLOP
@@ -408,7 +408,10 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             "_row_sides",
         )
     }
-    jacobians = {size: array.numpy() for size, array in solver.J_by_size.items()}
+    # The rows' Jacobians: the packed rows (packed_rows, by world) or each size group's.
+    packed = solver._mf_sweeps
+    jacobians = {0: solver._packed_J.numpy()} if packed else {size: a.numpy() for size, a in solver.J_by_size.items()}
+    art_offset = solver.articulation_world_dof_offset.numpy() if packed else None
     body_joint = solver.body_to_joint.numpy()
     body_art = solver.body_to_articulation.numpy()
     ancestor = solver.model.joint_ancestor.numpy()
@@ -443,6 +446,10 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         for witness in group:
             membership[world, witness.slot] = row
         normal = lead.normal
+        sides = fields["_row_sides"][world, row]
+        if packed:
+            # A packed row is never cleared (dense_rows.clear_side): the appended row starts from zero.
+            jacobians[0][world, row, :] = 0.0
         for body, sign in ((lead.body_a, 1.0), (lead.body_b, -1.0)):
             if body < 0:
                 continue
@@ -452,13 +459,20 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             if prescribed[art]:
                 fields["target_velocity"][world, row] -= sign * _dot3(normal, body_velocities[body, 3:])
                 continue
-            size, index = int(art_size[art]), int(art_group[art])
+            size = int(art_size[art])
+            # The side's Jacobian row and first entry (dense_rows.jacobian_row).
+            if not packed:
+                rows, index, first = jacobians[size], int(art_group[art]), 0
+            elif solver._packed_dense:
+                rows, index, first = jacobians[0], world, int(art_offset[art])
+            else:
+                rows, index, first = jacobians[0], world, 0 if art == sides[0] else int(art_size[sides[0]])
             joint = int(body_joint[body])
             while joint >= 0:
                 for global_dof in range(int(qd_start[joint]), int(qd_start[joint + 1])):
                     local = global_dof - int(art_start[art])
                     if 0 <= local < size:
-                        jacobians[size][index, row, local] += sign * _dot3(normal, motions[global_dof, 3:])
+                        rows[index, row, first + local] += sign * _dot3(normal, motions[global_dof, 3:])
                 joint = int(ancestor[joint])
         solver._torsion_stats["groups"].append(
             {
@@ -477,8 +491,11 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         return
     for name, values in fields.items():
         getattr(solver, name).assign(values)
-    for size, values in jacobians.items():
-        solver.J_by_size[size].assign(values)
+    if packed:
+        solver._packed_J.assign(jacobians[0])
+    else:
+        for size, values in jacobians.items():
+            solver.J_by_size[size].assign(values)
     solver.constraint_count.assign(count)
     solver.slot_counter.assign(count)
     solver._contact_torsion_group.assign(membership)
