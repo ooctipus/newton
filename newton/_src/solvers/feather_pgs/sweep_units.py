@@ -144,13 +144,17 @@ _SLOT_WEIGHT = wp.constant(SLOT_WEIGHT)
 _SLOT_RING = wp.constant(SLOT_RING)
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
 
+METRIC_FIELDS = 7
+"""Floats of a friction unit's cached metric: its pair's metric (scale, the two eigenvalues, the larger's axis) and
+the pair's Gram couplings with the normal row, ``Z_n . Z_t1`` and ``Z_n . Z_t2``."""
+
 SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
     Field("slot_data", wp.float32, ("slot", SLOT_ENTRIES + 2, "unit")),
     Field("slot_words", wp.int32, ("slot", SLOT_WORDS, "unit")),
-    # The friction pair metric of each staged friction unit (scale, eigenvalues, axis), formed by the colored sweep
-    # once per launch.
-    Field("slot_metric", wp.float32, ("slot", 5, "unit")),
+    # The friction pair metric and Gram couplings of each staged friction unit (METRIC_FIELDS), formed by the
+    # colored sweep once per launch.
+    Field("slot_metric", wp.float32, ("slot", METRIC_FIELDS, "unit")),
 )
 """A world's units' rows as the colored sweep reads them: by color slot, field by field (:func:`stage_slots`)."""
 

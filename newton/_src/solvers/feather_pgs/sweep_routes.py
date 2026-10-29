@@ -232,6 +232,8 @@ COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
 237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
 
+METRIC_FIELDS = sweep_units.METRIC_FIELDS
+
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
 
@@ -265,6 +267,80 @@ class _CachedPairBodyZ(FreeBodyZ):
         return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
 
 
+@dataclasses.dataclass(frozen=True)
+class _GramUnitBodyZ(_CachedPairBodyZ):
+    """The colored unit's rows on the unit's cached Gram block ``G = Z^T Z`` of its normal and friction rows.
+
+    Every row's velocity term is reduced from the unit's velocity ``u`` before the unit's first row
+    (``unit_jv0``..``unit_jv2``, :func:`_unit_terms`), at once; the friction pair's are then corrected by the normal
+    row's change through the cached couplings, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``. The applies are deferred
+    (``unit_dn``, ``unit_dt1``, ``unit_dt2``) to one pass over the unit's coordinates after its rows
+    (:func:`_unit_apply`): in exact arithmetic the sequential sweep, with one dot product round and one apply round
+    off the pair's critical path.
+    """
+
+    def residual(self, out: str, indent: str) -> str:
+        return f"{indent}float {out} = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;"
+
+    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
+        return f"{indent}float {out} = (unit_jv2 + gram_n2 * unit_dn) + {rhs};"
+
+    def apply(self, delta: str, indent: str) -> str:
+        return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
+
+    def apply_row(self, row: str, delta: str, indent: str) -> str:
+        return f"\n{indent}unit_dt2 += {delta};"
+
+
+def _unit_terms(pad: str) -> str:
+    """Native statements, after a unit's ``E``, ``metric``, ``rows`` and ``dof_a``, ``dof_b`` are declared: the unit's
+    velocity on its bodies (``unit_u``), its rows' velocity terms from it (each side's six products, then the sides
+    added), the cached Gram couplings of the pair with the normal, and the deferred changes."""
+    lines = [
+        "float unit_u[12];",
+        "#pragma unroll",
+        "for (int k = 0; k < 6; ++k) {",
+        "    unit_u[k] = dof_a >= 0 ? s_v[dof_a + k] : 0.0f;",
+        "    unit_u[6 + k] = dof_b >= 0 ? s_v[dof_b + k] : 0.0f;",
+        "}",
+        "float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;",
+        "#pragma unroll",
+        "for (int side = 0; side < 2; ++side) {",
+        "    if ((side == 0 ? dof_a : dof_b) < 0) continue;",
+        "    float n = 0.0f, t1 = 0.0f, t2 = 0.0f;",
+        "#pragma unroll",
+        "    for (int k = 0; k < 6; ++k) {",
+        "        const float u = unit_u[side * 6 + k];",
+        "        n += E[side * 6 + k] * u;",
+        "        t1 += E[12 + side * 6 + k] * u;",
+        "        t2 += E[24 + side * 6 + k] * u;",
+        "    }",
+        "    unit_jv0 += n;",
+        "    unit_jv1 += t1;",
+        "    unit_jv2 += t2;",
+        "}",
+        "const float gram_n1 = metric[5], gram_n2 = metric[6];",
+        "float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def _unit_apply(pad: str) -> str:
+    """The unit's deferred changes in one pass: ``u += Z_n dn + Z_t1 dt1 + Z_t2 dt2`` on each of its bodies."""
+    lines = [
+        "if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {",
+        "#pragma unroll",
+        "    for (int k = 0; k < 6; ++k) {",
+        "        if (dof_a >= 0)",
+        "            s_v[dof_a + k] = unit_u[k] + ((E[k] * unit_dn + E[12 + k] * unit_dt1) + E[24 + k] * unit_dt2);",
+        "        if (dof_b >= 0)",
+        "            s_v[dof_b + k] = unit_u[6 + k] + ((E[6 + k] * unit_dn + E[18 + k] * unit_dt1) + E[30 + k] * unit_dt2);",
+        "    }",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
 def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
     """Native statements, after a unit's ``E`` and ``W`` and ``dof_a``, ``dof_b`` are declared: its friction pair's
     metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
@@ -291,7 +367,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             raise ValueError(f"the colored unit reads rows i and sib, not {row!r}")
         return offsets[row]
 
-    unit_op = _CachedPairBodyZ(
+    unit_op = _GramUnitBodyZ(
         Lanes(1),
         velocity=Velocity("s_v"),
         entry=lambda array, row, k: f"E[{unit_offset(row)} * 12 + {arrays[array] * 6} + {k}]",
@@ -340,7 +416,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             "            };",
             "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
             "            // the unit loads with its fields.",
-            "            float metric[5];",
+            f"            float metric[{METRIC_FIELDS}];",
             "            const auto FRICTION_PAIR_CACHED = [&](int, float, float, float, wp::vec2 residual, wp::vec2 old,",
             "                                                  float radius, float relaxation) -> wp::vec2 {",
             "                return ProjectionLaw::friction_pair_from_metric(metric[0], metric[1], metric[2],",
@@ -375,7 +451,9 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
 #pragma unroll
                     for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
 #pragma unroll
-                    for (int f = 0; f < 5; ++f) metric[f] = slot_metric.data[unit_slot * {5 * M_MF} + p + f * {M_MF}];
+                    for (int f = 0; f < {METRIC_FIELDS}; ++f)
+                        metric[f] = slot_metric.data[unit_slot * {METRIC_FIELDS * M_MF} + p + f * {M_MF}];
+{_unit_terms(" " * 20)}
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {{
                         if (r >= rows) break;
@@ -394,6 +472,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
 {visit}
                         }}
                     }}
+{_unit_apply(" " * 20)}
                     // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
                     if (rows == 3 && ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration))
                         s_lam_mf[unit_row + 2] = 0.0f;
@@ -405,7 +484,8 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
 def _colored_metrics(M_MF: int) -> str:
     """Before the sweeps, every thread forms the friction pair metric of the world's staged friction units (a unit of
     three rows) at block stride and stores it in its slot's metric cache (``slot_metric``: scale, the two
-    eigenvalues and the larger's axis, field by field across the units), which the pair law reads at every visit."""
+    eigenvalues and the larger's axis, then the pair's Gram couplings with the normal, field by field across the
+    units), which the pair law and the unit's terms read at every visit."""
     fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
     arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
     op = FreeBodyZ(
@@ -429,12 +509,27 @@ def _colored_metrics(M_MF: int) -> str:
 #pragma unroll
             for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
 {_colored_pair_metric(op, " " * 12)}
-            const int at = unit_slot * {5 * M_MF} + p;
+            // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,
+            // body a's then b's products.
+            float gram_n1 = 0.0f, gram_n2 = 0.0f;
+            for (int k = 0; k < 6; ++k) {{
+                if (dof_a >= 0) {{
+                    gram_n1 += E[k] * E[12 + k];
+                    gram_n2 += E[k] * E[24 + k];
+                }}
+                if (dof_b >= 0) {{
+                    gram_n1 += E[6 + k] * E[18 + k];
+                    gram_n2 += E[6 + k] * E[30 + k];
+                }}
+            }}
+            const int at = unit_slot * {METRIC_FIELDS * M_MF} + p;
             slot_metric.data[at] = metric.v0;
             slot_metric.data[at + {M_MF}] = metric.v1;
             slot_metric.data[at + {2 * M_MF}] = metric.v2;
             slot_metric.data[at + {3 * M_MF}] = metric.v3[0];
             slot_metric.data[at + {4 * M_MF}] = metric.v3[1];
+            slot_metric.data[at + {5 * M_MF}] = gram_n1;
+            slot_metric.data[at + {6 * M_MF}] = gram_n2;
         }}
     }}
     __syncthreads();"""
