@@ -13,7 +13,7 @@ import warp as wp
 from ...sim import BodyFlags
 from . import cached_force, field_group, kernels, response_operator, sparse_factor
 from . import tree_scan as ts
-from .device_preludes import device_branches
+from .device_preludes import CUDA_ONLY, device_branches
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
@@ -416,10 +416,11 @@ def held_schedules(tree: TreePlan, lanes: int, *, chains: bool, reference: bool 
     )
 
 
-def publishes_twists(layout: TreeLayout, schedules: HeldSchedules) -> bool:
-    """Whether the predictor can publish the predicted body twists: a warp-sized tree whose scans keep to their
-    lane groups (the twist sums are a register scan of :attr:`TreeLayout.lanes` lanes)."""
-    return layout.lanes <= 32 and not schedules.chains
+def publishes_twists(layout: TreeLayout, schedules: HeldSchedules, *, cuda: bool) -> bool:
+    """Whether the predictor can publish the predicted body twists: on CUDA, for a warp-sized tree whose scans keep
+    to their lane groups (the twist sums are a register scan of :attr:`TreeLayout.lanes` lanes, which has no CPU
+    form: :func:`_twist_block`)."""
+    return cuda and layout.lanes <= 32 and not schedules.chains
 
 
 _SIZES = {"nodes": "$BODIES", "rounds": "$ROUNDS", "max_depth": "($LAST_PARENT+1)", "windows": "$WINDOWS"}
@@ -467,7 +468,8 @@ def _reduction(combine, schedule: ts.Schedule, storage: ts.Storage) -> str:
 
 
 def _twist_block() -> str:
-    """The predictor's twist publication (CUDA only), a register scan of warp-sized trees."""
+    """The predictor's twist publication, a register scan of warp-sized trees: CUDA only, so a CPU build of a
+    predictor that holds it fails (:func:`publishes_twists` leaves it out of a CPU owner's predictor)."""
     scan = _held_scan(
         _TWIST_SUM,
         ts.Direction.DOWN,
@@ -478,7 +480,7 @@ def _twist_block() -> str:
         sink=_TWIST_SINK,
         cpu=False,
     )
-    return device_branches("    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", "")
+    return device_branches("    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", CUDA_ONLY)
 
 
 _COLLECT = r"""    $PHYSICAL_TABLE
@@ -1521,11 +1523,13 @@ def get_predictor_kernel(
     response="sparse",
     reference: bool = False,
     clocked: bool = False,
+    twists: bool,
 ):
     """Apply current external/control force and both unchanged W actions.
 
     ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``reference`` keeps the
-    serial one-lane held solve on CUDA; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`).
+    serial one-lane held solve on CUDA; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`);
+    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds.
     """
     reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
     inverse = response_operator.SparseInverseFactor(
@@ -1641,7 +1645,7 @@ def get_predictor_kernel(
         data_type = HeldResponse
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
-    operations["TWIST_BLOCK"] = _twist_block() if publishes_twists(layout, schedules) else ""
+    operations["TWIST_BLOCK"] = _twist_block() if twists else ""
     source = layout.native(
         _PREDICT, preludes=SPATIAL.preludes(), **operations, **_native_clocks(clocked, "f", stages=5, column=8)
     )

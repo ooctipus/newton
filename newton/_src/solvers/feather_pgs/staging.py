@@ -268,8 +268,9 @@ class Staging:
                 f"{int(limit)}-byte limit"
             )
 
-    def declarations(self, indent: str = "    ", *, group: str = "SUB") -> str:
-        """The ``__shared__`` declarations of the working set.
+    def declarations(self, indent: str = "    ", *, group: str = "SUB", storage: str = "__shared__") -> str:
+        """The declarations of the working set, in ``storage`` (CUDA's ``__shared__``; ``SHARED`` for a body that
+        also runs on the CPU, where :data:`.device_preludes.SHARED_STORAGE` makes it the stack of the one thread).
 
         One array per buffer; with several lane groups per block, one struct of
         the buffers per group, indexed by ``group``, and an alias per buffer
@@ -280,7 +281,7 @@ class Staging:
         if not self.buffers:
             return ""
         if self.groups == 1:
-            return "\n".join(f"{indent}__shared__ {buffer.declaration()}" for buffer in self.buffers)
+            return "\n".join(f"{indent}{storage} {buffer.declaration()}" for buffer in self.buffers)
         if self.layout == "arrays":
             arrays = (
                 dataclasses.replace(buffer, name=f"{buffer.name}_storage", count=buffer.count * self.groups)
@@ -290,14 +291,14 @@ class Staging:
                 f"{indent}{buffer.ctype}* {buffer.name} = {buffer.name}_storage + {group} * {buffer.count};"
                 for buffer in self.buffers
             )
-            return "\n".join((*(f"{indent}__shared__ {array.declaration()}" for array in arrays), *views))
+            return "\n".join((*(f"{indent}{storage} {array.declaration()}" for array in arrays), *views))
         members = "\n".join(f"{indent}    {buffer.declaration()}" for buffer in self.buffers)
         aliases = "\n".join(
             f"#define {buffer.name} {self.name.lower()}[{group}].{buffer.name}" for buffer in self.buffers
         )
         return (
             f"{indent}struct {self.name} {{\n{members}\n{indent}}};\n"
-            f"{indent}__shared__ {self.name} {self.name.lower()}[{self.groups}];\n{aliases}"
+            f"{indent}{storage} {self.name} {self.name.lower()}[{self.groups}];\n{aliases}"
         )
 
     def undefine(self) -> str:

@@ -250,10 +250,11 @@ def _packed_rows(host, arrays, device):
     arrays["factor_storage"] = storage  # The addresses stay valid while the arrays live.
 
 
-def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_start=0):
-    """Solve with separate writable outputs but identical current data and the same law."""
-    if enabled:
-        launch_components(data, device)
+def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8, friction_start=0):
+    """The two sweeps' launches, ``(kernel, blocks, block size, arguments)``, on the fixture's data: the paired and
+    mixed kernels for CUDA architecture ``arch``, each argument taken by the name the kernel's signature gives it.
+
+    With ``enabled`` the components' selector, which :func:`launch_components` publishes, picks the worlds."""
     values = dict(arrays)
     values.update(
         world_count=5,
@@ -269,8 +270,20 @@ def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_s
     )
     if enabled:
         values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector
-    for kernel, grid, block in zip(
-        solve_kernels(enabled, str(device.arch), contact_triples=True), (3, 5), (64, 32), strict=True
+    return [
+        (kernel, grid, block, [values[name] for name in inspect.signature(kernel.func).parameters])
+        for kernel, grid, block in zip(
+            solve_kernels(enabled, str(arch), contact_triples=True), (3, 5), (64, 32), strict=True
+        )
+    ]
+
+
+def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_start=0):
+    """Solve with separate writable outputs but identical current data and the same law (CUDA: the sweeps are
+    CUDA-only bodies)."""
+    if enabled:
+        launch_components(data, device)
+    for kernel, grid, block, arguments in solve_pair_launches(
+        data, arrays, enabled=enabled, arch=device.arch, iterations=iterations, friction_start=friction_start
     ):
-        arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
         wp.launch_tiled(kernel, dim=[grid], inputs=arguments, block_dim=block, device=device)

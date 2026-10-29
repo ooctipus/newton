@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import contact_unit
-from newton._src.solvers.feather_pgs.device_preludes import cuda_native
+from newton.tests.feather_pgs_contact_unit_cuda import solve_points_native
 
 wp.init()
 
@@ -80,29 +80,6 @@ def _solve_ring(
         contact_unit.CONTACT_UNIT_NEWTON_CAP,
         contact_unit.CONTACT_UNIT_PROXIMAL,
     )
-
-
-_NATIVE_BODY = r"""
-    const float* p = problems.data + i * 16;
-    const ContactUnitSolution s = ContactUnit::solve(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10],
-                                                     p[11], static_cast<int>(p[12]), p[13], p[14], p[15]);
-    float* o = out.data + i * 5;
-    o[0] = s.normal;
-    o[1] = s.friction0;
-    o[2] = s.friction1;
-    o[3] = s.alpha;
-    o[4] = static_cast<float>(s.evaluations);
-#endif
-"""
-
-
-@wp.func_native(cuda_native(_NATIVE_BODY, preludes=(contact_unit.CONTACT_UNIT,)))
-def _native_solve(problems: wp.array2d[float], out: wp.array2d[float], i: int): ...
-
-
-@wp.kernel
-def _solve_points_native(problems: wp.array2d[float], out: wp.array2d[float]):
-    _native_solve(problems, out, wp.tid())
 
 
 def solve_points(problems, device=_CPU):
@@ -925,7 +902,7 @@ class TestContactUnitCuda(unittest.TestCase):
         device = "cuda:0"
         out = wp.zeros((len(rows), 5), dtype=float, device=device)
         wp.launch(
-            _solve_points_native, dim=len(rows), inputs=[wp.array(rows, dtype=float, device=device), out], device=device
+            solve_points_native, dim=len(rows), inputs=[wp.array(rows, dtype=float, device=device), out], device=device
         )
         problems = rows.astype(np.float64)
         blocks = np.stack(
@@ -964,7 +941,7 @@ class TestContactUnitCuda(unittest.TestCase):
             held, cpu, bound, scale = held_cases(anchors)
             out = wp.zeros((len(held), 5), dtype=float, device=device)
             wp.launch(
-                _solve_points_native,
+                solve_points_native,
                 dim=len(held),
                 inputs=[wp.array(held, dtype=float, device=device), out],
                 device=device,

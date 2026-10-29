@@ -39,7 +39,7 @@ from collections.abc import Callable
 import warp as wp
 
 from . import kernel_template
-from .device_preludes import lane_group, substitute
+from .device_preludes import SHARED_STORAGE, lane_group, substitute
 from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
@@ -225,8 +225,8 @@ def factor_coordinates_kernel() -> wp.Kernel:
 
 
 # A warp per articulation reads its leaf-first H (P H P^T, the coordinates reversed) from the held tree's geometry into
-# shared memory, lane 0 factors it with the kit, and the lanes store the lower triangle. The diagonal rounds as
-# (S F + R) + K.
+# shared memory, lane 0 factors it with the kit, and the lanes store the lower triangle, a row each in turn. The
+# diagonal rounds as (S F + R) + K. On the CPU one thread is the warp's every lane.
 _WARP_FACTOR = """
     const int group = tid >> 5;
     if (group >= n_arts) return;
@@ -260,13 +260,12 @@ $FACTOR
     }
     SYNC();
 
-    if (LANE < $DOFS) {
+    for (int row = LANE; row < $DOFS; row += STRIDE) {
         const int factor_base = group * $ELEMENTS;
 #pragma unroll
-        for (int col = 0; col <= LANE; ++col)
-            L_group.data[factor_base + LANE * $DOFS + col] = factor[LANE * $DOFS + col];
+        for (int col = 0; col <= row; ++col)
+            L_group.data[factor_base + row * $DOFS + col] = factor[row * $DOFS + col];
     }
-#endif
 """
 
 _WARP_FACTOR_INPUTS = (
@@ -320,7 +319,7 @@ def factor_warps_kernel(
         DOFS=size,
         ELEMENTS=elements,
         LOWER=size * (size + 1) // 2,
-        STAGING=staging.declarations(),
+        STAGING=staging.declarations(storage="SHARED"),
         GEOMETRY_ROW=row,
         GEOMETRY_STRIDE=geometric_stride or max(geometric_index) + 1,
         FACTOR=_indent(factor.factor(), "        "),
@@ -330,7 +329,8 @@ def factor_warps_kernel(
         tuple(inputs),
         snippet,
         THREADS,
-        preludes=(lane_group(32),),
+        preludes=(lane_group(32), SHARED_STORAGE),
+        dual=True,
         native_name="factor_native",
     ).kernel()
 

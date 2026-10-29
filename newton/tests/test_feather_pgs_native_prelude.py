@@ -8,7 +8,9 @@ struct, a lane group or the patch ring, and ``device_preludes.cuda_native``
 places them after the body's one architecture guard; ``dual_native`` places
 their CPU twins after an ``#else`` for a body that also runs on the CPU. These
 tests check that layout on every native snippet of the point-stream inventory
-and scan the package for text splices of preludes or guards elsewhere.
+and scan the package for text splices of preludes or guards elsewhere. No
+snippet compiles to nothing on the CPU: it runs there, or a CPU build of it
+fails (``device_preludes.CUDA_ONLY``).
 """
 
 import ast
@@ -21,8 +23,10 @@ from newton._src.solvers.feather_pgs import contact_unit, device_preludes
 from newton._src.solvers.feather_pgs.contact_laws import CONTACT_LAW
 from newton._src.solvers.feather_pgs.device_preludes import (
     ARCHITECTURE_GUARD,
+    CUDA_ONLY,
     DevicePrelude,
     cuda_native,
+    device_branches,
     dual_native,
     lane_group,
 )
@@ -178,6 +182,30 @@ def split_preludes(snippet, preludes):
     return lead, [prelude.name for prelude in declared], rest, dual
 
 
+def cpu_text(snippet, *, cuda=False):
+    """Return the statements a CPU build of ``snippet`` compiles (a CUDA build with ``cuda``): that side of its
+    architecture guards (other conditionals keep both sides), without comments or blank lines. A CUDA-only body
+    yields its ``#error`` on the CPU."""
+    lines, stack = [], []
+    for line in snippet.splitlines():
+        directive = line.strip().replace(" ", "")
+        if directive.startswith(("#ifdefined(__CUDA_ARCH__)", "#ifdef__CUDA_ARCH__")):
+            stack.append(cuda)
+        elif directive.startswith(("#if!defined(__CUDA_ARCH__)", "#ifndef__CUDA_ARCH__")):
+            stack.append(not cuda)
+        elif directive.startswith("#if"):
+            stack.append(None)
+        elif directive.startswith("#else"):
+            stack[-1] = None if stack[-1] is None else not stack[-1]
+        elif directive.startswith("#endif"):
+            stack.pop()
+        elif all(state is not False for state in stack):
+            code = line.split("//", 1)[0].strip()
+            if code:
+                lines.append(code)
+    return "\n".join(lines)
+
+
 class TestDevicePreludeComposition(unittest.TestCase):
     """The composition rule itself and the declared preludes of the package."""
 
@@ -189,8 +217,23 @@ class TestDevicePreludeComposition(unittest.TestCase):
         """Compose the lead, one guard, each prelude and its newline in order, then the body."""
         first, second = DevicePrelude("first", "    int a;"), DevicePrelude("second", "    int b;")
         snippet = cuda_native("    body();\n#endif\n", preludes=(first, second))
-        self.assertEqual(snippet, "\n#if defined(__CUDA_ARCH__)\n    int a;\n    int b;\n    body();\n#endif\n")
-        self.assertEqual(cuda_native("x", lead=""), "#if defined(__CUDA_ARCH__)\nx")
+        self.assertEqual(
+            snippet,
+            "\n#if defined(__CUDA_ARCH__)\n    int a;\n    int b;\n    body();\n#else\n" + CUDA_ONLY + "#endif\n",
+        )
+        self.assertEqual(
+            cuda_native("x\n#endif", lead=""), "#if defined(__CUDA_ARCH__)\nx\n#else\n" + CUDA_ONLY + "#endif\n"
+        )
+        with self.assertRaisesRegex(ValueError, "#endif"):
+            cuda_native("x", lead="")
+
+    def test_no_branch_compiles_to_nothing_on_the_cpu(self):
+        """Give a CUDA-only body a CPU branch that fails the build, and refuse an empty CPU branch."""
+        self.assertEqual(cpu_text(cuda_native("    body();\n#endif\n")).strip(), CUDA_ONLY.strip())
+        self.assertEqual(cpu_text(device_branches("    a();\n", "    b();\n")).strip(), "b();")
+        for empty in ("", "\n", "    \n"):
+            with self.subTest(cpu=empty), self.assertRaisesRegex(ValueError, "CPU statements"):
+                device_branches("    a();\n", empty)
 
     def test_dual_native_places_cpu_twins_after_the_preludes(self):
         """Compose the guard, the CUDA preludes, ``#else``, their CPU twins and ``#endif``, then the shared body."""
@@ -269,6 +312,27 @@ class TestNativeSweepLayout(unittest.TestCase):
                     if helper in body:
                         self.assertIn(prelude, names, f"the body calls {helper} without declaring {prelude}")
         self.assertGreater(checked, 0)
+
+    def test_no_snippet_compiles_to_nothing_on_the_cpu(self):
+        """Give every native snippet of the inventory and of the package's modules a CPU build: CPU statements, or
+        the ``#error`` of a CUDA-only body (BACKBONE rule 6)."""
+        from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
+
+        snippets = {}
+        for name, kernel in pins._inventory().items():
+            for snippet in _native_snippets(kernel):
+                snippets.setdefault(snippet, name)
+        for module_name, module in _modules().items():
+            for key, value in vars(module).items():
+                snippet = getattr(value, "native_snippet", None)
+                if isinstance(snippet, str):
+                    snippets.setdefault(snippet, f"{module_name}.{key}")
+        self.assertGreater(len(snippets), 100)
+        for snippet, owner in snippets.items():
+            if not cpu_text(snippet, cuda=True):
+                continue  # Empty on both devices: no device holds the other's code.
+            with self.subTest(owner=owner):
+                self.assertTrue(cpu_text(snippet), "the snippet compiles to nothing on the CPU")
 
     def test_helper_calls_declare_their_prelude(self):
         """Declare the defining prelude in every snippet that calls a law or a ring helper."""

@@ -10,6 +10,11 @@ architecture guard, in the declared order; :func:`dual_native` composes a body
 that also compiles for the CPU, where one thread runs a whole lane group. Only
 this module joins prelude text to a body.
 
+No body compiles to nothing on a device. A body written for CUDA only
+(:func:`cuda_native`) fails the CPU build with ``#error``, and a part of a body
+that runs on one device only (:func:`device_branches`) states the other
+device's statements, or an ``#error``, explicitly.
+
 The idioms, one implementation each, serve native sources through the
 preludes and Warp kernels through the ``wp.func_native`` functions built here
 from the same text:
@@ -110,18 +115,37 @@ def substitute(text: str, vocabulary: dict | None = None, /, **values) -> str:
     return template.substitute({name: str(available[name]) for name in slots})
 
 
+CUDA_ONLY = '#error "a CUDA-only native body is built for the CPU"\n'
+"""The CPU branch of a CUDA-only body: the CPU build fails instead of compiling the body to nothing."""
+
+
 def cuda_native(body: str, *, preludes: tuple[DevicePrelude, ...] = (), lead: str = "\n") -> str:
     """Return a ``func_native`` snippet that opens with one architecture guard and the body's preludes.
 
     The snippet is ``lead``, the guard, each prelude followed by a newline in
-    the declared order, then ``body``.
+    the declared order, then ``body`` up to the guard's closing ``#endif``, then
+    the CPU branch :data:`CUDA_ONLY`: a CPU build of the body fails.
 
     Args:
-        body: Native statements after the preludes, including the closing ``#endif``.
+        body: Native statements after the preludes, ending with the guard's closing ``#endif``.
         preludes: Device preludes the body declares, in the order they are defined.
         lead: Text before the architecture guard.
+
+    Raises:
+        ValueError: for a body that does not end with the guard's ``#endif``.
     """
-    return lead + ARCHITECTURE_GUARD + "".join(prelude.source + "\n" for prelude in preludes) + body
+    closed = body.rstrip()
+    if not closed.endswith("#endif"):
+        raise ValueError("a cuda_native body ends with its architecture guard's #endif")
+    return (
+        lead
+        + ARCHITECTURE_GUARD
+        + "".join(prelude.source + "\n" for prelude in preludes)
+        + closed[: -len("#endif")]
+        + "#else\n"
+        + CUDA_ONLY
+        + "#endif\n"
+    )
 
 
 def device_branches(cuda: str, cpu: str) -> str:
@@ -129,8 +153,14 @@ def device_branches(cuda: str, cpu: str) -> str:
 
     Args:
         cuda: Statements for the device, each line newline-terminated.
-        cpu: Statements for the CPU, each line newline-terminated.
+        cpu: Statements for the CPU, each line newline-terminated: never empty, :data:`CUDA_ONLY` for a part that
+            exists on CUDA only.
+
+    Raises:
+        ValueError: for an empty CPU branch.
     """
+    if not cpu.strip():
+        raise ValueError("a device branch states its CPU statements, or CUDA_ONLY")
     return ARCHITECTURE_GUARD + cuda + "#else\n" + cpu + "#endif\n"
 
 
@@ -277,6 +307,11 @@ def lane_group(lanes: int | str) -> DevicePrelude:
     if isinstance(lanes, int) and (lanes < 1 or (lanes & (lanes - 1) if lanes <= 32 else lanes % 32)):
         raise ValueError(f"a lane group needs a power of two up to 32 lanes or whole warps, got {lanes}")
     return DevicePrelude(f"lane_group_{lanes}", substitute(_LANE_GROUP, lanes=lanes), _LANE_GROUP_CPU)
+
+
+SHARED_STORAGE = DevicePrelude("shared_storage", "    #define SHARED __shared__", "    #define SHARED")
+"""``SHARED``, the storage of a block's working set (:meth:`.staging.Staging.declarations`): CUDA's shared memory, or
+the stack of the CPU's one thread, which runs the block's lane groups."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

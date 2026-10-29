@@ -47,7 +47,12 @@ def _kernels(reference, clocked):
         tree_kinetic_state.get_state_kernel(False, schedules, layout=_LAYOUT, clocked=clocked),
         tree_kinetic_state.get_state_kernel(True, schedules, layout=_LAYOUT, clocked=clocked),
         tree_kinetic_state.get_predictor_kernel(
-            schedules, layout=_LAYOUT, response="cholesky", reference=reference, clocked=clocked
+            schedules,
+            layout=_LAYOUT,
+            response="cholesky",
+            reference=reference,
+            clocked=clocked,
+            twists=tree_kinetic_state.publishes_twists(_LAYOUT, schedules, cuda=True),
         ),
     )
 

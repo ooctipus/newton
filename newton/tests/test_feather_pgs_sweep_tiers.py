@@ -122,7 +122,9 @@ class TestParallelTier(unittest.TestCase):
         for label, args, kwargs in CALLS:
             with self.subTest(label):
                 source = _source(args, kwargs)
-                self.assertTrue(source.rstrip().endswith("SYNC();\n#endif"), source[-200:])
+                # The CUDA body ends at the CPU branch, which fails a CPU build (device_preludes.CUDA_ONLY).
+                body = source[: source.rindex("#else\n")]
+                self.assertTrue(body.rstrip().endswith("SYNC();"), body[-200:])
 
     def test_drive_rows_take_the_drive_law_only_with_drive_rows(self):
         args = (64, 32, 18, "120")

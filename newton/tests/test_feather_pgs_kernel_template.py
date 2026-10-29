@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import field_group, kernel_template
-from newton._src.solvers.feather_pgs.device_preludes import RING
+from newton._src.solvers.feather_pgs.device_preludes import CUDA_ONLY, RING
 from newton._src.solvers.feather_pgs.field_group import Field
 from newton._src.solvers.feather_pgs.kernel_template import (
     Dispatch,
@@ -89,7 +89,7 @@ class TestKernelTemplate(unittest.TestCase):
         body = "    // body\n#endif\n"
         snippet = KernelTemplate("ringed", (), body, preludes=(RING,)).snippet
         self.assertEqual(snippet.count(RING.source), 1)
-        self.assertTrue(snippet.endswith(body))
+        self.assertTrue(snippet.endswith("    // body\n#else\n" + CUDA_ONLY + "#endif\n"))
         self.assertEqual(KernelTemplate("composed", (), snippet, composed=True).snippet, snippet)
         with self.assertRaisesRegex(ValueError, "composed"):
             _ = KernelTemplate("composed", (), snippet, preludes=(RING,), composed=True).snippet

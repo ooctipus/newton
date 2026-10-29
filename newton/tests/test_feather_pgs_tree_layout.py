@@ -77,7 +77,10 @@ class TestTreeLayoutRender(unittest.TestCase):
                     )
                     # The predictor's native: the held solve, the subtree reduction and the twist publication.
                     predictor = tree_kinetic_state.get_predictor_kernel.__wrapped__(
-                        schedules, layout=layout, response="cholesky"
+                        schedules,
+                        layout=layout,
+                        response="cholesky",
+                        twists=tree_kinetic_state.publishes_twists(layout, schedules, cuda=True),
                     )
                     predictor_natives = [
                         f for f in predictor.adj.get_references()[2] if getattr(f, "native_snippet", None)

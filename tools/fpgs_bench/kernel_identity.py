@@ -425,7 +425,9 @@ def held_tree_calls():
             kwargs = {**layout, **finish_options, **state_options}
             yield "tree_kinetic_state.get_state_kernel", state, (True, schedules), kwargs
             if options.keys() <= {"reference", "clocked"}:
-                kwargs = {**layout, "response": response, **options}
+                # The CUDA predictor: it holds the twist publication where the layout admits it.
+                twists = native.publishes_twists(tree, schedules, cuda=True)
+                kwargs = {**layout, "response": response, "twists": twists, **options}
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
         coordinates = tree.dofs + tree.free_roots

@@ -269,12 +269,11 @@ class TreeKineticState:
         root_of = np.searchsorted(tree.roots, tree.root_of).astype(np.int32)
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
-        # Predicted body twists for the resolved-world classifier: the predictor publishes them for warp-sized
-        # trees whose scans keep to their lane groups (the test pin predicted_twists=False leaves the classifier to
-        # its own kernel).
-        self.publishes_twists = native.publishes_twists(self.layout, self.schedules) and solver._route_pins.get(
-            "predicted_twists", True
-        )
+        # Predicted body twists for the resolved-world classifier: the predictor holds their publication for
+        # warp-sized trees whose scans keep to their lane groups (a CUDA register scan), and publishes them unless
+        # the test pin predicted_twists=False leaves the classifier to its own kernel.
+        self._predicts_twists = native.publishes_twists(self.layout, self.schedules, cuda=device.is_cuda)
+        self.publishes_twists = self._predicts_twists and solver._route_pins.get("predicted_twists", True)
         self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
         if self.publishes_twists:
             if getattr(solver, "_predicted_twist", None) is None:
@@ -421,7 +420,12 @@ class TreeKineticState:
             host=on_cpu,
         )
         self.predictor_kernel = native.get_predictor_kernel(
-            self.schedules, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
+            self.schedules,
+            layout=layout,
+            response=self._response,
+            reference=self.reference,
+            clocked=self.clocked,
+            twists=self._predicts_twists,
         )
 
     def _force_input(self, state_in, state_aug, control, predictor_qd, dt):

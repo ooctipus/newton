@@ -4,11 +4,14 @@
 """Exercise the paired articulation/free-body component split and its qualification."""
 
 import inspect
+import os
+import sys
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 import warp as wp
+from warp._src.context import pack_arg
 
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton.tests.feather_pgs_paired_fixture import (
@@ -19,7 +22,22 @@ from newton.tests.feather_pgs_paired_fixture import (
     pack_endpoints,
     solve_fixture,
     solve_kernels,
+    solve_pair_launches,
 )
+
+
+def _compile_offline(kernel):
+    """Compile ``kernel`` for sm_120 at 64 threads without a GPU (the repository's ``tools/fpgs_bench``: NVRTC and
+    ptxas) and return its resources, or ``None`` where the tools are not at hand."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if not os.path.isdir(os.path.join(root, "tools", "fpgs_bench")):
+        return None
+    sys.path.insert(0, root)
+    try:
+        from tools.fpgs_bench import kernel_sass  # noqa: PLC0415
+    finally:
+        sys.path.remove(root)
+    return kernel_sass.compile_kernel(kernel, arch=120, block_dim=64)
 
 
 class TestPairedComponents(unittest.TestCase):
@@ -171,13 +189,22 @@ class TestPairedComponents(unittest.TestCase):
             self.assertTrue(changed_sweep.startswith(original_sweep))
 
     def test_native_fixture_binds_actual_kernel_signatures(self):
-        """Compile both plain and split CUDA-test ABIs on CPU before device gating."""
+        """Bind the fixture's arrays to the plain and split sweeps' signatures as a launch does, and compile the
+        sweeps offline for sm_120, without a GPU: their bodies are CUDA-only (a CPU build fails)."""
         device = wp.get_device("cpu")
         for enabled in (False, True):
             data, arrays = solve_fixture(device)
-            launch_solve_pair(data, arrays, enabled=enabled, device=device)
             if enabled:
+                launch_components(data, device)
                 np.testing.assert_array_equal(data.selector.numpy(), [-1, -1, 3, 0, -1])
+            for kernel, _, _, arguments in solve_pair_launches(data, arrays, enabled=enabled, arch="120"):
+                with self.subTest(enabled=enabled, kernel=kernel.key):
+                    self.assertEqual(len(arguments), len(kernel.adj.args))
+                    for arg, value in zip(kernel.adj.args, arguments, strict=True):
+                        pack_arg(kernel, arg.type, arg.label, value, device)
+                    compiled = _compile_offline(kernel)
+                    if compiled is not None:
+                        self.assertEqual(compiled["local"], 0)
 
 
 class TestPairedComponentsCUDA(unittest.TestCase):

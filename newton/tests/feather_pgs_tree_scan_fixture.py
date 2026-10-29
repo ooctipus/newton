@@ -19,7 +19,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.device_preludes import device_branches
+from newton._src.solvers.feather_pgs.device_preludes import CUDA_ONLY, device_branches
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
@@ -270,8 +270,9 @@ def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, cpu: bool 
         cpu=item.name != "twist_shfl" and cpu,
     )
     if item.name == "twist_shfl":
+        # The twist publication is CUDA only, as in the predictor's twist block.
         return _TWIST_SCOPE + device_branches(
-            "    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", ""
+            "    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", CUDA_ONLY
         )
     if reduction:
         if item.combine is EXTERNAL:

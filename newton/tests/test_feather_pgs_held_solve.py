@@ -80,7 +80,12 @@ def _predictor(group, reference):
         group.tree, group.layout.lanes, chains=group.chains, reference=reference
     )
     return tree_kinetic_state.get_predictor_kernel(
-        schedules, layout=group.layout, response=group._response, reference=reference, clocked=group.clocked
+        schedules,
+        layout=group.layout,
+        response=group._response,
+        reference=reference,
+        clocked=group.clocked,
+        twists=group._predicts_twists,
     )
 
 
