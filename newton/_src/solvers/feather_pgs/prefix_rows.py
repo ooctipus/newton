@@ -22,8 +22,8 @@ from .field_group import Field
 
 LAW = (
     Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    Field("lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
     Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
     Field("beta", wp.float32, attr="pgs_beta"),
@@ -38,7 +38,7 @@ LAW = (
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
 VELOCITY_LAW = (
-    Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
+    Field("velocity_limit", wp.float32, ("dof",), attr="_joint_velocity_limit"),
     Field("vhat", wp.float32, ("dof",), attr="v_hat"),
     Field("activation", wp.float32, attr="velocity_limit_activation_fraction"),
 )

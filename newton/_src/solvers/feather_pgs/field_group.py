@@ -296,15 +296,20 @@ def upload(struct_type, device, source=None, /, **values):
 
     Each field takes ``values[field.name]``, else ``source``'s attribute (a host plan),
     else stays empty: a struct that several owners share may leave fields an owner
-    does not use unset. Host arrays become device arrays of the field's type; device
-    arrays are bound as they are; scalars take their declared type.
+    does not use unset. A solver's private copy of a model array (attribute ``_name``,
+    such as the kinematic state's effective limits) falls back to the source's
+    ``name``, so a model serves as the source. Host arrays become device arrays of
+    the field's type; device arrays are bound as they are; scalars take their declared type.
     """
     data = struct_type()
     for field in _STRUCT_FIELDS[struct_type]:
+        names = [field.attr or field.name]
+        if names[0].startswith("_"):
+            names.append(names[0][1:])
         if field.name in values:
             value = values[field.name]
-        elif source is not None and hasattr(source, field.attr or field.name):
-            value = getattr(source, field.attr or field.name)
+        elif source is not None and any(hasattr(source, name) for name in names):
+            value = getattr(source, next(name for name in names if hasattr(source, name)))
         else:
             continue
         if not field.dims:

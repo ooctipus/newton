@@ -144,7 +144,7 @@ def _kinematic_root_and_box():
     return builder.finalize(device="cuda:0"), root, box
 
 
-def _sparse_case(beta, cached, *, kinematic_body=None):
+def _sparse_case(beta, cached, *, kinematic_body=None, **options):
     """The branched scene of feather_pgs_sparse_scene on its native sparse route."""
     model = sparse_scene.branched_model()
     if kinematic_body is not None:
@@ -154,6 +154,7 @@ def _sparse_case(beta, cached, *, kinematic_body=None):
         True,
         pins={"evaluator": "ordinary"} if cached == "off" else None,
         friction_anchor_beta=beta,
+        **options,
     )
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -316,6 +317,29 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         sparse_scene.step(case)
                     runs[cached] = _snapshot(case[2])
                 self.assertTrue(np.isfinite(runs["auto"]["joint_qd"]).all())
+                self._assert_states_close(runs["auto"], runs["off"], what="owner against ordinary")
+
+    def test_a_kinematic_coordinate_past_its_limit_takes_no_row(self):
+        """A prescribed coordinate is outside the solver's unknowns: its joint limit takes no row on any route.
+
+        The scene starts the kinematic leaf's joint at 0.23 against its 0.2 limit. A limit row on that coordinate alone
+        has a response of the 1e10 armature's size against its cfm and no fixed point: its impulse grew with every
+        sweep and leaked into the ancestors, so the owner and the ordinary dense rows parted as the budget grew. Without
+        it, every row converges and the two meet at every budget.
+        """
+        for iterations in (8, 64, 512):
+            with self.subTest(iterations=iterations):
+                runs = {}
+                for cached in ("off", "auto"):
+                    case = _sparse_case(0.0, cached, kinematic_body=1, pgs_iterations=iterations)
+                    for _ in range(10):
+                        sparse_scene.step(case)
+                    runs[cached] = _snapshot(case[2])
+                    if cached == "off":
+                        solver = case[1]
+                        rows = int(solver.constraint_count.numpy()[0])
+                        impulses = np.abs(solver.impulses.numpy()[0, :rows])
+                        self.assertLess(float(impulses.max(initial=0.0)), 1.0e3, "a row grew without a fixed point")
                 self._assert_states_close(runs["auto"], runs["off"], what="owner against ordinary")
 
     def test_toggled_free_body_keeps_the_owner_and_ordinary_dynamics(self):

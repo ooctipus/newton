@@ -27,17 +27,18 @@ JOINTS = (
         "articulation_dof_start",
     ),
     Field("joint_target_q_start", wp.int32, ("joint_bound",), owner="model"),
-    Field("joint_target_ke", wp.float32, ("dof",), owner="model"),
-    Field("joint_target_kd", wp.float32, ("dof",), owner="model"),
+    Field("joint_target_ke", wp.float32, ("dof",), attr="_joint_target_ke"),
+    Field("joint_target_kd", wp.float32, ("dof",), attr="_joint_target_kd"),
     Field("joint_effort_limit", wp.float32, ("dof",), owner="model"),
-    Field("joint_velocity_limit", wp.float32, ("dof",), owner="model"),
-    Field("joint_limit_lower", wp.float32, ("dof",), owner="model"),
-    Field("joint_limit_upper", wp.float32, ("dof",), owner="model"),
+    Field("joint_velocity_limit", wp.float32, ("dof",), attr="_joint_velocity_limit"),
+    Field("joint_limit_lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
+    Field("joint_limit_upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
     Field("articulation_H_rows", wp.int32, ("articulation",)),
     Field("art_to_world", wp.int32, ("articulation",)),
 )
-"""The model's joint topology, drive gains, effort, velocity and position limits, and the solver's
-articulation coordinate starts, coordinate counts and worlds."""
+"""The model's joint topology and effort limits, the drive gains and velocity and position limits the solver's rows
+read (its kinematic state's effective arrays: none on a prescribed coordinate), and the solver's articulation
+coordinate starts, coordinate counts and worlds."""
 
 JointTable = field_group.struct("JointTable", JOINTS, __name__)
 
