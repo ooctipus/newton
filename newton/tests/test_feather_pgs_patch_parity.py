@@ -50,7 +50,7 @@ from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_patches import _ground_box, _patch_fixture
 
 # The dense split reference of the patch parity tests, on CPU.
-_DENSE_SPLIT = {"friction_anchor_beta": 0.2, "cached_dynamics": "off", "pgs_kernel": "loop"}
+_DENSE_SPLIT = {"friction_anchor_beta": 0.2}
 
 
 def _standing_cases(count, *, twin=False, iterations=8, **shape):

@@ -320,9 +320,7 @@ class Example:
                 body_pair_hysteresis=0.0,
                 body_pair_verify=args.test,
             ),
-            speculative_config=(
-                newton.CollisionPipeline.SpeculativeContactConfig() if args.solver == "fpgs" else None
-            ),
+            speculative_config=(newton.CollisionPipeline.SpeculativeContactConfig() if args.solver == "fpgs" else None),
             rigid_contact_max=self.contact_capacity * args.world_count,
             max_triangle_pairs=self.triangle_pair_capacity * args.world_count,
         )
@@ -342,7 +340,6 @@ class Example:
                 mf_max_constraints=self.mf_rows,
                 enable_joint_limits=True,
                 row_watermark=True,
-                use_parallel_streams=False,
             )
         else:
             self.solver = newton.solvers.SolverMuJoCo(

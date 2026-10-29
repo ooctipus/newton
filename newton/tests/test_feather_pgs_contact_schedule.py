@@ -402,7 +402,6 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
             model,
             pgs_mode="matrix_free",
             pgs_iterations=8,
-            use_parallel_streams=True,
             enable_joint_limits=True,
             dense_max_constraints=64,
             mf_max_constraints=64,

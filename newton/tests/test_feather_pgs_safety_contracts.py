@@ -4,6 +4,7 @@
 """Exercise capacity, dispatch and history contracts on ordinary robot defaults."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -36,9 +37,8 @@ class TestFeatherPGSSafety(unittest.TestCase):
         for capacity in (33, 35, 40):
             with self.subTest(capacity=capacity):
                 model = _driven_model(worlds=3, device=device)
-                solver = SolverFeatherPGS(
-                    model, pgs_mode="split", pgs_kernel="tiled_row", dense_max_constraints=capacity
-                )
+                with mock.patch.dict(SolverFeatherPGS._route_pins, {"pgs_kernel": "tiled_row"}):
+                    solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=capacity)
                 initial = np.zeros((3, capacity), dtype=np.float32)
                 initial[2] = 1234.0  # Inactive world must remain untouched.
                 solver.constraint_count.assign(np.array([capacity, 1, 0], dtype=np.int32))

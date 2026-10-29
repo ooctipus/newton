@@ -224,7 +224,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=40,
                     mf_gs_parallel_rows=0,
-                    use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)
                 self.assertEqual(solver._sparse_mass_matrix_plan.nonzero_count, nonzeros)

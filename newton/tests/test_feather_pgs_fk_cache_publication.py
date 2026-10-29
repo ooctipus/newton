@@ -77,7 +77,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="split",
-            pgs_kernel="loop",
             dense_max_constraints=16,
             pgs_iterations=6,
             friction_anchor_beta=0.0,

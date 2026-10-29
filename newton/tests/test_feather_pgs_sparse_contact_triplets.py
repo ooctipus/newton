@@ -459,7 +459,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=capacity,
                     mf_gs_parallel_rows=0,
-                    use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)
                 self.assertEqual("contact_triplets" in solver._pgs_solve_sparse_kernel.key, selected)
@@ -791,7 +790,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=192,
                     mf_gs_parallel_rows=0,
-                    use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)
                 key = solver._pgs_solve_sparse_kernel.key

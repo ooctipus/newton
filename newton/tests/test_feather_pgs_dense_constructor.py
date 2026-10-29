@@ -4,6 +4,7 @@
 """Exercise actual dense-kernel selection through a small real solver constructor."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -42,18 +43,19 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         for capacity, mode in cases:
             with self.subTest(device=str(device), capacity=capacity, mode=mode):
                 if model.device.is_cpu and mode != "loop":
-                    with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
-                        newton.solvers.SolverFeatherPGS(model, pgs_kernel=mode)
+                    with (
+                        self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"),
+                        mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"pgs_kernel": mode}),
+                    ):
+                        newton.solvers.SolverFeatherPGS(model)
                     continue
-                solver = newton.solvers.SolverFeatherPGS(
-                    model,
-                    pgs_mode="split",
-                    pgs_kernel=mode,
-                    dense_max_constraints=capacity,
-                    mf_max_constraints=8,
-                    use_parallel_streams=False,
-                    double_buffer=False,
-                )
+                with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"pgs_kernel": mode}):
+                    solver = newton.solvers.SolverFeatherPGS(
+                        model,
+                        pgs_mode="split",
+                        dense_max_constraints=capacity,
+                        mf_max_constraints=8,
+                    )
                 # No fabricated device, mocked factory, patched constructor, or
                 # synthetic solver shell participates in these assertions.
                 self.assertEqual(solver.world_count, world_count)
@@ -117,11 +119,8 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_mode="split",
-            pgs_kernel="tiled_row",
             dense_max_constraints=capacity,
             mf_max_constraints=8,
-            use_parallel_streams=False,
-            double_buffer=False,
         )
         dense = solver.get_path_selection()["routes"]["sweep"]["dense"]
         self.assertEqual(dense["kernels"], [f"sweep_tiled_row_{capacity}_global"])

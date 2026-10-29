@@ -25,6 +25,7 @@ child body's origin, ignoring a non-identity ``child_xform``.
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -311,7 +312,8 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         # this free-rooted body under either friction law and converts, transports and integrates in
         # its finish kernel instead (_stage6_update_qdd then returns early);
         # test_frictionless_slide_is_spin_invariant covers that route end to end.
-        solver = SolverFeatherPGS(model, angular_damping=0.0, cached_dynamics="off")
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            solver = SolverFeatherPGS(model, angular_damping=0.0)
         self.assertIsNone(solver.get_path_selection()["cached_prediction"])
         self.assertEqual(solver._free_root_joint_count, 1)
         state_in, state_out = model.state(), model.state()

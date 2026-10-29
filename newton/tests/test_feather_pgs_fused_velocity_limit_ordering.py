@@ -22,6 +22,7 @@ velocity-limit rows the fused clamp replaces.
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -91,25 +92,25 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         model.joint_target_kd.assign(target_kd)
         model.joint_velocity_limit.assign(vel_limit)
 
-        solver = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            drive_mode="physx_pgs",
-            enable_joint_velocity_limits=velocity_limits,
-            fuse_joint_velocity_limits=fuse,
-            enable_contact_friction=False,
-            # Deliberately under-converged (franka-class training configs run
-            # 8): ordering only matters when the sweep does NOT converge — at
-            # convergence the last contact visits apply ~zero delta and any
-            # clamp placement passes. A drive-visit clamp lets this impact
-            # reach 1.53x the limit at 8 iterations (7.1x at 1); dedicated
-            # rows and the end-of-iteration clamp hold the limit exactly at
-            # every iteration count.
-            pgs_iterations=8,
-            dense_max_constraints=32,
-            mf_max_constraints=32,
-            velocity_limit_law=velocity_limit_law,
-        )
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                drive_mode="physx_pgs",
+                enable_joint_velocity_limits=velocity_limits,
+                enable_contact_friction=False,
+                # Deliberately under-converged (franka-class training configs run
+                # 8): ordering only matters when the sweep does NOT converge — at
+                # convergence the last contact visits apply ~zero delta and any
+                # clamp placement passes. A drive-visit clamp lets this impact
+                # reach 1.53x the limit at 8 iterations (7.1x at 1); dedicated
+                # rows and the end-of-iteration clamp hold the limit exactly at
+                # every iteration count.
+                pgs_iterations=8,
+                dense_max_constraints=32,
+                mf_max_constraints=32,
+                velocity_limit_law=velocity_limit_law,
+            )
         if routes is not None:
             routes.append(solver.get_path_selection()["routes"])
 

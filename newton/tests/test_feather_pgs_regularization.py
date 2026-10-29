@@ -5,6 +5,7 @@
 
 import inspect
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -431,17 +432,17 @@ def test_assembled_dense_regularization_fixed_point(test: unittest.TestCase, dev
     g = 0.5
     with wp.ScopedDevice(device):
         model = _build_scissor_model(device)
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="split",
-            pgs_kernel="loop",
-            pgs_iterations=400,
-            pgs_velocity_iterations=0,
-            pgs_contact_regularization=g,
-            enable_contact_friction=False,
-            dense_max_constraints=64,
-            mf_max_constraints=16,
-        )
+        with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"pgs_kernel": "loop"}):
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="split",
+                pgs_iterations=400,
+                pgs_velocity_iterations=0,
+                pgs_contact_regularization=g,
+                enable_contact_friction=False,
+                dense_max_constraints=64,
+                mf_max_constraints=16,
+            )
         state_in = model.state()
         state_out = model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)

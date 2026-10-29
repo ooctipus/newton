@@ -859,10 +859,12 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             "dense_max_constraints": 320,
             "mf_max_constraints": 32,
             "mf_gs_incremental_rows": 0,
-            "sparse_mass_matrix": "off",
         }
         for schedule, phases in (("interleaved", {0}), ("physx_grasp", {3, 4, 5})):
-            with self.subTest(schedule=schedule):
+            with (
+                self.subTest(schedule=schedule),
+                mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, {"storage": "dense"}),
+            ):
                 solver, records = self._replay_solver_launches(model, {**options, "pgs_schedule": schedule})
                 sweep = solver.get_path_selection()["routes"]["sweep"]
                 self.assertEqual(sweep["mf_gs"], solver._pgs_solve_mf_gs_kernel.key)
@@ -917,11 +919,10 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             "dense_max_constraints": 320,
             "mf_max_constraints": 12288,
             "mf_gs_incremental_rows": 0,
-            "sparse_mass_matrix": "off",
         }
         solvers = {}
         for request in ("0", "1"):
-            pins = {"mf_storage": "streamed"} if request == "1" else {}
+            pins = {"storage": "dense", **({"mf_storage": "streamed"} if request == "1" else {})}
             with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, pins):
                 solvers[request] = fpgs.SolverFeatherPGS(model, **options)
         dofs = solvers["0"].max_world_dofs

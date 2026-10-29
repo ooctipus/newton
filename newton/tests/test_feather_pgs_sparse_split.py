@@ -117,11 +117,10 @@ def _model(*, floating=True, branches=3, depth=1, foot="sphere", device="cuda:0"
     return builder.finalize(device=device)
 
 
-def _solver(model, enabled, **overrides):
-    """Change only representation admission between the paired solvers."""
+def _solver(model, enabled, pins=None, **overrides):
+    """Change only representation admission between the paired solvers; ``pins`` are more test-only route pins."""
     options = {
         "pgs_mode": "split",
-        "pgs_kernel": "tiled_row",
         "pgs_schedule": "interleaved",
         "drive_mode": "augmented",
         "friction_anchor_beta": 0.0,
@@ -134,20 +133,20 @@ def _solver(model, enabled, **overrides):
         "restitution_velocity_threshold": 0.01,
         "dense_max_constraints": 32,
         "mf_max_constraints": 32,
-        "use_parallel_streams": True,
-        "double_buffer": False,
         "update_mass_matrix_interval": 2,
     }
-    if overrides.get("pgs_mode") == "matrix_free" and "pgs_kernel" not in overrides:
-        options["pgs_kernel"] = "auto"
     options.update(overrides)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"storage": "dense"}):
+    # Both arms keep one buffer set, so the rows compared after a step are still there.
+    single = {"double_buffer": False}
+    with mock.patch.dict(
+        SolverFeatherPGS._route_pins, {**single, **({} if enabled else {"storage": "dense"}), **(pins or {})}
+    ):
         return SolverFeatherPGS(model, **options)
 
 
-def _case(enabled, *, options=None, contact_matching=None, deterministic=False, standing=False, **shape):
+def _case(enabled, *, options=None, pins=None, contact_matching=None, deterministic=False, standing=False, **shape):
     model = standing_model(**shape) if standing else _model(**shape)
-    solver = _solver(model, enabled, **(options or {}))
+    solver = _solver(model, enabled, pins=pins, **(options or {}))
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
@@ -498,7 +497,12 @@ class TestSparseSplitPatchPhysics(unittest.TestCase):
         # which also serves patch friction.
         # Sorted contacts: both arms see the same contact order, which the by-contact checks key on.
         dense = _case(
-            False, options={**options, "cached_dynamics": "off"}, contact_matching=matching, deterministic=True, **shape
+            False,
+            options=options,
+            pins={"evaluator": "ordinary"},
+            contact_matching=matching,
+            deterministic=True,
+            **shape,
         )
         sparse = _case(True, options=options, contact_matching=matching, deterministic=True, **shape)
         self.assertFalse(dense[1]._sparse_split)

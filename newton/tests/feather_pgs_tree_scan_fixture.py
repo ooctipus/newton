@@ -12,6 +12,7 @@ and central-difference gradients of each. It defines no tests.
 
 import functools
 from dataclasses import dataclass
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -490,7 +491,8 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
     from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
 
     device = model.device
-    solver = SolverFeatherPGS(model, use_parallel_streams=False, cached_dynamics="off")
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+        solver = SolverFeatherPGS(model)
     state, control = model.state(), model.control()
     aug = solver._prepare_augmented_state(state, model.state(), control)
     rng = np.random.default_rng(seed)

@@ -45,7 +45,6 @@ def _rollout(model, *, serial, steps=90, cached=True):
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
             friction_anchor_beta=0.0,
-            cached_dynamics="auto" if cached else "off",
         )
     owner = getattr(solver, "_tree_kinetic_state", None)
     # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.

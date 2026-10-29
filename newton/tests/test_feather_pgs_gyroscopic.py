@@ -5,6 +5,7 @@
 
 import os
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -180,13 +181,13 @@ def _mixed_scene(device, *, arm, totes):
     # One route for every scene. The held-tree owner refuses the arm's revolute root but would take
     # the totes-only scene, and each scene would key its own incremental tier by its world width;
     # none of these scenes has a constraint row for the tier to solve.
-    solver = newton.solvers.SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split",
-        angular_damping=0.0,
-        cached_dynamics="off",
-        mf_gs_incremental_rows=0,
-    )
+    with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free" if wp.get_device(device).is_cuda else "split",
+            angular_damping=0.0,
+            mf_gs_incremental_rows=0,
+        )
     return model, solver, control, [state, output]
 
 

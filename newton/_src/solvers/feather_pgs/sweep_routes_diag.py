@@ -691,7 +691,7 @@ def tiled_row_staging(max_constraints: int, limit: int) -> tuple[str, str]:
         )
     raise ValueError(
         f"dense_max_constraints={max_constraints} needs {rows} bytes of shared memory per block for the tiled_row "
-        f"sweep's row vectors, more than the device's {limit}; use pgs_kernel='loop' or fewer dense rows"
+        f"sweep's row vectors, more than the device's {limit}; use fewer dense rows"
     )
 
 

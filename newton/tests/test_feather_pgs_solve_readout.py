@@ -344,7 +344,7 @@ def _sparse_route():
 
     return {
         "model": model,
-        "options": {"pgs_mode": "split", "sparse_mass_matrix": "on", "friction_anchor_beta": 0.0},
+        "options": {"pgs_mode": "split", "friction_anchor_beta": 0.0},
         "contacts": contacts,
         "labels": {"sparse_pgs"},
         "owners": ({"sparse_pgs"},),
@@ -424,12 +424,12 @@ def _matrix_free_route():
         "model": _build_model(free_count=2, robot_count=2),
         "options": {
             "pgs_mode": "matrix_free",
-            "sparse_mass_matrix": "off",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,
             "mf_max_constraints": 64,
         },
+        "overrides": {"storage": "dense"},
         "labels": {"mf_gs", "mf_gs_incremental"},
         "owners": ({"mf_gs", "mf_gs_incremental"},),
         "solving": {"mf_gs"},
@@ -450,12 +450,12 @@ def _incremental_route():
         "model": _build_model(),
         "options": {
             "pgs_mode": "matrix_free",
-            "sparse_mass_matrix": "off",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,
             "mf_max_constraints": 64,
         },
+        "overrides": {"storage": "dense"},
         "labels": {"mf_gs_incremental"},
         "owners": ({"mf_gs_incremental"},),
         "solving": {"mf_gs_incremental"},
@@ -518,14 +518,13 @@ def _tier_route():
         "model": _build_model(free_count=1, free_heights=(1.0, 0.05)),
         "options": {
             "pgs_mode": "matrix_free",
-            "sparse_mass_matrix": "off",
             "friction_anchor_beta": 0.0,
             "enable_joint_limits": True,
             "dense_max_constraints": 96,
             "mf_max_constraints": 64,
             "mf_gs_parallel_rows": 32,
         },
-        "overrides": {"hinv_jt_kernel": "tiled"},
+        "overrides": {"hinv_jt_kernel": "tiled", "storage": "dense"},
         "labels": {"mf_gs", "parallel_tier"},
         "owners": ({"mf_gs", "parallel_tier"},),
         "solving": {"mf_gs", "parallel_tier"},
@@ -572,7 +571,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def _solvers(route, variants):
         """Build one solver per option set of ``variants`` on the route's model, with the route's overrides; a
         variant's options override the route's."""
-        options = {**route["options"], "double_buffer": False, "pgs_iterations": BUDGET}
+        options = {**route["options"], "pgs_iterations": BUDGET}
         with mock.patch.object(SolverFeatherPGS, "_route_pins", route.get("overrides", {})):
             return [SolverFeatherPGS(route["model"], **{**options, **variant}) for variant in variants]
 

@@ -20,7 +20,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import environment_flags, friction_patches, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
-from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.step_plan import StepPlan
@@ -62,6 +61,12 @@ PATCH_DT = 1.0 / 400.0
 FIRST_STEP_VELOCITY_ATOL = 7.5e-4
 FIRST_STEP_IMPULSE_ATOL = 1.0e-3
 FIRST_STEP_REGION_BOUNDS = {"load_atol": 1.0e-3, "friction_atol": 1.0e-4}
+
+
+def _pinned(model, pins, **options):
+    """A solver built under the test-only route pins ``pins``."""
+    with patch.dict(SolverFeatherPGS._route_pins, pins):
+        return SolverFeatherPGS(model, **options)
 
 
 def _cpu_model():
@@ -210,7 +215,8 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=Fa
     ``after_reset(solver, contacts)`` runs after the first replay that follows
     the reset; seven more replays follow it. ``deterministic`` sorts contacts.
     """
-    solver = _make_solver(model, sparse, cached_dynamics=cached_dynamics, **options)
+    with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached_dynamics == "off" else {}):
+        solver = _make_solver(model, sparse, **options)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=deterministic)
@@ -239,8 +245,11 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=Fa
 def _first_patch_step(model, cached_dynamics):
     """Step a fresh standing solver once, eagerly, and copy the poses and twists its release test reads."""
     # The caller compares the opt-in stage-3 snapshot of the predicted velocity.
-    with patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}):
-        solver = _make_solver(model, False, cached_dynamics=cached_dynamics, mf_gs_incremental_rows=0)
+    with (
+        patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}),
+        patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached_dynamics == "off" else {}),
+    ):
+        solver = _make_solver(model, False, mf_gs_incremental_rows=0)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=True)
@@ -297,20 +306,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.2, "requested": None, "default": None, "source": "default"}
         )
-        self.assertEqual(
-            options["pgs_kernel"], {"applied": "loop", "requested": "auto", "default": "auto", "source": "default"}
-        )
         self.assertEqual(options["contact_friction_gap_threshold"]["applied"], "inf")
         self.assertEqual(options["joint_limit_activation_gap"]["default"], "inf")
-        self.assertFalse(options["fuse_joint_velocity_limits"]["applied"])
-        self.assertEqual(options["sparse_mass_matrix"]["applied"], "off")
-        self.assertEqual(options["cached_dynamics"]["applied"], "off")
-        # Split mode builds no matrix-free tier and CPU builds no stream.
+        # Split mode builds no matrix-free tier.
         self.assertEqual(
             options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
-        )
-        self.assertEqual(
-            options["use_parallel_streams"], {"applied": False, "requested": True, "default": True, "source": "default"}
         )
         solver = SolverFeatherPGS(
             model, angular_damping=0.1, friction_anchor_beta=0.0, pgs_iterations=7, mf_gs_parallel_rows=48
@@ -338,16 +338,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 44 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 45th
+        declaration order, so a positional call over the 39 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 40th
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:45]}
-        self.assertEqual((parameters[1].name, parameters[44].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:40]}
+        self.assertEqual((parameters[1].name, parameters[39].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -373,9 +373,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[45].name, "pgs_solve_readout")
-        with self.assertRaisesRegex(TypeError, r"takes at most 46 positional arguments but 47 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[45].default)
+        self.assertEqual(parameters[40].name, "pgs_solve_readout")
+        with self.assertRaisesRegex(TypeError, r"takes at most 41 positional arguments but 42 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[40].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
@@ -874,8 +874,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         built = resident_rows = 0
         for options, model_options in cases:
             with self.subTest(options=options, model=model_options):
+                arguments, pins = dict(options), {}
+                if arguments.pop("sparse_mass_matrix", None) == "off":
+                    pins["storage"] = "dense"
+                if arguments.pop("cached_dynamics", None) == "off":
+                    pins["evaluator"] = "ordinary"
                 try:
-                    solver = _make_solver(_build_model(**model_options), True, **options)
+                    with patch.dict(SolverFeatherPGS._route_pins, pins):
+                        solver = _make_solver(_build_model(**model_options), True, **arguments)
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
@@ -929,32 +935,40 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             resident_rows, 1, "A streamed-metadata route must keep its row types and parents resident"
         )
 
-    def test_private_override_validation_and_cpu_precedence(self):
-        """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
+    def test_kernel_pins_are_validated_on_the_cpu(self):
+        """Run the CPU's loop kernels, accept their own pins, and reject an invalid or a CUDA-only pin."""
         model = _cpu_model()
-        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "invalid"}):
-            with self.assertRaisesRegex(ValueError, "cholesky_kernel"):
+        solver = SolverFeatherPGS(model)
+        self.assertEqual(solver.cholesky_kernel, "loop")
+        self.assertIn("CPU", solver.get_path_selection()["routes"]["stages"]["factor"]["1"]["reason"])
+        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "loop"}):
+            self.assertEqual(SolverFeatherPGS(model).cholesky_kernel, "loop")
+        for name, value in (
+            ("cholesky_kernel", "invalid"),
+            ("cholesky_kernel", "tiled"),
+            ("trisolve_kernel", "tiled"),
+            ("hinv_jt_kernel", "tiled"),
+            ("delassus_kernel", "tiled"),
+            ("pgs_kernel", "tiled_row"),
+        ):
+            with (
+                self.subTest(name=name, value=value),
+                patch.dict(SolverFeatherPGS._route_pins, {name: value}),
+                self.assertRaisesRegex(ValueError, name),
+            ):
                 SolverFeatherPGS(model)
-            explicit = SolverFeatherPGS(model, cholesky_kernel="loop").get_path_selection()
-            self.assertIn("Explicit", explicit["routes"]["stages"]["factor"]["1"]["reason"])
-        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "tiled"}):
-            solver = SolverFeatherPGS(model)
-            self.assertEqual(solver.cholesky_kernel, "loop")
-            reason = solver.get_path_selection()["routes"]["stages"]["factor"]["1"]["reason"]
-            self.assertIn("CPU", reason)
-            self.assertIn("override", reason)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_selection_reasons_distinguish_policy_capacity_and_override(self):
         """Explain the actual sparse rejection while retaining the dense fallback."""
         model = _build_model()
         cases = (
-            ({"sparse_mass_matrix": "off"}, "Explicit"),
-            ({"trisolve_kernel": "loop"}, "explicit dense"),
-            ({"dense_max_constraints": _over_budget_rows(model)}, "shared memory"),
+            ({}, {"storage": "dense"}, "storage='dense'"),
+            ({}, {"placement": "general"}, "placement='general'"),
+            ({"dense_max_constraints": _over_budget_rows(model)}, {}, "shared memory"),
         )
-        for options, expected in cases:
-            with self.subTest(options=options):
+        for options, pins, expected in cases:
+            with self.subTest(options=options, pins=pins), patch.dict(SolverFeatherPGS._route_pins, pins):
                 selected = _make_solver(model, True, **options).get_path_selection()
                 self.assertEqual(selected["sparse_mass_matrix"], "off")
                 self.assertIn(expected, selected["reasons"]["sparse_mass_matrix"])
@@ -987,13 +1001,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         model = _build_model()
         with patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense"}):
             disabled = _make_solver(model, True)
-            forced = _make_solver(model, True, cached_dynamics="on", sparse_mass_matrix="on")
-        # The pin keeps the native sparse factor out; an explicit sparse_mass_matrix='on' overrides it.
+        # The pin keeps the native sparse factor out; the dense groups' held tree takes the solver.
         self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
         self.assertIn("storage='dense'", disabled.get_path_selection()["reasons"]["sparse_mass_matrix"])
-        self.assertEqual(forced.get_path_selection()["sparse_mass_matrix"], "on")
-        self.assertEqual(forced.get_path_selection()["cached_dynamics"], "on")
-        self.assertIn("Explicit", forced.get_path_selection()["reasons"]["cached_dynamics"])
+        self.assertEqual(disabled.get_path_selection()["cached_dynamics"], "on")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_auto_composes_existing_execution_choices(self):
@@ -1005,8 +1016,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 with self.subTest(options=options):
                     solver = _make_solver(model, True, friction_anchor_beta=0.0, **options)
                     self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
-                    disabled = _make_solver(model, True, sparse_mass_matrix="off", friction_anchor_beta=0.0, **options)
-                    self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
             for options in ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True}):
                 with self.subTest(patch=options):
                     # Default patch friction composes with the same sparse factors and tree cache.
@@ -1018,42 +1027,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 with self.subTest(pinned_dense=options):
                     ordinary = _make_solver(model, True, friction_anchor_beta=0.0, **options)
                     self.assertEqual(ordinary.get_path_selection()["sparse_mass_matrix"], "off")
-                    forced = _make_solver(model, True, sparse_mass_matrix="on", friction_anchor_beta=0.0, **options)
-                    self.assertEqual(forced.get_path_selection()["sparse_mass_matrix"], "on")
-
-    def test_cached_dynamics_cpu_choices(self):
-        """Keep CPU auto ordinary and reject a forced unsupported cache."""
-        model = _cpu_model()
-        for choice in ("auto", "off"):
-            selected = SolverFeatherPGS(model, cached_dynamics=choice).get_path_selection()
-            self.assertEqual(selected["requested"]["cached_dynamics"], choice)
-            self.assertEqual(selected["cached_dynamics"], "off")
-            self.assertEqual(selected["publication"], "ordinary")
-        for choice in ("on", "typo"):
-            with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
-                SolverFeatherPGS(model, cached_dynamics=choice)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
-    def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):
-        """Honor explicit cache choices and retain automatic dense kernel requests."""
-        model = _build_model()
-        # The storage pin under auto keeps the native sparse factor out; the dense groups' held tree takes the solver.
-        for choice, pins, expected, sparse in (
-            ("on", {}, True, True),
-            ("off", {}, False, False),
-            ("auto", {"storage": "dense"}, True, False),
-        ):
-            with self.subTest(choice=choice), patch.dict(SolverFeatherPGS._route_pins, pins):
-                solver = _make_solver(model, True, cached_dynamics=choice)
-                selected = solver.get_path_selection()
-                self.assertEqual(solver._sparse_mass_matrix_size is not None, sparse)
-                self.assertEqual(solver._tree_kinetic_state is not None, expected)
-                self.assertEqual(selected["cached_dynamics"], "on" if expected else "off")
-                self.assertEqual(selected["publication"], "cached" if expected else "ordinary")
-        with self.assertRaisesRegex(ValueError, "cached_dynamics.*conflicts"):
-            _make_solver(model, False, cached_dynamics="on", trisolve_kernel="loop")
-        solver = _make_solver(model, False, cached_dynamics="auto", trisolve_kernel="loop")
-        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
@@ -1075,12 +1048,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder = newton.ModelBuilder()
         builder.replicate(world, 2)
         model = builder.finalize(device="cuda:0")
-        solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
+        solver = _make_solver(model, False, friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
         self.assertEqual(solver.get_path_selection()["cached_prediction"], "tree")
         # The evaluator pin retains ordinary dynamics.
         with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
+            solver = _make_solver(model, False, friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
         # Cached trees require a fixed or free root; a revolute joint at the world is rejected.
         world = newton.ModelBuilder()
@@ -1095,8 +1068,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder = newton.ModelBuilder()
         builder.replicate(world, 2)
         model = builder.finalize(device="cuda:0")
-        with self.assertRaisesRegex(ValueError, "cached_dynamics"):
-            _make_solver(model, False, cached_dynamics="on", friction_anchor_beta=0.0)
+        solver = _make_solver(model, False, friction_anchor_beta=0.0)
+        self.assertIsNone(solver._tree_kinetic_state)
+        self.assertIn("Ordinary dynamics retained", solver.get_path_selection()["reasons"]["cached_dynamics"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_free_body_worlds_keep_the_dense_route_for_both_laws(self):
@@ -1147,7 +1121,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 "compact_jacobian",
                 small,
                 {},
-                lambda beta: SolverFeatherPGS(small, friction_anchor_beta=beta, sparse_mass_matrix="off"),
+                lambda beta: _pinned(small, {"storage": "dense"}, friction_anchor_beta=beta),
                 "compact_jacobian",
                 dict.fromkeys(("6", "1"), "compact_jacobian"),
             ),
@@ -1312,155 +1286,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         )
         assert_anchor_sites_close(*(anchor_sites(solver, contacts) for solver, contacts, _ in runs), tangent=False)
 
-    def test_scalar_overrides_reach_solver(self):
-        """Honor public choices independently of private test overrides."""
-        choices = {
-            "cholesky_kernel": "loop",
-            "trisolve_kernel": "loop",
-            "hinv_jt_kernel": "par_row",
-            "delassus_kernel": "par_row_col",
-            "pgs_kernel": "loop",
-        }
-        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "tiled"}):
-            solver = SolverFeatherPGS(_cpu_model(), **choices)
-        for name, value in choices.items():
-            self.assertEqual(getattr(solver, name), value)
-        self.assertEqual(solver.get_path_selection()["requested"]["cholesky_kernel"], "loop")
-
-    def test_auto_cpu_and_invalid_forced_choices(self):
-        """Resolve CPU auto to scalar kernels and reject unsupported explicit choices."""
-        model = _cpu_model()
-        self.assertEqual(SolverFeatherPGS(model).get_path_selection()["pgs_kernel"], "loop")
-        for name, value in (
-            ("cholesky_kernel", "tiled"),
-            ("trisolve_kernel", "tiled"),
-            ("hinv_jt_kernel", "tiled"),
-            ("delassus_kernel", "tiled"),
-            ("pgs_kernel", "tiled_row"),
-            ("sparse_mass_matrix", "on"),
-            ("cholesky_kernel", "typo"),
-        ):
-            with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
-                SolverFeatherPGS(model, **{name: value})
-
-    def test_matrix_free_resolution_ignores_an_explicit_pgs_kernel(self):
-        """Resolve an explicit matrix-free pgs_kernel like auto on every device, returning its warning.
-
-        Split mode still selects the kernel with its device rules, and matrix-free mode still
-        rejects unknown names and an explicit delassus_kernel.
-        """
-        auto = dict.fromkeys(
-            (
-                "cholesky_kernel",
-                "trisolve_kernel",
-                "hinv_jt_kernel",
-                "delassus_kernel",
-                "pgs_kernel",
-                "sparse_mass_matrix",
-                "cached_dynamics",
-            ),
-            "auto",
-        )
-        for is_cpu, automatic in ((False, "tiled_row"), (True, "loop")):
-            for kernel in ("loop", "tiled_row"):
-                with self.subTest(is_cpu=is_cpu, pgs_kernel=kernel):
-                    resolved, explicit_dense, reasons, ignored = resolve_kernel_choices(
-                        {**auto, "pgs_kernel": kernel}, {}, is_cpu=is_cpu, pgs_mode="matrix_free"
-                    )
-                    reference = resolve_kernel_choices(auto, {}, is_cpu=is_cpu, pgs_mode="matrix_free")
-                    self.assertEqual(reference[3], {})
-                    self.assertEqual(resolved, reference[0])
-                    self.assertEqual(resolved["pgs_kernel"], automatic)
-                    self.assertFalse(explicit_dense)
-                    self.assertEqual(list(ignored), ["pgs_kernel"])
-                    self.assertIn(f"pgs_kernel={kernel!r} is ignored in matrix_free mode", ignored["pgs_kernel"])
-                    self.assertTrue(reasons["pgs_kernel"].startswith(f"Explicit pgs_kernel={kernel!r} is ignored"))
-        resolved, _, _, ignored = resolve_kernel_choices(
-            {**auto, "pgs_kernel": "loop"}, {}, is_cpu=False, pgs_mode="split"
-        )
-        self.assertEqual((resolved["pgs_kernel"], ignored), ("loop", {}))
-        for is_cpu, mode, choice, message in (
-            (True, "split", {"pgs_kernel": "tiled_row"}, "requires CUDA"),
-            (False, "matrix_free", {"pgs_kernel": "typo"}, "must be one of"),
-            (False, "matrix_free", {"delassus_kernel": "tiled"}, "delassus_kernel is unused in matrix_free"),
-        ):
-            with self.subTest(is_cpu=is_cpu, pgs_mode=mode, choice=choice), self.assertRaisesRegex(ValueError, message):
-                resolve_kernel_choices({**auto, **choice}, {}, is_cpu=is_cpu, pgs_mode=mode)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free mode requires CUDA")
-    def test_matrix_free_ignores_an_explicit_pgs_kernel(self):
-        """Build the automatic matrix-free solver for an explicit pgs_kernel and warn that it is ignored.
-
-        An explicit friction law keeps a point kernel from selecting point friction, so every route
-        and kernel plan must equal the automatic solver's; only the request, its option record and
-        the pgs_kernel reason name the ignored kernel.
-        """
-        builder = newton.ModelBuilder()
-        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-        builder.add_articulation([builder.add_joint_revolute(-1, body)])
-        model = builder.finalize(device="cuda:0")
-        for beta in (0.0, 0.2):
-            reference = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_anchor_beta=beta).get_path_selection()
-            for kernel in ("loop", "tiled_row"):
-                with self.subTest(friction_anchor_beta=beta, pgs_kernel=kernel):
-                    with self.assertWarnsRegex(UserWarning, f"pgs_kernel='{kernel}' is ignored in matrix_free mode"):
-                        solver = SolverFeatherPGS(
-                            model, pgs_mode="matrix_free", pgs_kernel=kernel, friction_anchor_beta=beta
-                        )
-                    self.assertEqual(solver.pgs_kernel, "tiled_row")
-                    selected = solver.get_path_selection()
-                    for key in ("routes", "pgs_kernel", "sparse_mass_matrix", "cached_dynamics"):
-                        self.assertEqual(selected[key], reference[key], key)
-                    self.assertEqual(selected["requested"], {**reference["requested"], "pgs_kernel": kernel})
-                    self.assertEqual(
-                        selected["options"]["pgs_kernel"],
-                        {"applied": "tiled_row", "requested": kernel, "default": "auto", "source": "argument"},
-                    )
-                    self.assertEqual(
-                        selected["reasons"]["pgs_kernel"],
-                        f"{reference['reasons']['pgs_kernel']} Explicit pgs_kernel={kernel!r} is ignored in "
-                        "matrix_free mode.",
-                    )
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Sparse factors require CUDA")
-    def test_public_dense_kernels_override_sparse_and_fused_dispatch(self):
-        """Select actual dense kernels while leaving unspecified choices automatic."""
-        model = _build_model()
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", trisolve_kernel="loop")
-        selected = solver.get_path_selection()
-        self.assertEqual(selected["sparse_mass_matrix"], "off")
-        self.assertEqual(selected["routes"]["stages"]["trisolve"]["9"]["route"], "loop")
-        self.assertEqual(selected["requested"]["hinv_jt_kernel"], "auto")
-        split = SolverFeatherPGS(model, pgs_mode="split", delassus_kernel="par_row_col")
-        self.assertFalse(split._execution_plan.hinv_jt_fused_sizes)
-        for kwargs, message in (
-            ({"sparse_mass_matrix": "on", "trisolve_kernel": "loop"}, "conflicts"),
-            ({"delassus_kernel": "tiled"}, "delassus_kernel"),
-        ):
-            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
-                SolverFeatherPGS(model, pgs_mode="matrix_free", **kwargs)
-        # pgs_kernel is no dense factor choice: matrix-free mode ignores it and keeps automatic admission.
-        with self.assertWarnsRegex(UserWarning, "pgs_kernel='loop' is ignored in matrix_free mode"):
-            ignored = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel="loop")
-        self.assertEqual(
-            ignored.get_path_selection()["sparse_mass_matrix"],
-            SolverFeatherPGS(model, pgs_mode="matrix_free").get_path_selection()["sparse_mass_matrix"],
-        )
-
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse factors require CUDA")
     def test_force_sparse_and_dense_with_graph_replay(self):
-        """Force both representations and preserve a contacting articulated rollout."""
+        """Run both representations (dense storage pinned) and preserve a contacting articulated rollout."""
         model = _build_model()
         outputs = []
-        for choice in ("on", "off"):
-            solver = SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                sparse_mass_matrix=choice,
-                enable_joint_limits=True,
-                pgs_iterations=32,
-                double_buffer=False,
-            )
+        for choice, pins in (("on", {}), ("off", {"storage": "dense"})):
+            solver = _pinned(model, pins, pgs_mode="matrix_free", enable_joint_limits=True, pgs_iterations=32)
             self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], choice)
             state, output = model.state(), model.state()
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)

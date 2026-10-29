@@ -186,11 +186,9 @@ def run_oracle(solver, state, augmented, contacts):
 class TestDeviceTorsionPreparation(unittest.TestCase):
     """Exercise portable preparation kernels independently of a full CUDA solve."""
 
-    def test_public_device_option_is_default_off(self):
-        """Keep public device preparation opt-in and expose explicit graph validation."""
-        self.assertIs(
-            signature(solver_feather_pgs.SolverFeatherPGS).parameters["contact_torsion_device"].default, False
-        )
+    def test_device_preparation_exposes_graph_validation(self):
+        """Expose explicit graph validation of the device-resident preparation, the rule on CUDA."""
+        self.assertNotIn("contact_torsion_device", signature(solver_feather_pgs.SolverFeatherPGS).parameters)
         self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "prepare_contact_torsion_capture", None)))
         self.assertTrue(callable(getattr(solver_feather_pgs.SolverFeatherPGS, "validate_contact_torsion", None)))
 
@@ -641,17 +639,17 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_public_api_noop_and_fail_stop(self):
-        """No radius means no new state; active host torsion cannot be captured."""
-        _, plain, model, state, _ = fixture(0.0, contact_torsion_device=True, pgs_iterations=16)
+        """No radius means no new state; active host torsion (the pinned reference) cannot be captured."""
+        _, plain, model, state, _ = fixture(0.0, pins={}, pgs_iterations=16)
         plain.prepare_contact_torsion_capture(state, model.state())
         plain.validate_contact_torsion()
         self.assertIsNone(getattr(plain, "_device_torsion", None))
 
         _, reference, model, state, _ = fixture(0.01, pgs_iterations=16)
-        with self.assertRaisesRegex(RuntimeError, "requires contact_torsion_device"):
+        with self.assertRaisesRegex(RuntimeError, "requires the device-resident torsion preparation"):
             reference.prepare_contact_torsion_capture(state, model.state())
 
-        _, solver, model, state, contacts = fixture(0.01, contact_torsion_device=True, pgs_iterations=16)
+        _, solver, model, state, contacts = fixture(0.01, pins={}, pgs_iterations=16)
         output = model.state()
         solver.prepare_contact_torsion_capture(state, output)
         solver._device_torsion.work.status.assign(np.array([16], dtype=np.int32))
@@ -672,7 +670,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             for captured in (False, True):
                 _, solver, model, a, contacts = fixture(
                     0.01,
-                    contact_torsion_device=True,
+                    pins={},
                     pgs_iterations=16,
                     pgs_velocity_iterations=velocity,
                     pgs_contact_regularization=regularization,

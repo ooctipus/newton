@@ -306,7 +306,7 @@ def _solve_data(sign, *, contact, iterations, omega):
 
 # The reference arm's ordinary route: neither the held-tree owner nor the incremental matrix-free tier,
 # both of which serve either friction law.
-ORDINARY_ROUTE = {"cached_dynamics": "off", "mf_gs_incremental_rows": 0}
+ORDINARY_ROUTE = {"mf_gs_incremental_rows": 0}
 
 
 def _assert_ordinary_route(test, case):
@@ -331,7 +331,9 @@ def _case(
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
     limits.reshape(2, -1)[:, -1] = np.inf
     model.joint_velocity_limit.assign(limits)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"storage": "dense"}):
+    # Both arms keep one buffer set, so the rows compared after a step are still there.
+    pins = {"double_buffer": False, **({} if enabled else {"storage": "dense", "evaluator": "ordinary"})}
+    with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
@@ -345,7 +347,6 @@ def _case(
             pgs_warmstart=False,
             dense_max_constraints=32,
             mf_max_constraints=32,
-            double_buffer=False,
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
             velocity_limit_law=velocity_limit_law,

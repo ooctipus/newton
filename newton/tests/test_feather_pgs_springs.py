@@ -98,9 +98,7 @@ class TestFeatherPGSSprings(unittest.TestCase):
                     pgs_iterations=8,
                     dense_max_constraints=32,
                     enable_joint_velocity_limits=True,
-                    fuse_joint_velocity_limits=False,
                     drive_mode="augmented",
-                    use_parallel_streams=True,
                 )
                 state_in, state_out = model.state(), model.state()
                 state_in.joint_qd.fill_(velocity)

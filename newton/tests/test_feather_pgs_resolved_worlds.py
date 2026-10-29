@@ -576,7 +576,6 @@ def _rollout(
             enable_joint_limits=True,
             update_mass_matrix_interval=2,
             friction_anchor_beta=friction_anchor_beta,
-            sparse_mass_matrix="off",
             **(solver_kwargs or {}),
         )
     pipeline = newton.CollisionPipeline(model, deterministic=True)

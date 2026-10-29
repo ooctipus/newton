@@ -214,7 +214,6 @@ class Example:
             dense_max_constraints=args.rows,
             mf_max_constraints=256,
             row_watermark=True,
-            use_parallel_streams=False,
         )
         self.current, self.next = self.model.state(), self.model.state()
         self.control = self.model.control()

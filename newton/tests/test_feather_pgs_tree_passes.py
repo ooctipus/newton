@@ -179,7 +179,7 @@ class _Stages:
     def __init__(self, model):
         from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
 
-        self.solver = SolverFeatherPGS(model, use_parallel_streams=False)
+        self.solver = SolverFeatherPGS(model)
         self.state, self.out, control = model.state(), model.state(), model.control()
         self.aug = self.solver._prepare_augmented_state(self.state, self.out, control)
 

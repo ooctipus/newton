@@ -487,15 +487,14 @@ def _matrix_free_solver(model, law, **options):
         "pgs_mode": "matrix_free",
         "enable_joint_velocity_limits": True,
         "friction_anchor_beta": 0.0,
-        "sparse_mass_matrix": "off",
-        "cached_dynamics": "off",
         "pgs_iterations": 8,
         "dense_max_constraints": 32,
         "mf_max_constraints": 32,
         "velocity_limit_law": law,
     }
     settings.update(options)
-    return SolverFeatherPGS(model, **settings)
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary"}):
+        return SolverFeatherPGS(model, **settings)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free FPGS requires CUDA")

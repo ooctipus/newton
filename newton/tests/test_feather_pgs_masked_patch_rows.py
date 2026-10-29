@@ -105,14 +105,14 @@ def _builder(masked):
         yield
 
 
-def _rollout(model, *, masked, steps, **solver_kwargs):
+def _rollout(model, *, masked, steps, pins=None, **solver_kwargs):
     """Step the scene with the masked or the per-contact builder; return the solver and each step's rows by contact.
 
     The masked builder writes every size of at most 32 DOFs; ``masked=False`` substitutes the
     per-contact builder for it. Each step records its rows by contact, the body poses and, on CPU,
     the whole row arrays.
     """
-    with _builder(masked):
+    with _builder(masked), mock.patch.dict(SolverFeatherPGS._route_pins, pins or {}):
         solver = SolverFeatherPGS(model, **solver_kwargs)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
         contacts = pipeline.contacts()
@@ -331,8 +331,9 @@ class TestMaskedPatchRows(unittest.TestCase):
         """
         model = _conveyor_model(wp.get_device("cuda:0"))
         options = {"pgs_mode": "matrix_free", "pgs_iterations": 8, "dense_max_constraints": 96}
-        solver, masked, methods = _rollout(model, masked=True, steps=1, sparse_mass_matrix="off", **options)
-        _, general, general_methods = _rollout(model, masked=False, steps=1, sparse_mass_matrix="off", **options)
+        dense = {"storage": "dense"}
+        solver, masked, methods = _rollout(model, masked=True, steps=1, pins=dense, **options)
+        _, general, general_methods = _rollout(model, masked=False, steps=1, pins=dense, **options)
         self.assertEqual(methods, {"masked_combined"})
         self.assertEqual(general_methods, {"per_contact"})
         self.assertTrue(solver._has_prescribed_response)

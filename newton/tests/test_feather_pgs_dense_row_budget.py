@@ -69,7 +69,7 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
                 selected, reason = tiled_row_staging(capacity, limit)
                 self.assertEqual(selected, staging)
                 self.assertIn(str(limit), reason)
-        with self.assertRaisesRegex(ValueError, "pgs_kernel='loop'"):
+        with self.assertRaisesRegex(ValueError, "fewer dense rows"):
             tiled_row_staging(8192, rtx_pro_6000)
         self.assertEqual(tiled_row_kernel(384, 120, staging="global").key, "sweep_tiled_row_384_global")
         with self.assertRaises(ValueError):

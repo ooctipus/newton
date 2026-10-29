@@ -14,7 +14,15 @@ from newton.solvers import SolverFeatherPGS
 DT = 1.0 / 60.0
 # FK/ID reuse and the parallel inertia refresh belong to the ordinary dense
 # route; keep sparse factors and cache owners off under either friction law.
-ORDINARY_ROUTE = {"sparse_mass_matrix": "off", "cached_dynamics": "off"}
+# The ordinary route: dense storage and ordinary dynamics (test-only route pins).
+ORDINARY_PINS = {"storage": "dense", "evaluator": "ordinary"}
+
+
+def _ordinary_solver(model, **options):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, ORDINARY_PINS):
+        return SolverFeatherPGS(model, **options)
+
+
 # Per-articulation initial pose/velocity: [base, left branch, right branch].
 INITIAL_JOINT_Q = (0.7, 0.3, -0.4)
 INITIAL_JOINT_QD = (0.5, -0.2, 0.3)
@@ -238,7 +246,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = SolverFeatherPGS(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True, **ORDINARY_ROUTE)
+        solver = _ordinary_solver(model, pgs_mode="matrix_free", enable_joint_velocity_limits=True)
         self.assertFalse(solver._fk_id_cache_enabled)
         self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
 
@@ -253,7 +261,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, **ORDINARY_ROUTE)
+            solver = _ordinary_solver(model, update_mass_matrix_interval=2)
             trajectory, mass_masks = _run_state_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -272,7 +280,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_floating_model("cuda:0")
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, **ORDINARY_ROUTE)
+            solver = _ordinary_solver(model, update_mass_matrix_interval=2)
             trajectory, mass_masks = _run_floating_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -285,41 +293,13 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 trajectories[0][name], trajectories[1][name], rtol=0.0, atol=2.0e-6, err_msg=name
             )
 
-    @unittest.skipUnless(wp.is_cuda_available(), "parallel compact inertia refresh requires CUDA")
-    def test_parallel_compact_refresh_matches_serial_trajectory(self):
-        trajectories = []
-        for use_parallel_streams in (False, True):
-            model = _build_model("cuda:0")
-            solver = SolverFeatherPGS(
-                model,
-                update_mass_matrix_interval=1,
-                double_buffer=False,
-                use_parallel_streams=use_parallel_streams,
-                **ORDINARY_ROUTE,
-            )
-            trajectories.append(_run_trajectory(model, solver, num_steps=20))
-
-        np.testing.assert_allclose(trajectories[1], trajectories[0], rtol=0.0, atol=2.0e-6)
-
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph capture requires CUDA")
     def test_captured_parallel_dynamics_matches_fused_trajectory(self):
         """Match captured parallel dynamics against eager fused execution."""
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        graph_solver = SolverFeatherPGS(
-            graph_model,
-            update_mass_matrix_interval=1,
-            double_buffer=False,
-            use_parallel_streams=True,
-            **ORDINARY_ROUTE,
-        )
-        eager_solver = SolverFeatherPGS(
-            eager_model,
-            update_mass_matrix_interval=1,
-            double_buffer=False,
-            use_parallel_streams=False,
-            **ORDINARY_ROUTE,
-        )
+        graph_solver = _ordinary_solver(graph_model, update_mass_matrix_interval=1)
+        eager_solver = _ordinary_solver(eager_model, update_mass_matrix_interval=1)
         graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
         eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()

@@ -43,6 +43,10 @@ def pads(device, *, mu=0.5, separation=0.0, restitution=0.0):
     return b.finalize(device=device)
 
 
+# The host reference of the torsion rows, which records its groups (solver._torsion_stats).
+HOST_TORSION = {"torsion_preparation": "host"}
+
+
 def fixture(
     radius=None,
     *,
@@ -57,9 +61,14 @@ def fixture(
     restitution=0.0,
     dt=0.0025,
     row_limit=None,
+    pins=None,
     **solver_overrides,
 ):
-    """Solve two equal articulated rectangular pads touching face to face."""
+    """Solve two equal articulated rectangular pads touching face to face.
+
+    ``pins`` are the solver's test-only route pins, by default the host reference of the torsion rows
+    (:data:`HOST_TORSION`), whose construction statistics these tests read.
+    """
     model = pads("cuda:0", mu=mu, separation=separation, restitution=restitution)
     a, z = model.state(), model.state()
     a.joint_qd.assign(np.array([sliding, 0, closing, 0, 0, spin, -sliding, 0, -closing, 0, 0, -spin], np.float32))
@@ -109,7 +118,8 @@ def fixture(
     if radius is not None:
         kwargs["contact_torsion_radius"] = radius
     kwargs.update(solver_overrides)
-    solver = SolverFeatherPGS(model, **kwargs)
+    with patch.dict(SolverFeatherPGS._route_pins, HOST_TORSION if pins is None else pins):
+        solver = SolverFeatherPGS(model, **kwargs)
     if row_limit is not None:
         solver.dense_max_constraints = row_limit
     solver.step(a, z, model.control(), contacts, dt)
@@ -130,7 +140,8 @@ def fixture(
 # it even with no shape selected (torsion requires ordinary factors and is not law-agnostic), while a
 # zero radius admits native sparse velocity-limit factors, the held-tree owner and the incremental
 # tier wherever they fit; these differ from the legacy route in float order only.
-TORSION_OFF_ROUTE = {"sparse_mass_matrix": "off", "cached_dynamics": "off", "mf_gs_incremental_rows": 0}
+TORSION_OFF_ROUTE = {"mf_gs_incremental_rows": 0}
+TORSION_OFF_PINS = {**HOST_TORSION, "storage": "dense", "evaluator": "ordinary"}
 
 
 def _without_reasons(record):
@@ -201,21 +212,23 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         body, hx=half, hy=half, hz=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=0, mu=mu, restitution=0)
     )
     model = b.finalize(device="cuda:0")
-    solver = SolverFeatherPGS(
-        model,
-        contact_torsion_radius=radius,
-        pgs_mode="matrix_free",
-        pgs_iterations=64,
-        pgs_velocity_iterations=0,
-        pgs_beta=0.05,
-        pgs_cfm=0,
-        pgs_contact_regularization=0,
-        pgs_warmstart=False,
-        angular_damping=0,
-        dense_max_constraints=64,
-        mf_max_constraints=16,
-        **PATCH_OPTIONS,
-    )
+    # The test reads the host preparation's torsion record (_torsion_stats).
+    with patch.dict(SolverFeatherPGS._route_pins, HOST_TORSION):
+        solver = SolverFeatherPGS(
+            model,
+            contact_torsion_radius=radius,
+            pgs_mode="matrix_free",
+            pgs_iterations=64,
+            pgs_velocity_iterations=0,
+            pgs_beta=0.05,
+            pgs_cfm=0,
+            pgs_contact_regularization=0,
+            pgs_warmstart=False,
+            angular_damping=0,
+            dense_max_constraints=64,
+            mf_max_constraints=16,
+            **PATCH_OPTIONS,
+        )
     pipeline = newton.CollisionPipeline(
         model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
     )
@@ -391,6 +404,7 @@ class TestTorsionNeutralRoute(unittest.TestCase):
             with (
                 self.subTest(law=law),
                 patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
+                patch.dict(SolverFeatherPGS._route_pins, TORSION_OFF_PINS),
             ):
                 reference = SolverFeatherPGS(model, contact_torsion_radius=0.0, **{**split, **options})
                 selected_out = SolverFeatherPGS(
@@ -408,8 +422,10 @@ class TestContactTorsion(unittest.TestCase):
 
     def test_default_off_equivalent(self):
         """Keep the zero-radius option exactly equivalent to prefeature output."""
-        reference, reference_solver, *_ = fixture(0.0, **TORSION_OFF_ROUTE)
-        actual, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **TORSION_OFF_ROUTE)
+        reference, reference_solver, *_ = fixture(0.0, pins=TORSION_OFF_PINS, **TORSION_OFF_ROUTE)
+        actual, selected_out, *_ = fixture(
+            0.01, contact_torsion_shape_indices=(), pins=TORSION_OFF_PINS, **TORSION_OFF_ROUTE
+        )
         assert_torsion_neutral_routes(self, reference_solver, selected_out)
         for key in reference:
             np.testing.assert_array_equal(actual[key], reference[key], err_msg=key)

@@ -27,7 +27,6 @@ from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 
 # Options whose applied value lives under another attribute after construction.
 _APPLIED_ATTRIBUTES = {
-    "double_buffer": "_double_buffer",
     "nvtx": "_nvtx",
     "row_watermark": "_row_watermark",
     "enable_bilateral_preelimination": "_preelim_active",
@@ -77,27 +76,12 @@ def _is_default(value, default) -> bool:
     return bool(same) if isinstance(same, (bool, np.bool_)) else False
 
 
-def _streams_created(solver) -> bool:
-    # Every stream use_parallel_streams gates: size groups, local owners, the compact inertia
-    # refresh, asynchronous augmented drives and the paired overlap. CPU builds none.
-    names = ("_local_internal_stream", "_articulation_dynamics_stream")
-    streams = (
-        *solver._size_streams.values(),
-        *(getattr(solver, name, None) for name in names),
-        getattr(solver, "_paired_general_solve_stream", None),
-    )
-    return any(stream is not None for stream in streams)
-
-
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
-    "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
-    "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
     "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
-    "use_parallel_streams": _streams_created,
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
         solver._ink_rows > 0 and any(tier.velocity_limit_pass for tier in solver._mf_gs_tiers)
     ),
@@ -688,8 +672,8 @@ def _contact_update(solver, record) -> dict:
         reason = "Every sweep of this route solves each contact unit exactly against its own Delassus block."
     else:
         reason = (
-            "Only the loop sweeps solve contact units: the dense loop sweep of split mode (pgs_kernel='loop') on any "
-            "device and the split free-body sweep on CPU. The other sweeps keep the sequential law."
+            "Only the loop sweeps solve contact units: the dense loop sweep of split mode on any device and the split "
+            "free-body sweep on CPU. The other sweeps keep the sequential law."
         )
     return {
         "requested": requested,

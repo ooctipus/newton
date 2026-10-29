@@ -1157,7 +1157,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cpu")
-        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="auto")
+        solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2)
         self.assertEqual(solver.pgs_kernel, "loop")
 
     def test_anchor_selection_respects_contact_gap_filters(self):
@@ -1278,17 +1278,18 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 released.append((kwargs["inputs"][2].numpy().copy(), kwargs["inputs"][3].numpy().copy()))
             return launch(kernel, *args, **kwargs)
 
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            pgs_iterations=8,
-            enable_joint_limits=True,
-            update_mass_matrix_interval=2,
-            dense_max_constraints=256,
-            cached_dynamics="off",
-            sparse_mass_matrix="off",
-            friction_anchor_beta=0.2,
-        )
+        with mock.patch.dict(
+            newton.solvers.SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary"}
+        ):
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                update_mass_matrix_interval=2,
+                dense_max_constraints=256,
+                friction_anchor_beta=0.2,
+            )
         selected = solver.get_path_selection()
         self.assertEqual(selected["publication"], "ordinary")
         # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.

@@ -457,7 +457,7 @@ class TestHeldTreeChains(unittest.TestCase):
                         tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains, reference=False: on_chains
                     ),
                 ):
-                    solver = _make_solver(model, True, cached_dynamics="on")
+                    solver = _make_solver(model, True)
                 self.assertIsNotNone(solver._tree_kinetic_state)
                 # The sparse factor's held group is the owner's only group.
                 (owner,) = solver._tree_kinetic_state.groups

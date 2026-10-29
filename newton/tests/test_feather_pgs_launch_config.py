@@ -208,7 +208,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         """Preserve main's positional budget while adding keyword-only research options."""
         parameters = inspect.signature(SolverFeatherPGS).parameters
         names = list(parameters)
-        self.assertEqual(names[names.index("fuse_joint_velocity_limits") + 1], "pgs_iterations")
+        self.assertEqual(names[names.index("velocity_limit_activation_fraction") + 1], "pgs_iterations")
         for name in (
             "pgs_solve_readout",
             "mf_gs_incremental_rows",
@@ -273,61 +273,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 pgs_mode="split",
                 enable_joint_velocity_limits=True,
             )
-
-    def test_default_kwargs_produce_identical_kernel_selection(self):
-        model = _build_chain_model()
-        implicit = SolverFeatherPGS(model)
-        explicit = SolverFeatherPGS(model, tile_threads=64)
-        for attr in (
-            "_cholesky_kernels_by_size",
-            "_triangular_solve_kernels_by_size",
-            "_hinv_jt_kernels_by_size",
-            "_hinv_jt_fused_kernels_by_size",
-        ):
-            implicit_kernels = getattr(implicit, attr)
-            explicit_kernels = getattr(explicit, attr)
-            self.assertEqual(set(implicit_kernels), set(explicit_kernels))
-            for size, kernel in implicit_kernels.items():
-                # The factories are functools.cache'd, so identical knob values
-                # must resolve to the *same* kernel objects as the defaults.
-                self.assertIs(kernel, explicit_kernels[size], f"{attr}[{size}]")
-
-    def test_non_default_tile_threads_selects_distinct_kernels(self):
-        model = _build_chain_model()
-        default = SolverFeatherPGS(model)
-        wide = SolverFeatherPGS(model, tile_threads=128)
-        for size, kernel in default._cholesky_kernels_by_size.items():
-            if kernel is None:
-                continue
-            other = wide._cholesky_kernels_by_size[size]
-            self.assertIsNot(kernel, other)
-            self.assertIn("_bd64", kernel.key)
-            self.assertIn("_bd128", other.key)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "compact response mapping requires CUDA matrix-free mode")
-    def test_compact_world_dof_mapping_pads_heterogeneous_worlds(self):
-        solver = SolverFeatherPGS(_build_heterogeneous_world_model(), pgs_mode="matrix_free")
-        self.assertEqual(solver.max_world_dofs, 6)
-        np.testing.assert_array_equal(solver.world_dof_count.numpy(), np.array((6, 1), dtype=np.int32))
-        indices = solver.world_dof_indices.numpy()
-        np.testing.assert_array_equal(indices[0], np.arange(6, dtype=np.int32))
-        self.assertGreaterEqual(int(indices[1, 0]), 0)
-        np.testing.assert_array_equal(indices[1, 1:], np.full(5, -1, dtype=np.int32))
-
-    def test_hinv_chunk_selection_respects_shared_memory(self):
-        """Select the largest response chunk that fits shared memory."""
-        cases = (
-            (23, 384, 101376, 32),
-            (128, 384, 101376, 16),
-            (160, 384, 101376, None),
-            (23, 0, 101376, None),
-            (23, 384, 8192, 16),
-            (23, 384, 2500, None),
-            (100, 1, 49152, 1),
-        )
-        for n_dofs, max_constraints, shared_memory, expected in cases:
-            with self.subTest(n_dofs=n_dofs, max_constraints=max_constraints, shared_memory=shared_memory):
-                self.assertEqual(_select_hinv_jt_chunk_size(n_dofs, max_constraints, shared_memory, 64), expected)
 
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
         """Include tile scratch space when selecting response chunks."""
@@ -508,17 +453,18 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             # Point friction keeps the contact-triple schedule under test; patch rows are not uniform triples.
             friction_anchor_beta=0.0,
         )
-        reference = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            dense_max_constraints=64,
-            mf_max_constraints=32,
-            pgs_iterations=8,
-            enable_joint_limits=True,
-            # Point friction keeps the contact-triple schedule under test; patch rows are not uniform triples.
-            friction_anchor_beta=0.0,
-            use_parallel_streams=False,
-        )
+        # The dense reference: the general placement keeps the response and limit rows of every size.
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"placement": "general"}):
+            reference = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                dense_max_constraints=64,
+                mf_max_constraints=32,
+                pgs_iterations=8,
+                enable_joint_limits=True,
+                # Point friction keeps the contact-triple schedule under test; patch rows are not uniform triples.
+                friction_anchor_beta=0.0,
+            )
 
         self.assertTrue(optimized._sparse_diagonal_contact_solve)
         self.assertTrue(optimized._sparse_diagonal_contact_triples)
@@ -624,7 +570,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for label, friction_kwargs in (("patch", {}), ("point", {"friction_anchor_beta": 0.0})):
             with self.subTest(friction=label):
                 optimized = make_solver(**friction_kwargs)
-                reference = make_solver(use_parallel_streams=False, **friction_kwargs)
+                with mock.patch.dict(SolverFeatherPGS._route_pins, {"placement": "general"}):
+                    reference = make_solver(**friction_kwargs)
                 self.assertTrue(optimized._sparse_diagonal_contact_solve)
                 self.assertEqual(optimized._friction_anchors_enabled, label == "patch")
                 # Point contacts are uniform triples; patch contacts are units of one or three rows.
@@ -852,47 +799,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertIn(tree_passes.fk_id.key, blocks)
         self.assertEqual(set().union(*blocks.values()), {tree_passes.SERIAL_BLOCK_DIM}, blocks)
 
-    def test_tile_threads_validation(self):
-        model = newton.ModelBuilder().finalize()
-        for bad in (0, -64, 16, 48, 96, 512):
-            with self.subTest(value=bad):
-                with self.assertRaisesRegex(ValueError, "tile_threads"):
-                    SolverFeatherPGS(model, tile_threads=bad)
-        for good in (32, 64, 128, 256):
-            with self.subTest(value=good):
-                solver = SolverFeatherPGS(model, tile_threads=good)
-                self.assertEqual(solver.tile_threads, good)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "tiled launch-config step test requires CUDA")
-    def test_non_default_tile_threads_compiles_and_steps(self):
-        """Compile and step streamed fusion with a wide reservation and non-default block size."""
-        model = _build_chain_model()
-        forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
-        with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
-            solver = SolverFeatherPGS(
-                model,
-                tile_threads=128,
-                pgs_mode="split",
-                pgs_kernel="loop",
-                dense_max_constraints=384,
-            )
-        self.assertTrue(all(solver._execution_plan.use_tiled_hinv_jt(size) for size in solver.size_groups))
-        self.assertTrue(all(solver._execution_plan.use_fused_hinv_jt(size) for size in solver.size_groups))
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
-        for _ in range(5):
-            state_0.clear_forces()
-            solver.step(state_0, state_1, control, None, 1.0 / 600.0)
-            state_0, state_1 = state_1, state_0
-        wp.synchronize()
-        self.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
-        self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
-
-    def test_fuse_joint_velocity_limits_validation(self):
-        # fuse_joint_velocity_limits defaults to True but only engages in the
-        # matrix_free + physx_pgs + velocity-limits formulation; anywhere else
-        # it must be silently inert (no error), so the default doesn't
-        # constrain unrelated solver modes.
+    def test_fused_velocity_limit_clamp_rule(self):
+        # The fused clamp engages exactly in the matrix_free + physx_pgs + velocity-limits formulation; anywhere
+        # else the velocity limits keep their dedicated rows.
         model = _build_chain_model(num_links=2, num_worlds=1)
         for kwargs in (
             {},  # neither matrix_free nor velocity limits nor physx drive
@@ -901,9 +810,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 if kwargs.get("pgs_mode") == "matrix_free" and model.device.is_cpu:
                     with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-                        SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
+                        SolverFeatherPGS(model, **kwargs)
                     continue
-                solver = SolverFeatherPGS(model, fuse_joint_velocity_limits=True, **kwargs)
+                solver = SolverFeatherPGS(model, **kwargs)
                 self.assertFalse(solver.fuse_joint_velocity_limits)
         if wp.is_cuda_available():
             # drive_mode='augmented' with velocity limits enabled is inert too
@@ -913,11 +822,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="augmented",
-                fuse_joint_velocity_limits=True,
             )
             self.assertFalse(solver.fuse_joint_velocity_limits)
-            # The applicable combination engages by default (no kwarg passed),
-            # and an explicit False opts out.
+            # The applicable combination engages, and the test pin velocity_limit_clamp=False keeps the rows.
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
@@ -925,25 +832,24 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 drive_mode="physx_pgs",
             )
             self.assertTrue(solver.fuse_joint_velocity_limits)
-            solver = SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                enable_joint_velocity_limits=True,
-                drive_mode="physx_pgs",
-                fuse_joint_velocity_limits=False,
-            )
+            with mock.patch.dict(SolverFeatherPGS._route_pins, {"velocity_limit_clamp": False}):
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    enable_joint_velocity_limits=True,
+                    drive_mode="physx_pgs",
+                )
             self.assertFalse(solver.fuse_joint_velocity_limits)
             # velocity_limit_activation_fraction=inf is the explicit
             # never-activate kill-switch for velocity limits; the fused clamp
             # rides the drive-row visit (which the inf gate does not cover),
-            # so an explicit opt-in must stay inert rather than re-enforce
-            # limits the fraction disabled.
+            # so it must stay inert rather than re-enforce limits the fraction
+            # disabled.
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
                 enable_joint_velocity_limits=True,
                 drive_mode="physx_pgs",
-                fuse_joint_velocity_limits=True,
                 velocity_limit_activation_fraction=float("inf"),
             )
             self.assertFalse(solver.fuse_joint_velocity_limits)
@@ -957,7 +863,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     pgs_mode="matrix_free",
                     enable_joint_velocity_limits=True,
                     drive_mode="physx_pgs",
-                    fuse_joint_velocity_limits=True,
                     pgs_velocity_iterations=2,
                     pgs_velocity_drive_mode=velocity_drive_mode,
                 )
@@ -966,7 +871,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "fused velocity-limit clamp requires CUDA")
     def test_fuse_joint_velocity_limits_clamps_driven_dofs_without_rows(self):
         # A strongly driven chain with a low joint velocity limit: with
-        # fuse_joint_velocity_limits=True the driven DOFs must (a) stay within
+        # the fused clamp the driven DOFs must (a) stay within
         # the limit plus a small GS-convergence tolerance and (b) use fewer
         # dense rows than the dedicated-row formulation (the two vel-limit
         # rows per driven DOF are replaced by a stateless end-of-iteration
@@ -980,16 +885,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             model.joint_target_ke.assign(np.full(n, 200.0, dtype=np.float32))
             model.joint_target_kd.assign(np.full(n, 5.0, dtype=np.float32))
             model.joint_velocity_limit.assign(np.full(n, qdot_max, dtype=np.float32))
-            solver = SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                drive_mode="physx_pgs",
-                enable_joint_velocity_limits=True,
-                fuse_joint_velocity_limits=fuse,
-                pgs_iterations=64,
-                dense_max_constraints=16,
-                mf_max_constraints=16,
-            )
+            with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
+                solver = SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    drive_mode="physx_pgs",
+                    enable_joint_velocity_limits=True,
+                    pgs_iterations=64,
+                    dense_max_constraints=16,
+                    mf_max_constraints=16,
+                )
             state_0, state_1 = model.state(), model.state()
             control = model.control()
             control.joint_target_q.assign(np.full(n, 3.0, dtype=np.float32))

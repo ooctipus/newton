@@ -795,7 +795,8 @@ class TestParallelPatchReference(unittest.TestCase):
         model = _pushed_sphere("cpu")
         limits = model.joint_velocity_limit.numpy().astype(np.float64)
         model.joint_qd.assign(prescaled_joint_velocity(model))  # what the matrix-free route predicts from
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, sparse_mass_matrix="off", cached_dynamics="off")
+        with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
+            solver = SolverFeatherPGS(model, friction_anchor_beta=0.2)
         _rollout(model, solver, 1)
         (size,) = solver.size_groups
         mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
@@ -1213,9 +1214,8 @@ class TestTierSweeps(unittest.TestCase):
         TestPatchParallelPhysics runs the solver's tiers on the same stance.
         """
         model = sliding_stance("cpu")
-        solver = SolverFeatherPGS(
-            model, friction_anchor_beta=0.2, pgs_iterations=2000, sparse_mass_matrix="off", cached_dynamics="off"
-        )
+        with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
+            solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=2000)
         _rollout(model, solver, 1)
         case, serial = split_world_case(solver)
         # Sixteen contact rows: two patch rings of four normals, each ring with two anchors.
@@ -1426,26 +1426,29 @@ class TestParallelPatchKernel(unittest.TestCase):
 
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+# Dense storage, and dense storage over ordinary dynamics (test-only route pins).
+_DENSE = {"storage": "dense"}
+_ORDINARY = {"storage": "dense", "evaluator": "ordinary"}
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
 _STATE_FLOOR = {"joint_q": 2.0e-4, "body_q": 2.0e-4, "joint_qd": 2.0e-3, "body_qd": 2.0e-3}
 
 
-def _matrix_free_solver(model, *, beta, parallel_rows, **options):
-    """A dense matrix-free solver whose sweep is serial (``parallel_rows=0``) or the parallel tiers."""
+def _matrix_free_solver(model, *, beta, parallel_rows, pins=_DENSE, **options):
+    """A matrix-free solver whose sweep is serial (``parallel_rows=0``) or the parallel tiers, on dense storage
+    unless ``pins`` (test-only route pins) say otherwise."""
     settings = {
         "pgs_mode": "matrix_free",
         "friction_anchor_beta": beta,
         "pgs_iterations": 8,
         "dense_max_constraints": 32,
-        "sparse_mass_matrix": "off",
         "mf_gs_incremental_rows": 0,
         "mf_gs_parallel_rows": parallel_rows,
         "mf_gs_parallel_matrix_free": True,
         "mf_gs_parallel_sweeps": 24,
-        "double_buffer": False,
     }
     settings.update(options)
-    return SolverFeatherPGS(model, **settings)
+    with patch.dict(SolverFeatherPGS._route_pins, pins):
+        return SolverFeatherPGS(model, **settings)
 
 
 def _rollout(model, solver, steps, *, dt=1.0 / 240.0, after_step=None):
@@ -1599,7 +1602,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         tier, point or linked, sweeps the automatic budget of 32 rows at eight iterations.
         """
         model = standing_model()
-        options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
+        options = {"pins": {}}
         patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
         # Both tiers requested on the dense route (sparse factors off): the parallel one is built.
         over_incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
@@ -1691,7 +1694,10 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 for _ in range(2):
                     pair()
                 outcomes = _admitted_modes(solver._friction_patches)
+                # The eager steps queued buffer clears the graph does not wait for (seed_double_buffer_events).
+                wp.synchronize_device(model.device)
                 with scoped_capture_after_gc(device=model.device) as capture:
+                    solver.seed_double_buffer_events()
                     pair()
                 self.assertEqual(outcomes, ["sort", "keep"] if reuse is None else ["sort", "sort"], reuse)
                 replays[reuse] = []
@@ -2040,7 +2046,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         # As test_accumulated_serial_sweep_converges_to_the_parallel_tier builds its routes on this hand.
         converged = {
             "enable_joint_velocity_limits": True,
-            "cached_dynamics": "off",
+            "pins": _ORDINARY,
             "pgs_iterations": 2000,
             "mf_gs_parallel_sweeps": 2000,
         }

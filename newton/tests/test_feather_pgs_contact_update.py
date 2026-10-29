@@ -1185,13 +1185,14 @@ class TestContactUpdateCuda(unittest.TestCase):
             builder.add_ground_plane()
             model = builder.finalize(device="cuda:0")
             with self.assertWarnsRegex(UserWarning, "contact_update='unit' applies only to some sweeps"):
-                tiled = SolverFeatherPGS(model, contact_update="unit", pgs_kernel="tiled_row")
+                tiled = SolverFeatherPGS(model, contact_update="unit")
             update = tiled.get_path_selection()["routes"]["sweep"]["contact_update"]
             self.assertEqual(update["law"], "sequential")
             self.assertTrue(update["sequential"])
             with warnings.catch_warnings(record=True) as recorded:
                 warnings.simplefilter("always")
-                loop = SolverFeatherPGS(model, contact_update="unit", pgs_kernel="loop")
+                with mock.patch.dict(SolverFeatherPGS._route_pins, {"pgs_kernel": "loop"}):
+                    loop = SolverFeatherPGS(model, contact_update="unit")
             self.assertFalse([w for w in recorded if "contact_update" in str(w.message)])
             update = loop.get_path_selection()["routes"]["sweep"]["contact_update"]
             self.assertEqual(update["unit"], ["sweep_loop_unit"])

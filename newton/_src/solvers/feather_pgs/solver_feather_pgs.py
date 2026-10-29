@@ -69,7 +69,7 @@ from . import (
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .conditioning import ArmatureFloor, conditioning_armature
-from .configuration import check_options, resolve_kernel_choices
+from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
@@ -267,6 +267,8 @@ _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in 
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
 _SMALL_DOF_THRESHOLD_DEFAULT = 12
+# Threads per block of the tiled factor, triangular-solve and response kernels.
+_TILE_THREADS = 64
 # Beyond this guard, the relaxation weight is too close to zero to be a
 # useful float32 PGS update and the assembled split path risks overflow when
 # it converts the weight back to a diagonal regularizer.
@@ -843,8 +845,11 @@ class SolverFeatherPGS(SolverBase):
     #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
     #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
-    #   row_support False: sparse rows on explicit indices.
-    #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel: a dense kernel.
+    #   row_support False: sparse rows on explicit indices.     placement "general": no specialized placement.
+    #   velocity_limit_clamp False: dedicated rows for driven velocity limits.
+    #   torsion_preparation "host": the host reference of the torsion rows.
+    #   double_buffer False: one set of mass matrices and Jacobians, whose rows stay readable after a step.
+    #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel, pgs_kernel: a dense kernel (CUDA).
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -931,7 +936,6 @@ class SolverFeatherPGS(SolverBase):
         joint_limit_activation_gap: float = float("inf"),
         enable_joint_velocity_limits: bool = False,
         velocity_limit_activation_fraction: float = 0.0,
-        fuse_joint_velocity_limits: bool = True,
         pgs_iterations: int = 12,
         pgs_velocity_iterations: int = 0,
         pgs_beta: float = 0.2,
@@ -944,15 +948,9 @@ class SolverFeatherPGS(SolverBase):
         pgs_mode: str = "split",
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         mf_max_constraints: int = 512,
-        # Dense-path PGS kernel (matrix_free solves through the fused MF-GS kernel)
-        pgs_kernel: str = "auto",
-        # Parallelism options
-        use_parallel_streams: bool = True,
-        double_buffer: bool = True,
         nvtx: bool = False,
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
-        tile_threads: int = 64,
         row_watermark: bool = False,
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
@@ -977,14 +975,7 @@ class SolverFeatherPGS(SolverBase):
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
-        contact_torsion_device: bool = False,
         contact_compliance: bool = False,
-        cholesky_kernel: Literal["auto", "tiled", "loop"] = "auto",
-        trisolve_kernel: Literal["auto", "tiled", "loop"] = "auto",
-        hinv_jt_kernel: Literal["auto", "tiled", "par_row"] = "auto",
-        delassus_kernel: Literal["auto", "tiled", "par_row_col"] = "auto",
-        sparse_mass_matrix: Literal["auto", "on", "off"] = "auto",
-        cached_dynamics: Literal["auto", "on", "off"] = "auto",
     ):
         """Create the solver for ``model``.
 
@@ -997,29 +988,6 @@ class SolverFeatherPGS(SolverBase):
 
         Args:
             model (Model): the model to be simulated.
-            cholesky_kernel: Factor kernel. ``auto`` uses topology, size and device resources.
-                Explicit choices override private test hooks and disable competing sparse/paired owners.
-            trisolve_kernel: Triangular solve kernel; ``auto`` selects by articulation size.
-            hinv_jt_kernel: Dense contact response kernel; ``auto`` selects by size and resources.
-            delassus_kernel: Dense Delassus assembly kernel; explicit choices require split mode.
-            sparse_mass_matrix: Experimental native sparse factors: ``auto`` retains topology/resource
-                admission, ``on`` requires admission, and ``off`` retains the ordinary representation.
-                Only the held-tree owner evaluates them, so ``cached_dynamics='off'`` keeps the ordinary one.
-                Compatible split sweeps and velocity limits compose automatically.
-                Legacy sparse-composition opt-outs apply to ``auto``; ``on`` overrides those gates.
-                This option does not enable research packed-factor owners. Incompatible forced choices
-                raise ValueError; this experimental selector may change without notice.
-            cached_dynamics: Experimental paired cached prediction and next-state publication.
-                ``auto`` selects a qualified cache for the current topology, factor and row policy;
-                unsupported cases use ordinary prediction/publication. ``on`` requires admission;
-                ``off`` disables these paired caches. Explicit choices override legacy cache
-                environment settings; ``auto`` retains those settings when present. Under ``auto``
-                the held-tree owner is admitted wherever its topology, representation and row policy
-                allow. Explicit dense kernels
-                disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
-                are unchanged. Where the held-tree owner is admitted, a diagonal-mass group of
-                world-fixed roots over one-coordinate prismatic or revolute leaves runs as its scalar
-                branches; :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -1058,20 +1026,6 @@ class SolverFeatherPGS(SolverBase):
                 an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
                 unmatched nonempty patterns raise ValueError. Experimental, with the
                 same compatibility limitations as the radius.
-            contact_torsion_device: Experimental opt-in device-resident torsion preparation.
-                False retains the host reference implementation. True preserves the
-                grouping and friction law while using preallocated GPU buffers.
-                Eager stepping checks errors synchronously. For CUDA graph capture,
-                first call :meth:`prepare_contact_torsion_capture` outside capture,
-                then call :meth:`validate_contact_torsion` after every replay batch
-                before consuming results. Errors latch permanently; recreate the
-                solver rather than continuing an invalid graph. No effect when the
-                torsion radius is zero. The host reference cannot be captured.
-                Grouping currently runs serially within each world with worst-case
-                quadratic contact-count cost. Many small worlds can benefit, but
-                a single contact-dense world may be slower than host preparation;
-                CUDA graphs do not remove that device-side work. Benchmark the
-                intended per-world contact distribution before enabling.
             contact_compliance: Experimental opt-in implicit unilateral contact material response.
                 Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
                 zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
@@ -1245,38 +1199,6 @@ class SolverFeatherPGS(SolverBase):
                 be exact no-op clamps. Because the gate samples the pre-solve velocity, a DOF
                 crossing the threshold between steps is clamped one step late. Must be non-negative
                 and not NaN. Defaults to ``0.0``.
-            fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
-                *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
-                stateless clamp instead of two dedicated dense rows per DOF. This mirrors
-                PhysX's ``PxClamp`` on ``jointV`` (``DyFeatherstoneArticulation.cpp``): if
-                ``|jointV| > maxJointVel`` an extra impulse
-                ``(clamp(jointV) - jointV) * recipResponse`` is applied — no accumulated
-                lambda, no relaxation, no Baumgarte. DOFs with a velocity limit
-                but no drive row keep their dedicated fallback rows. The clamp runs at the
-                end of every PGS iteration, after the contact rows — the position the
-                dedicated velocity-limit rows it replaces own — so the limit keeps the
-                last word of each iteration even when the sweep is under-converged. That
-                is the ordering PhysX documents for gripping scenarios
-                (``PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST`` /
-                ``VelLimit::eAFTER_STATIC_CONSTRAINTS``); clamping inside the drive-row
-                visit instead would let contact impulses landing later in the iteration
-                push driven DOFs past their limits with nothing left to re-clamp them.
-                The fused clamp also skips driven DOFs in the PhysX-style pre-solve
-                velocity prescale ratio. Requires ``model.joint_velocity_limit`` to be
-                allocated; when it is absent the flag is inert (the dedicated-row path
-                skips allocation without that array too, so behavior matches). The flag is
-                also inert when ``velocity_limit_activation_fraction`` is ``inf``: that value
-                is the explicit never-activate kill-switch for velocity limits, and the fused
-                clamp rides the drive-row visit rather than the gated velocity-limit phase,
-                so it must not re-enforce limits the fraction disabled. The fused clamp only applies to the
-                ``pgs_mode="matrix_free"`` + ``enable_joint_velocity_limits=True`` +
-                ``drive_mode="physx_pgs"`` formulation; in any other configuration the flag
-                is inert and velocity limits keep their dedicated rows (no error — the flag
-                is an engage-where-applicable request, not a demand, which lets it default
-                to True without constraining unrelated solver modes). The clamp pass is
-                independent of the drive-row visit, so it stays active during velocity-only
-                iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
-                dedicated rows it replaces. Defaults to True.
             velocity_limit_law (str, optional): How the matrix-free sweeps project the dedicated
                 joint and free-body velocity-limit rows, which keep the last word at the end of
                 every iteration either way. A free body's row bounds the magnitude of its linear or
@@ -1444,15 +1366,6 @@ class SolverFeatherPGS(SolverBase):
                 then joint velocity limits. Defaults to ``"interleaved"``.
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world.
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
-            pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
-                Explicit ``loop`` and ``tiled_row`` select the split-mode kernel and require a supported
-                device. ``tiled_row`` stages the packed Delassus triangle in shared memory while it fits the
-                device's shared memory per block and reads the Delassus rows from global memory past that
-                (``routes.sweep.dense.staging``). Matrix-free mode owns its sweep dispatcher: an explicit
-                choice there warns and is ignored.
-            use_parallel_streams (bool, optional): Overlap independent work on separate CUDA streams: the
-                size groups, and the drive preparation beside inverse dynamics. It never selects the
-                dynamics evaluator. Defaults to True.
             drive_mode (str, optional): Joint target drive implementation.
                 ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
                 that folds drive stiffness into the articulated mass matrix.
@@ -1461,11 +1374,6 @@ class SolverFeatherPGS(SolverBase):
                 force-drive PGS formula each Gauss-Seidel iteration. The
                 PhysX row mode is currently supported only with
                 ``pgs_mode="matrix_free"``. Defaults to ``"augmented"``.
-            tile_threads (int, optional): Threads per block for the tiled
-                Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
-                change floating-point reduction order with the block size, so non-default
-                values need numerical validation, not bit-identical comparison.
-                Must be one of {32, 64, 128, 256}. Defaults to 64.
             enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
                 ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
@@ -1509,30 +1417,13 @@ class SolverFeatherPGS(SolverBase):
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         options = check_options(requested_options)
 
-        self._requested_kernel_choices = {
-            "cholesky_kernel": cholesky_kernel,
-            "trisolve_kernel": trisolve_kernel,
-            "hinv_jt_kernel": hinv_jt_kernel,
-            "delassus_kernel": delassus_kernel,
-            "pgs_kernel": pgs_kernel,
-            "sparse_mass_matrix": sparse_mass_matrix,
-            "cached_dynamics": cached_dynamics,
-        }
-        kernel_choices, self._explicit_dense_kernels, self._kernel_choice_reasons, ignored_choices = (
-            resolve_kernel_choices(
-                self._requested_kernel_choices,
-                self._route_pins,
-                is_cpu=model.device.is_cpu,
-                pgs_mode=pgs_mode,
-            )
+        # The dense kernels from the device and the dense row capacity (configuration.kernel_choices).
+        choices, self._kernel_choice_reasons = kernel_choices(
+            self._route_pins,
+            is_cpu=model.device.is_cpu,
+            split=pgs_mode == "split",
+            dense_rows=options["dense_max_constraints"],
         )
-        cholesky_kernel = kernel_choices["cholesky_kernel"]
-        trisolve_kernel = kernel_choices["trisolve_kernel"]
-        hinv_jt_kernel = kernel_choices["hinv_jt_kernel"]
-        delassus_kernel = kernel_choices["delassus_kernel"]
-        pgs_kernel = kernel_choices["pgs_kernel"]
-        self.sparse_mass_matrix = sparse_mass_matrix
-        self.cached_dynamics = cached_dynamics
 
         self.angular_damping = angular_damping
         self.update_mass_matrix_interval = update_mass_matrix_interval
@@ -1560,8 +1451,6 @@ class SolverFeatherPGS(SolverBase):
             else:
                 friction_anchor_beta = 0.2
                 self._friction_anchor_beta_source = "default"
-        for message in ignored_choices.values():
-            warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
@@ -1658,22 +1547,21 @@ class SolverFeatherPGS(SolverBase):
             raise NotImplementedError("drive_mode='physx_pgs' currently requires pgs_mode='matrix_free'")
         self.pgs_schedule = pgs_schedule
         self.drive_mode = drive_mode
-        # fuse_joint_velocity_limits is an engage-where-applicable request,
-        # not a demand: the fused clamp only exists in the matrix_free +
-        # physx_pgs + velocity-limits formulation (and needs
-        # model.joint_velocity_limit), so any other configuration keeps its
-        # dedicated rows silently instead of erroring. An inf activation
-        # fraction is the explicit never-activate kill-switch for velocity
-        # limits; the fused clamp rides the drive-row visit rather than the
-        # gated velocity-limit phase, so it must stay disengaged there too.
-        _fuse_applicable = (
-            self.pgs_mode == "matrix_free"
+        # Driven DOFs clamp their joint velocity limits statelessly (PhysX's PxClamp on jointV) instead of taking two
+        # dedicated rows each, wherever the formulation has drive rows: matrix-free mode with physx_pgs drives and
+        # velocity limits on a model that holds them. The clamp runs at the end of every PGS iteration, after the
+        # contact rows, so the limit keeps the last word; DOFs without a drive row keep their dedicated rows. An inf
+        # activation fraction never activates velocity limits, and the clamp rides the drive-row visit rather than
+        # the gated velocity-limit phase, so it stays disengaged there too. The test pin velocity_limit_clamp=False
+        # keeps the dedicated rows.
+        self.fuse_joint_velocity_limits = bool(
+            self._route_pins.get("velocity_limit_clamp", True)
+            and self.pgs_mode == "matrix_free"
             and self.enable_joint_velocity_limits
             and self.drive_mode == "physx_pgs"
             and not np.isinf(self.velocity_limit_activation_fraction)
             and getattr(model, "joint_velocity_limit", None) is not None
         )
-        self.fuse_joint_velocity_limits = bool(fuse_joint_velocity_limits) and _fuse_applicable
         # Row budget of the incremental-residual matrix-free GS kernel; 0 disables it.
         self.mf_gs_incremental_rows = int(mf_gs_incremental_rows)
         self.mf_gs_parallel_rows = int(mf_gs_parallel_rows)
@@ -1697,7 +1585,8 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_body_max_linear_velocity is not None and self.rigid_body_max_angular_velocity is not None
         )
 
-        self._double_buffer = double_buffer
+        # Double-buffered mass matrices on CUDA (the sparse factor's producers overwrite every value and take none).
+        self._double_buffer = bool(self._route_pins.get("double_buffer", True))
         self._nvtx = nvtx
         self.pgs_debug = pgs_debug
         # The position/velocity split needs only v_out_snap. Full row snapshots
@@ -1723,18 +1612,17 @@ class SolverFeatherPGS(SolverBase):
 
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
-        self.tile_threads = options["tile_threads"]
+        self.tile_threads = _TILE_THREADS
         # Launches over the contact capacity (the force export, the warm-start snapshot
         # and gathers, the keyed-row key scatters) grid-stride over about one wave of blocks.
         self._contact_capacity_blocks = contact_capacity_blocks(model.device)
 
-        self.cholesky_kernel = cholesky_kernel
-        self.trisolve_kernel = trisolve_kernel
-        self.hinv_jt_kernel = hinv_jt_kernel
-        self.delassus_kernel = delassus_kernel
-        self.pgs_kernel = pgs_kernel
+        self.cholesky_kernel = choices["cholesky_kernel"]
+        self.trisolve_kernel = choices["trisolve_kernel"]
+        self.hinv_jt_kernel = choices["hinv_jt_kernel"]
+        self.delassus_kernel = choices["delassus_kernel"]
+        self.pgs_kernel = choices["pgs_kernel"]
         self.small_dof_threshold = small_dof_threshold
-        self.use_parallel_streams = use_parallel_streams
 
         self._step = 0
         self._force_mass_update = False
@@ -1815,9 +1703,10 @@ class SolverFeatherPGS(SolverBase):
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
         # The sparse owner does not solve the appended torsion row.
+        general = self._route_pins.get("placement") == "general"
         sparse_diagonal_pair = (
             None
-            if self._contact_torsion_enabled or self._explicit_dense_kernels
+            if self._contact_torsion_enabled or general
             else self._select_sparse_diagonal_response_pair(factor_dense_contract=self._fused_diagonal_joint_limits)
         )
         held = None
@@ -1829,9 +1718,9 @@ class SolverFeatherPGS(SolverBase):
             if held is not None:
                 sparse_diagonal_pair = None
         self._sparse_diagonal_contact_solve = sparse_diagonal_pair is not None
-        if self._contact_torsion_enabled or self._explicit_dense_kernels:
+        if self._contact_torsion_enabled or general:
             self._sparse_diagonal_reason = (
-                "Contact torsion or an explicit dense kernel choice keeps the general response."
+                "Contact torsion or a test pin (placement='general') keeps the general response."
             )
         elif held is not None:
             self._sparse_diagonal_reason = f"Only the held tree evaluates the compact diagonal. {held}"
@@ -1930,6 +1819,7 @@ class SolverFeatherPGS(SolverBase):
                 (not facts.velocity_limits, "Local owners do not solve joint velocity-limit rows."),
                 (self._local_solve_max_rows > 0, "dense_max_constraints leaves the local owners no row."),
                 (not self._contact_torsion_enabled, "Local owners do not solve the appended torsion row."),
+                (self._route_pins.get("placement") != "general", "A test pin keeps the general placement."),
             )
         )
         local_base_supported = local_decline is None
@@ -2097,11 +1987,6 @@ class SolverFeatherPGS(SolverBase):
         self._compact_diagonal_mass_size = self._sparse_diagonal_response_size
         self._row_watermark = bool(row_watermark)
         self._setup_sparse_mass_matrix(model)
-        if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
-            raise ValueError(
-                "sparse_mass_matrix='on' is unsupported by this topology, device, solver policy or research mode; "
-                "use 'auto' to allow the ordinary representation"
-            )
         # The matrix-free sweeps read the dense rows packed (packed_rows): decided before the buffers, since that
         # placement allocates neither a size group's response nor the world layout.
         self._mf_sweeps = bool(
@@ -2141,7 +2026,7 @@ class SolverFeatherPGS(SolverBase):
                     not (self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None),
                     "A sparse response owner owns response.",
                 ),
-                (not self._explicit_dense_kernels, "An explicit dense kernel choice owns response."),
+                (self._route_pins.get("placement") != "general", "A test pin keeps the general placement."),
             )
         )
         response_pair = None if self._paired_response_reason else self._select_paired_response()
@@ -2351,7 +2236,11 @@ class SolverFeatherPGS(SolverBase):
 
         self._init_double_buffer_stream()
 
-        self.contact_torsion_device = bool(contact_torsion_device)
+        # Contact torsion's preparation is device-resident on CUDA and on the host on the CPU (the host preparation is
+        # the test pin torsion_preparation='host' on CUDA).
+        self.contact_torsion_device = bool(
+            model.device.is_cuda and self._route_pins.get("torsion_preparation") != "host"
+        )
         if self._contact_torsion_enabled and self.contact_torsion_device:
             from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
 
@@ -2383,11 +2272,11 @@ class SolverFeatherPGS(SolverBase):
         held_tree.install(self)
         # Ordinary dynamics take the CPU's drive pass and layout (_stage1_drives: the joint forces and the drives in
         # one launch, K added after the assembly); the per-coordinate drive rows are the held tree's.
-        # use_parallel_streams overlaps their preparation with FK/ID on a stream of its own.
+        # Their preparation overlaps FK/ID on a stream of its own.
         if self._tree_kinetic_state is None:
             self._parallel_augmented_drive_topology = False
         self._articulation_dynamics_stream = (
-            wp.Stream(model.device) if self._parallel_augmented_drive_topology and self.use_parallel_streams else None
+            wp.Stream(model.device) if self._parallel_augmented_drive_topology else None
         )
 
         # Worlds whose every candidate row separates at the predictor skip row
@@ -2454,7 +2343,7 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def get_path_selection(self) -> dict:
-        """Return requested choices, active plans and selection reasons.
+        """Return the active plans and selection reasons.
 
         The record is read on the host without device synchronization, except
         under ``pgs_solve_readout``: reading its counters synchronizes once.
@@ -2509,7 +2398,6 @@ class SolverFeatherPGS(SolverBase):
         """
         cached = self._tree_kinetic_state is not None
         selection = {
-            "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
             "cached_dynamics": "on" if cached else "off",
             "publication": "cached" if cached else "ordinary",
@@ -2522,11 +2410,6 @@ class SolverFeatherPGS(SolverBase):
                 if cached
                 else "Ordinary state publication remains active.",
                 "pgs_kernel": "Matrix-free mode owns the iteration kernel; split PGS selection is unused."
-                + (
-                    ""
-                    if self._requested_kernel_choices["pgs_kernel"] == "auto"
-                    else f" {self._kernel_choice_reasons['pgs_kernel']}"
-                )
                 if self.pgs_mode == "matrix_free"
                 else self._kernel_choice_reasons["pgs_kernel"],
             },
@@ -2540,7 +2423,7 @@ class SolverFeatherPGS(SolverBase):
     def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
         """Prepare experimental torsion rollback buffers before CUDA graph capture.
 
-        Requires ``contact_torsion_device=True`` when torsion is active. Call
+        Torsion's preparation is device-resident on CUDA. Call
         outside capture with the state layouts used by the graph. Subsequent
         graph replay requires :meth:`validate_contact_torsion` at every batch
         boundary before results are consumed. Eager steps continue to validate
@@ -2550,7 +2433,7 @@ class SolverFeatherPGS(SolverBase):
             return
         preparation = getattr(self, "_device_torsion", None)
         if preparation is None:
-            raise RuntimeError("Contact torsion graph capture requires contact_torsion_device=True")
+            raise RuntimeError("Contact torsion graph capture requires the device-resident torsion preparation")
         if wp.get_stream(self.model.device).is_capturing:
             raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
         preparation.validate()
@@ -3393,7 +3276,6 @@ class SolverFeatherPGS(SolverBase):
             and self.pgs_mode == "matrix_free"
             and self.pgs_schedule == "interleaved"
             and self.drive_mode == "augmented"
-            and self.use_parallel_streams
             and self.pgs_velocity_iterations == 0
             and self.enable_contact_friction
             and not self.enable_joint_velocity_limits
@@ -3821,12 +3703,8 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_contact_transaction_reason = "Native sparse factors are not selected."
         self._sparse_contact_records = None
         self._sparse_max_row_support = None
-        sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
-        if sparse_choice == "off":
-            self._sparse_selection_reason = "Explicit sparse_mass_matrix='off' retains ordinary factors."
-            return
-        if getattr(self, "_explicit_dense_kernels", False):
-            self._sparse_selection_reason = "An explicit dense kernel choice owns factor and response construction."
+        if self._route_pins.get("placement") == "general":
+            self._sparse_selection_reason = "A test pin keeps the general placement (placement='general')."
             return
         # Reuse the factor representation without changing split's row law or
         # state-cache lifecycle. The full ordered sweep pools linked patch normal
@@ -3839,7 +3717,7 @@ class SolverFeatherPGS(SolverBase):
         )
         for supported, reason in (
             (
-                sparse_choice == "on" or self._route_pins.get("storage") != "dense",
+                self._route_pins.get("storage") != "dense",
                 "A test pin keeps dense storage (storage='dense').",
             ),
             (model.device.is_cuda, "CPU uses ordinary factors; native sparse factors require CUDA."),
@@ -4039,9 +3917,8 @@ class SolverFeatherPGS(SolverBase):
             )
             return
 
-        source = "Explicit sparse_mass_matrix='on'" if sparse_choice == "on" else "Automatic sparse selection"
         self._sparse_selection_reason = (
-            f"{source}: {size}-DOF topology and row policy admitted; "
+            f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "
             f"solve uses {solve.bytes}/{budget} bytes of shared memory."
         )
         self._sparse_mass_matrix_size = size
@@ -5373,7 +5250,7 @@ class SolverFeatherPGS(SolverBase):
         self._size_streams: dict[int, wp.Stream | None] = {}
         self._size_events: dict[int, wp.Event | None] = {}
 
-        if self.use_parallel_streams and model.device.is_cuda and len(self.size_groups) > 1:
+        if model.device.is_cuda and len(self.size_groups) > 1:
             for size in self.size_groups:
                 self._size_streams[size] = wp.Stream(model.device)
                 self._size_events[size] = wp.Event(model.device)
@@ -5384,8 +5261,7 @@ class SolverFeatherPGS(SolverBase):
                 self._size_events[size] = None
         self._local_internal_stream = (
             wp.Stream(model.device)
-            if self.use_parallel_streams
-            and model.device.is_cuda
+            if model.device.is_cuda
             and (
                 self._pgs_solve_local_internal_kernels
                 or self._pgs_solve_local_pair_kernels
@@ -5411,7 +5287,6 @@ class SolverFeatherPGS(SolverBase):
         # Components are admitted on CUDA without gradients, under the factor-coordinate sweep's plain policy.
         paired_overlap = bool(
             self._paired_components is not None
-            and self.use_parallel_streams
             and self._paired_factor_solve_kernel is not None
             and not getattr(self, "_mf_gs_tiers", ())
             and not _FPGS_SYNC_TIMINGS
@@ -6285,7 +6160,7 @@ class SolverFeatherPGS(SolverBase):
         # STAGE 2: Cholesky
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
-            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+            for size, ctx in self._for_sizes():
                 with ctx:
                     self._stage2_factor(size)
         # ══════════════════════════════════════════════════════════════
@@ -6299,7 +6174,7 @@ class SolverFeatherPGS(SolverBase):
                 self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
             else:
                 self._stage3_zero_qdd(state_aug)
-                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                for size, ctx in self._for_sizes():
                     with ctx:
                         self._stage3_trisolve(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
@@ -6326,7 +6201,7 @@ class SolverFeatherPGS(SolverBase):
         if not solve.assembles_delassus:
             # Compute Y = H^-1 * J^T only (no Delassus C)
             with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
-                for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+                for size, ctx in self._for_sizes():
                     with ctx:
                         self._stage4_response(size)
 
@@ -6374,7 +6249,7 @@ class SolverFeatherPGS(SolverBase):
             assemble = self._plan.assembles_world_delassus
             if assemble:
                 self._stage4_zero_world_C()
-            for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
+            for size, ctx in self._for_sizes():
                 with ctx:
                     self._stage4_response(size)
             if assemble:
@@ -7090,9 +6965,9 @@ class SolverFeatherPGS(SolverBase):
         eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
 
     @contextmanager
-    def _parallel_size_region(self, enabled: bool = True):
+    def _parallel_size_region(self):
         """Context for parallel dispatch across size groups."""
-        if not enabled or not self.use_parallel_streams or not self.model.device.is_cuda or len(self.size_groups) <= 1:
+        if not self.model.device.is_cuda or len(self.size_groups) <= 1:
             yield
             return
 
@@ -7120,18 +6995,13 @@ class SolverFeatherPGS(SolverBase):
             yield
 
     @contextmanager
-    def _size_dispatch(self, enabled: bool):
-        with self._parallel_size_region(enabled=enabled):
-            yield
-
-    @contextmanager
     def _size_ctx(self, size: int):
         with self._on_size_stream(size):
             yield
 
-    def _for_sizes(self, enabled: bool):
+    def _for_sizes(self):
         # convenience generator; keeps step code tight
-        with self._size_dispatch(enabled):
+        with self._parallel_size_region():
             for size in self.size_groups:
                 yield size, self._size_ctx(size)
 

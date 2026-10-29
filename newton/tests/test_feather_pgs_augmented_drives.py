@@ -69,7 +69,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         model,
                         pgs_mode="matrix_free",
                         drive_mode=drive_mode,
-                        use_parallel_streams=parallel_streams,
                         enable_joint_limits=False,
                         dense_max_constraints=16,
                         mf_max_constraints=16,

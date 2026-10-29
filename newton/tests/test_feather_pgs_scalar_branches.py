@@ -252,13 +252,12 @@ def same(test, expected, actual, index, name):
     np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
-def recipe_solver(model, *, scalar, compact=True, **options):
-    """The keyboard recipe's solver: compact contacts, plus scalar branches if asked."""
+def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
+    """The keyboard recipe's solver: compact contacts, plus scalar branches if asked; ``pins`` are more route pins."""
     arguments = {
         "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
         "update_mass_matrix_interval": 2,
-        "use_parallel_streams": True,
         "enable_joint_limits": True,
         "dense_max_constraints": 64,
         "mf_max_constraints": 64,
@@ -266,9 +265,12 @@ def recipe_solver(model, *, scalar, compact=True, **options):
     }
     with (
         compact_boundary(compact),
-        mock.patch.dict(SolverFeatherPGS._route_pins, {} if scalar else {"star": "held"}),
+        mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if scalar else {"star": "held"}), **(pins or {})}),
     ):
         return SolverFeatherPGS(model, **arguments)
+
+
+_ORDINARY = {"evaluator": "ordinary"}
 
 
 def ordinary_head(model, *, rows=64, **options):
@@ -280,7 +282,7 @@ def ordinary_head(model, *, rows=64, **options):
     a world whose rows all separate without rows (:func:`_normal_impulses`), which changes the rows the arms keep,
     not their physics (the pusher press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
     """
-    return recipe_solver(model, scalar=False, cached_dynamics="off", dense_max_constraints=rows, **options)
+    return recipe_solver(model, scalar=False, pins=_ORDINARY, dense_max_constraints=rows, **options)
 
 
 def ordinary_inverse_mass(solver, size):
@@ -1962,7 +1964,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_limit_upper.assign(upper)
         model.joint_q.zero_()
         model.joint_qd.zero_()
-        solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
+        solvers = [recipe_solver(model, scalar=False, pins=_ORDINARY), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2147,13 +2149,11 @@ class TestScalarBranchOwner(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
-        head = recipe_solver(model, scalar=False, cached_dynamics="off")
+        head = recipe_solver(model, scalar=False, pins=_ORDINARY)
         scalar = recipe_solver(model, scalar=True)
         self._assert_routes(head, scalar)
         # The head route converged: the same solver with many more sweeps.
-        reference = recipe_solver(
-            model, scalar=False, cached_dynamics="off", pgs_iterations=GRIPPER_REFERENCE_ITERATIONS
-        )
+        reference = recipe_solver(model, scalar=False, pins=_ORDINARY, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
         self.assertIsNone(reference._tree_kinetic_state)
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
@@ -2196,13 +2196,13 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIn("star='held'", head["held_tree"]["scalar_branches"]["reason"])
         # Without the held-tree owner there is no compact diagonal, which only it evaluates, so no group to
         # branch: every route is the one of the same solver built without the flag.
-        declined = recipe_solver(model, scalar=True, cached_dynamics="off")
+        declined = recipe_solver(model, scalar=True, pins=_ORDINARY)
         self.assertIsNone(declined._scalar_branches)
         self.assertIsNone(declined._compact_diagonal_mass_size)
         routes = declined.get_path_selection()["routes"]
         self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("No diagonal-mass group", routes["held_tree"]["scalar_branches"]["reason"])
-        plain = recipe_solver(model, scalar=False, cached_dynamics="off").get_path_selection()["routes"]
+        plain = recipe_solver(model, scalar=False, pins=_ORDINARY).get_path_selection()["routes"]
         # The plain arm pins the star to the held tree; every route but the pins record matches.
         self.assertEqual({**routes, "pins": None}, {**plain, "pins": None})
 

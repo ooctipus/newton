@@ -37,13 +37,11 @@ _UNBOUNDED = 2**31 - 1
 # contacting tripods beside two free spheres, one sphere deep in a foot, whose dense and
 # matrix-free contact rows an 8-sweep Gauss-Seidel solve visits in slot order.
 _ROUTE_OPTIONS = {
-    "sparse_mass_matrix": "off",
     "friction_anchor_beta": 0.0,
     "enable_joint_limits": True,
     "dense_max_constraints": 96,
     "mf_max_constraints": 64,
     "pgs_iterations": 8,
-    "double_buffer": False,
 }
 _ROW_PATHS = (0, 1)  # dense, matrix-free
 
@@ -152,9 +150,10 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     counts, contact rows' start and dense overflow, and the output joint state.
     """
     model = _build_model(free_count=2, robot_count=2, device=device)
-    solver = SolverFeatherPGS(
-        model, pgs_mode="matrix_free" if device.is_cuda else "split", **{**_ROUTE_OPTIONS, **options}
-    )
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense"}):
+        solver = SolverFeatherPGS(
+            model, pgs_mode="matrix_free" if device.is_cuda else "split", **{**_ROUTE_OPTIONS, **options}
+        )
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic)

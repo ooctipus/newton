@@ -798,34 +798,27 @@ class HeldTree:
 
 
 def options_decline(solver) -> str | None:
-    """Why the solver's options keep ordinary dynamics, or ``None``.
+    """Why the device or a test pin keeps ordinary dynamics, or ``None``.
 
-    ``cached_dynamics='off'``, an explicit dense kernel choice and the CPU keep the serial passes; under ``auto`` a
-    test pin does too (``evaluator='ordinary'``). Only the held tree evaluates the native sparse factor and the compact
-    diagonal, so their admissions read this before :func:`install` does.
+    The CPU keeps the serial passes, and so does the test pin ``evaluator='ordinary'``. Only the held tree evaluates
+    the native sparse factor and the compact diagonal, so their admissions read this before :func:`install` does.
     """
-    choice = solver.cached_dynamics
-    if choice == "off":
-        return "Explicit cached_dynamics='off' retains ordinary dynamics."
-    if solver._explicit_dense_kernels:
-        return "An explicit dense kernel choice retains ordinary dynamics."
     if solver.model.device.is_cpu:
         return "CPU uses ordinary dynamics; cached prediction requires CUDA."
-    if choice != "on" and solver._route_pins.get("evaluator") == "ordinary":
+    if solver._route_pins.get("evaluator") == "ordinary":
         return "A test pin keeps ordinary dynamics (evaluator='ordinary')."
     return None
 
 
 def install(solver) -> None:
     """Install the held tree as ``solver._tree_kinetic_state`` where :func:`options_decline` and :func:`decline` admit
-    it, with the reason; ``cached_dynamics='on'`` raises where it is not admitted.
+    it, with the reason.
 
     The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
     where :func:`sparse_decline` and :func:`compact_decline` admit them, so the held tree takes every solver that
     holds one.
     """
     solver._tree_kinetic_state = None
-    choice = solver.cached_dynamics
     reason = options_decline(solver)
     if reason is None:
         reason = decline(solver)
@@ -836,12 +829,9 @@ def install(solver) -> None:
                 reason = f"The topology does not fit the held groups: {error}"
         if reason is None:
             solver._fk_id_cache_enabled = True
-            source = "Explicit cached_dynamics='on'" if choice == "on" else "Automatic cache selection"
-            reason = f"{source}: tree cache admitted for this topology, representation and state lifecycle."
+            reason = (
+                "Automatic cache selection: tree cache admitted for this topology, representation and state lifecycle."
+            )
         else:
             reason = f"Ordinary dynamics retained: {reason}"
     solver._cached_dynamics_selection_reason = reason
-    if choice == "on" and solver._tree_kinetic_state is None:
-        raise ValueError(
-            "cached_dynamics='on' has no admitted cache for this topology, representation and solver policy"
-        )

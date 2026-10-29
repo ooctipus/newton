@@ -11,6 +11,7 @@ from newton._src.solvers.feather_pgs import contact_torsion
 from newton.tests.feather_pgs_law_harness import row_support, unpacked_rows
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
+    TORSION_OFF_PINS,
     TORSION_OFF_ROUTE,
     assert_torsion_neutral_routes,
     fixture,
@@ -220,7 +221,12 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         """Keep the torsion-zero velocity path identical when no shapes are selected."""
         for velocity in (0, 4):
             with self.subTest(pgs_velocity_iterations=velocity):
-                options = {"pgs_velocity_iterations": velocity, **TORSION_OFF_ROUTE, **PATCH_OPTIONS}
+                options = {
+                    "pgs_velocity_iterations": velocity,
+                    "pins": TORSION_OFF_PINS,
+                    **TORSION_OFF_ROUTE,
+                    **PATCH_OPTIONS,
+                }
                 expected, reference, *_ = fixture(0.0, **options)
                 actual, selected_out, *_ = fixture(0.01, contact_torsion_shape_indices=(), **options)
                 assert_torsion_neutral_routes(self, reference, selected_out)

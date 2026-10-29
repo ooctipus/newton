@@ -45,8 +45,9 @@ def _set_flag(model, body, flag):
 
 
 def _solver(model, beta, cached, **options):
-    """A default solver under one friction law; ``cached`` is the ``cached_dynamics`` choice."""
-    return SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=beta, cached_dynamics=cached, **options)
+    """A default solver under one friction law; ``cached="off"`` pins ordinary dynamics."""
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached == "off" else {}):
+        return SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=beta, **options)
 
 
 def _toggle_scene():
@@ -149,7 +150,11 @@ def _sparse_case(beta, cached, *, kinematic_body=None):
     if kinematic_body is not None:
         _set_flag(model, kinematic_body, KINEMATIC)
     solver = sparse_split._solver(
-        model, True, pgs_mode="matrix_free", friction_anchor_beta=beta, cached_dynamics=cached
+        model,
+        True,
+        pins={"evaluator": "ordinary"} if cached == "off" else None,
+        pgs_mode="matrix_free",
+        friction_anchor_beta=beta,
     )
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)

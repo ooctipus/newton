@@ -42,7 +42,6 @@ _NUMBER_RULES = (
     ("restitution_velocity_threshold", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("pgs_warmstart_decay", float, _finite_nonnegative, "must be finite and non-negative", True),
     ("dense_max_constraints", int, lambda value: value >= 1, "must be positive", False),
-    ("tile_threads", int, lambda value: value in (32, 64, 128, 256), "must be one of (32, 64, 128, 256)", True),
 )
 # Each option with a fixed set of values.
 _CHOICE_RULES = (
@@ -76,84 +75,59 @@ def check_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return checked
 
 
-_KERNEL_CHOICES = {
-    "cholesky_kernel": ("auto", "tiled", "loop"),
-    "trisolve_kernel": ("auto", "tiled", "loop"),
-    "hinv_jt_kernel": ("auto", "tiled", "par_row"),
-    "delassus_kernel": ("auto", "tiled", "par_row_col"),
-    "pgs_kernel": ("auto", "loop", "tiled_row"),
-    "sparse_mass_matrix": ("auto", "on", "off"),
-    "cached_dynamics": ("auto", "on", "off"),
-}
+# The kernels the CPU runs, and the choices a test pin may fix on CUDA.
 _CPU_KERNELS = {
     "cholesky_kernel": "loop",
     "trisolve_kernel": "loop",
     "hinv_jt_kernel": "par_row",
     "delassus_kernel": "par_row_col",
     "pgs_kernel": "loop",
-    "sparse_mass_matrix": "off",
-    "cached_dynamics": "off",
 }
-_DENSE_KERNELS = ("cholesky_kernel", "trisolve_kernel", "hinv_jt_kernel", "delassus_kernel")
+_PINNABLE = {
+    "cholesky_kernel": ("tiled", "loop"),
+    "trisolve_kernel": ("tiled", "loop"),
+    "hinv_jt_kernel": ("tiled", "par_row"),
+    "delassus_kernel": ("tiled", "par_row_col"),
+    "pgs_kernel": ("loop", "tiled_row"),
+}
+# Split mode's assembled Delassus is swept by one thread per world up to this many rows (at most 256 floats), by the
+# tiled-row sweep beyond.
+LOOP_SWEEP_MAX_ROWS = 16
 
 
-def resolve_kernel_choices(
-    requested: dict[str, str],
-    overrides: dict[str, str | bool],
-    *,
-    is_cpu: bool,
-    pgs_mode: str,
-) -> tuple[dict[str, str], bool, dict[str, str], dict[str, str]]:
-    """Return effective choices, explicit dense ownership, construction-time reasons and ignored requests.
+def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool, split: bool, dense_rows: int):
+    """Return each dense kernel's choice and why.
 
-    Public choices take precedence over private test hooks. A private hook is
-    validated before CPU fallback, but does not acquire explicit dense ownership.
-    Topology and resource admission remain the responsibility of execution planning.
-    Matrix-free mode owns its sweep kernels, so a valid explicit ``pgs_kernel``
-    there resolves like ``auto`` on any device; the last mapping holds the warning
-    the caller emits for it.
+    The CPU runs the loop kernels. On CUDA the factor, triangular-solve, response and Delassus kernels are
+    ``"auto"``: the execution plan maps each size by its resource rule. Split mode's dense sweep is the loop for at
+    most :data:`LOOP_SWEEP_MAX_ROWS` rows per world and the tiled-row sweep beyond; matrix-free mode builds neither.
+    A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where the execution plan maps a size to a
+    dense kernel; it claims no worlds from the other owners (the ``placement`` pin does).
+
+    Raises:
+        ValueError: for a pin that names no kernel of its stage, or a CUDA kernel on the CPU.
     """
-    pgs_kernel = requested["pgs_kernel"]
-    matrix_free = pgs_mode == "matrix_free"
-    ignored = {}
-    for name, value in requested.items():
-        if value not in _KERNEL_CHOICES[name]:
-            raise ValueError(f"{name} must be one of {_KERNEL_CHOICES[name]}, got {value!r}")
-        if matrix_free and name == "pgs_kernel" and value != "auto":
-            ignored[name] = (
-                f"pgs_kernel={value!r} is ignored in matrix_free mode, which owns its sweep kernels; "
-                "omit it or use pgs_mode='split'."
+    choices, reasons = {}, {}
+    for name, allowed in _PINNABLE.items():
+        pinned = pins.get(name)
+        if pinned == "auto":
+            pinned = None
+        if pinned is not None and pinned not in allowed:
+            raise ValueError(f"The {name} pin must be one of {allowed}, got {pinned!r}")
+        if is_cpu:
+            if pinned is not None and pinned != _CPU_KERNELS[name]:
+                raise ValueError(f"The {name} pin {pinned!r} requires CUDA; the CPU runs {_CPU_KERNELS[name]!r}")
+            choices[name], reasons[name] = _CPU_KERNELS[name], f"The CPU runs {_CPU_KERNELS[name]}."
+        elif pinned is not None:
+            choices[name], reasons[name] = pinned, f"A test pin selects {name}={pinned!r}."
+        elif name == "pgs_kernel":
+            loop = split and dense_rows <= LOOP_SWEEP_MAX_ROWS
+            choices[name] = "loop" if loop else "tiled_row"
+            reasons[name] = (
+                f"Split mode sweeps at most {LOOP_SWEEP_MAX_ROWS} dense rows per world on one thread."
+                if loop
+                else f"The tiled-row sweep serves more than {LOOP_SWEEP_MAX_ROWS} dense rows per world."
             )
-        elif is_cpu and value not in ("auto", _CPU_KERNELS[name]):
-            raise ValueError(f"{name}={value!r} requires CUDA; use 'auto' or {_CPU_KERNELS[name]!r}")
-    if matrix_free and requested["delassus_kernel"] != "auto":
-        raise ValueError("delassus_kernel is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
-    explicit_dense = any(requested[name] != "auto" for name in _DENSE_KERNELS)
-    for name in ("sparse_mass_matrix", "cached_dynamics"):
-        if requested[name] == "on" and explicit_dense:
-            raise ValueError(f"{name}='on' conflicts with explicit dense kernel choices; use 'auto'")
-
-    resolved = dict(requested)
-    reasons = {
-        name: f"Explicit {name}={value!r}." if value != "auto" else "Automatic selection."
-        for name, value in requested.items()
-    }
-    for name in _DENSE_KERNELS:
-        if requested[name] == "auto" and name in overrides:
-            value = overrides[name]
-            if value not in _KERNEL_CHOICES[name]:
-                raise ValueError(f"{name} must be one of {sorted(_KERNEL_CHOICES[name])}")
-            resolved[name] = value
-            reasons[name] = f"Private override selects {name}={value!r}."
-    if pgs_kernel == "auto" or "pgs_kernel" in ignored:
-        resolved["pgs_kernel"] = "loop" if is_cpu else "tiled_row"
-        reasons["pgs_kernel"] = (
-            f"Explicit pgs_kernel={pgs_kernel!r} is ignored in matrix_free mode."
-            if "pgs_kernel" in ignored
-            else f"Automatic {'CPU' if is_cpu else 'CUDA'} default: {resolved['pgs_kernel']}."
-        )
-    if is_cpu:
-        for name in (*_DENSE_KERNELS, "pgs_kernel"):
-            resolved[name] = _CPU_KERNELS[name]
-            reasons[name] += f" CPU uses {_CPU_KERNELS[name]}."
-    return resolved, explicit_dense, reasons, ignored
+        else:
+            choices[name], reasons[name] = "auto", "Automatic selection by size and device resources."
+    return choices, reasons

@@ -527,7 +527,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             with self.subTest(device=str(device)):
                 model = _solver_model(device)
                 # CPU solvers reject velocity limits (matrix-free mode needs CUDA), but the launcher is the same.
-                solver = SolverFeatherPGS(model, use_parallel_streams=False)
+                solver = SolverFeatherPGS(model)
                 self.assertEqual(
                     (solver._velocity_prescale_lanes, solver._velocity_prescale_threads),
                     _velocity_prescale_launch(
@@ -562,7 +562,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                         pgs_mode="matrix_free",
                         enable_joint_velocity_limits=True,
                         drive_mode=drive_mode,
-                        use_parallel_streams=False,
                     )
                     # The fused clamp skips driven DOFs; only physx_pgs drives allocate drive rows.
                     self.assertEqual(solver._vel_limit_skip_driven, int(drive_mode == "physx_pgs"))
@@ -626,7 +625,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 friction_anchor_beta=friction_anchor_beta,
             )
         self.assertIsNotNone(solver._tree_kinetic_state)
-        self.assertTrue(solver.use_parallel_streams)
         pipeline = newton.CollisionPipeline(model, deterministic=friction_anchor_beta > 0.0)
         contacts = pipeline.contacts()
         states, control = (model.state(), model.state()), model.control()

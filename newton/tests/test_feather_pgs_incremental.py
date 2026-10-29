@@ -6,6 +6,7 @@
 import functools
 import inspect
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -128,19 +129,17 @@ def _patch_case(model, incremental_rows, *, iterations=8):
     # The pipeline sets model.rigid_contact_max, which sizes the solver's contact and patch buffers, so it is
     # built first: both arms then hold the same capacity on the shared model.
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
-    solver = SolverFeatherPGS(
-        model,
-        pgs_mode="matrix_free",
-        pgs_iterations=iterations,
-        enable_joint_limits=True,
-        friction_anchor_beta=0.2,
-        sparse_mass_matrix="off",
-        cached_dynamics="off",
-        mf_gs_incremental_rows=incremental_rows,
-        dense_max_constraints=32,
-        double_buffer=False,
-        update_mass_matrix_interval=2,
-    )
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary"}):
+        solver = SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=iterations,
+            enable_joint_limits=True,
+            friction_anchor_beta=0.2,
+            mf_gs_incremental_rows=incremental_rows,
+            dense_max_constraints=32,
+            update_mass_matrix_interval=2,
+        )
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     return model, solver, state, out, control, pipeline, pipeline.contacts()

@@ -159,10 +159,16 @@ class Route:
     expect: dict = dataclasses.field(default_factory=dict)
     """Route-record values the run must report: ``"key.path": value`` into ``get_path_selection()["routes"]``."""
 
-    def but(self, name: str, *, options: dict | None = None, expect: dict | None = None) -> Route:
-        """This route with more options and expectations (a feature variant served by the same route)."""
+    def but(
+        self, name: str, *, options: dict | None = None, pins: dict | None = None, expect: dict | None = None
+    ) -> Route:
+        """This route with more options, pins and expectations (a feature variant served by the same route)."""
         return dataclasses.replace(
-            self, name=name, options={**self.options, **(options or {})}, expect={**self.expect, **(expect or {})}
+            self,
+            name=name,
+            options={**self.options, **(options or {})},
+            pins={**self.pins, **(pins or {})},
+            expect={**self.expect, **(expect or {})},
         )
 
 
@@ -1123,16 +1129,17 @@ def reference(physics: Physics, route: Route, device) -> Reference:
 # ---------------------------------------------------------------------------------------------------------------------
 
 _MF = {"pgs_mode": "matrix_free"}
-_GENERAL = {**_MF, "sparse_mass_matrix": "off", "cached_dynamics": "off", "mf_gs_incremental_rows": 0}
+# Dense storage and ordinary dynamics: the route of the general placement's reference.
+_ORDINARY = {"storage": "dense", "evaluator": "ordinary"}
 
 
 REFERENCE_CUDA = Route(
     "reference",
     "cuda",
-    # The plain matrix-free Gauss-Seidel sweep over ordinary dynamics and rows: an explicit response kernel
-    # declines the local, paired and sparse-diagonal owners, and every world is solved (no resolved-world claim).
-    options={**_GENERAL, "hinv_jt_kernel": "tiled"},
-    pins={"claims": ()},
+    # The plain matrix-free Gauss-Seidel sweep over ordinary dynamics and rows: the general placement declines the
+    # local, paired and sparse-diagonal owners, and every world is solved (no resolved-world claim).
+    options={**_MF, "mf_gs_incremental_rows": 0},
+    pins={**_ORDINARY, "hinv_jt_kernel": "tiled", "placement": "general", "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
@@ -1155,13 +1162,15 @@ CPU_SPLIT_UNIT = CPU_SPLIT.but(
 SPLIT_LOOP = Route(
     "split_loop",
     "cuda",
-    options={"pgs_mode": "split", "pgs_kernel": "loop"},
+    options={"pgs_mode": "split"},
+    pins={"pgs_kernel": "loop"},
     expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop"]},
 )
 SPLIT_LOOP_UNIT = Route(
     "split_loop_unit",
     "cuda",
-    options={"pgs_mode": "split", "pgs_kernel": "loop", "contact_update": "unit"},
+    options={"pgs_mode": "split", "contact_update": "unit"},
+    pins={"pgs_kernel": "loop"},
     expect={"sweep.route": "dense_loop", "sweep.dense.kernels": ["sweep_loop_unit"]},
 )
 SPLIT_TILED = Route(
@@ -1169,6 +1178,7 @@ SPLIT_TILED = Route(
     "cuda",
     # The constructor's default mode on CUDA where native sparse factors decline its rows.
     options={"pgs_mode": "split"},
+    pins={"pgs_kernel": "tiled_row"},
     expect={"sweep.route": "dense_tiled_row"},
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
@@ -1176,13 +1186,15 @@ MF_GENERAL = Route(
     "mf_incremental_ordinary",
     "cuda",
     # The clutter scenes' route: incremental tier over ordinary dynamics.
-    options={**_MF, "sparse_mass_matrix": "off", "cached_dynamics": "off"},
+    options=_MF,
+    pins=_ORDINARY,
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "incremental", "held_tree.owner": None},
 )
 MF_HELD = Route(
     "mf_incremental_held",
     "cuda",
-    options={**_MF, "sparse_mass_matrix": "off"},
+    options=_MF,
+    pins={"storage": "dense"},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers.family": "incremental",
@@ -1292,8 +1304,8 @@ LOCAL_ORDINARY = Route(
     "local_owned_ordinary",
     "cuda",
     # The clutter scenes' route: local owners over ordinary dynamics.
-    options={**_MF, "cached_dynamics": "off"},
-    pins={"producer": "compact_jacobian"},
+    options=_MF,
+    pins={"producer": "compact_jacobian", "evaluator": "ordinary"},
     expect={"local_solve.enabled": True, "sweep.local.factory": "local_owned", "held_tree.owner": None},
 )
 PAIRED = Route(
@@ -1489,8 +1501,10 @@ def cuda_groups() -> list:
                 _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
                 ref,
                 (
-                    MF_DEFAULT.but("mf_torsion", expect={"friction.torsion": True}),
-                    MF_DEFAULT.but("mf_torsion_device", options={"contact_torsion_device": True}),
+                    MF_DEFAULT.but(
+                        "mf_torsion", pins={"torsion_preparation": "host"}, expect={"friction.torsion": True}
+                    ),
+                    MF_DEFAULT.but("mf_torsion_device"),
                 ),
             ),
         ]

@@ -17,20 +17,16 @@ class TestFinalPatchBudget(unittest.TestCase):
         for iterations in (1, 2, 4, 8, 64):
             for spin, sliding in ((0.0, 1.0), (10.0, 1.0), (100.0, 0.0)):
                 with self.subTest(iterations=iterations, spin=spin, sliding=sliding):
-                    # The fixture solves matrix-free, which ignores any kernel request with a warning, so one
-                    # request covers every kernel and checks that such a call warns instead of raising.
-                    with self.assertWarnsRegex(UserWarning, "pgs_kernel='loop' is ignored in matrix_free"):
-                        result, solver, *_ = fixture(
-                            0.0075,
-                            friction_anchor_beta=0.2,
-                            pgs_kernel="loop",
-                            pgs_iterations=iterations,
-                            closing=0.1,
-                            spin=spin,
-                            sliding=sliding,
-                            contact_shared_anchor=False,
-                            contact_friction_shared_anchor=False,
-                        )
+                    result, solver, *_ = fixture(
+                        0.0075,
+                        friction_anchor_beta=0.2,
+                        pgs_iterations=iterations,
+                        closing=0.1,
+                        spin=spin,
+                        sliding=sliding,
+                        contact_shared_anchor=False,
+                        contact_friction_shared_anchor=False,
+                    )
                     count = int(result["count"][0])
                     response = result["response"][0, :count].T @ result["impulses"][0, :count]
                     # The sweeps accumulate the velocity in factor coordinates and leave them once (packed_rows):

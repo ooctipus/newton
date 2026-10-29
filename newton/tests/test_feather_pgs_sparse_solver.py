@@ -199,8 +199,6 @@ def _make_solver(model, sparse, **overrides):
         "enable_joint_velocity_limits": False,
         "pgs_warmstart": False,
         "dense_max_constraints": 32,
-        "use_parallel_streams": True,
-        "double_buffer": False,
         "update_mass_matrix_interval": 4,
     }
     options.update(overrides)

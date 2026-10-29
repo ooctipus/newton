@@ -112,7 +112,7 @@ def _owned_case(name, device, **options):
         model = _build(device, worlds=4, prescribed=True)
         return model, _mixed_solver(model, forest=True, **options)
     model = _build_model()
-    return model, _make_solver(model, True, **{"cached_dynamics": "on", "friction_anchor_beta": 0.0, **options})
+    return model, _make_solver(model, True, **{"friction_anchor_beta": 0.0, **options})
 
 
 class _Rollout:

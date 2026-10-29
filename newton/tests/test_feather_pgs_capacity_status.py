@@ -178,12 +178,10 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="split",
-                pgs_kernel="loop",
                 dense_max_constraints=capacity,
                 pgs_iterations=8,
                 angular_damping=0.0,
                 friction_anchor_beta=0.0,
-                use_parallel_streams=False,
             )
             state_in, state_out = model.state(), model.state()
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
