@@ -476,9 +476,7 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("world_row_mu", wp.array2d[float]),
     ("world_mf_constraint_count", wp.array[int]),
     ("primary_L", wp.array3d[float]),
-    ("primary_Linv", wp.array3d[float]),
     ("secondary_L", wp.array3d[float]),
-    ("secondary_Linv", wp.array3d[float]),
     ("primary_group_by_world", wp.array[int]),
     ("secondary_group_by_world", wp.array[int]),
     ("primary_offset_by_world", wp.array[int]),
@@ -529,10 +527,8 @@ def paired_factor_source(
     op = FactorRows(
         D,
         (
-            FactorComponent(P, "primary_offset", "primary_lane", "primary_L", "primary_Linv", "primary_matrix_base"),
-            FactorComponent(
-                S, "secondary_offset", "secondary_lane", "secondary_L", "secondary_Linv", "secondary_matrix_base"
-            ),
+            FactorComponent(P, "primary_offset", "primary_lane", "primary_L", "primary_matrix_base"),
+            FactorComponent(S, "secondary_offset", "secondary_lane", "secondary_L", "secondary_matrix_base"),
         ),
         lanes,
         diagonal=lambda row: f"s_diag[{row}]",

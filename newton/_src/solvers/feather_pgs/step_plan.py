@@ -141,7 +141,7 @@ class StepPlan:
 
     factor: Mapping[int, Route]
     """Stage 2, per size: ``none`` (no dense factor), ``held`` (the held tree refreshes the factor in stage 1),
-    ``diagonal``, ``tiles``, ``tiles_inverse`` (the paired response's primary factor with its inverse) or ``loop``."""
+    ``diagonal``, ``tiles`` or ``loop``."""
     trisolve: Mapping[int, Route]
     """Stage 3, per size: ``sparse``, ``compact_diagonal``, ``diagonal``, ``tiles`` or ``loop``; empty under a
     held-tree owner, whose predictor replaces the stage."""
@@ -244,10 +244,7 @@ def _factor(solver) -> dict[int, Route]:
         elif plan.use_diagonal_mass(size):
             route = "diagonal", ""
         elif plan.use_tiled_cholesky(size):
-            if size == solver._paired_response_primary_size and not solver._paired_factor_coordinates:
-                route = "tiles_inverse", "The paired response's primary factor also materializes its inverse."
-            else:
-                route = "tiles", ""
+            route = "tiles", ""
         else:
             route = "loop", ""
         routes[size] = _route(solver, size, "cholesky_kernel", *route)

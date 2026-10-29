@@ -675,10 +675,10 @@ def _launch_paired_factor_solve(
 
     def factor(size):
         lower = np.tril(rng.normal(0.0, 0.2, (worlds, size, size))) + 1.5 * np.eye(size)
-        return lower.astype(np.float32), np.linalg.inv(lower).astype(np.float32)
+        return lower.astype(np.float32)
 
-    primary_L, primary_Linv = factor(primary)
-    secondary_L, secondary_Linv = factor(secondary)
+    primary_L = factor(primary)
+    secondary_L = factor(secondary)
     odd = np.arange(worlds) % 2 == 1
     selector = np.zeros(worlds, np.int32)
     if components:
@@ -706,9 +706,7 @@ def _launch_paired_factor_solve(
             array(rows["row_mu"], wp.float32),
             array(selector, wp.int32),
             array(primary_L, wp.float32),
-            array(primary_Linv, wp.float32),
             array(secondary_L, wp.float32),
-            array(secondary_Linv, wp.float32),
             array(np.arange(worlds, dtype=np.int32), wp.int32),
             array(np.arange(worlds, dtype=np.int32), wp.int32),
             array(np.where(odd, secondary, 0).astype(np.int32), wp.int32),

@@ -285,7 +285,7 @@ _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_CONTACT_THREADS_X", "1")))
 _ROWS_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_ROWS_THREADS_X", "4")))
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
-_PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
+_PAIRED_RESPONSE_THREADS = 128
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
@@ -2382,14 +2382,7 @@ class SolverFeatherPGS(SolverBase):
         self._paired_factor_secondary_groups_by_world = None
         self._paired_factor_primary_offsets_by_world = None
         self._paired_factor_secondary_offsets_by_world = None
-        self._paired_response_inverse_identity = None
         if response_pair is not None:
-            for response_size in response_pair[:2]:
-                if self._paired_factor_coordinates:
-                    self.Linv_by_size[response_size] = wp.zeros_like(self.L_by_size[response_size])
-                    self.Hinv_by_size[response_size] = self.Linv_by_size[response_size]
-                else:
-                    self.Hinv_by_size[response_size] = wp.zeros_like(self.L_by_size[response_size])
             if self._paired_factor_coordinates:
                 response_dof_count = self._model_plan.response_dof_count
                 primary_arts = np.flatnonzero(response_dof_count == response_pair[0])
@@ -2420,12 +2413,6 @@ class SolverFeatherPGS(SolverBase):
                 )
                 self._paired_factor_secondary_offsets_by_world = wp.array(
                     secondary_offsets, dtype=wp.int32, device=model.device
-                )
-            if not self._paired_factor_coordinates:
-                self._paired_response_inverse_identity = wp.array(
-                    np.eye(self._paired_response_primary_size, dtype=np.float32),
-                    dtype=wp.float32,
-                    device=model.device,
                 )
         if not self._hinv_jt_writes_world and response_pair is None:
             self._hinv_jt_diag_sizes = frozenset()
@@ -4915,8 +4902,6 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_buffers(self, model):
         self.H_by_size = {}
-        self.Hinv_by_size = {}
-        self.Linv_by_size = {}
         self.L_by_size = {}
         self.J_by_size = {}
         self.Y_by_size = {}
@@ -4969,12 +4954,6 @@ class SolverFeatherPGS(SolverBase):
                 H_by_size[size], J_by_size[size] = system["H"], system["J"]
             for name, array in buffers.items():
                 getattr(self, f"{name}_by_size")[size] = array
-            self.Hinv_by_size[size] = None
-            self.Linv_by_size[size] = (
-                wp.zeros_like(self.L_by_size[size])
-                if self._sparse_mass_matrix_size is not None and self._has_free_rigid_bodies and size == 6
-                else None
-            )
             self.diag_by_size[size] = (
                 wp.zeros(
                     (n_arts, self.dense_max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
@@ -5259,28 +5238,11 @@ class SolverFeatherPGS(SolverBase):
             self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
-        """Build the paired response's inverse kernels and the sweeps.
+        """Build the paired response and the sweeps.
 
         The factor, stage-3 and stage-4 kernels follow the step plan (:meth:`_build_stage_kernels`).
         """
         device_arch = model.device.arch
-        self._inverse_cholesky_kernels_by_size = {}
-        self._inverse_cholesky_lower_kernels_by_size = {}
-
-        for size in self.size_groups:
-            self._inverse_cholesky_kernels_by_size[size] = (
-                response_builds_dense.inverse_lanes_kernel(size)
-                if size == self._paired_response_secondary_size and not self._paired_factor_coordinates
-                else None
-            )
-            self._inverse_cholesky_lower_kernels_by_size[size] = (
-                response_builds_dense.inverse_lanes_kernel(size, lower_only=True)
-                if self._paired_factor_coordinates
-                and size in (self._paired_response_primary_size, self._paired_response_secondary_size)
-                else None
-            )
-
-        self._paired_cholesky_inverse_kernel = None
         self._paired_response_kernel = None
         from . import paired_components  # noqa: PLC0415
 
@@ -5298,18 +5260,13 @@ class SolverFeatherPGS(SolverBase):
         if self._paired_response_primary_size is not None:
             primary_size = self._paired_response_primary_size
             secondary_size = self._paired_response_secondary_size
-            self._paired_cholesky_inverse_kernel = (
-                None
-                if self._paired_factor_coordinates
-                else response_builds_dense.factor_tiles_kernel(primary_size, self.tile_threads, inverse=True)
-            )
             self._paired_response_kernel = response_builds_dense.response_pairs_kernel(
                 primary_size,
                 secondary_size,
                 self.dense_max_constraints,
                 self.max_world_dofs,
                 device_arch,
-                _PAIRED_RESPONSE_WARPS_PER_BLOCK,
+                _PAIRED_RESPONSE_THREADS,
                 factor_coordinates=self._paired_factor_coordinates,
             )
             self._paired_factor_solve_kernel = (
@@ -6169,8 +6126,6 @@ class SolverFeatherPGS(SolverBase):
                 if (
                     primary_size is None
                     or secondary_size is None
-                    or self.Linv_by_size[primary_size] is None
-                    or self.Linv_by_size[secondary_size] is None
                     or self._paired_factor_primary_groups_by_world is None
                     or self._paired_factor_secondary_groups_by_world is None
                     or self._paired_factor_primary_offsets_by_world is None
@@ -6197,9 +6152,7 @@ class SolverFeatherPGS(SolverBase):
                                 self.row_mu,
                                 self.mf_constraint_count if components is None else components.selector,
                                 self.L_by_size[primary_size],
-                                self.Linv_by_size[primary_size],
                                 self.L_by_size[secondary_size],
-                                self.Linv_by_size[secondary_size],
                                 self._paired_factor_primary_groups_by_world,
                                 self._paired_factor_secondary_groups_by_world,
                                 self._paired_factor_primary_offsets_by_world,
@@ -6609,7 +6562,6 @@ class SolverFeatherPGS(SolverBase):
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
                     self._stage2_factor(size)
-                    self._stage2_materialize_paired_inverse(size)
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
         # ══════════════════════════════════════════════════════════════
@@ -7868,8 +7820,6 @@ class SolverFeatherPGS(SolverBase):
             self._stage2_cholesky_diagonal(size)
         elif route == "tiles":
             self._stage2_cholesky_tiled(size)
-        elif route == "tiles_inverse":
-            self._stage2_cholesky_tiles_inverse(size)
         elif route == "loop":
             self._stage2_cholesky_loop(size)
 
@@ -7887,23 +7837,6 @@ class SolverFeatherPGS(SolverBase):
                 size,
             ],
             outputs=[self.L_by_size[size]],
-            device=self.model.device,
-        )
-
-    def _stage2_cholesky_tiles_inverse(self, size: int) -> None:
-        """Factor the paired response's primary size and materialize its inverse (factor route ``tiles_inverse``)."""
-        wp.launch_tiled(
-            self._paired_cholesky_inverse_kernel,
-            dim=[self.n_arts_by_size[size]],
-            inputs=[
-                self.H_by_size[size],
-                self.R_by_size[size],
-                self._paired_response_inverse_identity,
-                self.group_to_art[size],
-                self.mass_update_mask,
-            ],
-            outputs=[self.L_by_size[size], self.Hinv_by_size[size]],
-            block_dim=self.tile_threads,
             device=self.model.device,
         )
 
@@ -7942,29 +7875,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self.L_by_size[size]],
             device=model.device,
         )
-
-    def _stage2_materialize_paired_inverse(self, size: int) -> None:
-        """Materialize paired inverse forms not produced by factorization."""
-        kernel = self._inverse_cholesky_kernels_by_size[size]
-        if kernel is not None:
-            wp.launch(
-                kernel,
-                dim=self.n_arts_by_size[size] * 32,
-                inputs=[self.L_by_size[size], self.group_to_art[size], self.mass_update_mask],
-                outputs=[self.Hinv_by_size[size]],
-                device=self.model.device,
-                block_dim=256,
-            )
-        lower_kernel = self._inverse_cholesky_lower_kernels_by_size[size]
-        if lower_kernel is not None:
-            wp.launch(
-                lower_kernel,
-                dim=self.n_arts_by_size[size] * 32,
-                inputs=[self.L_by_size[size], self.group_to_art[size], self.mass_update_mask],
-                outputs=[self.Linv_by_size[size]],
-                device=self.model.device,
-                block_dim=256,
-            )
 
     def _stage3_zero_qdd(self, state_aug: State):
         state_aug.joint_qdd.zero_()
@@ -9368,29 +9278,17 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_hinv_jt_paired(self, primary_size: int, secondary_size: int) -> None:
-        """Build one world response from its robot and free-body components."""
+        """Build one world response from its robot and free-body components through their leaf-first factors."""
         if self._paired_response_kernel is None or self._paired_response_secondary_groups is None:
             raise RuntimeError("Paired H^-1 J^T kernel is unavailable")
-        primary_linv = (
-            self.Linv_by_size[primary_size]
-            if self.Linv_by_size[primary_size] is not None
-            else self.Hinv_by_size[primary_size]
-        )
-        secondary_linv = (
-            self.Linv_by_size[secondary_size]
-            if self.Linv_by_size[secondary_size] is not None
-            else self.Hinv_by_size[secondary_size]
-        )
         wp.launch_tiled(
             self._paired_response_kernel,
             dim=[self.n_arts_by_size[primary_size]],
             inputs=[
-                self.Hinv_by_size[primary_size],
-                primary_linv,
+                self.L_by_size[primary_size],
                 self.J_by_size[primary_size],
                 self.group_to_art[primary_size],
-                self.Hinv_by_size[secondary_size],
-                secondary_linv,
+                self.L_by_size[secondary_size],
                 self.J_by_size[secondary_size],
                 self.group_to_art[secondary_size],
                 self._paired_response_secondary_groups,
@@ -9401,7 +9299,7 @@ class SolverFeatherPGS(SolverBase):
                 self.row_cfm,
             ],
             outputs=[self.J_world, self.Y_world, self.diag],
-            block_dim=32 * _PAIRED_RESPONSE_WARPS_PER_BLOCK,
+            block_dim=_PAIRED_RESPONSE_THREADS,
             device=self.model.device,
         )
 

@@ -2363,10 +2363,10 @@ SPARSE_FACTOR = SparseFactorBuild(
 # ---------------------------------------------------------------------------------------------------------------------
 #
 # A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
-# secondary group), each a diagonal block of ``H = L L^T`` with the inverse factor ``L^-1``. Its rows' factor rows
-# ``z = L^-1 j`` (``Y_world = z``, ``A_ii = |z|^2 + cfm`` in a world without free-body rows) or physical rows
-# ``y = L^-T z`` (``A_ii = j y + cfm`` otherwise) are the DenseJY ``("response", "pairs")`` build
-# (:func:`.response_builds_dense.response_pairs_kernel`). Physical rows move into the held form ``L^T y`` where a
+# secondary group), each a diagonal block of the leaf-first ``P H P^T = L L^T``. Its rows' factor rows
+# ``z = L^-1 P j`` (``Y_world = z``, ``A_ii = |z|^2 + cfm`` in a world without free-body rows) or physical rows
+# ``y = P^T L^-T z`` (``A_ii = j y + cfm`` otherwise) are the DenseJY ``("response", "pairs")`` build
+# (:func:`.response_builds_dense.response_pairs_kernel`). Physical rows move into the held form ``L^T P y`` where a
 # world qualifies as independent components (:func:`paired_components_kernel`).
 #
 # A paired world's qualification as independent components: every current row of the world is valid and touches
@@ -2470,11 +2470,11 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
     if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
         raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
     P = int(primary_size)
-    held = FactorRows(P, (FactorComponent(P, "0", "lane", "data.L", "", f"group * {P} * {P}"),), Lanes(32, "lane"))
+    held = FactorRows(P, (FactorComponent(P, "0", "lane", "data.L", f"group * {P} * {P}"),), Lanes(32, "lane"))
     convert = f"""#if defined(__CUDA_ARCH__)
                 const int lane = LANE & 31;
                 const float y = lane < {P} ? data.Y.data[base + lane] : 0.0f;
-{held.transposed("L", "y", "z", " " * 16)}
+{held.transposed("y", "z", " " * 16)}
                 if (lane < {P}) data.Y.data[base + lane] = z;
 #else
                 float y[{P}];
@@ -2482,7 +2482,7 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
                 for (int d = 0; d < {P}; ++d) {{
                     float z = 0.0f;
                     for (int k = 0; k <= d; ++k)
-                        z += {held.components[0].element("L", f"({P}-1-k)", f"({P}-1-d)")} * y[k];
+                        z += {held.components[0].element(f"({P}-1-k)", f"({P}-1-d)")} * y[k];
                     data.Y.data[base + d] = z;
                 }}
 #endif"""

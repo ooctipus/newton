@@ -56,12 +56,12 @@ class TestKit(unittest.TestCase):
 
         storage = CholeskySolve(6, "L")
         accessor = CholeskySolve(6, lambda r, c: f"(L)[{r}*6+{c}]")
-        self.assertEqual(storage.forward(x, y), accessor.forward(x, y))
-        self.assertEqual(storage.transpose(y, y), accessor.transpose(y, y))
-        self.assertNotIn("#pragma", storage.forward(x, y) + storage.transpose(y, y))
+        self.assertEqual(storage.whiten(x, y), accessor.whiten(x, y))
+        self.assertEqual(storage.leave(y, y), accessor.leave(y, y))
+        self.assertNotIn("#pragma", storage.whiten(x, y) + storage.leave(y, y))
         unrolled = CholeskySolve(6, "L", unroll=True)
-        self.assertEqual(unrolled.forward(x, y).count("#pragma unroll"), 2)
-        self.assertEqual(unrolled.transpose(y, y).count("#pragma unroll"), 2)
+        self.assertEqual(unrolled.whiten(x, y).count("#pragma unroll"), 2)
+        self.assertEqual(unrolled.leave(y, y).count("#pragma unroll"), 2)
 
 
 class TestDelassusStaging(unittest.TestCase):

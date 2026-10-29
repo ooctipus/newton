@@ -249,13 +249,13 @@ class TestResponseOperators(unittest.TestCase):
 
     def test_a_separate_reciprocal_diagonal(self):
         solve = CholeskySolve(6, "s_L + 144", inverse="s_Dinv + 12", masked=True)
-        forward = solve.forward(lambda k: f"z[{k}]", lambda k: f"z[{k}]")
+        forward = solve.whiten(lambda k: f"z[{k}]", lambda k: f"z[{k}]")
         self.assertTrue(forward.startswith("#pragma unroll 1\n"))
         # The leaf-first factor: factor coordinate ``k`` of a vector sits at position ``6 - 1 - k``.
         self.assertIn("for(int k=0;k<6;++k)if(k<row)value-=(s_L + 144)[row*6+k]*z[(6-1-(k))];", forward)
         self.assertIn("z[(6-1-(row))]=value*(s_Dinv + 12)[row];", forward)
         self.assertNotIn("diagonal", forward)
-        transpose = solve.transpose(lambda k: f"v[{k}]", lambda k: f"v[{k}]")
+        transpose = solve.leave(lambda k: f"v[{k}]", lambda k: f"v[{k}]")
         self.assertIn("v[(6-1-(row))]=value*(s_Dinv + 12)[row];\n        }", transpose)
         self.assertEqual(
             solve.stage_inverse("lane"), "if (lane < 6) (s_Dinv + 12)[lane] = 1.0f / (s_L + 144)[lane * 6 + lane];"

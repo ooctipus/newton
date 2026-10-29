@@ -178,8 +178,8 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("if (i % 4 == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;", staged)
         out = lambda i: f"x[{i}]"  # noqa: E731
         # The leaf-first factor: factor row ``row`` writes the vector's physical position ``3 - 1 - row``.
-        self.assertIn("x[(3-1-(row))]=value*diagonal;", solve.forward(out, out))
-        transposed = solve.transpose(out, out)
+        self.assertIn("x[(3-1-(row))]=value*diagonal;", solve.whiten(out, out))
+        transposed = solve.leave(out, out)
         self.assertIn("for(int step=0;step<3;++step)", transposed)
         self.assertIn("const int row=3-1-step;", transposed)
         self.assertNotIn("1.0f / factor", CholeskySolve(3, "s_L").stage(lambda i: f"L[{i}]", "lane", 32))
@@ -197,9 +197,7 @@ class TestResponseOperators(unittest.TestCase):
             LocalBlock(16, block.factors, Lanes(32)).respond(("a", "b"), "")
 
     def test_factor_rows_fuse_a_pair_ladder(self):
-        rows = FactorRows(
-            23, (FactorComponent(17, "o", "l", "L", "Linv", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]"
-        )
+        rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
         fused = rows.pair_terms("i", "sib", rhs, "", own=True)
         self.assertIn("SUM(residual, sibling_residual, cross);", fused)
@@ -208,7 +206,10 @@ class TestResponseOperators(unittest.TestCase):
         self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))
         self.assertIn("factor_velocity += sibling_z * d;", rows.apply_row("sib", "d", ""))
         self.assertIn("const int l = lane - o;", rows.enter("v", ""))
-        self.assertIn("Linv.data[b + ((17-1-(k))) * 17 + ((17-1-(l)))]", rows.leave("out", ""))
+        # Leaving runs the factor's back substitution on the lanes: no explicit inverse.
+        leave = rows.leave("out", "")
+        self.assertIn("value -= L.data[b + ((17-1-(s))) * 17 + ((17-1-(l)))] * x;", leave)
+        self.assertIn("const float x = READ(out, source);", leave)
 
 
 def _kernel_sass():

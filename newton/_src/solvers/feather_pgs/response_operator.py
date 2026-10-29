@@ -134,10 +134,11 @@ class CholeskySolve:
     """Apply the leaf-first factor's L^-1 and L^-T with the owner's zero-diagonal convention.
 
     ``L`` is indexed in factor coordinates and every vector operand in physical
-    positions (:func:`leaf_first`): :meth:`forward` whitens a physical vector
-    (``x = L^-1 P b``), :meth:`transpose` leaves factor coordinates (``P^T L^-T``)
-    and :meth:`transposed_product` enters them (``L^T P v``); both operands of an
-    action keep the same positions, so an action may work in place.
+    positions (:func:`leaf_first`): :meth:`whiten` maps a physical vector into
+    factor coordinates (``x = L^-1 P b``), :meth:`leave` maps back (``P^T L^-T``)
+    and :meth:`enter` maps a velocity in (``L^T P v``): the three actions of the
+    whitened rows. Both operands of an action keep the same positions, so an
+    action may work in place; ``whiten`` then ``leave`` is the response ``H^-1``.
     One lane owns each complete solve. The output may alias the input; an
     optional post-row statement retains per-owner finite-state reporting.
     A zero diagonal produces zero, as in the retained predictor/fallback law.
@@ -198,8 +199,8 @@ class CholeskySolve:
             return ""
         return f"\n            const float diagonal={self._entry('row', 'row')};"
 
-    def forward(self, rhs: Vector, output: Vector) -> str:
-        """Solve L x = rhs in increasing row order."""
+    def whiten(self, rhs: Vector, output: Vector) -> str:
+        """Whiten: solve ``L x = P rhs`` in increasing row order."""
         if self.masked:
             return f"""#pragma unroll 1
         for(int row=0;row<{self.size};++row){{
@@ -216,8 +217,8 @@ class CholeskySolve:
             {self._at(output, "row")}={self._finish()};
         }}"""
 
-    def transpose(self, rhs: Vector, output: Vector, *, post_row: str = "") -> str:
-        """Solve L.T x = rhs in decreasing row order."""
+    def leave(self, rhs: Vector, output: Vector, *, post_row: str = "") -> str:
+        """Leave factor coordinates: solve ``L^T P x = rhs`` in decreasing row order."""
         head = (
             f"for(int step=0;step<{self.size};++step){{\n            const int row={self.size}-1-step;"
             if self.ascending
@@ -231,8 +232,8 @@ class CholeskySolve:
             {self._at(output, "row")}={self._finish()};{post}
         }}"""
 
-    def transposed_product(self, rhs: Vector, output: Vector) -> str:
-        """``x = L^T rhs`` in increasing row order, each row's terms from zero, ascending (the output may alias the
+    def enter(self, rhs: Vector, output: Vector) -> str:
+        """Enter factor coordinates: ``x = L^T P rhs`` in increasing row order, each row's terms from zero, ascending (the output may alias the
         input: row ``r`` reads rows ``r`` on)."""
         rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
         terms = _unrolled(f"for(int k=row;k<{self.size};++k)", "            ", self.unroll)
@@ -965,11 +966,11 @@ class FreeBodyZ(ResponseOperator):
 
     def enter(self, velocity: Vector, factor: str) -> str:
         """Map a body's six coordinates ``velocity`` into factor coordinates in place, ``u = L^T v`` (one thread)."""
-        return CholeskySolve(6, self.lower(factor), unroll=True).transposed_product(velocity, velocity)
+        return CholeskySolve(6, self.lower(factor), unroll=True).enter(velocity, velocity)
 
     def leave(self, velocity: Vector, factor: str) -> str:
         """Map a body's six coordinates ``velocity`` back in place, ``v = L^-T u`` (one thread)."""
-        return CholeskySolve(6, self.lower(factor), unroll=True).transpose(velocity, velocity)
+        return CholeskySolve(6, self.lower(factor), unroll=True).leave(velocity, velocity)
 
     # -- software pipeline: the packed row word (bodies, inverse diagonal, rhs, type and parent) and the entries ---
 
@@ -1201,7 +1202,7 @@ class FreeBodyZ(ResponseOperator):
         lines = [
             "float speed_dv[6];",
             f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? {scale} * speed_v[k] : 0.0f;",
-            CholeskySolve(6, self.lower(factor), unroll=True).transposed_product(
+            CholeskySolve(6, self.lower(factor), unroll=True).enter(
                 lambda k: f"speed_dv[{k}]", lambda k: f"speed_dv[{k}]"
             ),
             "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_dv[k];",
@@ -1464,7 +1465,7 @@ class WhitenedRows:
             def z(index, art=art):
                 return f"(Zi + {art.offset_name} * ZS)[{index} * ZS]"
 
-            row.append(_lines([art.guarded(art.factor.forward(z, z))], "    "))
+            row.append(_lines([art.guarded(art.factor.whiten(z, z))], "    "))
         row += ["    #pragma unroll", f"    for (int d = 0; d < {D}; ++d) Jr[d] = Zi[d * ZS];"]
         if publish:
             row += [
@@ -1493,7 +1494,7 @@ class WhitenedRows:
                 return f"s_dv[{art.offset_name} + {index}]"
 
             test = f"{art.guard} && {lane} == {owner}" if art.guard else f"{lane} == {owner}"
-            lines += [f"if ({test}) {{", _lines([art.factor.transpose(dv, dv)], "    "), "}"]
+            lines += [f"if ({test}) {{", _lines([art.factor.leave(dv, dv)], "    "), "}"]
         lines += [
             "SYNC();",
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
@@ -2463,8 +2464,8 @@ class LocalBlock(ResidualBlock):
                 f"    {jacobian('i')} = jacobian;",
                 "    if (jacobian != 0.0f) active = 1;",
                 "}",
-                solve.forward(jacobian, response),
-                solve.transpose(response, response),
+                solve.whiten(jacobian, response),
+                solve.leave(response, response),
                 f"for (int i = 0; i < {solve.size}; ++i) {{",
                 f"    s_Y[{first} + i] = {response('i')};",
                 f"    row_diagonal += {jacobian('i')} * {response('i')};",
@@ -2505,7 +2506,7 @@ class LocalBlock(ResidualBlock):
                 f"if ({side} >= 0) {{",
                 "    float side_u[6];",
                 indent_lines(
-                    CholeskySolve(6, self.free_factor, unroll=True).transposed_product(
+                    CholeskySolve(6, self.free_factor, unroll=True).enter(
                         lambda d, side=side: physical(side, d), lambda d: f"side_u[{d}]"
                     ),
                     "    ",
@@ -2608,7 +2609,7 @@ class LocalBlock(ResidualBlock):
         if free is not None:
             # The free rows' change of a body coordinate: L^-T of the body's sum Z app, every lane forming the
             # whole body's (the free rows act on the paired body alone).
-            leave = CholeskySolve(6, self.free_factor, unroll=True).transpose(
+            leave = CholeskySolve(6, self.free_factor, unroll=True).leave(
                 lambda k: f"body_du[{k}]", lambda k: f"body_du[{k}]"
             )
             lines += [
@@ -2639,23 +2640,22 @@ class LocalBlock(ResidualBlock):
 class FactorComponent:
     """One diagonal block of a block-diagonal factor ``L``: ``size`` coordinates from lane ``offset``.
 
-    ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes); ``L`` and
-    ``Linv`` hold the block's leaf-first lower factor and its inverse in factor coordinates, row-major from
-    ``base``: Warp arrays, or with ``staged`` the block's own shared arrays. A lane's coordinate is a physical
-    position: factor coordinate ``i`` sits on lane ``size - 1 - i`` (:func:`leaf_first`).
+    ``lane`` is this lane's coordinate in the block (``LANE - offset``, out of range on other lanes); ``L`` holds the
+    block's leaf-first lower factor in factor coordinates, row-major from ``base``: a Warp array, or with ``staged``
+    the block's own shared array. A lane's coordinate is a physical position: factor coordinate ``i`` sits on lane
+    ``size - 1 - i`` (:func:`leaf_first`).
     """
 
     size: int
     offset: str
     lane: str
     L: str
-    Linv: str
     base: str
     staged: bool = False
 
-    def element(self, matrix: str, row: str, col: str) -> str:
-        """Entry ``(row, col)`` of the block's ``matrix`` (``"L"`` or ``"Linv"``)."""
-        data = getattr(self, matrix) if self.staged else f"{getattr(self, matrix)}.data"
+    def element(self, row: str, col: str) -> str:
+        """Entry ``(row, col)`` of the block's ``L``."""
+        data = self.L if self.staged else f"{self.L}.data"
         return f"{data}[{self.base} + ({row}) * {self.size} + ({col})]"
 
 
@@ -2754,19 +2754,17 @@ class FactorRows(ResponseOperator):
         """``u += Z_s delta`` of the friction sibling ``row`` (its entries in the ``sibling`` register)."""
         return f"\n{indent}{self.velocity} += {self.sibling} * {delta};"
 
-    def _factor_product(
-        self, matrix: str, source: str, out: str, indent: str, *, transposed: bool, declare: bool
-    ) -> str:
-        """``out = M source`` or ``M^T source`` per component in leaf-first positions (factor coordinate ``i`` on
+    def _factor_product(self, source: str, out: str, indent: str, *, transposed: bool, declare: bool) -> str:
+        """``out = L source`` or ``L^T source`` per component in leaf-first positions (factor coordinate ``i`` on
         lane ``size - 1 - i``), lane ``l`` summing its terms in increasing lane ``k``."""
         lines = [f"{indent}float {out} = 0.0f;"] if declare else []
         for component in self.components:
             size, lane = component.size, component.lane
             row, col = leaf_first(size, lane), leaf_first(size, "k")
             if transposed:
-                terms, entry = f"k <= {lane}", component.element(matrix, col, row)
+                terms, entry = f"k <= {lane}", component.element(col, row)
             else:
-                terms, entry = f"{lane} <= k", component.element(matrix, row, col)
+                terms, entry = f"{lane} <= k", component.element(row, col)
             lines += [
                 "#pragma unroll",
                 f"{indent}for (int k = 0; k < {size}; ++k) {{",
@@ -2777,17 +2775,15 @@ class FactorRows(ResponseOperator):
             ]
         return "\n".join(lines)
 
-    def transposed(self, matrix: str, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = M^T source`` per component (``M`` its ``L`` or ``Linv``, leaf-first positions): lane ``l`` adds the
-        terms of the lanes ``k <= l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero
-        (``declare``) or given so."""
-        return self._factor_product(matrix, source, out, indent, transposed=True, declare=declare)
+    def transposed(self, source: str, out: str, indent: str, *, declare: bool = True) -> str:
+        """``out = L^T P source`` per component (leaf-first positions): lane ``l`` adds the terms of the lanes ``k <=
+        l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
+        return self._factor_product(source, out, indent, transposed=True, declare=declare)
 
-    def forward(self, matrix: str, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = M source`` per component (``M`` its lower ``L`` or ``Linv``, leaf-first positions): lane ``l`` adds
-        the terms of the lanes ``k >= l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared
-        zero (``declare``) or given so."""
-        return self._factor_product(matrix, source, out, indent, transposed=False, declare=declare)
+    def forward(self, source: str, out: str, indent: str, *, declare: bool = True) -> str:
+        """``out = L source`` per component (leaf-first positions): lane ``l`` adds the terms of the lanes ``k >= l``
+        in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
+        return self._factor_product(source, out, indent, transposed=False, declare=declare)
 
     def lanes_of(self, indent: str) -> list[str]:
         """Lines declaring each component's lane (``LANE - offset``)."""
@@ -2795,11 +2791,40 @@ class FactorRows(ResponseOperator):
 
     def enter(self, physical: str, indent: str) -> str:
         """Declare each component's lane and ``velocity = L^T P physical`` (the factor velocity)."""
-        return "\n".join([*self.lanes_of(indent), self.transposed("L", physical, self.velocity, indent)])
+        return "\n".join([*self.lanes_of(indent), self.transposed(physical, self.velocity, indent)])
 
     def leave(self, out: str, indent: str) -> str:
-        """Declare ``out = P^T L^-T velocity`` (this lane's physical velocity)."""
-        return self.transposed("Linv", self.velocity, out, indent)
+        """Declare ``out = P^T L^-T velocity`` (this lane's physical velocity): the components' back substitutions
+        run side by side, one step per factor row from the last (lane 0 of the component) and one shuffle a step:
+        the lane that holds the row divides by its pivot (a zero pivot gives zero), every later lane of its
+        component subtracts its term."""
+        steps = max(c.size for c in self.components)
+        lines = [f"{indent}float {out} = 0.0f;", f"{indent}{{", f"{indent}    float value = {self.velocity};"]
+        lines += [
+            "#pragma unroll",
+            f"{indent}    for (int s = 0; s < {steps}; ++s) {{",
+            f"{indent}        int source = 0;",
+        ]
+        for c in self.components:
+            mine = f"{c.lane} >= 0 && {c.lane} < {c.size} && s < {c.size}"
+            pivot = c.element(leaf_first(c.size, "s"), leaf_first(c.size, "s"))
+            lines += [
+                f"{indent}        if ({mine}) {{",
+                f"{indent}            source = {c.offset} + s;",
+                f"{indent}            if ({c.lane} == s) {{",
+                f"{indent}                const float pivot = {pivot};",
+                f"{indent}                {out} = pivot != 0.0f ? value / pivot : 0.0f;",
+                f"{indent}            }}",
+                f"{indent}        }}",
+            ]
+        lines.append(f"{indent}        const float x = READ({out}, source);")
+        for c in self.components:
+            entry = c.element(leaf_first(c.size, "s"), leaf_first(c.size, c.lane))
+            lines.append(
+                f"{indent}        if ({c.lane} > s && {c.lane} < {c.size} && s < {c.size}) value -= {entry} * x;"
+            )
+        lines += [f"{indent}    }}", f"{indent}}}"]
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)

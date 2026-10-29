@@ -1612,8 +1612,8 @@ def get_predictor_kernel(
 
             serial.append(
                 "if(lane==0){\n"
-                + held.forward(lambda index, o=offset: f"s[$SIX_BODIES+{o}+{index}]", white)
-                + held.transpose(white, white)
+                + held.whiten(lambda index, o=offset: f"s[$SIX_BODIES+{o}+{index}]", white)
+                + held.leave(white, white)
                 + "\n}"
             )
             if family <= min(32, layout.lanes) and not reference:

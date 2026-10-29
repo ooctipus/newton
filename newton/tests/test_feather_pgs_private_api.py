@@ -13,7 +13,6 @@ _KERNEL_FACTORIES = {
     "response_builds_dense.py": (
         "factor_warps_kernel",
         "factor_tiles_kernel",
-        "inverse_lanes_kernel",
         "response_warps_kernel",
         "response_tiles_kernel",
         "response_pairs_kernel",

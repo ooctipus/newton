@@ -15,11 +15,11 @@ dense kit:
 * :class:`.CholeskySolve`: the triangular solves (physical vectors in, physical vectors out, the reversal bound in
   the kit), with the zero-diagonal conventions as named options: a zero
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
-  group, the register inverse), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
+  group, the paired response), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
   response); a diagonal factor divides twice, unguarded (Zdiv, :func:`diagonal_solve`);
 * :func:`dot`: a sum of products in ascending order from zero (every diagonal, every Delassus entry, the apply);
-* the tile primitives (``tile_cholesky``, ``tile_lower_solve``, ``tile_upper_solve``, ``tile_cholesky_solve``,
-  ``tile_matmul``) for the tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
+* the tile primitives (``tile_cholesky``, ``tile_lower_solve``, ``tile_upper_solve``, ``tile_matmul``) for the
+  tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
   re-derives it.
 
 Where two mappings of a stage differ in the order they round in, each keeps its own order (the lane layout, a
@@ -57,10 +57,9 @@ __all__ = [
     "solve_six",
 ]
 
-STAGES = ("factor", "inverse", "response", "gather", "diagonal", "cfm", "delassus", "apply")
-"""What a build stage writes: the leaf-first factor ``L`` of ``P (H + diag(R)) P^T``; an explicit inverse (``L^-1`` or
-``H^-1``); the
-response ``Y = H^-1 J^T`` (by size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``);
+STAGES = ("factor", "response", "gather", "diagonal", "cfm", "delassus", "apply")
+"""What a build stage writes: the leaf-first factor ``L`` of ``P (H + diag(R)) P^T``; the response ``Y = H^-1 J^T`` (by
+size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``);
 the world-layout copy of ``J`` and ``Y``; the world diagonal ``A_ii = J_i Y_i``; its ``cfm``; the Delassus ``C = J
 Y^T`` with its diagonal; the velocity ``v_hat + Y^T lambda``."""
 
@@ -118,8 +117,8 @@ def _respond_in_place(L: str, J: str, Y: str, group: str, row: str, size: str) -
             f"const int response_row = {row};",
             f"const float* response_J = &{_element(J, group, 'response_row', f'{size} - 1')};",
             f"float* response_Y = &{_element(Y, group, 'response_row', f'{size} - 1')};",
-            solve.forward(jacobian, response),
-            solve.transpose(response, response),
+            solve.whiten(jacobian, response),
+            solve.leave(response, response),
         )
     )
 
@@ -340,40 +339,12 @@ def factor_warps_kernel(
 
 
 @functools.cache
-def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = False) -> wp.Kernel:
+def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64) -> wp.Kernel:
     """The leaf-first factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
     ``tile_cholesky(tile_diag_add(P H P^T, P R))``, the coordinates reversed by indexed loads, the primitive's
-    rounding. With ``inverse`` the factor also materializes the physical ``H^-1 = P^T tile_cholesky_solve(L, I) P``.
-    """
+    rounding."""
     dofs = wp.constant(int(n_dofs))
     last = wp.constant(int(n_dofs) - 1)
-    if inverse:
-
-        def cholesky_inverse_tiled_template(
-            H_group: wp.array3d[float],
-            R_group: wp.array2d[float],
-            identity: wp.array2d[float],
-            group_to_art: wp.array[int],
-            mass_update_mask: wp.array[int],
-            L_group: wp.array3d[float],
-            Hinv_group: wp.array3d[float],
-        ):
-            group, _lane = wp.tid()
-            art = group_to_art[group]
-            if mass_update_mask[art] == 0:
-                return
-            reverse = wp.tile_arange(last, -1, -1, dtype=int)
-            H_tile = wp.tile_load_indexed(H_group[group], indices=reverse, shape=(dofs, dofs), axis=0)[:, reverse]
-            armature_tile = wp.tile_load_indexed(R_group[group], indices=reverse, shape=(dofs,), axis=0)
-            identity_tile = wp.tile_load(identity, shape=(dofs, dofs), bounds_check=False)
-            L_tile = wp.tile_cholesky(wp.tile_diag_add(H_tile, armature_tile))
-            Hinv_tile = wp.tile_cholesky_solve(L_tile, identity_tile, "lower")
-            wp.tile_store(L_group[group], L_tile, bounds_check=False)
-            wp.tile_store_indexed(Hinv_group[group], indices=reverse, t=Hinv_tile[:, reverse], axis=0)
-
-        return python_kernel(
-            cholesky_inverse_tiled_template, f"dense_factor_tiles_inverse_{int(n_dofs)}_bd{int(tile_threads)}"
-        )
 
     def cholesky_tiled_template(
         H_group: wp.array3d[float],
@@ -394,61 +365,6 @@ def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64, *, inverse: bool = 
         wp.tile_store(L_group[idx], L_tile)
 
     return python_kernel(cholesky_tiled_template, f"dense_factor_tiles_{int(n_dofs)}_bd{int(tile_threads)}")
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Stage "inverse": L^-1 or H^-1 from the factor
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@functools.cache
-def inverse_lanes_kernel(n_dofs: int, *, lower_only: bool = False) -> wp.Kernel:
-    """An explicit inverse, one lane per column (``dim = articulations * 32``) with the kit's solves (unrolled, Z0):
-    with ``lower_only`` lane ``l`` solves ``L x = e_l`` and stores column ``l`` of the leaf-first ``L^-1`` (factor
-    coordinates, lower); otherwise it solves ``H y = e_l`` (``L x = P e_l``, then ``L^T`` back) and stores column
-    ``l`` of the physical ``H^-1``. CUDA only."""
-    n = int(n_dofs)
-    solve = CholeskySolve(
-        n, lambda row, col: f"L_group.data[factor_base + ({row}) * {n} + ({col})]", ascending=True, unroll=True
-    )
-
-    # The kit reads factor coordinate i of a vector at position n - 1 - i: L^-1's unit column sits at n - 1 - l.
-    target = f"{n - 1} - lane" if lower_only else "lane"
-
-    def unit(i):
-        return f"{i} == {target} ? 1.0f : 0.0f"
-
-    def column(i):
-        return f"column[{i}]"
-
-    backward = "" if lower_only else _indent(solve.transpose(column, column), "    ")
-    row = f"({n - 1} - i)" if lower_only else "i"
-    body = f"""    const int lane = tid & 31;
-    const int group = tid / 32;
-    if (lane >= {n}) return;
-    const int art = group_to_art.data[group];
-    if (mass_update_mask.data[art] == 0) return;
-
-    const int factor_base = group * {n * n};
-    float column[{n}];
-{_indent(solve.forward(unit, column), "    ")}
-{backward}
-#pragma unroll
-    for (int i = 0; i < {n}; ++i)
-        Hinv_group.data[factor_base + {row} * {n} + lane] = column[i];
-#endif
-"""
-    return _kernel(
-        f"dense_inverse_lanes_{'lower' if lower_only else 'cholesky'}_{n}",
-        kernel_template.params(
-            ("L_group", wp.array3d[float]),
-            ("group_to_art", wp.array[int]),
-            ("mass_update_mask", wp.array[int]),
-            ("Hinv_group", wp.array3d[float]),
-        ),
-        body,
-        dual=False,
-    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -621,8 +537,8 @@ def _solve_six_snippet() -> str:
     bool nonzero = false;
     for (int i = 0; i < 6; ++i) nonzero = nonzero || jacobian[i] != 0.0f;
     if (nonzero) {{
-{_indent(solve.forward(jacobian_at, response_at), "        ")}
-{_indent(solve.transpose(response_at, response_at), "        ")}
+{_indent(solve.whiten(jacobian_at, response_at), "        ")}
+{_indent(solve.leave(response_at, response_at), "        ")}
     }}
     return response;
 """
@@ -737,8 +653,8 @@ for (int d = 0; d < N_; ++d) {
         float j[N_], y[N_];
         #pragma unroll
         for (int d = 0; d < N_; ++d) {{ j[d] = J_group.data[gbase + d]; y[d] = 0.0f; }}
-{_indent(solve.forward(j, y), "        ")}
-{_indent(solve.transpose(y, y), "        ")}{_indent(group_store + diag_store + world_store, "        ")}
+{_indent(solve.whiten(j, y), "        ")}
+{_indent(solve.leave(y, y), "        ")}{_indent(group_store + diag_store + world_store, "        ")}
     }}
 #endif
 """
@@ -887,157 +803,55 @@ def response_tiles_kernel(
     return python_kernel(hinv_jt_plain_template, name)
 
 
-_PAIRED_RESPONSE_PHYSICAL = """
-        float y = 0.0f;
-#pragma unroll
-        for (int k = 0; k < $P; ++k) {
-            const float jk = READ(j, k);
-            if (lane < $P) y += s_primary_M[lane * $P + k] * jk;
-        }
-#pragma unroll
-        for (int k = 0; k < $S; ++k) {
-            const float jk = READ(j, $P + k);
-            if (lane >= $P && lane < $T)
-                y += s_secondary_M[(lane - $P) * $S + k] * jk;
-        }"""
-
-_PAIRED_RESPONSE_FACTOR = """
-        float y = 0.0f;
-        float z = 0.0f;
-#pragma unroll
-        for (int k = 0; k < $P; ++k) {
-            const float jk = READ(j, k);
-            if (lane < $P && k >= lane)
-                z += s_primary_M[($P - 1 - lane) * $P + $P - 1 - k] * jk;
-        }
-        const int secondary_lane = lane - $P;
-#pragma unroll
-        for (int k = 0; k < $S; ++k) {
-            const float jk = READ(j, $P + k);
-            if (lane >= $P && lane < $T && k >= secondary_lane)
-                z += s_secondary_M[($S - 1 - secondary_lane) * $S + $S - 1 - k] * jk;
-        }
-        if (!factor_world) {
-#pragma unroll
-            for (int k = 0; k < $P; ++k) {
-                const float zk = READ(z, k);
-                if (lane < $P && k <= lane)
-                    y += s_primary_M[($P - 1 - k) * $P + $P - 1 - lane] * zk;
-            }
-#pragma unroll
-            for (int k = 0; k < $S; ++k) {
-                const float zk = READ(z, $P + k);
-                if (lane >= $P && lane < $T)
-                    if (k <= secondary_lane)
-                        y += s_secondary_M[($S - 1 - k) * $S + $S - 1 - secondary_lane] * zk;
-            }
-        }"""
-
-_PAIRED_CPU_PHYSICAL = """
-        for (int d = 0; d < $P; ++d)
-            for (int k = 0; k < $P; ++k)
-                y[d] += primary_Hinv.data[primary_group * $PP + d * $P + k] * j[k];
-        for (int d = 0; d < $S; ++d)
-            for (int k = 0; k < $S; ++k)
-                y[$P + d] += secondary_Hinv.data[secondary_group * $SS
-                    + d * $S + k] * j[$P + k];"""
-
-_PAIRED_CPU_FACTOR = """
-        for (int d = 0; d < $P; ++d)
-            for (int k = d; k < $P; ++k)
-                z[d] += primary_Linv.data[primary_group * $PP + ($P - 1 - d) * $P + $P - 1 - k] * j[k];
-        for (int d = 0; d < $S; ++d)
-            for (int k = d; k < $S; ++k)
-                z[$P + d] += secondary_Linv.data[secondary_group * $SS
-                    + ($S - 1 - d) * $S + $S - 1 - k] * j[$P + k];
-        if (!factor_world) {
-            for (int d = 0; d < $P; ++d)
-                for (int k = 0; k <= d; ++k)
-                    y[d] += primary_Linv.data[primary_group * $PP + ($P - 1 - k) * $P + $P - 1 - d] * z[k];
-            for (int d = 0; d < $S; ++d)
-                for (int k = 0; k <= d; ++k)
-                    y[$P + d] += secondary_Linv.data[secondary_group * $SS
-                        + ($S - 1 - k) * $S + $S - 1 - d] * z[$P + k];
-        }"""
-
-_PAIRED = """$STAGING
-    const int lane = LANE & 31;
-
-    const int secondary_group = secondary_group_by_primary.data[primary_group];
+_PAIRED = """    const int secondary_group = secondary_group_by_primary.data[primary_group];
     const int primary_art = primary_group_to_art.data[primary_group];
     const int secondary_art = secondary_group_to_art.data[secondary_group];
     const int world = art_to_world.data[primary_art];
-$FACTOR_WORLD
-    int n_constraints = world_constraint_count.data[world];
-    if (n_constraints > $M) n_constraints = $M;
+    const bool factor_world = $FACTOR_WORLD;
+    const int n_constraints = wp::min(world_constraint_count.data[world], $M);
     if (n_constraints <= 0) return;
     const int primary_offset = articulation_world_dof_offset.data[primary_art];
     const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
+#if defined(__CUDA_ARCH__)
+    __shared__ float s_primary[$PP];
+    __shared__ float s_secondary[$SS];
+    __shared__ float s_rows[$T * $BLOCK];
+    constexpr int ZS = $BLOCK;
     for (int element = LANE; element < $PP; element += STRIDE)
-        s_primary_M[element] = primary_$MATRIX.data[primary_group * $PP + element];
+        s_primary[element] = primary_L.data[primary_group * $PP + element];
     for (int element = LANE; element < $SS; element += STRIDE)
-        s_secondary_M[element] = secondary_$MATRIX.data[secondary_group * $SS + element];
+        s_secondary[element] = secondary_L.data[secondary_group * $SS + element];
     SYNC();
-
-    for (int constraint = WARP; constraint < n_constraints; constraint += WARPS) {
-        const int world_row = (world * $M + constraint) * $D;
-        float j = 0.0f;
-        if (lane < $P) {
-            const int row = (primary_group * $M + constraint) * $P;
-            j = primary_J.data[row + lane];
-        } else if (lane < $T) {
-            const int secondary_lane = lane - $P;
-            const int row = (secondary_group * $M + constraint) * $S;
-            j = secondary_J.data[row + secondary_lane];
-        }
-$RESPONSE
-
-        if (lane < $P) {
-            J_world.data[world_row + primary_offset + lane] = j;
-            Y_world.data[world_row + primary_offset + lane] = $RESPONSE_VALUE;
-        } else if (lane < $T) {
-            const int secondary_lane = lane - $P;
-            J_world.data[world_row + secondary_offset + secondary_lane] = j;
-            Y_world.data[world_row + secondary_offset + secondary_lane] = $RESPONSE_VALUE;
-        }
-
-        float diagonal = lane < $T ? $DIAGONAL_VALUE : 0.0f;
-        SUM(diagonal);
-        if (lane == 0) {
-            const int diag_index = world * $M + constraint;
-            world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
-        }
-    }
 #else
-    const int secondary_group = secondary_group_by_primary.data[primary_group];
-    const int primary_art = primary_group_to_art.data[primary_group];
-    const int secondary_art = secondary_group_to_art.data[secondary_group];
-    const int world = art_to_world.data[primary_art];
-    const int m = wp::min(world_constraint_count.data[world], $M);
-    const int po = articulation_world_dof_offset.data[primary_art];
-    const int so = articulation_world_dof_offset.data[secondary_art];
-    const bool factor_world = $CPU_FACTOR_WORLD;
-    for (int row = 0; row < m; ++row) {
-        float j[$T], z[$T], y[$T];
-        for (int d = 0; d < $T; ++d) {
-            j[d] = d < $P ? primary_J.data[(primary_group * $M + row) * $P + d]
-                : secondary_J.data[(secondary_group * $M + row) * $S + d - $P];
-            z[d] = 0.0f;
-            y[d] = 0.0f;
-        }
-$CPU_ACTION
-        float diagonal = 0.0f;
-        for (int d = 0; d < $T; ++d) {
-            const int coord = d < $P ? po + d : so + d - $P;
-            const int index = (world * $M + row) * $D + coord;
-            J_world.data[index] = j[d];
-            Y_world.data[index] = factor_world ? z[d] : y[d];
-            diagonal += factor_world ? z[d] * z[d] : j[d] * y[d];
-        }
-        world_diag.data[world * $M + row] = diagonal
-            + world_row_cfm.data[world * $M + row];
-    }
+    const float* s_primary = primary_L.data + primary_group * $PP;
+    const float* s_secondary = secondary_L.data + secondary_group * $SS;
+    float s_rows[$T];
+    constexpr int ZS = 1;
 #endif
+    // A row's coordinates, strided by thread (conflict-free), the solves' operands.
+    float* z = s_rows + LANE;
+    for (int row = LANE; row < n_constraints; row += STRIDE) {
+        const int world_row = (world * $M + row) * $D;
+        for (int d = 0; d < $P; ++d) {
+            const float j = primary_J.data[(primary_group * $M + row) * $P + d];
+            J_world.data[world_row + primary_offset + d] = j;
+            z[d * ZS] = j;
+        }
+        for (int d = 0; d < $S; ++d) {
+            const float j = secondary_J.data[(secondary_group * $M + row) * $S + d];
+            J_world.data[world_row + secondary_offset + d] = j;
+            z[($P + d) * ZS] = j;
+        }
+$WHITEN
+        float diagonal = 0.0f;
+        for (int d = 0; d < $T; ++d) diagonal += z[d * ZS] * z[d * ZS];
+        if (!factor_world) {
+$LEAVE
+        }
+        for (int d = 0; d < $T; ++d)
+            Y_world.data[world_row + (d < $P ? primary_offset + d : secondary_offset + d - $P)] = z[d * ZS];
+        world_diag.data[world * $M + row] = diagonal + world_row_cfm.data[world * $M + row];
+    }
 """
 
 
@@ -1048,59 +862,56 @@ def response_pairs_kernel(
     max_constraints: int,
     max_world_dofs: int,
     device_arch,
-    warps_per_block: int = 4,
+    block_dim: int = 128,
     *,
     factor_coordinates: bool = False,
 ) -> wp.Kernel:
-    """The response of a paired world (an articulation and a free body), a block per pair and a warp per row, a lane
-    per coordinate (``launch_tiled(dim=[pairs], block_dim=32 * warps_per_block)``; on the CPU one thread per pair):
-    with the explicit inverses ``y = H^-1 j`` per component (physical coordinates), or with ``factor_coordinates``
-    the leaf-first ``z = L^-1 P j`` (factor coordinate ``i`` on lane ``n - 1 - i``) and, in a world with free-body
-    rows, ``y = P^T L^-T z`` (factor coordinates where a world has none, its response ``Z`` and diagonal ``|z|^2``). The products sum in column order; the diagonal ``sum j y + cfm``
-    reduces over the lanes (``SUM``), on the CPU in coordinate order.
+    """The response of a paired world (an articulation and a free body), a block per pair and a thread per row
+    (``launch_tiled(dim=[pairs], block_dim=block_dim)``; on the CPU one thread per pair over its rows): both
+    components' leaf-first factors and the rows staged in shared memory (a row's coordinates strided by thread), each
+    row whitened in place per component, ``z = L^-1 P j``, by the kit's solves (masked rows, Z0), its diagonal
+    ``|z|^2 = j H^-1 j^T`` (coordinate order) plus ``cfm``, then
+    ``y = P^T L^-T z`` back to physical coordinates, except, with ``factor_coordinates``, in a world without free-body
+    rows, whose response is ``Z`` itself (factor coordinate ``i`` at position ``n - 1 - i``).
     """
     cpu = str(device_arch) == "cpu"
     P, S = int(primary_dofs), int(secondary_dofs)
     total = P + S
     if total > 32:
-        raise ValueError("paired warp response requires at most 32 total DOFs")
-    if warps_per_block <= 0 or warps_per_block > 32:
-        raise ValueError("warps_per_block must be in [1, 32]")
-    vocabulary = {"P": P, "S": S, "T": total, "PP": P * P, "SS": S * S, "M": max_constraints, "D": max_world_dofs}
-    staging = Staging((Buffer("s_primary_M", "float", P * P), Buffer("s_secondary_M", "float", S * S)))
-    if factor_coordinates:
-        response = substitute(_PAIRED_RESPONSE_FACTOR, vocabulary)
-        cpu_action = substitute(_PAIRED_CPU_FACTOR, vocabulary)
-        factor_world = "    const bool factor_world = world_mf_constraint_count.data[world] == 0;"
-        response_value, diagonal_value = "factor_world ? z : y", "factor_world ? z * z : j * y"
-    else:
-        response = substitute(_PAIRED_RESPONSE_PHYSICAL, vocabulary)
-        cpu_action = substitute(_PAIRED_CPU_PHYSICAL, vocabulary)
-        factor_world = ""
-        response_value, diagonal_value = "y", "j * y"
+        raise ValueError("paired response requires at most 32 total DOFs")
+    if block_dim <= 0 or block_dim % 32:
+        raise ValueError("block_dim must be a positive multiple of 32")
+    # The masked whiten holds one row's chain at a time (bounded registers); the operands live in shared memory.
+    primary = CholeskySolve(P, "s_primary", masked=True)
+    secondary = CholeskySolve(S, "s_secondary", masked=True)
+
+    def at(offset):
+        return lambda i: f"z[({offset} + {i}) * ZS]"
+
+    whiten = "\n".join((primary.whiten(at(0), at(0)), secondary.whiten(at(P), at(P))))
+    leave = "\n".join((primary.leave(at(0), at(0)), secondary.leave(at(P), at(P))))
     snippet = substitute(
         _PAIRED,
-        vocabulary,
-        STAGING=staging.declarations(),
-        FACTOR_WORLD=factor_world,
-        MATRIX="Linv" if factor_coordinates else "Hinv",
-        RESPONSE=response,
-        RESPONSE_VALUE=response_value,
-        DIAGONAL_VALUE=diagonal_value,
-        CPU_FACTOR_WORLD="world_mf_constraint_count.data[world] == 0" if factor_coordinates else "false",
-        CPU_ACTION=cpu_action,
+        P=P,
+        S=S,
+        T=total,
+        PP=P * P,
+        SS=S * S,
+        M=max_constraints,
+        D=max_world_dofs,
+        BLOCK=block_dim,
+        FACTOR_WORLD="world_mf_constraint_count.data[world] == 0" if factor_coordinates else "false",
+        WHITEN=_indent(whiten, "        "),
+        LEAVE=_indent(leave, "            "),
     )
-    block_dim = 32 * warps_per_block
     name = f"dense_response_pairs_{P}_{S}_{max_constraints}_bd{block_dim}" + ("_factor" if factor_coordinates else "")
     return KernelTemplate(
         name,
         kernel_template.params(
-            ("primary_Hinv", wp.array3d[float]),
-            ("primary_Linv", wp.array3d[float]),
+            ("primary_L", wp.array3d[float]),
             ("primary_J", wp.array3d[float]),
             ("primary_group_to_art", wp.array[int]),
-            ("secondary_Hinv", wp.array3d[float]),
-            ("secondary_Linv", wp.array3d[float]),
+            ("secondary_L", wp.array3d[float]),
             ("secondary_J", wp.array3d[float]),
             ("secondary_group_to_art", wp.array[int]),
             ("secondary_group_by_primary", wp.array[int]),
@@ -1121,6 +932,7 @@ def response_pairs_kernel(
             constants=(("cpu", cpu),),
         ),
         preludes=(lane_group(block_dim),),
+        dual=True,
         native_name="paired_hinv_jt_native",
     ).kernel()
 
@@ -1631,7 +1443,6 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ),
     ("factor", "warps"): _entry("factor", "warps", factor_warps_kernel, ("articulations", "32 lanes"), _warps),
     ("factor", "tiles"): _entry("factor", "tiles", factor_tiles_kernel, ("articulations",), _tile_threads, tiled=True),
-    ("inverse", "lanes"): _entry("inverse", "lanes", inverse_lanes_kernel, ("articulations", "32 lanes"), 256),
     ("response", "rows"): _entry("response", "rows", response_rows_kernel, ("articulations", "rows")),
     ("response", "lanes"): _entry("response", "lanes", response_lanes_kernel, ("articulations", "32 lanes"), 256),
     ("response", "queue"): _entry("response", "queue", response_queue_kernel, ("workers",), 32, tiled=True),
@@ -1640,7 +1451,14 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("response", "tiles"): _entry(
         "response", "tiles", response_tiles_kernel, ("articulations", "row chunks"), _tile_threads, tiled=True
     ),
-    ("response", "pairs"): _entry("response", "pairs", response_pairs_kernel, ("pairs",), _warps, tiled=True),
+    ("response", "pairs"): _entry(
+        "response",
+        "pairs",
+        response_pairs_kernel,
+        ("pairs",),
+        lambda options: int(options.get("block_dim", 128)),
+        tiled=True,
+    ),
     ("gather", "coordinates"): _entry(
         "gather", "coordinates", gather_coordinates_kernel, ("articulations", "rows", "coordinates")
     ),
@@ -1658,7 +1476,7 @@ as keywords and returns the :class:`Build`. The mappings: ``articulations``, a t
 a thread per articulation (or world row) coordinate; ``rows``, a thread per articulation row; ``lanes``, 32 threads
 per articulation, rows lane-strided; ``warps``, a warp per articulation, a lane per row (or the lanes assembling and
 lane 0 factoring); ``tiles``, a block per articulation (and row chunk) through the tile primitives; ``queue``, warps
-walking the local owners' general-world queue; ``pairs``, a block per paired world, a warp per row; ``groups``, a
+walking the local owners' general-world queue; ``pairs``, a block per paired world, a thread per row; ``groups``, a
 thread per world row summing its articulations' group diagonals; ``world rows``, a thread per world row of the world
 layout; ``worlds``, a thread per world. ``diagonal`` is the thread-per-row response of a structurally diagonal ``H``.
 The register response of the six-coordinate group is a device function, :func:`solve_six`."""

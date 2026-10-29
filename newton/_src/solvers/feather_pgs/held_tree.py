@@ -94,14 +94,6 @@ def decline(solver, *, sparse: tuple[bool, bool] | None = None, compact: int | N
         # Split mode composes its rows from the same held factors the owner refreshes.
         if solver.pgs_mode not in ("matrix_free", "split"):
             return "The held tree serves the matrix-free and split modes."
-        # The paired response (a 17-26 coordinate robot and one free body per world) reads the robot's held
-        # factor in the fused kernel's layout when it runs in factor coordinates, which the owner's refresh
-        # writes; its secondary lower inverse is materialized in stage 2 from the box family's factor. The
-        # register-inverse variant is not.
-        if getattr(solver, "_paired_response_primary_size", None) is not None and not getattr(
-            solver, "_paired_factor_coordinates", False
-        ):
-            return "The paired response's register inverse is outside the held factors."
         if solver.drive_mode != "augmented":
             return "PhysX drive rows keep the ordinary dynamics."
         if solver.pgs_velocity_iterations != 0:
