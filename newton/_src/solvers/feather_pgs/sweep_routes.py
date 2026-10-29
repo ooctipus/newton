@@ -354,10 +354,10 @@ def _colored_pair_metric(op: FreeBodyZ, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
+def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
-    (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's slots) and runs the free-body row law,
-    unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
+    (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
+    law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
     unit_rows = FreeBodyRows(M_MF, stream=free.stream, lanes=Lanes(1))
     arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
 
@@ -440,19 +440,19 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
                 for (int p = s_color_offset[chunk] + tid; p < end_unit; p += blockDim.x) {{
                     const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
-                    const int slot_base = unit_slot * {fields * M_MF} + p;
-                    const int word_base = unit_slot * {words * M_MF} + p;
+                    const int slot_base = unit_slot * {fields * units} + p;
+                    const int word_base = unit_slot * {words * units} + p;
                     // Every field of the slot and its metric at once, beside the slot's own load: one round of
                     // memory latency per unit. A unit without a friction pair never reads its pair's fields.
                     float E[{fields}];
                     int W[{words}];
 #pragma unroll
-                    for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {M_MF}];
+                    for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];
 #pragma unroll
-                    for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
+                    for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {units}];
 #pragma unroll
                     for (int f = 0; f < {METRIC_FIELDS}; ++f)
-                        metric[f] = slot_metric.data[unit_slot * {METRIC_FIELDS * M_MF} + p + f * {M_MF}];
+                        metric[f] = slot_metric.data[unit_slot * {METRIC_FIELDS * units} + p + f * {units}];
 {_unit_terms(" " * 20)}
 #pragma unroll
                     for (int r = 0; r < 2; ++r) {{
@@ -481,7 +481,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
             }}"""
 
 
-def _colored_metrics(M_MF: int) -> str:
+def _colored_metrics(units: int) -> str:
     """Before the sweeps, every thread forms the friction pair metric of the world's staged friction units (a unit of
     three rows) at block stride and stores it in its slot's metric cache (``slot_metric``: scale, the two
     eigenvalues and the larger's axis, then the pair's Gram couplings with the normal, field by field across the
@@ -500,14 +500,14 @@ def _colored_metrics(M_MF: int) -> str:
             const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
             if ((slot.y & 3) != 3) continue;
             const int dof_a = slot.z, dof_b = slot.w;
-            const int slot_base = unit_slot * {fields * M_MF} + p;
-            const int word_base = unit_slot * {words * M_MF} + p;
+            const int slot_base = unit_slot * {fields * units} + p;
+            const int word_base = unit_slot * {words * units} + p;
             float E[{fields}];
             int W[{words}];
 #pragma unroll
-            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {M_MF}];
+            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];
 #pragma unroll
-            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {M_MF}];
+            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {units}];
 {_colored_pair_metric(op, " " * 12)}
             // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,
             // body a's then b's products.
@@ -522,14 +522,14 @@ def _colored_metrics(M_MF: int) -> str:
                     gram_n2 += E[6 + k] * E[30 + k];
                 }}
             }}
-            const int at = unit_slot * {METRIC_FIELDS * M_MF} + p;
+            const int at = unit_slot * {METRIC_FIELDS * units} + p;
             slot_metric.data[at] = metric.v0;
-            slot_metric.data[at + {M_MF}] = metric.v1;
-            slot_metric.data[at + {2 * M_MF}] = metric.v2;
-            slot_metric.data[at + {3 * M_MF}] = metric.v3[0];
-            slot_metric.data[at + {4 * M_MF}] = metric.v3[1];
-            slot_metric.data[at + {5 * M_MF}] = gram_n1;
-            slot_metric.data[at + {6 * M_MF}] = gram_n2;
+            slot_metric.data[at + {units}] = metric.v1;
+            slot_metric.data[at + {2 * units}] = metric.v2;
+            slot_metric.data[at + {3 * units}] = metric.v3[0];
+            slot_metric.data[at + {4 * units}] = metric.v3[1];
+            slot_metric.data[at + {5 * units}] = gram_n1;
+            slot_metric.data[at + {6 * units}] = gram_n2;
         }}
     }}
     __syncthreads();"""
@@ -739,15 +739,16 @@ def mf_gs_source(
         )
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
         first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
-        free_phase = _colored_units(free, laws, M_MF)
+        units = sweep_units.unit_capacity(M_MF)
+        free_phase = _colored_units(free, laws, M_MF, units)
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
         # The world's storage slot (a colored world has one): its colors and staged units.
         offsets = (
             "\n    const int unit_slot = world_slot.data[world];"
-            f"\n    const int off_unit = unit_slot * {M_MF};"
-            f"\n    const int off_color = unit_slot * {M_MF + 1};"
+            f"\n    const int off_unit = unit_slot * {units};"
+            f"\n    const int off_color = unit_slot * {units + 1};"
         )
     else:
         sweep_end = end_sweep(
@@ -790,7 +791,7 @@ def mf_gs_source(
             "!= 0.0f) return true; return false; }()"
         )
         shared = bodies.shared(D, scan, thread, threads, sync)
-    metric_build = _colored_metrics(M_MF) if colored else ""
+    metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF)) if colored else ""
     # The launch's prologue after the loads: the dense rows' support and shared bodies, the free bodies entering
     # factor coordinates, and the colored units' pair metrics.
     prologue = "\n".join(

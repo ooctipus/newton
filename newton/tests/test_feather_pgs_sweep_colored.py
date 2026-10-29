@@ -10,7 +10,8 @@ units that share one keep their row order. The unit builder gives the colored ma
 check
 
 - the unit builder against a host reference of the same rules (units, row-order levels, the slot records), that a
-  color never shares a body or a patch, and that the colors keep the row order;
+  color never shares a body or a patch, that the colors keep the row order, and that a world past its slot's units
+  keeps the one-warp mapping and sets the capacity status;
 - that a world's result repeats bitwise and that the warp's worlds and the colored worlds split the batch;
 - the physics: the colored mapping is the reference's row-order Gauss-Seidel sweep, so it meets the conformance
   gate's laws and its distance to the converged reference on a tray carrying a grid of boxes (a hub body) and on
@@ -194,6 +195,7 @@ class TestColoredSweep(unittest.TestCase):
         stats = solver._colored_units.stats()
         self.assertEqual(len(stats), solver.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))
+        self.assertFalse(solver._colored_units.capacity_status())
 
     def test_the_route_record_reports_the_storage(self):
         """The path selection records the colored kernel, its capable worlds and their storage's bytes."""
@@ -202,9 +204,12 @@ class TestColoredSweep(unittest.TestCase):
         units = solver._colored_units
         self.assertEqual(record["capable_worlds"], solver.world_count)
         self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
-        arrays = (*units.units.values(), *units.slots.values(), units.slot_world)
+        arrays = (*units.units.values(), *units.slots.values(), units.slot_world, units.status)
         self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
         self.assertGreater(record["storage_bytes"], 0)
+        # A slot holds a unit for every three rows of the row capacity.
+        capacity = sweep_units.unit_capacity(solver.mf_max_constraints)
+        self.assertEqual(units.slots["slot_data"].shape, (units.slot_count, sweep_units.SLOT_ENTRIES + 2, capacity))
 
     def test_a_color_never_shares_a_body_or_a_patch(self):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
@@ -238,6 +243,24 @@ class TestColoredSweep(unittest.TestCase):
                     if dof in last:
                         self.assertGreater(color, last[dof], f"unit {unit} on body {dof}")
                     last[dof] = color
+
+    def test_a_world_past_its_slot_keeps_the_warp(self):
+        """A world of more units than its slot holds keeps the one-warp mapping, bitwise, and sets the status."""
+        # The tray's 76 units in slots of one unit each.
+        solvers = []
+        with mock.patch.object(sweep_units, "UNIT_ROWS", 1024):
+            over = self._simulate(tray(), "patch", solvers)
+        units = solvers[-1]._colored_units
+        self.assertIsNotNone(units)
+        self.assertTrue(units.capacity_status())
+        stats = units.stats()
+        self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
+        self.assertTrue(all(world["units"] > units.unit_capacity for world in stats), stats)
+        plain = []
+        warp = self._simulate(tray(), "patch", plain, units=4096)
+        self.assertIsNone(plain[-1]._colored_units)
+        for name in ("body_q", "body_qd"):
+            np.testing.assert_array_equal(getattr(over, name), getattr(warp, name), err_msg=name)
 
     def test_repeats_bitwise_and_splits_the_worlds(self):
         """A repeat gives the same trajectory bitwise; a rule past the row capacity builds no colored mapping."""
