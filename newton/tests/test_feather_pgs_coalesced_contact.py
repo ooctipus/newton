@@ -30,7 +30,7 @@ def clear(data, aux):
     wp.launch(
         compact.clear_contact_response,
         dim=(2, 256),
-        inputs=[aux.counts, aux.bounds, data.dense_group, data.J, data.Y],
+        inputs=[aux.counts, aux.bounds, data.dense_group, data.Z],
         block_dim=256,
         device=aux.device,
     )
@@ -48,40 +48,49 @@ def publish(data, aux):
     clear(data, aux)
     produce(data, aux)
     wp.launch(
-        response_builds_rows.sparse_pair_limit_kernel,
-        dim=(2, 12),
-        inputs=[aux.bounds, aux.counts, data.dense_group, data.factor, data.J, data.Y, data.row_cfm, data.diag],
+        response_builds_rows.sparse_pair_whiten_kernel(),
+        dim=2 * 12,
+        inputs=[
+            data.factor,
+            data.dense_group,
+            aux.counts,
+            aux.bounds,
+            1,
+            12,
+            40,
+            6,
+            data.sparse_dof,
+            data.sparse_z,
+            data.row_cfm,
+        ],
+        outputs=[data.Z, data.diag],
         device=aux.device,
     )
 
 
 class TestCoalescedContact(unittest.TestCase):
     def test_current_contact_range_preserves_prefix_tail_and_groups(self):
-        """Clear both outputs only in current contact ranges through growth, shrink and empty cases."""
+        """Clear the dense rows only in current contact ranges through growth, shrink and empty cases."""
         data, aux = fixture()
-        pointers = (data.J.ptr, data.Y.ptr, aux.counts.ptr, aux.bounds.ptr)
+        pointers = (data.Z.ptr, aux.counts.ptr, aux.bounds.ptr)
         for prefix, counts in (((2, 3), (23, 24)), ((12, 1), (18, 25)), ((1, 12), (25, 15)), ((3, 0), (3, 0))):
             aux.bounds.assign(np.array([[p, p] for p in prefix], dtype=np.int32))
             aux.counts.assign(np.array(counts, dtype=np.int32))
-            before_j = np.arange(480, dtype=np.float32).reshape(2, 40, 6) + 0.5
-            before_y = -before_j - 1.0
-            data.J.assign(before_j)
-            data.Y.assign(before_y)
+            before = np.arange(480, dtype=np.float32).reshape(2, 40, 6) + 0.5
+            data.Z.assign(before)
             clear(data, aux)
-            for actual, before in ((data.J, before_j), (data.Y, before_y)):
-                expected = before.copy()
-                for world, group in enumerate(data.dense_group.numpy()):
-                    expected[group, prefix[world] : counts[world]] = 0.0
-                np.testing.assert_array_equal(actual.numpy(), expected)
-            self.assertEqual(pointers, (data.J.ptr, data.Y.ptr, aux.counts.ptr, aux.bounds.ptr))
+            expected = before.copy()
+            for world, group in enumerate(data.dense_group.numpy()):
+                expected[group, prefix[world] : counts[world]] = 0.0
+            np.testing.assert_array_equal(data.Z.numpy(), expected)
+            self.assertEqual(pointers, (data.Z.ptr, aux.counts.ptr, aux.bounds.ptr))
             np.testing.assert_array_equal(aux.counts.numpy(), counts)
             np.testing.assert_array_equal(aux.bounds.numpy()[:, 1], prefix)
 
     def test_raw_key_only_owner_does_not_publish_dense_zeros(self):
-        """Leave key-only J/Y to the preceding clear while dense endpoints still own all coefficients."""
+        """Leave key-only rows to the preceding clear while dense endpoints still own all coefficients."""
         data, aux = fixture(shared=1)
-        data.J.fill_(713.0)
-        data.Y.fill_(-919.0)
+        data.Z.fill_(713.0)
         produce(data, aux)
         response_dofs = data.response_dofs.numpy()
         arts = (data.art0.numpy(), data.art1.numpy())
@@ -92,28 +101,24 @@ class TestCoalescedContact(unittest.TestCase):
             group = data.dense_group.numpy()[world]
             dense = any(art[contact] >= 0 and response_dofs[art[contact]] == 6 for art in arts)
             if not dense:
-                np.testing.assert_array_equal(data.J.numpy()[group, slot : slot + 3], 713.0)
-                np.testing.assert_array_equal(data.Y.numpy()[group, slot : slot + 3], -919.0)
+                np.testing.assert_array_equal(data.Z.numpy()[group, slot : slot + 3], 713.0)
             else:
-                self.assertTrue(np.isfinite(data.J.numpy()[group, slot : slot + 3]).all())
-                self.assertFalse(np.any(data.J.numpy()[group, slot : slot + 3] == 713.0))
+                self.assertTrue(np.isfinite(data.Z.numpy()[group, slot : slot + 3]).all())
+                self.assertFalse(np.any(data.Z.numpy()[group, slot : slot + 3] == 713.0))
             self.assertTrue(np.isfinite(data.diag.numpy()[world, slot : slot + 3]).all())
 
     def test_multi_tile_ranges_and_capacity_clamp(self):
         """Cover every coefficient across repeated cooperative tiles without changing the raw overflow count."""
         data, aux = fixture()
-        before_j = np.arange(2 * 704 * 6, dtype=np.float32).reshape(2, 704, 6) + 0.25
-        before_y = -before_j - 2.0
-        data.J = wp.array(before_j, dtype=float, device="cpu")
-        data.Y = wp.array(before_y, dtype=float, device="cpu")
+        before = np.arange(2 * 704 * 6, dtype=np.float32).reshape(2, 704, 6) + 0.25
+        data.Z = wp.array(before, dtype=float, device="cpu")
         aux.bounds.assign(np.array([[11, 11], [9, 9]], dtype=np.int32))
         aux.counts.assign(np.array([803, 670], dtype=np.int32))
         clear(data, aux)
-        for actual, before in ((data.J, before_j), (data.Y, before_y)):
-            expected = before.copy()
-            expected[1, 11:704] = 0.0
-            expected[0, 9:670] = 0.0
-            np.testing.assert_array_equal(actual.numpy(), expected)
+        expected = before.copy()
+        expected[1, 11:704] = 0.0
+        expected[0, 9:670] = 0.0
+        np.testing.assert_array_equal(data.Z.numpy(), expected)
         # The allocator's original sticky status/finalizer still owns rejection;
         # this bounded writer must neither write out of bounds nor hide demand.
         np.testing.assert_array_equal(aux.counts.numpy(), [803, 670])
@@ -174,8 +179,7 @@ class TestCoalescedContact(unittest.TestCase):
         baseline.TestCompactContact().compare(original, data, aux)
         world, slot = data.world.numpy()[first], data.slot.numpy()[first]
         group = data.dense_group.numpy()[world]
-        np.testing.assert_array_equal(data.J.numpy()[group, slot : slot + 3], 0.0)
-        np.testing.assert_array_equal(data.Y.numpy()[group, slot : slot + 3], 0.0)
+        np.testing.assert_array_equal(data.Z.numpy()[group, slot : slot + 3], 0.0)
 
     def test_launch_binding_uses_current_counts_before_original_marker(self):
         """Bind the live slot counter, not stale finalized counts, and retain same-stream publication order."""
@@ -191,8 +195,7 @@ class TestCoalescedContact(unittest.TestCase):
             constraint_count=wp.zeros(2, dtype=int, device="cpu"),
             model=SimpleNamespace(device="cpu", shape_body=data.shape_body),
             L_by_size={6: data.factor},
-            J_by_size={6: data.J},
-            Y_by_size={6: data.Y},
+            J_by_size={6: data.Z},
             _mark_independent_sparse_contact_candidates_kernel=marker,
             # Point friction: the patch row law with beta 0 and a disabled view.
             _friction_anchors_enabled=False,
@@ -260,8 +263,7 @@ class TestCoalescedContact(unittest.TestCase):
                 aux.bounds.assign(other.bounds)
                 run_original(original, other)
                 for graph in graphs:
-                    data.J.fill_(float("nan"))
-                    data.Y.fill_(float("nan"))
+                    data.Z.fill_(float("nan"))
                     data.sparse_dof.fill_(-35)
                     install_prefix(data, aux)
                     wp.capture_launch(graph)

@@ -11,9 +11,9 @@ applied into velocities outside the sweeps. This module holds the builds and pub
   L^-1 J^T`` through the body's held factor, and ``1 / A_ii``, the rows' body coordinates in each addressing a
   mapping reads (a world's local body slots, world and global coordinates, the packed row word), and the
   publication ``v += L^-T sum Z lambda`` of a world's impulses;
-- :class:`.response_operator.SparsePairJY` (a compact dense articulation plus two scalar coordinates): a row's dense
-  response through the compact factor, its two sparse slots ``(J, J / m)`` merged when they share a coordinate, and
-  its diagonal ``(dense + sparse) + cfm``;
+- :class:`.response_operator.SparsePairZ` (a compact dense articulation plus two scalar coordinates): a row's dense
+  part whitened through the compact factor, its two sparse slots ``J / sqrt(m)`` merged when they share a coordinate,
+  and its diagonal ``|Z|^2 + cfm``;
 - :class:`.response_operator.SparseFactor` (rows ``Z = L^-1 P J^T`` packed by support): the internal rows' unit
   columns of ``L^-1`` (position limits, velocity limits, mimic), and the publication ``v = v_hat + P^T L^-T u`` of a
   world's factor-coordinate velocity change;
@@ -23,7 +23,7 @@ applied into velocities outside the sweeps. This module holds the builds and pub
 and :class:`BilateralElimination`, the Schur transform of a dense response build that folds a
 world's bilateral block into the responses of its other rows.
 
-**API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparsePairJY.build()``,
+**API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparsePairZ.build()``,
 ``SparseFactor.build()``, ``FactorRows.build()``): a frozen descriptor whose members are the Warp kernels (or cached
 factories of kernel variants, or a Warp function) of each step of the build and of the publication; the solver's
 launch sites call them directly. The arithmetic of a step is one function per representation and mapping, called by
@@ -81,7 +81,7 @@ from .kernels import (
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import PROJECTION_LAW
-from .response_builds_dense import _Vec6, solve_six
+from .response_builds_dense import _indent, _Vec6, whiten_six
 from .response_operator import FreeBodyZ
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
 from .row_metadata import _validate_mf_metadata_encoding
@@ -544,14 +544,15 @@ FREE_BODY_Z = FreeBodyZBuild(
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Sparse-diagonal rows (SparsePairJY)
+# Sparse-diagonal rows (SparsePairZ)
 # ---------------------------------------------------------------------------------------------------------------------
 #
-# A sparse-diagonal row acts on a world's compact dense articulation (its dense part: ``J`` and ``Y = H^-1 J^T``
-# through the articulation's compact factor) and on at most two scalar coordinates of diagonal-mass articulations
-# (its sparse slots ``s``: a world coordinate, ``J_s`` and ``Y_s = J_s / m_s``). An endpoint has a slot when its
-# articulation has the sparse size and its body a single response coordinate; two slots on one coordinate merge
-# into the first. ``A_ii = (J Y + sum_s J_s Y_s) + cfm``.
+# A sparse-diagonal row acts on a world's compact dense articulation (its dense part) and on at most two scalar
+# coordinates of diagonal-mass articulations (its slots), as a whitened row in factor coordinates: the dense part
+# ``Z = L^-1 P J^T`` through the articulation's leaf-first factor (stored in place of the producers' ``J``), and a slot
+# ``Z_s = J_s / sqrt(m_s)``, a star's factor being diagonal (``s = m^-1/2``, the square root of the held tree's
+# ``_diagonal_inverse_mass``). An endpoint has a slot when its articulation has the sparse size and its body a single
+# response coordinate; two slots on one coordinate merge into the first. ``A_ii = |Z|^2 + sum_s Z_s^2 + cfm``.
 
 
 COMPACT_BOUNDARY = (
@@ -561,13 +562,12 @@ COMPACT_BOUNDARY = (
     Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
     Field("factor", wp.float32, ("group", 6, 6), owner="six"),
     Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),
-    Field("J", wp.float32, ("group", "row", 6), owner="six"),
-    Field("Y", wp.float32, ("group", "row", 6), owner="six"),
+    Field("Z", wp.float32, ("group", "row", 6), owner="six"),
     Field("sparse_dof", wp.int32, ("world", "row", 2), attr="_sparse_diagonal_row_dof"),
-    Field("sparse_jy", wp.float32, ("world", "row", 4), attr="_sparse_diagonal_row_jy"),
+    Field("sparse_z", wp.float32, ("world", "row", 2), attr="_sparse_diagonal_row_z"),
 )
-"""What the compact boundary producer writes besides the contact input's row records: each row's dense-six
-Jacobian and response (by the six-DOF size group's factor) and its two sparse response coordinates."""
+"""What the compact boundary producer writes besides the contact input's row records: each row's whitened dense-six
+part (by the six-DOF size group's factor) and its two whitened sparse slots."""
 
 CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name__)
 
@@ -577,7 +577,6 @@ def sparse_pair_slot(
     art: int,
     body: int,
     negate: bool,
-    windowed: bool,
     size: int,
     response_dofs: wp.array[int],
     single_dof: wp.array[int],
@@ -589,32 +588,23 @@ def sparse_pair_slot(
     direction: wp.vec3,
     point: wp.vec3,
 ):
-    """One endpoint's sparse slot: its world coordinate (-1 for none), Jacobian entry and response ``J / m``.
+    """One endpoint's sparse slot: its world coordinate (-1 for none) and whitened entry ``Z = J / sqrt(m)``.
 
-    The entry of the second endpoint is negated (``negate``): a row pushes its endpoints apart. The response is
-    formed where the body has a single response coordinate, or (``windowed``) only where that coordinate also lies
-    in the articulation's window; the two forms differ only for a coordinate outside its articulation, which a
-    body's coordinate never is (the contact producers' and the compact producer's forms).
+    The entry of the second endpoint is negated (``negate``): a row pushes its endpoints apart. A body's coordinate
+    holds a slot only inside its articulation's window.
     """
-    dof = int(-1)
     coordinate = int(-1)
     value = float(0.0)
-    response = float(0.0)
     if art >= 0 and body >= 0 and response_dofs[art] == size:
         dof = single_dof[body]
         if dof >= 0:
             local = dof - dof_start[art]
             if local >= 0 and local < size:
                 coordinate = dof_offset[art] + local
-                value = jacobian_entry(motion[dof], direction, point, origin[art])
+                value = jacobian_entry(motion[dof], direction, point, origin[art]) * wp.sqrt(inverse_mass[dof])
                 if negate:
                     value = -value
-                if windowed:
-                    response = value * inverse_mass[dof]
-    if not windowed:
-        if dof >= 0:
-            response = value * inverse_mass[dof]
-    return coordinate, value, response
+    return coordinate, value
 
 
 @wp.func
@@ -626,7 +616,6 @@ def sparse_pair_slots(
     body_b: int,
     point_b: wp.vec3,
     direction: wp.vec3,
-    windowed: bool,
     size: int,
     response_dofs: wp.array[int],
     single_dof: wp.array[int],
@@ -637,12 +626,11 @@ def sparse_pair_slots(
     origin: wp.array[wp.vec3],
 ):
     """A row's two sparse slots (:func:`sparse_pair_slot`), merged into the first when they share a coordinate:
-    ``(coordinate, J, Y)`` of slot 0, then of slot 1."""
-    coord_a, value_a, response_a = sparse_pair_slot(
+    ``(coordinate, Z)`` of slot 0, then of slot 1."""
+    coord_a, value_a = sparse_pair_slot(
         art_a,
         body_a,
         False,
-        windowed,
         size,
         response_dofs,
         single_dof,
@@ -654,11 +642,10 @@ def sparse_pair_slots(
         direction,
         point_a,
     )
-    coord_b, value_b, response_b = sparse_pair_slot(
+    coord_b, value_b = sparse_pair_slot(
         art_b,
         body_b,
         True,
-        windowed,
         size,
         response_dofs,
         single_dof,
@@ -672,35 +659,32 @@ def sparse_pair_slots(
     )
     if coord_a >= 0 and coord_a == coord_b:
         value_a += value_b
-        response_a += response_b
         coord_b = -1
         value_b = 0.0
-        response_b = 0.0
-    return coord_a, value_a, response_a, coord_b, value_b, response_b
+    return coord_a, value_a, coord_b, value_b
 
 
 @wp.func
-def sparse_pair_diagonal(
-    coord_0: int, value_0: float, response_0: float, coord_1: int, value_1: float, response_1: float
-):
-    """The sparse slots' term of ``A_ii``: from zero, each present slot's ``J_s Y_s`` in slot order."""
+def sparse_pair_diagonal(coord_0: int, value_0: float, coord_1: int, value_1: float):
+    """The sparse slots' term of ``A_ii``: from zero, each present slot's ``Z_s^2`` in slot order."""
     diagonal = float(0.0)
     if coord_0 >= 0:
-        diagonal += value_0 * response_0
+        diagonal += value_0 * value_0
     if coord_1 >= 0:
-        diagonal += value_1 * response_1
+        diagonal += value_1 * value_1
     return diagonal
 
 
 @wp.func
 def sparse_pair_dense(factor: wp.array3d[float], group: int, jacobian: _Vec6):
-    """The dense part's response ``Y = H^-1 J^T`` through the group's compact six-coordinate factor
-    (:func:`.response_builds_dense.solve_six`) and its term ``J Y`` of the diagonal, from zero in coordinate order."""
-    response = solve_six(factor, group, jacobian)
+    """The dense part whitened, ``Z = L^-1 P J^T``, through the group's compact six-coordinate factor
+    (:func:`.response_builds_dense.whiten_six`), and its term ``|Z|^2`` of the diagonal, from zero in coordinate
+    order."""
+    whitened = whiten_six(factor, group, jacobian)
     diagonal = float(0.0)
     for dof in range(6):
-        diagonal += jacobian[dof] * response[dof]
-    return response, diagonal
+        diagonal += whitened[dof] * whitened[dof]
+    return whitened, diagonal
 
 
 @wp.kernel(enable_backward=False)
@@ -714,7 +698,7 @@ def sparse_pair_contact_rows_kernel(
     law: PatchRowLaw,
     # outputs
     sparse_row_dof: wp.array3d[int],
-    sparse_row_jy: wp.array3d[float],
+    sparse_row_z: wp.array3d[float],
 ):
     """Write each contact row's sparse slots (:func:`sparse_pair_slots`); a worker strides over the contacts.
 
@@ -740,7 +724,7 @@ def sparse_pair_contact_rows_kernel(
             direction, p0, p1 = contact_row_frame(
                 row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
             )
-            coord_a, value_a, response_a, coord_b, value_b, response_b = sparse_pair_slots(
+            coord_a, value_a, coord_b, value_b = sparse_pair_slots(
                 art_a,
                 body_a,
                 p0,
@@ -748,7 +732,6 @@ def sparse_pair_contact_rows_kernel(
                 body_b,
                 p1,
                 direction,
-                False,
                 target_size,
                 data.response_dofs,
                 body_single_response_dof,
@@ -761,35 +744,8 @@ def sparse_pair_contact_rows_kernel(
             output_row = slot + row
             sparse_row_dof[world, output_row, 0] = coord_a
             sparse_row_dof[world, output_row, 1] = coord_b
-            sparse_row_jy[world, output_row, 0] = value_a
-            sparse_row_jy[world, output_row, 1] = response_a
-            sparse_row_jy[world, output_row, 2] = value_b
-            sparse_row_jy[world, output_row, 3] = response_b
-
-
-@wp.kernel(enable_backward=False)
-def sparse_pair_diagonal_kernel(
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    sparse_row_dof: wp.array3d[int],
-    sparse_row_jy: wp.array3d[float],
-    # in/out
-    world_diag: wp.array2d[float],
-):
-    """Add each row's sparse term (:func:`sparse_pair_diagonal`) to its diagonal, which holds the dense term."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    row = tid - world * max_constraints
-    if row >= world_constraint_count[world]:
-        return
-    world_diag[world, row] += sparse_pair_diagonal(
-        sparse_row_dof[world, row, 0],
-        sparse_row_jy[world, row, 0],
-        sparse_row_jy[world, row, 1],
-        sparse_row_dof[world, row, 1],
-        sparse_row_jy[world, row, 2],
-        sparse_row_jy[world, row, 3],
-    )
+            sparse_row_z[world, output_row, 0] = value_a
+            sparse_row_z[world, output_row, 1] = value_b
 
 
 @wp.func
@@ -808,10 +764,11 @@ def sparse_pair_row_response(
     p0: wp.vec3,
     p1: wp.vec3,
 ):
-    """Write one compact-boundary row's dense-six part, sparse slots and diagonal ``(dense + sparse) + cfm``.
+    """Write one compact-boundary row whitened: its dense-six part, its sparse slots and its diagonal ``(|Z|^2 + sum_s
+    Z_s^2) + cfm``.
 
     The dense Jacobian sums both endpoints' entries per coordinate of the six-coordinate articulation (each where
-    the body's coordinate mask holds the coordinate).
+    the body's coordinate mask holds the coordinate), then is whitened in registers.
     """
     diagonal = float(0.0)
     if has_dense:
@@ -827,11 +784,10 @@ def sparse_pair_row_response(
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
                     value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
             jacobian[dof] = value0 + value1
-        response, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
+        whitened, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
         for dof in range(6):
-            boundary.J[group, output_row, dof] = jacobian[dof]
-            boundary.Y[group, output_row, dof] = response[dof]
-    coord0, value0, response0, coord1, value1, response1 = sparse_pair_slots(
+            boundary.Z[group, output_row, dof] = whitened[dof]
+    coord0, value0, coord1, value1 = sparse_pair_slots(
         art0,
         body0,
         p0,
@@ -839,7 +795,6 @@ def sparse_pair_row_response(
         body1,
         p1,
         direction,
-        True,
         boundary.sparse_size,
         data.response_dofs,
         boundary.body_single_dof,
@@ -851,65 +806,99 @@ def sparse_pair_row_response(
     )
     boundary.sparse_dof[world, output_row, 0] = coord0
     boundary.sparse_dof[world, output_row, 1] = coord1
-    boundary.sparse_jy[world, output_row, 0] = value0
-    boundary.sparse_jy[world, output_row, 1] = response0
-    boundary.sparse_jy[world, output_row, 2] = value1
-    boundary.sparse_jy[world, output_row, 3] = response1
-    sparse = sparse_pair_diagonal(coord0, value0, response0, coord1, value1, response1)
+    boundary.sparse_z[world, output_row, 0] = value0
+    boundary.sparse_z[world, output_row, 1] = value1
+    sparse = sparse_pair_diagonal(coord0, value0, coord1, value1)
     data.diag[world, output_row] = (diagonal + sparse) + data.cfm
 
 
-@wp.kernel(enable_backward=False)
-def sparse_pair_limit_kernel(
-    bounds: wp.array2d[int],
-    counts: wp.array[int],
-    groups: wp.array[int],
-    factor: wp.array3d[float],
-    J: wp.array3d[float],
-    Y: wp.array3d[float],
-    cfm: wp.array2d[float],
-    diag: wp.array2d[float],
-):
-    """Respond to the bounded dense-six position-limit prefix (:func:`sparse_pair_dense`): ``A_ii = J Y + cfm``."""
-    world, row = wp.tid()
-    if row >= wp.min(bounds[world, 1], counts[world]):
-        return
-    group = groups[world]
-    jacobian = _Vec6()
-    for dof in range(6):
-        jacobian[dof] = J[group, row, dof]
-    response, diagonal = sparse_pair_dense(factor, group, jacobian)
-    for dof in range(6):
-        Y[group, row, dof] = response[dof]
-    diag[world, row] = diagonal + cfm[world, row]
+@cache
+def sparse_pair_whiten_kernel() -> wp.Kernel:
+    """Whiten the sparse-diagonal rows' dense parts in place and store their diagonals, one thread per world row
+    (``dim = worlds * rows``, ``rows`` at most ``max_constraints``).
+
+    The dense part, ``Z = L^-1 P J^T`` through the world's compact dense factor (:class:`.CholeskySolve`'s forward
+    solve at the leaf-first positions, Z0), overwrites the producers' ``J``; ``A_ii = (|Z|^2 + sum_s Z_s^2) + cfm``
+    adds the row's whitened slots. Every row below the world's count, or with ``prefix_only`` below its limit prefix's
+    bound (the compact boundary whitens its contact rows as it writes them).
+    """
+    from .response_builds_dense import _element  # noqa: PLC0415
+    from .response_operator import CholeskySolve, Reversed  # noqa: PLC0415
+
+    solve = CholeskySolve("n_dofs", lambda r, c: _element("L_group", "group", r, c))
+    # The row's last coordinates, read backwards: factor coordinate k at physical position n_dofs - 1 - k.
+    entries = Reversed(lambda k: f"whitened_row[-{k}]")
+    body = f"""    const int world = tid / rows;
+    const int sparse_row = tid - world * rows;
+    int end = world_constraint_count.data[world];
+    if (end > max_constraints) end = max_constraints;
+    if (prefix_only != 0 && dense_phase_bounds.data[world * 2 + 1] < end) end = dense_phase_bounds.data[world * 2 + 1];
+    if (sparse_row >= end) return;
+    const int group = dense_groups.data[world];
+    float* whitened_row = &{_element("Z_group", "group", "sparse_row", "n_dofs - 1")};
+    {{
+{_indent(solve.whiten(entries, entries), "        ")}
+    }}
+    float diagonal = 0.0f;
+    for (int i = 0; i < n_dofs; ++i) {{
+        const float z = {_element("Z_group", "group", "sparse_row", "i")};
+        diagonal += z * z;
+    }}
+    for (int slot = 0; slot < 2; ++slot) {{
+        if ({_element("sparse_row_dof", "world", "sparse_row", "slot")} >= 0) {{
+            const float z = {_element("sparse_row_z", "world", "sparse_row", "slot")};
+            diagonal += z * z;
+        }}
+    }}
+    {_element("world_diag", "world", "sparse_row")} = diagonal + {_element("row_cfm", "world", "sparse_row")};
+"""
+    return KernelTemplate(
+        "sparse_pair_whiten",
+        kernel_template.params(
+            ("L_group", wp.array3d[float]),
+            ("dense_groups", wp.array[int]),
+            ("world_constraint_count", wp.array[int]),
+            ("dense_phase_bounds", wp.array2d[int]),
+            ("prefix_only", int),
+            ("rows", int),
+            ("max_constraints", int),
+            ("n_dofs", int),
+            ("sparse_row_dof", wp.array3d[int]),
+            ("sparse_row_z", wp.array3d[float]),
+            ("row_cfm", wp.array2d[float]),
+            ("Z_group", wp.array3d[float]),
+            ("world_diag", wp.array2d[float]),
+        ),
+        dual_native(body, preludes=()),
+        kernel_template.THREADS,
+        composed=True,
+        native_name="sparse_pair_whiten_native",
+    ).kernel()
 
 
 @dataclasses.dataclass(frozen=True)
 class SparsePairBuild:
-    """The build of sparse-diagonal rows (:class:`.response_operator.SparsePairJY`).
+    """The build of sparse-diagonal rows (:class:`.response_operator.SparsePairZ`).
 
     Attributes:
-        contact_rows: Each contact row's sparse slots (:func:`sparse_pair_contact_rows_kernel`); the dense part is a
-            dense response build of the dense group.
-        diagonal: Each row's sparse term added to its dense diagonal (:func:`sparse_pair_diagonal_kernel`).
-        row_response: One compact-boundary row's dense part, slots and diagonal (:func:`sparse_pair_row_response`),
-            the response of the compact contact producer.
-        limit_response: The dense-six limit prefix's responses and diagonals (:func:`sparse_pair_limit_kernel`).
+        contact_rows: Each contact row's whitened sparse slots (:func:`sparse_pair_contact_rows_kernel`); the dense
+            part is the producers' ``J``, whitened by :attr:`whiten`.
+        row_response: One compact-boundary row whitened, its dense part, slots and diagonal
+            (:func:`sparse_pair_row_response`), the response of the compact contact producer.
+        whiten: The rows' dense parts whitened in place and their diagonals (:func:`sparse_pair_whiten_kernel`).
     """
 
     contact_rows: wp.Kernel
-    diagonal: wp.Kernel
     row_response: wp.Function
-    limit_response: wp.Kernel
+    whiten: Callable[[], wp.Kernel]
 
 
 SPARSE_PAIR = SparsePairBuild(
     contact_rows=sparse_pair_contact_rows_kernel,
-    diagonal=sparse_pair_diagonal_kernel,
     row_response=sparse_pair_row_response,
-    limit_response=sparse_pair_limit_kernel,
+    whiten=sparse_pair_whiten_kernel,
 )
-"""The sparse-diagonal rows' build (:meth:`.SparsePairJY.build`)."""
+"""The sparse-diagonal rows' build (:meth:`.SparsePairZ.build`)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

@@ -1910,6 +1910,19 @@ class SolverFeatherPGS(SolverBase):
         if self._mf_sweeps:
             self._jy_world_aliased = False
             self._hinv_jt_diag_sizes = frozenset()
+        # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
+        # six-coordinate dense articulation (decided before the buffers: it clears its own rows, so their Jacobian
+        # needs no second buffer). It writes the point and the patch row law; torsion and compliance keep ordinary
+        # rows.
+        from .compact_contact import supported  # noqa: PLC0415
+
+        declined = capable("compact", self._laws)
+        if declined is None and not supported(self):
+            declined = (
+                "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
+            )
+        self._compact_contact_boundary = declined is None
+        self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
         # CONTACT row_parent belongs to ordinary friction/patch load linkage.
@@ -2154,23 +2167,6 @@ class SolverFeatherPGS(SolverBase):
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
         # then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
-
-        # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
-        # six-coordinate dense articulation. It writes the point and the patch row law; torsion and compliance keep
-        # ordinary rows.
-        from .compact_contact import supported  # noqa: PLC0415
-
-        declined = capable("compact", self._laws)
-        if declined is not None:
-            pass
-        elif not supported(self):
-            declined = (
-                "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
-            )
-        else:
-            declined = None
-        self._compact_contact_boundary = declined is None
-        self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
 
         held_tree.install(self)
         # Ordinary dynamics take the CPU's drive pass and layout (_stage1_drives: the joint forces and the drives in
@@ -4359,6 +4355,17 @@ class SolverFeatherPGS(SolverBase):
         self.aug_row_dof_index.assign(row_dof_index)
         self._parallel_augmented_drive_topology = True
 
+    def _memset_clears_jacobian(self, size: int) -> bool:
+        """Whether the memset stream clears a size group's active Jacobian rows between uses (double-buffered on CUDA):
+        not under the matrix-free sweeps (their producers write the packed rows' sides whole), nor for the
+        sparse-diagonal response size (no dense Jacobian) or the compact boundary's six coordinates (it clears its
+        rows itself); :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a private Jacobian."""
+        return not (
+            self._mf_sweeps
+            or (self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_response_size)
+            or (self._compact_contact_boundary and size == 6)
+        )
+
     def _allocate_buffers(self, model):
         self.H_by_size = {}
         self.L_by_size = {}
@@ -4392,8 +4399,10 @@ class SolverFeatherPGS(SolverBase):
             factor = 1 if compact_diagonal_mass else 0
             # The matrix-free sweeps' producers write the packed rows (_jacobian_rows): no size group's Jacobian.
             response = 1 if sparse_response or self._mf_sweeps else 0
-            # The matrix-free sweeps read the packed rows: no route reads a size group's response.
-            y = 1 if sparse_response or self._mf_sweeps else 0
+            # The matrix-free sweeps read the packed rows and the sparse-diagonal owner whitens its dense rows in place
+            # (SparsePairZ): no route reads a size group's response.
+            whitened = self._sparse_diagonal_contact_solve and size == self._sparse_diagonal_dense_size
+            y = 1 if sparse_response or self._mf_sweeps or whitened else 0
             sizes = {
                 "art": n_arts,
                 "size": size,
@@ -4410,13 +4419,17 @@ class SolverFeatherPGS(SolverBase):
             if not compact_diagonal_mass:
                 # Grouped scratch belongs to the dense triangular solve, not the compact paths.
                 buffers.update(arrays.allocate(SIZE_GROUPED_SOLVE, owner={}, **sizes))
-            # Double buffering gives the mass matrix and Jacobian of a size group two sets.
+            # Double buffering gives the mass matrix and Jacobian of a size group two sets; the second Jacobian only
+            # where the memset stream clears the rows between uses, else both sets share one.
             systems = (
                 zip(self._H_bufs, self._J_bufs, strict=True) if double_buffered else ((self.H_by_size, self.J_by_size),)
             )
-            for H_by_size, J_by_size in systems:
-                system = arrays.allocate(SIZE_SYSTEM, owner={}, **sizes)
-                H_by_size[size], J_by_size[size] = system["H"], system["J"]
+            for index, (H_by_size, J_by_size) in enumerate(systems):
+                shared = index > 0 and not self._memset_clears_jacobian(size)
+                one = {"response_art": 1, "response_row": 1, "response_size": 1} if shared else {}
+                system = arrays.allocate(SIZE_SYSTEM, owner={}, **{**sizes, **one})
+                H_by_size[size] = system["H"]
+                J_by_size[size] = self._J_bufs[0][size] if shared else system["J"]
             for name, array in buffers.items():
                 getattr(self, f"{name}_by_size")[size] = array
             self.diag_by_size[size] = (
@@ -5407,10 +5420,10 @@ class SolverFeatherPGS(SolverBase):
                     self._sparse_contact_serial_normals,
                     self._sparse_diagonal_dense_offsets,
                     self._sparse_diagonal_dense_groups,
+                    self.L_by_size[dense_size],
                     self.J_by_size[dense_size],
-                    self.Y_by_size[dense_size],
                     self._sparse_diagonal_row_dof,
-                    self._sparse_diagonal_row_jy,
+                    self._sparse_diagonal_row_z,
                     self._fused_diagonal_limit_active,
                     self._fused_diagonal_limit_lower_rhs,
                     self._fused_diagonal_limit_upper_rhs,
@@ -8148,7 +8161,7 @@ class SolverFeatherPGS(SolverBase):
                             self._diagonal_inverse_mass,
                             law,
                         ],
-                        outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_jy],
+                        outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_z],
                         extent=count,
                         clamp=True,
                     )
@@ -8986,8 +8999,8 @@ class SolverFeatherPGS(SolverBase):
             return  # The packed rows' build adds CFM with the diagonal.
         if self._sparse_prepare_contacts:
             return  # Contact and limit producers add CFM exactly once.
-        if self._compact_contact_boundary:
-            return  # Both complete owners already add the original row CFM exactly once.
+        if self._sparse_diagonal_contact_solve:
+            return  # The sparse-diagonal owner adds its rows' CFM with their diagonals.
         model = self.model
         wp.launch(
             response_builds_dense.cfm_worlds_kernel(),
@@ -9088,20 +9101,28 @@ class SolverFeatherPGS(SolverBase):
             if self._row_packets is None:
                 self.diag.zero_()
             return 2
-        if self._compact_contact_boundary:
+        if self._sparse_diagonal_contact_solve:
+            # The sparse-diagonal owner whitens its rows' dense parts in place and stores their diagonals with cfm:
+            # every row, or the compact boundary's limit prefix (its producer whitens its contact rows as it writes).
+            size = self._sparse_diagonal_dense_size
+            rows = 12 if self._compact_contact_boundary else self.dense_max_constraints
             wp.launch(
-                response_builds_rows.sparse_pair_limit_kernel,
-                dim=(self.world_count, 12),
+                response_builds_rows.SPARSE_PAIR.whiten(),
+                dim=self.world_count * rows,
                 inputs=[
-                    self.dense_phase_bounds,
-                    self.constraint_count,
+                    self.L_by_size[size],
                     self._sparse_diagonal_dense_groups,
-                    self.L_by_size[6],
-                    self.J_by_size[6],
-                    self.Y_by_size[6],
+                    self.constraint_count,
+                    self.dense_phase_bounds,
+                    int(self._compact_contact_boundary),
+                    rows,
+                    self.dense_max_constraints,
+                    size,
+                    self._sparse_diagonal_row_dof,
+                    self._sparse_diagonal_row_z,
                     self.row_cfm,
-                    self.diag,
                 ],
+                outputs=[self.J_by_size[size], self.diag],
                 device=self.model.device,
             )
             return 0
@@ -9109,23 +9130,6 @@ class SolverFeatherPGS(SolverBase):
             # Sparse producers write the diagonal; unfused controls add CFM separately.
             return 0
         self.diag.zero_()
-        if self._sparse_diagonal_contact_solve:
-            for size in self.size_groups:
-                if size != self._sparse_diagonal_response_size:
-                    self._stage4_diag_from_JY(size)
-            wp.launch(
-                response_builds_rows.sparse_pair_diagonal_kernel,
-                dim=self.world_count * self.dense_max_constraints,
-                inputs=[
-                    self.constraint_count,
-                    self.dense_max_constraints,
-                    self._sparse_diagonal_row_dof,
-                    self._sparse_diagonal_row_jy,
-                ],
-                outputs=[self.diag],
-                device=self.model.device,
-            )
-            return 0
         if self._hinv_jt_diag_sizes:
             for size in self.size_groups:
                 if size in self._hinv_jt_diag_sizes:
@@ -9244,9 +9248,11 @@ class SolverFeatherPGS(SolverBase):
                     self._sparse_diagonal_dense_offsets,
                     self._sparse_diagonal_dense_groups,
                     dense_size,
+                    self.L_by_size[dense_size] if sparse else self._dummy_world_J,
                     self.J_by_size[dense_size] if sparse else self._dummy_world_J,
                     self._sparse_diagonal_row_dof,
-                    self._sparse_diagonal_row_jy,
+                    self._sparse_diagonal_row_z,
+                    self._diagonal_inverse_mass,
                     dt,
                     self._effective_restitution_velocity_threshold,
                     int(self._regularization_enabled),

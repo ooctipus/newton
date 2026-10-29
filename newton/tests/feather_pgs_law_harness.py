@@ -779,8 +779,10 @@ def world_restitution_layout(device) -> list:
         wp.zeros(1, dtype=wp.int32, device=device),
         0,
         wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
+        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
         wp.full((1, 1, 2), -1, dtype=wp.int32, device=device),
-        wp.zeros((1, 1, 4), dtype=wp.float32, device=device),
+        wp.zeros((1, 1, 2), dtype=wp.float32, device=device),
+        wp.zeros(1, dtype=wp.float32, device=device),
     ]
 
 

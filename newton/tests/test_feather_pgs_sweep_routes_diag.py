@@ -19,7 +19,7 @@ from pathlib import Path
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_routes_diag as routes
-from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, SparsePairJY, Velocity
+from newton._src.solvers.feather_pgs.response_operator import FreeBodyZ, Lanes, SparsePairZ, Velocity
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 
 _POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
@@ -84,7 +84,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         self.assertIn("const int contact_start = row_count;", plain)
         self.assertNotIn("independent_group_count", plain)
         # Independent contacts: one product rounded alone, as the warp's sum of it rounds.
-        self.assertIn("float jv = __fmul_rn(jacobian, s_v[scalar_coord]);", triples)
+        self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", triples)
         # A chain visits a contact's normal and its pair's first tangent with their kinds (and the pair's parent) known,
         # so no visit reads row metadata; the second tangent is only zeroed while friction waits. A unit has a pair
         # only when it owns an anchor.
@@ -102,9 +102,17 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # A pair loads its sibling's entries once and reduces its two terms in one ladder; its apply reuses them.
         for text in (triples, units):
             self.assertEqual(text.count("SUM(sibling_residual, cross);"), 1)
-            self.assertEqual(text.count("const float sib_response = sparse_row_jy.data[sib_entry + 1];"), 1)
-            self.assertIn("s_v[scalar_coord] += sib_response * sib_delta;", text)
-            self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_response * sib_delta;", text)
+            self.assertEqual(text.count("const float sib_z = sparse_row_z.data[sib_entry];"), 1)
+            self.assertIn("s_v[scalar_coord] += sib_z * sib_delta;", text)
+            self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_z * sib_delta;", text)
+        # The rows act in factor coordinates: the dense articulation enters (u = L^T P v) once after the velocity is
+        # staged and leaves once before it is written back; a diagonal coordinate scales by its m^-1/2.
+        for text in (plain, triples, units):
+            self.assertIn("s_v[d] = diagonal_scale > 0.0f ? velocity / diagonal_scale : velocity;", text)
+            self.assertIn("v_out.data[global_dof] = diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
+            self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
+            self.assertLess(text.index("u = L^T P v"), text.index("for (int iteration = 0;"))
+            self.assertLess(text.index("for (int iteration = 0;"), text.index("v = P^T L^-T u"))
 
 
 class TestSweepRoutesDiagOperators(unittest.TestCase):
@@ -146,16 +154,24 @@ class TestSweepRoutesDiagOperators(unittest.TestCase):
         self.assertIn("if (lane == 0) {", op.scale_speed("s", "speed_dof", "axis", ""))
 
     def test_sparse_pair_layouts(self):
-        warp = SparsePairJY(6, 32, Lanes(32), diagonal=lambda row: f"d[{row}]")
+        warp = SparsePairZ(6, 32, Lanes(32), diagonal=lambda row: f"d[{row}]")
         self.assertIn(
-            "float jv_partial = coord >= 0 ? jacobian * s_v[coord] : 0.0f;\nSUM(jv_partial);", warp.residual("jv", "")
+            "float jv_partial = coord >= 0 ? z * s_v[coord] : 0.0f;\nSUM(jv_partial);", warp.residual("jv", "")
         )
-        self.assertIn("lane <= 7", warp.consume("i", ""))
-        segment = SparsePairJY(6, 32, Lanes(8, "batch_lane", segment=True))
+        consumed = warp.consume("i", "")
+        self.assertIn("lane <= 7", consumed)
+        # One whitened entry per lane: the dense part's Z, or a slot's Z_s, read where the coordinate is.
+        self.assertIn("z = dense_Z.data[(dense_group * 32 + i) * 6 + lane];", consumed)
+        self.assertIn("const int sparse_entry = (row_base + i) * 2 + lane - 6;", consumed)
+        self.assertIn("z = sparse_row_z.data[sparse_entry];", consumed)
+        # W = Z^T Z: the coupling and the apply read the same entries the residual does.
+        self.assertIn("float cross = coord >= 0 ? z * cross_here : 0.0f;", warp.coupling("cross", "i", "s", ""))
+        self.assertIn("if (coord >= 0) s_v[coord] += z * delta;", warp.apply("delta", ""))
+        segment = SparsePairZ(6, 32, Lanes(8, "batch_lane", segment=True))
         self.assertIn("SEGMENT_SUM(8, v);", segment.row_velocity("v", "c", "", active="valid"))
         self.assertIn("if (valid && batch_lane < 6)", segment.row_velocity("v", "c", "", active="valid"))
-        scalar = SparsePairJY(6, 32, Lanes(1))
-        self.assertIn("__fmul_rn(jacobian, s_v[scalar_coord])", scalar.residual("jv", ""))
+        scalar = SparsePairZ(6, 32, Lanes(1))
+        self.assertIn("__fmul_rn(z, s_v[scalar_coord])", scalar.residual("jv", ""))
         self.assertEqual(warp.step("r", "i"), "-r / d[i]")
 
 

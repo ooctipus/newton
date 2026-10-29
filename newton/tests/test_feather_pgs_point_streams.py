@@ -399,6 +399,15 @@ def _dense_build_calls():
         yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
     for name in ("apply_kernel", "project_kernel"):
         yield f"packed_rows.{name}", getattr(packed_rows, name).__wrapped__, (), {}
+    from newton._src.solvers.feather_pgs import response_builds_rows  # noqa: PLC0415
+
+    # The sparse-diagonal rows whitened in place, with their diagonals.
+    yield (
+        "response_builds_rows.sparse_pair_whiten_kernel",
+        response_builds_rows.sparse_pair_whiten_kernel.__wrapped__,
+        (),
+        {},
+    )
 
 
 def _solver_factory_calls():

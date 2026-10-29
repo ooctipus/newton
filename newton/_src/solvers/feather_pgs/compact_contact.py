@@ -54,31 +54,29 @@ def clear_contact_response(
     counts: wp.array[int],
     bounds: wp.array2d[int],
     groups: wp.array[int],
-    J: wp.array3d[float],
-    Y: wp.array3d[float],
+    Z: wp.array3d[float],
 ):
     """Clear only current contact coefficients, with contiguous lanes within each world."""
     world, lane = wp.tid()
     start = wp.max(bounds[world, 1], 0)
-    end = wp.min(counts[world], J.shape[1])
+    end = wp.min(counts[world], Z.shape[1])
     if end <= start:
         return
     group = groups[world]
-    # The limit prefix already contains current J. Align the first coefficient
-    # tile down for coalescing, but never write its prefix lanes.
+    # The limit prefix already contains the producers' current J. Align the first coefficient tile down for
+    # coalescing, but never write its prefix lanes.
     first = (start * 6 // 32) * 32
     for coefficient in range(first + lane, end * 6, 256):
         if coefficient >= start * 6:
             row = coefficient // 6
             dof = coefficient % 6
-            J[group, row, dof] = 0.0
-            Y[group, row, dof] = 0.0
+            Z[group, row, dof] = 0.0
 
 
 @wp.kernel
 def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact): its records
-    (:func:`.row_build.write_contact_row`), then its dense-six and sparse pair response.
+    (:func:`.row_build.write_contact_row`), then its whitened dense-six part and sparse slots.
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
@@ -108,15 +106,13 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
 
 def launch_contacts(solver, data, workers):
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
-    boundary = field_group.bind(
-        CompactBoundary, solver=solver, factor=solver.L_by_size[6], J=solver.J_by_size[6], Y=solver.Y_by_size[6]
-    )
+    boundary = field_group.bind(CompactBoundary, solver=solver, factor=solver.L_by_size[6], Z=solver.J_by_size[6])
     # Allocation has completed, but constraint_count is finalized later. Keep
     # this clear and the following producer ordered on the current stream.
     wp.launch(
         clear_contact_response,
         dim=(solver.world_count, 256),
-        inputs=[solver.slot_counter, solver.dense_phase_bounds, boundary.dense_group, boundary.J, boundary.Y],
+        inputs=[solver.slot_counter, solver.dense_phase_bounds, boundary.dense_group, boundary.Z],
         block_dim=256,
         device=solver.model.device,
     )

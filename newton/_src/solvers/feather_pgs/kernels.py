@@ -2557,26 +2557,34 @@ def sparse_diagonal_row_dot(
     dense_offsets: wp.array[int],
     dense_groups: wp.array[int],
     dense_dofs: int,
-    dense_J: wp.array3d[float],
+    dense_L: wp.array3d[float],
+    dense_Z: wp.array3d[float],
     sparse_row_dof: wp.array3d[int],
-    sparse_row_jy: wp.array3d[float],
+    sparse_row_z: wp.array3d[float],
+    diagonal_inverse_mass: wp.array[float],
 ):
-    """Dot one sparse-diagonal row (its compact dense component and two sparse response coordinates) with a global
-    velocity state."""
+    """``J v`` of one sparse-diagonal row with a global velocity state, from its whitened entries: ``Z^T u``, the
+    velocity entered on the fly, ``u = L^T P v`` on the compact dense part (factor coordinate ``k`` at position
+    ``dense_dofs - 1 - k``, each coordinate's terms from zero, ascending) and ``u = v / s`` on a slot's coordinate
+    (``s = m^-1/2``)."""
     out = float(0.0)
     dense_offset = dense_offsets[world]
-    dense_group = dense_groups[world]
-    for local_dof in range(dense_dofs):
-        world_dof = dense_offset + local_dof
-        global_dof = world_dof_indices[world, world_dof]
-        if global_dof >= 0:
-            out += dense_J[dense_group, row, local_dof] * velocity[global_dof]
+    group = dense_groups[world]
+    for k in range(dense_dofs):
+        u = float(0.0)
+        for j in range(k, dense_dofs):
+            global_dof = world_dof_indices[world, dense_offset + dense_dofs - 1 - j]
+            if global_dof >= 0:
+                u += dense_L[group, j, k] * velocity[global_dof]
+        out += dense_Z[group, row, dense_dofs - 1 - k] * u
     for sparse_slot in range(2):
         world_dof = sparse_row_dof[world, row, sparse_slot]
         if world_dof >= 0:
             global_dof = world_dof_indices[world, world_dof]
             if global_dof >= 0:
-                out += sparse_row_jy[world, row, sparse_slot * 2] * velocity[global_dof]
+                scale = wp.sqrt(diagonal_inverse_mass[global_dof])
+                if scale > 0.0:
+                    out += sparse_row_z[world, row, sparse_slot] * (velocity[global_dof] / scale)
     return out
 
 
@@ -3033,9 +3041,11 @@ def apply_world_contact_restitution_matrix_free(
     dense_offsets: wp.array[int],
     dense_groups: wp.array[int],
     dense_dofs: int,
-    dense_J: wp.array3d[float],
+    dense_L: wp.array3d[float],
+    dense_Z: wp.array3d[float],
     sparse_row_dof: wp.array3d[int],
-    sparse_row_jy: wp.array3d[float],
+    sparse_row_z: wp.array3d[float],
+    diagonal_inverse_mass: wp.array[float],
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
@@ -3043,8 +3053,7 @@ def apply_world_contact_restitution_matrix_free(
     """Replace a matrix-free contact bias with a one-shot restitution target.
 
     The row's incident velocity is its packed Jacobian row's (:func:`world_contact_row_dot`), or under the
-    ``sparse_diagonal`` owner its compact dense component's plus its two sparse slots'
-    (:func:`sparse_diagonal_row_dot`). Matrix-free GS adds live J*v itself, so the row stores only
+    ``sparse_diagonal`` owner its whitened row's against the entered velocity (:func:`sparse_diagonal_row_dot`). Matrix-free GS adds live J*v itself, so the row stores only
     ``-target + e*u_incident``.
     """
     tid = wp.tid()
@@ -3065,9 +3074,11 @@ def apply_world_contact_restitution_matrix_free(
             dense_offsets,
             dense_groups,
             dense_dofs,
-            dense_J,
+            dense_L,
+            dense_Z,
             sparse_row_dof,
-            sparse_row_jy,
+            sparse_row_z,
+            diagonal_inverse_mass,
         )
     else:
         relative_incident = world_contact_row_dot(

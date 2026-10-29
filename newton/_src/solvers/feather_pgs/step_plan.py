@@ -140,13 +140,8 @@ class StepPlan:
             solve=solve,
             unread_mass_sizes=tuple(solver.size_groups) if held else (),
             jacobian_clear_sizes=()
-            if solver._mf_sweeps or solver._row_packets is not None or solver._keyed_rows is not None
-            else tuple(
-                size
-                for size in solver.size_groups
-                if not (solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size)
-                and not (solver._compact_contact_boundary and size == 6)
-            ),
+            if solver._row_packets is not None or solver._keyed_rows is not None
+            else tuple(size for size in solver.size_groups if solver._memset_clears_jacobian(size)),
         )
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:
@@ -228,8 +223,13 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
         if not solve.assembles_delassus:
             if owner:
                 route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
-            elif solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size:
-                route = Route("sparse_diagonal", "The diagonal-mass contact owner publishes this size's response.")
+            elif solver._sparse_diagonal_contact_solve and size in (
+                solver._sparse_diagonal_response_size,
+                solver._sparse_diagonal_dense_size,
+            ):
+                route = Route(
+                    "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
+                )
             elif solver._packed_response:
                 route = Route(
                     "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."

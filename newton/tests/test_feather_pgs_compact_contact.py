@@ -18,7 +18,6 @@ from newton._src.solvers.feather_pgs import (
     contact_input,
     field_group,
     kernels,
-    response_builds_dense,
     response_builds_rows,
 )
 from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
@@ -56,10 +55,9 @@ OUTPUTS = (
     "phi",
     "target",
     "restitution",
-    "J",
-    "Y",
+    "Z",
     "sparse_dof",
-    "sparse_jy",
+    "sparse_z",
     "diag",
 )
 
@@ -140,12 +138,10 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
     for name in OUTPUTS:
         dtype = int if name in ("row_type", "row_parent", "sparse_dof") else float
         shape = (2, 40)
-        if name in ("J", "Y"):
+        if name == "Z":
             shape = (2, 40, 6)
-        if name == "sparse_dof":
+        if name in ("sparse_dof", "sparse_z"):
             shape = (2, 40, 2)
-        if name == "sparse_jy":
-            shape = (2, 40, 4)
         setattr(data, name, wp.full(shape, -777 if dtype is int else float("nan"), dtype=dtype, device=device))
     # The general producers record each row's sides (the packed placement's).
     data.sides = wp.zeros((2, 40), dtype=wp.vec2i, device=device)
@@ -155,11 +151,12 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
 
 
 def install_prefix(data, aux):
-    """Use the real bounded clear, then emulate only original unit-row limit stores."""
+    """Use the real bounded clear, then emulate only original unit-row limit stores (their ``J``, which the build
+    whitens in place)."""
     wp.launch(
-        compact.clear_limit_prefix, dim=(2, 12), inputs=[data.dense_group, data.J, data.sparse_dof], device=aux.device
+        compact.clear_limit_prefix, dim=(2, 12), inputs=[data.dense_group, data.Z, data.sparse_dof], device=aux.device
     )
-    J = data.J.numpy()
+    J = data.Z.numpy()
     types = data.row_type.numpy()
     cfm = data.row_cfm.numpy()
     for world, end in enumerate(aux.bounds.numpy()[:, 1]):
@@ -167,7 +164,7 @@ def install_prefix(data, aux):
             J[data.dense_group.numpy()[world], row, row % 6] = 1.0 if row < 6 else -1.0
             types[world, row] = 3
             cfm[world, row] = data.cfm
-    data.J.assign(J)
+    data.Z.assign(J)
     data.row_type.assign(types)
     data.row_cfm.assign(cfm)
 
@@ -186,11 +183,12 @@ def patch_view(device, count=16, *, seed=29):
 
 
 def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
-    """Execute all seven original producer/consumer kernels on exactly the same inputs.
+    """Execute the general producers and the sparse-diagonal build on exactly the same inputs: the dense contact rows'
+    ``J``, the whitened slots, then every row whitened in place with its diagonal.
 
     Without ``patches`` the producers see point friction's zero-phi view.
     """
-    data.J.zero_()
+    data.Z.zero_()
     install_prefix(data, aux)
     if patches is None:
         patches = FrictionPatches()
@@ -246,27 +244,24 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "art_dof_start": data.dof_start,
         "body_response_dof_mask": data.body_mask,
         "joint_S_s": data.motion,
-        "J_group": data.J,
+        "J_group": data.Z,
         "articulation_dof_start": data.dof_start,
         "articulation_world_dof_offset": data.dof_offset,
         "body_single_response_dof": data.body_single_dof,
         "diagonal_inverse_mass": data.inverse_mass,
         "sparse_row_dof": data.sparse_dof,
-        "sparse_row_jy": data.sparse_jy,
+        "sparse_row_z": data.sparse_z,
         "world_constraint_count": aux.counts,
         "max_constraints": 40,
+        "rows": 40,
         "L_group": data.factor,
-        "group_to_art": wp.array([3, 0], dtype=int, device=aux.device),
-        "art_to_world": wp.array([0, 0, 0, 1, 1, 1], dtype=int, device=aux.device),
+        "dense_groups": data.dense_group,
+        "dense_phase_bounds": aux.bounds,
+        "prefix_only": 0,
         "n_dofs": 6,
-        "n_arts": 2,
-        "write_world": 0,
-        "Y_group": data.Y,
-        "J_world": data.J,
-        "Y_world": data.Y,
+        "row_cfm": data.row_cfm,
+        "Z_group": data.Z,
         "world_diag": data.diag,
-        "mf_constraint_count": wp.zeros(2, dtype=int, device=aux.device),
-        "skip_rows_le": 0,
     }
 
     values["support"] = group_rows(aux.device)
@@ -279,11 +274,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
     launch(kernels.populate_world_J_for_compact_size, (16, 32))
     values["target_size"] = 108
     launch(response_builds_rows.sparse_pair_contact_rows_kernel, 16)
-    launch(response_builds_dense.response_rows_kernel(), 80)
-    data.diag.zero_()
-    launch(response_builds_dense.diagonal_rows_kernel(), 80)
-    launch(response_builds_rows.sparse_pair_diagonal_kernel, 80)
-    launch(response_builds_dense.cfm_worlds_kernel(), 2)
+    launch(response_builds_rows.sparse_pair_whiten_kernel(), 80)
 
 
 def run_candidate(data, aux, law=None):
@@ -295,7 +286,7 @@ def run_candidate(data, aux, law=None):
     wp.launch(
         compact.clear_contact_response,
         dim=(2, 256),
-        inputs=[aux.counts, aux.bounds, data.dense_group, data.J, data.Y],
+        inputs=[aux.counts, aux.bounds, data.dense_group, data.Z],
         block_dim=256,
         device=aux.device,
     )
@@ -304,18 +295,22 @@ def run_candidate(data, aux, law=None):
     # One thread per row: three per contact.
     wp.launch(compact.produce_contacts, dim=(16, 3), inputs=[*structs(data), law], device=aux.device)
     wp.launch(
-        response_builds_rows.sparse_pair_limit_kernel,
-        dim=(2, 12),
+        response_builds_rows.sparse_pair_whiten_kernel(),
+        dim=2 * 12,
         inputs=[
-            aux.bounds,
-            aux.counts,
-            data.dense_group,
             data.factor,
-            data.J,
-            data.Y,
+            data.dense_group,
+            aux.counts,
+            aux.bounds,
+            1,
+            12,
+            40,
+            6,
+            data.sparse_dof,
+            data.sparse_z,
             data.row_cfm,
-            data.diag,
         ],
+        outputs=[data.Z, data.diag],
         device=aux.device,
     )
 
@@ -337,8 +332,7 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
         dense_phase_bounds=aux.bounds,
         model=SimpleNamespace(device=aux.device, shape_body=data.shape_body),
         L_by_size={6: data.factor},
-        J_by_size={6: data.J},
-        Y_by_size={6: data.Y},
+        J_by_size={6: data.Z},
         _mark_independent_sparse_contact_candidates_kernel=object(),
         _friction_anchors_enabled=anchors,
         _friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
@@ -672,8 +666,8 @@ class TestCompactContact(unittest.TestCase):
             for name in OUTPUTS:
                 a = getattr(original, name).numpy()
                 b = getattr(candidate, name).numpy()
-                index = candidate.dense_group.numpy()[world] if name in ("J", "Y") else world
-                start = 0 if name in ("J", "Y", "diag", "row_type", "row_cfm", "sparse_dof") else prefix
+                index = candidate.dense_group.numpy()[world] if name == "Z" else world
+                start = 0 if name in ("Z", "diag", "row_type", "row_cfm", "sparse_dof") else prefix
                 a = a[index, start:count]
                 b = b[index, start:count]
                 if a.dtype.kind in "iu":
@@ -727,7 +721,7 @@ class TestCompactContact(unittest.TestCase):
                 )
             friction = candidate.row_type.numpy() == 2
             self.assertGreater(np.max(np.abs(candidate.target.numpy() - point.target.numpy())[friction]), 1.0e-3)
-            self.assertGreater(np.max(np.abs(candidate.sparse_jy.numpy() - point.sparse_jy.numpy())[friction]), 1.0e-3)
+            self.assertGreater(np.max(np.abs(candidate.sparse_z.numpy() - point.sparse_z.numpy())[friction]), 1.0e-3)
             # Normal-only units hold one row; normal rows match the point producer.
             normal = candidate.row_type.numpy() == 0
             np.testing.assert_array_equal(candidate.diag.numpy()[normal], point.diag.numpy()[normal])
@@ -793,48 +787,68 @@ class TestCompactContact(unittest.TestCase):
             self.compare(original, candidate, aux)
             self.assertEqual(owners, {name: getattr(candidate, name).ptr for name in OUTPUTS})
 
-    def test_held_factor_response_against_float64(self):
-        """Check physical dense response and diagonal with an independent double-precision solve."""
-        candidate, aux = fixture()
-        run_candidate(candidate, aux)
-        for world, count in enumerate(aux.counts.numpy()):
-            group = candidate.dense_group.numpy()[world]
-            L = candidate.factor.numpy()[group].astype(np.float64)
-            J = candidate.J.numpy()[group, :count].astype(np.float64)
-            Y = np.linalg.solve((L @ L.T)[::-1, ::-1], J.T).T  # the leaf-first factor: P H P^T = L L^T
-            np.testing.assert_allclose(candidate.Y.numpy()[group, :count], Y, rtol=5e-6, atol=3e-6)
-            expected = np.sum(J * Y, axis=1)
-            sd = candidate.sparse_dof.numpy()[world, :count]
-            sj = candidate.sparse_jy.numpy()[world, :count].astype(np.float64)
-            for row in range(count):
-                for slot in range(2):
-                    if sd[row, slot] >= 0:
-                        expected[row] += sj[row, 2 * slot] * sj[row, 2 * slot + 1]
-            expected += candidate.cfm
-            np.testing.assert_allclose(candidate.diag.numpy()[world, :count], expected, rtol=5e-6, atol=3e-6)
+    def test_held_factor_whitening_against_float64(self):
+        """Check the whitened rows and their diagonals against an independent double-precision whitening of the
+        geometry's Jacobian: ``Z = L^-1 P J^T`` on the dense part, ``J_s / sqrt(m_s)`` on a slot."""
+        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
+            data, aux = fixture(shared=shared, friction_shared=friction_shared)
+            reference = geometry_reference(data)
+            run_candidate(data, aux)
+            inverse = data.inverse_mass.numpy().astype(np.float64)
+            dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
+            rows = {(world, row): (dense, sparse) for world, row, dense, sparse, _target, _phi in reference}
+            for world, count in enumerate(aux.counts.numpy()):
+                group = data.dense_group.numpy()[world]
+                L = data.factor.numpy()[group].astype(np.float64)
+                for row in range(count):
+                    if row < aux.bounds.numpy()[world, 1]:
+                        dense, sparse = np.zeros(6), np.zeros(114)
+                        dense[row % 6] = 1.0 if row < 6 else -1.0
+                    else:
+                        dense, sparse = rows[(world, row)]
+                    # Factor coordinate k sits at position 5 - k: whiten the reversed row, store it reversed back.
+                    whitened = np.linalg.solve(L, dense[::-1])[::-1]
+                    np.testing.assert_allclose(data.Z.numpy()[group, row], whitened, rtol=5e-6, atol=3e-6)
+                    expected = np.dot(whitened, whitened)
+                    for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
+                        if coordinate < 0:
+                            continue
+                        # The world's 108-coordinate articulation (1 or 4) holds the slot's coordinate.
+                        art = (1, 4)[world]
+                        dof = dof_start[art] + coordinate - dof_offset[art]
+                        z = sparse[coordinate] * np.sqrt(inverse[dof])
+                        np.testing.assert_allclose(data.sparse_z.numpy()[world, row, slot], z, rtol=5e-6, atol=3e-6)
+                        expected += z * z
+                    expected += data.row_cfm.numpy()[world, row]
+                    np.testing.assert_allclose(data.diag.numpy()[world, row], expected, rtol=5e-6, atol=3e-6)
 
     def test_independent_geometry_action_and_prescribed_targets(self):
-        """Compare Jv, physical H^-1 J^T action and prescribed targets, not row counts alone."""
+        """Compare J v through the whitened rows (``Z^T u`` with ``u = L^T P v`` on the dense part and ``u = sqrt(m) v``
+        on a slot: the invariant |J v - Z^T u| at rounding level) and the prescribed targets, not row counts alone."""
         rng = np.random.default_rng(443)
         for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
             data, aux = fixture(shared=shared, friction_shared=friction_shared)
             reference = geometry_reference(data)
             run_candidate(data, aux)
             velocity = rng.normal(size=(2, 114))
+            inverse = data.inverse_mass.numpy().astype(np.float64)
+            dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
             for world, row, dense, sparse, target, phi in reference:
                 group = data.dense_group.numpy()[world]
-                np.testing.assert_allclose(data.J.numpy()[group, row], dense, rtol=3e-6, atol=3e-6)
                 self.assertAlmostEqual(data.target.numpy()[world, row], target, delta=3e-6)
                 self.assertAlmostEqual(data.phi.numpy()[world, row], phi, delta=3e-6)
-                actual = data.J.numpy()[group, row].astype(np.float64) @ velocity[world, :6]
-                for slot, dof in enumerate(data.sparse_dof.numpy()[world, row]):
-                    if dof >= 0:
-                        actual += data.sparse_jy.numpy()[world, row, slot * 2] * velocity[world, dof]
+                factor = data.factor.numpy()[group].astype(np.float64)
+                # u = L^T P v on the dense part, at the same reversed positions as Z.
+                u = (factor.T @ velocity[world, :6][::-1])[::-1]
+                actual = data.Z.numpy()[group, row].astype(np.float64) @ u
+                art = (1, 4)[world]
+                for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
+                    if coordinate >= 0:
+                        dof = dof_start[art] + coordinate - dof_offset[art]
+                        u_slot = velocity[world, coordinate] / np.sqrt(inverse[dof])
+                        actual += data.sparse_z.numpy()[world, row, slot] * u_slot
                 expected = dense @ velocity[world, :6] + sparse @ velocity[world]
                 self.assertAlmostEqual(actual, expected, delta=1e-5)
-                factor = data.factor.numpy()[group].astype(np.float64)
-                response = np.linalg.solve((factor @ factor.T)[::-1, ::-1], dense)
-                np.testing.assert_allclose(data.Y.numpy()[group, row], response, rtol=5e-6, atol=4e-6)
 
     def test_exact_mode_admission(self):
         """Reject incomplete mode compositions before any contact ownership changes.
@@ -1063,7 +1077,7 @@ class TestCompactContact(unittest.TestCase):
                     wp.launch(
                         compact.clear_contact_response,
                         dim=(2, 256),
-                        inputs=[aux.counts, aux.bounds, candidate.dense_group, candidate.J, candidate.Y],
+                        inputs=[aux.counts, aux.bounds, candidate.dense_group, candidate.Z],
                         block_dim=256,
                         device=device,
                     )
@@ -1074,24 +1088,30 @@ class TestCompactContact(unittest.TestCase):
                         device=device,
                     )
                     wp.launch(
-                        response_builds_rows.sparse_pair_limit_kernel,
-                        dim=(2, 12),
+                        response_builds_rows.sparse_pair_whiten_kernel(),
+                        dim=2 * 12,
                         inputs=[
-                            aux.bounds,
-                            aux.counts,
-                            candidate.dense_group,
                             candidate.factor,
-                            candidate.J,
-                            candidate.Y,
+                            candidate.dense_group,
+                            aux.counts,
+                            aux.bounds,
+                            1,
+                            12,
+                            40,
+                            6,
+                            candidate.sparse_dof,
+                            candidate.sparse_z,
                             candidate.row_cfm,
-                            candidate.diag,
                         ],
+                        outputs=[candidate.Z, candidate.diag],
                         device=device,
                     )
                 graphs.append(capture.graph)
             for graph in graphs:
-                candidate.Y.fill_(float("nan"))
+                # The build whitens the limit prefix in place: each replay starts from the producers' J again.
+                candidate.Z.fill_(float("nan"))
                 candidate.diag.fill_(float("nan"))
+                install_prefix(candidate, aux)
                 wp.capture_launch(graph)
                 self.compare(original, candidate, aux)
 

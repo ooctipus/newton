@@ -12,10 +12,10 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import response_builds_rows
+from newton._src.solvers.feather_pgs import dense_rows, field_group, kernels, response_builds_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_law_harness import contact_input, packed_world_rows
 from newton.tests.feather_pgs_patch_parity import row_law
 
 
@@ -108,7 +108,7 @@ def _fixture(device, capacity=4353, shared_anchor=0):
         "contact_shared_anchor": shared_anchor,
         "friction_patches": FrictionPatches(),
         "sparse_row_dof": wp.full((world_count, 15, 2), -777, dtype=int, device=device),
-        "sparse_row_jy": wp.full((world_count, 15, 4), np.nan, dtype=float, device=device),
+        "sparse_row_z": wp.full((world_count, 15, 2), np.nan, dtype=float, device=device),
     }
     return values
 
@@ -123,10 +123,10 @@ def _launch(values, workers, device):
 
 
 def _expected(values, active_count):
-    """Evaluate the sparse physical response independently in FP64."""
+    """Evaluate the whitened sparse slots independently in FP64: ``Z_s = J_s / sqrt(m_s)``."""
     host = {key: value.numpy() if isinstance(value, wp.array) else value for key, value in values.items()}
     dofs = np.full(host["sparse_row_dof"].shape, -777, dtype=np.int32)
-    response = np.full(host["sparse_row_jy"].shape, np.nan, dtype=np.float32)
+    whitened = np.full(host["sparse_row_z"].shape, np.nan, dtype=np.float32)
     count = min(active_count, len(host["contact_slot"]))
     for contact in range(count):
         slot = host["contact_slot"][contact]
@@ -149,7 +149,6 @@ def _expected(values, active_count):
                 continue
             coordinates = [-1, -1]
             coefficients = [0.0, 0.0]
-            actions = [0.0, 0.0]
             for side in range(2):
                 body = bodies[side]
                 art = host["contact_art_a" if side == 0 else "contact_art_b"][contact]
@@ -166,17 +165,95 @@ def _expected(values, active_count):
                     point = patch_points.numpy()[contact].astype(np.float64)
                 motion = host["joint_S_s"][dof].astype(np.float64)
                 velocity = motion[:3] + np.cross(motion[3:], point)
-                coefficients[side] = (1.0 if side == 0 else -1.0) * np.dot(direction, velocity)
-                actions[side] = coefficients[side] * host["diagonal_inverse_mass"][dof]
+                coefficients[side] = (
+                    (1.0 if side == 0 else -1.0)
+                    * np.dot(direction, velocity)
+                    * np.sqrt(np.float64(host["diagonal_inverse_mass"][dof]))
+                )
                 coordinates[side] = 6 + dof
             if coordinates[0] >= 0 and coordinates[0] == coordinates[1]:
                 coefficients[0] += coefficients[1]
-                actions[0] += actions[1]
-                coordinates[1], coefficients[1], actions[1] = -1, 0.0, 0.0
+                coordinates[1], coefficients[1] = -1, 0.0
             world = host["contact_world"][contact]
             dofs[world, slot + row] = coordinates
-            response[world, slot + row] = (coefficients[0], actions[0], coefficients[1], actions[1])
-    return dofs, response
+            whitened[world, slot + row] = coefficients
+    return dofs, whitened
+
+
+class TestSparseDiagonalWhitenedRows(unittest.TestCase):
+    def test_restitution_reads_jv_through_the_whitened_rows(self):
+        """The invariant |J v - Z^T u|: restitution's incident velocity of a sparse-diagonal row, read from the whitened
+        rows with the velocity entered (``u = L^T P v`` on the dense part, ``sqrt(m) v`` on a slot), is the one the
+        physical Jacobian gives."""
+        rng = np.random.default_rng(7)
+        worlds, rows, dense, diagonal = 3, 5, 4, 3
+        dofs = dense + diagonal
+        offsets = np.array((0, diagonal, 1), dtype=np.int32)  # the dense block's first world coordinate
+        inverse = rng.uniform(0.3, 2.0, worlds * dofs).astype(np.float32)
+        velocity = rng.normal(size=worlds * dofs).astype(np.float32)
+        factors = np.zeros((worlds, dense, dense), np.float32)
+        Z = np.zeros((worlds, rows, dense), np.float32)
+        sparse_dof = np.full((worlds, rows, 2), -1, np.int32)
+        sparse_z = np.zeros((worlds, rows, 2), np.float32)
+        jv = np.zeros((worlds, rows))
+        for w in range(worlds):
+            a = rng.normal(size=(dense, dense))
+            mass = a @ a.T + dense * np.eye(dense)
+            L = np.linalg.cholesky(mass[::-1, ::-1])  # the leaf-first factor: P H P^T = L L^T
+            factors[w] = L
+            block = [offsets[w] + k for k in range(dense)]
+            others = [d for d in range(dofs) if d not in block]
+            v = velocity[w * dofs : (w + 1) * dofs].astype(np.float64)
+            for r in range(rows):
+                J = rng.normal(size=dense)
+                Z[w, r] = np.linalg.solve(L, J[::-1])[::-1]
+                jv[w, r] = J @ v[block]
+                for slot, coordinate in enumerate(rng.choice(others, size=2, replace=False)[: 1 + r % 2]):
+                    value = rng.normal()
+                    sparse_dof[w, r, slot] = coordinate
+                    sparse_z[w, r, slot] = value * np.sqrt(inverse[w * dofs + coordinate])
+                    jv[w, r] += value * v[coordinate]
+        rhs = np.full((worlds, rows), -7.0, np.float32)
+        records = field_group.upload(
+            dense_rows.DenseRows,
+            "cpu",
+            row_type=np.zeros((worlds, rows), np.int32),
+            phi=np.full((worlds, rows), -0.01, np.float32),
+            target=np.zeros((worlds, rows), np.float32),
+            restitution=np.full((worlds, rows), 0.5, np.float32),
+            rhs=rhs,
+            row_w=np.ones((worlds, rows), np.float32),
+        )
+        wp.launch(
+            kernels.apply_world_contact_restitution_matrix_free,
+            dim=worlds * rows,
+            inputs=[
+                records,
+                wp.full(worlds, rows, dtype=wp.int32, device="cpu"),
+                rows,
+                wp.array(velocity, dtype=wp.float32, device="cpu"),
+                wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device="cpu"),
+                *packed_world_rows(np.zeros((1, 1, 1)), "cpu"),
+                1,
+                wp.array(offsets, device="cpu"),
+                wp.array(np.arange(worlds, dtype=np.int32), device="cpu"),
+                dense,
+                wp.array(factors, device="cpu"),
+                wp.array(Z, device="cpu"),
+                wp.array(sparse_dof, device="cpu"),
+                wp.array(sparse_z, device="cpu"),
+                wp.array(inverse, device="cpu"),
+                0.01,
+                0.0,
+                0,
+            ],
+            device="cpu",
+        )
+        # A restitutive impact: rhs = e * J v (target 0, the threshold 0 admits every approaching row).
+        approaching = jv < 0.0
+        self.assertTrue(approaching.any())
+        actual = records.rhs.numpy()
+        np.testing.assert_allclose(actual[approaching], 0.5 * jv[approaching], rtol=2e-5, atol=2e-6)
 
 
 class TestSparseResponseOwner(unittest.TestCase):
@@ -194,10 +271,10 @@ class TestSparseResponseOwner(unittest.TestCase):
             # The selected workers and the full capacity: the device stride covers either.
             for workers in (_launch_workers(count), count):
                 values["sparse_row_dof"].fill_(-777)
-                values["sparse_row_jy"].fill_(np.nan)
+                values["sparse_row_z"].fill_(np.nan)
                 _launch(values, workers, "cpu")
                 np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
-                np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+                np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
     def test_cpu_empty_and_partial_prefix(self):
         """Respond to empty, partial and full prefixes; a collision pass clamps its count to the rows."""
@@ -205,11 +282,11 @@ class TestSparseResponseOwner(unittest.TestCase):
         for raw_count in (0, 9, 17):
             values["contact_count"].assign(np.array([raw_count], dtype=np.int32))
             values["sparse_row_dof"].fill_(-777)
-            values["sparse_row_jy"].fill_(np.nan)
+            values["sparse_row_z"].fill_(np.nan)
             _launch(values, 17, "cpu")
             expected = _expected(values, raw_count)
             np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
-            np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+            np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
         empty = _fixture("cpu", capacity=0)
         _launch(empty, 0, "cpu")
         self.assertEqual(empty["sparse_row_dof"].numpy().size, 0)
@@ -224,7 +301,7 @@ class TestSparseResponseOwner(unittest.TestCase):
         expected = _expected(values, 73)
         _launch(values, _launch_workers(73), "cpu")
         np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
-        np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+        np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
     @unittest.skipUnless(wp.is_cuda_available(), "actual CUDA graph replay requires CUDA")
     def test_cuda_graph_actual_prefix_transitions(self):
@@ -232,7 +309,7 @@ class TestSparseResponseOwner(unittest.TestCase):
         device = wp.get_device("cuda:0")
         values = _fixture(device, capacity=65569)
         capacity = len(values["contact_slot"])
-        owners = (values["sparse_row_dof"].ptr, values["sparse_row_jy"].ptr)
+        owners = (values["sparse_row_dof"].ptr, values["sparse_row_z"].ptr)
         for workers in (_launch_workers(capacity), capacity):
             _launch(values, workers, device)
             with wp.ScopedCapture(device=device) as capture:
@@ -242,14 +319,14 @@ class TestSparseResponseOwner(unittest.TestCase):
                 expected = _expected(values, raw_count)
                 for graph in (False, True, True):
                     values["sparse_row_dof"].fill_(-777)
-                    values["sparse_row_jy"].fill_(np.nan)
+                    values["sparse_row_z"].fill_(np.nan)
                     if graph:
                         wp.capture_launch(capture.graph)
                     else:
                         _launch(values, workers, device)
                     np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
-                    np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
-                self.assertEqual(owners, (values["sparse_row_dof"].ptr, values["sparse_row_jy"].ptr))
+                    np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+                self.assertEqual(owners, (values["sparse_row_dof"].ptr, values["sparse_row_z"].ptr))
 
 
 if __name__ == "__main__":

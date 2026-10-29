@@ -1443,143 +1443,139 @@ class TransposedResponse(ResponseOperator):
 
 
 @dataclass(frozen=True)
-class SparsePairJY(ResponseOperator):
-    """Rows of ``J`` and ``Y`` over a world's dense group of ``dofs`` coordinates plus two scalar sparse coordinates.
+class SparsePairZ(ResponseOperator):
+    """Whitened rows over a world's dense group of ``dofs`` coordinates plus two scalar sparse coordinates.
 
     The sparse-diagonal rows: a world pairs one compact dense articulation (its group ``group``, first coordinate
-    ``offset``) with diagonal-mass coordinates. Row ``i``'s dense part is ``J[(group * rows + i) * dofs + l]`` (and
-    ``Y``) on coordinate ``offset + l``; its sparse part is two slots ``s``: coordinate
-    ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link),
-    ``J = sparse_jy[(base + i) * 4 + 2 s]`` and ``Y = sparse_jy[(base + i) * 4 + 2 s + 1]``.
+    ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity in factor coordinates: ``u = L^T P v``
+    on the dense articulation (``L`` its leaf-first factor) and ``u = sqrt(m) v`` on a diagonal coordinate (a star's
+    factor is diagonal). Row ``i``'s dense part is ``Z = L^-1 P J^T`` at ``Z[(group * rows + i) * dofs + l]`` on
+    coordinate ``offset + l`` (factor coordinates at the leaf-first positions of ``J``); its sparse part is two slots
+    ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link)
+    and ``Z_s = J_s / sqrt(m_s)`` at ``sparse_z[(base + i) * 2 + s]``. A row's velocity term is ``Z^T u``, its update
+    ``u += Z delta``, and two rows couple through ``Z_i^T Z_s``: ``W = Z^T Z``.
 
     With lanes (a warp, or a segment of ``width`` lanes), lane ``l < dofs`` owns dense coordinate ``l`` and lanes
     ``dofs`` and ``dofs + 1`` the slots: each lane's one product, zero without a coordinate, is reduced with the
     lanes' sum; the other lanes add zero. A segment of at least ``dofs + 2`` lanes reduces the same products in the
-    same order as the warp, up to the sign of a zero sum. The visited row's lane entries are ``coord``,
-    ``jacobian`` and ``response`` (:meth:`consume`).
+    same order as the warp, up to the sign of a zero sum. The visited row's lane entries are ``coord`` and ``z``
+    (:meth:`consume`).
 
     With one thread (``Lanes(1)``), a row on the single coordinate ``coordinate`` (an independent scalar contact,
-    whose dense part is empty), through the slot that holds it: its product is rounded on its own
-    (``__fmul_rn``, no contraction into the right-hand side's add), as the lanes' sum of one product rounds it.
+    whose dense part is empty), through the slot that holds it: its product is rounded on its own (``__fmul_rn``,
+    no contraction into the right-hand side's add), as the lanes' sum of one product rounds it.
 
-    Built by the response's Cholesky solves, ``A_ii`` is stored as a value; the step divides by it.
+    Built with the rows (:data:`.response_builds_rows.SPARSE_PAIR`), ``A_ii = |Z|^2 + cfm`` is stored as a value; the
+    step divides by it.
     """
 
     dofs: int
     rows: int
     lanes: Lanes = Lanes()
-    J: str = "dense_J"
-    Y: str = "dense_Y"
+    Z: str = "dense_Z"
     group: str = "dense_group"
     offset: str = "dense_offset"
     sparse_dof: str = "sparse_row_dof"
-    sparse_jy: str = "sparse_row_jy"
+    sparse_z: str = "sparse_row_z"
     base: str = "row_base"
     coordinate: str = "scalar_coord"
     velocity: Velocity = Velocity()
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
-    name = "sparse_pair_jy"
+    name = "sparse_pair_z"
 
     # -- build (response_builds_rows) ---------------------------------------------------------------------------------
 
     @staticmethod
     def build():
-        """The rows' build (:data:`.response_builds_rows.SPARSE_PAIR`): each row's sparse slots ``(J, J / m)``,
-        merged on a shared coordinate, its dense part through the compact factor, and ``A_ii = (dense + sparse) +
+        """The rows' build (:data:`.response_builds_rows.SPARSE_PAIR`): each row's slots ``Z_s = J_s / sqrt(m_s)``,
+        merged on a shared coordinate, its dense part whitened through the compact factor, and ``A_ii = |Z|^2 +
         cfm``."""
         from .response_builds_rows import SPARSE_PAIR  # noqa: PLC0415
 
         return SPARSE_PAIR
 
-    def _entries(self, row: str, coord: str, jacobian: str, response: str | None, indent: str, active=None) -> str:
-        """Declare this lane's coordinate and entries of row ``row`` (``coord`` negative for none)."""
+    def _entries(self, row: str, coord: str, value: str, indent: str, active=None) -> str:
+        """Declare this lane's coordinate and entry of row ``row`` (``coord`` negative for none)."""
         lane, P = self.lanes.lane, self.dofs
         guard = f"{active} && " if active else ""
-        lines = [f"int {coord} = -1;", f"float {jacobian} = 0.0f;"]
-        if response:
-            lines.append(f"float {response} = 0.0f;")
-        lines += [
+        lines = [
+            f"int {coord} = -1;",
+            f"float {value} = 0.0f;",
             f"if ({guard}{lane} < {P}) {{",
             f"    {coord} = {self.offset} + {lane};",
-            f"    const int dense_index = ({self.group} * {self.rows} + {row}) * {P} + {lane};",
-            f"    {jacobian} = {self.J}.data[dense_index];",
-        ]
-        if response:
-            lines.append(f"    {response} = {self.Y}.data[dense_index];")
-        lines += [
+            f"    {value} = {self.Z}.data[({self.group} * {self.rows} + {row}) * {P} + {lane}];",
             f"}} else if ({guard}{lane} <= {P + 1}) {{",
-            f"    const int sparse_slot = {lane} - {P};",
-            f"    const int sparse_row = {self.base} + {row};",
-            f"    {coord} = {self.sparse_dof}.data[sparse_row * 2 + sparse_slot];",
-            f"    {jacobian} = {self.sparse_jy}.data[sparse_row * 4 + sparse_slot * 2];",
+            f"    const int sparse_entry = ({self.base} + {row}) * 2 + {lane} - {P};",
+            f"    {coord} = {self.sparse_dof}.data[sparse_entry];",
+            f"    {value} = {self.sparse_z}.data[sparse_entry];",
+            "}",
         ]
-        if response:
-            lines.append(f"    {response} = {self.sparse_jy}.data[sparse_row * 4 + sparse_slot * 2 + 1];")
-        lines.append("}")
         return "\n".join(indent + line for line in lines)
 
     def _slot(self, row: str, name: str, indent: str) -> str:
-        """One thread: declare ``name``, the entry index of row ``row``'s slot that holds its coordinate."""
+        """One thread: declare ``name``, the entry of row ``row``'s slot that holds its coordinate."""
         sparse_row = f"({self.base} + {row})"
-        return f"{indent}const int {name} = {sparse_row} * 4 + ({self.sparse_dof}.data[{sparse_row} * 2] >= 0 ? 0 : 2);"
+        return f"{indent}const int {name} = {sparse_row} * 2 + ({self.sparse_dof}.data[{sparse_row} * 2] >= 0 ? 0 : 1);"
+
+    def _here(self, sibling: str, out: str) -> list[str]:
+        """A slot lane's entry of row ``sibling`` on the lane's own coordinate ``coord``: the sibling's slot that
+        carries it, zero when none does (``out`` declared zero before)."""
+        lane, P = self.lanes.lane, self.dofs
+        return [
+            f"if ({lane} >= {P} && {lane} <= {P + 1}) {{",
+            f"    const int {out}_row = ({self.base} + {sibling}) * 2;",
+            f"    {out} = 0.0f;",
+            f"    if (coord >= 0 && coord == {self.sparse_dof}.data[{out}_row])",
+            f"        {out} = {self.sparse_z}.data[{out}_row];",
+            f"    else if (coord >= 0 && coord == {self.sparse_dof}.data[{out}_row + 1])",
+            f"        {out} = {self.sparse_z}.data[{out}_row + 1];",
+            "}",
+        ]
 
     def consume(self, row: str, indent: str) -> str:
-        """Declare the visited row ``row``'s entries: this lane's ``coord``, ``jacobian`` and ``response``."""
+        """Declare the visited row ``row``'s entries: this lane's ``coord`` and ``z``."""
         if not self.lanes.parallel:
-            return (
-                f"{self._slot(row, 'row_entry', indent)}\n"
-                f"{indent}const float jacobian = {self.sparse_jy}.data[row_entry];\n"
-                f"{indent}const float response = {self.sparse_jy}.data[row_entry + 1];"
-            )
-        return self._entries(row, "coord", "jacobian", "response", indent)
+            return f"{self._slot(row, 'row_entry', indent)}\n{indent}const float z = {self.sparse_z}.data[row_entry];"
+        return self._entries(row, "coord", "z", indent)
 
     def residual(self, out: str, indent: str) -> str:
-        """``float out = J_i v`` from the consumed entries (every lane holds it)."""
+        """``float out = Z_i^T u`` from the consumed entries (every lane holds it)."""
         if not self.lanes.parallel:
-            return f"{indent}float {out} = __fmul_rn(jacobian, {self.velocity.at(self.coordinate)});"
+            return f"{indent}float {out} = __fmul_rn(z, {self.velocity.at(self.coordinate)});"
         return (
-            f"{indent}float {out}_partial = coord >= 0 ? jacobian * {self.velocity.at('coord')} : 0.0f;\n"
+            f"{indent}float {out}_partial = coord >= 0 ? z * {self.velocity.at('coord')} : 0.0f;\n"
             f"{indent}{self.lanes.reduce(f'{out}_partial')}\n"
             f"{indent}float {out} = {out}_partial;"
         )
 
     def row_velocity(self, out: str, row: str, indent: str, *, active: str | None = None) -> str:
-        """``float out = J_row v`` of a row outside the visit (``active``: whether this lane's row exists)."""
+        """``float out = Z_row^T u`` of a row outside the visit (``active``: whether this lane's row exists)."""
         if not self.lanes.parallel:
             return (
                 f"{self._slot(row, f'{out}_entry', indent)}\n"
-                f"{indent}float {out} = __fmul_rn({self.sparse_jy}.data[{out}_entry], "
+                f"{indent}float {out} = __fmul_rn({self.sparse_z}.data[{out}_entry], "
                 f"{self.velocity.at(self.coordinate)});"
             )
         return (
-            self._entries(row, f"{out}_coord", f"{out}_jacobian", None, indent, active)
-            + f"\n{indent}float {out} = {out}_coord >= 0 ? {out}_jacobian * {self.velocity.at(f'{out}_coord')} : 0.0f;"
+            self._entries(row, f"{out}_coord", f"{out}_z", indent, active)
+            + f"\n{indent}float {out} = {out}_coord >= 0 ? {out}_z * {self.velocity.at(f'{out}_coord')} : 0.0f;"
             + f"\n{indent}{self.lanes.reduce(out)}"
         )
 
     def pair_entries(self, sibling: str, indent: str) -> str:
-        """Load the sibling's entries once for the pair's terms and its apply: one thread's slot entry (``sib_entry``,
-        its ``J`` and ``Y``); a lane's coordinate, ``J`` and ``Y`` of the sibling, and the sibling's ``Y`` on the
-        lane's own coordinate (``sib_response_here``: a sparse slot's when the sibling carries that coordinate)."""
+        """Load the sibling's entries once for the pair's terms and its apply: one thread's slot entry (``sib_z``); a
+        lane's coordinate and entry of the sibling, and the sibling's entry on the lane's own coordinate
+        (``sib_z_here``: a sparse slot's when the sibling carries that coordinate)."""
         if not self.lanes.parallel:
             return (
                 f"{self._slot(sibling, 'sib_entry', indent)}\n"
-                f"{indent}const float sib_jacobian = {self.sparse_jy}.data[sib_entry];\n"
-                f"{indent}const float sib_response = {self.sparse_jy}.data[sib_entry + 1];"
+                f"{indent}const float sib_z = {self.sparse_z}.data[sib_entry];"
             )
-        lane, P = self.lanes.lane, self.dofs
         lines = [
-            self._entries(sibling, "sib_coord", "sib_jacobian", "sib_response", ""),
-            "float sib_response_here = sib_response;",
-            f"if ({lane} >= {P} && {lane} <= {P + 1}) {{",
-            f"    const int sib_row = {self.base} + {sibling};",
-            "    sib_response_here = 0.0f;",
-            f"    if (coord >= 0 && coord == {self.sparse_dof}.data[sib_row * 2])",
-            f"        sib_response_here = {self.sparse_jy}.data[sib_row * 4 + 1];",
-            f"    else if (coord >= 0 && coord == {self.sparse_dof}.data[sib_row * 2 + 1])",
-            f"        sib_response_here = {self.sparse_jy}.data[sib_row * 4 + 3];",
-            "}",
+            self._entries(sibling, "sib_coord", "sib_z", ""),
+            "float sib_z_here = sib_z;",
+            *self._here(sibling, "sib_z_here"),
         ]
         return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
 
@@ -1590,78 +1586,58 @@ class SparsePairJY(ResponseOperator):
             return super().pair_terms(row, sibling, rhs, indent, own=own)
         if not self.lanes.parallel:
             return (
-                f"{indent}float sibling_residual = __fmul_rn(sib_jacobian, {self.velocity.at(self.coordinate)});\n"
+                f"{indent}float sibling_residual = __fmul_rn(sib_z, {self.velocity.at(self.coordinate)});\n"
                 f"{indent}sibling_residual += {rhs(sibling)};\n"
-                f"{indent}float cross = jacobian * sib_response;"
+                f"{indent}float cross = z * sib_z;"
             )
         return (
-            f"{indent}float sibling_residual = sib_coord >= 0 ? sib_jacobian * {self.velocity.at('sib_coord')} : 0.0f;\n"
-            f"{indent}float cross = coord >= 0 ? jacobian * sib_response_here : 0.0f;\n"
+            f"{indent}float sibling_residual = sib_coord >= 0 ? sib_z * {self.velocity.at('sib_coord')} : 0.0f;\n"
+            f"{indent}float cross = coord >= 0 ? z * sib_z_here : 0.0f;\n"
             f"{indent}{self.lanes.reduce('sibling_residual', 'cross')}\n"
             f"{indent}sibling_residual += {rhs(sibling)};"
         )
 
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = J_i Y_s`` of the visited row ``row``: each lane's ``J`` times the sibling's ``Y`` at its
+        """``float out = Z_i^T Z_s`` of the visited row ``row``: each lane's entry times the sibling's on its
         coordinate (a sparse slot's, when the sibling carries that coordinate), reduced."""
         if not self.lanes.parallel:
             return (
                 f"{self._slot(sibling, f'{out}_entry', indent)}\n"
-                f"{indent}float {out} = jacobian * {self.sparse_jy}.data[{out}_entry + 1];"
+                f"{indent}float {out} = z * {self.sparse_z}.data[{out}_entry];"
             )
         lane, P = self.lanes.lane, self.dofs
         lines = [
-            f"float {out}_response = 0.0f;",
-            f"if ({lane} < {P}) {{",
-            f"    {out}_response = {self.Y}.data[({self.group} * {self.rows} + {sibling}) * {P} + {lane}];",
-            f"}} else if ({lane} <= {P + 1}) {{",
-            f"    const int {out}_row = {self.base} + {sibling};",
-            f"    const int {out}_coord_0 = {self.sparse_dof}.data[{out}_row * 2];",
-            f"    const int {out}_coord_1 = {self.sparse_dof}.data[{out}_row * 2 + 1];",
-            f"    if (coord >= 0 && coord == {out}_coord_0)",
-            f"        {out}_response = {self.sparse_jy}.data[{out}_row * 4 + 1];",
-            f"    else if (coord >= 0 && coord == {out}_coord_1)",
-            f"        {out}_response = {self.sparse_jy}.data[{out}_row * 4 + 3];",
-            "}",
-            f"float {out} = coord >= 0 ? jacobian * {out}_response : 0.0f;",
+            f"float {out}_here = 0.0f;",
+            f"if ({lane} < {P}) {out}_here = {self.Z}.data[({self.group} * {self.rows} + {sibling}) * {P} + {lane}];",
+            *self._here(sibling, f"{out}_here"),
+            f"float {out} = coord >= 0 ? z * {out}_here : 0.0f;",
             self.lanes.reduce(out),
         ]
         return "\n".join(indent + line for line in lines)
 
     def apply(self, delta: str, indent: str) -> str:
-        """``v += Y_i delta`` from the consumed entries."""
+        """``u += Z_i delta`` from the consumed entries."""
         if not self.lanes.parallel:
-            return f"\n{indent}{self.velocity.at(self.coordinate)} += response * {delta};"
-        return f"\n{indent}if (coord >= 0) {self.velocity.at('coord')} += response * {delta};"
+            return f"\n{indent}{self.velocity.at(self.coordinate)} += z * {delta};"
+        return f"\n{indent}if (coord >= 0) {self.velocity.at('coord')} += z * {delta};"
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``v += Y_row delta`` for a row outside the visit; the pair's sibling ``sib`` from its kept entries
+        """``u += Z_row delta`` for a row outside the visit; the pair's sibling ``sib`` from its kept entries
         (:meth:`pair_entries`)."""
         if row == "sib":
             if not self.lanes.parallel:
-                return f"\n{indent}{self.velocity.at(self.coordinate)} += sib_response * {delta};"
-            return f"\n{indent}if (sib_coord >= 0) {self.velocity.at('sib_coord')} += sib_response * {delta};"
+                return f"\n{indent}{self.velocity.at(self.coordinate)} += sib_z * {delta};"
+            return f"\n{indent}if (sib_coord >= 0) {self.velocity.at('sib_coord')} += sib_z * {delta};"
         if not self.lanes.parallel:
             return (
                 f"\n{self._slot(row, 'apply_entry', indent)}\n"
-                f"{indent}{self.velocity.at(self.coordinate)} += {self.sparse_jy}.data[apply_entry + 1] * {delta};"
+                f"{indent}{self.velocity.at(self.coordinate)} += {self.sparse_z}.data[apply_entry] * {delta};"
             )
-        lane, P = self.lanes.lane, self.dofs
         lines = [
-            "int apply_coord = -1;",
-            "float apply_response = 0.0f;",
-            f"if ({lane} < {P}) {{",
-            f"    apply_coord = {self.offset} + {lane};",
-            f"    apply_response = {self.Y}.data[({self.group} * {self.rows} + {row}) * {P} + {lane}];",
-            f"}} else if ({lane} <= {P + 1}) {{",
-            f"    const int sparse_slot = {lane} - {P};",
-            f"    const int sparse_row = {self.base} + {row};",
-            f"    apply_coord = {self.sparse_dof}.data[sparse_row * 2 + sparse_slot];",
-            f"    apply_response = {self.sparse_jy}.data[sparse_row * 4 + sparse_slot * 2 + 1];",
-            "}",
-            f"if (apply_coord >= 0) {self.velocity.at('apply_coord')} += apply_response * {delta};",
+            self._entries(row, "apply_coord", "apply_z", ""),
+            f"if (apply_coord >= 0) {self.velocity.at('apply_coord')} += apply_z * {delta};",
         ]
-        return "".join(f"\n{indent}{line}" for line in lines)
+        return "".join(f"\n{indent}{line}" for line in "\n".join(lines).split("\n"))
 
 
 @dataclass(frozen=True)

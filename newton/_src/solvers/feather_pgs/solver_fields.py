@@ -436,9 +436,9 @@ Connects = field_group.struct(
 
 SPARSE_DIAGONAL_ROWS = FieldGroup(
     Field("_sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1, grad=False),
-    Field("_sparse_diagonal_row_jy", wp.float32, ("world", "row", 4), grad=False),
+    Field("_sparse_diagonal_row_z", wp.float32, ("world", "row", 2), grad=False),
 )
-"""Each sparse-diagonal row's two response coordinates and their J and Y entries."""
+"""Each sparse-diagonal row's two response coordinates and their whitened entries ``J / sqrt(m)``."""
 
 SPARSE_CONTACT_GROUPS = FieldGroup(
     Field("_sparse_contact_group_count", wp.int32, ("world",), grad=False),

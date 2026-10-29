@@ -52,7 +52,7 @@ __all__ = [
     "Build",
     "diagonal_solve",
     "dot",
-    "solve_six",
+    "whiten_six",
 ]
 
 STAGES = ("factor", "response", "diagonal", "cfm", "delassus", "apply")
@@ -461,31 +461,26 @@ def response_lanes_kernel() -> wp.Kernel:
 _Vec6 = wp.types.vector(length=6, dtype=wp.float32)
 
 
-def _solve_six_snippet() -> str:
+def _whiten_six_snippet() -> str:
     solve = CholeskySolve(6, lambda row, col: _element("factor", "group", row, col))
 
     def jacobian_at(i):
         return f"jacobian[{i}]"
 
-    def response_at(i):
-        return f"response[{i}]"
+    def whitened_at(i):
+        return f"whitened[{i}]"
 
     return f"""
-    wp::vec_t<6, float> response(0.0f);
-    bool nonzero = false;
-    for (int i = 0; i < 6; ++i) nonzero = nonzero || jacobian[i] != 0.0f;
-    if (nonzero) {{
-{_indent(solve.whiten(jacobian_at, response_at), "        ")}
-{_indent(solve.leave(response_at, response_at), "        ")}
-    }}
-    return response;
+    wp::vec_t<6, float> whitened(0.0f);
+{_indent(solve.whiten(jacobian_at, whitened_at), "    ")}
+    return whitened;
 """
 
 
-@wp.func_native(_solve_six_snippet())
-def solve_six(factor: wp.array3d[float], group: int, jacobian: _Vec6) -> _Vec6:
-    """The response of one row of the six-coordinate group in registers: ``H^-1 J^T`` by the kit's solves (Z0), zero
-    for a zero row: the dense part of a compact boundary row (:func:`.response_builds_rows.sparse_pair_dense`)."""
+@wp.func_native(_whiten_six_snippet())
+def whiten_six(factor: wp.array3d[float], group: int, jacobian: _Vec6) -> _Vec6:
+    """One row of the six-coordinate group whitened in registers, ``Z = L^-1 P J^T`` by the kit's forward solve (Z0):
+    the dense part of a compact boundary row (:func:`.response_builds_rows.sparse_pair_dense`)."""
 
 
 @functools.cache
@@ -986,7 +981,7 @@ per articulation, rows lane-strided; ``warps``, a warp per articulation, a lane 
 lane 0 factoring); ``tiles``, a block per articulation (and row chunk) through the tile primitives; ``queue``, warps
 walking the local owners' general-world queue; ``pairs``, a block per paired world, a thread per row; ``groups``, a
 thread per world row summing its articulations' group diagonals; ``worlds``, a thread per world. ``diagonal`` is the thread-per-row response of a structurally diagonal ``H``.
-The register response of the six-coordinate group is a device function, :func:`solve_six`."""
+The register whitening of the six-coordinate group is a device function, :func:`whiten_six`."""
 
 ASSEMBLED_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("delassus", "entries"): _entry("delassus", "entries", delassus_entries_kernel, ("articulations", "rows", "rows")),

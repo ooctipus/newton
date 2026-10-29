@@ -270,6 +270,20 @@ _UNIT_EDGES = (
 )
 
 
+def _diagonal_factor(inverse):
+    """The leaf-first factor of a diagonal mass matrix ``H = diag(1 / inverse)``: ``L = diag(sqrt(m))`` in factor
+    coordinates (factor coordinate ``k`` at position ``n - 1 - k``), as the sparse-diagonal sweep reads its dense
+    articulation's factor."""
+    return np.diag(np.sqrt(1.0 / np.asarray(inverse, np.float64)[::-1])).astype(np.float32)
+
+
+def _whiten_slots(sparse_dof, jacobian, inverse):
+    """A sparse-diagonal row's slots whitened, ``Z_s = J_s sqrt(m_s^-1)`` where a slot holds a coordinate."""
+    present = sparse_dof >= 0
+    scale = np.sqrt(np.asarray(inverse, np.float32)[np.where(present, sparse_dof, 0)])
+    return np.where(present, jacobian * scale, 0.0).astype(np.float32)
+
+
 def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diagonal=8, dense=6, layout=None):
     """Build sparse-diagonal rows of patch contact units with linked normal rings.
 
@@ -394,6 +408,23 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         rows["limit_active"][w, limited] = rng.integers(1, 4, 3)
         rows["limit_lower_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
         rows["limit_upper_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
+    # The sweep's whitened rows: the dense articulation's factor and Z = L^-1 P J^T (its mass matrix is diagonal
+    # here), and the slots' J / sqrt(m).
+    inverse = rows["inverse_mass"].reshape(worlds, dofs)
+    rows["dense_L"] = np.stack([_diagonal_factor(inverse[w, diagonal:]) for w in range(worlds)])
+    rows["dense_Z"] = (rows["dense_J"] * np.sqrt(inverse[:, None, diagonal:])).astype(np.float32)
+    rows["sparse_z"] = np.stack(
+        [
+            np.stack(
+                [
+                    _whiten_slots(rows["sparse_dof"][w, :, s], rows["sparse_jy"][w, :, 2 * s], inverse[w])
+                    for s in (0, 1)
+                ],
+                axis=-1,
+            )
+            for w in range(worlds)
+        ]
+    )
     rows["contacts"] = {name: np.array(values, np.int32) for name, values in contact.items()}
     return rows
 
@@ -818,9 +849,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         row_mu = np.zeros((1, max_constraints), dtype=np.float32)
         row_mu[0, 1:3] = 0.7
         dense_j = np.zeros((1, max_constraints, dense_dofs), dtype=np.float32)
-        dense_y = np.zeros_like(dense_j)
         dense_j[0, :3] = jacobian[:, :dense_dofs]
-        dense_y[0, :3] = response[:, :dense_dofs]
         sparse_dof = np.full((1, max_constraints, 2), -1, dtype=np.int32)
         sparse_jy = np.zeros((1, max_constraints, 4), dtype=np.float32)
         sparse_dof[0, :3] = (2, 3)
@@ -891,10 +920,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                wp.array(dense_j, device=device),
-                wp.array(dense_y, device=device),
+                wp.array(_diagonal_factor(inverse_mass[:dense_dofs])[None], device=device),
+                wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
-                wp.array(sparse_jy, device=device),
+                wp.array(
+                    np.stack(
+                        [_whiten_slots(sparse_dof[..., s], sparse_jy[..., 2 * s], inverse_mass) for s in (0, 1)], -1
+                    ),
+                    device=device,
+                ),
                 wp.array(limit_active, device=device),
                 wp.array(limit_lower_rhs, device=device),
                 wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
@@ -942,7 +976,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             row_parent[0, normal + 1 : normal + 3] = normal
         row_mu = np.zeros((1, max_constraints), dtype=np.float32)
         dense_j = jacobian[:, :dense_dofs][None, ...]
-        dense_y = response[:, :dense_dofs][None, ...]
         sparse_dof = np.empty((1, max_constraints, 2), dtype=np.int32)
         sparse_dof[:, :, 0] = 6
         sparse_dof[:, :, 1] = 7
@@ -991,10 +1024,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(normal_rows[None, :], device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                wp.array(dense_j, device=device),
-                wp.array(dense_y, device=device),
+                wp.array(_diagonal_factor(inverse_mass[:dense_dofs])[None], device=device),
+                wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
-                wp.array(sparse_jy, device=device),
+                wp.array(
+                    np.stack(
+                        [_whiten_slots(sparse_dof[..., s], sparse_jy[..., 2 * s], inverse_mass) for s in (0, 1)], -1
+                    ),
+                    device=device,
+                ),
                 wp.zeros((1, world_dofs), dtype=wp.int32, device=device),
                 wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
                 wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
@@ -1277,10 +1315,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(serial_heads, device=device),
                             wp.array(rows["dense_offsets"], device=device),
                             wp.array(rows["dense_groups"], device=device),
-                            wp.array(rows["dense_J"], device=device),
-                            wp.array(rows["dense_Y"], device=device),
+                            wp.array(rows["dense_L"], device=device),
+                            wp.array(rows["dense_Z"], device=device),
                             wp.array(schedule["sparse_row_dof"], device=device),
-                            wp.array(rows["sparse_jy"], device=device),
+                            wp.array(rows["sparse_z"], device=device),
                             wp.array(rows["limit_active"], device=device),
                             wp.array(rows["limit_lower_rhs"], device=device),
                             wp.array(rows["limit_upper_rhs"], device=device),
