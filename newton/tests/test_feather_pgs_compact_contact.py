@@ -147,6 +147,8 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
         if name == "sparse_jy":
             shape = (2, 40, 4)
         setattr(data, name, wp.full(shape, -777 if dtype is int else float("nan"), dtype=dtype, device=device))
+    # The general producers record each row's sides (the packed placement's).
+    data.sides = wp.zeros((2, 40), dtype=wp.vec2i, device=device)
     counts = array([prefix[w] + int(np.sum(rows[: kept[w]])) for w in range(2)], int)
     bounds = array([[p, p] for p in prefix], int)
     return data, SimpleNamespace(counts=counts, bounds=bounds, device=device)

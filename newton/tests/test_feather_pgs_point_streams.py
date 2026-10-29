@@ -110,7 +110,7 @@ def _linked_tier_calls():
     (``mf_gs_parallel_linked_velocity_limit_pass``).
     """
     for tier, matrix_free, inkernel, last_word in itertools.product(
-        ((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None), (False, True)
+        ((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0),), (False, True)
     ):
         kwargs = {
             "rows": tier[0],
@@ -412,13 +412,20 @@ def _dense_build_calls():
         "gather_coordinates_kernel",
         "diagonal_rows_kernel",
         "diagonal_groups_kernel",
-        "diagonal_world_rows_kernel",
         "diagonal_queue_kernel",
         "cfm_worlds_kernel",
         "delassus_entries_kernel",
         "apply_coordinates_kernel",
     ):
         yield f"response_builds_dense.{name}", getattr(response_builds_dense, name).__wrapped__, (), {}
+    from newton._src.solvers.feather_pgs import packed_rows  # noqa: PLC0415
+
+    # The dense rows packed by support: their build (by the side sizes it whitens), the velocity of their impulses
+    # and the bilateral projection.
+    for sizes in ((6,), (6, 9), (18,), (6, 106)):
+        yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
+    for name in ("apply_kernel", "project_kernel"):
+        yield f"packed_rows.{name}", getattr(packed_rows, name).__wrapped__, (), {}
 
 
 def _solver_factory_calls():
@@ -531,9 +538,8 @@ def _solver_factory_calls():
         # These pins were recorded with world_rows=False in their labels, before the in-sweep world rows went.
         return sweep_routes_tiers.parallel_kernel(*args, **kwargs)
 
-    # Parallel tiers: one articulation per world with in-kernel response, and the response-block variants
-    # without it.
-    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None)):
+    # Parallel tiers: one articulation per world, its rows whitened in the kernel.
+    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0),)):
         kwargs = {
             "rows": tier[0],
             "min_rows": tier[1],

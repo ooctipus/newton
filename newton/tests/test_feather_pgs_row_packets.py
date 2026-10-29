@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import position_pass, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import packed_world_rows, position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -168,6 +168,7 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
     data.bias_scale, data.speculative_scale, data.restitution_threshold, data.contact_w = 1.0, 0.6, 0.05, 1.0
     for name, values in _poisoned_rows(device).items():
         setattr(data, name, values)
+    data.sides = wp.zeros((WORLDS, ROWS), dtype=wp.vec2i, device=device)
     layout = SimpleNamespace(
         device=device,
         view=view,
@@ -201,7 +202,9 @@ def _run_general(data, layout, beta):
     and the right-hand sides before the bounces.
     """
     device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
-    general = field_group.replace(data, **vars(rows))
+    # The general route records each row's sides (the packed placement's).
+    sides = wp.zeros((WORLDS, ROWS), dtype=wp.vec2i, device=device)
+    general = field_group.replace(data, **vars(rows), sides=sides)
     law = _law(layout.view, beta)
     wp.launch(kernels.prepare_world_contact_rows, dim=16, inputs=[general, 16, law], device=device)
     jacobians = {}
@@ -220,7 +223,7 @@ def _run_general(data, layout, beta):
     for w in range(WORLDS):
         world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
         world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
-    records = field_group.upload(DenseRows, device, **vars(rows))
+    records = field_group.upload(DenseRows, device, **vars(rows), sides=sides)
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
@@ -235,10 +238,10 @@ def _run_general(data, layout, beta):
         kernels.apply_world_contact_restitution_matrix_free,
         dim=WORLDS * ROWS,
         inputs=[
-            *(records, layout.counts, ROWS, wp.full(WORLDS, PRIMARY + SECONDARY, dtype=int, device=device)),
+            *(records, layout.counts, ROWS),
             data.incident,
             wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
-            wp.array(world_jacobian, dtype=float, device=device),
+            *packed_world_rows(world_jacobian, device),
             *world_restitution_layout(device),
             *(data.dt, data.restitution_threshold, 0),
         ],

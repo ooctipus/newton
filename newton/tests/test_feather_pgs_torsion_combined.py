@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 from newton.tests import test_feather_pgs_torsion_velocity as velocity_tests
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.test_feather_pgs_contact_torsion import PATCH_OPTIONS, fixture
 
 
@@ -28,7 +29,7 @@ class TestTorsionCombined(unittest.TestCase):
         delta = result["impulses"][0, :count] - baseline["impulses"][0, :count]
         np.testing.assert_allclose(
             result["v_out"],
-            baseline["v_out"].astype(np.float64) + result["Y_world"][0, :count].astype(np.float64).T @ delta,
+            baseline["v_out"].astype(np.float64) + result["response"][0, :count].T @ delta,
             atol=2e-5,
             rtol=8 * np.finfo(np.float32).eps,
         )
@@ -91,10 +92,11 @@ class TestTorsionCombined(unittest.TestCase):
             solver.phi.assign(phi)
             # Force a separating end-gap through the normal row's response vector.
             row = group["normal_rows"][0]
-            separating = solver.Y_world.numpy()[0, row].copy()
+            response = unpacked_rows(solver)[1][0]
+            separating = response[row].astype(np.float32)
             solver.v_out_snap.assign(separating)
             solver.v_hat.assign(separating)
-            solver.v_out.assign(separating + solver.Y_world.numpy()[0, :n].T @ before)
+            solver.v_out.assign((separating + response[:n].T @ before).astype(np.float32))
             velocity_before = solver.v_out.numpy().copy()
             solver._conclude_matrix_free_position_problem(0.0025)
             solver._run_matrix_free_velocity_post_solve()
@@ -104,7 +106,7 @@ class TestTorsionCombined(unittest.TestCase):
             for anchor in group["anchor_rows"]:
                 self.assertLess(np.linalg.norm(after[anchor + 1 : anchor + 3]), 2e-7)
             np.testing.assert_allclose(
-                solver.v_out.numpy(), velocity_before + solver.Y_world.numpy()[0, :n].T @ (after - before), atol=2e-5
+                solver.v_out.numpy(), velocity_before + response[:n].T @ (after - before), atol=2e-5
             )
 
 

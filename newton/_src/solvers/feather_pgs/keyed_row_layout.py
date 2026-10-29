@@ -54,7 +54,8 @@ class KeyedLayout:
 
 
 def topology_plan(solver):
-    """Derive uniform block offsets and supported velocity DOFs from the model."""
+    """Derive uniform block offsets and supported velocity DOFs from the model: the layout, then each world's group
+    index, first coordinate and articulation of each size."""
     sizes = sorted((int(n) for n in solver.size_groups), reverse=True)
     if not 1 <= len(sizes) <= 2 or sum(sizes) != solver.max_world_dofs:
         raise ValueError("keyed rows require at most two complete uniform size groups")
@@ -63,6 +64,7 @@ def topology_plan(solver):
     starts = solver.articulation_dof_start.numpy()
     groups = np.zeros((solver.world_count, 2), dtype=np.int32)
     dof_starts = np.zeros_like(groups)
+    arts_by_world = np.full_like(groups, -1)
     block_offsets = [0, 0]
     model = solver.model
     art_joint = model.articulation_start.numpy()
@@ -79,6 +81,7 @@ def topology_plan(solver):
         block_offsets[column] = int(offsets[arts[0]])
         groups[worlds[arts], column] = np.arange(len(arts), dtype=np.int32)
         dof_starts[worlds[arts], column] = starts[arts]
+        arts_by_world[worlds[arts], column] = arts
         masks, position_masks = set(), set()
         for art in arts:
             position_masks.add(
@@ -110,7 +113,7 @@ def topology_plan(solver):
         velocity_mask,
         position_mask,
     )
-    return layout, groups, dof_starts
+    return layout, groups, dof_starts, arts_by_world
 
 
 @cache

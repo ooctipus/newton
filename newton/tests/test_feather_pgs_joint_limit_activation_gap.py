@@ -74,6 +74,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
                 row_cfm=world_row_cfm,
                 phi=world_phi,
                 target=world_target_velocity,
+                sides=wp.zeros(world_row_type.shape, dtype=wp.vec2i, device=device),
             ),
         ],
         device=device,

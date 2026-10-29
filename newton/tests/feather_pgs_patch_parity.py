@@ -27,6 +27,7 @@ import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 
 # Per route: constraint count, row type, parent, mu, right-hand side, impulse, phi and
 # target arrays. Route 1 (matrix-free rows) folds its target into the right-hand side.
@@ -70,7 +71,7 @@ def _jacobian(solver, route, world, count):
 
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
     if solver.pgs_mode == "matrix_free":
-        return solver.J_world.numpy()[world, :count]
+        return unpacked_rows(solver)[0][world, :count]
     # Split mode keeps each articulation's columns in its size group; the world's
     # articulations follow in index order (split construction maps no world offsets).
     worlds = solver.art_to_world.numpy()

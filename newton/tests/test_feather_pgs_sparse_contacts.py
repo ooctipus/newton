@@ -28,7 +28,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import position_pass, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import packed_world_rows, position_pass, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -66,6 +66,9 @@ def _contact_input(f, device="cpu", **fields):
         "incident": f["velocity"],
     }
     values.update(fields)
+    if "row_type" in values and "sides" not in values:
+        # The contact rows record their sides (the packed placement's).
+        values["sides"] = wp.zeros(values["row_type"].shape, dtype=wp.vec2i, device=device)
     return field_group.upload(ContactInput, device, **values)
 
 
@@ -547,10 +550,9 @@ class TestSparseContacts(unittest.TestCase):
                             reference_rows,
                             count,
                             9,
-                            array([6], int),
                             f["velocity"],
                             array([np.arange(6)], int),
-                            dense,
+                            *packed_world_rows(dense.numpy(), device),
                             *world_restitution_layout(device),
                             0.01,
                             law["restitution_threshold"],
@@ -909,10 +911,9 @@ class TestSparseContacts(unittest.TestCase):
                 ),
                 count,
                 row_count,
-                _array([row_count], int),
                 _array(incident.numpy()[0]),
                 _array([np.arange(row_count)], int),
-                _array(np.eye(row_count)[None]),
+                *packed_world_rows(np.eye(row_count)[None], "cpu"),
                 *world_restitution_layout("cpu"),
                 0.01,
                 0.1,

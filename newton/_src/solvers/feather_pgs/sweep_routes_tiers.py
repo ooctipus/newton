@@ -8,11 +8,12 @@ descriptor (:class:`.kernel_template.SweepTier`).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
 (:class:`.sweep.JacobiRows`). The rows step together under the Jacobi law with Nesterov momentum
-(:func:`.sweep.jacobi_sweeps`) over one of two response operators, each fed by the response kernels' rows or by rows
-whitened in the kernel (:class:`.response_operator.WhitenedRows`, which keyed rows feed):
+(:func:`.sweep.jacobi_sweeps`) over one of two response operators, each fed by rows whitened in the kernel
+(:class:`.response_operator.WhitenedRows`, from the group Jacobians or the keyed rows):
 
-- the response block ``A = J Y`` in row layout (:class:`.response_operator.Block`);
-- matrix-free, ``J`` in registers and ``Y^T`` staged (:class:`.response_operator.TransposedResponse`).
+- the response block ``A = Z^T Z`` in row layout (:class:`.response_operator.Block`), the rows published to the
+  world's packed rows (:mod:`.packed_rows`: the packed build's rows, rewritten in the tier's rounding);
+- matrix-free, ``Z`` in registers and staged transposed (:class:`.response_operator.TransposedResponse`).
 """
 
 from __future__ import annotations
@@ -55,8 +56,8 @@ PARALLEL_ABI = kernel_template.params(
     ("world_row_cfm", wp.array2d[float]),
     ("v_out", wp.array[float]),
 )
-"""The parallel tiers' native ABI: the matrix-free sweep's, then the in-kernel response's operands (placeholders when
-a tier builds none) before ``v_out``; keyed rows insert theirs after ``world_row_cfm``."""
+"""The parallel tiers' native ABI: the matrix-free sweep's, then the in-kernel response's operands before ``v_out``;
+keyed rows insert theirs after ``world_row_cfm``."""
 
 # The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
 # every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
@@ -102,8 +103,8 @@ def _phase_admission() -> str:
 
 
 def inkernel_response_fits(max_world_dofs: int, rows: int, matrix_free: bool) -> bool:
-    """Whether a tier of ``rows`` rows can form its worlds' response in-kernel: the A-based (not matrix-free) form
-    keeps the padded ``Z`` scratch in its response block."""
+    """Whether a tier of ``rows`` rows can form its worlds' rows in the kernel: the A-based (not matrix-free) form
+    whitens them in its response block."""
     return matrix_free or max_world_dofs * (rows + 4) <= rows * (rows + 1)
 
 
@@ -127,12 +128,13 @@ def _operands(
         raise ValueError("rows must be in [1, min(max_constraints, 128)]")
     if AM > 96 and not matrix_free:
         raise ValueError("rows above 96 need the matrix-free variant (the response block exceeds shared memory)")
-    ink = inkernel_response is not None
-    groups = tuple(int(v) for v in inkernel_response) if ink else (0, 0, 0, 0)
+    if inkernel_response is None:
+        raise ValueError("a parallel tier forms its worlds' rows in the kernel: inkernel_response is required")
+    groups = tuple(int(v) for v in inkernel_response)
     NA, NB, OA, OB = groups
-    if ink and (NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D)):
+    if NA <= 0 or NB < 0 or OA + NA > D or (NB > 0 and OB + NB > D):
         raise ValueError("inkernel_response needs group sizes within the world DOF count")
-    if ink and not inkernel_response_fits(D, AM, matrix_free):
+    if not inkernel_response_fits(D, AM, matrix_free):
         raise ValueError("in-kernel response (A-based) needs the response block storage to hold the padded Z scratch")
     if AM % 4 != 0:
         raise ValueError("rows must be a multiple of 4")
@@ -140,7 +142,7 @@ def _operands(
         raise ValueError("min_rows must be in [0, rows)")
     operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
     if operands is not None:
-        if not ink or not matrix_free or has_drive_rows:
+        if not matrix_free or has_drive_rows:
             raise ValueError("generated factor rows require the ordinary matrix-free parallel law")
         if operands.stage is not None and matrix_free and exact_row_sums:
             raise ValueError("preprojected row staging does not implement exact row sums")
@@ -158,7 +160,7 @@ def parallel_source(
     matrix_free: bool = False,
     has_drive_rows: bool = False,
     skip_local_internal_worlds: bool = False,
-    inkernel_response: tuple[int, int, int, int] | None = None,
+    inkernel_response: tuple[int, int, int, int],
     exact_row_sums: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
@@ -169,10 +171,10 @@ def parallel_source(
     Jacobi law, a thread per row.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the response operator: the block
-    ``A = J Y`` (row layout; ``rows`` above 96 need ``matrix_free``) or, ``matrix_free``, ``J`` in registers and
-    ``Y^T`` staged, its step scale bounded by the exact row sums (``exact_row_sums``) or the column sums. With
-    ``inkernel_response = (NA, NB, OA, OB)`` the rows are whitened in the kernel (:class:`.WhitenedRows`), from the
-    group Jacobians or the keyed rows' operands (``row_inputs``: their metadata, physical rows and arguments). It
+    ``A = Z^T Z`` (row layout; ``rows`` above 96 need ``matrix_free``) or, ``matrix_free``, ``Z`` in registers and
+    staged transposed, its step scale bounded by the exact row sums (``exact_row_sums``) or the column sums. The rows
+    are whitened in the kernel (:class:`.WhitenedRows`) for the groups ``inkernel_response = (NA, NB, OA, OB)``, from
+    the group Jacobians or the keyed rows' operands (``row_inputs``: their metadata, physical rows and arguments). It
     runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: momentum with ``nesterov``, pairs projected on
     their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
     ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses.
@@ -195,33 +197,23 @@ def parallel_source(
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
     laws = RowLaws(drive=has_drive_rows, velocity_limit_law="accumulated", regularize=False, policy=solve_policy)
-    store = JacobiRows(
-        AM,
-        NT,
-        drive=has_drive_rows,
-        limits=velocity_limit_pass,
-        diagonal=None if inkernel_response is not None else "world_diag.data[off_dense + i]",
-        types=solve_policy.traces,
+    store = JacobiRows(AM, NT, drive=has_drive_rows, limits=velocity_limit_pass, types=solve_policy.traces)
+    whitened = WhitenedRows(
+        NA,
+        NB,
+        OA,
+        OB,
+        D,
+        M_D,
+        AM + 4,
+        lanes,
+        read=operands.physical_row if operands is not None else None,
+        staged=operands.stage if operands is not None else None,
     )
-    whitened = None
-    if inkernel_response is not None:
-        whitened = WhitenedRows(
-            NA,
-            NB,
-            OA,
-            OB,
-            D,
-            M_D,
-            AM + 4,
-            lanes,
-            read=operands.physical_row if operands is not None else None,
-            staged=operands.stage if operands is not None else None,
-        )
     if matrix_free:
         op = TransposedResponse(D, AM, lanes, exact=bool(exact_row_sums), whitened=whitened)
     else:
-        schedule = "rows" if whitened is not None or D > 32 else "pairs"
-        op = Block(D, AM + 1, lanes, rows="n_rows", layout="row", schedule=schedule, whitened=whitened)
+        op = Block(D, AM + 1, lanes, rows="n_rows", layout="row", whitened=whitened)
     dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 and nesterov else ()
     # A block of several warps reduces the trace's largest change over its warps.
     trace_reduction, trace = "", ()
@@ -244,14 +236,13 @@ def parallel_source(
         unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT) if laws.accumulated else (CONTACT, JOINT_LIMIT),
         admission=_phase_admission(),
     )
-    cfm = "world_row_cfm.data[off_dense + i]" if whitened is not None else None
 
     def scale(aii, bound, pad):
-        return jacobi_scale(aii, bound, cfm=cfm, pad=pad)
+        return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)
 
     last_word = jacobi_limit_pass(store, op, laws) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
-{dense_tier_world(AM, int(min_rows), D, M_D, local=skip_local_internal_worlds, rows="n_rows")}
+{dense_tier_world(AM, int(min_rows), D, M_D, local=skip_local_internal_worlds, rows="n_rows", support=D)}
 
 {staging.declarations("    ")}{trace_reduction}
 {op.registers("    ")}
@@ -293,7 +284,7 @@ def parallel_kernel(
     matrix_free: bool = False,
     has_drive_rows: bool = False,
     skip_local_internal_worlds: bool = False,
-    inkernel_response: tuple[int, int, int, int] | None = None,
+    inkernel_response: tuple[int, int, int, int],
     exact_row_sums: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
@@ -305,7 +296,8 @@ def parallel_kernel(
     A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as accumulated
-    unilateral rows whatever the serial sweeps' law.
+    unilateral rows whatever the serial sweeps' law. Its worlds' packed rows (:mod:`.packed_rows`) lie at their
+    coordinates, ``max_world_dofs`` entries a row: the A-based tier rewrites them with its own.
     """
     options = {
         "rows": rows,
@@ -331,13 +323,11 @@ def parallel_kernel(
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
     AM = int(rows)
     NT = 32 * ((AM + 31) // 32)
-    ink = inkernel_response is not None
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nes{int(bool(nesterov))}"
-        f"_nt{NT}_mf{int(bool(matrix_free))}"
-        + (f"_ink{NA}_{NB}_o{OA}_{OB}" if ink else "")
-        + f"_hd{int(bool(has_drive_rows))}_z{int(ink and not matrix_free)}_ex{int(bool(matrix_free and exact_row_sums))}"
+        f"_nt{NT}_mf{int(bool(matrix_free))}_ink{NA}_{NB}_o{OA}_{OB}"
+        f"_hd{int(bool(has_drive_rows))}_z{int(not matrix_free)}_ex{int(bool(matrix_free and exact_row_sums))}"
         + ("_local_fallback" if skip_local_internal_worlds else "")
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")

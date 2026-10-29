@@ -95,9 +95,9 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 joint_limit_speculative_scale=limit_spec,
                 contact_w=contact_w,
                 velocity_pass=0,
-                world_dof_count=np.zeros(worlds, dtype=np.int32),
                 world_dof_indices=np.zeros((worlds, 1), dtype=np.int32),
-                world_J=np.zeros((worlds, rows, 1), dtype=np.float32),
+                packed_dof=np.full((worlds, rows, 1), -1, dtype=np.int32),
+                packed_J=np.zeros((worlds, rows, 1), dtype=np.float32),
                 world_position_velocity=np.zeros(1, dtype=np.float32),
                 world_incident_velocity=np.zeros(1, dtype=np.float32),
                 restitution_velocity_threshold=0.0,
@@ -502,18 +502,19 @@ def test_contact_rhs_matches_mf_rhs_bias(test, device):
 
 
 def _dense_layout(rng, worlds, rows, dofs):
+    """Packed rows (:mod:`.packed_rows`) over every world coordinate."""
     return {
-        "world_dof_count": np.full(worlds, dofs, dtype=np.int32),
         "world_dof_indices": (dofs * np.arange(worlds)[:, None] + np.arange(dofs)[None, :]).astype(np.int32),
-        "world_J": rng.normal(size=(worlds, rows, dofs)).astype(np.float32),
+        "packed_dof": np.broadcast_to(np.arange(dofs, dtype=np.int32), (worlds, rows, dofs)).copy(),
+        "packed_J": rng.normal(size=(worlds, rows, dofs)).astype(np.float32),
     }
 
 
 @wp.kernel
 def _law_velocity_pass(
-    world_dof_count: wp.array[int],
     world_dof_indices: wp.array2d[int],
-    world_J: wp.array3d[float],
+    packed_dof: wp.array3d[int],
+    packed_J: wp.array3d[float],
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
@@ -540,7 +541,7 @@ def _law_velocity_pass(
         if restitution > 0.0:
             relative_incident = (
                 kernels.world_contact_row_dot(
-                    world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i
+                    world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i
                 )
                 - target
             )
@@ -553,7 +554,7 @@ def _law_velocity_pass(
             end_gap = float(0.0)
             if phi > 0.0:
                 jv = kernels.world_contact_row_dot(
-                    world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
+                    world_dof_indices, packed_dof, packed_J, world_position_velocity, world, i
                 )
                 end_gap = phi + dt * (jv - target)
             value, _w = row_laws.contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
@@ -614,9 +615,9 @@ def test_velocity_pass_matches_world_contact_bias(test, device):
 
 @wp.kernel
 def _law_restitution_matrix_free(
-    world_dof_count: wp.array[int],
     world_dof_indices: wp.array2d[int],
-    world_J: wp.array3d[float],
+    packed_dof: wp.array3d[int],
+    packed_J: wp.array3d[float],
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
@@ -632,7 +633,7 @@ def _law_restitution_matrix_free(
         return
     target = world_target_velocity[world, i]
     relative_incident = (
-        kernels.world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
+        kernels.world_contact_row_dot(world_dof_indices, packed_dof, packed_J, world_incident_velocity, world, i)
         - target
     )
     fires, bounce = row_laws.contact_restitution_rhs(

@@ -292,6 +292,7 @@ def _contact_row_outputs(device: str) -> dict[str, wp.array]:
         "phi": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "target_velocity": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
         "row_restitution": wp.full((1, 8), -9.0, dtype=wp.float32, device=device),
+        "sides": wp.zeros((1, 8), dtype=wp.vec2i, device=device),
     }
 
 
@@ -384,6 +385,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             phi=rows["phi"],
             target=rows["target_velocity"],
             restitution=rows["row_restitution"],
+            sides=rows["sides"],
         )
 
     serial = _contact_row_outputs(device)

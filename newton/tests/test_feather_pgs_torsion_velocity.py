@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import contact_torsion
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.test_feather_pgs_contact_torsion import (
     PATCH_OPTIONS,
     TORSION_OFF_ROUTE,
@@ -27,14 +28,15 @@ class TestTorsionVelocityAdmission(unittest.TestCase):
                 phi = wp.array([[initial_gap, 0.0]], dtype=float, device="cpu")
                 target = wp.array([[0.0, 0.25]], dtype=float, device="cpu")
                 velocity = wp.array([(end_gap - initial_gap) / 0.01], dtype=float, device="cpu")
-                dofs = wp.array([1], dtype=int, device="cpu")
                 indices = wp.array([[0]], dtype=int, device="cpu")
+                # Packed rows (packed_rows): the normal row's one entry at coordinate 0, the spin row's none.
+                packed_dof = wp.array(np.array([[[0], [-1]]], np.int32), dtype=int, device="cpu")
                 jacobian = wp.array(np.array([[[1.0], [0.0]]], np.float32), device="cpu")
                 rhs = wp.array([[3.0, 9.0]], dtype=float, device="cpu")
                 wp.launch(
                     contact_torsion._prepare_velocity_torsion_rows,
                     dim=2,
-                    inputs=[count, 2, types, groups, phi, target, velocity, dofs, indices, jacobian, 0.01],
+                    inputs=[count, 2, types, groups, phi, target, velocity, indices, packed_dof, jacobian, 0.01],
                     outputs=[rhs],
                     device="cpu",
                 )
@@ -47,7 +49,7 @@ class TestTorsionVelocityAdmission(unittest.TestCase):
                 wp.launch(
                     contact_torsion._prepare_velocity_torsion_rows,
                     dim=2,
-                    inputs=[count, 2, types, groups, phi, target, velocity, dofs, indices, jacobian, 0.01],
+                    inputs=[count, 2, types, groups, phi, target, velocity, indices, packed_dof, jacobian, 0.01],
                     outputs=[rhs],
                     device="cpu",
                 )
@@ -139,7 +141,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         count = int(result["count"][0])
         delta = result["impulses"][0, :count] - baseline["impulses"][0, :count]
         np.testing.assert_allclose(
-            result["v_out"] - baseline["v_out"], result["Y_world"][0, :count].T @ delta, atol=2e-5
+            result["v_out"] - baseline["v_out"], result["response"][0, :count].T @ delta, atol=2e-5
         )
         self._assert_budget(result, solver)
 
@@ -180,7 +182,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         self.assertLess(abs(float(after_lambda[group["row"]])), 1e-9)
         np.testing.assert_allclose(
             solver.v_out.numpy() - before_velocity,
-            solver.Y_world.numpy()[0, :count].T @ (after_lambda - before_lambda),
+            unpacked_rows(solver)[1][0, :count].T @ (after_lambda - before_lambda),
             atol=2e-5,
         )
         # A new position solve must restore admission rather than inherit the

@@ -252,12 +252,20 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
 
 
 def _unit_factors(worlds, dofs, device):
-    """Unit mass factors of each world's free body at its first coordinate (so Z = J and u = v)."""
+    """Unit mass factors of each world's free body at its first coordinate (so Z = J and u = v), with the factor
+    lookup the sweeps' factor coordinates read (body ``w`` at global coordinate ``w * dofs``, six coordinates, at
+    world coordinate 0)."""
     factors = BodyFactors()
     dof_factor = np.full(worlds * dofs, -1, np.int32)
     dof_factor[np.arange(worlds) * dofs] = np.arange(worlds)
     factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
     factors.L = wp.array(np.tile(np.eye(6, dtype=np.float32), (worlds, 1, 1)), dtype=wp.float32, device=device)
+    factors.first_art = wp.array(dof_factor, dtype=wp.int32, device=device)
+    factors.size = wp.full(worlds, 6, dtype=wp.int32, device=device)
+    factors.world_offset = wp.zeros(worlds, dtype=wp.int32, device=device)
+    factors.address = wp.array(
+        [factors.L.ptr + body * 36 * 4 for body in range(worlds)], dtype=wp.uint64, device=device
+    )
     return factors
 
 

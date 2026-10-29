@@ -736,11 +736,14 @@ def dense_rows_block(
     inline_velocity_limit: bool = True,
     pad: str = "        ",
 ) -> str:
-    """The Gauss-Seidel loop over a world's dense rows ``[lo, hi)`` in slot order.
+    """The Gauss-Seidel loop over a world's dense rows ``[lo, hi)`` in slot order, on packed rows
+    (:class:`.response_operator.SparseFactor`).
 
     ``admission`` holds the block's own skips (row phases, frozen drives),
     run after the row's type is read. Drive rows are skipped unless the laws
-    give them the PhysX drive law.
+    give them the PhysX drive law. A friction pair's second tangent shares its
+    first tangent's entries: the first tangent's residual reduces the pair's
+    terms with its own (:meth:`.SparseFactor.residual`).
     """
     inner = pad + "    "
     drive_skip = "" if laws.drive else f"if (row_type == {DRIVE}) continue;"
@@ -761,20 +764,23 @@ def dense_rows_block(
         drive_data=rows.drive_data if laws.drive else None,
         inline_velocity_limit=inline_velocity_limit,
     )
+    residual = op.residual("jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
     body = [
-        op.consume("i", hi, inner),
         f"{inner}int row_type = {rows.kind('i')};",
         indent(torsion_skip, inner) if torsion_skip else "",
         indent(admission, inner) if admission else "",
         indent(drive_skip, inner) if drive_skip else "",
         row_visit(
-            ctx, laws, parent=rows.parent("i"), check="denom", declare=f"float denom = {rows.diag('i')};", pad=inner
+            ctx,
+            laws,
+            parent=rows.parent("i"),
+            check="denom",
+            declare=f"float denom = {rows.diag('i')};",
+            residual=residual,
+            pad=inner,
         ),
     ]
-    return (
-        f"{pad}if ({hi} > {lo}) {{\n{op.prefetch_first(lo, pad + '    ')}\n{pad}}}\n"
-        f"{pad}for (int i = {lo}; i < {hi}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
-    )
+    return f"{pad}for (int i = {lo}; i < {hi}; i++) {{\n" + "\n".join(line for line in body if line) + f"\n{pad}}}"
 
 
 def free_body_rows_block(
@@ -997,14 +1003,24 @@ def speed_row(
 
 
 def dense_tier_world(
-    capacity: int, min_rows: int, dofs: int, max_constraints: int, *, local: bool, rows: str, pad: str = "    "
+    capacity: int,
+    min_rows: int,
+    dofs: int,
+    max_constraints: int,
+    *,
+    local: bool,
+    rows: str,
+    support: int,
+    pad: str = "    ",
 ) -> str:
     """Enter a world of a dense-row tier, or return: one without free-body rows and with more than ``min_rows`` and
     at most ``capacity`` dense rows (and, with ``local``, one the local owners leave to the general sweeps).
 
     Declares ``m_dense``, ``m_mf``, the row phase's range ``[dense_lo, dense_hi)`` (returning for an empty one),
-    ``rows`` (the rows the tier holds, ``[0, dense_hi)``), ``dof_map_base``, ``off_dense`` and ``jy_world_base``.
+    ``rows`` (the rows the tier holds, ``[0, dense_hi)``), ``dof_map_base``, ``off_dense``, and the world's first
+    packed row entry ``packed_base`` (rows of ``support`` entries: :mod:`.packed_rows`).
     """
+    base = f"const size_t packed_base = (size_t)world * {max_constraints * int(support)};"
     local_skip = (
         f"\n{pad}if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;" if local else ""
     )
@@ -1028,7 +1044,7 @@ def dense_tier_world(
 {pad}const int {rows} = dense_hi;
 {pad}const int dof_map_base = world * {dofs};
 {pad}const int off_dense = world * {max_constraints};
-{pad}const int jy_world_base = world * {max_constraints} * {dofs};"""
+{pad}{base}"""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1055,27 +1071,21 @@ class JacobiRows:
     ``drive`` the PhysX drive rows' right-hand side (``s_drive_rhs``) and data
     (:data:`DRIVE_DATA`) are staged; with ``limits``, which rows are joint
     velocity limits (``s_vlim``, for the last word: :func:`jacobi_limit_pass`).
-    A row is admitted on its stored ``diagonal`` (native, at row ``i``) or,
-    for ``None``, provisionally: the operator forms the diagonal from the
-    staged rows, and a row whose formed diagonal is not positive is frozen
-    once every lane has read the staged kinds (its lane's ``frozen``). The
-    lane keeps its row's diagonal in a register (``row_diag``), which the exit
-    law scales the row's impulse by; with ``types`` each row's constraint type
-    is staged (``s_type``), which the trace names its change by.
+    A row is admitted provisionally: the operator forms its diagonal from the
+    staged rows (whitened in the kernel), and a row whose formed diagonal is
+    not positive is frozen once every lane has read the staged kinds (its
+    lane's ``frozen``). The lane keeps its row's diagonal in a register
+    (``row_diag``), which the exit law scales the row's impulse by; with
+    ``types`` each row's constraint type is staged (``s_type``), which the
+    trace names its change by.
     """
 
     capacity: int
     threads: int
     drive: bool = False
     limits: bool = False
-    diagonal: str | None = "world_diag.data[off_dense + i]"
     rows: str = "n_rows"
     types: bool = False
-
-    @property
-    def formed(self) -> bool:
-        """Whether the operator forms the rows' diagonals."""
-        return self.diagonal is None
 
     def buffers(self) -> tuple[Buffer, ...]:
         """The rows' state and metadata."""
@@ -1104,11 +1114,10 @@ class JacobiRows:
         pad: str = "    ",
     ) -> str:
         """Stage each row, lane-strided: its impulses at their warm start, its metadata (native expressions at row
-        ``i``) and its kind; a row is admitted on its phase (``admission``: statements that clear ``admit``) and a
-        positive diagonal, and its step starts at the inverse diagonal. ``unilateral`` lists the row types that
-        clamp at zero; without drive rows a drive row is frozen."""
+        ``i``) and its kind; a row is admitted on its phase (``admission``: statements that clear ``admit``), its
+        diagonal formed later (:func:`jacobi_scale`). ``unilateral`` lists the row types that clamp at zero; without
+        drive rows a drive row is frozen."""
         drive = self.drive
-        diagonal = "1.0f" if self.formed else self.diagonal
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
             f"else if (row_type == {FRICTION}) kind = {JACOBI_FRICTION};",
@@ -1124,23 +1133,20 @@ class JacobiRows:
             f"    s_parent[i] = {parent};",
             f"    s_mu[i] = {mu};",
             f"    s_vlim[i] = row_type == {VELOCITY_LIMIT} ? 1 : 0;" if self.limits else "",
-            f"    const float diag = {diagonal};",
             f"    int kind = {JACOBI_BILATERAL};",
             *("    " + line for line in decode),
-            f"    int admit = (i >= dense_lo && diag > 0.0f{'' if drive else f' && row_type != {DRIVE}'}) ? 1 : 0;",
+            f"    int admit = (i >= dense_lo{'' if drive else f' && row_type != {DRIVE}'}) ? 1 : 0;",
             indent(admission, "    "),
             f"    if (freeze_drive_rows != 0 && row_type == {DRIVE}) admit = 0;" if drive else "",
             f"    s_kind[i] = admit ? kind : {JACOBI_FROZEN};",
-            "    s_step[i] = admit ? 1.0f / diag : 0.0f;",
+            "    s_step[i] = admit ? 1.0f : 0.0f;",
             "    s_type[i] = row_type;" if self.types else "",
-            "    row_diag = diag;" if not self.formed else "",
         ]
         if drive:
             lines.append("    s_drive_rhs[i] = s_rhs[i];")
             lines += [f"    {name}[i] = {source}.data[off_dense + i];" for name, source in DRIVE_DATA.values()]
         lines.append("}")
-        if self.formed:
-            lines.insert(0, "int frozen = 0;")
+        lines.insert(0, "int frozen = 0;")
         # The lane's own row's diagonal (a row each: the loop runs at most once per lane).
         lines.insert(0, "float row_diag = 0.0f;")
         return indent("\n".join(line for line in lines if line), pad)
@@ -1174,27 +1180,27 @@ class JacobiRows:
         )
 
 
-def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
-    """Set admitted row ``i``'s Jacobi step: ``omega w_i / A_ii`` with ``w_i = min(A_ii / bound, 1)`` (zero for a zero
-    bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
+def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
+    """Set admitted row ``i``'s Jacobi step: ``omega w_i / (A_ii + cfm)`` with ``w_i = min(A_ii / bound, 1)`` (zero
+    for a zero bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
 
     ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
-    the simultaneous steps from diverging where many rows couple through one body. With ``cfm`` (the row's
-    compliance) the diagonal ``A_ii + cfm`` is formed here and a row without a positive one is marked for freezing
-    (``frozen``, :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds); otherwise ``s_step``
-    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it. The formed diagonal is
-    the lane's ``row_diag``, which the exit law reads.
+    the simultaneous steps from diverging where many rows couple through one body. The diagonal ``A_ii + cfm`` (the
+    row's compliance) is formed here and a row without a positive one is marked for freezing (``frozen``,
+    :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds). The formed diagonal is the lane's
+    ``row_diag``, which the exit law reads.
     """
-    lines = [f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;"]
-    if cfm is None:
-        lines.append("s_step[i] *= w * omega;")
-    else:
-        lines += [
-            f"const float diag_i = {aii} + {cfm};",
-            "row_diag = diag_i;",
-            "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
-        ]
-    return indent("\n".join(lines), pad)
+    return indent(
+        "\n".join(
+            [
+                f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;",
+                f"const float diag_i = {aii} + {cfm};",
+                "row_diag = diag_i;",
+                "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
+            ]
+        ),
+        pad,
+    )
 
 
 def isotropic_pair_step(rows: JacobiRows, pad: str = "    ") -> str:
@@ -1385,7 +1391,7 @@ def jacobi_sweeps(
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
     block = rows.threads > 32
     lines = [
-        rows.freeze(pad) if rows.formed else "",
+        rows.freeze(pad),
         isotropic_pair_step(rows, pad),
         # The lane's row: its residual at zero impulse and its step size, fixed through the sweeps.
         f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",

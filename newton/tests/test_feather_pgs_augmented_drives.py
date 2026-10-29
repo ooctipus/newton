@@ -227,6 +227,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                                     strict=True,
                                 )
                             ),
+                            sides=wp.zeros((2, 2), dtype=wp.vec2i, device=device),
                         ),
                         *fields[7:],
                     ],

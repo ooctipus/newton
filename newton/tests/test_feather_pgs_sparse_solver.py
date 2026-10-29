@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 
 DT = 1.0 / 400.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -80,13 +81,40 @@ def _build_chain(device: str, *, base_z: float, contact_sphere: str | None, grou
     return scene.finalize(device=device)
 
 
-def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous=False, device="cuda:0"):
+def _build_model(
+    *, free_count=0, robot_count=1, prescribed=False, heterogeneous=False, free_heights=None, device="cuda:0"
+):
     """Replicate a contacting tripod, optionally surrounded by separate free bodies.
 
     Native sparse factors decline worlds with free rigid bodies, so ``free_count`` builds
     models that keep the dense route. ``heterogeneous`` puts one tripod world beside a world
-    holding a single free sphere instead of replicating the tripod world.
+    holding a single free sphere instead of replicating the tripod world. ``free_heights``
+    builds a world per height instead, its free bodies' centers at that height.
     """
+    if free_heights is not None:
+        builder = newton.ModelBuilder()
+        for height in free_heights:
+            builder.add_world(_tripod_env(free_count, robot_count, prescribed, height))
+        if not prescribed:
+            builder.add_ground_plane()
+        return builder.finalize(device=device)
+    env = _tripod_env(free_count, robot_count, prescribed, 0.05)
+    builder = newton.ModelBuilder()
+    if heterogeneous:
+        builder.add_world(env)
+        free_world = newton.ModelBuilder()
+        body = free_world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
+        free_world.add_shape_sphere(body, radius=0.05)
+        builder.add_world(free_world)
+    else:
+        builder.replicate(env, 2)
+    if not prescribed:
+        builder.add_ground_plane()
+    return builder.finalize(device=device)
+
+
+def _tripod_env(free_count, robot_count, prescribed, free_height):
+    """One world of :func:`_build_model`: the tripods and the free bodies, their centers at ``free_height``."""
     env = newton.ModelBuilder()
     if prescribed:
         support = env.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.02), wp.quat_identity()), is_kinematic=True)
@@ -126,7 +154,7 @@ def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous
     for index in range(free_count):
         body = env.add_link(
             xform=wp.transform(
-                wp.vec3(0.26 + index * 0.095, 0.0, 0.05),
+                wp.vec3(0.26 + index * 0.095, 0.0, free_height),
                 wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.4, 0.5)), 0.6 + index * 0.2),
             ),
             mass=0.4 + index * 0.2,
@@ -137,18 +165,7 @@ def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous
         cfg.density, cfg.mu = 0.0, 0.6
         env.add_shape_sphere(body, radius=0.05, cfg=cfg)
         env.add_articulation([env.add_joint_free(body)])
-    builder = newton.ModelBuilder()
-    if heterogeneous:
-        builder.add_world(env)
-        free_world = newton.ModelBuilder()
-        body = free_world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
-        free_world.add_shape_sphere(body, radius=0.05)
-        builder.add_world(free_world)
-    else:
-        builder.replicate(env, 2)
-    if not prescribed:
-        builder.add_ground_plane()
-    return builder.finalize(device=device)
+    return env
 
 
 def _over_budget_rows(model) -> int:
@@ -361,17 +378,18 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             "target_velocity",
             "row_restitution",
         ]
-        names += ["_sparse_row_dof", "_sparse_row_factor", "_sparse_row_incident"] if sparse else ["J_world", "Y_world"]
+        # The dense route's rows are packed (packed_rows): they move with their row slots.
+        packed = ["_packed_dof", "_packed_J", "_packed_Z", "_row_sides"]
+        names += ["_sparse_row_dof", "_sparse_row_factor", "_sparse_row_incident"] if sparse else packed
         arrays = {name: getattr(solver, name).numpy() for name in names}
+        dense_jacobian = None if sparse else unpacked_rows(solver)[0]
         worlds, slots, needed = (
             getattr(solver, name).numpy() for name in ("contact_world", "contact_slot", "contact_slots_needed")
         )
         shape_a, shape_b = contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()
         identities = []
         for world, count in enumerate(solver.constraint_count.numpy()):
-            jacobian = (
-                self._sparse_rows_physical(solver, world, count)[1] if sparse else arrays["J_world"][world, :count]
-            )
+            jacobian = self._sparse_rows_physical(solver, world, count)[1] if sparse else dense_jacobian[world, :count]
             bundles = []
             prefix = np.isin(
                 arrays["row_type"][world, :count],

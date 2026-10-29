@@ -18,10 +18,10 @@ applied into velocities outside the sweeps. This module holds the builds and pub
   columns of ``L^-1`` (position limits, velocity limits, mimic), and the publication ``v = v_hat + P^T L^-T u`` of a
   world's factor-coordinate velocity change;
 - :class:`.response_operator.FactorRows` (a pair's rows in factor coordinates, a lane per coordinate): the held form
-  ``L^T Y`` of physical rows (the rows themselves are the DenseJY pairs build,
+  ``L^T Y`` of physical rows (the rows themselves are the dense response pairs build,
   :func:`.response_builds_dense.response_pairs_kernel`);
 
-and :class:`BilateralElimination`, the Schur transform of a :class:`.response_operator.DenseJY` build that folds a
+and :class:`BilateralElimination`, the Schur transform of a dense response build that folds a
 world's bilateral block into the responses of its other rows.
 
 **API.** Each operator class returns its build from ``build()`` (``FreeBodyZ.build()``, ``SparsePairJY.build()``,
@@ -68,6 +68,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
+    PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PREELIM_MAX_ROWS,
     BodyFactors,
     _preelim_vec,
@@ -82,7 +83,7 @@ from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedC
 from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import PROJECTION_LAW
 from .response_builds_dense import _Vec6, solve_six
-from .response_operator import FactorComponent, FactorRows, FreeBodyZ, Lanes
+from .response_operator import FreeBodyZ
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import Preelim
@@ -890,7 +891,7 @@ class SparsePairBuild:
 
     Attributes:
         contact_rows: Each contact row's sparse slots (:func:`sparse_pair_contact_rows_kernel`); the dense part is a
-            :class:`.response_operator.DenseJY` build of the dense group.
+            dense response build of the dense group.
         diagonal: Each row's sparse term added to its dense diagonal (:func:`sparse_pair_diagonal_kernel`).
         row_response: One compact-boundary row's dense part, slots and diagonal (:func:`sparse_pair_row_response`),
             the response of the compact contact producer.
@@ -913,15 +914,38 @@ SPARSE_PAIR = SparsePairBuild(
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Bilateral pre-elimination: the Schur transform of a DenseJY build
+# Bilateral pre-elimination: the Schur transform of the packed rows
 # ---------------------------------------------------------------------------------------------------------------------
 #
-# An articulation's selected bilateral rows (mimic, connect) form a block ``B``. After the DenseJY build gives every
-# row ``J_i`` and ``Y_i = H^-1 J_i^T``, the transform factors ``S = J_B Y_B + R`` (``R`` relative to ``S``'s diagonal)
-# and replaces every other row's response by ``Y'_i = Y_i - Y_B S^-1 (J_B Y_i)``, so that ``J_B Y'_i ~ 0``: a sweep's
-# impulses keep the closures, and the diagonals formed from ``J`` and ``Y'`` are the closed-loop effective masses.
-# The velocity is projected once, ``v -= Y_B S^-1 (J_B v + b_B)``, in place of the eliminated rows' Baumgarte work.
-# The block's rows keep their responses. Rows are a size group's (``J_group``, ``Y_group``), one articulation each.
+# An articulation's selected bilateral rows (mimic, connect) form a block ``B``. On the packed rows (:mod:`.packed_rows`,
+# ``Z_i = L^-1 P J_i^T`` on each side) the transform factors ``S = Z_B^T Z_B + R`` (``R`` relative to ``S``'s diagonal)
+# and replaces every other row's side on the articulation by ``Z'_i = Z_i - Z_B S^-1 (Z_B^T Z_i)``, so that
+# ``Z_B^T Z'_i ~ 0``: a sweep's impulses, applied as ``u += Z'_i delta``, keep the closures, and the diagonals
+# ``|Z'_i|^2 + cfm`` are the closed-loop effective masses. The velocity is projected once, ``v -= P^T L^-T Z_B S^-1
+# (J_B v + b_B)``, in place of the eliminated rows' Baumgarte work; then ``Z_B^T u = J_B v = -b_B``, so a corrected row
+# reads ``Z'_i^T u = J_i v + y_i^T b_B`` (``y_i = S^-1 Z_B^T Z_i``), which its right-hand side takes back:
+# ``rhs_i -= y_i^T b_B``. The block's rows keep theirs. A block row has one side, its articulation.
+
+
+@wp.func
+def packed_side(sides: wp.vec2i, art: int, dense: int, offset: int, response_dofs: wp.array[int]) -> int:
+    """The first packed entry of ``art``'s coordinates in a row of ``sides`` (:mod:`.packed_rows`), -1 off them."""
+    if sides[0] == art:
+        return wp.where(dense != 0, offset, 0)
+    if sides[1] == art:
+        return wp.where(dense != 0, offset, response_dofs[sides[0]])
+    return -1
+
+
+@wp.func
+def packed_product(
+    Z: wp.array3d[float], world: int, row_a: int, first_a: int, row_b: int, first_b: int, n_dofs: int
+) -> float:
+    """``Z_a . Z_b`` over an articulation's ``n_dofs`` packed entries (from ``first_a``, ``first_b``), in order."""
+    acc = float(0.0)
+    for e in range(n_dofs):
+        acc += Z[world, row_a, first_a + e] * Z[world, row_b, first_b + e]
+    return acc
 
 
 @wp.func
@@ -932,28 +956,6 @@ def bilateral_product(
     acc = start
     for d in range(n_dofs):
         acc += J[group, slot, d] * x[group, row, d]
-    return acc
-
-
-@wp.func
-def bilateral_velocity(
-    J: wp.array3d[float], group: int, slot: int, velocity: wp.array[float], first: int, n_dofs: int, start: float
-) -> float:
-    """``start + J_slot v`` over the articulation's ``n_dofs`` coordinates from ``first``, in order."""
-    acc = start
-    for d in range(n_dofs):
-        acc += J[group, slot, d] * velocity[first + d]
-    return acc
-
-
-@wp.func
-def bilateral_response(
-    Y: wp.array3d[float], group: int, slots: wp.array[int], base: int, m: int, z: _preelim_vec, d: int
-) -> float:
-    """``(Y_B z)_d``: from zero, each block row's response at coordinate ``d`` times its weight, in block order."""
-    acc = float(0.0)
-    for p in range(m):
-        acc += Y[group, slots[base + p], d] * z[p]
     return acc
 
 
@@ -1007,6 +1009,9 @@ def bilateral_rows(
 def bilateral_setup_kernel(
     preelim: Preelim,
     group_to_art: wp.array[int],
+    art_to_world: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    dense: int,
     mimic_slot: wp.array[int],
     mimic_art_start: wp.array[int],
     mimic_art_list: wp.array[int],
@@ -1015,12 +1020,12 @@ def bilateral_setup_kernel(
     connect_art: wp.array[int],
     n_connect: int,
     J_group: wp.array3d[float],
-    Y_group: wp.array3d[float],
+    packed_Z: wp.array3d[float],
     n_dofs: int,
 ):
-    """Select an articulation's block (:func:`bilateral_rows`), form ``S = J_B Y_B`` and factor ``S + R``.
+    """Select an articulation's block (:func:`bilateral_rows`), form ``S = Z_B^T Z_B`` and factor ``S + R``.
 
-    One thread per articulation of the size group, after the DenseJY build. ``R_pp = reg_rel S_pp + reg_floor``:
+    One thread per articulation of the size group, after the packed rows' build. ``R_pp = reg_rel S_pp + reg_floor``:
     relative to the row's own diagonal, so that a near-redundant closure axis (float32 cancellation noise around a
     zero pivot) stays positive at any mass scale; the redundant axis turns ``reg_rel`` soft.
     """
@@ -1048,12 +1053,14 @@ def bilateral_setup_kernel(
     preelim.nB[pe] = m
     if m == 0:
         return
+    world = art_to_world[art]
+    first = wp.where(dense != 0, articulation_world_dof_offset[art], 0)
     s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
     for p in range(m):
         sp = preelim.slots[base + p]
         for q in range(m):
-            preelim.S[s_base + dense_index(m, p, q)] = bilateral_product(
-                J_group, group, sp, Y_group, preelim.slots[base + q], n_dofs, 0.0
+            preelim.S[s_base + dense_index(m, p, q)] = packed_product(
+                packed_Z, world, sp, first, preelim.slots[base + q], first, n_dofs
             )
     for p in range(m):
         preelim.reg[base + p] = preelim.reg_rel * preelim.S[s_base + dense_index(m, p, p)] + preelim.reg_floor
@@ -1063,117 +1070,140 @@ def bilateral_setup_kernel(
 @wp.kernel(enable_backward=False)
 def bilateral_correct_kernel(
     preelim: Preelim,
+    row_sides: wp.array2d[wp.vec2i],
+    response_dofs: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    dense: int,
+    constraint_count: wp.array[int],
+    local_solve_owner: wp.array[int],
+    world_row_cfm: wp.array2d[float],
+    packed_dof: wp.array3d[int],
+    # outputs
+    packed_Z: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    world_diag: wp.array2d[float],
+):
+    """Correct every other row's sides on the blocks' articulations, ``Z'_i = Z_i - Z_B y_i`` with ``y_i = S^-1 Z_B^T
+    Z_i``, take ``y_i^T b_B`` back from its right-hand side and store its diagonal ``|Z'_i|^2 + cfm`` (the squares
+    summed in entry order; in the worlds the general solver owns). One thread per world row, after the right-hand
+    sides are final.
+
+    A side the block does not see (``Z_B^T Z_i`` exactly zero) keeps its entries; the block's rows keep theirs for the
+    projection.
+    """
+    tid = wp.tid()
+    capacity = row_sides.shape[1]
+    world = tid // capacity
+    row = tid - world * capacity
+    if world >= constraint_count.shape[0] or row >= constraint_count[world]:
+        return
+    sides = row_sides[world, row]
+    corrected = int(0)
+    for side in range(2):
+        art = sides[side]
+        if art < 0:
+            continue
+        pe = preelim.art_to_preelim[art]
+        if pe < 0:
+            continue
+        m = preelim.nB[pe]
+        base = pe * PREELIM_MAX_ROWS
+        for p in range(m):
+            if preelim.slots[base + p] == row:
+                return
+        n_dofs = response_dofs[art]
+        offset = articulation_world_dof_offset[art]
+        first = packed_side(sides, art, dense, offset, response_dofs)
+        block = wp.where(dense != 0, offset, 0)
+        x = _preelim_vec()
+        nonzero = int(0)
+        for p in range(m):
+            acc = packed_product(packed_Z, world, preelim.slots[base + p], block, row, first, n_dofs)
+            x[p] = acc
+            if acc != 0.0:
+                nonzero = 1
+        if nonzero == 0:
+            continue
+        y = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, x)
+        for e in range(n_dofs):
+            acc = float(0.0)
+            for p in range(m):
+                acc += packed_Z[world, preelim.slots[base + p], block + e] * y[p]
+            packed_Z[world, row, first + e] -= acc
+        fold = float(0.0)
+        for p in range(m):
+            fold += y[p] * world_rhs[world, preelim.slots[base + p]]
+        world_rhs[world, row] -= fold
+        corrected = 1
+    if corrected != 0 and local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
+        norm = float(0.0)
+        for e in range(packed_Z.shape[2]):
+            if packed_dof[world, row, e] >= 0:
+                z = packed_Z[world, row, e]
+                norm += z * z
+        world_diag[world, row] = norm + world_row_cfm[world, row]
+
+
+@wp.kernel(enable_backward=False)
+def bilateral_weights_kernel(
+    preelim: Preelim,
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
-    constraint_count: wp.array[int],
-    J_group: wp.array3d[float],
+    articulation_dof_start: wp.array[int],
+    articulation_world_dof_offset: wp.array[int],
+    dense: int,
+    packed_J: wp.array3d[float],
+    world_rhs: wp.array2d[float],
+    velocity: wp.array[float],
     n_dofs: int,
-    max_constraints: int,
-    n_arts: int,
-    # outputs
-    Y_group: wp.array3d[float],
 ):
-    """Correct every other row's response, ``Y_i -= Y_B S^-1 (J_B Y_i)``, one thread per (articulation, row).
-
-    A row the block does not see (``J_B Y_i`` exactly zero: another articulation's row) keeps its response; the
-    block's rows keep theirs for the projection.
-    """
-    idx = wp.tid()
-    group = idx // max_constraints
-    i = idx % max_constraints
-    if group >= n_arts:
-        return
+    """The projection's block weights ``y = S^-1 (J_B v + b_B)`` (``preelim.weight``), one thread per articulation of
+    the size group; :func:`.packed_rows.project_kernel` then applies ``-Z_B y``."""
+    group = wp.tid()
     art = group_to_art[group]
     pe = preelim.art_to_preelim[art]
     if pe < 0:
         return
-    world = art_to_world[art]
-    if i >= constraint_count[world]:
-        return
-    base = pe * PREELIM_MAX_ROWS
     m = preelim.nB[pe]
     if m == 0:
         return
-    for p in range(m):
-        if preelim.slots[base + p] == i:
-            return
-    w = _preelim_vec()
-    nonzero = int(0)
-    for p in range(m):
-        acc = bilateral_product(J_group, group, preelim.slots[base + p], Y_group, i, n_dofs, 0.0)
-        w[p] = acc
-        if acc != 0.0:
-            nonzero = 1
-    if nonzero == 0:
-        return
-    z = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, w)
-    for d in range(n_dofs):
-        Y_group[group, i, d] -= bilateral_response(Y_group, group, preelim.slots, base, m, z, d)
-
-
-@wp.kernel(enable_backward=False)
-def bilateral_project_kernel(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    art_to_preelim: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    preelim_slots: wp.array[int],
-    preelim_nB: wp.array[int],
-    LS: wp.array[float],
-    J_group: wp.array3d[float],
-    Y_group: wp.array3d[float],
-    world_rhs: wp.array2d[float],
-    n_dofs: int,
-    # outputs
-    v_out: wp.array[float],
-):
-    """Project the velocity once, ``v -= Y_B S^-1 (J_B v + b_B)``, one thread per articulation (its own window).
-
-    After it ``J_B v = -b_B``, which the sweeps keep: every corrected response has ``J_B Y'_i ~ 0``. A coordinate
-    whose correction is exactly zero is left as it is.
-    """
-    group = wp.tid()
-    art = group_to_art[group]
-    pe = art_to_preelim[art]
-    if pe < 0:
-        return
-    m = preelim_nB[pe]
-    if m == 0:
-        return
     base = pe * PREELIM_MAX_ROWS
     world = art_to_world[art]
-    dof_start = articulation_dof_start[art]
+    start = articulation_dof_start[art]
+    first = wp.where(dense != 0, articulation_world_dof_offset[art], 0)
     r = _preelim_vec()
     for p in range(m):
-        sp = preelim_slots[base + p]
-        r[p] = bilateral_velocity(J_group, group, sp, v_out, dof_start, n_dofs, world_rhs[world, sp])
-    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
-    for d in range(n_dofs):
-        acc = bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
-        if acc != 0.0:
-            v_out[dof_start + d] -= acc
+        slot = preelim.slots[base + p]
+        acc = world_rhs[world, slot]
+        for e in range(n_dofs):
+            acc += packed_J[world, slot, first + e] * velocity[start + e]
+        r[p] = acc
+    y = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
+    for p in range(m):
+        preelim.weight[base + p] = y[p]
 
 
 @dataclasses.dataclass(frozen=True)
 class BilateralElimination:
-    """The Schur transform of a :class:`.response_operator.DenseJY` build by a bilateral block, and its projection.
+    """The Schur transform of the packed rows by a bilateral block, and its projection.
 
     Attributes:
         setup: Select, form and factor each articulation's block (:func:`bilateral_setup_kernel`).
-        correct: Correct the other rows' responses (:func:`bilateral_correct_kernel`), before their diagonals.
-        project: Project the velocity onto the block's constraints (:func:`bilateral_project_kernel`), once after
-            the velocity is seeded with the predictor.
+        correct: Correct the other rows and their right-hand sides and diagonals (:func:`bilateral_correct_kernel`),
+            once the right-hand sides are final.
+        weights: The projection's block weights (:func:`bilateral_weights_kernel`), once after the velocity is seeded
+            with the predictor; :func:`.packed_rows.project_kernel` applies them.
     """
 
     setup: wp.Kernel
     correct: wp.Kernel
-    project: wp.Kernel
+    weights: wp.Kernel
 
 
 ELIMINATION = BilateralElimination(
-    setup=bilateral_setup_kernel, correct=bilateral_correct_kernel, project=bilateral_project_kernel
+    setup=bilateral_setup_kernel, correct=bilateral_correct_kernel, weights=bilateral_weights_kernel
 )
-"""The bilateral pre-elimination of a DenseJY build."""
+"""The bilateral pre-elimination of the packed rows."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2364,15 +2394,11 @@ SPARSE_FACTOR = SparseFactorBuild(
 #
 # A paired world holds one articulation (``P`` coordinates, its primary group) and one free body (``S = 6``, its
 # secondary group), each a diagonal block of the leaf-first ``P H P^T = L L^T``. Its rows' factor rows
-# ``z = L^-1 P j`` (``Y_world = z``, ``A_ii = |z|^2 + cfm`` in a world without free-body rows) or physical rows
-# ``y = P^T L^-T z`` (``A_ii = j y + cfm`` otherwise) are the DenseJY ``("response", "pairs")`` build
-# (:func:`.response_builds_dense.response_pairs_kernel`). Physical rows move into the held form ``L^T P y`` where a
-# world qualifies as independent components (:func:`paired_components_kernel`).
+# ``z = L^-1 P j`` are its packed rows at their world coordinates (:mod:`.packed_rows`, ``A_ii = |z|^2 + cfm``).
 #
 # A paired world's qualification as independent components: every current row of the world is valid and touches
 # only its own component (dense rows the articulation's coordinates, free-body rows the body's), its pair structure
-# intact; a qualified world's rows move into the held form (``$CONVERT``) and its selector turns negative (zero: no
-# free-body rows, positive: the mixed fallback).
+# intact; a qualified world's selector turns negative (zero: no free-body rows, positive: the mixed fallback).
 _PAIRED_COMPONENTS = r"""
 #if !defined(__CUDA_ARCH__)
     if (logical_lane != 0) return;
@@ -2450,47 +2476,24 @@ _PAIRED_COMPONENTS = r"""
                     && wp::isfinite(data.mf_Z_b.data[r * $SECONDARY + d]);
             }
         }
-        if (ALL(valid != 0)) {
-            for (int row = WARP; row < m; row += WARPS) {
-                const int base = (world * M + row) * $WORLD + po;
-$CONVERT
-            }
-            if (LANE == 0) data.selector.data[world] = -1;
-        }
+        if (ALL(valid != 0) && LANE == 0) data.selector.data[world] = -1;
     }
 """
 
 
 @cache
 def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS) -> wp.Kernel:
-    """Qualify each paired world's rows as independent components and move a qualified world's dense rows into the
-    held form ``z = L^T P y`` (:meth:`.FactorRows.transposed` of the primary factor, a lane per coordinate of a warp
-    per row; the CPU converts serially). A block of :data:`.paired_components.PAIRED_COMPONENT_THREADS` threads per
-    worker strides over the worlds; the signed selector is the dispatch's private metadata."""
+    """Qualify each paired world's rows as independent components. A block of
+    :data:`.paired_components.PAIRED_COMPONENT_THREADS` threads per worker strides over the worlds; the signed selector
+    is the dispatch's private metadata."""
     if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
         raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
     P = int(primary_size)
-    held = FactorRows(P, (FactorComponent(P, "0", "lane", "data.L", f"group * {P} * {P}"),), Lanes(32, "lane"))
-    convert = f"""#if defined(__CUDA_ARCH__)
-                const int lane = LANE & 31;
-                const float y = lane < {P} ? data.Y.data[base + lane] : 0.0f;
-{held.transposed("y", "z", " " * 16)}
-                if (lane < {P}) data.Y.data[base + lane] = z;
-#else
-                float y[{P}];
-                for (int k = 0; k < {P}; ++k) y[k] = data.Y.data[base + k];
-                for (int d = 0; d < {P}; ++d) {{
-                    float z = 0.0f;
-                    for (int k = 0; k <= d; ++k)
-                        z += {held.components[0].element(f"({P}-1-k)", f"({P}-1-d)")} * y[k];
-                    data.Y.data[base + d] = z;
-                }}
-#endif"""
     source = kernel_template.substitute(
-        _PAIRED_COMPONENTS, PRIMARY=P, SECONDARY=secondary_size, WORLD=P + secondary_size, CONVERT=convert
+        _PAIRED_COMPONENTS, PRIMARY=P, SECONDARY=secondary_size, WORLD=P + secondary_size
     )
     return KernelTemplate(
-        f"paired_components_held_{P}_{secondary_size}",
+        f"paired_components_{P}_{secondary_size}",
         (("workers", int), ("data", PairedComponentData)),
         source,
         # A lane group per worker: its worker index and the thread's lane in it.
@@ -2503,11 +2506,11 @@ def paired_components_kernel(primary_size: int, secondary_size: int = FREE_BODY_
 
 @dataclasses.dataclass(frozen=True)
 class FactorRowsBuild:
-    """The build of a pair's held rows (:class:`.response_operator.FactorRows`); the rows themselves are the
-    DenseJY ``("response", "pairs")`` build (:func:`.response_builds_dense.response_pairs_kernel`).
+    """The build of a pair's factor rows (:class:`.response_operator.FactorRows`): the rows themselves are the packed
+    rows at their world coordinates (:mod:`.packed_rows`).
 
     Attributes:
-        components: The factory of the qualification and held-form conversion (:func:`paired_components_kernel`).
+        components: The factory of the qualification (:func:`paired_components_kernel`).
     """
 
     components: Callable[..., wp.Kernel]

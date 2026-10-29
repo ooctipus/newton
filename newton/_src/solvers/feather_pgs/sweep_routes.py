@@ -21,7 +21,7 @@ from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
-from .response_operator import Block, DenseJY, DenseSupport, FreeBodyZ, Lanes, Velocity
+from .response_operator import Block, CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, block_argmax, bound, sweep_exit
 from .staging import Buffer, Staging, arch_budget
@@ -38,6 +38,7 @@ from .sweep import (
     WorldRows,
     change_vote,
     dense_rows_block,
+    dense_tier_world,
     end_sweep,
     free_body_rows_block,
     fused_clamp_pass,
@@ -86,8 +87,9 @@ MF_GS_ABI = kernel_template.params(
     ("world_diag", wp.array2d[float]),
     ("world_row_w", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
-    ("J_world", wp.array3d[float]),
-    ("Y_world", wp.array3d[float]),
+    ("packed_dof", wp.array3d[int]),
+    ("packed_Z", wp.array3d[float]),
+    ("row_sides", wp.array2d[wp.vec2i]),
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
@@ -119,18 +121,16 @@ MF_GS_ABI = kernel_template.params(
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
 
 
-DENSE_SUPPORT = DenseSupport()
-"""Where a matrix-free sweep keeps its dense rows' support (:class:`.response_operator.DenseSupport`)."""
+class FactorCoordinates:
+    """The articulations a matrix-free sweep holds in factor coordinates, and their conversions (native).
 
-
-class FreeBodyCoordinates:
-    """The free bodies a matrix-free sweep holds in factor coordinates, and their conversions (native).
-
-    The bodies of the launch's free-body rows are marked at their first world coordinate in a bitmap
-    (``s_mf_bodies``), enter factor coordinates ``u = L^T v`` once the velocity is staged and leave them, ``v =
-    L^-T u``, before it is written back (:meth:`.FreeBodyZ.enter`, :meth:`.FreeBodyZ.leave`). The world's dense rows
-    read physical coordinates, so a body they touch too (``s_mf_shared``) leaves around them in every sweep. A
-    body's factor is ``factors.dof_factor`` of its first global coordinate.
+    The articulations the launch's rows touch are marked at their first world coordinate in a bitmap
+    (``s_factor_marks``): each free body of its free-body rows and each side of its dense rows
+    (:func:`.dense_rows.row_sides`). Each enters factor coordinates ``u = L^T P v`` once the velocity is staged and
+    leaves them, ``v = P^T L^-T u``, before it is written back (:class:`.CholeskySolve`'s ``enter`` and ``leave``), so
+    every row the sweep visits reads and updates ``u``: ``Z^T u`` and ``u += Z delta``. An articulation's factor is
+    found from its first global coordinate (:class:`.kernels.BodyFactors`' ``first_art``, ``size`` and ``address``); a
+    free body's six coordinates take the unrolled solves.
     """
 
     op = FreeBodyZ()
@@ -141,24 +141,16 @@ class FreeBodyCoordinates:
 
     @classmethod
     def buffers(cls, dofs: int) -> tuple[Buffer, ...]:
-        words = cls.words(dofs)
-        return (
-            Buffer("s_mf_bodies", "unsigned", words),
-            Buffer("s_mf_shared", "unsigned", words),
-            Buffer("s_mf_any_shared", "int", 1),
-        )
+        return (Buffer("s_factor_marks", "unsigned", cls.words(dofs)),)
 
     def factor(self, first: str) -> str:
-        """The native factor index of the free body whose first world coordinate is ``first``."""
+        """The native index in ``factors.L`` of the free body whose first world coordinate is ``first``."""
         return f"{self.op.factors}.dof_factor.data[world_dof_indices.data[dof_map_base + {first}]]"
 
     @classmethod
     def clear(cls, dofs: int, lane: str) -> str:
-        """Clear the bitmaps (the first warp, before the loads' barrier)."""
-        return (
-            f"for (int w = {lane}; w < {cls.words(dofs)}; w += 32) {{ s_mf_bodies[w] = 0u; s_mf_shared[w] = 0u; }}\n"
-            f"if ({lane} == 0) s_mf_any_shared[0] = 0;"
-        )
+        """Clear the bitmap (the first warp, before the loads' barrier)."""
+        return f"for (int w = {lane}; w < {cls.words(dofs)}; w += 32) s_factor_marks[w] = 0u;"
 
     @staticmethod
     def mark(first_row: str, rows: str, thread: str, threads: str) -> str:
@@ -166,62 +158,63 @@ class FreeBodyCoordinates:
         return f"""for (int i = {first_row} + {thread}; i < {rows}; i += {threads}) {{
     const int dofs = mf_meta.data[off_meta + i * 4];
     const int da = dofs >> 16, db = (dofs << 16) >> 16;
-    if (da >= 0) atomicOr(&s_mf_bodies[da >> 5], 1u << (da & 31));
-    if (db >= 0) atomicOr(&s_mf_bodies[db >> 5], 1u << (db & 31));
+    if (da >= 0) atomicOr(&s_factor_marks[da >> 5], 1u << (da & 31));
+    if (db >= 0) atomicOr(&s_factor_marks[db >> 5], 1u << (db & 31));
 }}"""
 
-    @classmethod
-    def _each(cls, bitmap: str, dofs: int, thread: str, threads: str, body: str) -> str:
-        """``body`` on each marked first coordinate ``d`` of ``bitmap``, a thread per word."""
-        return f"""for (int w = {thread}; w < {cls.words(dofs)}; w += {threads}) {{
-    unsigned bits = {bitmap}[w];
-    while (bits != 0u) {{
-        const int d = (w << 5) + __ffs(bits) - 1;
-        bits &= bits - 1u;
-{indent(body, "        ")}
+    def mark_sides(self, rows: str, thread: str, threads: str) -> str:
+        """Mark the sides of the dense rows ``[0, rows)`` at their first world coordinates."""
+        return f"""for (int i = {thread}; i < {rows}; i += {threads}) {{
+    const wp::vec2i sides = row_sides.data[off_dense + i];
+    for (int side = 0; side < 2; ++side) {{
+        if (sides[side] < 0) continue;
+        const int d = {self.op.factors}.world_offset.data[sides[side]];
+        atomicOr(&s_factor_marks[d >> 5], 1u << (d & 31));
     }}
 }}"""
 
-    @classmethod
-    def shared(cls, dofs: int, touched: str, thread: str, threads: str, sync: str) -> str:
-        """Mark each body some dense row touches as shared (``touched``: native, true when coordinate ``c`` is)."""
-        body = f"""bool touched = false;
-for (int c = d; c < d + 6 && !touched; ++c) touched = {touched};
-if (touched) {{
-    s_mf_shared[w] |= 1u << (d & 31);
-    s_mf_any_shared[0] = 1;
-}}"""
-        return f"{cls._each('s_mf_bodies', dofs, thread, threads, body)}\n{sync}"
-
     def convert_all(self, dofs: int, thread: str, threads: str, sync: str, *, enter: bool) -> str:
-        """Every marked body enters (or leaves) factor coordinates, a thread per bitmap word."""
-        action = self.op.enter if enter else self.op.leave
-        body = f"const int factor = {self.factor('d')};\n{action(lambda k: f's_v[d + {k}]', 'factor')}"
-        return f"{self._each('s_mf_bodies', dofs, thread, threads, body)}\n{sync}"
+        """Every marked articulation enters (or leaves) factor coordinates in place, a thread per bitmap word."""
+        factors = self.op.factors
+        action = "enter" if enter else "leave"
 
-    def convert_shared(self, dofs: int, lane: str, *, enter: bool) -> str:
-        """The shared bodies enter (or leave) factor coordinates on the first warp, between warp barriers."""
-        action = self.op.enter if enter else self.op.leave
-        body = f"const int factor = {self.factor('d')};\n{action(lambda k: f's_v[d + {k}]', 'factor')}"
-        return f"""if (mf_shared) {{
-    SYNC();
-{indent(self._each("s_mf_shared", dofs, lane, "32", body), "    ")}
-    SYNC();
-}}"""
+        def solve(size):
+            if size == 6:
+                return getattr(CholeskySolve(6, "factor", unroll=True), action)
+            return getattr(CholeskySolve("size", "factor"), action)
+
+        coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
+        return f"""for (int w = {thread}; w < {self.words(dofs)}; w += {threads}) {{
+    unsigned bits = s_factor_marks[w];
+    while (bits != 0u) {{
+        const int d = (w << 5) + __ffs(bits) - 1;
+        bits &= bits - 1u;
+        const int art = {factors}.first_art.data[world_dof_indices.data[dof_map_base + d]];
+        const int size = {factors}.size.data[art];
+        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
+        if (size == 6) {{
+{indent(solve(6)(coordinates, coordinates), "            ")}
+        }} else {{
+{indent(solve(0)(coordinates, coordinates), "            ")}
+        }}
+    }}
+}}
+{sync}"""
 
 
-FREE_BODY_COORDINATES = FreeBodyCoordinates()
-"""Where a matrix-free sweep keeps its free bodies' coordinates (:class:`FreeBodyCoordinates`)."""
+FACTOR_COORDINATES = FactorCoordinates()
+"""Where a matrix-free sweep keeps its articulations' coordinates (:class:`FactorCoordinates`)."""
 
 
-def dense_support(max_world_dofs: int, lanes: Lanes = Lanes(32)) -> DenseSupport | None:
-    """The dense rows' support of a sweep over worlds of ``max_world_dofs`` coordinates, or None.
+def packed_operator(support: int, lanes: Lanes) -> SparseFactor:
+    """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
+    explicit world coordinates and values from the world's first row (``packed_base``), over the factor velocity the
+    sweep stages (``s_v``)."""
 
-    The support skips a lane's coordinates that no row touches, so it can only pay when a lane owns more than one
-    coordinate. A world of at most ``lanes.width`` coordinates keeps the dense loop, whose software pipeline loads the
-    next row's entries while a row is solved (the support's loop reads them at use).
-    """
-    return DENSE_SUPPORT if int(max_world_dofs) > lanes.width else None
+    def at(array):
+        return lambda row, entry: f"{array}.data[packed_base + ({row}) * {int(support)} + ({entry})]"
+
+    return SparseFactor(int(support), at("packed_dof"), at("packed_Z"), lanes, velocity=Velocity("s_v"))
 
 
 MAPPINGS = ("warp", "colored")
@@ -565,14 +558,12 @@ def mf_gs_staging(
         colored = (Buffer("s_color_offset", "int", COLOR_CHUNK + 1),)
         if traces:
             colored += block_argmax(warps, warp="warp", lane="lane")[1]
-    support = dense_support(max_world_dofs)
     return Staging(
         (
             Buffer("s_v", "float", max_world_dofs),
-            *FREE_BODY_COORDINATES.buffers(max_world_dofs),
+            *FACTOR_COORDINATES.buffers(max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
-            *(support.buffers(max_world_dofs) if support is not None else ()),
             *colored,
         ),
         threads=COLORED_THREADS if mapping == "colored" else 32,
@@ -584,6 +575,7 @@ def mf_gs_source(
     mf_max_constraints: int,
     max_world_dofs: int,
     *,
+    max_row_dofs: int | None = None,
     mapping: str = "warp",
     colored_worlds: bool = False,
     shared_metadata: bool = True,
@@ -600,9 +592,10 @@ def mf_gs_source(
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
-    """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:class:`.DenseJY`) and its
-    free-body rows (:class:`.FreeBodyZ`, its bodies in factor coordinates: :class:`FreeBodyCoordinates`), then its
-    end-of-sweep passes.
+    """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
+    whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
+    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity in factor coordinates
+    (:class:`FactorCoordinates`).
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
@@ -629,6 +622,7 @@ def mf_gs_source(
     _validate_dense_metadata_encoding(max_constraints)
     accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
+    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     lanes = Lanes(32)
     laws = RowLaws(
         drive=has_drive_rows,
@@ -646,9 +640,8 @@ def mf_gs_source(
         lanes=lanes,
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
-    support = dense_support(D, lanes)
-    dense_op = DenseJY(D, lanes, support=support)
-    bodies = FREE_BODY_COORDINATES
+    dense_op = packed_operator(max_row_dofs, lanes)
+    bodies = FACTOR_COORDINATES
     free_op = FreeBodyZ(lanes, factor=bodies.factor)
     staging = mf_gs_staging(
         M_D,
@@ -715,12 +708,7 @@ def mf_gs_source(
         + "\n        }"
     )
     if contact_torsion:
-        # The torsion pass applies dense rows: their bodies leave factor coordinates around it.
-        passes.append(
-            indent(bodies.convert_shared(D, "lane", enter=False), "        ")
-            + torque_sweep_source(D, solve_policy)
-            + indent(bodies.convert_shared(D, "lane", enter=True), "        ")
-        )
+        passes.append(torque_sweep_source(dense_op, solve_policy))
 
     if colored:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
@@ -756,41 +744,11 @@ def mf_gs_source(
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "32")
     sync = "__syncthreads();" if colored else "SYNC();"
-    # The dense rows' support: the coordinates their J or Y touch, from rows [0, m_dense) (every pass reads them),
-    # which also flags the free bodies the dense rows share.
-    if support is not None:
-        shared = support.build(
-            dofs=D,
-            rows="m_dense",
-            J="J_world",
-            Y="Y_world",
-            base="jy_world_base",
-            thread=thread,
-            threads=threads,
-            first_warp="warp == 0" if colored else "true",
-            lane="lane",
-            sync=sync,
-            marked=bodies.shared(D, f"(({support.bits}[c >> 5] >> (c & 31)) & 1u) != 0u", thread, threads, sync),
-        )
-    else:
-        scan = (
-            "[&]() { for (int r = 0; r < m_dense; ++r) "
-            f"if (J_world.data[jy_world_base + r * {D} + c] != 0.0f || Y_world.data[jy_world_base + r * {D} + c] "
-            "!= 0.0f) return true; return false; }()"
-        )
-        shared = bodies.shared(D, scan, thread, threads, sync)
     metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF)) if colored else ""
-    # The launch's prologue after the loads: the dense rows' support and shared bodies, the free bodies entering
-    # factor coordinates, and the colored units' pair metrics.
+    # The launch's prologue after the marks: the marked articulations entering factor coordinates, and the colored
+    # units' pair metrics.
     prologue = "\n".join(
-        part
-        for part in (
-            shared,
-            bodies.convert_all(D, thread, threads, sync, enter=True),
-            "    const bool mf_shared = s_mf_any_shared[0] != 0;",
-            metric_build,
-        )
-        if part
+        part for part in (bodies.convert_all(D, thread, threads, sync, enter=True), metric_build) if part
     )
     body = f"""{head}
 
@@ -821,7 +779,7 @@ def mf_gs_source(
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;{component}
-    int jy_world_base = world * {M_D} * {D};
+    const size_t packed_base = (size_t)world * {M_D * int(max_row_dofs)};
     int mf6_base = world * {M_MF} * 6;
     int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;{offsets}
 
@@ -842,21 +800,19 @@ def mf_gs_source(
     }}
 {indent(bodies.clear(D, "lane"), "    ")}
 {end_first_warp}    {barrier}
-    // The bodies of the free-body rows this launch visits.
+    // The articulations this launch's rows touch: the bodies of its free-body rows, the sides of every dense row.
     if (row_phase != 3 && row_phase != 6) {{
 {indent(bodies.mark("mf_load_lo", "m_mf", thread, threads), "        ")}
     }}
+{indent(bodies.mark_sides("m_dense", thread, threads), "    ")}
     {barrier}
 {prologue}
-{dense_op.pipeline_registers("    ")}
 
     for (int iter = 0; iter < iterations; iter++) {{
         int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 
-{first_warp}{indent(bodies.convert_shared(D, "lane", enter=False), "        ")}
-{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
-{indent(bodies.convert_shared(D, "lane", enter=True), "        ")}
+{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
 {end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
 {free_phase}
@@ -892,6 +848,7 @@ def mf_gs_kernel(
     max_world_dofs: int,
     device_arch: str,
     *,
+    max_row_dofs: int | None = None,
     mapping: str = "warp",
     colored_worlds: bool = False,
     shared_metadata: bool = True,
@@ -912,10 +869,12 @@ def mf_gs_kernel(
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches
     32 threads per world item and takes :data:`MF_GS_ABI` (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the
     colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`."""
+    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     snippet, staging = mf_gs_source(
         max_constraints,
         mf_max_constraints,
         max_world_dofs,
+        max_row_dofs=max_row_dofs,
         mapping=mapping,
         colored_worlds=colored_worlds,
         shared_metadata=shared_metadata,
@@ -936,6 +895,7 @@ def mf_gs_kernel(
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
     name = (
         f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
+        f"_s{max_row_dofs}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
         + velocity_limit_law_suffix(velocity_limit_law)
         + ("_fvl" if fuse_vel_limits else "")
@@ -962,11 +922,74 @@ def mf_gs_kernel(
     ).kernel()
 
 
+def packed_block(support: int, rows: str, stride: int, pad: str) -> str:
+    """Native statements: the column-major response block ``s_A[i * stride + r] = Z_r . Z_i`` of the packed rows
+    ``[0, rows)`` and their residuals ``s_res[i] = s_rhs[i] + Z_i . u`` (the velocity ``s_v`` in factor coordinates),
+    lane-strided. An entry pairs the two rows' entries of one coordinate, summed in the second row's entry order from
+    zero; a row's residual sums its entries in order from its right-hand side."""
+    lines = [
+        f"for (int pair = lane; pair < ({rows}) * ({rows}); pair += 32) {{",
+        f"    const int i = pair / ({rows});",
+        f"    const int r = pair - i * ({rows});",
+        f"    const int* dof_i = &packed_dof.data[packed_base + (size_t)i * {support}];",
+        f"    const int* dof_r = &packed_dof.data[packed_base + (size_t)r * {support}];",
+        f"    const float* z_i = &packed_Z.data[packed_base + (size_t)i * {support}];",
+        f"    const float* z_r = &packed_Z.data[packed_base + (size_t)r * {support}];",
+        "    float a = 0.0f;",
+        f"    for (int e = 0; e < {support}; ++e) {{",
+        "        const int d = dof_i[e];",
+        "        if (d < 0) continue;",
+        f"        for (int f = 0; f < {support}; ++f) {{",
+        "            if (dof_r[f] == d) {",
+        "                a += z_r[f] * z_i[e];",
+        "                break;",
+        "            }",
+        "        }",
+        "    }",
+        f"    s_A[i * {stride} + r] = a;",
+        "}",
+        f"for (int i = lane; i < {rows}; i += 32) {{",
+        "    float r = s_rhs[i];",
+        f"    for (int e = 0; e < {support}; ++e) {{",
+        f"        const int d = packed_dof.data[packed_base + (size_t)i * {support} + e];",
+        f"        if (d >= 0) r += packed_Z.data[packed_base + (size_t)i * {support} + e] * s_v[d];",
+        "    }",
+        "    s_res[i] = r;",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def packed_publish(support: int, rows: str, dofs: int, pad: str) -> str:
+    """Native statements: ``u += Z_i applied_i`` of the packed rows ``[0, rows)`` in row order (a row's coordinates
+    are distinct, so its lanes never collide), the marked articulations leave factor coordinates
+    (:class:`FactorCoordinates`), and the world's velocity is written through its coordinate map."""
+    lines = [
+        f"for (int i = 0; i < {rows}; ++i) {{",
+        "    const float a = s_app[i];",
+        "    if (a != 0.0f) {",
+        f"        for (int e = lane; e < {support}; e += 32) {{",
+        f"            const int d = packed_dof.data[packed_base + (size_t)i * {support} + e];",
+        f"            if (d >= 0) s_v[d] += packed_Z.data[packed_base + (size_t)i * {support} + e] * a;",
+        "        }",
+        "    }",
+        "    SYNC();",
+        "}",
+        FACTOR_COORDINATES.convert_all(dofs, "lane", "32", "SYNC();", enter=False),
+        f"for (int d = lane; d < {dofs}; d += 32) {{",
+        "    const int global_dof = world_dof_indices.data[dof_map_base + d];",
+        "    if (global_dof >= 0) v_out.data[global_dof] = s_v[d];",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
 def incremental_source(
     max_constraints: int,
     max_world_dofs: int,
     *,
     incremental_rows: int,
+    max_row_dofs: int | None = None,
     has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
     skip_local_internal_worlds: bool = False,
@@ -976,13 +999,16 @@ def incremental_source(
 ) -> tuple[str, Staging]:
     """The Gauss-Seidel sweep of a world's dense rows (at most ``incremental_rows``) over their response block.
 
-    For worlds without free-body rows: the warp builds ``A = J Y`` and the residuals once (:class:`.Block`),
-    compacts the rows this phase visits in row order, and solves them with the shared row law; the velocity is
-    published once after the sweeps.
+    For worlds without free-body rows: the warp holds the articulations the rows touch in factor coordinates
+    (:class:`FactorCoordinates`), builds ``A = Z^T Z`` and the residuals ``rhs + Z^T u`` once from the packed rows
+    (:func:`packed_block`), compacts the rows this phase visits in row order, and solves them with the shared row law
+    on the block (:class:`.Block`); the velocity ``u + Z applied`` leaves factor coordinates and is published once
+    after the sweeps.
     """
     _validate_dense_metadata_encoding(max_constraints)
     accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D, D, AM, MIN_ROWS = max_constraints, max_world_dofs, int(incremental_rows), int(min_rows)
+    S = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     if AM <= 0 or AM > M_D or AM > 64:
         raise ValueError("incremental_rows must be in [1, min(max_constraints, 64)]")
     if MIN_ROWS < 0 or MIN_ROWS >= AM:
@@ -999,6 +1025,7 @@ def incremental_source(
     staging = Staging(
         (
             Buffer("s_v", "float", D),
+            *FACTOR_COORDINATES.buffers(D),
             *(
                 Buffer(name, "float", AM)
                 for name in ("s_lam", "s_app", "s_rhs", "s_diag", "s_inv_diag", "s_res", "s_w")
@@ -1071,11 +1098,6 @@ def incremental_source(
             }}
         }}"""
     sweep_end = end_sweep(solve_policy, iteration="iter")
-    local_skip = (
-        f"\n    if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;"
-        if skip_local_internal_worlds
-        else ""
-    )
     drive_loads = "".join(f"\n        {name}[i] = {source}.data[off_dense + i];" for name, source in drive.values())
     admit_drive = "1" if has_drive_rows else f"(row_type != {DRIVE})"
     phase_filters = "\n".join(
@@ -1086,27 +1108,7 @@ def incremental_source(
     )
     body = f"""    const int lane = LANE;
 
-    int m_dense = world_constraint_count.data[world];
-    const int m_mf = mf_constraint_count.data[world];
-    if (m_dense == 0 || m_mf != 0) return;
-    if (m_dense > {AM} || m_dense <= {MIN_ROWS}) return;{local_skip}
-
-    int dense_lo = 0;
-    int dense_hi = m_dense;
-    if (row_phase == 3) {{
-        dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
-    }} else if (row_phase == 5) {{
-        dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
-        dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-    }} else if (row_phase == 4) {{
-        dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-    }}
-    if (dense_hi <= dense_lo) return;
-    // The block holds rows [0, dense_hi): a friction row's parent precedes it, rows below dense_lo never change.
-    const int n_rows_total = dense_hi;
-    const int dof_map_base = world * {D};
-    const int off_dense = world * {M_D};
-    const int jy_world_base = world * {M_D} * {D};
+{dense_tier_world(AM, MIN_ROWS, D, M_D, local=skip_local_internal_worlds, rows="n_rows_total", support=S)}
 
 {staging.declarations("    ")}
 
@@ -1126,7 +1128,11 @@ def incremental_source(
         const int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
+{indent(FACTOR_COORDINATES.clear(D, "lane"), "    ")}
     SYNC();
+{indent(FACTOR_COORDINATES.mark_sides("n_rows_total", "lane", "32"), "    ")}
+    SYNC();
+{indent(FACTOR_COORDINATES.convert_all(D, "lane", "32", "SYNC();", enter=True), "    ")}
 
     // The rows this phase visits, in row order; the phase's velocity-limit rows for the end pass.
     int n_active = 0;
@@ -1151,7 +1157,7 @@ def incremental_source(
         if (vlim) s_vlim_rows[vlim_slot] = row;
     }}
 
-{op.build()}
+{packed_block(S, "n_rows_total", AM, "    ")}
     SYNC();
 
     for (int iter = 0; iter < iterations; iter++) {{
@@ -1161,7 +1167,7 @@ def incremental_source(
 {vlim_pass}
 {sweep_end}    }}
 
-{op.publish()}
+{packed_publish(S, "n_rows_total", D, "    ")}
     for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
         world_impulses.data[off_dense + i] = s_lam[i];
     }}
@@ -1179,6 +1185,7 @@ def incremental_kernel(
     device_arch: str,
     *,
     incremental_rows: int,
+    max_row_dofs: int | None = None,
     has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
     skip_local_internal_worlds: bool = False,
@@ -1188,9 +1195,11 @@ def incremental_kernel(
 ) -> wp.Kernel:
     """The incremental tier's kernel (the matrix-free sweep's ABI); its working set fits the static budget of
     ``device_arch``."""
+    max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     snippet, staging = incremental_source(
         max_constraints,
         max_world_dofs,
+        max_row_dofs=max_row_dofs,
         incremental_rows=incremental_rows,
         has_drive_rows=has_drive_rows,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
@@ -1201,7 +1210,8 @@ def incremental_kernel(
     )
     staging.check("the incremental tier", arch_budget(device_arch))
     name = (
-        f"sweep_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{int(incremental_rows)}"
+        f"sweep_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_s{max_row_dofs}"
+        f"_rows{int(incremental_rows)}"
         f"_min{int(min_rows)}_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
         + velocity_limit_law_suffix(velocity_limit_law)
         + ("_local_fallback" if skip_local_internal_worlds else "")

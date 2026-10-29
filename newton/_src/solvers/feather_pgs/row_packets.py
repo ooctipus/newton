@@ -184,6 +184,7 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
         ordered=True,
         rhs=True,
         locals_="int mimic = -1;",
+        side="art",
     )
     source = substitute(_PREFIX_SOURCE, ROWS=rows, PACKETS=packets, WARPS=WARPS_PER_BLOCK)
     return KernelTemplate(

@@ -502,20 +502,21 @@ def _velocity_limit_route():
 
 
 def _tier_route():
-    """A tripod world beside a free-body world, with the parallel tiers of ``mf_gs_parallel_rows`` built.
+    """Two tripod worlds, each with a free sphere, and the parallel tiers of ``mf_gs_parallel_rows`` built.
 
-    The tripod's world holds only dense rows (24 while its feet touch the ground: six contacts and
-    six joint-limit rows), within the tiers' bound, so the tiers solve and count it and the
-    matrix-free sweep returns before its first sweep there; the free body's matrix-free rows keep
-    its world on the counted matrix-free sweep. The tiled response keeps the local owners out: the
-    automatic choice gives the tripod's 9 DOFs the parallel-row response, which makes a world with
-    one small non-free articulation, in a model with free bodies, a local-owner candidate, and its
+    Each world holds one tripod and one free body, which the tiers' in-kernel rows need. In the first the
+    sphere floats clear of the ground: its world holds only dense rows (24 while the tripod's feet touch the
+    ground: six contacts and six joint-limit rows), within the tiers' bound, so the tiers solve and count it
+    and the matrix-free sweep returns before its first sweep there; in the second the sphere rests on the
+    ground, and its matrix-free rows keep its world on the counted matrix-free sweep. The tiled response keeps
+    the local owners out: the automatic choice gives the tripod's 9 DOFs the parallel-row response, which makes
+    a world with one small non-free articulation, in a model with free bodies, a local-owner candidate, and its
     counted local sweep would claim the world whenever it holds at most 9 rows of one phase.
     """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
     return {
-        "model": _build_model(heterogeneous=True),
+        "model": _build_model(free_count=1, free_heights=(1.0, 0.05)),
         "options": {
             "pgs_mode": "matrix_free",
             "sparse_mass_matrix": "off",

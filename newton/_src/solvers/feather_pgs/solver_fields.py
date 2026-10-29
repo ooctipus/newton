@@ -97,10 +97,11 @@ STATE_GRAD_SCRATCH = FieldGroup(Field("joint_solve_tmp", wp.float32, ("dof",)))
 
 SIZE_FACTORS = FieldGroup(
     Field("L", wp.float32, ("factor_art", "factor_size", "factor_size")),
-    Field("Y", wp.float32, ("response_art", "response_row", "response_size")),
+    Field("Y", wp.float32, ("y_art", "y_row", "y_size")),
     Field("R", wp.float32, ("art", "size")),
 )
-"""One size group's mass factor, response and armature; compact and sparse sizes keep (1, 1, 1) placeholders."""
+"""One size group's mass factor, response and armature; compact and sparse sizes keep (1, 1, 1) placeholders, and
+so does the response of the matrix-free sweeps, which read the packed rows."""
 
 SIZE_GROUPED_SOLVE = FieldGroup(
     Field("tau", wp.float32, ("art", "size", 1), grad=False),
@@ -140,8 +141,9 @@ DENSE_ROWS = FieldGroup(
     Field("drive_impulse_multiplier", wp.float32, ("world", "row"), mirror=True),
     Field("drive_max_impulse", wp.float32, ("world", "row"), mirror=True),
     Field("constraint_count", wp.int32, ("world",), mirror=True),
+    Field("_row_sides", wp.vec2i, ("world", "row"), grad=False),
 )
-"""Every world's dense rows: the system, the row records and the PhysX drive coefficients."""
+"""Every world's dense rows: the system, the row records (with each row's sides) and the PhysX drive coefficients."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, grad=False))
 """Per-row regularization weights (speculative and restitution rows keep the rigid law)."""
@@ -224,6 +226,8 @@ PREELIMINATION = FieldGroup(
     Field("_preelim_LS", wp.float32, ("preelim_block",), grad=False),
     # Relative diagonal regularization of the S factor, rebuilt each step from the current S diagonal.
     Field("_preelim_reg", wp.float32, ("preelim_row",), grad=False),
+    # The projection's block weights y = S^-1 (J_B v + b_B).
+    Field("_preelim_weight", wp.float32, ("preelim_row",), grad=False),
 )
 """Fixed-capacity bilateral pre-elimination buffers, ``PREELIM_MAX_ROWS`` rows per eliminating articulation."""
 
@@ -233,7 +237,14 @@ Preelim = field_group.struct(
         Field("art_to_preelim", wp.int32, ("articulation",), attr="_preelim_art_to_idx"),
         *(
             dataclasses.replace(PREELIMINATION[attr], name=attr.removeprefix("_preelim_"), attr=attr)
-            for attr in ("_preelim_slots", "_preelim_nB", "_preelim_S", "_preelim_LS", "_preelim_reg")
+            for attr in (
+                "_preelim_slots",
+                "_preelim_nB",
+                "_preelim_S",
+                "_preelim_LS",
+                "_preelim_reg",
+                "_preelim_weight",
+            )
         ),
         Field("reg_rel", wp.float32, attr="_preelim_reg_rel"),
         Field("reg_floor", wp.float32, attr="_preelim_reg_floor"),
@@ -241,7 +252,8 @@ Preelim = field_group.struct(
     __name__,
 )
 """The pre-elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows and their
-count, its Schur complement, factor and regularization, and the regularization's relative scale and floor."""
+count, its Schur complement, factor and regularization, the projection's weights, and the regularization's relative
+scale and floor."""
 
 SPARSE_FACTOR = FieldGroup(
     Field("_sparse_Linv", wp.float32, ("group", "nonzero"), grad=False),

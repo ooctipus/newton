@@ -128,18 +128,13 @@ def solve_fixture(device):
     host["mf_meta"][1, 15] = pack_endpoints(-1, 4)
     host["counts"][4] = 0
     host["J"][2, 0, 23] = 0.35
-    host["Y"][2, 0, 23] = 0.245
-    host["diag"] = np.sum(host["J"] * host["Y"], axis=2) + np.float32(0.03)
     # The paired path owns a position-limit prefix then contact triples.
-    for name in ("J", "Y", "rhs", "diag", "mu", "row_type", "row_parent"):
+    for name in ("J", "rhs", "mu", "row_type", "row_parent"):
         host[name][:, :4] = host[name][:, [3, 0, 1, 2]]
     host["row_parent"][:, :4] = [-1, -1, 1, 1]
-    # Paired row production already stores factor rows when MF is absent: z = L^T P y, factor coordinate i at
-    # position 22 - i.
-    for world in (3,):
-        offset, group = host["primary_offset"][world], host["primary_group"][world]
-        rows = host["Y"][world, :, offset : offset + 23]
-        host["Y"][world, :, offset : offset + 23] = (rows[:, ::-1] @ host["L"][group])[:, ::-1]
+    # The rows the sweeps read: packed at their world coordinates and whitened (packed_rows).
+    host["Y"] = _whitened(host)
+    host["diag"] = np.sum(host["Y"] * host["Y"], axis=2) + np.float32(0.03)
     data = bind_components(host, device)
 
     def array(value):
@@ -177,8 +172,6 @@ def solve_fixture(device):
         ("world_row_type", "row_type"),
         ("world_row_parent", "row_parent"),
         ("world_row_mu", "mu"),
-        ("J_world", "J"),
-        ("Y_world", "Y"),
         ("factor_rows", "Y"),
         ("mf_row_mu", "mf_mu"),
         ("mf_meta", "mf_meta"),
@@ -194,9 +187,62 @@ def solve_fixture(device):
     factors.dof_factor = array(dof_factor)
     factors.L = arrays["secondary_L"]
     arrays["factors"] = factors
+    _packed_rows(host, arrays, device)
     for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
         arrays[f"world_drive_{name}"] = array(np.zeros((1, 1), np.float32))
     return data, arrays
+
+
+_SECONDARY_FACTOR = np.eye(6) / np.sqrt(0.7)
+"""Each world's free body's factor (the solve fixture's secondary ``L``)."""
+
+
+def _whitened(host):
+    """Each world's rows at their world coordinates, whitened per component through its leaf-first factor: ``z =
+    L^-1 P j`` in the kit's positions (:mod:`.packed_rows`' dense layout)."""
+    worlds, capacity = host["J"].shape[:2]
+    Z = np.zeros((worlds, capacity, 29), np.float32)
+    for world in range(worlds):
+        primary = host["L"][host["primary_group"][world]].astype(np.float64)
+        for factor, offset, n in (
+            (primary, int(host["primary_offset"][world]), 23),
+            (_SECONDARY_FACTOR, int(host["secondary_offset"][world]), 6),
+        ):
+            j = host["J"][world, :, offset : offset + n].astype(np.float64)
+            Z[world, :, offset : offset + n] = np.linalg.solve(np.tril(factor), j[:, ::-1].T).T[:, ::-1]
+    return Z
+
+
+def _packed_rows(host, arrays, device):
+    """The dense rows packed at their world coordinates (:mod:`.packed_rows`, dense) and every articulation's factor,
+    as the matrix-free sweep reads them: each world's primary (articulation ``2 w``, 23 coordinates) and its free body
+    (``2 w + 1``)."""
+    worlds, capacity = host["J"].shape[:2]
+    dof = np.broadcast_to(np.arange(29, dtype=np.int32), (worlds, capacity, 29)).copy()
+    sides = np.zeros((worlds, capacity, 2), np.int32)
+    first_art = np.full(145, -1, np.int32)
+    blocks = []
+    for world in range(worlds):
+        primary_offset, secondary_offset = int(host["primary_offset"][world]), int(host["secondary_offset"][world])
+        sides[world] = (2 * world, 2 * world + 1)
+        first_art[world * 29 + primary_offset] = 2 * world
+        first_art[world * 29 + secondary_offset] = 2 * world + 1
+        blocks += [host["L"][host["primary_group"][world]].ravel(), _SECONDARY_FACTOR.astype(np.float32).ravel()]
+    arrays["packed_dof"] = wp.array(dof, dtype=wp.int32, device=device)
+    arrays["packed_Z"] = wp.array(host["Y"], dtype=wp.float32, device=device)
+    arrays["row_sides"] = wp.array(sides, dtype=wp.vec2i, device=device)
+    storage = wp.array(np.concatenate(blocks), dtype=wp.float32, device=device)
+    starts = np.concatenate([[0], np.cumsum([block.size for block in blocks])[:-1]]).astype(np.uint64)
+    factors = arrays["factors"]
+    factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
+    factors.size = wp.array(np.tile(np.array([23, 6], np.int32), worlds), dtype=wp.int32, device=device)
+    factors.world_offset = wp.array(
+        np.stack([host["primary_offset"], host["secondary_offset"]], axis=1).reshape(-1).astype(np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    factors.address = wp.array(storage.ptr + starts * np.uint64(4), dtype=wp.uint64, device=device)
+    arrays["factor_storage"] = storage  # The addresses stay valid while the arrays live.
 
 
 def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_start=0):

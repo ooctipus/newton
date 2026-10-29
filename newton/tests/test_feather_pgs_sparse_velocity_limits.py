@@ -25,6 +25,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -397,7 +398,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         old, new = reference[1], candidate[1]
         counts = new.constraint_count.numpy()
         np.testing.assert_array_equal(counts, old.constraint_count.numpy())
-        old_j, old_y = old.J_world.numpy(), old.Y_world.numpy()
+        old_j, old_y = unpacked_rows(old)
         for world, row_count in enumerate(counts):
             count = int(row_count)
             z, jacobian = sparse_tests.TestFeatherPGSSparseSolver._sparse_rows_physical(self, new, world, count)

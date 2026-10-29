@@ -20,7 +20,7 @@ from unittest import mock
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
-from newton._src.solvers.feather_pgs.response_operator import Block, CholeskySolve, Lanes
+from newton._src.solvers.feather_pgs.response_operator import Block, CholeskySolve, Lanes, WhitenedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     JacobiRows,
@@ -45,54 +45,43 @@ def _keyed(linked: bool):
     return functools.partial(get_direct_parallel_inputs, _LAYOUT, patch=linked)
 
 
-_INK = {"matrix_free": True, "inkernel_response": (12, 6, 0, 12)}
+# Every tier whitens its rows in the kernel: the response block (A-based) or matrix-free.
+_INK = {"inkernel_response": (12, 6, 0, 12)}
+_MF = {"matrix_free": True, **_INK}
 
 CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
-    ("block", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112}),
-    ("block_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, "linked_rows": True}),
-    (
-        "matrix_free_exact",
-        (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, "matrix_free": True, "exact_row_sums": True},
-    ),
+    ("block", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_INK}),
+    ("block_linked", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, "linked_rows": True, **_INK}),
+    ("matrix_free_exact", (64, 32, 18, "120"), {"rows": 32, "sweeps": 112, **_MF, "exact_row_sums": True}),
     (
         "keyed",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "exact_row_sums": True, "row_inputs": _keyed(False)},
+        {"rows": 32, "sweeps": 112, **_MF, "exact_row_sums": True, "row_inputs": _keyed(False)},
     ),
     (
         "keyed_linked",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 112, **_INK, "exact_row_sums": True, "row_inputs": _keyed(True), "linked_rows": True},
+        {"rows": 32, "sweeps": 112, **_MF, "exact_row_sums": True, "row_inputs": _keyed(True), "linked_rows": True},
     ),
-    ("block_rows", (64, 32, 40, "120"), {"rows": 32, "sweeps": 42}),
-    ("block_drive", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "has_drive_rows": True}),
-    ("block_64", (96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 60}),
+    ("block_wide", (64, 32, 40, "120"), {"rows": 64, "sweeps": 42, "inkernel_response": (40, 0, 0, 0)}),
+    ("block_drive", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "has_drive_rows": True, **_INK}),
+    ("block_64", (96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 60, **_INK}),
     (
         "block_96_last_word",
         (96, 32, 18, "120"),
-        {"rows": 96, "min_rows": 64, "sweeps": 73, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 96, "min_rows": 64, "sweeps": 73, "linked_rows": True, "velocity_limit_pass": True, **_INK},
     ),
-    ("matrix_free_bound", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "matrix_free": True}),
+    ("matrix_free_bound", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, **_MF}),
     (
         "matrix_free_128",
         (128, 32, 18, "120"),
-        {
-            "rows": 128,
-            "min_rows": 96,
-            "sweeps": 84,
-            "matrix_free": True,
-            "linked_rows": True,
-            "velocity_limit_pass": True,
-        },
+        {"rows": 128, "min_rows": 96, "sweeps": 84, **_MF, "linked_rows": True, "velocity_limit_pass": True},
     ),
-    ("whitened", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, **_INK}),
-    ("whitened_block", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (12, 6, 0, 12)}),
     (
         "local_without_momentum",
         (64, 32, 18, "120"),
-        {"rows": 32, "sweeps": 24, "nesterov": False, "skip_local_internal_worlds": True},
+        {"rows": 32, "sweeps": 24, "nesterov": False, "skip_local_internal_worlds": True, **_INK},
     ),
 )
 """``(label, arguments, options)`` of the factory: the conformance routes' tiers and the other variants."""
@@ -116,32 +105,40 @@ def _source(args, kwargs) -> str:
     return snippet[snippet.index("    const int lane = LANE;\n") :]
 
 
+def _block() -> Block:
+    """The 32-row response block of the 18-coordinate worlds, its rows whitened in the kernel."""
+    return Block(
+        18, 33, Lanes(32), rows="n_rows", layout="row", whitened=WhitenedRows(12, 6, 0, 12, 18, 64, 36, Lanes(32))
+    )
+
+
 class TestParallelTier(unittest.TestCase):
     """The tier's options, sources and votes."""
 
     def test_invalid_options_raise(self):
         args = (64, 32, 18, "120")
         invalid = (
-            {"rows": 0, "sweeps": 1},
-            {"rows": 72, "sweeps": 1},
-            {"rows": 30, "sweeps": 1},
-            {"rows": 32, "sweeps": 1, "min_rows": 32},
+            {"rows": 0, "sweeps": 1, **_INK},
+            {"rows": 72, "sweeps": 1, **_INK},
+            {"rows": 30, "sweeps": 1, **_INK},
+            {"rows": 32, "sweeps": 1, "min_rows": 32, **_INK},
+            {"rows": 32, "sweeps": 1, "inkernel_response": None},
             {"rows": 32, "sweeps": 1, "inkernel_response": (12, 7, 0, 12)},
             {"rows": 4, "sweeps": 1, "inkernel_response": (12, 6, 0, 12)},
-            {"rows": 32, "sweeps": 1, "row_inputs": _keyed(False)},
-            {"rows": 32, "sweeps": 1, **_INK, "has_drive_rows": True, "row_inputs": _keyed(False)},
-            {"rows": 32, "sweeps": 1, "inkernel_response": (12, 6, 0, 12), "row_inputs": _keyed(False)},
+            {"rows": 32, "sweeps": 1, "inkernel_response": None, "row_inputs": _keyed(False)},
+            {"rows": 32, "sweeps": 1, **_MF, "has_drive_rows": True, "row_inputs": _keyed(False)},
+            {"rows": 32, "sweeps": 1, **_INK, "row_inputs": _keyed(False)},
         )
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     _tier(_TIER, args, kwargs)
         with self.assertRaisesRegex(ValueError, "rows above 96 need the matrix-free variant"):
-            _tier(_TIER, (128, 32, 18, "120"), {"rows": 100, "sweeps": 1})
+            _tier(_TIER, (128, 32, 18, "120"), {"rows": 100, "sweeps": 1, **_INK})
 
     def test_worlds_are_entered_as_the_incremental_tier_enters_them(self):
         incremental, _ = sweep_routes.incremental_source(64, 18, incremental_rows=32, skip_local_internal_worlds=True)
-        self.assertIn(dense_tier_world(32, 0, 18, 64, local=True, rows="n_rows_total"), incremental)
+        self.assertIn(dense_tier_world(32, 0, 18, 64, local=True, rows="n_rows_total", support=18), incremental)
 
     def test_every_world_ends_with_a_barrier(self):
         """The world queue's next world restages the shared rows only after every lane has read this world's."""
@@ -152,16 +149,16 @@ class TestParallelTier(unittest.TestCase):
 
     def test_drive_rows_take_the_drive_law_only_with_drive_rows(self):
         args = (64, 32, 18, "120")
-        driven = _source(args, {"rows": 32, "sweeps": 1, "has_drive_rows": True})
+        driven = _source(args, {"rows": 32, "sweeps": 1, "has_drive_rows": True, **_INK})
         self.assertIn("ProjectionLaw::physx_drive(s_y[i], r - s_drive_rhs[i]", driven)
-        undriven = _source(args, {"rows": 32, "sweeps": 1})
+        undriven = _source(args, {"rows": 32, "sweeps": 1, **_INK})
         self.assertNotIn("physx_drive", undriven)
         self.assertNotIn("s_drive", undriven)
-        self.assertIn("diag > 0.0f && row_type != 1) ? 1 : 0;", undriven)
+        self.assertIn("(i >= dense_lo && row_type != 1) ? 1 : 0;", undriven)
 
     def test_formed_diagonals_freeze_their_rows_after_the_staging(self):
         """A row the formed diagonal freezes changes its kind only once every lane has read the kinds."""
-        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK, "exact_row_sums": True})
+        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_MF, "exact_row_sums": True})
         self.assertIn("else { s_step[i] = 0.0f; frozen = 1; }", source)
         self.assertNotIn("s_kind[i] = -1", source)
         freeze = source.index("if (frozen) s_kind[lane] = -1;\n    SYNC();")
@@ -169,9 +166,9 @@ class TestParallelTier(unittest.TestCase):
         self.assertLess(freeze, source.index("step_pair = fminf(step_a, step_b)"))
 
     def test_several_warps_stop_on_the_block_vote(self):
-        one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1})
+        one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
         self.assertIn(_EXIT, one)
-        block = _source((96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 1})
+        block = _source((96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 1, **_INK})
         self.assertIn(_BLOCK_EXIT, block)
         self.assertNotIn("BALLOT", block)
 
@@ -184,7 +181,7 @@ class TestJacobiLaw(unittest.TestCase):
         step size (its right-hand side and terms, and its impulse before the step times its step's share of a
         Gauss-Seidel step, ``A_ii s_i``)."""
         rows = JacobiRows(32, 32)
-        op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
+        op = _block()
         text = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
         self.assertNotIn("if (x_new != x_old) {", text)
         self.assertIn("const float row_share = row_diag * row_step;", text)
@@ -205,7 +202,7 @@ class TestJacobiLaw(unittest.TestCase):
 
     def test_the_trace_needs_staged_types(self):
         rows = JacobiRows(32, 32)
-        op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
+        op = _block()
         with self.assertRaisesRegex(ValueError, "staged types"):
             jacobi_sweeps(rows, op, RowLaws(policy=SolvePolicy(readout="trace")), sweeps=1, momentum=True, pooled=False)
         counted = jacobi_sweeps(
@@ -214,35 +211,26 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 
     def test_a_pooled_pair_reads_its_ring_from_the_staged_impulses(self):
-        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, "linked_rows": True})
+        source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, "linked_rows": True, **_INK})
         self.assertIn("RING_LOAD(s_x[p], p, n_rows,", source)
         self.assertIn("return next < n_rows ? next : -1;", source)
-        point = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1})
+        point = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
         self.assertIn("const float xp = READ(x_new, p & 31);", point)
         self.assertNotIn("RING_LOAD", point)
 
 
 class TestResponseOperators(unittest.TestCase):
-    """The tiers' response operators: one block build for both layouts, the whitened rows' triangular solves."""
+    """The tiers' response operators: the whitened block over the packed rows, the whitened rows' triangular
+    solves."""
 
-    def test_one_build_serves_both_layouts(self):
-        column = Block(18, 32, Lanes(32)).assemble()
-        self.assertIn("const float* Jr = &J_world.data[jy_world_base + r * 18];", column)
-        self.assertIn("const float* Yi = &Y_world.data[jy_world_base + i * 18];", column)
-        row = Block(18, 33, Lanes(32), rows="n_rows", layout="row").assemble()
-        self.assertIn("const float* Ji = &J_world.data[jy_world_base + i * 18];", row)
-        self.assertIn("const float* Yr = &Y_world.data[jy_world_base + r * 18];", row)
-        for text in (column, row):
-            self.assertIn("for (int d = 0; d < 18; ++d) a += J", text)
+    def test_the_block_reads_the_other_rows_from_the_packed_rows(self):
+        row = _block().assemble()
+        self.assertIn("const float* Zr = &packed_Z.data[packed_base + (size_t)r * 18];", row)
+        self.assertIn("for (int d = 0; d < 18; ++d) a += Jr[d] * Zr[d];", row)
         self.assertEqual(Block(18, 32).entry("s", "t")[1], "s * 32 + t")
-        self.assertEqual(Block(18, 33, layout="row").entry("s", "t")[1], "t * 33 + s")
-        with self.assertRaisesRegex(ValueError, "row layout"):
-            Block(18, 32, schedule="rows")
-
-    def test_the_rows_schedule_holds_each_lanes_row(self):
-        rows = Block(40, 33, Lanes(32), rows="n_rows", layout="row", schedule="rows").assemble()
-        self.assertIn("float Ji[40];", rows)
-        self.assertIn("a += Ji[d] * Yr[d];", rows)
+        self.assertEqual(_block().entry("s", "t")[1], "t * 33 + s")
+        with self.assertRaisesRegex(ValueError, "row layout holds whitened rows"):
+            Block(18, 33, layout="row")
 
     def test_a_separate_reciprocal_diagonal(self):
         solve = CholeskySolve(6, "s_L + 144", inverse="s_Dinv + 12", masked=True)

@@ -30,6 +30,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
+from .dense_rows import row_sides
 from .friction_patches import PatchRowLaw, patch_tangent_row
 from .row_laws import ROW_CONTACT, ROW_FRICTION, contact_restitution_rhs, contact_rhs, row_rhs
 
@@ -333,6 +334,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         data.restitution[world, r] = 0.0
     data.row_cfm[world, r] = data.cfm
     data.target[world, r] = target
+    data.sides[world, r] = row_sides(art_a, art_b)
     if with_rhs:
         inv_dt = 1.0 / data.dt
         rhs = float(0.0)

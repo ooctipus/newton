@@ -32,8 +32,11 @@ class TestFinalPatchBudget(unittest.TestCase):
                             contact_friction_shared_anchor=False,
                         )
                     count = int(result["count"][0])
-                    response = result["Y_world"][0, :count].T @ result["impulses"][0, :count]
-                    np.testing.assert_allclose(result["v_out"] - result["v_hat"], response, atol=2e-5)
+                    response = result["response"][0, :count].T @ result["impulses"][0, :count]
+                    # The sweeps accumulate the velocity in factor coordinates and leave them once (packed_rows):
+                    # that rounding, carried through the pads' factors, reaches about 1e-5 of the velocity at 64
+                    # sweeps of a sliding pair.
+                    np.testing.assert_allclose(result["v_out"] - result["v_hat"], response, atol=2e-5, rtol=2e-5)
                     groups = solver._torsion_stats["groups"]
                     self.assertTrue(groups, "The regression must exercise coupled patch/torsion rows")
                     for group in groups:

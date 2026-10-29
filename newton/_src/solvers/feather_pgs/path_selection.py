@@ -988,6 +988,13 @@ def _dynamics(solver) -> dict:
         # Response layout: whether J/Y are gathered per world or already world-indexed.
         "jy_world_aliased": bool(solver._jy_world_aliased),
         "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),
+        # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step alone.
+        "packed_rows": {
+            "support": int(solver._packed_support) if solver._mf_sweeps else None,
+            "dense": bool(solver._packed_dense),
+            "response_only": bool(solver._packed_response),
+            "reason": solver._packed_response_reason,
+        },
         "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
         "double_buffer": bool(solver._double_buffer),
         # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset

@@ -562,9 +562,7 @@ def _tier_texts(rows: int):
 class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
         """Build linked tiers as the point tiers with the golden ring walk; both take the isotropic pair step."""
-        for rows, min_rows, matrix_free, inkernel in itertools.product(
-            (32, 64), (0,), (False, True), (None, (6, 0, 0, 0))
-        ):
+        for rows, min_rows, matrix_free, inkernel in itertools.product((32, 64), (0,), (False, True), ((6, 0, 0, 0),)):
             options = {
                 "rows": rows,
                 "min_rows": min_rows,
@@ -669,8 +667,16 @@ class TestParallelPatchReference(unittest.TestCase):
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         keyed = keyed_rows.get_parallel_factory(sweep_routes_tiers.parallel_kernel, layout)
         for factory, shape, extra in (
-            (sweep_routes_tiers.parallel_kernel, (_CAPACITY, 32, _DOFS, "120"), {}),
-            (sweep_routes_tiers.parallel_kernel, (_CAPACITY, 32, _DOFS, "120"), {"matrix_free": True}),
+            (
+                sweep_routes_tiers.parallel_kernel,
+                (_CAPACITY, 32, _DOFS, "120"),
+                {"inkernel_response": (_DOFS, 0, 0, 0)},
+            ),
+            (
+                sweep_routes_tiers.parallel_kernel,
+                (_CAPACITY, 32, _DOFS, "120"),
+                {"matrix_free": True, "inkernel_response": (_DOFS, 0, 0, 0)},
+            ),
             (keyed, (128, 32, 22, "120"), {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}),
         ):
             for linked in (False, True):
@@ -726,10 +732,8 @@ class TestParallelPatchReference(unittest.TestCase):
             (128, 32, 22, "120"),
         )
         variants = {
-            "response block": (plain_tiers, {"matrix_free": False}),
-            "matrix-free": (plain_tiers, {"matrix_free": True}),
-            "in-kernel matrix-free": (plain_tiers, {"matrix_free": True, "inkernel_response": (6, 0, 0, 0)}),
-            "in-kernel response block": (plain_tiers, {"matrix_free": False, "inkernel_response": (6, 0, 0, 0)}),
+            "matrix-free": (plain_tiers, {"matrix_free": True, "inkernel_response": (6, 0, 0, 0)}),
+            "response block": (plain_tiers, {"matrix_free": False, "inkernel_response": (6, 0, 0, 0)}),
             "keyed rows": (keyed_tiers, {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}),
         }
         for name, ((factory, args), options) in variants.items():
@@ -1123,7 +1127,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
         built with.
         """
         for anchors, linked, limits in itertools.product((False, True), repeat=3):
-            options = {"matrix_free": True, "linked_rows": linked}
+            options = {"matrix_free": True, "linked_rows": linked, "inkernel_response": (_DOFS, 0, 0, 0)}
             kernels = [
                 sweep_routes_tiers.parallel_kernel(
                     _CAPACITY, 32, _DOFS, "120", rows=rows, min_rows=rows - 32, sweeps=sweeps, **options
@@ -1136,8 +1140,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _par_sweeps_rule="auto",
                 _par_sweeps_reason="auto: ...",
                 _ink_rows=64,
-                _ink_sizes=None,
-                _ink_reason="A world has several articulations of size 12.",
+                _ink_sizes=(_DOFS, 0, 0, 0),
+                _ink_reason="The parallel tiers whiten the rows of sizes [6] in the kernel.",
                 _keyed_rows=None,
                 _friction_anchors_enabled=anchors,
                 enable_joint_velocity_limits=limits,
@@ -1360,8 +1364,9 @@ def _dummy(arg):
     return arg.type(0)
 
 
-def _launch_parallel(tier, case, *, inkernel, device):
-    """Launch one world through a parallel tier and return its impulses and velocity."""
+def _launch_parallel(tier, case, *, device):
+    """Launch one world through a parallel tier, its rows whitened in the kernel, and return its impulses and
+    velocity."""
     kernel = tier.kernel
     count = len(case["J"])
     padded = np.zeros((1, _CAPACITY))
@@ -1373,8 +1378,6 @@ def _launch_parallel(tier, case, *, inkernel, device):
 
     J = np.zeros((1, _CAPACITY, _DOFS), np.float32)
     J[0, :count] = case["J"]
-    Y = np.zeros((1, _CAPACITY, _DOFS), np.float32)
-    Y[0, :count] = case["Y"]
     values = {
         "general_world_count": wp.array([1], dtype=wp.int32, device=device),
         "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),
@@ -1387,8 +1390,8 @@ def _launch_parallel(tier, case, *, inkernel, device):
         "rhs_bias": rows(case["rhs"]),
         "world_diag": rows(case["diag"]),
         "world_impulses": rows(case["impulses"]),
-        "J_world": wp.array(J, dtype=wp.float32, device=device),
-        "Y_world": wp.array(Y, dtype=wp.float32, device=device),
+        # The response block's scratch: the world's packed rows at their coordinates.
+        "packed_Z": wp.zeros((1, _CAPACITY, _DOFS), dtype=wp.float32, device=device),
         "world_row_type": rows(case["types"], wp.int32),
         "world_row_parent": rows(case["parents"], wp.int32),
         "world_row_mu": rows(case["mu"]),
@@ -1397,11 +1400,10 @@ def _launch_parallel(tier, case, *, inkernel, device):
         "omega": 1.0,
         "v_out": wp.array(case["velocity"].astype(np.float32), dtype=wp.float32, device=device),
     }
-    if inkernel:
-        L = case["L"].astype(np.float32)[None]
-        values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
-        values["ink_L_a"] = wp.array(L, dtype=wp.float32, device=device)
-        values["ink_J_a"] = wp.array(J, dtype=wp.float32, device=device)
+    L = case["L"].astype(np.float32)[None]
+    values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
+    values["ink_L_a"] = wp.array(L, dtype=wp.float32, device=device)
+    values["ink_J_a"] = wp.array(J, dtype=wp.float32, device=device)
     arguments = {arg.label: arg for arg in kernel.adj.args}
     inputs = [
         values[name] if name in values else _dummy(arguments[name])
@@ -1424,7 +1426,7 @@ class TestParallelPatchKernel(unittest.TestCase):
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
         for (faces, rows, min_rows), matrix_free, inkernel, nesterov, warm, spread in itertools.product(
-            ((1, 32, 0), (3, 64, 32)), (False, True), (False, True), (False, True), (False, True), (False, True)
+            ((1, 32, 0), (3, 64, 32)), (False, True), (True,), (False, True), (False, True), (False, True)
         ):
             options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": nesterov}
             with self.subTest(faces=faces, warm=warm, spread=spread, **options):
@@ -1443,10 +1445,10 @@ class TestParallelPatchKernel(unittest.TestCase):
                         sweeps=24,
                         nesterov=nesterov,
                         matrix_free=matrix_free,
-                        inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
+                        inkernel_response=(_DOFS, 0, 0, 0),
                         linked_rows=linked,
                     )
-                    impulses, velocity = _launch_parallel(kernel, case, inkernel=inkernel, device=device)
+                    impulses, velocity = _launch_parallel(kernel, case, device=device)
                     expected, expected_velocity = parallel_sweep_reference(
                         case, sweeps=24, tol=0.0, linked=linked, **options
                     )
@@ -1470,7 +1472,7 @@ class TestParallelPatchKernel(unittest.TestCase):
             "unequal masses": sliding_pair_case(),
             "one live tangent": sliding_pair_case(sliding=(1.0, 0.0), live_tangents=1),
         }
-        for (name, case), matrix_free, inkernel in itertools.product(cases.items(), (False, True), (False, True)):
+        for (name, case), matrix_free, inkernel in itertools.product(cases.items(), (False, True), (True,)):
             options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True}
             with self.subTest(case=name, **options):
                 kernel = sweep_routes_tiers.parallel_kernel(
@@ -1481,10 +1483,10 @@ class TestParallelPatchKernel(unittest.TestCase):
                     rows=32,
                     sweeps=2000,
                     matrix_free=matrix_free,
-                    inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
+                    inkernel_response=(_DOFS, 0, 0, 0),
                     linked_rows=True,
                 )
-                impulses, velocity = _launch_parallel(kernel, case, inkernel=inkernel, device=device)
+                impulses, velocity = _launch_parallel(kernel, case, device=device)
                 impulses, velocity = impulses.astype(np.float64), velocity.astype(np.float64)
                 expected, expected_velocity = parallel_sweep_reference(
                     case, sweeps=2000, tol=0.0, linked=True, **options
@@ -1507,7 +1509,7 @@ class TestParallelPatchKernel(unittest.TestCase):
         arch = str(device.arch)
         case = limited_contact_case()
         limit = case["rhs"][1]
-        for matrix_free, inkernel, sweeps in itertools.product((False, True), (False, True), (2, 2000)):
+        for matrix_free, inkernel, sweeps in itertools.product((False, True), (True,), (2, 2000)):
             options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True}
             with self.subTest(sweeps=sweeps, **options):
                 results = {}
@@ -1520,11 +1522,11 @@ class TestParallelPatchKernel(unittest.TestCase):
                         rows=32,
                         sweeps=sweeps,
                         matrix_free=matrix_free,
-                        inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
+                        inkernel_response=(_DOFS, 0, 0, 0),
                         linked_rows=True,
                         velocity_limit_pass=last_word,
                     )
-                    impulses, velocity = _launch_parallel(kernel, case, inkernel=inkernel, device=device)
+                    impulses, velocity = _launch_parallel(kernel, case, device=device)
                     expected, expected_velocity = parallel_sweep_reference(
                         case, sweeps=sweeps, tol=0.0, linked=True, velocity_limit_pass=last_word, **options
                     )

@@ -32,9 +32,9 @@ import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_rows
 
 _LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
@@ -362,23 +362,22 @@ class TestVelocityLimitLawReference(unittest.TestCase):
         np.testing.assert_allclose(results["stateless", (1, 0)], _CHAIN_SOLUTION, atol=1.0e-12)
 
 
-def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
+def _dense_row_values(device, *, order, row_phase, iterations, first_row=0, mass=_CHAIN_MASS):
     """Inputs of a matrix-free sweep kernel holding the chain's two velocity-limit rows in ``order``.
 
-    ``first_row`` puts that many inactive velocity-limit rows (no Jacobian, zero
-    diagonal) before the chain's, which then occupy rows ``first_row`` and
-    ``first_row + 1``.
+    The rows are packed (:mod:`.packed_rows`): whitened by the chain's leaf-first factor of ``mass``, at their
+    coordinates. ``first_row`` puts that many inactive velocity-limit rows (no Jacobian, zero diagonal) before the
+    chain's, which then occupy rows ``first_row`` and ``first_row + 1``.
     """
     rows = list(order)
     count = first_row + 2
     capacity, dofs = max(4, count), 2
     chain = slice(first_row, count)
-    jacobian = np.zeros((1, capacity, dofs), np.float32)
-    jacobian[0, chain] = _CHAIN_JACOBIAN[rows]
-    response = np.zeros_like(jacobian)
-    response[0, chain] = np.linalg.solve(_CHAIN_MASS, _CHAIN_JACOBIAN[rows].T).T
+    factors, factor = articulation_factor(mass, device)
+    whitened = np.zeros((1, capacity, dofs))
+    whitened[0, chain] = whitened_rows(_CHAIN_JACOBIAN[rows], factor)
     diagonal = np.zeros((1, capacity), np.float32)
-    diagonal[0, chain] = np.einsum("ij,ij->i", jacobian[0, chain], response[0, chain])
+    diagonal[0, chain] = np.einsum("ij,ij->i", whitened[0, chain], whitened[0, chain])
     bias = np.zeros((1, capacity), np.float32)
     bias[0, chain] = _CHAIN_BIAS[rows]
     row_type = np.full((1, capacity), VELOCITY_LIMIT, np.int32)
@@ -402,8 +401,9 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
         "world_diag": array(diagonal),
         "world_row_w": array(np.ones((1, capacity), np.float32)),
         "world_impulses": array(np.zeros((1, capacity), np.float32)),
-        "J_world": array(jacobian),
-        "Y_world": array(response),
+        "packed_dof": array(np.broadcast_to(np.arange(dofs, dtype=np.int32), (1, capacity, dofs)).copy(), wp.int32),
+        "packed_Z": array(whitened.astype(np.float32)),
+        "row_sides": wp.array(np.tile(np.array([0, -1], np.int32), (1, capacity, 1)), dtype=wp.vec2i, device=device),
         "world_row_type": array(row_type, wp.int32),
         "world_row_parent": array(np.full((1, capacity), -1, np.int32), wp.int32),
         "world_row_mu": array(np.zeros((1, capacity), np.float32)),
@@ -415,7 +415,7 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
         "mf_impulses": zero_float,
         "mf_Z_a": zero_spatial,
         "mf_Z_b": zero_spatial,
-        "factors": BodyFactors(),
+        "factors": factors,
         "mf_row_mu": zero_float,
         "mf_row_w": zero_float,
         "iterations": iterations,

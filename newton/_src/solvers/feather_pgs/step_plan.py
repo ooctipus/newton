@@ -147,8 +147,9 @@ class StepPlan:
     held-tree owner, whose predictor replaces the stage."""
     response: Mapping[int, Route]
     """Stage 4, per size: ``owner`` (a contact owner publishes the response), ``sparse_diagonal``,
-    ``paired_secondary`` (solved with the primary), ``paired``, ``fused`` (with the Delassus), ``diagonal``,
-    ``grouped``, ``tiles``, ``packets``, ``lanes`` or ``rows``."""
+    ``paired_secondary`` (solved with the primary), ``paired``, ``packed`` (only the packed rows' build: none reads
+    the response), ``fused`` (with the Delassus), ``diagonal``, ``grouped``, ``tiles``, ``packets``, ``lanes`` or
+    ``rows``."""
     delassus: Mapping[int, Route]
     """Stage 4, per size, split mode's Delassus assembly: ``tiles`` or ``entries``; empty where none is assembled."""
     solve: SolveRoute
@@ -181,6 +182,7 @@ class StepPlan:
             and not (
                 solver._jy_world_aliased
                 or solver._hinv_jt_writes_world
+                or solver._packed_response
                 or solver._sparse_diagonal_contact_solve
                 or solver._sparse_mass_matrix_size is not None
             )
@@ -291,6 +293,10 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
                 route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
             elif solver._sparse_diagonal_contact_solve and size == solver._sparse_diagonal_response_size:
                 route = Route("sparse_diagonal", "The diagonal-mass contact owner publishes this size's response.")
+            elif solver._packed_response:
+                route = Route(
+                    "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
+                )
             elif size == solver._paired_response_secondary_size:
                 route = Route("paired_secondary", "The paired response solves this size with its primary.")
             elif size == solver._paired_response_primary_size:

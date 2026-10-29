@@ -27,6 +27,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
+    world_contact_row_dot,
 )
 from .row_laws import CONTACT_END_GAP_SLOP
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, vote
@@ -311,9 +312,9 @@ def _prepare_velocity_torsion_rows(
     phi: wp.array2d[float],
     target: wp.array2d[float],
     position_velocity: wp.array[float],
-    dof_count: wp.array[int],
     dof_indices: wp.array2d[int],
-    jacobian: wp.array3d[float],
+    packed_dof: wp.array3d[int],
+    packed_J: wp.array3d[float],
     dt: float,
     rhs: wp.array2d[float],
 ):
@@ -326,11 +327,7 @@ def _prepare_velocity_torsion_rows(
     touching = bool(False)
     for row in range(count[world]):
         if row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT and group[world, row] == spin:
-            speed = float(0.0)
-            for dof in range(dof_count[world]):
-                global_dof = dof_indices[world, dof]
-                if global_dof >= 0:
-                    speed += jacobian[world, row, dof] * position_velocity[global_dof]
+            speed = world_contact_row_dot(dof_indices, packed_dof, packed_J, position_velocity, world, row)
             end_gap = phi[world, row] + dt * (speed - target[world, row])
             # Retain touching support through rebound, with the existing end-gap
             # slop as the initial touching tolerance. Otherwise require contact
@@ -368,9 +365,9 @@ def prepare_torsion_velocity_pass(solver, dt):
             solver.phi,
             solver.target_velocity,
             solver.v_out_snap,
-            solver.world_dof_count,
             solver.world_dof_indices,
-            solver.J_world,
+            solver._packed_dof,
+            solver._packed_J,
             dt,
         ],
         outputs=[solver.rhs_unbiased],
@@ -407,6 +404,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             "phi",
             "target_velocity",
             "row_restitution",
+            "_row_sides",
         )
     }
     jacobians = {size: array.numpy() for size, array in solver.J_by_size.items()}
@@ -435,6 +433,8 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
             field[world, row] = 0
         fields["row_type"][world, row] = PGS_CONSTRAINT_TYPE_TORSION
         fields["row_parent"][world, row] = lead.slot
+        # The spin row acts on its lead contact's bodies.
+        fields["_row_sides"][world, row] = fields["_row_sides"][world, lead.slot]
         # The sweep reads the group's coefficient from its own row; anchor tangent
         # rows carry it divided by the anchor count under persistent patches.
         fields["row_mu"][world, row] = coefficient
@@ -483,13 +483,15 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._contact_torsion_group.assign(membership)
 
 
-def torque_sweep_source(dofs, policy: SolvePolicy = DEFAULT_POLICY):
+def torque_sweep_source(op, policy: SolvePolicy = DEFAULT_POLICY):
     """Return the coupled residual-budget angular solve inside each PGS sweep, voting its changes under the exit law
     with ``policy``'s readout.
 
     A friction pair's rescale votes both tangents' changes (a projection onto the budget, which forms no residual:
     their floors read the rescaled impulses) and the torsion row its own, each scaled by its row's diagonal
-    (:func:`.solve_policy.vote`: a torsion row's velocity change is angular, in rad/s).
+    (:func:`.solve_policy.vote`: a torsion row's velocity change is angular, in rad/s). The rows' velocity terms and
+    applies are the sweep's response operator ``op``'s (:meth:`~.ResponseOperator.row_velocity` and
+    :meth:`~.ResponseOperator.apply_row`), over its lanes.
     """
     friction = str(PGS_CONSTRAINT_TYPE_FRICTION)
     rescale = tuple(
@@ -567,10 +569,9 @@ def torque_sweep_source(dofs, policy: SolvePolicy = DEFAULT_POLICY):
                                 s_lam_dense[n + 1] = t1;
                                 s_lam_dense[n + 2] = t2;
                             }}
-                            for (int d = lane; d < {dofs}; d += 32) {{
-                                s_v[d] += Y_world.data[jy_world_base + (n + 1) * {dofs} + d] * delta1
-                                    + Y_world.data[jy_world_base + (n + 2) * {dofs} + d] * delta2;
-                            }}
+{op.apply_row("n + 1", "delta1", " " * 28)}
+                            SYNC();
+{op.apply_row("n + 2", "delta2", " " * 28)}
                         }}
                         sliding_used += sqrtf(t1 * t1 + t2 * t2);
                         SYNC();
@@ -579,10 +580,7 @@ def torque_sweep_source(dofs, policy: SolvePolicy = DEFAULT_POLICY):
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
                 if (world_torsion_group.data[off_dense + spin] == {_TORSION_SPIN_RETIRED}) bound = 0.0f;
                 if (global_iter < friction_start_iteration) bound = 0.0f;
-                float dot = 0.0f;
-                for (int d = lane; d < {dofs}; d += 32)
-                    dot += J_world.data[jy_world_base + spin * {dofs} + d] * s_v[d];
-                SUM(dot);
+{op.row_velocity("dot", "spin", " " * 16)}
                 float residual = dot + rhs_bias.data[off_dense + spin];
                 float old = s_lam_dense[spin];
                 float diagonal = world_diag.data[off_dense + spin];
@@ -592,8 +590,7 @@ def torque_sweep_source(dofs, policy: SolvePolicy = DEFAULT_POLICY):
                 if (delta != 0.0f) {{
 {torsion_vote}
                     if (lane == 0) s_lam_dense[spin] = next;
-                    for (int d = lane; d < {dofs}; d += 32)
-                        s_v[d] += Y_world.data[jy_world_base + spin * {dofs} + d] * delta;
+{op.apply_strided("spin", "delta", " " * 20)}
                 }}
                 SYNC();
             }}

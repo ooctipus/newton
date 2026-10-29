@@ -1361,10 +1361,13 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     self.assertEqual(reference_solver._hinv_jt_diag_sizes, frozenset())
                     self.assertEqual(reference_solver._preelim_active, preelimination)
                     self.assertEqual(tiled_solver._preelim_active, preelimination)
-                    expected_diag_sizes = frozenset() if preelimination else frozenset((6, 13))
-                    self.assertEqual(tiled_solver._hinv_jt_diag_sizes, expected_diag_sizes)
+                    # The packed rows' build forms every diagonal (packed_rows): no response size reduces its own.
+                    self.assertEqual(tiled_solver._hinv_jt_diag_sizes, frozenset())
                     self.assertEqual(len(reference), len(tiled))
                     self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
+                    # Without warm start or pre-elimination the par_row arm's world takes the local owners, which
+                    # solve the free body in their held rows, against the tiled arm's packed rows (factor
+                    # coordinates): a slow coordinate differs by up to 4e-6 where the arms' velocities reach 3.
                     for step, (expected, actual) in enumerate(zip(reference, tiled, strict=True)):
                         self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
                         for label, expected_value, actual_value in zip(
@@ -1377,7 +1380,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                                 actual_value,
                                 expected_value,
                                 rtol=5.0e-4,
-                                atol=2.0e-6,
+                                atol=1.0e-5,
                                 err_msg=f"{label} differed at step {step}",
                             )
 
@@ -1409,7 +1412,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 self.assertEqual(paired_solver._friction_anchors_enabled, label == "patch")
                 self.assertEqual(paired_solver._paired_response_primary_size, 23)
                 self.assertEqual(paired_solver._paired_response_secondary_size, 6)
-                self.assertIsNotNone(paired_solver._paired_response_kernel)
+                # The packed rows' build serves the paired worlds: no paired response is built.
+                self.assertIsNone(paired_solver._paired_response_kernel)
                 self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
                 self.assertTrue(paired_solver._paired_factor_coordinates)
                 self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)

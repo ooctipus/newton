@@ -40,8 +40,9 @@ from .step_plan import JOINT_TOPOLOGY, TopologyPin
 ROW_MAPS = FieldGroup(
     Field("groups", wp.int32, ("world", "size"), owner="maps"),
     Field("starts", wp.int32, ("world", "size"), owner="maps"),
+    Field("arts", wp.int32, ("world", "size"), owner="maps"),
 )
-"""Each world's size-group index and first coordinate of its articulation of each size."""
+"""Each world's size-group index, first coordinate and index of its articulation of each size."""
 
 RowMaps = field_group.struct("RowMaps", ROW_MAPS, __name__)
 
@@ -270,6 +271,7 @@ def materialize_general_rows(
             token = -1 - key
             if q == token // 2:
                 value = wp.where(token % 2 == 0, 1.0, -1.0)
+                data.sides[world, row] = wp.vec2i(z.maps.arts[world, wp.where(size == primary, 0, 1)], -1)
         else:
             c, r = key // 4, key % 4
             body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
@@ -361,12 +363,12 @@ class KeyedRows:
     def __init__(self, solver):
         self.solver = solver
         self.keyed_rows = True
-        self.layout, groups, starts = direct_topology_plan(solver)
+        self.layout, groups, starts, arts = direct_topology_plan(solver)
         self.prefix_layout = self.layout
         dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
         self.data, self.prefix = KineticRows(), PrefixInput()
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
-        self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts)
+        self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
         self.contact_input = None
         # The placeholders of absent prefix tables, allocated before any capture.
         solver._arrays.placeholder(wp.int32)

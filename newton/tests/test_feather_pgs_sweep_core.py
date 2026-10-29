@@ -9,7 +9,7 @@ No GPU is needed: the checks read the native statements the core emits for small
 import dataclasses
 import unittest
 
-from newton._src.solvers.feather_pgs.response_operator import Block, DenseJY, Lanes, ResponseOperator
+from newton._src.solvers.feather_pgs.response_operator import Block, Lanes, ResponseOperator, SparseFactor
 from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
@@ -102,8 +102,9 @@ class TestResponseOperatorInterface(unittest.TestCase):
 
     def test_end_passes_apply_a_row_through_apply_row(self):
         self.assertEqual(_Rows().apply_strided("r", "d", ""), _Rows().apply_row("r", "d", ""))
-        dense = DenseJY(40, Lanes(32))
-        self.assertIn("for (int d = lane; d < 40; d += 32)", dense.apply_strided("r", "d", ""))
+        # Packed rows apply the entries their row velocity kept.
+        packed = SparseFactor(16, lambda row, e: f"dof[{row}][{e}]", lambda row, e: f"Z[{row}][{e}]", Lanes(32))
+        self.assertEqual(packed.apply_strided("r", "d", ""), packed.apply("d", ""))
 
     def test_an_operator_names_the_action_it_lacks(self):
         with self.assertRaisesRegex(NotImplementedError, "_Rows has no pair apply"):

@@ -820,26 +820,22 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             np.testing.assert_allclose(cuda[0], cpu[0], rtol=0.0, atol=5.0e-6)
             np.testing.assert_allclose(cuda[1], cpu[1], rtol=0.0, atol=5.0e-6)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free diagonal fusion requires CUDA")
-    def test_matrix_free_diagonal_fusion_requires_nonaliased_world_response(self):
-        """Keep the extra tiled reduction off response buffers that already alias world storage."""
-        aliased = SolverFeatherPGS(
-            _build_chain_model(num_links=23, num_worlds=1),
-            pgs_mode="matrix_free",
-            dense_max_constraints=192,
-        )
-        direct = SolverFeatherPGS(
-            _build_chain_model(num_links=23, num_worlds=1, with_free_body=True),
-            pgs_mode="matrix_free",
-            dense_max_constraints=192,
-        )
-
-        self.assertTrue(aliased._jy_world_aliased)
-        self.assertFalse(aliased._hinv_jt_writes_world)
-        self.assertEqual(aliased._hinv_jt_diag_sizes, frozenset())
-        self.assertFalse(direct._jy_world_aliased)
-        self.assertTrue(direct._hinv_jt_writes_world)
-        self.assertEqual(direct._hinv_jt_diag_sizes, frozenset((23,)))
+    @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free sweeps require CUDA")
+    def test_matrix_free_rows_are_packed_alone(self):
+        """Serve a chain's rows, with or without a free body beside it, from the packed rows alone: their build forms
+        every diagonal, and no response is written in world layout, aliased to it or reduced by size."""
+        for with_free_body in (False, True):
+            with self.subTest(with_free_body=with_free_body):
+                solver = SolverFeatherPGS(
+                    _build_chain_model(num_links=23, num_worlds=1, with_free_body=with_free_body),
+                    pgs_mode="matrix_free",
+                    dense_max_constraints=192,
+                )
+                self.assertTrue(solver._packed_response)
+                self.assertFalse(solver._jy_world_aliased)
+                self.assertFalse(solver._hinv_jt_writes_world)
+                self.assertEqual(solver._hinv_jt_diag_sizes, frozenset())
+                self.assertIsNone(solver.J_world)
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""

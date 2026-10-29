@@ -16,6 +16,7 @@ from newton import GeoType
 from newton._src.solvers.feather_pgs.contact_torsion import _contact_groups, _group_budget
 from newton._src.solvers.feather_pgs.friction_patches import patch_routes
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 
 # Persistent patches select their own friction locations; shared-anchor flags only warn.
@@ -118,10 +119,11 @@ def fixture(
     result.update(
         {
             name: getattr(solver, name).numpy()
-            for name in ("impulses", "row_type", "row_parent", "row_mu", "J_world", "Y_world", "v_hat", "v_out")
+            for name in ("impulses", "row_type", "row_parent", "row_mu", "v_hat", "v_out")
         }
     )
     result["count"] = solver.constraint_count.numpy()
+    result["response"] = unpacked_rows(solver)[1]
     return result, solver, model, a, contacts
 
 
@@ -469,8 +471,9 @@ class TestContactTorsion(unittest.TestCase):
                 np.testing.assert_allclose(angular(v1), angular(v0), atol=2e-6)
                 count = int(actual["count"][0])
                 impulse = actual["impulses"][0, :count]
-                response = actual["Y_world"][0, :count].T @ impulse
-                np.testing.assert_allclose(actual["v_out"] - actual["v_hat"], response, atol=2e-5)
+                response = actual["response"][0, :count].T @ impulse
+                # Factor-coordinate accumulation, left once (packed_rows): rounding of about 1e-5 of the velocity.
+                np.testing.assert_allclose(actual["v_out"] - actual["v_hat"], response, atol=2e-5, rtol=2e-5)
                 for group in solver._torsion_stats["groups"]:
                     rows = group["normal_rows"]
                     budget = 0.5 * sum(max(float(impulse[r]), 0) for r in rows)

@@ -28,10 +28,25 @@ RECORDS = (
     Field("rhs", wp.float32, ("world", "row")),
     Field("diag", wp.float32, ("world", "row")),
     Field("row_w", wp.float32, ("world", "row")),
+    Field("sides", wp.vec2i, ("world", "row"), attr="_row_sides"),
 )
-"""Each dense row's kind, friction parent, coefficients, gap, targets and law outputs, by world and row."""
+"""Each dense row's kind, friction parent, coefficients, gap, targets and law outputs, and its sides (the
+articulations it touches: :func:`row_sides`), by world and row."""
 
 DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
+
+
+@wp.func
+def row_sides(art_a: int, art_b: int) -> wp.vec2i:
+    """A row's sides: the articulations it touches, the first by index, then the second or -1 (none, or the same).
+
+    Articulation indices ascend with a world's coordinates, so a packed row's entries (:mod:`.packed_rows`) ascend too.
+    """
+    if art_a < 0 or art_a == art_b:
+        return wp.vec2i(art_b, -1)
+    if art_b < 0:
+        return wp.vec2i(art_a, -1)
+    return wp.vec2i(wp.min(art_a, art_b), wp.max(art_a, art_b))
 
 
 MF_RECORDS = (

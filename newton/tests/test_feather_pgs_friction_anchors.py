@@ -369,11 +369,12 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
         )
         # The position pass: no velocity-pass operands are read.
         none = wp.zeros((1, 1), dtype=wp.int32, device=device)
+        packed = wp.full((1, 3, 6), -1, dtype=wp.int32, device=device)
         velocity = wp.zeros((1,), dtype=wp.float32, device=device)
         wp.launch(
             compute_world_contact_bias,
             dim=3,
-            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0, 0, count, none, zJ(), velocity, velocity, 0.5],
+            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0, 0, none, packed, zJ(), velocity, velocity, 0.5],
             device=device,
         )
     elif family == "mf_setup":

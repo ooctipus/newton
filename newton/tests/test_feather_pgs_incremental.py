@@ -14,10 +14,10 @@ import newton
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
 from newton.tests import test_feather_pgs_sparse_split as split_tests
+from newton.tests.feather_pgs_law_harness import articulation_factor
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     SLIDING_ITERATIONS,
@@ -53,9 +53,8 @@ class TestFeatherPGSIncremental(unittest.TestCase):
         zero_int = array([0], wp.int32)
         zero_float = array([[0.0]])
         zero_spatial = wp.zeros((1, 1, 6), dtype=wp.float32, device=device)
-        # H=I, J_B=(1,0), J_C=(1,1). Pre-elimination preserves Y_B but
-        # projects Y_C to (0,1), so J Y^T=[[1,0],[1,1]] is not symmetric.
-        # Applying the contact impulse cannot change the bilateral velocity.
+        # H=I (one articulation of two coordinates, L=I), the bilateral row's Z_B=(1,0) and the contact row
+        # projected off it, Z_C=(0,1): applying the contact impulse cannot change the bilateral velocity.
         values = {
             "general_world_count": array([1], wp.int32),
             "general_worlds": zero_int,
@@ -69,8 +68,9 @@ class TestFeatherPGSIncremental(unittest.TestCase):
             "world_diag": array([[1.0, 1.0]]),
             "world_row_w": array([[1.0, 1.0]]),
             "world_impulses": array([[0.0, 0.0]]),
-            "J_world": array([[[1.0, 0.0], [1.0, 1.0]]]),
-            "Y_world": array([[[1.0, 0.0], [0.0, 1.0]]]),
+            "packed_dof": array([[[0, 1], [0, 1]]], wp.int32),
+            "packed_Z": array([[[1.0, 0.0], [0.0, 1.0]]]),
+            "row_sides": wp.array([[[0, -1], [0, -1]]], dtype=wp.vec2i, device=device),
             "world_row_type": array([[5, 0]], wp.int32),
             "world_row_parent": array([[-1, -1]], wp.int32),
             "world_row_mu": array([[0.0, 0.0]]),
@@ -82,7 +82,7 @@ class TestFeatherPGSIncremental(unittest.TestCase):
             "mf_impulses": zero_float,
             "mf_Z_a": zero_spatial,
             "mf_Z_b": zero_spatial,
-            "factors": BodyFactors(),
+            "factors": articulation_factor(np.eye(2), device)[0],
             "mf_row_mu": zero_float,
             "mf_row_w": zero_float,
             "regularize": 1,

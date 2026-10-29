@@ -879,7 +879,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         Every case runs with ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` unset, its default (on); the
         patch-friction parallel case also runs opted out (``=0``).
         """
-        patch_parallel = ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2})
+        # One free body beside the tripod: the tiers whiten a world's rows in the kernel for one articulation of
+        # each size.
+        patch_parallel = ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 1})
         cases = (
             ({}, {}),
             ({"friction_anchor_beta": 0.0}, {}),
@@ -887,7 +889,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {"free_count": 2}),
             (
                 {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
-                {"free_count": 2},
+                {"free_count": 1},
             ),
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),

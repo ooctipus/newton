@@ -232,6 +232,49 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
 
+    def test_loaded_contacts_keep_the_projected_closure(self):
+        """Keep the closure through every sweep of loaded contacts, not only at the projection.
+
+        The eliminated block corrects the other rows (``Z' = Z - Z_B S^-1 Z_B^T Z``): a contact's impulse then leaves
+        ``J_B v`` alone, so two sweeps a step hold the closure as the projection set it, where uncorrected contact
+        rows reopen it every step.
+        """
+        builder = _build_four_bar()
+        builder.joint_effort_limit[0] = float("inf")
+        builder.add_shape_box(
+            -1, xform=wp.transform(wp.vec3(-0.04, 0.0, 0.5), wp.quat_identity()), hx=0.02, hy=0.1, hz=0.1
+        )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=2,
+            pgs_beta=0.1,
+            dense_max_constraints=128,
+            enable_bilateral_preelimination=True,
+        )
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.6
+        control.joint_target_q.assign(targets)
+        worst = loaded = 0.0
+        for _ in range(120):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            worst = max(worst, _loop_anchor_gap(model, state_0))
+            count = int(solver.constraint_count.numpy()[0])
+            contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+            if contact_rows.any():
+                loaded = max(loaded, float(np.max(solver.impulses.numpy()[0, :count][contact_rows])))
+        self.assertTrue(solver._preelim_active)
+        self.assertGreater(loaded, 0.1, "the contacts carried no load")
+        self.assertLess(worst, 1.0e-5, f"loaded contacts opened the closure by {worst:.2e} m")
+
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""
         _, _, state, _ = _run_four_bar(enable_bilateral_preelimination=True, pgs_iterations=16)

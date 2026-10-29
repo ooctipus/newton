@@ -23,7 +23,7 @@ class TestTorsionRegularization(unittest.TestCase):
         count = int(result["count"][0])
         impulses = result["impulses"][0, :count]
         types = result["row_type"][0, :count]
-        response = result["Y_world"][0, :count].astype(np.float64)
+        response = result["response"][0, :count]
         expected = result["v_hat"].astype(np.float64) + response.T @ impulses.astype(np.float64)
         # Compare full velocities in float64 within the rounding of the sweep's float32 velocity.
         # Each PGS sweep (no velocity pass here) adds a changed row's response to it in place,

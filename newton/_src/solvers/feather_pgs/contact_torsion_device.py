@@ -308,6 +308,7 @@ def _apply_rows(
     target: wp.array2d[float],
     restitution: wp.array2d[float],
     membership: wp.array2d[int],
+    sides: wp.array2d[wp.vec2i],
 ):
     c = wp.tid()
     if work.status[0] != 0:
@@ -325,6 +326,8 @@ def _apply_rows(
     lead = work.lead[rep]
     row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
     parent[world, row] = work.slot[lead]
+    # The spin row acts on its lead contact's bodies.
+    sides[world, row] = sides[world, work.slot[lead]]
     mu[world, row] = work.coefficient[rep]
     beta[world, row] = 0.0
     cfm[world, row] = pgs_cfm
@@ -645,6 +648,7 @@ class DeviceTorsionPreparation:
                 s.target_velocity,
                 s.row_restitution,
                 s._contact_torsion_group,
+                s._row_sides,
             ],
             device=device,
         )

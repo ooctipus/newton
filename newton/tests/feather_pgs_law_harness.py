@@ -592,8 +592,13 @@ def bind_struct(struct_type, values, device):
         if fields[name].dims and not isinstance(value, wp.array):
             value = wp.array(np.asarray(value), dtype=fields[name].dtype, device=device)
         bound[name] = value
+    if "sides" in fields and "sides" not in bound and "row_type" in bound:
+        # The producers record each row's sides (the packed placement's); a scene without them reads none back.
+        bound["sides"] = wp.zeros(bound["row_type"].shape, dtype=wp.vec2i, device=device)
     instance = field_group.upload(struct_type, device, **bound)
-    return instance, {arguments[name]: value for name, value in bound.items() if isinstance(value, wp.array)}
+    return instance, {
+        arguments[name]: value for name, value in bound.items() if isinstance(value, wp.array) and name in arguments
+    }
 
 
 def contact_input(values, device):
@@ -603,11 +608,11 @@ def contact_input(values, device):
 
 def position_pass(device) -> list:
     """The trailing operands of ``kernels.compute_world_contact_bias``'s position pass: no velocity pass (0), whose
-    world layout, velocities and restitution threshold it then never reads."""
+    world coordinates, packed rows, velocities and restitution threshold it then never reads."""
     return [
         0,
-        wp.zeros(1, dtype=wp.int32, device=device),
         wp.zeros((1, 1), dtype=wp.int32, device=device),
+        wp.full((1, 1, 1), -1, dtype=wp.int32, device=device),
         wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
         wp.zeros(1, dtype=wp.float32, device=device),
         wp.zeros(1, dtype=wp.float32, device=device),
@@ -615,9 +620,76 @@ def position_pass(device) -> list:
     ]
 
 
+def packed_world_rows(world_jacobian, device) -> list:
+    """Packed rows (:mod:`.packed_rows`) of a dense world-layout Jacobian ``[world, row, coordinate]``: every entry at its
+    own coordinate, as ``(packed_dof, packed_J)``."""
+    world_jacobian = np.asarray(world_jacobian, dtype=np.float32)
+    dof = np.broadcast_to(np.arange(world_jacobian.shape[2], dtype=np.int32), world_jacobian.shape).copy()
+    return [wp.array(dof, dtype=wp.int32, device=device), wp.array(world_jacobian, dtype=wp.float32, device=device)]
+
+
+_FACTOR_STORAGE = []
+"""The factors :func:`articulation_factor` addresses, kept alive while the tests run."""
+
+
+def articulation_factor(mass, device):
+    """The :class:`.kernels.BodyFactors` of one articulation on global coordinates ``0..n-1`` with mass matrix
+    ``mass``, and its leaf-first factor ``L`` (``P mass P^T = L L^T``, ``P`` reversing the coordinates, float64)."""
+    mass = np.asarray(mass, dtype=np.float64)
+    n = mass.shape[0]
+    L = np.linalg.cholesky(mass[::-1, ::-1])
+    storage = wp.array(L.astype(np.float32), dtype=wp.float32, device=device)
+    _FACTOR_STORAGE.append(storage)
+    factors = kernels.BodyFactors()
+    factors.first_art = wp.array([0] + [-1] * (n - 1), dtype=wp.int32, device=device)
+    factors.size = wp.array([n], dtype=wp.int32, device=device)
+    factors.world_offset = wp.array([0], dtype=wp.int32, device=device)
+    factors.address = wp.array([storage.ptr], dtype=wp.uint64, device=device)
+    return factors, L
+
+
+def whitened_rows(jacobian, L) -> np.ndarray:
+    """The packed whitened rows ``Z = L^-1 P J^T`` of rows ``jacobian`` ``[..., n]`` on one articulation of leaf-first
+    factor ``L``, at their coordinates (factor coordinate ``i`` at entry ``n - 1 - i``), float64."""
+    jacobian = np.asarray(jacobian, dtype=np.float64)
+    flat = jacobian.reshape(-1, jacobian.shape[-1])
+    z = np.linalg.solve(L, flat[:, ::-1].T).T[:, ::-1]
+    return z.reshape(jacobian.shape)
+
+
+def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
+    """The matrix-free sweeps' dense rows over their worlds' coordinates, from the packed rows (:mod:`.packed_rows`),
+    float64 ``[world, row, coordinate]``: the Jacobian ``J`` and the response ``H^-1 J^T`` (``P^T L^-T z`` on each
+    side, the side's entries found by their coordinates)."""
+    dof = solver._packed_dof.numpy()
+    J, Z = solver._packed_J.numpy().astype(np.float64), solver._packed_Z.numpy().astype(np.float64)
+    sides, sizes = solver._row_sides.numpy(), solver.articulation_response_dof_count.numpy()
+    groups, offsets = solver.art_group_idx.numpy(), solver.articulation_world_dof_offset.numpy()
+    factors = {}
+    shape = (*dof.shape[:2], solver.max_world_dofs)
+    jacobian, response = np.zeros(shape), np.zeros(shape)
+    for world, count in enumerate(solver.constraint_count.numpy()):
+        for row in range(min(int(count), dof.shape[1])):
+            for art in sides[world, row]:
+                if art < 0:
+                    continue
+                n, first = int(sizes[art]), int(offsets[art])
+                if n == 0:
+                    continue  # No response coordinates (a prescribed articulation): no entries.
+                held = (dof[world, row] >= first) & (dof[world, row] < first + n)
+                coordinates = dof[world, row, held]
+                jacobian[world, row, coordinates] = J[world, row, held]
+                if n not in factors:
+                    factors[n] = solver.L_by_size[n].numpy().astype(np.float64)
+                L = np.tril(factors[n][groups[art]])
+                # Leaf-first positions: factor coordinate i is the side's coordinate n - 1 - i.
+                response[world, row, coordinates] = np.linalg.solve(L.T, Z[world, row, held][::-1])[::-1]
+    return jacobian, response
+
+
 def world_restitution_layout(device) -> list:
-    """The sparse-diagonal operands of ``kernels.apply_world_contact_restitution_matrix_free`` after ``world_J``,
-    for a world-layout row (``sparse_diagonal`` 0): never read."""
+    """The sparse-diagonal operands of ``kernels.apply_world_contact_restitution_matrix_free`` after ``packed_J``,
+    for a packed row (``sparse_diagonal`` 0): never read."""
     return [
         0,
         wp.zeros(1, dtype=wp.int32, device=device),

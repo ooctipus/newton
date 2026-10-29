@@ -35,17 +35,9 @@ class TestPairedComponents(unittest.TestCase):
         expected_selector = np.full(517, -1, np.int32)
         expected_selector[1:3] = [0, 3]
         np.testing.assert_array_equal(data.selector.numpy(), expected_selector)
-        expected = host["Y"].copy()
-        for world in np.flatnonzero(expected_selector == -1):
-            offset, count = host["primary_offset"][world], host["counts"][world]
-            factor = host["L"][host["primary_group"][world]].astype(np.float64)
-            # The held form z = L^T P y of the leaf-first factor, factor coordinate i at position 22 - i.
-            expected[world, :count, offset : offset + 23] = (
-                host["Y"][world, :count, offset : offset + 23][:, ::-1].astype(np.float64) @ factor
-            )[:, ::-1]
-        np.testing.assert_allclose(data.Y.numpy(), expected, rtol=2e-6, atol=2e-7)
+        # The rows are already whitened (packed at their world coordinates): the qualification reads them only.
         for name, before in host.items():
-            if name not in ("Y", "selector"):
+            if name != "selector":
                 np.testing.assert_array_equal(getattr(data, name).numpy(), before, err_msg=name)
 
     def test_reject_current_coupling_metadata_and_nonfinite(self):
@@ -148,7 +140,6 @@ class TestPairedComponents(unittest.TestCase):
             source = (
                 native.nonlocals.get("paired_components_native") or native.globals["paired_components_native"]
             ).native_snippet
-            self.assertIn(f"float y[{primary}]", source)
             self.assertIn(f"r * {primary + 6} + d", source)
         for primary, secondary in ((0, 6), (33, 6), (23, 3), (23, 7)):
             with self.subTest(primary=primary, secondary=secondary), self.assertRaises(ValueError):

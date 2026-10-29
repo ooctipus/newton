@@ -114,7 +114,7 @@ $LOCALS$EVALUATE        $SLOT
             LAW::row_cfm.data[at] = LAW::cfm;
             LAW::phi.data[at] = phi;
             LAW::target.data[at] = target;
-$RHS$SINK
+$SIDES$RHS$SINK
         }
 $AFTER    }
 """
@@ -128,7 +128,15 @@ _RHS = """            LAW::restitution.data[at] = 0.0f;
 
 
 def prefix_rows(
-    phases, *, law: str, ordered: bool, rhs: bool, sink: str = "", after: str = "", locals_: str = ""
+    phases,
+    *,
+    law: str,
+    ordered: bool,
+    rhs: bool,
+    sink: str = "",
+    after: str = "",
+    locals_: str = "",
+    side: str = "",
 ) -> str:
     """The prefix producer's candidate loop over one articulation, as native code inside its lane group.
 
@@ -144,6 +152,8 @@ def prefix_rows(
         sink: Native code that publishes an active row's coefficients at ``slot`` (record ``at``).
         after: Native code the whole lane group runs after each chunk of candidates (a cooperative sink).
         locals_: Native declarations of the families' and the sinks' own per-candidate variables.
+        side: The native articulation the rows touch, recorded as each row's sides (:func:`.dense_rows.row_sides`)
+            for the packed placement (:mod:`.packed_rows`); empty: a sink that keeps its rows elsewhere.
     """
     slot = (
         "const int slot = ORDERED(base, active != 0);"
@@ -174,6 +184,7 @@ def prefix_rows(
                 LOCALS=f"        {locals_}\n" if locals_ else "",
                 EVALUATE=evaluate,
                 SLOT=slot,
+                SIDES=f"            LAW::sides.data[at] = wp::vec2i({side}, -1);\n" if side else "",
                 RHS=_RHS if rhs else "",
                 SINK=sink,
                 AFTER=after,

@@ -1466,13 +1466,17 @@ def cuda_groups() -> list:
                 (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY, SPLIT_LOOP),
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST, SPLIT_LOOP)),
-            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL, SPLIT_LOOP, SPLIT_TILED)),
+            # The tiers whiten their rows in the kernel: the response block's scratch holds 29 coordinates a row at
+            # 32 rows, so the 66-coordinate sprawl and the 106-coordinate snake take the matrix-free tier.
+            Group(
+                _physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED)
+            ),
             # The parallel tiers cannot own the snake's 303-row world either: requesting them must leave its
             # serial sweep undisturbed.
             Group(
                 _physics(scenes.long_chain(), law, 64),
                 ref,
-                (MF_DEFAULT, MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
+                (MF_DEFAULT, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
             ),
             # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
             # armature it needs near the head, the same on every route.
@@ -1782,7 +1786,7 @@ OWNERSHIP = (
     (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
     # The snake's world exceeds every tier's row bound: the serial sweep keeps it.
-    (scenes.long_chain, "patch", 64, MF_PARALLEL, ("mf_gs",), ()),
+    (scenes.long_chain, "patch", 64, MF_PARALLEL_MATRIX_FREE, ("mf_gs",), ()),
     (scenes.gripper, "point", 32, LOCAL_PACKETS, ("local_pair|local_residual|local_internal",), ()),
     (scenes.gripper, "patch", 32, LOCAL_OWNED, ("local_pair|local_residual|local_internal",), ()),
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.

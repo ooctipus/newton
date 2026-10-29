@@ -5,7 +5,7 @@
 Delassus ``C``, and the velocity the impulses publish.
 
 A dense response is built per articulation size group in stages (:data:`STAGES`), each one implementation per
-thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the data a :class:`.DenseJY` sweep reads) and
+thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the response by size group and the world layout) and
 :data:`ASSEMBLED_BUILDS` (the data of an :class:`.Assembled` sweep). Each stage's arithmetic comes from one small
 dense kit:
 
@@ -1052,36 +1052,6 @@ def diagonal_groups_kernel() -> wp.Kernel:
 
 
 @functools.cache
-def diagonal_world_rows_kernel() -> wp.Kernel:
-    """The diagonal from the world layout, one thread per world row (``dim = worlds * max_constraints``): ``sum J Y``
-    over the world's coordinates in order, stored (no ``cfm``), in the worlds the general solver owns."""
-
-    def J(k):
-        return _element("J_world", "world", "row", k)
-
-    def Y(k):
-        return _element("Y_world", "world", "row", k)
-
-    body = f"""    const int row = tid % max_constraints;
-    const int world = tid / max_constraints;
-    if (row >= world_constraint_count.data[world]) return;
-    if (local_solve_owner.data[world] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}) return;
-{_indent(dot("value", "world_dof_count.data[world]", J, Y, index="dof"), "    ")}
-    {_element("world_diag", "world", "row")} = value;
-"""
-    params = kernel_template.params(
-        ("world_constraint_count", wp.array[int]),
-        ("local_solve_owner", wp.array[int]),
-        ("world_dof_count", wp.array[int]),
-        ("J_world", wp.array3d[float]),
-        ("Y_world", wp.array3d[float]),
-        ("max_constraints", int),
-        ("world_diag", wp.array2d[float]),
-    )
-    return _kernel("dense_diagonal_world_rows", params, body)
-
-
-@functools.cache
 def diagonal_queue_kernel() -> wp.Kernel:
     """The diagonal of the general worlds of the local owners' queue, a warp per worker, rows lane-strided
     (``launch_tiled(dim=[workers], block_dim=32)``): ``sum J Y`` over the world's coordinates in order, plus the
@@ -1464,21 +1434,19 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ),
     ("diagonal", "rows"): _entry("diagonal", "rows", diagonal_rows_kernel, ("articulations", "rows")),
     ("diagonal", "groups"): _entry("diagonal", "groups", diagonal_groups_kernel, ("worlds", "rows")),
-    ("diagonal", "world rows"): _entry("diagonal", "world rows", diagonal_world_rows_kernel, ("worlds", "rows")),
     ("diagonal", "queue"): _entry("diagonal", "queue", diagonal_queue_kernel, ("workers",), 32, tiled=True),
     ("cfm", "worlds"): _CFM_WORLDS,
     ("apply", "coordinates"): _entry(
         "apply", "coordinates", apply_coordinates_kernel, ("articulations", "coordinates")
     ),
 }
-"""The builds of a :class:`.DenseJY` operator's data, by ``(stage, mapping)``. Each takes its kernel factory's options
+"""The builds of the dense response's data, by ``(stage, mapping)``. Each takes its kernel factory's options
 as keywords and returns the :class:`Build`. The mappings: ``articulations``, a thread per articulation; ``coordinates``,
 a thread per articulation (or world row) coordinate; ``rows``, a thread per articulation row; ``lanes``, 32 threads
 per articulation, rows lane-strided; ``warps``, a warp per articulation, a lane per row (or the lanes assembling and
 lane 0 factoring); ``tiles``, a block per articulation (and row chunk) through the tile primitives; ``queue``, warps
 walking the local owners' general-world queue; ``pairs``, a block per paired world, a thread per row; ``groups``, a
-thread per world row summing its articulations' group diagonals; ``world rows``, a thread per world row of the world
-layout; ``worlds``, a thread per world. ``diagonal`` is the thread-per-row response of a structurally diagonal ``H``.
+thread per world row summing its articulations' group diagonals; ``worlds``, a thread per world. ``diagonal`` is the thread-per-row response of a structurally diagonal ``H``.
 The register response of the six-coordinate group is a device function, :func:`solve_six`."""
 
 ASSEMBLED_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {

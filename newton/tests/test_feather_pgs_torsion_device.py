@@ -144,6 +144,7 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         row_type=arr(row_types, int),
         row_parent=arr(parents, int),
         row_mu=arr(mu, float),
+        _row_sides=wp.zeros((worlds, dense), dtype=wp.vec2i, device=model.device),
         _row_dropped_dense=zero(worlds, int),
         _contact_torsion_group=full((worlds, dense), -1),
         pgs_cfm=0.003,
