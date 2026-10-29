@@ -49,7 +49,7 @@ from .kernels import BodyFactors
 from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Assembled, FreeBodyZ, Lanes, ResponseOperator, Velocity
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit
 from .staging import Staging
 from .sweep import (
     CONTACT,
@@ -389,8 +389,7 @@ def contact_units(sweep: LoopSweep, laws: RowLaws) -> tuple[str, str]:
     ring member without a pair takes the contact row's update. Each unit's alternation latch (``ContactUnit::latch``)
     relaxes the move; a unit that holds nothing and does not approach stays at zero. The operator binds the units'
     arithmetic: a row's whole residual, the block's entries and the apply of a row's change. A unit votes its rows'
-    changes under the solve policy, and under the exact law any change of its state too: a sweep that changes
-    nothing leaves a fixed point.
+    changes under the exit law; its state (latch, slide root) follows the impulses and votes nothing.
 
     Returns the declarations (after the world's operands, before the sweeps) and the admission (after the row's type
     is read; ``friction`` is set per sweep).
@@ -417,31 +416,27 @@ def contact_units(sweep: LoopSweep, laws: RowLaws) -> tuple[str, str]:
             return ""
         return "\n".join(f"UNIT_APPLY({row}, {change});" for row, change in changes)
 
+    def unit_change(row: str, kind: int) -> Change:
+        # The point unit's rows: their whole residuals r_<row> and old impulses o_<row> are in scope at the vote.
+        rhs = rows.rhs(row)
+        unit_bound = bound(rhs, op.terms(f"r_{row}", rhs, whole=True), f"exit_inverse(w_{row})", f"o_{row}")
+        return Change(f"new_{row} - o_{row}", unit_bound, str(kind), f"w_{row}")
+
     point_vote = (
         "if (new_n != o_n || new_t0 != o_t0 || new_t1 != o_t1) {\n"
         + change_vote(
-            laws,
-            (
-                ("new_n - o_n", "w_n", str(CONTACT)),
-                ("new_t0 - o_t0", "w_t0", str(FRICTION)),
-                ("new_t1 - o_t1", "w_t1", str(FRICTION)),
-            ),
-            "    ",
+            laws, (unit_change("n", CONTACT), unit_change("t0", FRICTION), unit_change("t1", FRICTION)), "    "
         )
         + "\n}"
     )
-    ring_vote = indent(
-        "if (updated != old) {\n"
-        + change_vote(
-            laws,
-            (("updated - old", "ring_W[a * rows + a]", f"(a < normals ? {CONTACT} : {FRICTION})"),),
-            "    ",
-        )
-        + "\n}",
-        "    ",
+    # A ring member's residual is folded into the block's right-hand side: the member votes on a zero bound of S_i.
+    ring_change = Change(
+        "updated - old",
+        bound(rows.rhs("ring_rows[a]"), "0.0f", "exit_inverse(ring_W[a * rows + a])", "old"),
+        f"(a < normals ? {CONTACT} : {FRICTION})",
+        "ring_W[a * rows + a]",
     )
-    # A unit's state change keeps the world sweeping under the exact law; a tolerance stops on the impulses alone.
-    keep = "if (slot != value) iteration_changed = 1;\n" if laws.policy.exact else ""
+    ring_vote = indent("if (updated != old) {\n" + change_vote(laws, (ring_change,), "    ") + "\n}", "    ")
     point = f"""const int t0 = n + 1, t1 = n + 2;
 const float r_n = UNIT_RESIDUAL(n);
 const float o_n = lam[n], o_t0 = lam[t0], o_t1 = lam[t1];
@@ -611,7 +606,7 @@ for (int a = 0; a < normals; ++a) {
     lambdas = [
         (
             "UNIT_KEEP = [&](const int row, const int field, const float value)",
-            f"float& slot = STATE(row, field);\n{keep}slot = value;",
+            "STATE(row, field) = value;",
         ),
         ("HAS_PAIR = [&](const int n) -> bool", has_pair),
         ("UNIT_SHAPE = [&](const int n, int& normals, int& anchors, int& first)", shape),
@@ -736,7 +731,6 @@ def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool, solve_policy: So
     quiet = "iteration_changed == 0"
     sweep_end = sweep_exit(
         solve_policy,
-        f"        if (global_iter >= friction_start_iteration && {quiet}) break;\n",
         quiet=quiet,
         gate="global_iter >= friction_start_iteration",
         iteration="it",
@@ -765,7 +759,7 @@ def _source(sweep: LoopSweep, *, units: bool, speed_rows: bool, solve_policy: So
 """
 
 
-def loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXACT_POLICY) -> tuple[str, Staging]:
+def loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = DEFAULT_POLICY) -> tuple[str, Staging]:
     """The native body of split mode's loop sweep over a world's assembled Delassus rows: one thread per world.
 
     The rows' impulses are updated in place; ``C``, the right-hand sides and the diagonals are read where they are
@@ -781,7 +775,7 @@ def loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXAC
     return _source(_dense(), units=contact_units, speed_rows=False, solve_policy=solve_policy), Staging()
 
 
-def mf_loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = EXACT_POLICY) -> tuple[str, Staging]:
+def mf_loop_source(*, contact_units: bool = False, solve_policy: SolvePolicy = DEFAULT_POLICY) -> tuple[str, Staging]:
     """The native body of split mode's loop sweep over a world's free-body rows: one thread per world.
 
     The rows' impulses and the bodies' velocities are updated in place (:class:`.FreeBodyZ` with one thread in the
@@ -810,26 +804,26 @@ def _kernel(name: str, abi, body: str, preludes, solve_policy: SolvePolicy) -> w
 
 
 @functools.cache
-def loop_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+def loop_kernel(*, solve_policy: SolvePolicy = DEFAULT_POLICY) -> wp.Kernel:
     """The assembled loop sweep kernel (:func:`loop_source`); a readout's operand follows the rows' operands."""
     return _kernel("sweep_loop", LOOP_ABI, loop_source(solve_policy=solve_policy)[0], _PRELUDES, solve_policy)
 
 
 @functools.cache
-def loop_unit_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+def loop_unit_kernel(*, solve_policy: SolvePolicy = DEFAULT_POLICY) -> wp.Kernel:
     """The assembled loop sweep kernel with contact units (:func:`loop_source`)."""
     source = loop_source(contact_units=True, solve_policy=solve_policy)[0]
     return _kernel("sweep_loop_unit", LOOP_UNIT_ABI, source, _UNIT_PRELUDES, solve_policy)
 
 
 @functools.cache
-def mf_loop_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+def mf_loop_kernel(*, solve_policy: SolvePolicy = DEFAULT_POLICY) -> wp.Kernel:
     """The free-body loop sweep kernel (:func:`mf_loop_source`)."""
     return _kernel("sweep_mf_loop", MF_LOOP_ABI, mf_loop_source(solve_policy=solve_policy)[0], _PRELUDES, solve_policy)
 
 
 @functools.cache
-def mf_loop_unit_kernel(*, solve_policy: SolvePolicy = EXACT_POLICY) -> wp.Kernel:
+def mf_loop_unit_kernel(*, solve_policy: SolvePolicy = DEFAULT_POLICY) -> wp.Kernel:
     """The free-body loop sweep kernel with contact units (:func:`mf_loop_source`)."""
     source = mf_loop_source(contact_units=True, solve_policy=solve_policy)[0]
     return _kernel("sweep_mf_loop_unit", MF_LOOP_UNIT_ABI, source, _UNIT_PRELUDES, solve_policy)

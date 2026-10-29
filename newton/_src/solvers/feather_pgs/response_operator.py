@@ -27,6 +27,7 @@ never extracted from another owner's source. No runtime method is selected here.
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .solve_policy import terms_bound
 from .staging import Buffer
 
 Vector = Callable[[str], str]
@@ -488,6 +489,13 @@ class ResponseOperator:
         inverse = self.inverse(row)
         return f"{inverse} > 0.0f ? 1.0f / {inverse} : 0.0f"
 
+    def step_size(self, row: str) -> str:
+        """``1 / A_ii`` of row ``row`` as the exit law's bound scales by it (:func:`.solve_policy.bound`): the stored
+        inverse when the operator keeps one, else the law's fast reciprocal of the diagonal."""
+        if self.inverse is not None:
+            return self.inverse(row)
+        return f"exit_inverse({self.diagonal(row)})"
+
     def step(self, residual: str, row: str) -> str:
         """The Gauss-Seidel step ``-r / A_ii``."""
         if self.inverse is not None:
@@ -503,6 +511,15 @@ class ResponseOperator:
     def velocity_term(self, residual: str, rhs: str, jv: str) -> str:
         """``J v`` of the row: the reduced ``jv``, or the maintained residual less its right-hand side."""
         return f"{residual} - {rhs}" if self.residual_includes_rhs else jv
+
+    def terms(self, out: str, rhs: str, *, whole: bool) -> str:
+        """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
+        lower bound of it, which the exit law scales a row's floor by (:class:`.solve_policy.Change`).
+
+        By default the reduced velocity term: ``|out|``, or ``|out - rhs|`` for a sum that includes its right-hand
+        side ``rhs`` (``whole``). An operator that reduces ``sum_k |t_ik|`` beside the sum returns it.
+        """
+        return terms_bound(out, rhs) if whole else f"fabsf({out})"
 
     # -- row actions ---------------------------------------------------------------------------------------------------
 
@@ -2721,11 +2738,23 @@ class FactorRows(ResponseOperator):
         return f"float {out} = {self.lanes.lane} < {self.dofs} ? {a} * {b} : 0.0f;"
 
     def _sums(self, channels, indent: str) -> str:
-        lines = [f"{indent}{self._product(out, a, b)}" for out, a, b in channels]
-        return "\n".join([*lines, f"{indent}{self.lanes.reduce(*(out for out, _, _ in channels))}"])
+        """Reduce each channel ``(out, a, b)``'s products in one ladder; a velocity sum (``b`` the velocity) reduces
+        its terms' magnitude beside it, ``{out}_terms`` (:meth:`terms`)."""
+        lines, names = [], []
+        for out, a, b in channels:
+            lines.append(f"{indent}{self._product(out, a, b)}")
+            names.append(out)
+            if b == self.velocity:
+                lines.append(f"{indent}float {out}_terms = fabsf({out});")
+                names.append(f"{out}_terms")
+        return "\n".join([*lines, f"{indent}{self.lanes.reduce(*names)}"])
+
+    def terms(self, out: str, rhs: str, *, whole: bool) -> str:
+        """``sum_k |Z_ik u_k|`` of a velocity sum reduced into ``out``, reduced beside it."""
+        return f"{out}_terms"
 
     def residual(self, out: str, indent: str) -> str:
-        """``float out = Z_i u`` of the current row."""
+        """``float out = Z_i u`` of the current row, and ``{out}_terms``."""
         return self._sums(((out, self.current, self.velocity),), indent)
 
     def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:

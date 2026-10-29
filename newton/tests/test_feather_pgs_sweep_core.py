@@ -10,7 +10,7 @@ import dataclasses
 import unittest
 
 from newton._src.solvers.feather_pgs.response_operator import Block, DenseJY, Lanes, ResponseOperator
-from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
+from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
     RowContext,
@@ -185,13 +185,16 @@ class TestRowTail(unittest.TestCase):
         update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"), fenced=False)
         self.assertEqual(update.count("SYNC();"), 2)
 
-    def test_the_impulse_slack_quiets_small_changes(self):
-        laws = RowLaws(regularize=False, policy=SolvePolicy(change_tolerance=1.0e-6, relative_change_tolerance=0.01))
-        vote = change_vote(laws, (("d", "A", "0"),), "", new="n")
-        self.assertEqual(vote, "if (!(fabsf(d) <= 1e-06f + 0.01f * fabsf(n))) iteration_changed = 1;")
-        update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"), laws)
-        self.assertIn("0.01f * fabsf(new_impulse)", update)
-        self.assertEqual(change_vote(RowLaws(), (("d", "A", "0"),), "  "), "  iteration_changed = 1;")
+    def test_the_exit_law_quiets_changes_at_the_rounding_floor(self):
+        """A change is loud beyond its row's bound, 2^-20 ((|b| + S) / A + |lambda|) at the old impulse."""
+        vote = change_vote(RowLaws(regularize=False), (Change("d", "tau", "0", "A"),), "  ")
+        self.assertEqual(vote, "  if ((!(fabsf(d) <= tau))) iteration_changed = 1;")
+        self.assertEqual(bound("b", "S", "s", "l"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
+        update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"))
+        self.assertIn(f"float row_bound = {bound('rhs[i]', 'fabsf(jv)', 'exit_inverse(A[i])', 'old_impulse')};", update)
+        self.assertIn("(!(fabsf(delta_impulse) <= row_bound))", update)
+        traced = change_vote(RowLaws(policy=SolvePolicy(readout="trace")), (Change("d", "tau", "0", "A"),), "")
+        self.assertTrue(traced.startswith("if (d != 0.0f) solve_trace_change(fabsf(d) * (A), 0);"))
 
 
 if __name__ == "__main__":

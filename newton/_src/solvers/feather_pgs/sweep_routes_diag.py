@@ -28,7 +28,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Assembled, FreeBodyZ, Lanes, SparsePairJY, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -113,11 +113,14 @@ def _diagonal_limits(dofs: int, laws: RowLaws) -> tuple[str, str, str, str]:
         )
         sides = []
         for bit, side, sign, update in ((1, "lower", "", "+="), (2, "upper", "-", "-=")):
-            change = change_vote(laws, (("delta_lambda", "limit_denom", str(JOINT_LIMIT)),), " " * 20)
+            limit_bound = bound(f"limit_{side}_rhs_{k}", f"fabsf(s_v[{d}])", "exit_inverse(limit_denom)", "old_lambda")
+            limit = Change("delta_lambda", "limit_bound", str(JOINT_LIMIT), "limit_denom")
+            change = change_vote(laws, (limit,), " " * 20)
             sides.append(
                 f"            if ((limit_active_{k} & {bit}) != 0) {{\n"
                 f"                const float residual = {sign}s_v[{d}] + limit_{side}_rhs_{k};\n"
                 f"                const float old_lambda = limit_{side}_lambda_{k};\n"
+                f"                const float limit_bound = {limit_bound};\n"
                 "                const float new_lambda = ProjectionLaw::unilateral(\n"
                 "                    ProjectionLaw::relaxed_step(old_lambda, -residual / limit_denom, omega));\n"
                 "                const float delta_lambda = new_lambda - old_lambda;\n"
@@ -152,7 +155,7 @@ def sparse_diagonal_source(
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
@@ -407,13 +410,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         }}"""
 
     declarations, limit_loads, limit_rows, limit_stores = _diagonal_limits(D, laws)
-    sweep_end = end_sweep(
-        solve_policy,
-        iteration="iteration",
-        exact="""        if (global_iter >= friction_start_iteration
-            && BALLOT(iteration_changed != 0) == 0u) break;
-""",
-    )
+    sweep_end = end_sweep(solve_policy, iteration="iteration")
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
     body = f"""    const int lane = LANE;
@@ -473,7 +470,7 @@ def sparse_diagonal_kernel(
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The sparse-diagonal sweep kernel."""
     snippet, staging = sparse_diagonal_source(
@@ -532,7 +529,7 @@ def tiled_row_source(
     row_budget: int | None = None,
     min_rows: int = 0,
     staging: str = "shared",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of split mode's Gauss-Seidel sweep over a world's assembled Delassus rows: one warp per world.
 
@@ -706,7 +703,7 @@ def tiled_row_kernel(
     row_budget: int | None = None,
     min_rows: int = 0,
     staging: str = "shared",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The tiled-row sweep kernel; a readout's operand follows the rows' operands.
 
@@ -766,7 +763,7 @@ def mf_split_source(
     max_mf_bodies: int,
     *,
     has_velocity_limit_rows: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of split mode's free-body Gauss-Seidel sweep: one warp per world, its first lane solving.
 
@@ -844,8 +841,6 @@ def mf_split_source(
     quiet = "iteration_changed == 0"
     sweep_end = sweep_exit(
         solve_policy,
-        f"""            if (global_iter >= friction_start_iteration && {quiet}) break;
-""",
         quiet=quiet,
         gate="global_iter >= friction_start_iteration",
         iteration="iter",
@@ -908,7 +903,7 @@ def mf_split_kernel(
     device_arch: str,
     *,
     has_velocity_limit_rows: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The split free-body sweep kernel."""
     snippet, staging = mf_split_source(

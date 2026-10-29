@@ -80,7 +80,7 @@ MU_PRESSED = 1.2
 # The certified references that 256 sweeps started from them leave above an NCP residual of 1e-3 m/s, by update
 # and friction law (test_sweeps_from_a_reference_leave_only_the_recorded_ones).
 _LEFT_REFERENCES = {
-    "sequential": {"point": {2114}, "patch": {2549}},
+    "sequential": {"point": set(), "patch": {2549}},
     "unit": {"point": set(), "patch": set()},
 }
 
@@ -811,8 +811,9 @@ class TestContactUpdateReplica(unittest.TestCase):
     def test_sweeps_from_a_reference_leave_only_the_recorded_ones(self):
         """Leave exactly the recorded certified references within 256 sweeps started from them, under each update.
 
-        One sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch
-        2549) within 256 sweeps. The unit sweeps keep every reference, also where a unit's problem has several
+        One sequential sweep keeps every reference, and the exit law stops it there, but for patch 2549, whose
+        period-two cycle moves its coinciding normals above their floor and repels it within 256 sweeps (the bitwise
+        exit kept sweeping point 2114 too, until the cycle repelled it). The unit sweeps keep every reference, also where a unit's problem has several
         solutions (test_reference_is_a_fixed_point_of_the_unit_sweep), and stay there. Exact solves of a slide whose
         load answers the contact's approach with the wrong sign (the middle one of several slides) or more than 8
         times its normal row's own response are driven away from it by the coupling of units: without the split step
@@ -898,10 +899,12 @@ class TestContactUpdateSolveState(unittest.TestCase):
         """Continue a solve's unit state across one-sweep launches and clear it when a new solve starts.
 
         One launch of 8 or 64 sweeps equals as many one-sweep launches that continue it (iteration_offset 1, 2,
-        ...), as the interleaved split driver launches them, bitwise; a new solve equals a fresh one whatever the
-        previous solve left. Restarting the solve at every launch, as the prototype harness did, changes the
-        result of 13 and 14 of the 27 stored systems at 8 and 64 sweeps: their latches restart, and the slide roots
-        that a held friction does not resume. A change of the state's semantics that changes fewer fails here.
+        ...), as the interleaved split driver launches them, to the exit law's floor: the launch stops at its first
+        quiet sweep, the one-sweep launches sweep on by changes within it. A new solve equals a fresh one bitwise,
+        whatever the previous solve left. Restarting the solve at every launch, as the prototype harness did, changes
+        the result of 6 and 11 of the 27 stored systems at 8 and 64 sweeps by more than 1e-4 of their largest impulse
+        (the others by less than 1e-6, at the floor): their latches restart, and the slide roots that a held friction
+        does not resume. A change of the state's semantics that changes fewer fails here.
         """
         systems = replica_systems("point") + replica_systems("patch")
         fresh = {sweeps: World(systems).sweep(sweeps, "unit") for sweeps in (8, 64)}
@@ -912,16 +915,21 @@ class TestContactUpdateSolveState(unittest.TestCase):
             again = world.sweep(sweeps, "unit")
             for k, system in enumerate(systems):
                 with self.subTest(sweeps=sweeps, system=system["source"]):
-                    np.testing.assert_array_equal(continued[k][-1], fresh[sweeps][k])
+                    scale = max(float(np.abs(fresh[sweeps][k]).max()), 1.0e-12)
+                    np.testing.assert_allclose(continued[k][-1], fresh[sweeps][k], rtol=0.0, atol=1.0e-4 * scale)
                     np.testing.assert_array_equal(again[k], fresh[sweeps][k])
-            changed = sum(not np.array_equal(h[-1], lam) for h, lam in zip(restarted, fresh[sweeps], strict=True))
-            self.assertGreaterEqual(changed, {8: 13, 64: 14}[sweeps])
+            changed = sum(
+                np.abs(h[-1] - lam).max() > 1.0e-4 * max(float(np.abs(lam).max()), 1.0e-12)
+                for h, lam in zip(restarted, fresh[sweeps], strict=True)
+            )
+            self.assertGreaterEqual(changed, {8: 6, 64: 11}[sweeps])
 
     def test_free_body_unit_state_lasts_one_solve(self):
         """Continue and clear the free-body unit sweep's state as the loop sweep's, on two contacts that alternate.
 
         The two contacts' loads reverse between visits, so their latches relax them: restarting the solve at every
-        launch moves their loads by 5% after 8 sweeps.
+        launch moves their loads by 5% after 8 sweeps. The one-sweep launches equal one launch to the exit law's
+        floor, past which they sweep on.
         """
         system = alternating_system()
         body = FreeBody(system)
@@ -929,7 +937,10 @@ class TestContactUpdateSolveState(unittest.TestCase):
         for sweeps in (8, 64):
             single = sweep_free_body(system, sweeps, "unit")
             with self.subTest(sweeps=sweeps):
-                np.testing.assert_array_equal(body.sweep(sweeps, "unit", offsets=range(sweeps)), single)
+                scale = max(float(np.abs(single).max()), 1.0e-12)
+                np.testing.assert_allclose(
+                    body.sweep(sweeps, "unit", offsets=range(sweeps)), single, rtol=0.0, atol=1.0e-4 * scale
+                )
                 np.testing.assert_array_equal(body.sweep(sweeps, "unit"), single)
                 restarted = body.sweep(sweeps, "unit", offsets=[0] * sweeps)
                 if sweeps == 8:

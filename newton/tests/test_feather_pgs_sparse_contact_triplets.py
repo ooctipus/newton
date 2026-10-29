@@ -20,7 +20,6 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION as FRICTION,
 )
-from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.staging import arch_budget
@@ -35,11 +34,8 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 TRANSACTIONS = ("staged", "single")
 
 
-def factory(
-    capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16, relative=0.0
-):
-    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request, ``relative``
-    the policy's relative impulse slack."""
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16):
+    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request."""
     options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
     if candidate and blocks != 16:
         options["transaction_blocks"] = blocks
@@ -50,7 +46,6 @@ def factory(
         active_rows=active,
         use_support_table=True,
         linked_rows=linked,
-        solve_policy=SolvePolicy(relative_change_tolerance=relative),
         **options,
     )
 
@@ -192,7 +187,6 @@ class DeviceSolve:
             linked=linked,
             transaction=transaction,
             blocks=blocks,
-            relative=float(data.get("relative_change_tolerance", 0.0)),
         )
         self.records = None
 
@@ -748,11 +742,8 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         without a 30-row lead that moves records and rings across 32-row words; zero and
         seeded impulses, delayed friction and relaxation, in the linked active scan and in
         the full sweep. The six-member rings catch a fused radius, in either sweep, or a
-        pair selection that stops after up to five members. A relative change tolerance
-        ends sweeps early on the same decisions: the normal bounds its change by its new
-        impulse and the pair by its new first tangent, as their ordinary updates do. The
-        single-stage transaction rounds differently, so under the tolerance it may stop a
-        sweep apart; its impulses must then still act through their own responses.
+        pair selection that stops after up to five members. The exit law stops both sweeps
+        on the same decisions: each change against the same floor as its ordinary update's.
         """
         settings = (
             {},
@@ -761,15 +752,11 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             {"seeded": True, "delay": 3, "iteration_offset": 4},
             {"seeded": True, "omega": -0.5},
         )
-        early_exits = 0
-        for (name, layout), pad, options, active, relative, transaction in product(
-            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), (0.0, 0.05), TRANSACTIONS
+        for (name, layout), pad, options, active, transaction in product(
+            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), TRANSACTIONS
         ):
-            with self.subTest(
-                layout=name, pad=pad, active=active, relative=relative, transaction=transaction, **options
-            ):
+            with self.subTest(layout=name, pad=pad, active=active, transaction=transaction, **options):
                 data, physical = linked_fixture(layout, pad=pad, active=active, **options)
-                data["relative_change_tolerance"] = relative
                 control = DeviceSolve(data, candidate=False, active=active, linked=True)
                 candidate = DeviceSolve(data, candidate=True, active=active, linked=True, transaction=transaction)
                 self.assertIn("_contact_triplets", candidate.kernel.key)
@@ -782,23 +769,11 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 if transaction == "staged":
                     np.testing.assert_array_equal(delta, control.result()[0])
                     np.testing.assert_array_equal(impulses, control.result()[1])
-                elif not relative:
+                else:
                     assert_output(self, data, delta, impulses, reference=control.result())
-                if relative:
-                    # The eight-sweep oracle does not apply once the tolerance ends a solve early.
-                    if transaction == "staged":
-                        every_sweep = DeviceSolve(
-                            {**data, "relative_change_tolerance": 0.0}, candidate=False, active=active, linked=True
-                        )
-                        every_sweep.launch()
-                        early_exits += not np.array_equal(every_sweep.result()[1], impulses)
-                    assert_output(self, data, delta, impulses)
-                    continue
                 # The oracle pools each ring as the ordinary update does; a fused radius
                 # without the ring would leave it.
                 assert_output(self, data, delta, impulses, physical=physical)
-        # The tolerance must end solves early, or its cases would prove nothing.
-        self.assertGreater(early_exits, 20)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_patch_host_admission_cuda(self):

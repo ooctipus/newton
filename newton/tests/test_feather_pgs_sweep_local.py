@@ -23,7 +23,7 @@ from newton._src.solvers.feather_pgs.response_operator import (
     Lanes,
     LocalBlock,
 )
-from newton._src.solvers.feather_pgs.solve_policy import EXACT_POLICY, SolvePolicy
+from newton._src.solvers.feather_pgs.solve_policy import DEFAULT_POLICY, SolvePolicy
 
 _LOCAL = sweep_routes_local.local_owned_kernel.__wrapped__
 _PAIRED = sweep_routes_local.paired_factor_kernel.__wrapped__
@@ -56,7 +56,7 @@ def _row_inputs(primary: int):
 
 def _local_variants():
     for (label, args, options), packets, policy in itertools.product(
-        LOCAL_CALLS, (False, True), (EXACT_POLICY, SolvePolicy(readout="sweeps"))
+        LOCAL_CALLS, (False, True), (DEFAULT_POLICY, SolvePolicy(readout="sweeps"))
     ):
         kwargs = {**options, "solve_policy": policy}
         if packets:
@@ -66,7 +66,7 @@ def _local_variants():
 
 def _paired_variants():
     for schedule, components, policy in itertools.product(
-        PAIRED_SCHEDULES, (False, True), (EXACT_POLICY, SolvePolicy(readout="sweeps"))
+        PAIRED_SCHEDULES, (False, True), (DEFAULT_POLICY, SolvePolicy(readout="sweeps"))
     ):
         kwargs = {**schedule, "independent_components": components, "solve_policy": policy}
         yield f"{list(schedule) or 'general'} components={components}{policy.suffix}", (64, 23, 17, 6, "120"), kwargs
@@ -155,12 +155,15 @@ class TestPairedFactorRoute(unittest.TestCase):
                 _PAIRED(*args, **kwargs)
 
     def test_unit_schedules_reduce_a_pair_in_one_ladder(self):
+        """A pair solved as a unit reduces both residuals, their terms' magnitudes (the exit law's scale) and the
+        coupling in one ladder; a pair at its first tangent reduces its sibling's and the coupling."""
+        unit = "SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);"
         for schedule in PAIRED_SCHEDULES[1:]:
             body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, **schedule)
-            self.assertIn("SUM(residual, sibling_residual, cross);", body)
+            self.assertIn(unit, body)
         body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6)
-        self.assertIn("SUM(sibling_residual, cross);", body)
-        self.assertNotIn("SUM(residual, sibling_residual, cross);", body)
+        self.assertIn("SUM(sibling_residual, sibling_residual_terms, cross);", body)
+        self.assertNotIn(unit, body)
 
     def test_triple_prefix_holds_no_friction_pairs(self):
         body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, contact_triples=True)
@@ -200,7 +203,9 @@ class TestResponseOperators(unittest.TestCase):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
         rhs = lambda r: f"s_rhs[{r}]"  # noqa: E731
         fused = rows.pair_terms("i", "sib", rhs, "", own=True)
-        self.assertIn("SUM(residual, sibling_residual, cross);", fused)
+        self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", fused)
+        self.assertIn("float residual_terms = fabsf(residual);", fused)
+        self.assertEqual(rows.terms("residual", "s_rhs[i]", whole=True), "residual_terms")
         self.assertIn("residual += s_rhs[i];", fused)
         self.assertEqual(rows.step("r", "i"), "-r / s_diag[i]")
         self.assertIn("factor_velocity += row_z * d;", rows.apply("d", ""))

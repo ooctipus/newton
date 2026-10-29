@@ -23,7 +23,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, DenseJY, DenseSupport, FreeBodyZ, Lanes, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
-from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax, sweep_exit
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, block_argmax, bound, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -598,7 +598,7 @@ def mf_gs_source(
     skip_incremental_rows: int = 0,
     independent_components: bool = False,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:class:`.DenseJY`) and its
     free-body rows (:class:`.FreeBodyZ`, its bodies in factor coordinates: :class:`FreeBodyCoordinates`), then its
@@ -727,10 +727,6 @@ def mf_gs_source(
         quiet = "!__syncthreads_or(iteration_changed != 0)"
         sweep_end = sweep_exit(
             solve_policy,
-            f"""        if (global_iter >= friction_start_iteration) {{
-            if ({quiet}) break;
-        }}
-""",
             quiet=quiet,
             gate="global_iter >= friction_start_iteration",
             iteration="iter",
@@ -751,15 +747,7 @@ def mf_gs_source(
             f"\n    const int off_color = unit_slot * {units + 1};"
         )
     else:
-        sweep_end = end_sweep(
-            solve_policy,
-            iteration="iter",
-            exact="""        if (global_iter >= friction_start_iteration) {
-            unsigned changed = BALLOT(iteration_changed != 0);
-            if (changed == 0u) break;
-        }
-""",
-        )
+        sweep_end = end_sweep(solve_policy, iteration="iter")
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
@@ -919,7 +907,7 @@ def mf_gs_kernel(
     skip_incremental_rows: int = 0,
     independent_components: bool = False,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches
     32 threads per world item and takes :data:`MF_GS_ABI` (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the
@@ -984,7 +972,7 @@ def incremental_source(
     skip_local_internal_worlds: bool = False,
     min_rows: int = 0,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The Gauss-Seidel sweep of a world's dense rows (at most ``incremental_rows``) over their response block.
 
@@ -1055,6 +1043,11 @@ def incremental_source(
         ]
     )
     vlim_old = "s_lam[i]" if accumulated else "0.0f"
+    vlim_rhs = ctx.rhs("i")
+    vlim_bound = bound(
+        vlim_rhs, op.terms("residual_vlim", vlim_rhs, whole=op.residual_includes_rhs), op.step_size("i"), vlim_old
+    )
+    vlim_change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), op.value("i"))
     vlim_pass = ""
     if has_dense_velocity_limit_rows:
         vlim_pass = f"""
@@ -1062,6 +1055,7 @@ def incremental_source(
             for (int k = 0; k < n_vlim; k++) {{
                 const int i = s_vlim_rows[k];
                 const float residual_vlim = s_res[i];
+                const float bound_vlim = {vlim_bound};
                 const auto vlim = ProjectionLaw::velocity_limit_update({vlim_old}, residual_vlim, {op.scale("residual_vlim", "i")}, {int(accumulated)});
                 const float delta_impulse_vlim = vlim.v1;
                 SYNC();
@@ -1070,7 +1064,7 @@ def incremental_source(
                     s_app[i] += delta_impulse_vlim;
                 }}
                 if (delta_impulse_vlim != 0.0f) {{
-{change_vote(laws, (("delta_impulse_vlim", op.value("i"), str(VELOCITY_LIMIT)),), " " * 20)}
+{change_vote(laws, (vlim_change,), " " * 20)}
 {op.apply_row("i", "delta_impulse_vlim", "                    ")}
                 }}
                 SYNC();
@@ -1190,7 +1184,7 @@ def incremental_kernel(
     skip_local_internal_worlds: bool = False,
     min_rows: int = 0,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The incremental tier's kernel (the matrix-free sweep's ABI); its working set fits the static budget of
     ``device_arch``."""

@@ -30,7 +30,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import EXACT_POLICY, SolvePolicy, block_argmax
+from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -163,7 +163,7 @@ def parallel_source(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row.
@@ -201,7 +201,7 @@ def parallel_source(
         drive=has_drive_rows,
         limits=velocity_limit_pass,
         diagonal=None if inkernel_response is not None else "world_diag.data[off_dense + i]",
-        scales=solve_policy.velocity or solve_policy.traces,
+        types=solve_policy.traces,
     )
     whitened = None
     if inkernel_response is not None:
@@ -247,7 +247,7 @@ def parallel_source(
     cfm = "world_row_cfm.data[off_dense + i]" if whitened is not None else None
 
     def scale(aii, bound, pad):
-        return jacobi_scale(aii, bound, cfm=cfm, pad=pad, scales=store.scales)
+        return jacobi_scale(aii, bound, cfm=cfm, pad=pad)
 
     last_word = jacobi_limit_pass(store, op, laws) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
@@ -298,7 +298,7 @@ def parallel_kernel(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 

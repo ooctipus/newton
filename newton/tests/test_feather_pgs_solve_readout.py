@@ -5,39 +5,29 @@
 
 Under ``pgs_solve_readout="sweeps"`` each sweep kernel records, per world, the
 sweeps a solve executed and whether it stopped before its budget. A sweep
-stops a world after a sweep that changes no impulse, so a world that stops
-after ``s`` sweeps has the same impulses and velocities after ``s - 1`` and
-after ``s`` sweeps. The kernel tests replay a solve at every sweep budget and
-check the counts against that rule; the solver tests check that every route's
-readout leaves the trajectory bitwise unchanged and counts each world-solve
-once: in the slot of the sweep that solved it, or, for a world without rows
-that the matrix-free sweeps do not enter, as skipped. The parallel tiers count
-their own worlds, against their own sweep budget.
-
-``pgs_velocity_change_tolerance`` stops a solve earlier, after the first sweep
-whose velocity-scaled changes fit the tolerance. Before that sweep it runs
-exactly the exact-law sweeps, so its outputs equal the exact law's at that
-budget, and the trace of an exact solve predicts that sweep for every grid
-tolerance. On the solver routes the trace changes no result and records every
-solve once per grid tolerance, and a tolerance compiled into every counted
-sweep keeps the trajectory near the exact law's in no more sweeps. Velocity-limit
-rows vote under both velocity-limit laws in the kernel tests, and bind under the
+stops a world after a sweep whose changes all lie within the exit law's
+rounding floor, so a world that stops after ``s`` sweeps has the same impulses
+and velocities at every budget from ``s`` on, and its outputs change at every
+budget before: they settle at ``s``, or at ``s - 1`` when sweep ``s`` changed
+nothing. The kernel tests replay a solve at every sweep budget and check the
+counts against that rule; the solver tests check that every route's readout
+leaves the trajectory bitwise unchanged and counts each world-solve once: in
+the slot of the sweep that solved it, or, for a world without rows that the
+matrix-free sweeps do not enter, as skipped. The parallel tiers count their own
+worlds, against their own sweep budget. Velocity-limit rows bind under the
 accumulated law on a route of their own.
 """
 
-import itertools
 import unittest
 import warnings
-from functools import partial
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sweep_routes, sweep_routes_local
+from newton._src.solvers.feather_pgs import sweep_routes_local
 from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
@@ -55,7 +45,6 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
-from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 
 SWEEPS = SolvePolicy(readout="sweeps")
@@ -82,99 +71,48 @@ def _trace(device, worlds, budget=BUDGET):
     return operand
 
 
-def _violation_problem():
-    """Two contact rows on one coordinate: the first one's update violates the second, unselected at entry.
-
-    In ``_problem``'s layout: identity factor, rows ``[1, 0, 0]`` and ``[-3, 1, 0]``,
-    incident velocity zero and bias ``[-1, 0.5]``. The first sweep visits only the
-    first row (the second is satisfied at entry); its velocity-scaled change is 1
-    and leaves the second row violated by 2.5.
-    """
-    rows = np.array([[1.0, 0.0, 0.0], [-3.0, 1.0, 0.0]])
-    types = np.full(2, PGS_CONSTRAINT_TYPE_CONTACT, dtype=np.int32)
-    diagonal = np.sum(rows * rows, axis=1) + 1.0e-6
-    zeros = np.zeros(2)
-    return (
-        np.eye(3),
-        np.arange(3),
-        rows,
-        np.zeros(3),
-        np.array([-1.0, 0.5]),
-        types,
-        np.full(2, -1, dtype=np.int32),
-        zeros,
-        zeros,
-        rows,
-        rows,
-        zeros,
-        diagonal,
-    )
-
-
-# Two velocity-limit DOFs whose positive mass coupling makes braking either one speed the other up.
-_PAIR_MASS = np.array([[3.0, 0.6], [0.6, 1.0]])
-_PAIR_VELOCITY = np.array([2.0, 2.5])
-
-
-def _velocity_limit_pair(device, *, row_phase, iterations):
-    """One world's launch values of two coupled velocity-limit rows that keep pushing each other's DOF past its limit.
-
-    The values of test_feather_pgs_velocity_limit_law's chain (upper limits of 1 on both DOFs, the
-    rows in order) with another mass matrix and start: both DOFs start beyond their limits, and
-    braking one speeds the other up, so every correction is a push and the stateless corrections
-    add up to the accumulated impulses. The sweeps then converge to both limits geometrically under
-    either law, by about 0.12 per sweep: the largest velocity-scaled change falls from about 2 in
-    the first sweep to about 1e-6 in the eighth.
-    """
-    from newton.tests.test_feather_pgs_velocity_limit_law import _dense_row_values  # noqa: PLC0415
-
-    values = _dense_row_values(device, order=(0, 1), row_phase=row_phase, iterations=iterations)
-    jacobian = values["J_world"].numpy()[0, :2]
-    response, diagonal = values["Y_world"].numpy(), values["world_diag"].numpy()
-    response[0, :2] = np.linalg.solve(_PAIR_MASS, jacobian.T).T
-    diagonal[0, :2] = np.einsum("ij,ij->i", jacobian, response[0, :2])
-    values.update(
-        Y_world=wp.array(response, dtype=wp.float32, device=device),
-        world_diag=wp.array(diagonal, dtype=wp.float32, device=device),
-        v_out=wp.array(_PAIR_VELOCITY, dtype=wp.float32, device=device),
-    )
-    return values
-
-
 def _expected_counts(outputs, *, offset=0, friction_start=0):
-    """Return ``(executed, stopped)`` per world from per-budget outputs ``outputs[s][world]``.
+    """Return the sweeps each world may have executed, from per-budget outputs ``outputs[s][world]``.
 
-    A world stops after the first sweep ``s`` that leaves its outputs bitwise
-    unchanged, once friction rows are active (global sweep index at least
-    ``friction_start``); otherwise it executes the whole budget.
+    The outputs settle at budget ``c``, the first from which they never change. A world stops after the first
+    sweep, once friction rows are active (global sweep index at least ``friction_start``), whose changes were all
+    quiet: sweep ``c`` (its changes within the floor) or ``c + 1`` (no change), or the first open sweep after them.
+    A world whose outputs settle only at the budget may have run it out. Returns per world the allowed counts.
     """
     budget = len(outputs) - 1
-    executed, stopped = [], []
+    allowed = []
     for world in range(len(outputs[0])):
-        stop = next(
-            (
-                s
-                for s in range(1, budget + 1)
-                if offset + s - 1 >= friction_start
-                and all(np.array_equal(a, b) for a, b in zip(outputs[s][world], outputs[s - 1][world], strict=True))
-            ),
-            None,
-        )
-        executed.append(budget if stop is None else stop)
-        stopped.append(stop is not None)
-    return executed, stopped
+
+        def same(a, b, world=world):
+            return all(np.array_equal(x, y) for x, y in zip(outputs[a][world], outputs[b][world], strict=True))
+
+        settle = next(c for c in range(budget + 1) if all(same(c, later) for later in range(c, budget + 1)))
+        first = max(settle, 1)
+        while first < budget and offset + first - 1 < friction_start:
+            first += 1
+        counts = {first, min(first + 1, budget)} if first == settle else {first}
+        allowed.append(counts)
+    return allowed
 
 
-def _assert_counts(test, operand, executed, stopped, solved, *, repeats=1):
-    """Check one record of ``repeats`` identical solves per world in ``solved``, none elsewhere."""
+def _assert_counts(test, operand, allowed, solved, *, repeats=1):
+    """Check one record of ``repeats`` identical solves per world in ``solved`` at one of its allowed counts (a
+    count below the budget stopped the world), none elsewhere."""
     sweeps, exhausted = operand.sweeps.numpy(), operand.exhausted.numpy()
-    for world, (count, stop) in enumerate(zip(executed, stopped, strict=True)):
+    budget = sweeps.shape[0] - 1
+    for world, counts in enumerate(allowed):
         with test.subTest(world=world):
-            expected = np.zeros(sweeps.shape[0], dtype=np.int32)
-            if world in solved:
-                expected[count] = repeats
-            np.testing.assert_array_equal(sweeps[:, world], expected)
-            test.assertEqual(exhausted[world], repeats if world in solved and not stop else 0)
+            if world not in solved:
+                np.testing.assert_array_equal(sweeps[:, world], 0)
+                test.assertEqual(exhausted[world], 0)
+                continue
+            (recorded,) = np.flatnonzero(sweeps[:, world])
+            test.assertIn(int(recorded), counts)
+            test.assertEqual(int(sweeps[recorded, world]), repeats)
+            if recorded < budget:
+                test.assertEqual(exhausted[world], 0)
+            else:
+                test.assertIn(int(exhausted[world]), (0, repeats))
 
 
 class _SparseCase:
@@ -363,13 +301,13 @@ class TestSolveReadoutKernels(unittest.TestCase):
                 for budget in range(BUDGET + 1):
                     case.run(exact, budget)
                     outputs.append(case.read())
-                executed, stopped = _expected_counts(outputs, offset=offset, friction_start=friction_start)
+                allowed = _expected_counts(outputs, offset=offset, friction_start=friction_start)
                 operand = _readout(device, case.worlds)
                 case.run(counted, BUDGET, operand)
                 for actual, expected in zip(case.read(), outputs[BUDGET], strict=True):
                     for actual_array, expected_array in zip(actual, expected, strict=True):
                         np.testing.assert_array_equal(actual_array, expected_array)
-                _assert_counts(self, operand, executed, stopped, solved=range(case.worlds))
+                _assert_counts(self, operand, allowed, solved=range(case.worlds))
                 # Graph replays add one record per replay to the captured operand.
                 operand = _readout(device, case.worlds)
                 with wp.ScopedCapture(device=device) as capture:
@@ -379,142 +317,7 @@ class TestSolveReadoutKernels(unittest.TestCase):
                 for actual, expected in zip(case.read(), outputs[BUDGET], strict=True):
                     for actual_array, expected_array in zip(actual, expected, strict=True):
                         np.testing.assert_array_equal(actual_array, expected_array)
-                _assert_counts(self, operand, executed, stopped, solved=range(case.worlds), repeats=2)
-
-    def test_trace_predicts_where_each_tolerance_stops(self):
-        """Stop each tolerance run where the exact trace predicted, with the exact law's outputs at that sweep."""
-        from newton.tests.test_feather_pgs_sparse_pgs import _problem  # noqa: PLC0415
-
-        device = wp.get_device("cuda:0")
-        cases = (
-            ((43, 18, False, None), {}, (0, 0, 1.0)),
-            ((43, 18, True, None), {}, (3, 1, 0.7)),
-            ((43, 18, False, None), {"active_rows": True}, (0, 0, 1.0)),
-        )
-        for (dofs, support, seeded, activity), options, (friction_start, offset, omega) in cases:
-            with self.subTest(dofs=dofs, seeded=seeded, options=options):
-                problem = _problem(dofs, support, seeded, contact_activity=activity)
-                case = _SparseCase(device, problem, options, friction_start, offset, omega)
-                exact = case.kernel()
-                outputs = []
-                for budget in range(BUDGET + 1):
-                    case.run(exact, budget)
-                    outputs.append(case.read())
-                trace = _trace(device, case.worlds)
-                case.run(case.kernel(SolvePolicy(readout="trace")), BUDGET, trace)
-                for actual, expected in zip(case.read(), outputs[BUDGET], strict=True):
-                    for actual_array, expected_array in zip(actual, expected, strict=True):
-                        np.testing.assert_array_equal(actual_array, expected_array)
-                stops = trace.stops.numpy()
-                self.assertEqual(int(trace.reasons.numpy().sum()), case.worlds)
-                for point in (4, 8, 12):
-                    with self.subTest(tolerance=TRACE_GRID[point]):
-                        policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=TRACE_GRID[point])
-                        operand = _readout(device, case.worlds)
-                        case.run(case.kernel(policy), BUDGET, operand)
-                        sweeps, exhausted = operand.sweeps.numpy(), operand.exhausted.numpy()
-                        histogram = sweeps.sum(axis=1)
-                        np.testing.assert_array_equal(histogram[1:BUDGET], stops[point, 1:BUDGET])
-                        self.assertEqual(histogram[BUDGET], stops[point, BUDGET] + stops[point, BUDGET + 1])
-                        self.assertEqual(int(exhausted.sum()), stops[point, BUDGET + 1])
-                        # Before its exit a tolerance run sweeps exactly as the exact law does.
-                        result = case.read()
-                        for world in range(case.worlds):
-                            executed = int(np.flatnonzero(sweeps[:, world])[0])
-                            for actual_array, expected_array in zip(
-                                result[world], outputs[executed][world], strict=True
-                            ):
-                                np.testing.assert_array_equal(actual_array, expected_array)
-
-    def test_active_rows_wait_for_a_violated_unvisited_row(self):
-        """Keep sweeping while the visit of a row the active scan skipped would change it beyond the tolerance.
-
-        The first sweep visits only the first row: its velocity-scaled change is ``omega`` and it leaves
-        the second row violated by ``3 * omega - 0.5``, which a visit would change by ``omega`` times
-        that. At ``omega = 1`` that is 2.5, beyond a tolerance of 1.5, so the world sweeps on. At
-        ``omega = 0.5`` it is 0.5, within a tolerance of 0.75, so the world stops after the first sweep,
-        although the second row's violation itself (1) exceeds the tolerance.
-        """
-        device = wp.get_device("cuda:0")
-        rows = _violation_problem()[2]
-        for omega, tolerance, violation in ((1.0, 1.5, 2.5), (0.5, 0.75, 1.0)):
-            with self.subTest(omega=omega):
-                case = _SparseCase(device, _violation_problem(), {"active_rows": True}, 0, 0, omega)
-                outputs = []
-                for budget in range(BUDGET + 1):
-                    case.run(case.kernel(), budget)
-                    outputs.append(case.read())
-                delta, impulses = outputs[1][0]
-                # The impulse buffer holds the case's padded capacity; only the leading rows are live.
-                live, padding = impulses[: len(rows)], impulses[len(rows) :]
-                np.testing.assert_allclose(live, [omega, 0.0], rtol=1.0e-5, atol=0.0)
-                np.testing.assert_array_equal(padding, 0.0)
-                np.testing.assert_allclose(rows[1] @ delta + 0.5, -violation, rtol=1.0e-5)
-                operand = _readout(device, case.worlds)
-                policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=tolerance)
-                case.run(case.kernel(policy), BUDGET, operand)
-                executed = int(np.flatnonzero(operand.sweeps.numpy()[:, 0])[0])
-                if omega * violation > tolerance:
-                    self.assertGreater(executed, 1)
-                else:
-                    self.assertEqual(executed, 1)
-                for actual_array, expected_array in zip(case.read()[0], outputs[executed][0], strict=True):
-                    np.testing.assert_array_equal(actual_array, expected_array)
-
-    def test_velocity_limit_trace_predicts_where_each_tolerance_stops(self):
-        """Stop the tolerance runs of velocity-limit rows where the exact trace predicted, under either law.
-
-        Two coupled velocity-limit rows (:func:`_velocity_limit_pair`) go through the matrix-free and
-        incremental sweeps, which visit them in the end-of-iteration pass of row phase 0 and in the
-        main row loop of phase 5. A row votes the correction it applies under the stateless law and
-        the change of its stored total under the accumulated law, each scaled by its A_ii. The trace
-        of an exact solve changes no output and predicts the sweep after which each tolerance run
-        stops; that run has the exact law's outputs there and leaves neither DOF beyond its limit by
-        more than the tolerance, and the largest tolerance stops several sweeps before the budget.
-        """
-        from newton.tests.test_feather_pgs_velocity_limit_law import _launch_inputs  # noqa: PLC0415
-
-        device = wp.get_device("cuda:0")
-        arch = str(device.arch)
-        factories = {
-            "mf_gs": partial(sweep_routes.mf_gs_kernel, 4, 1, 2, arch, has_drive_rows=False),
-            "incremental": partial(
-                sweep_routes.incremental_kernel, 4, 1, 2, arch, incremental_rows=4, has_drive_rows=False
-            ),
-        }
-        for (name, factory), law, row_phase in itertools.product(factories.items(), VELOCITY_LIMIT_LAWS, (0, 5)):
-            with self.subTest(kernel=name, law=law, row_phase=row_phase):
-
-                def run(policy, budget, operand=None, factory=factory, law=law, row_phase=row_phase):
-                    kernel = factory(velocity_limit_law=law, solve_policy=policy)
-                    values = _velocity_limit_pair(device, row_phase=row_phase, iterations=budget)
-                    if operand is not None:
-                        values["readout"] = operand
-                    inputs = _launch_inputs(kernel, values)
-                    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=32, device=device)
-                    return values["v_out"].numpy(), values["world_impulses"].numpy()[0]
-
-                outputs = [run(SolvePolicy(), budget) for budget in range(BUDGET + 1)]
-                trace = _trace(device, 1)
-                _assert_bitwise([run(SolvePolicy(readout="trace"), BUDGET, trace)], [outputs[BUDGET]])
-                self.assertEqual(int(trace.reasons.numpy().sum()), 1)
-                stops = trace.stops.numpy()
-                earliest = BUDGET + 1
-                for point in (4, 8, 12):
-                    tolerance = TRACE_GRID[point]
-                    stop = int(np.flatnonzero(stops[point])[0])
-                    operand = _readout(device, 1)
-                    policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=tolerance)
-                    velocity, impulses = run(policy, BUDGET, operand)
-                    executed = int(np.flatnonzero(operand.sweeps.numpy()[:, 0])[0])
-                    self.assertEqual(executed, min(stop, BUDGET), tolerance)
-                    self.assertEqual(int(operand.exhausted.numpy()[0]), int(stop > BUDGET), tolerance)
-                    # Before its exit a tolerance run sweeps exactly as the exact law does.
-                    _assert_bitwise([(velocity, impulses)], [outputs[executed]])
-                    if stop <= BUDGET:
-                        self.assertLessEqual(float(np.max(velocity - 1.0)), tolerance + 1.0e-6, tolerance)
-                    earliest = min(earliest, stop)
-                self.assertLess(earliest, BUDGET - 2)
+                _assert_counts(self, operand, allowed, solved=range(case.worlds), repeats=2)
 
     def test_local_counts_sweeps_to_the_stationary_exit(self):
         """Count only the owned world's sweeps to its first stationary sweep, with bitwise outputs."""
@@ -524,40 +327,11 @@ class TestSolveReadoutKernels(unittest.TestCase):
         for budget in range(BUDGET + 1):
             case.run(exact, budget)
             outputs.append(case.read())
-        executed, stopped = _expected_counts(outputs)
+        allowed = _expected_counts(outputs)
         operand = _readout(case.device, case.worlds)
         case.run(counted, BUDGET, operand)
         _assert_bitwise(case.read(), outputs[BUDGET])
-        _assert_counts(self, operand, executed, stopped, solved=(0,))
-
-    def test_local_trace_predicts_where_each_tolerance_stops(self):
-        """Stop the local owner's tolerance runs where its exact trace predicted, with the exact outputs there."""
-        case = _LocalCase(wp.get_cuda_device())
-        exact = case.kernel()
-        outputs = []
-        for budget in range(BUDGET + 1):
-            case.run(exact, budget)
-            outputs.append(case.read())
-        trace = _trace(case.device, case.worlds)
-        case.run(case.kernel(SolvePolicy(readout="trace")), BUDGET, trace)
-        _assert_bitwise(case.read(), outputs[BUDGET])
-        # Only the owned world solves: one record per grid tolerance, exit reason and final sweep.
-        stops = trace.stops.numpy()
-        np.testing.assert_array_equal(stops.sum(axis=1), np.ones(len(TRACE_GRID), dtype=np.int32))
-        self.assertEqual((int(trace.reasons.numpy().sum()), int(trace.limits.numpy().sum())), (1, 1))
-        for point in (4, 8, 12):
-            with self.subTest(tolerance=TRACE_GRID[point]):
-                stop = int(np.flatnonzero(stops[point])[0])
-                operand = _readout(case.device, case.worlds)
-                policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=TRACE_GRID[point])
-                case.run(case.kernel(policy), BUDGET, operand)
-                sweeps, exhausted = operand.sweeps.numpy(), operand.exhausted.numpy()
-                np.testing.assert_array_equal(sweeps[:, 1], 0)
-                executed = int(np.flatnonzero(sweeps[:, 0])[0])
-                self.assertEqual(executed, min(stop, BUDGET))
-                self.assertEqual(int(exhausted[0]), int(stop > BUDGET))
-                # Before its exit a tolerance run sweeps exactly as the exact law does.
-                _assert_bitwise(case.read(), [outputs[executed][0], outputs[BUDGET][1]])
+        _assert_counts(self, operand, allowed, solved=(0,))
 
 
 def _sparse_route():
@@ -975,8 +749,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Count the parallel tiers' world-solves in their own slots, every world-solve once, none twice.
 
         The tiers solve the tripod's world, the matrix-free sweep the free body's: their slots and the
-        skip counter must add up to every world at every step. Under a velocity tolerance every sweep,
-        the tiers' included, compiles the law, without a warning.
+        skip counter must add up to every world at every step.
         """
         route, steps = _tier_route(), 4
         solver, summary, _ = self._lockstep(route, steps=steps)
@@ -988,14 +761,6 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertLessEqual(tier_kernels, set(sweep["readout"]["counted"]))
         tiers = sum(slot["solves"] for slot in summary["slots"] if slot["route"] == "parallel_tier")
         self.assertGreater(tiers, 0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            (loose,) = self._solvers(route, [{"pgs_velocity_change_tolerance": 1.0e-3}])
-        law = loose.get_path_selection()["routes"]["sweep"]["exit_law"]
-        self.assertEqual(law["law"], "velocity")
-        self.assertLessEqual(
-            {loose._pgs_solve_mf_gs_kernel.key, *(tier.kernel.key for tier in loose._mf_gs_tiers)}, set(law["honored"])
-        )
 
     def test_torsion_traces_its_changes(self):
         """Trace the matrix-free sweep with contact torsion, without a warning: every sweep compiles the trace."""
@@ -1054,62 +819,6 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                         self.assertEqual([sum(row) for row in trace["stops"]], [slot["solves"]] * len(TRACE_GRID))
                         self.assertEqual(sum(trace["reasons"].values()), slot["solves"])
                         self.assertEqual(sum(kind["count"] for kind in trace["final_change"].values()), slot["solves"])
-
-    def test_tolerance_stays_near_the_exact_law_in_fewer_sweeps(self):
-        """Step every policy route under a velocity tolerance beside the exact law: near it, in no more sweeps.
-
-        From one state on shared contacts, a 1e-3 tolerance compiled into every counted sweep must keep
-        every joint velocity within 1e-2 of the exact law's over 12 steps, count every world-solve once
-        (in a slot or as skipped), execute no more sweeps than the exact law on the route (and per route
-        label whose solve count matches), and fewer on at least one route.
-        """
-        steps, tolerance = 12, 1.0e-3
-        savings = {}
-        for route in _policy_routes():
-            name = _route_name(route)
-            with self.subTest(route=name):
-                variants = [
-                    {"pgs_solve_readout": "sweeps"},
-                    {"pgs_solve_readout": "sweeps", "pgs_velocity_change_tolerance": tolerance},
-                ]
-                with warnings.catch_warnings():
-                    # A route's fixed-iteration sweeps keep their own law, about which the solver may warn.
-                    warnings.simplefilter("ignore", UserWarning)
-                    exact, loose = self._solvers(route, variants)
-                counted = loose._solve_readout.kernels
-                self.assertTrue(set(counted.values()) & route["labels"], counted)
-                law = loose.get_path_selection()["routes"]["sweep"]["exit_law"]
-                self.assertEqual(law["law"], "velocity")
-                self.assertEqual(set(law["honored"]), set(counted))
-                deviation = 0.0
-                # The two trajectories differ slightly, so each solver's worlds may lack rows at other steps.
-                rowless = [0, 0]
-                for step, (exact_state, loose_state) in self._steps(route, [exact, loose], steps):
-                    rowless = [count + _rowless(solver) for count, solver in zip(rowless, (exact, loose), strict=True)]
-                    for field in STATE_FIELDS:
-                        self.assertTrue(np.isfinite(getattr(loose_state, field).numpy()).all(), f"{field} at {step}")
-                    difference = loose_state.joint_qd.numpy() - exact_state.joint_qd.numpy()
-                    deviation = max(deviation, float(np.abs(difference).max()))
-                self.assertLess(deviation, 1.0e-2)
-                totals = []
-                for solver, solver_rowless in zip((exact, loose), rowless, strict=True):
-                    summary = solver.get_path_selection()["measurements"]["solve_readout"]
-                    self._assert_owned(route, summary, steps, solver_rowless)
-                    by_label = {}
-                    for slot in summary["slots"]:
-                        solves, sweeps = by_label.get(slot["route"], (0, 0))
-                        executed = sum(count * sweep for sweep, count in enumerate(slot["sweeps"]))
-                        by_label[slot["route"]] = (solves + slot["solves"], sweeps + executed)
-                    totals.append(by_label)
-                exact_totals, loose_totals = totals
-                for label, (solves, sweeps) in loose_totals.items():
-                    if solves and exact_totals.get(label, (0, 0))[0] == solves:
-                        self.assertLessEqual(sweeps, exact_totals[label][1], label)
-                savings[name] = sum(sweeps for _, sweeps in exact_totals.values()) - sum(
-                    sweeps for _, sweeps in loose_totals.values()
-                )
-                self.assertGreaterEqual(savings[name], 0)
-        self.assertTrue(any(saving > 0 for saving in savings.values()), savings)
 
 
 if __name__ == "__main__":

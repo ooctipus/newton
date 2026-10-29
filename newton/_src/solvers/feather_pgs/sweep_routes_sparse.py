@@ -38,7 +38,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
-from .solve_policy import EXACT_POLICY, SolvePolicy
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .staging import Buffer, Staging, arch_budget
@@ -194,7 +194,7 @@ def _resolve(
     warm_start: bool = False,
     linked_rows: bool = False,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
 ) -> SparseSweep:
@@ -418,12 +418,17 @@ SYNC();"""
     return indent(text, pad)
 
 
-def active_violation(sweep: SparseSweep, op: SparseFactor) -> tuple[str, str, str]:
-    """The exit's bound on the rows an active sweep leaves unvisited: the largest change a visit of a zero-impulse
-    unilateral row would make, its violation times ``omega`` (:func:`.solve_policy.sweep_exit`)."""
+def active_violation(sweep: SparseSweep, op: SparseFactor) -> tuple[str, str, str, str]:
+    """The exit law on the rows an active sweep leaves unvisited (:func:`.solve_policy.sweep_exit`): whether a visit
+    of some zero-impulse unilateral row would make a loud change (its violation times ``omega``, as the row's own
+    update would), and the largest such change with its row's kind."""
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
+    # A visit would give the row the impulse excess / A_ii: the change of its own velocity is the excess.
+    # A visit would change the row's own velocity by its excess: velocity units on both sides.
+    visit = Change("excess", bound("s_rhs[row]", "fabsf(dot)", "1.0f", "0.0f"), "kind", "1.0f")
     code = f"""float sweep_violation = 0.0f;
 int sweep_violation_kind = -1;
+int sweep_violation_loud = 0;
 for (int first = 0; first < count; first += 32) {{
     const int row = first + lane;
     const int kind = row < count ? static_cast<int>(s_type[row]) : -1;
@@ -432,14 +437,16 @@ for (int first = 0; first < count; first += 32) {{
 {serial.accumulate("dot", "row", "        ")}
         const float residual = dot + s_rhs[row];
         const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
+        if (excess != 0.0f && ({visit.loud})) sweep_violation_loud = 1;
         if (excess > sweep_violation) {{
             sweep_violation = excess;
             sweep_violation_kind = kind;
         }}
     }}
 }}
-ARGMAX(sweep_violation, sweep_violation_kind);"""
-    return code, "sweep_violation", "sweep_violation_kind"
+ARGMAX(sweep_violation, sweep_violation_kind);
+const bool sweep_violation_any = BALLOT(sweep_violation_loud != 0) != 0u;"""
+    return code, "sweep_violation_any", "sweep_violation", "sweep_violation_kind"
 
 
 def warm_start_seed(op: SparseFactor, pad: str) -> str:
@@ -526,23 +533,20 @@ def ordinary_rows(
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _triplet_vote(laws: RowLaws, linked: bool, pad: str) -> str:
-    """A triplet's change vote: every change bounded by the new normal impulse, or (linked) the normal's by its new
-    impulse and the pair's by its new first tangent, as their ordinary updates bound them."""
-    terms = (
-        ("normal_change", "s_diag[i]", str(CONTACT)),
-        ("tangent_change", "s_diag[tangent]", str(FRICTION)),
-        ("sibling_change", "s_diag[sibling]", str(FRICTION)),
+def _triplet_vote(laws: RowLaws, pad: str) -> str:
+    """A triplet's vote under the exit law: the normal's change and the pair's (:func:`_tangent_state`)."""
+    changes = (
+        Change("normal_change", "normal_bound", str(CONTACT), "s_diag[i]"),
+        Change("tangent_change", "tangent_bound", str(FRICTION), "s_diag[tangent]"),
+        Change("sibling_change", "sibling_bound", str(FRICTION), "s_diag[sibling]"),
     )
-    new = ("new_normal", "tangent_value", "tangent_value") if linked else "new_normal"
-    return change_vote(laws, terms, pad, new=new)
+    return change_vote(laws, changes, pad)
 
 
-def _triplet_pair(*, reduce: str, pair_law: str, apply: str, linked: bool) -> str:
+def _triplet_pair(*, reduce: str, pair_law: str, apply: str) -> str:
     """The pair's update at the new normal load: ``reduce`` its residuals, project the pair on its disk by
     ``pair_law``, store it from the first lane (every lane read the pair's impulses before the normal's store) and
     ``apply`` its changes to the coordinates a transaction holds. A zero disk without carried impulse is skipped."""
-    keep = "\n    tangent_value = new_tangent;" if linked else ""
     lines = [
         "if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {",
         indent(reduce, "    ") if reduce else "",
@@ -553,7 +557,7 @@ def _triplet_pair(*, reduce: str, pair_law: str, apply: str, linked: bool) -> st
         "    pair = ProjectionLaw::disk(pair, radius);",
         "    const float new_tangent = pair[0], new_sibling = pair[1];",
         "    tangent_change = new_tangent - old_tangent;",
-        f"    sibling_change = new_sibling - old_sibling;{keep}",
+        "    sibling_change = new_sibling - old_sibling;",
         "    if (lane == 0) { s_impulse[tangent] = new_tangent; s_impulse[sibling] = new_sibling; }",
         indent(apply, "    ") if apply else "",
         "}",
@@ -561,9 +565,22 @@ def _triplet_pair(*, reduce: str, pair_law: str, apply: str, linked: bool) -> st
     return "\n".join(line for line in lines if line)
 
 
-def _tangent_state(linked: bool) -> str:
-    """The pair's changes (zero for a skipped pair) and, linked, its new first tangent, which bounds them."""
-    return "float tangent_change = 0.0f, sibling_change = 0.0f" + (", tangent_value = 0.0f;" if linked else ";")
+def _tangent_state(bounds: tuple[str, str] = ("0.0f", "0.0f")) -> str:
+    """The pair's changes (zero for a skipped pair) and their bounds under the exit law (``bounds``, or set where the
+    pair reduces its residuals; a skipped pair changes nothing)."""
+    tangent_bound, sibling_bound = bounds
+    return (
+        "float tangent_change = 0.0f, sibling_change = 0.0f, "
+        f"tangent_bound = {tangent_bound}, sibling_bound = {sibling_bound};"
+    )
+
+
+def _pair_bounds(tangent_dot: str, sibling_dot: str, tangent_rhs: str, sibling_rhs: str) -> tuple[str, str]:
+    """The bounds of a triplet's tangent pair from the reduced sums of its residuals, at its old impulses."""
+    return (
+        bound(tangent_rhs, f"fabsf({tangent_dot})", "exit_inverse(s_diag[tangent])", "old_tangent"),
+        bound(sibling_rhs, f"fabsf({sibling_dot})", "exit_inverse(s_diag[sibling])", "old_sibling"),
+    )
 
 
 def _record(width: int, row: str) -> str:
@@ -677,16 +694,19 @@ if (index >= 0) {{
     load, ring = "new_normal", ""
     if sweep.linked:
         load, ring = "load", f"\n    const float load = {rows.ring_load('i', 'new_normal')};"
+    staged_bounds = _pair_bounds("dot", "sibling_dot", "s_rhs[tangent]", "s_rhs[sibling]")
     reduce = f"""const bool ready = s_metric_map[triplet_slot] >= 0;
 float dot = 0.0f, sibling_dot = 0.0f, cross = 0.0f;
 {pair_gather}
 SUM(dot, sibling_dot);
 if (!ready) SUM(cross);
+tangent_bound = {staged_bounds[0]};
+sibling_bound = {staged_bounds[1]};
 const float residual = dot + s_rhs[tangent];"""
     pair_law = """const float sibling_residual = sibling_dot + s_rhs[sibling];
 pair = friction_pair_cached(triplet_slot, s_diag[tangent], cross, s_diag[sibling],
     wp::vec2(residual, sibling_residual), wp::vec2(old_tangent, old_sibling), radius, omega);"""
-    pair = _triplet_pair(reduce=reduce, pair_law=pair_law, apply=pair_move, linked=sweep.linked)
+    pair = _triplet_pair(reduce=reduce, pair_law=pair_law, apply=pair_move)
     update = f"""if (i == consumed_tangent) continue;
 const int triplet_slot = contact_metric_slot(i);
 const bool fuse = triplet_slot >= 0 && global_iter >= friction_start_iteration
@@ -702,19 +722,20 @@ if (fuse) {{
     SUM(normal_dot);
     const float normal_residual = normal_dot + s_rhs[i];
     const float old_normal = s_impulse[i];
+    const float normal_bound = {bound("s_rhs[i]", "fabsf(normal_dot)", "exit_inverse(s_diag[i])", "old_normal")};
     const float new_normal = ProjectionLaw::unilateral(
         ProjectionLaw::relaxed_step(old_normal, -normal_residual / s_diag[i], omega));
     const float normal_change = new_normal - old_normal;{ring}
     const float radius = fmaxf(world_row_mu.data[offset + tangent] * {load}, 0.0f);
     const float old_tangent = s_impulse[tangent], old_sibling = s_impulse[sibling];
-    {_tangent_state(sweep.linked)}
+    {_tangent_state()}
     // Every lane has read the triplet's impulses before the first lane writes them.
     SYNC();
     if (lane == 0) s_impulse[i] = new_normal;
 {normal_move}
 {indent(pair, "    ")}
     if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-{_triplet_vote(laws, sweep.linked, "        ")}
+{_triplet_vote(laws, "        ")}
 {write_back}
     }}
     consumed_tangent = tangent;
@@ -823,7 +844,7 @@ if (index >= 0) {{
 pair = ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y, wp::vec2(basis.z, basis.w),
     wp::vec2(tangent_residual + coupling.x * normal_change, sibling_residual + coupling.y * normal_change),
     wp::vec2(old_tangent, old_sibling), radius, omega);"""
-    pair = _triplet_pair(reduce="", pair_law=pair_law, apply="", linked=sweep.linked)
+    pair = _triplet_pair(reduce="", pair_law=pair_law, apply="")
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
@@ -856,18 +877,19 @@ if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
         const float normal_residual = normal_dot + normal_rhs;
         const float tangent_residual = tangent_dot + tangent_rhs;
         const float sibling_residual = sibling_dot + sibling_rhs;
+        const float normal_bound = {bound("normal_rhs", "fabsf(normal_dot)", "coupling.w", "old_normal")};
         const float new_normal = ProjectionLaw::unilateral(
             ProjectionLaw::relaxed_step(old_normal, -normal_residual * coupling.w, omega));
         const float normal_change = new_normal - old_normal;{ring}
         const float radius = fmaxf(mu * {load}, 0.0f);
-        {_tangent_state(sweep.linked)}
+        {_tangent_state(_pair_bounds("tangent_dot", "sibling_dot", "tangent_rhs", "sibling_rhs"))}
         // Shuffles order execution, not memory: every lane has read the triplet's impulses before the first
         // lane writes them.
         SYNC();
         if (lane == 0) s_impulse[i] = new_normal;
 {indent(pair, "        ")}
         if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-{_triplet_vote(laws, sweep.linked, "            ")}
+{_triplet_vote(laws, "            ")}
 {apply}
         }}
         consumed_tangent = tangent;
@@ -966,12 +988,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     passes = ""
     if sweep.velocity_limits:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
-    exit_ = end_sweep(
-        sweep.policy,
-        iteration="iter",
-        exact="        if (global_iter >= friction_start_iteration && BALLOT(iteration_changed != 0) == 0u) break;\n",
-        violation=active_violation(sweep, op) if sweep.active else None,
-    )
+    exit_ = end_sweep(sweep.policy, iteration="iter", violation=active_violation(sweep, op) if sweep.active else None)
     body = f"""    const int lane = LANE;
     const int offset = world * {M};
     const int row_base = offset * {S};
@@ -1017,7 +1034,7 @@ def sparse_source(
     warm_start: bool = False,
     linked_rows: bool = False,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
 ) -> tuple[str, Staging]:
@@ -1062,7 +1079,7 @@ def sparse_kernel(
     warm_start: bool = False,
     linked_rows: bool = False,
     velocity_limit_law: str = "stateless",
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
     device_arch=None,

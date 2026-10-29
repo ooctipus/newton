@@ -1,46 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compile-time stopping rule of the native sweeps and their opt-in readout.
+"""The sweeps' exit law, written once for every route, and its opt-in readout.
 
-Every native sweep stops a world after a sweep in which no row voted a
-change. A :class:`SolvePolicy` is compiled into every sweep (Gauss-Seidel and
-Jacobi alike) and keys their kernel caches: equal policies share kernels, and
-the default policy emits exactly the kernels built before policies existed.
+Every native sweep (Gauss-Seidel and Jacobi alike) stops a world after a sweep in which every row update was
+quiet: its change lay within the rounding floor of the update's own arithmetic. For row ``i`` with diagonal
+``A_ii``, impulse ``lambda_i`` before the update and change ``dlambda_i``, the law reads the change of the row's own
+velocity that the update made, ``phi_i = A_ii |dlambda_i|`` (the row's natural residual in velocity units; a Jacobi
+step from extrapolated impulses reads its step from them over its step size), against
 
-Under the exact law (the default) every nonzero impulse change votes. The
-impulse slack (``change_tolerance`` and ``relative_change_tolerance``) makes a
-change within ``change_tolerance + relative_change_tolerance * |lambda|`` of
-its update's reference impulse quiet. ``velocity_change_tolerance`` replaces
-the impulse test by a velocity-scaled one: a row is quiet when its impulse
-change times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of
-the row's own velocity), is at most the tolerance plus its scaled slack.
-Sweeps that visit only rows selected at sweep entry also require, under the
-velocity law, the change a visit would make to every zero-impulse unilateral
-row, its violation times the relaxation factor, to be at most the tolerance.
-Under the exact law without readout the emitters return each sweep's own
-exact text.
+    tau_i = 16 u s_i,   s_i = |b_i| + S_i + A_ii |lambda_i|,   u = 2^-24,
 
-Without slack a solve under the velocity law runs the exact law's sweeps and
-stops at or before the sweep where the exact law stops, so its outputs are
-the exact law's at that sweep, and the trace of an exact solve predicts that
-sweep for every tolerance of its grid. The slack lets a solve stop with
-nonzero changes: the trace records changes without it, so it no longer
-predicts the stop, and the unvisited-row bound, which has no slack, can add
-sweeps.
+where ``b_i`` is the residual's right-hand side and ``S_i = sum_k |t_ik|`` the magnitude of the terms its velocity
+sum adds (``Z_ik u_k``, ``J_ik v_k`` or ``W_ij lambda_j``, as the sweep forms it). The residual is computed only to
+``gamma_n S_i + u |b_i|``, and the step, projection and difference add a few roundings of the impulse, so a change
+within ``tau_i`` is indistinguishable from rounding: a sweep of quiet updates is a fixed point of the floating-point
+projected Gauss-Seidel map up to its floor, whatever the schedule. (The impulse after the update bounds the impulse
+term within ``phi_i`` of the one before, so the floor reads the one before, at hand where the residual is formed.)
+A sweep that visits only the rows it selected at entry also requires every unvisited zero-impulse unilateral row's
+would-be change to be quiet.
 
-With ``readout="sweeps"`` each sweep also counts, per world, how many sweeps
-every solve executed; ``readout="trace"`` adds, per solve, the sweep at which
-each tolerance of :data:`TRACE_GRID` would have stopped it, its exit reason,
-and the largest velocity-scaled change of its final sweep with that row's
-kind. The counters are one operand per kernel, appended to the kernel's
-arguments, and :class:`SolveReadoutRecord` owns them on the host. The
-matrix-free sweeps enter no world without rows, so the record also counts
-the solves of worlds without dense or matrix-free rows as skipped, in a
-launch of its own. Neither readout changes a computed value.
+A vote site computes each row's bound in impulse units, ``tau_i / A_ii`` (:func:`bound`), where its residual is
+reduced, and votes its change against it with one compare (:class:`Change`); a Jacobi step, whose ``phi_i`` is its
+change over its step size ``s_i``, votes against ``tau_i s_i``. An operator that does not form ``S_i`` passes a
+lower bound of it (by default the reduced velocity term, ``|sum_k t_ik| <= sum_k |t_ik|``), which makes the test
+stricter: a quiet vote always certifies ``phi_i <= tau_i``. A :class:`SolvePolicy` names the readout compiled into
+every sweep and keys their kernel caches.
+
+With ``readout="sweeps"`` each sweep also counts, per world, how many sweeps every solve executed;
+``readout="trace"`` adds, per solve, the sweep at which each absolute velocity tolerance of :data:`TRACE_GRID` would
+have stopped it, its exit reason, and the largest velocity-scaled change of its final sweep with that row's kind.
+The counters are one operand per kernel, appended to the kernel's arguments, and :class:`SolveReadoutRecord` owns
+them on the host. The matrix-free sweeps enter no world without rows, so the record also counts the solves of
+worlds without dense or matrix-free rows as skipped, in a launch of its own. Neither readout changes a computed
+value.
 """
 
-import math
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -64,7 +59,7 @@ TRACE_GRID = tuple(10.0 ** (-7.0 + 0.5 * point) for point in range(13))
 """Velocity tolerances [m/s or rad/s] at which the trace records where each solve would stop: 1e-7 to 1e-1."""
 
 TRACE_REASONS = ("stationary", "tolerance", "budget")
-"""Exit reasons of a traced solve: no change, changes within the tolerance, or the sweep budget ran out."""
+"""Exit reasons of a traced solve: no change, changes within the exit law's floor, or the sweep budget ran out."""
 
 TRACE_KINDS = ("contact", "drive", "friction", "joint_limit", "velocity_limit", "mimic", "connect", "torsion", "none")
 """Row kinds of the trace's final-sweep change, indexed by constraint type; ``"none"`` when no row changed."""
@@ -176,9 +171,85 @@ SWEEP_TRACE = DevicePrelude("sweep_trace", _SWEEP_TRACE, _serial(_SWEEP_TRACE))
 """Device state and helpers of the trace; ``readout`` is the kernel's :class:`SolveTrace` operand."""
 
 
+QUIET_UNITS = 16
+"""Rounding units of the exit law's floor: a change within ``QUIET_UNITS * UNIT_ROUNDOFF`` of its update's scale is
+quiet. It covers a lane reduction's depth (5 to 8 roundings) and the applies a velocity carries between two visits
+of a row (random-sign roundings of a few dozen applies, about 8)."""
+
+UNIT_ROUNDOFF = 2.0**-24
+"""The unit roundoff of float32, the precision every sweep computes in."""
+
+QUIET = QUIET_UNITS * UNIT_ROUNDOFF
+"""The exit law's floor relative to an update's scale, ``2^-20``."""
+
+QUIET_LITERAL = f"{QUIET!r}f"
+""":data:`QUIET` as a CUDA ``float`` literal (exact: a power of two)."""
+
+
+_EXIT_LAW = """    // The exit law's inverse of a row's diagonal: a bound's scale, to a few ulps.
+    const auto exit_inverse = [](float diagonal) -> float { return __fdividef(1.0f, diagonal); };"""
+
+EXIT_LAW = DevicePrelude(
+    "exit_law",
+    _EXIT_LAW,
+    _EXIT_LAW.replace("__fdividef(1.0f, diagonal)", "1.0f / diagonal").replace(", to a few ulps", ""),
+)
+"""Device helper of the exit law, which every sweep declares: ``exit_inverse(A)``, the fast reciprocal its bounds
+scale by when a row stores its diagonal rather than its inverse."""
+
+
+def bound(rhs: str, terms: str, step: str, impulse: str) -> str:
+    """The bound ``tau_i step = 2^-20 ((|b_i| + S_i) step + A_ii step |lambda_i|)`` of a row update's impulse change.
+
+    Args:
+        rhs: The right-hand side ``b_i`` of the residual the update reads.
+        terms: ``S_i``, the magnitude of the terms the residual's velocity sum adds, or a lower bound of it.
+        step: The row's step size: ``1 / A_ii`` for a Gauss-Seidel step (``exit_inverse`` of a stored diagonal), or
+            a Jacobi step's ``s_i``.
+        impulse: The row's impulse before the update times ``A_ii step``: the impulse itself for a Gauss-Seidel
+            step, its share of one for a Jacobi step.
+    """
+    return f"{QUIET_LITERAL} * ((fabsf({rhs}) + ({terms})) * ({step}) + fabsf({impulse}))"
+
+
+@dataclass(frozen=True)
+class Change:
+    """One update's change as the exit law reads it: native expressions in scope at the vote.
+
+    The change is loud beyond its bound (:func:`bound`), which the vote site computed where the residual was reduced;
+    a NaN change is loud. The trace records ``phi = |delta| * velocity``, the change of the row's own velocity.
+    """
+
+    delta: str
+    """The impulse change ``dlambda_i``."""
+    bound: str
+    """The row's bound ``tau_i / A_ii`` (:func:`bound`)."""
+    kind: str
+    """The row's constraint type (the trace names its change by it)."""
+    velocity: str
+    """Converts the impulse change into the row's velocity change for the trace: ``A_ii``, or a Jacobi step's inverse
+    size."""
+
+    @property
+    def phi(self) -> str:
+        """The change of the row's own velocity, ``|dlambda_i| A_ii``."""
+        return f"fabsf({self.delta}) * ({self.velocity})"
+
+    @property
+    def loud(self) -> str:
+        """Whether the change exceeds its bound."""
+        return f"!(fabsf({self.delta}) <= {self.bound})"
+
+
+def terms_bound(residual: str, rhs: str) -> str:
+    """The default lower bound of ``S_i``: the reduced velocity term ``|r_i - b_i|`` of a residual ``r_i`` read with
+    its right-hand side ``b_i`` (``|sum_k t_ik| <= sum_k |t_ik|``)."""
+    return f"fabsf(({residual}) - ({rhs}))"
+
+
 @dataclass(frozen=True, repr=False, kw_only=True)
 class SolvePolicy:
-    """How a native Gauss-Seidel sweep stops, and what it reports.
+    """What a native sweep reports beside the exit law, which every sweep compiles.
 
     A frozen, hashable value: sweep factories take it as a keyword and cache
     their kernels on it. Its representation names only the fields that differ
@@ -186,24 +257,11 @@ class SolvePolicy:
     """
 
     readout: str = "off"
-    """``"off"``, ``"sweeps"`` to count the sweeps every solve executes, or ``"trace"`` to add the exit-law trace."""
-    velocity_change_tolerance: float = 0.0
-    """Largest velocity-scaled change of a quiet row [m/s or rad/s]; zero votes every change beyond the slack."""
-    change_tolerance: float = 0.0
-    """Impulse slack of a quiet row [N s, or N m s for an angular row]: a change within it does not vote."""
-    relative_change_tolerance: float = 0.0
-    """Slack relative to the update's reference impulse, added to ``change_tolerance``; in ``[0, 1)``."""
+    """``"off"``, ``"sweeps"`` to count the sweeps every solve executes, or ``"trace"`` to add the exit trace."""
 
     def __post_init__(self):
         if self.readout not in SOLVE_READOUTS:
             raise ValueError(f"readout must be one of {SOLVE_READOUTS}, got {self.readout!r}")
-        for name in ("velocity_change_tolerance", "change_tolerance", "relative_change_tolerance"):
-            tolerance = float(getattr(self, name))
-            if not (math.isfinite(tolerance) and tolerance >= 0.0):
-                raise ValueError(f"{name} must be finite and non-negative, got {tolerance!r}")
-            object.__setattr__(self, name, tolerance)
-        if self.relative_change_tolerance >= 1.0:
-            raise ValueError(f"relative_change_tolerance must be below 1, got {self.relative_change_tolerance!r}")
 
     def __repr__(self) -> str:
         changed = (
@@ -220,51 +278,18 @@ class SolvePolicy:
 
     @property
     def traces(self) -> bool:
-        """Whether the sweep records the exit-law trace."""
+        """Whether the sweep records the exit trace."""
         return self.readout == "trace"
 
     @property
-    def exact(self) -> bool:
-        """Whether the sweep keeps the exact stationary-sweep law: every change votes."""
-        return not (self.velocity or self.slack)
-
-    @property
-    def velocity(self) -> bool:
-        """Whether a row votes its velocity-scaled change against ``velocity_change_tolerance``."""
-        return self.velocity_change_tolerance > 0.0
-
-    @property
-    def slack(self) -> bool:
-        """Whether a change within the impulse slack does not vote."""
-        return self.change_tolerance > 0.0 or self.relative_change_tolerance > 0.0
-
-    @property
-    def tolerance_literal(self) -> str:
-        """The velocity tolerance as a CUDA ``float`` literal."""
-        return f"{self.velocity_change_tolerance!r}f"
-
-    def slack_bound(self, reference: str | None) -> str:
-        """The impulse slack of a change whose update's reference impulse is ``reference`` (``None``: the absolute
-        slack alone), as a CUDA expression."""
-        terms = [f"{self.change_tolerance!r}f"] if self.change_tolerance > 0.0 or reference is None else []
-        if reference is not None and self.relative_change_tolerance > 0.0:
-            terms.append(f"{self.relative_change_tolerance!r}f * fabsf({reference})")
-        return " + ".join(terms)
-
-    @property
     def suffix(self) -> str:
-        """Kernel-name suffix of this policy's variant; empty for the exact policy without readout."""
-        tolerances = (("vtol", self.velocity_change_tolerance), ("ctol", self.change_tolerance))
-        tolerances += (("rtol", self.relative_change_tolerance),)
-        named = "".join(
-            f"_{name}" + repr(value).replace(".", "p").replace("-", "m") for name, value in tolerances if value > 0.0
-        )
-        return named + (f"_{self.readout}" if self.counts else "")
+        """Kernel-name suffix of this policy's variant; empty without readout."""
+        return f"_{self.readout}" if self.counts else ""
 
     @property
     def preludes(self) -> tuple[DevicePrelude, ...]:
         """Device preludes the sweep body declares under this policy, after its own."""
-        return {"off": (), "sweeps": (SWEEP_READOUT,), "trace": (SWEEP_TRACE,)}[self.readout]
+        return (EXIT_LAW, *{"off": (), "sweeps": (SWEEP_READOUT,), "trace": (SWEEP_TRACE,)}[self.readout])
 
     @property
     def operands(self) -> dict:
@@ -277,74 +302,39 @@ class SolvePolicy:
         return tuple(RowArgument(name, dtype) for name, dtype in self.operands.items())
 
 
-EXACT_POLICY = SolvePolicy()
-"""The exact law without readout: every sweep factory's default."""
+DEFAULT_POLICY = SolvePolicy()
+"""The policy without readout: every sweep factory's default."""
 
 
-def vote(
-    policy: SolvePolicy,
-    exact: str,
-    *,
-    flag: str,
-    terms: tuple[tuple[str, str, str], ...],
-    references: tuple[str | None, ...] | str | None = None,
-) -> str:
-    """Return a row update's change vote under the policy's exit law.
+def vote(policy: SolvePolicy, changes: tuple[Change, ...], *, flag: str, pad: str) -> str:
+    """Return the exit law's vote on an update's changes: ``flag`` is set when one of them is loud.
 
-    Under the exact law without trace the update's own vote, ``exact``, is
-    returned unchanged. The impulse slack makes a term quiet within
-    ``change_tolerance + relative_change_tolerance * |reference|``; a positive
-    velocity tolerance votes when some term's velocity-scaled change exceeds
-    the tolerance plus its scaled slack. The sweep keeps applying every nonzero
-    change to the velocity. The trace records each term's velocity-scaled
-    change, without the slack. Every form leaves a zero change quiet, so the
-    vote may stand outside a block entered on a change.
+    The sweep keeps applying every nonzero change to the velocity; a quiet change only does not keep the world
+    sweeping. The trace records each nonzero change's ``phi``. A zero change is quiet, so the vote may stand outside
+    a block entered on a change.
 
     Args:
-        policy: The sweep's solve policy.
-        exact: The update's vote under the exact law, with its leading indentation.
+        policy: The sweep's solve policy (its readout).
+        changes: The update's changes (one per row it changed).
         flag: The sweep's change flag.
-        terms: ``(change, scale, kind)`` per row the update changed: its impulse
-            change, its effective-mass diagonal ``A_ii`` and its constraint type.
-        references: The reference impulse of every term (one expression) or one per term, which the relative slack
-            scales; ``None`` bounds a term by the absolute slack alone.
+        pad: Indentation of the emitted statements.
     """
-    if policy.exact and not policy.traces:
-        return exact
-    indent = exact[: len(exact) - len(exact.lstrip())]
-    if not isinstance(references, tuple):
-        references = (references,) * len(terms)
-    slack = tuple(policy.slack_bound(reference) for reference in references) if policy.slack else None
     statements = []
     if policy.traces:
         statements += [
-            f"if ({change} != 0.0f) solve_trace_change(fabsf({change}) * ({scale}), {kind});"
-            for change, scale, kind in terms
+            f"if ({change.delta} != 0.0f) solve_trace_change({change.phi}, {change.kind});" for change in changes
         ]
-    if policy.exact:
-        statements.append(exact.strip())
-    elif not policy.velocity:
-        within = " && ".join(f"fabsf({change}) <= {bound}" for (change, _, _), bound in zip(terms, slack, strict=True))
-        statements.append(f"if (!({within})) {flag} = 1;")
-    else:
-        bounds = []
-        for index, (change, scale, _) in enumerate(terms):
-            bound = policy.tolerance_literal
-            if slack is not None:
-                bound += f" + ({scale}) * ({slack[index]})"
-            bounds.append(f"({change} != 0.0f && !(fabsf({change}) * ({scale}) <= {bound}))")
-        statements.append(f"if ({' || '.join(bounds)}) {flag} = 1;")
-    text = "\n".join(indent + statement for statement in statements)
-    return text + "\n" if exact.endswith("\n") else text
+    loud = " || ".join(f"({change.loud})" for change in changes)
+    statements.append(f"if ({loud}) {flag} = 1;")
+    return "\n".join(pad + statement for statement in statements)
 
 
 def sweep_exit(
     policy: SolvePolicy,
-    exact: str,
     *,
     quiet: str,
     gate: str | None = None,
-    violation: tuple[str, str, str] | None = None,
+    violation: tuple[str, str, str, str] | None = None,
     world: str = "world",
     iteration: str = "iteration",
     iterations: str = "iterations",
@@ -352,25 +342,19 @@ def sweep_exit(
     argmax: str | None = "ARGMAX",
     indent: str = "        ",
 ) -> str:
-    """Return the end-of-sweep exit of a native Gauss-Seidel sweep.
+    """Return the end-of-sweep exit of a native sweep: stop the world once no update of the sweep was loud.
 
-    Under the exact law without readout the sweep's own exit text is returned
-    unchanged. With a readout, lane 0 records the solve when the world stops
-    and after the last sweep of its budget, so no counter stays live through
-    the loop.
+    With a readout, lane 0 records the solve when the world stops and after the last sweep of its budget, so no
+    counter stays live through the loop.
 
     Args:
         policy: The sweep's solve policy.
-        exact: The sweep's exit under the exact law without readout.
-        quiet: Warp-uniform condition that no row of this sweep voted a change.
+        quiet: Group-uniform condition that no update of this sweep voted (no loud change).
         gate: Condition under which a quiet sweep may stop the world (delayed friction), or ``None``.
-        violation: For sweeps that visit only rows selected at sweep entry,
-            ``(code, value, kind)``: warp-uniform statements that set the float
-            ``value`` to the largest velocity change a visit of a zero-impulse
-            unilateral row would make (its violation times the relaxation
-            factor) and the int ``kind`` to that row's constraint type. A
-            positive tolerance stops only when ``value`` is within it; without
-            run-time impulse tolerances the exact law implies it.
+        violation: For sweeps that visit only rows selected at sweep entry, ``(code, loud, value, kind)``:
+            group-uniform statements that set the bool ``loud`` when a visit of some zero-impulse unilateral row
+            would make a loud change (:attr:`Change.loud`), the float ``value`` to the largest such change (its
+            violation times the relaxation factor) and the int ``kind`` to that row's constraint type.
         world: World index expression.
         iteration: Zero-based sweep index within this launch.
         iterations: Sweep budget of this launch.
@@ -380,23 +364,20 @@ def sweep_exit(
             sweeps.
         indent: Indentation of the emitted statements.
     """
-    if not policy.velocity and not policy.counts:
-        return exact
     stop = quiet if gate is None else f"{gate} && {quiet}"
     inner = indent + "    "
-    tolerance = policy.tolerance_literal
 
     def block(code):
         return "\n".join(inner + line if line.strip() else line for line in code.strip("\n").split("\n"))
 
     lines = [f"{indent}{{"]
     if not policy.traces:
-        if not policy.velocity or violation is None:
+        if violation is None:
             lines.append(f"{inner}const bool sweep_stop = {stop};")
         else:
-            code, value, _ = violation
+            code, loud, _, _ = violation
             lines += [f"{inner}bool sweep_stop = {stop};", f"{inner}if (sweep_stop) {{", block(code)]
-            lines += [f"{inner}    sweep_stop = {value} <= {tolerance};", f"{inner}}}"]
+            lines += [f"{inner}    sweep_stop = !{loud};", f"{inner}}}"]
         if policy.counts:
             lines += [
                 f"{inner}if ({lane} == 0 && (sweep_stop || {iteration} + 1 == {iterations}))",
@@ -413,11 +394,10 @@ def sweep_exit(
     ]
     stop_line = f"{inner}const bool sweep_stop = {stop};"
     if violation is not None:
-        code, value, kind = violation
+        code, loud, value, kind = violation
         lines += [block(code), f"{inner}if ({value} > sweep_change) {{"]
         lines += [f"{inner}    sweep_change = {value};", f"{inner}    sweep_kind = {kind};", f"{inner}}}"]
-        if policy.velocity:
-            stop_line = f"{inner}const bool sweep_stop = {stop} && {value} <= {tolerance};"
+        stop_line = f"{inner}const bool sweep_stop = {stop} && !{loud};"
     lines += [
         stop_line,
         f"{inner}if ({lane} == 0)",

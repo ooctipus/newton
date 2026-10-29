@@ -1,1 +1,0 @@
-Add keyword-only `pgs_change_tolerance` and `pgs_relative_change_tolerance` options to `SolverFeatherPGS`: absolute and unit-free early-exit criteria for native sparse sweeps (a row's change is small when it is within the absolute bound plus this fraction of its impulse). Zero for both, the default, keeps the exact stationary-sweep exit.

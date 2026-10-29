@@ -66,7 +66,7 @@ def _build(device, worlds=4, drop=0.01):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse factors are a CUDA path")
 class TestFeatherPGSSparseWarmstart(unittest.TestCase):
-    def _rollout(self, iterations, *, warmstart, steps=160, dt=1.0 / 240.0, tolerance=0.0):
+    def _rollout(self, iterations, *, warmstart, steps=160, dt=1.0 / 240.0):
         device = wp.get_device("cuda:0")
         model, masses = _build(device)
         solver = SolverFeatherPGS(
@@ -75,12 +75,10 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             sparse_mass_matrix="on",
             pgs_iterations=iterations,
             pgs_warmstart=warmstart,
-            pgs_change_tolerance=tolerance,
             friction_anchor_beta=0.0,
         )
         self.assertIsNotNone(solver._sparse_mass_matrix_size, solver._sparse_selection_reason)
         self.assertTrue(solver._sparse_split)
-        # The policy's slack follows the variant's name (``_ctol...``).
         self.assertEqual("_warm_start" in solver._pgs_solve_sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
@@ -128,11 +126,11 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
         self.assertLess(warm_error, cold_error)
 
     def test_early_exit_with_warm_start(self):
-        """A warm-started sweep with a change tolerance stays close to the exact solve."""
-        _, torso_exact, qd_exact, _ = self._rollout(8, warmstart=True)
-        _, torso_loose, qd_loose, _ = self._rollout(8, warmstart=True, tolerance=1.0e-4)
-        np.testing.assert_allclose(torso_loose, torso_exact, atol=2.0e-3)
-        self.assertLess(float(np.abs(qd_loose - qd_exact).max()), 2.0e-2)
+        """A warm-started sweep that the exit law stops early stays close to a long solve."""
+        _, torso_long, qd_long, _ = self._rollout(64, warmstart=True)
+        _, torso_short, qd_short, _ = self._rollout(8, warmstart=True)
+        np.testing.assert_allclose(torso_short, torso_long, atol=2.0e-3)
+        self.assertLess(float(np.abs(qd_short - qd_long).max()), 2.0e-2)
 
 
 if __name__ == "__main__":

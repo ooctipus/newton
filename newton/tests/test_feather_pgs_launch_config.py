@@ -211,8 +211,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         names = list(parameters)
         self.assertEqual(names[names.index("fuse_joint_velocity_limits") + 1], "pgs_iterations")
         for name in (
-            "pgs_change_tolerance",
-            "pgs_relative_change_tolerance",
+            "pgs_solve_readout",
             "mf_gs_incremental_rows",
             "mf_gs_parallel_rows",
             "mf_gs_parallel_sweeps",

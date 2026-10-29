@@ -23,7 +23,7 @@ from newton._src.solvers.feather_pgs.response_operator import Assembled, FreeBod
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
 from newton._src.solvers.feather_pgs.staging import arch_budget
 
-_POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(velocity_change_tolerance=1.0e-4))
+_POLICIES = (SolvePolicy(), SolvePolicy(readout="sweeps"), SolvePolicy(readout="trace"))
 _SCHEDULES = (
     {},
     {"contact_triples": True},

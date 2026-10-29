@@ -29,7 +29,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
 from .row_metadata import _mf_parent_expression
-from .solve_policy import EXACT_POLICY, SolvePolicy
+from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -164,7 +164,7 @@ def local_owned_source(
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
     row_inputs=None,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel.
@@ -414,7 +414,7 @@ def local_owned_kernel(
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
     row_inputs=None,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """A local owner's sweep kernel.
 
@@ -501,7 +501,7 @@ def paired_factor_source(
     independent_components: bool = False,
     *,
     contact_units: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the factor velocity ``u = L^T v`` in a register per lane.
@@ -757,7 +757,7 @@ def paired_factor_kernel(
     independent_components: bool = False,
     *,
     contact_units: bool = False,
-    solve_policy: SolvePolicy = EXACT_POLICY,
+    solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; a readout's operand follows ``v_out``."""
     snippet, staging = paired_factor_source(

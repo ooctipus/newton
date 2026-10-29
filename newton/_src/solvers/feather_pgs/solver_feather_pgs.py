@@ -172,7 +172,6 @@ from .path_selection import (
     contact_update_warnings,
     measurement_selection,
     options_selection,
-    policy_warnings,
     route_selection,
 )
 from .row_build import contact_row_prelude, populate_world_J_masked
@@ -973,10 +972,7 @@ class SolverFeatherPGS(SolverBase):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
-        pgs_change_tolerance: float = 0.0,
-        pgs_relative_change_tolerance: float = 0.0,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
-        pgs_velocity_change_tolerance: float = 0.0,
         mf_gs_incremental_rows: int = 32,
         mf_gs_parallel_rows: int = 0,
         mf_gs_parallel_sweeps: int = 24,
@@ -1369,8 +1365,8 @@ class SolverFeatherPGS(SolverBase):
                 larger, from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the
                 accuracy to match. The factor is fit, by interpolating each world's error between measured sweep
                 caps, so that each evaluated row bucket of contact-rich point- and patch-friction workloads reaches
-                the serial sweep's accuracy. A world stops earlier under the sweeps' exit law
-                (``pgs_change_tolerance``, ``pgs_relative_change_tolerance``, ``pgs_velocity_change_tolerance``).
+                the serial sweep's accuracy. A world stops earlier under the sweeps' exit law, once its rows'
+                changes are at the rounding floor.
                 ``get_path_selection()`` reports each tier's budget and its rule under ``routes.sweep.tiers``.
                 Defaults to 24.
             mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Deprecated: the tiers that serve
@@ -1403,40 +1399,19 @@ class SolverFeatherPGS(SolverBase):
                 mimic and connect rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
-            pgs_change_tolerance (float, optional): Impulse slack of every sweep's exit law: a sweep
-                stops a world early once no impulse changes by more than this absolute amount (plus
-                the relative slack). Zero keeps the exact stationary-sweep exit. A positive slack
-                trades accuracy for speed and stops small Jacobi-tier worlds short of the serial
-                sweep's accuracy whatever their budget. Defaults to 0.0.
-            pgs_relative_change_tolerance (float, optional): Unit-free companion of
-                ``pgs_change_tolerance``: a row's change is also small when it is within this
-                fraction of the row's (normal) impulse after the update. Velocity-limit rows use
-                the absolute tolerance only. Defaults to 0.0.
             pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
                 ``"sweeps"`` counts, per sweep kernel and world, how many sweeps each solve executed
                 and whether it stopped before its budget, the velocity pass of
                 ``pgs_velocity_iterations`` apart from the position solve; ``"trace"`` adds, per
-                solve, the sweep at which each velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s]
-                would have stopped it, its exit reason, and the largest velocity-scaled change of its
-                final sweep with that row's kind; it records changes without the impulse slack of
-                ``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``, so its stops predict
-                runs with both at zero. ``get_path_selection()`` summarizes them under
+                solve, the sweep at which each absolute velocity tolerance from 1e-7 to 1e-1 [m/s or
+                rad/s] would have stopped it, its exit reason (no change, changes within the exit law's
+                rounding floor, or the budget), and the largest velocity-scaled change of its final sweep
+                with that row's kind. ``get_path_selection()`` summarizes them under
                 ``measurements["solve_readout"]``, which synchronizes the device once. Neither
                 readout changes a computed value. Every sweep counts (``routes.sweep.readout``). The
                 matrix-free sweeps enter no world without rows (such as one the resolved-world
                 classifier left without rows); the readout counts those solves as ``skipped``.
                 Defaults to ``"off"``.
-            pgs_velocity_change_tolerance (float, optional): Velocity exit law of every sweep
-                [m/s or rad/s]. A sweep stops a world once no row's impulse change times its
-                effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own velocity),
-                exceeds the tolerance plus its scaled impulse slack (``pgs_change_tolerance``,
-                ``pgs_relative_change_tolerance``); sweeps that visit only the rows selected at sweep
-                entry also require the change a visit would make to every zero-impulse unilateral row,
-                its violation times ``pgs_omega``, to be at most the tolerance. Without slack, a solve
-                runs the exact law's sweeps and stops at or before the sweep where the exact law
-                stops; with slack, the unvisited-row bound has none and can add sweeps. Zero keeps the
-                exact stationary-sweep exit. Drivers that launch part of a solve at a time stop no
-                world early (``routes.sweep.exit_law``, with a warning). Experimental. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free and dense). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -1704,20 +1679,10 @@ class SolverFeatherPGS(SolverBase):
         self._regularization_enabled = self._contact_w < 1.0
         self.pgs_cfm = pgs_cfm
         self.pgs_omega = pgs_omega
-        self.pgs_change_tolerance = options["pgs_change_tolerance"]
-        self.pgs_relative_change_tolerance = options["pgs_relative_change_tolerance"]
         self.pgs_solve_readout = pgs_solve_readout
-        self.pgs_velocity_change_tolerance = options["pgs_velocity_change_tolerance"]
-        # Every sweep compiles the policy: its exit law and readout.
-        self._solve_policy = SolvePolicy(
-            readout=pgs_solve_readout,
-            velocity_change_tolerance=self.pgs_velocity_change_tolerance,
-            change_tolerance=self.pgs_change_tolerance,
-            relative_change_tolerance=self.pgs_relative_change_tolerance,
-        )
+        # Every sweep compiles the exit law and the policy's readout.
+        self._solve_policy = SolvePolicy(readout=pgs_solve_readout)
         self._solve_readout = SolveReadoutRecord(self._solve_policy)
-        # Sweep kernels built under a policy other than the exact law, with their routes.
-        self._solve_policy_honored = {}
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
         self.restitution_velocity_threshold = options["restitution_velocity_threshold"]
@@ -2623,9 +2588,6 @@ class SolverFeatherPGS(SolverBase):
         self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
-        if not self._solve_policy.exact:
-            for message in policy_warnings(route_selection(self)["sweep"]):
-                warnings.warn(message, stacklevel=2)
         if self.contact_update != "sequential":
             for message in contact_update_warnings(route_selection(self)["sweep"]):
                 warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
@@ -2695,8 +2657,7 @@ class SolverFeatherPGS(SolverBase):
         bodies and the friction law, each with a reason; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
         of worlds without rows as skipped and the owners of the worlds no counter
-        counts, and ``routes.sweep.exit_law`` the sweeps that honor, decline or
-        ignore ``pgs_velocity_change_tolerance``. The
+        counts, and ``routes.sweep.exit_law`` the law every sweep stops under. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
         contact rows built outside the sweep: the parallel tiers build keyed rows'
         direct rows in the sweep (``direct_rows``) and the free-body matrix-free
@@ -4398,8 +4359,6 @@ class SolverFeatherPGS(SolverBase):
         policy = self._solve_policy
         built = factory(*args, solve_policy=policy, **kwargs)
         kernel = built.kernel if isinstance(built, SweepTier) else built
-        if not policy.exact:
-            self._solve_policy_honored[kernel.key] = route
         budget, velocity_budget = int(self.pgs_iterations), int(self.pgs_velocity_iterations)
         if readout_budget is not None:
             budget, velocity_budget = int(readout_budget), int(readout_budget) if velocity_budget > 0 else 0
@@ -4483,9 +4442,7 @@ class SolverFeatherPGS(SolverBase):
         units, pooling their ring loads as the ordinary pair update does, in the active
         scan or else in the full ordered sweep; split, velocity-limit, free-body and
         packed small-world sweeps keep ordinary updates. The staged patch transaction is
-        bitwise equal to the same sweep without it. The staged point transaction is too,
-        unless ``pgs_relative_change_tolerance > 0``: its early exit bounds the tangent
-        changes by the new normal impulse instead of the new tangent impulse. The
+        bitwise equal to the same sweep without it. The staged point transaction is too. The
         single-stage transaction (:meth:`_request_sparse_contact_transaction`) differs
         from the staged one by rounding only.
 

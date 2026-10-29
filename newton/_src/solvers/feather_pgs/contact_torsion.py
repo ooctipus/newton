@@ -29,7 +29,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
 )
 from .row_laws import CONTACT_END_GAP_SLOP
-from .solve_policy import EXACT_POLICY, SolvePolicy, vote
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, vote
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
@@ -483,27 +483,37 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     solver._contact_torsion_group.assign(membership)
 
 
-def torque_sweep_source(dofs, policy: SolvePolicy = EXACT_POLICY):
-    """Return the coupled residual-budget angular solve inside each PGS sweep, voting its changes under ``policy``.
+def torque_sweep_source(dofs, policy: SolvePolicy = DEFAULT_POLICY):
+    """Return the coupled residual-budget angular solve inside each PGS sweep, voting its changes under the exit law
+    with ``policy``'s readout.
 
-    A friction pair's rescale votes both tangents' changes and the torsion row its own, each scaled by its row's
-    diagonal (:func:`.solve_policy.vote`: a torsion row's velocity change is angular, in rad/s).
+    A friction pair's rescale votes both tangents' changes (a projection onto the budget, which forms no residual:
+    their floors read the rescaled impulses) and the torsion row its own, each scaled by its row's diagonal
+    (:func:`.solve_policy.vote`: a torsion row's velocity change is angular, in rad/s).
     """
-    rescale_vote = vote(
-        policy,
-        "                            iteration_changed = 1;",
-        flag="iteration_changed",
-        terms=(
-            ("delta1", "world_diag.data[off_dense + n + 1]", str(PGS_CONSTRAINT_TYPE_FRICTION)),
-            ("delta2", "world_diag.data[off_dense + n + 2]", str(PGS_CONSTRAINT_TYPE_FRICTION)),
-        ),
+    friction = str(PGS_CONSTRAINT_TYPE_FRICTION)
+    rescale = tuple(
+        Change(
+            f"delta{k}",
+            bound(
+                f"rhs_bias.data[off_dense + n + {k}]",
+                "0.0f",
+                f"exit_inverse(world_diag.data[off_dense + n + {k}])",
+                f"s_lam_dense[n + {k}]",
+            ),
+            friction,
+            f"world_diag.data[off_dense + n + {k}]",
+        )
+        for k in (1, 2)
     )
-    torsion_vote = vote(
-        policy,
-        "                    iteration_changed = 1;",
-        flag="iteration_changed",
-        terms=(("delta", "diagonal", str(PGS_CONSTRAINT_TYPE_TORSION)),),
+    rescale_vote = vote(policy, rescale, flag="iteration_changed", pad=" " * 28)
+    torsion = Change(
+        "delta",
+        bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "exit_inverse(diagonal)", "old"),
+        str(PGS_CONSTRAINT_TYPE_TORSION),
+        "diagonal",
     )
+    torsion_vote = vote(policy, (torsion,), flag="iteration_changed", pad=" " * 20)
     return f"""
         if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
             for (int spin = 0; spin < m_dense; ++spin) {{

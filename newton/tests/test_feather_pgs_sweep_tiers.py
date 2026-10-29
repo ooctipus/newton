@@ -21,18 +21,21 @@ from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import Block, CholeskySolve, Lanes
-from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy
+from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
-    EXACT_EXIT,
     JacobiRows,
     RowLaws,
-    change_vote,
     dense_tier_world,
     end_sweep,
     jacobi_sweeps,
 )
 
 _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
+
+# The exit of a warp's sweep and of a block's, without readout: stop a quiet sweep once friction is active.
+_EXIT = "const bool sweep_stop = global_iter >= friction_start_iteration && BALLOT(iteration_changed != 0) == 0u;"
+_BLOCK_EXIT = "const bool sweep_stop = global_iter >= friction_start_iteration && !ANY(iteration_changed != 0);"
+_EXIT_TEXT = f"        {{\n            {_EXIT}\n            if (sweep_stop) break;\n        }}\n"
 
 _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
 
@@ -167,50 +170,44 @@ class TestParallelTier(unittest.TestCase):
 
     def test_several_warps_stop_on_the_block_vote(self):
         one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1})
-        self.assertIn(EXACT_EXIT.rstrip(), one)
+        self.assertIn(_EXIT, one)
         block = _source((96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 1})
-        self.assertIn("if (!ANY(iteration_changed != 0)) break;", block)
+        self.assertIn(_BLOCK_EXIT, block)
         self.assertNotIn("BALLOT", block)
 
 
 class TestJacobiLaw(unittest.TestCase):
     """The core's Jacobi law: its vote, its exit and its policy."""
 
-    def test_the_jacobi_vote_follows_the_policy(self):
-        """A row votes every change under the exact law and changes beyond the policy's slack or velocity bound."""
+    def test_the_jacobi_vote_follows_the_exit_law(self):
+        """A row's step from the extrapolated impulse votes against its bound: the floor of its residual times its
+        step size (its right-hand side and terms, and its impulse before the step times its step's share of a
+        Gauss-Seidel step, ``A_ii s_i``)."""
         rows = JacobiRows(32, 32)
         op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
-        exact = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
-        self.assertIn("if (x_new != x_old) {\n", exact)
-        self.assertIn("iteration_changed = 1;", exact)
-        slack = RowLaws(policy=SolvePolicy(relative_change_tolerance=1.0e-4))
-        self.assertIn(
-            "if (!(fabsf(x_new - x_old) <= 0.0001f * fabsf(x_new))) iteration_changed = 1;",
-            jacobi_sweeps(rows, op, slack, sweeps=1, momentum=True, pooled=False),
-        )
-        scaled = JacobiRows(32, 32, scales=True)
-        traced = RowLaws(policy=SolvePolicy(readout="trace", velocity_change_tolerance=1.0e-3))
-        text = jacobi_sweeps(scaled, op, traced, sweeps=7, momentum=True, pooled=False)
-        self.assertIn("solve_trace_change(fabsf(x_new - x_old) * (s_diag[i]), s_type[i]);", text)
-        self.assertIn("!(fabsf(x_new - x_old) * (s_diag[i]) <= 0.001f)", text)
+        text = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
+        self.assertNotIn("if (x_new != x_old) {", text)
+        self.assertIn("const float row_share = row_diag * row_step;", text)
+        self.assertIn(f"row_bound = {bound('row_rhs', 'fabsf((r) - (row_rhs))', 'row_step', 'row_share * xi')};", text)
+        self.assertIn("x_from = s_y[i];", text)
+        self.assertIn("if (x_new != x_from) {", text)
+        self.assertIn("(!(fabsf(x_new - x_from) <= row_bound))", text)
+        typed = JacobiRows(32, 32, types=True)
+        traced = RowLaws(policy=SolvePolicy(readout="trace"))
+        text = jacobi_sweeps(typed, op, traced, sweeps=7, momentum=True, pooled=False)
+        self.assertIn("solve_trace_change(fabsf(x_new - x_from) * (row_inv_step), s_type[i]);", text)
         self.assertIn("sweep + 1 == 7", text)
 
-    def test_the_default_exit_and_votes_are_unchanged(self):
-        self.assertEqual(end_sweep(SolvePolicy(), iteration="iter"), EXACT_EXIT)
-        self.assertEqual(change_vote(RowLaws(), (("d", "A", "0"),), "  "), "  iteration_changed = 1;")
+    def test_the_exit_stops_a_quiet_sweep_once_friction_is_active(self):
+        self.assertEqual(end_sweep(SolvePolicy(), iteration="iter"), _EXIT_TEXT)
         block = end_sweep(SolvePolicy(), iteration="sweep", block=True)
-        self.assertEqual(
-            block,
-            "        if (global_iter >= friction_start_iteration) {\n"
-            "            if (!ANY(iteration_changed != 0)) break;\n        }\n",
-        )
+        self.assertIn(_BLOCK_EXIT, block)
 
-    def test_the_velocity_law_and_trace_need_staged_scales(self):
+    def test_the_trace_needs_staged_types(self):
         rows = JacobiRows(32, 32)
         op = Block(18, 33, Lanes(32), rows="n_rows", layout="row")
-        for policy in (SolvePolicy(readout="trace"), SolvePolicy(velocity_change_tolerance=1.0e-3)):
-            with self.subTest(policy=policy), self.assertRaisesRegex(ValueError, "staged diagonals"):
-                jacobi_sweeps(rows, op, RowLaws(policy=policy), sweeps=1, momentum=True, pooled=False)
+        with self.assertRaisesRegex(ValueError, "staged types"):
+            jacobi_sweeps(rows, op, RowLaws(policy=SolvePolicy(readout="trace")), sweeps=1, momentum=True, pooled=False)
         counted = jacobi_sweeps(
             rows, op, RowLaws(policy=SolvePolicy(readout="sweeps")), sweeps=3, momentum=True, pooled=False
         )

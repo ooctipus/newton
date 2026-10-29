@@ -23,6 +23,7 @@ from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from . import response_builds_rows
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
+from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 
 # Options whose applied value lives under another attribute after construction.
 _APPLIED_ATTRIBUTES = {
@@ -120,11 +121,8 @@ _EFFECTIVE = {
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
     # The largest budget of the built linked (patch) tiers; 0 without them (deprecated option).
     "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
-    # A readout applies only where a sweep kernel carries its counters, the velocity law where a sweep compiles it.
+    # A readout applies only where a sweep kernel carries its counters.
     "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
-    "pgs_velocity_change_tolerance": lambda solver: (
-        solver.pgs_velocity_change_tolerance if solver._solve_policy_honored else 0.0
-    ),
     # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
     "contact_update": lambda solver: (
         "unit" if solver._dense_contact_unit or solver._free_body_contact_unit else "sequential"
@@ -678,31 +676,16 @@ def _readout(solver, record) -> dict:
 
 
 def _exit_law(solver, record) -> dict:
-    """The sweeps' exit law (``pgs_velocity_change_tolerance`` and the impulse slack), and whether its driver honors it."""
-    policy = solver._solve_policy
-    # Drivers whose launches each sweep all iterations of their rows, so a sweep's exit ends that launch's solve.
-    driver_honors = record["driver"] in ("direct", "contact_then_internal", "dense_split")
-    if policy.exact:
-        reason = "Every sweep keeps the exact stationary-sweep law: a world stops once a sweep changes no impulse."
-    elif not driver_honors:
-        reason = (
-            f"The {record['driver']} driver runs part of a solve per launch, so a sweep's exit cannot end the solve."
-        )
-    else:
-        reason = (
-            "Every sweep stops a world once each row's change of a sweep is within the impulse slack or, under a "
-            "velocity tolerance, its velocity-scaled change within the tolerance plus the scaled slack."
-        )
-    law = "velocity" if policy.velocity else "impulse_slack" if policy.slack else "exact"
+    """The exit law every sweep stops a world under (:mod:`.solve_policy`): its floor, in rounding units of float32."""
     return {
-        "law": law,
-        "velocity_change_tolerance": json_value(policy.velocity_change_tolerance),
-        "change_tolerance": json_value(policy.change_tolerance),
-        "relative_change_tolerance": json_value(policy.relative_change_tolerance),
-        # The sweep kernels that compile the law, with their routes (none under the exact law).
-        "honored": dict(sorted(solver._solve_policy_honored.items())),
-        "driver_honors": driver_honors,
-        "reason": reason,
+        "law": "rounding_floor",
+        "quiet_units": QUIET_UNITS,
+        "unit_roundoff": json_value(UNIT_ROUNDOFF),
+        "reason": (
+            "Every sweep stops a world once each row update's change of its own velocity, |dlambda| A_ii, is within "
+            f"{QUIET_UNITS} rounding units of the magnitude its update combines: the right-hand side, the terms of "
+            "its velocity sum and its own impulse times A_ii."
+        ),
     }
 
 
@@ -754,18 +737,6 @@ def contact_update_warnings(sweep) -> list[str]:
         f"contact_update='unit' applies only to some sweeps of this solver: {update['reason']} "
         f"Sequential: {update['sequential']}."
     ]
-
-
-def policy_warnings(sweep) -> list[str]:
-    """Return a warning when the requested exit law cannot end the solves of a sweep record's driver.
-
-    Args:
-        sweep: The ``routes.sweep`` record of :func:`route_selection`.
-    """
-    law = sweep["exit_law"]
-    if law["law"] == "exact" or law["driver_honors"]:
-        return []
-    return [f"The sweeps' exit law stops no world early under this solver's driver: {law['reason']}"]
 
 
 def _mf_gs_storage(solver) -> dict | None:

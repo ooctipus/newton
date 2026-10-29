@@ -374,7 +374,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[53].name, "pgs_change_tolerance")
+        self.assertEqual(parameters[53].name, "pgs_solve_readout")
         with self.assertRaisesRegex(TypeError, r"takes at most 54 positional arguments but 55 were given$"):
             SolverFeatherPGS(model, *legacy.values(), parameters[53].default)
 

@@ -22,8 +22,8 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, the radial projection of each friction
   pair, Nesterov's momentum with adaptive restart and the relative change vote, the operator forming each row's
   residual from the impulses;
-- the **exit** is the solve policy (:mod:`.solve_policy`): the change votes and the end-of-sweep stop
-  (:func:`end_sweep`);
+- the **exit** is the exit law (:mod:`.solve_policy`): each change votes against the rounding floor of its update
+  (:func:`change_vote`) and the end of the sweep stops a world none of whose updates was loud (:func:`end_sweep`);
 - the **publication** writes the impulses and velocities back.
 
 Only the response operator and the lane layout fix a row's floating-point order, so a configuration that keeps a
@@ -48,7 +48,7 @@ from .kernels import (
 )
 from .response_operator import Lanes, ResponseOperator
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, vote
 from .staging import Buffer
 
 CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
@@ -291,29 +291,24 @@ class RowLaws:
         velocity_limit_law: ``"stateless"`` or ``"accumulated"`` (:mod:`.velocity_limit_law`).
         regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
         torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
-        policy: The solve policy: the change votes and the stop.
+        policy: The solve policy: the readout beside the exit law.
     """
 
     drive: bool = False
     velocity_limit_law: str = "stateless"
     regularize: bool = True
     torsion: bool = False
-    policy: SolvePolicy = EXACT_POLICY
+    policy: SolvePolicy = DEFAULT_POLICY
 
     @property
     def accumulated(self) -> int:
         return int(self.velocity_limit_law == "accumulated")
 
 
-def change_vote(laws: RowLaws, terms: tuple[tuple[str, str, str], ...], pad: str, *, new=None) -> str:
-    """The change vote of one update's ``terms`` (``(change, A_ii, kind)`` each) under the laws' solve policy
-    (:func:`.solve_policy.vote`), in a block entered on a change.
-
-    ``new`` is the reference impulse of every term, or one per term, which the policy's relative slack scales: a
-    row's own new impulse, a friction pair's first tangent's; ``None`` bounds by the absolute slack alone (a
-    velocity-limit correction).
-    """
-    return vote(laws.policy, f"{pad}iteration_changed = 1;", flag="iteration_changed", terms=terms, references=new)
+def change_vote(laws: RowLaws, changes: tuple[Change, ...], pad: str) -> str:
+    """The exit law's vote on one update's ``changes`` (:func:`.solve_policy.vote`): a loud change keeps the world
+    sweeping."""
+    return vote(laws.policy, changes, flag="iteration_changed", pad=pad)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -381,6 +376,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     lines = [
         f"float old_impulse = {ctx.load(row)};",
         f"float residual = {full};",
+        f"float row_bound = {_row_bound(ctx, op.terms(residual, ctx.rhs(row), whole=op.residual_includes_rhs))};",
     ]
     step = op.step("residual", row)
     if laws.regularize:
@@ -394,7 +390,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
         lines.append(f"float new_impulse = ProjectionLaw::relaxed_step(old_impulse, {step}, omega);")
     lines.append("float delta_impulse = 0.0f;")
     if ctx.friction:
-        lines += ["int sib = -1;", "float sib_new = 0.0f, sib_delta = 0.0f;"]
+        lines += ["int sib = -1;", "float sib_new = 0.0f, sib_delta = 0.0f, sib_bound = 0.0f;"]
     branches = []
     if laws.drive and ctx.drive_data is not None:
         target, vel_mul, imp_mul, max_imp = (ctx.drive_data(name, row) for name in DRIVE_DATA)
@@ -429,14 +425,13 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
         if _sibling_in_pair(ctx):
             # Impulses that need no barrier: the pair stores, votes and applies its second tangent in its branch, so
             # the rows without a pair carry no sibling test.
-            sib_term = ("sib_delta", op.value("sib"), str(FRICTION))
             pair += "\n" + "\n".join(
                 line
                 for line in (
                     ctx.store("sib", "sib_new"),
                     ctx.record("sib", "sib_delta") if ctx.record is not None else "",
                     "if (sib_delta != 0.0f) {",
-                    change_vote(laws, (sib_term,), "    ", new="new_impulse"),
+                    change_vote(laws, (_sibling_change(ctx),), "    "),
                     indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
                     "}",
                 )
@@ -458,6 +453,16 @@ def _sibling_in_pair(ctx: RowContext) -> bool:
     return ctx.friction and not ctx.owned and not ctx.operator.fused_pair_apply
 
 
+def _row_bound(ctx: RowContext, terms: str) -> str:
+    """The visited row's bound (:func:`.solve_policy.bound`) from its residual's ``terms``, at its old impulse."""
+    return bound(ctx.rhs(ctx.row), terms, ctx.operator.step_size(ctx.row), "old_impulse")
+
+
+def _sibling_change(ctx: RowContext) -> Change:
+    """The friction pair's second-tangent change as the exit law reads it (``sib_bound``: :func:`friction_pair`)."""
+    return Change("sib_delta", "sib_bound", str(FRICTION), ctx.operator.value("sib"))
+
+
 def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
     """Store the row's (and its sibling's) impulse, record and vote the changes, apply the sibling's then the row's.
 
@@ -477,12 +482,12 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             "}",
         ]
     lines.append(ctx.lanes.sync() if ctx.owned and ctx.fenced else "")
-    row_term = ("delta_impulse", op.value(row), kind)
-    sib_term = ("sib_delta", op.value("sib"), str(FRICTION))
+    row_change = Change("delta_impulse", "row_bound", kind, op.value(row))
+    sib_change = _sibling_change(ctx)
     if ctx.friction and op.fused_pair_apply:
         lines += [
             "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
-            change_vote(laws, (row_term, sib_term), "    ", new="new_impulse"),
+            change_vote(laws, (row_change, sib_change), "    "),
             indent(op.apply_pair("sib_delta", "delta_impulse", "").lstrip("\n"), "    "),
             "}",
         ]
@@ -490,13 +495,13 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         if ctx.friction and not _sibling_in_pair(ctx):
             lines += [
                 "if (sib_delta != 0.0f) {",
-                change_vote(laws, (sib_term,), "    ", new="new_impulse"),
+                change_vote(laws, (sib_change,), "    "),
                 indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
                 "}",
             ]
         lines += [
             "if (delta_impulse != 0.0f) {",
-            change_vote(laws, (row_term,), "    ", new="new_impulse"),
+            change_vote(laws, (row_change,), "    "),
             indent(op.apply("delta_impulse", "").lstrip("\n"), "    "),
             "}",
         ]
@@ -518,12 +523,18 @@ def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
         "float new_impulse = old_impulse;",
         "float delta_impulse = 0.0f;",
         "int sib = -1;",
-        "float sib_new = 0.0f, sib_delta = 0.0f;",
+        "float sib_new = 0.0f, sib_delta = 0.0f, row_bound = 0.0f, sib_bound = 0.0f;",
         friction_pair(ctx, own=True),
         "delta_impulse = new_impulse - old_impulse;",
         *_row_tail(ctx, laws),
     ]
     return indent("\n".join(line for line in lines if line != ""), pad)
+
+
+def _sibling_bound(ctx: RowContext) -> str:
+    """The friction sibling's bound from its residual (``sibling_residual``), at its old impulse."""
+    op, rhs = ctx.operator, ctx.rhs("sib")
+    return bound(rhs, op.terms("sibling_residual", rhs, whole=True), op.step_size("sib"), "sibling_impulse")
 
 
 def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
@@ -540,6 +551,8 @@ def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
         "// Zero load gives a zero disk; avoid unused tangent reductions.",
         "if (radius > 0.0f) {",
         op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
+        f"    row_bound = {_row_bound(ctx, op.terms('residual', ctx.rhs(ctx.row), whole=True))};" if own else "",
+        f"    sib_bound = {_sibling_bound(ctx)};",
         f"    pair = {ctx.pair_law}{op.value(ctx.row)}, cross, {op.value('sib')},",
         "        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega);",
         "}",
@@ -671,17 +684,10 @@ def row_visit(
 # ---------------------------------------------------------------------------------------------------------------------
 
 QUIET = "BALLOT(iteration_changed != 0) == 0u"
-"""No lane of the sweep's group voted a change."""
+"""No lane of the sweep's group voted a loud change."""
 
 BLOCK_QUIET = "!ANY(iteration_changed != 0)"
-"""No lane of a block group of several warps voted a change: the block's vote, a barrier."""
-
-EXACT_EXIT = """        if (global_iter >= friction_start_iteration) {
-            const unsigned changed = BALLOT(iteration_changed != 0);
-            if (changed == 0u) break;
-        }
-"""
-"""The exact law's end of a sweep: stop once friction is active and no row voted a change."""
+"""No lane of a block group of several warps voted a loud change: the block's vote, a barrier."""
 
 
 def end_sweep(
@@ -689,31 +695,22 @@ def end_sweep(
     *,
     iteration: str,
     gated: bool = True,
-    exact: str | None = None,
-    violation: tuple[str, str, str] | None = None,
+    violation: tuple[str, str, str, str] | None = None,
     block: bool = False,
     iterations: str = "iterations",
     argmax: str | None = "ARGMAX",
 ) -> str:
-    """The end of a sweep under the solve policy (:func:`.solve_policy.sweep_exit`): stop once no row voted a change.
+    """The end of a sweep under the exit law (:func:`.solve_policy.sweep_exit`): stop once no update was loud.
 
-    A ``gated`` sweep stops only once friction is active (delayed friction is a change to come). ``exact`` is the
-    sweep's text under the exact law (:data:`EXACT_EXIT` by default, or the ungated test of :data:`QUIET`);
-    ``violation`` bounds the rows a sweep of selected rows leaves unvisited. A ``block`` group spans several warps:
-    its quiet test is the block's vote (:data:`BLOCK_QUIET`) and ``argmax`` its trace reduction
-    (:func:`.solve_policy.block_argmax`). ``iterations`` is the sweep budget.
+    A ``gated`` sweep stops only once friction is active (delayed friction is a change to come). ``violation`` bounds
+    the rows a sweep of selected rows leaves unvisited. A ``block`` group spans several warps: its quiet test is the
+    block's vote (:data:`BLOCK_QUIET`) and ``argmax`` its trace reduction (:func:`.solve_policy.block_argmax`).
+    ``iterations`` is the sweep budget.
     """
     gate = "global_iter >= friction_start_iteration" if gated else None
     quiet = BLOCK_QUIET if block else QUIET
-    if exact is None:
-        if block:
-            stop = f"if ({quiet}) break;"
-            exact = f"        if ({gate}) {{\n            {stop}\n        }}\n" if gated else f"        {stop}\n"
-        else:
-            exact = EXACT_EXIT if gated else f"        if ({QUIET}) break;\n"
     return sweep_exit(
         policy,
-        exact,
         gate=gate,
         quiet=quiet,
         violation=violation,
@@ -853,17 +850,19 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     if accumulated:
         lines.append(f"    const float old_vlim = {rows.load('i')};")
     lines += [
+        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'exit_inverse(denom)', old)};",
         f"    const auto vlim = ProjectionLaw::velocity_limit_update({old}, residual_vlim, residual_vlim / denom, "
         f"{accumulated});",
         "    const float delta_impulse_vlim = vlim.v1;",
     ]
     if accumulated:
         lines.append(f"    {lanes.sync()}")
+    change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "denom")
     lines += [
         f"    {rows.store('i', 'vlim.v0')}",
         "",
         "    if (delta_impulse_vlim != 0.0f) {",
-        change_vote(laws, (("delta_impulse_vlim", "denom", str(VELOCITY_LIMIT)),), "        "),
+        change_vote(laws, (change,), "        "),
         op.apply_strided("i", "delta_impulse_vlim", "        "),
         "    }",
         f"    {lanes.sync()}",
@@ -890,11 +889,17 @@ def fused_clamp_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "        
         "    float jv_fvl = my_sum_fvl;",
         "    if (fabsf(jv_fvl) > qdot_max_fvl) {",
         "        const float delta_fvl = ProjectionLaw::velocity_clamp_impulse(jv_fvl, qdot_max_fvl, denom_fvl);",
-        vote(
-            laws.policy,
-            "        if (delta_fvl != 0.0f) iteration_changed = 1;",
-            flag="iteration_changed",
-            terms=(("delta_fvl", "denom_fvl", str(VELOCITY_LIMIT)),),
+        change_vote(
+            laws,
+            (
+                Change(
+                    "delta_fvl",
+                    bound("qdot_max_fvl", op.terms("my_sum_fvl", "", whole=False), "exit_inverse(denom_fvl)", "0.0f"),
+                    str(VELOCITY_LIMIT),
+                    "denom_fvl",
+                ),
+            ),
+            "        ",
         ),
         op.apply_strided("i", "delta_fvl", "        "),
         "    }",
@@ -961,17 +966,23 @@ def speed_row(
     lines = [op.speed("speed_mf_vlim", body, axis, pad)]
     if accumulated:
         lines.append(f"{pad}const float old_mf_vlim = {load};")
-    lines.append(
-        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, "
-        f"{'old_mf_vlim' if accumulated else '0.0f'}, {accumulated});"
-    )
+    old = "old_mf_vlim" if accumulated else "0.0f"
+    lines += [
+        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', inverse, old)};",
+        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, {old}, "
+        f"{accumulated});",
+    ]
     if accumulated and lanes.sync():
         lines.append(f"{pad}{lanes.sync()}")
     lines += [
         f"{pad}{store}",
         "",
         f"{pad}if (speed_row[2] != 0.0f) {{",
-        change_vote(laws, (("speed_row[1]", f"1.0f / {inverse}", str(VELOCITY_LIMIT)),), pad + "    "),
+        change_vote(
+            laws,
+            (Change("speed_row[1]", "bound_speed", str(VELOCITY_LIMIT), f"1.0f / {inverse}"),),
+            pad + "    ",
+        ),
         op.scale_speed("speed_row[2]", body, axis, pad + "    "),
         f"{pad}}}",
     ]
@@ -1047,10 +1058,10 @@ class JacobiRows:
     A row is admitted on its stored ``diagonal`` (native, at row ``i``) or,
     for ``None``, provisionally: the operator forms the diagonal from the
     staged rows, and a row whose formed diagonal is not positive is frozen
-    once every lane has read the staged kinds (its lane's ``frozen``). With
-    ``scales`` each row's diagonal (``s_diag``) and constraint type
-    (``s_type``) are staged too, which the velocity law and the trace scale and
-    name its changes by.
+    once every lane has read the staged kinds (its lane's ``frozen``). The
+    lane keeps its row's diagonal in a register (``row_diag``), which the exit
+    law scales the row's impulse by; with ``types`` each row's constraint type
+    is staged (``s_type``), which the trace names its change by.
     """
 
     capacity: int
@@ -1059,7 +1070,7 @@ class JacobiRows:
     limits: bool = False
     diagonal: str | None = "world_diag.data[off_dense + i]"
     rows: str = "n_rows"
-    scales: bool = False
+    types: bool = False
 
     @property
     def formed(self) -> bool:
@@ -1070,9 +1081,8 @@ class JacobiRows:
         """The rows' state and metadata."""
         AM = self.capacity
         state = (Buffer("s_x", "float", AM, align=16), Buffer("s_y", "float", AM, align=16))
-        scales = ("s_diag",) if self.scales else ()
-        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu", *scales))
-        ints = ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ()), *(("s_type",) if self.scales else ()))
+        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu"))
+        ints = ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ()), *(("s_type",) if self.types else ()))
         return (*state, *floats, *(Buffer(name, "int", AM) for name in ints))
 
     def drive_buffers(self) -> tuple[Buffer, ...]:
@@ -1122,8 +1132,8 @@ class JacobiRows:
             f"    if (freeze_drive_rows != 0 && row_type == {DRIVE}) admit = 0;" if drive else "",
             f"    s_kind[i] = admit ? kind : {JACOBI_FROZEN};",
             "    s_step[i] = admit ? 1.0f / diag : 0.0f;",
-            "    s_type[i] = row_type;" if self.scales else "",
-            "    s_diag[i] = diag;" if self.scales and not self.formed else "",
+            "    s_type[i] = row_type;" if self.types else "",
+            "    row_diag = diag;" if not self.formed else "",
         ]
         if drive:
             lines.append("    s_drive_rhs[i] = s_rhs[i];")
@@ -1131,6 +1141,8 @@ class JacobiRows:
         lines.append("}")
         if self.formed:
             lines.insert(0, "int frozen = 0;")
+        # The lane's own row's diagonal (a row each: the loop runs at most once per lane).
+        lines.insert(0, "float row_diag = 0.0f;")
         return indent("\n".join(line for line in lines if line), pad)
 
     def freeze(self, pad: str = "    ") -> str:
@@ -1162,7 +1174,7 @@ class JacobiRows:
         )
 
 
-def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str, scales: bool = False) -> str:
+def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str) -> str:
     """Set admitted row ``i``'s Jacobi step: ``omega w_i / A_ii`` with ``w_i = min(A_ii / bound, 1)`` (zero for a zero
     bound), ``bound`` the row's absolute sum ``sum_j |A_ij|`` or a bound of it.
 
@@ -1170,8 +1182,8 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str, scales: boo
     the simultaneous steps from diverging where many rows couple through one body. With ``cfm`` (the row's
     compliance) the diagonal ``A_ii + cfm`` is formed here and a row without a positive one is marked for freezing
     (``frozen``, :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds); otherwise ``s_step``
-    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it. With ``scales`` the
-    formed diagonal is staged (``s_diag``, :attr:`JacobiRows.scales`).
+    holds the inverse of the stored diagonal, staged at load, and the scale multiplies it. The formed diagonal is
+    the lane's ``row_diag``, which the exit law reads.
     """
     lines = [f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;"]
     if cfm is None:
@@ -1179,7 +1191,7 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str | None, pad: str, scales: boo
     else:
         lines += [
             f"const float diag_i = {aii} + {cfm};",
-            *(["s_diag[i] = diag_i;"] if scales else []),
+            "row_diag = diag_i;",
             "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
         ]
     return indent("\n".join(lines), pad)
@@ -1231,15 +1243,18 @@ def _jacobi_step(rows: JacobiRows, op, pad: str) -> str:
     else:
         update = step
     lines = [
-        "float x_new = 0.0f, x_old = 0.0f;",
+        "float x_new = 0.0f, x_old = 0.0f, x_from = 0.0f, row_bound = 0.0f;",
         "{",
         "    const int i = lane;",
         f"    if (i < {rows.rows}) {{",
         "        const float xi = s_x[i];",
         "        x_old = xi;",
+        "        x_from = xi;",
         "        float value = xi;",
         "        if (s_kind[i] >= 0) {",
         op.jacobi_residual("r", "            "),
+        f"            row_bound = {bound('row_rhs', op.terms('r', 'row_rhs', whole=True), 'row_step', 'row_share * xi')};",
+        "            x_from = s_y[i];",
         *("            " + line for line in update),
         "        }",
         "        x_new = value;",
@@ -1357,20 +1372,27 @@ def jacobi_sweeps(
     ``y_i - s_step_i r`` clamped at zero for a unilateral row, zero for a friction row while friction is delayed, or
     the PhysX drive law on ``y_i`` and the row's ``J v = r - rhs``. Each friction row is then projected radially onto
     its pair's disk (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
-    momentum and adaptive restart (``momentum``), each row votes its change under the laws' solve policy
-    (:func:`change_vote`; the velocity law and the trace scale it by the row's staged diagonal,
-    :attr:`JacobiRows.scales`), and the sweep ends under the policy (:func:`end_sweep`, the budget ``sweeps``; a block
-    of several warps reduces the trace with ``BLOCK_ARGMAX``, :func:`.solve_policy.block_argmax`).
+    momentum and adaptive restart (``momentum``), each row votes its change under the exit law (:func:`change_vote`:
+    its step from the extrapolated impulse over its step size, which is the row's residual there for an unclamped row,
+    against its floor; the trace names it by the row's staged type, :attr:`JacobiRows.types`), and the sweep ends
+    under the policy (:func:`end_sweep`, the budget ``sweeps``; a block of several warps reduces the trace with
+    ``BLOCK_ARGMAX``, :func:`.solve_policy.block_argmax`).
     """
     policy = laws.policy
-    if (policy.velocity or policy.traces) and not rows.scales:
-        raise ValueError("the velocity law and the trace scale the Jacobi rows' changes by their staged diagonals")
+    if policy.traces and not rows.types:
+        raise ValueError("the trace names the Jacobi rows' changes by their staged types")
     inner = pad + "    "
-    term = (("x_new - x_old", "s_diag[i]", "s_type[i]"),)
+    change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
     block = rows.threads > 32
     lines = [
         rows.freeze(pad) if rows.formed else "",
         isotropic_pair_step(rows, pad),
+        # The lane's row: its residual at zero impulse and its step size, fixed through the sweeps.
+        f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
+        f"{pad}const float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
+        f"{pad}const float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
+        # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
+        f"{pad}const float row_share = row_diag * row_step;",
         f"{pad}float t_k = 1.0f;" if momentum else "",
         f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
         f"{inner}const int global_iter = iteration_offset + sweep;",
@@ -1384,8 +1406,8 @@ def jacobi_sweeps(
         f"{inner}    if (i < {rows.rows}) {{",
         f"{inner}        s_x[i] = x_new;",
         f"{inner}        s_y[i] = x_new + beta * (x_new - x_old);",
-        f"{inner}        if (x_new != x_old) {{",
-        change_vote(laws, term, inner + "            ", new="x_new"),
+        f"{inner}        if (x_new != x_from) {{",
+        change_vote(laws, (change,), inner + "            "),
         f"{inner}        }}",
         f"{inner}    }}",
         f"{inner}}}",

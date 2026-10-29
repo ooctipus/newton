@@ -76,17 +76,17 @@ CONFIGURATIONS = (
         None,
     ),
     ("patch_warm_start", 48, 18, 12, {**_PATCH, "warm_start": True}, None),
-    # Exit laws and readouts.
-    ("point_staged_tolerance", 112, 18, 12, _TRIPLETS, {"velocity_change_tolerance": 5e-2}),
-    ("explicit_rows_tolerance", 128, 43, 18, {"active_rows": True}, {"velocity_change_tolerance": 5e-2}),
-    ("patch_trace", 112, 18, 12, _PATCH, {"velocity_change_tolerance": 5e-2, "readout": "trace"}),
+    # Readouts.
+    ("point_staged_sweeps", 112, 18, 12, _TRIPLETS, {"readout": "sweeps"}),
+    ("explicit_rows_trace", 128, 43, 18, {"active_rows": True}, {"readout": "trace"}),
+    ("patch_trace", 112, 18, 12, _PATCH, {"readout": "trace"}),
     (
-        "limits_tolerance_sweeps",
+        "limits_sweeps",
         64,
         9,
         9,
         {**_LIMITS, "lanes_per_world": 16},
-        {"velocity_change_tolerance": 1e-3, "readout": "sweeps"},
+        {"readout": "sweeps"},
     ),
     ("small_trace", 16, 6, 6, {**_TABLE, **_LIMITS, **_SMALL}, {"readout": "trace"}),
 )
