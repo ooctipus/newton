@@ -113,8 +113,8 @@ def _diagonal_limits(dofs: int, laws: RowLaws) -> tuple[str, str, str, str]:
         )
         sides = []
         for bit, side, sign, update in ((1, "lower", "", "+="), (2, "upper", "-", "-=")):
-            limit_bound = bound(f"limit_{side}_rhs_{k}", f"fabsf(s_v[{d}])", "exit_inverse(limit_denom)", "old_lambda")
-            limit = Change("delta_lambda", "limit_bound", str(JOINT_LIMIT), "limit_denom")
+            limit_bound = bound(f"limit_{side}_rhs_{k}", f"fabsf(s_v[{d}])", "old_lambda", diagonal="limit_denom")
+            limit = Change("delta_lambda", "limit_bound", str(JOINT_LIMIT), "limit_denom", scaled=True)
             change = change_vote(laws, (limit,), " " * 20)
             sides.append(
                 f"            if ((limit_active_{k} & {bit}) != 0) {{\n"

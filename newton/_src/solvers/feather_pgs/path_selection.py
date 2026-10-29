@@ -530,7 +530,6 @@ def _sparse_mass_matrix(solver) -> dict:
         # records) or "staged" (normal, then tangents, metric cache); None without triplets.
         "contact_transaction": solver._sparse_contact_transaction,
         "contact_transaction_reason": solver._sparse_contact_transaction_reason,
-        "contact_transaction_launch_bounds": json_value(solver._sparse_contact_transaction_launch_bounds),
     }
     if size is not None:
         record.update(
@@ -541,6 +540,8 @@ def _sparse_mass_matrix(solver) -> dict:
                 "factor_warps_per_block": int(solver._sparse_factor_warps_per_block),
                 "contact_response_kernel": _key(solver._sparse_contact_response_kernel),
                 "sweep_kernel": _key(solver._pgs_solve_sparse_kernel),
+                # The sweep's launch bounds from its shared memory and register budget (threads, minimum blocks).
+                "launch_bounds": json_value(solver._pgs_solve_sparse_kernel.options.get("launch_bounds")),
             }
         )
     return record

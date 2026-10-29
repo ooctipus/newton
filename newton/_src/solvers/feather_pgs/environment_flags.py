@@ -161,12 +161,6 @@ _READ = (
         "Transaction of fused sparse contact triplets: single (one load group and reduction, per-triplet records) or staged (normal, then tangents, metric cache); auto (default) is single for patch and staged for point friction.",
     ),
     (
-        "FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS",
-        "experiment",
-        _SOLVER,
-        "Minimum blocks per SM of the single-stage sparse transaction at 128 rows or fewer: 16 (default) or 14.",
-    ),
-    (
         "FEATHER_PGS_SPARSE_VELOCITY_LIMITS",
         "policy",
         _SOLVER,

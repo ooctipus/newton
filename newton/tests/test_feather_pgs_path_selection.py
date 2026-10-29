@@ -819,7 +819,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             self.assertIn("_contact_triplets", routes["sweep"]["sparse"])
         # Point friction keeps the staged transaction of admitted triplets by default.
         self.assertEqual(sparse["contact_transaction"], "staged" if sparse["contact_triplets"] else None)
-        self.assertIsNone(sparse["contact_transaction_launch_bounds"])
+        # Every sparse sweep states its occupancy: 64 threads, at most the register budget's 16 blocks.
+        threads, blocks = sparse["launch_bounds"]
+        self.assertEqual(threads, 64)
+        self.assertLessEqual(blocks, 16)
         # The 9-DOF, 32-row tripod is a small world: patch friction keeps its packed full sweep.
         patch_sparse = patch_selected["routes"]["sparse_mass_matrix"]
         self.assertFalse(patch_sparse["active_rows"])

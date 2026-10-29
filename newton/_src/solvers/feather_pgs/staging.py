@@ -46,12 +46,14 @@ import warp as wp
 
 __all__ = [
     "RESERVED_SHARED_BYTES",
+    "SM_SHARED_BYTES",
     "STATIC_SHARED_BUDGETS",
     "STATIC_SHARED_BYTES",
     "TILE_BYTES_PER_THREAD",
     "Buffer",
     "Staging",
     "arch_budget",
+    "resident_blocks",
     "static_budget",
 ]
 
@@ -69,6 +71,13 @@ maximum less the driver's reservation; :func:`static_budget` reads them first. N
 
 TILE_BYTES_PER_THREAD = 4
 """Shared memory Warp's tiled launches declare per block thread [B] (``tile_shared_storage_t``'s offsets)."""
+
+SM_SHARED_BYTES = 100 * 1024
+"""Shared memory one SM gives its resident blocks [B] when no device of the architecture is at hand (an offline
+build, the CPU): the RTX PRO 6000's (sm_120), the smallest of the suite's GPUs."""
+
+SHARED_ALLOCATION_BYTES = 128
+"""Granule in which an SM allocates a block's shared memory [B] (``cuda_occupancy.h``, sm_80 and later)."""
 
 _SIZES = {
     "float": 4,
@@ -154,6 +163,26 @@ def arch_budget(device_arch) -> int:
     except (TypeError, ValueError):
         return STATIC_SHARED_BYTES
     return static_budget(arch) if arch > 0 else STATIC_SHARED_BYTES
+
+
+def resident_blocks(block_bytes: int, device_arch=None) -> int:
+    """Blocks of ``block_bytes`` static shared memory each that one SM of ``device_arch`` keeps resident.
+
+    A block takes its bytes and the driver's reservation, in 128-byte granules, out of the SM's shared memory: the
+    opt-in maximum per block plus that reservation (every architecture since sm_80), read from a CUDA device of the
+    architecture as :func:`static_budget` reads it, else :data:`SM_SHARED_BYTES`.
+    """
+    sm_bytes = SM_SHARED_BYTES
+    try:
+        arch = int(str(device_arch).removeprefix("sm_"))
+    except (TypeError, ValueError):
+        arch = 0
+    for device in wp.get_cuda_devices() if arch > 0 else ():
+        if device.arch == arch:
+            sm_bytes = int(device.max_shared_memory_per_block) + RESERVED_SHARED_BYTES
+            break
+    granules = -(-(int(block_bytes) + RESERVED_SHARED_BYTES) // SHARED_ALLOCATION_BYTES)
+    return sm_bytes // (granules * SHARED_ALLOCATION_BYTES)
 
 
 def _layout(buffers) -> int:

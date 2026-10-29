@@ -64,7 +64,6 @@ CONFIGURATIONS = (
     # Options the recipes select.
     ("patch_staged", 112, 18, 12, {**_PATCH, "contact_transaction": "staged"}, None),
     ("point_single", 256, 18, 12, {**_TRIPLETS, "contact_transaction": "single"}, None),
-    ("patch_single14", 112, 18, 12, {**_PATCH, "transaction_blocks": 14}, None),
     ("patch_without_triplets", 256, 18, 12, {**_ACTIVE, "linked_rows": True}, None),
     ("patch_full_sweep_single", 112, 18, 12, {**_TABLE, "contact_triplets": True, "linked_rows": True}, None),
     (
@@ -182,7 +181,6 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             ((16, 6, 4), {"lanes_per_world": 8, "active_rows": True}),
             ((96, 6, 4), {"local_factors": True}),
             ((16, 6, 4), {"contact_transaction": "fused"}),
-            ((16, 6, 4), {"transaction_blocks": 12}),
             ((16, 6, 4), {"velocity_limit_law": "clamped"}),
         )
         for args, options in cases:

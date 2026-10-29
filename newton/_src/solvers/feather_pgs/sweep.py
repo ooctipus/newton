@@ -455,12 +455,12 @@ def _sibling_in_pair(ctx: RowContext) -> bool:
 
 def _row_bound(ctx: RowContext, terms: str) -> str:
     """The visited row's bound (:func:`.solve_policy.bound`) from its residual's ``terms``, at its old impulse."""
-    return bound(ctx.rhs(ctx.row), terms, ctx.operator.step_size(ctx.row), "old_impulse")
+    return ctx.operator.bound(ctx.rhs(ctx.row), terms, "old_impulse", ctx.row)
 
 
 def _sibling_change(ctx: RowContext) -> Change:
     """The friction pair's second-tangent change as the exit law reads it (``sib_bound``: :func:`friction_pair`)."""
-    return Change("sib_delta", "sib_bound", str(FRICTION), ctx.operator.value("sib"))
+    return ctx.operator.change("sib_delta", "sib_bound", str(FRICTION), "sib")
 
 
 def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
@@ -482,7 +482,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             "}",
         ]
     lines.append(ctx.lanes.sync() if ctx.owned and ctx.fenced else "")
-    row_change = Change("delta_impulse", "row_bound", kind, op.value(row))
+    row_change = op.change("delta_impulse", "row_bound", kind, row)
     sib_change = _sibling_change(ctx)
     if ctx.friction and op.fused_pair_apply:
         lines += [
@@ -534,7 +534,7 @@ def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
 def _sibling_bound(ctx: RowContext) -> str:
     """The friction sibling's bound from its residual (``sibling_residual``), at its old impulse."""
     op, rhs = ctx.operator, ctx.rhs("sib")
-    return bound(rhs, op.terms("sibling_residual", rhs, whole=True), op.step_size("sib"), "sibling_impulse")
+    return op.bound(rhs, op.terms("sibling_residual", rhs, whole=True), "sibling_impulse", "sib")
 
 
 def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
@@ -856,14 +856,14 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     if accumulated:
         lines.append(f"    const float old_vlim = {rows.load('i')};")
     lines += [
-        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'exit_inverse(denom)', old)};",
+        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), old, diagonal='denom')};",
         f"    const auto vlim = ProjectionLaw::velocity_limit_update({old}, residual_vlim, residual_vlim / denom, "
         f"{accumulated});",
         "    const float delta_impulse_vlim = vlim.v1;",
     ]
     if accumulated:
         lines.append(f"    {lanes.sync()}")
-    change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "denom")
+    change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "denom", scaled=True)
     lines += [
         f"    {rows.store('i', 'vlim.v0')}",
         "",
@@ -900,9 +900,10 @@ def fused_clamp_pass(rows: WorldRows, op, laws: RowLaws, *, pad: str = "        
             (
                 Change(
                     "delta_fvl",
-                    bound("qdot_max_fvl", op.terms("my_sum_fvl", "", whole=False), "exit_inverse(denom_fvl)", "0.0f"),
+                    bound("qdot_max_fvl", op.terms("my_sum_fvl", "", whole=False), "0.0f", diagonal="denom_fvl"),
                     str(VELOCITY_LIMIT),
                     "denom_fvl",
+                    scaled=True,
                 ),
             ),
             "        ",
@@ -974,7 +975,7 @@ def speed_row(
         lines.append(f"{pad}const float old_mf_vlim = {load};")
     old = "old_mf_vlim" if accumulated else "0.0f"
     lines += [
-        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', inverse, old)};",
+        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', old, step=inverse)};",
         f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, {old}, "
         f"{accumulated});",
     ]
@@ -1259,7 +1260,7 @@ def _jacobi_step(rows: JacobiRows, op, pad: str) -> str:
         "        float value = xi;",
         "        if (s_kind[i] >= 0) {",
         op.jacobi_residual("r", "            "),
-        f"            row_bound = {bound('row_rhs', op.terms('r', 'row_rhs', whole=True), 'row_step', 'row_share * xi')};",
+        f"            row_bound = {bound('row_rhs', op.terms('r', 'row_rhs', whole=True), 'row_share * xi', step='row_step')};",
         "            x_from = s_y[i];",
         *("            " + line for line in update),
         "        }",

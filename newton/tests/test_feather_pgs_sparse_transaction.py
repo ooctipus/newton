@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact
 from newton._src.solvers.feather_pgs.response_builds_rows import factor_contact_rows_kernel
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import row_supports
-from newton._src.solvers.feather_pgs.sweep_routes_sparse import contact_transaction_launch_bounds, sparse_kernel
+from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.feather_pgs_patch_parity import row_law, standing_model
@@ -36,11 +36,9 @@ from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 from newton.tests.test_feather_pgs_sparse_solver import _make_solver
 
 TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
-# Row capacities of the suite's two launch-bound families: 12 blocks above 128 rows, 16 at or below.
+# Row capacities of the suite's two launch-bound families: shared memory admits 12 blocks of 256 rows on the
+# RTX PRO 6000, and the register budget's 16 of 96.
 CAPACITIES = (256, 96)
-# Row capacities with the minimum blocks a single-stage sweep requests: the 14-block variant
-# (FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS=14) compiles to another register budget at 128 rows or fewer.
-SHAPES = ((256, 16), (96, 16), (96, 14))
 
 
 def _snippet(kernel):
@@ -281,10 +279,8 @@ class TestSingleStageTransaction(unittest.TestCase):
 
         Point friction keeps the staged transaction unless asked; either law reaches either form.
         """
-        for capacity, blocks in product((256, 192, 128, 96, 48), (16, 14)):
-            bounds = contact_transaction_launch_bounds(capacity, transaction_blocks=blocks)
-            self.assertEqual(bounds, (64, 12 if capacity > 128 else blocks))
-            with self.subTest(capacity=capacity, blocks=blocks):
+        for capacity in (256, 192, 128, 96, 48):
+            with self.subTest(capacity=capacity):
                 kernels = {
                     (law, transaction): sparse_kernel(
                         capacity,
@@ -292,7 +288,6 @@ class TestSingleStageTransaction(unittest.TestCase):
                         12,
                         linked_rows=law == "patch",
                         contact_transaction=transaction,
-                        transaction_blocks=blocks,
                         **TRIPLETS,
                     )
                     for law, transaction in product(("patch", "point"), ("auto", "single", "staged"))
@@ -300,21 +295,22 @@ class TestSingleStageTransaction(unittest.TestCase):
                 for (law, transaction), kernel in kernels.items():
                     single = transaction == "single" or (transaction == "auto" and law == "patch")
                     linked = "_linked" if law == "patch" else ""
-                    suffix = f"_contact_triplets_single{bounds[1]}{linked}" if single else f"_contact_triplets{linked}"
+                    suffix = f"_contact_triplets_single{linked}" if single else f"_contact_triplets{linked}"
                     self.assertTrue(kernel.key.endswith(suffix), kernel.key)
-                    self.assertEqual(kernel.options.get("launch_bounds"), bounds if single else None)
+                    # Either transaction states the occupancy its shared memory admits, at most the register
+                    # budget's 16 blocks.
+                    threads, blocks = kernel.options["launch_bounds"]
+                    self.assertEqual(threads, 64)
+                    self.assertLessEqual(blocks, 16)
+                    self.assertEqual(blocks == 16, capacity <= 128, (capacity, blocks))
                     names = list(kernel.adj.arg_types)
                     self.assertEqual("contact_records" in names, single)
                     if single:
                         # The records follow the scalar inputs, before the outputs.
                         self.assertEqual(names[names.index("iteration_offset") + 1], "contact_records")
                 self.assertIs(kernels[("patch", "auto")], kernels[("patch", "auto")])
-        for options in ({"contact_transaction": "fused"}, {"transaction_blocks": 12}):
-            with self.subTest(options=options), self.assertRaises(ValueError):
-                sparse_kernel(64, 18, 12, **TRIPLETS, **options)
-        # The block request is an option, so it is keyword-only.
-        with self.assertRaises(TypeError):
-            contact_transaction_launch_bounds(96, 14)
+        with self.assertRaises(ValueError):
+            sparse_kernel(64, 18, 12, **TRIPLETS, contact_transaction="fused")
 
     def test_single_stage_sweep_reduces_once_from_records_cpu(self):
         """Reduce three residuals once from the record, without the staged metric cache, its capacity or walk.
@@ -387,43 +383,32 @@ class TestSingleStageTransaction(unittest.TestCase):
                 transaction, reason = SolverFeatherPGS._request_sparse_contact_transaction(probe)
                 self.assertEqual(transaction, expected)
                 self.assertIn(phrase, reason)
-        for environment, blocks in (({}, 16), ({"FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS": "14"}, 14)):
-            with mock.patch.dict(os.environ, environment, clear=True):
-                self.assertEqual(SolverFeatherPGS._sparse_transaction_flags(), ("auto", blocks))
-        for name, value in (
-            ("FEATHER_PGS_SPARSE_TRANSACTION", "fused"),
-            ("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "12"),
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(SolverFeatherPGS._sparse_transaction_flags(), "auto")
+        with (
+            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_TRANSACTION": "fused"}, clear=True),
+            self.assertRaisesRegex(ValueError, "FEATHER_PGS_SPARSE_TRANSACTION"),
         ):
-            with (
-                self.subTest(name=name),
-                mock.patch.dict(os.environ, {name: value}, clear=True),
-                self.assertRaisesRegex(ValueError, name),
-            ):
-                SolverFeatherPGS._sparse_transaction_flags()
-        # =staged turns the patch default off; 14 blocks opts into a non-default launch bound.
+            SolverFeatherPGS._sparse_transaction_flags()
+        # =staged turns the patch default off; the launch bounds are a rule, not a flag.
         self.assertEqual(environment_flags.FLAGS["FEATHER_PGS_SPARSE_TRANSACTION"].kind, "policy")
-        self.assertEqual(environment_flags.FLAGS["FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS"].kind, "experiment")
+        self.assertNotIn("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", environment_flags.FLAGS)
 
     def test_invalid_flags_raise_on_every_route_cpu(self):
         """Reject an invalid transaction flag at construction, also where no sparse sweep runs."""
         model = _cpu_model()
-        for name, value in (
-            ("FEATHER_PGS_SPARSE_TRANSACTION", "fused"),
-            ("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "12"),
+        with (
+            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_TRANSACTION": "fused"}),
+            self.assertRaisesRegex(ValueError, "FEATHER_PGS_SPARSE_TRANSACTION"),
         ):
-            with (
-                self.subTest(name=name),
-                mock.patch.dict(os.environ, {name: value}),
-                self.assertRaisesRegex(ValueError, name),
-            ):
-                SolverFeatherPGS(model)
+            SolverFeatherPGS(model)
 
     def test_route_record_names_no_transaction_without_sparse_factors_cpu(self):
         """Record the transaction fields of the sparse route even where the route is not selected."""
         solver = SolverFeatherPGS(_cpu_model())
         record = solver.get_path_selection()["routes"]["sparse_mass_matrix"]
         self.assertIsNone(record["contact_transaction"])
-        self.assertIsNone(record["contact_transaction_launch_bounds"])
+        self.assertNotIn("launch_bounds", record)
         self.assertEqual(record["contact_transaction_reason"], "Native sparse factors are not selected.")
 
 
@@ -431,17 +416,14 @@ class TestSingleStageTransaction(unittest.TestCase):
 class TestSingleStageTwins(unittest.TestCase):
     """CUDA twins of the single-stage transaction: the staged sweep and the physical reference, to rounding."""
 
-    def _twins(self, data, *, linked=False, active=True, blocks=16):
-        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve.
-
-        ``blocks`` is the single-stage sweep's block request, which applies at 128 rows or fewer.
-        """
+    def _twins(self, data, *, linked=False, active=True):
+        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve."""
         options = {"candidate": True, "active": active, "linked": linked}
-        single = triplets.DeviceSolve(data, transaction="single", blocks=blocks, **options)
+        single = triplets.DeviceSolve(data, transaction="single", **options)
         staged = triplets.DeviceSolve(data, transaction="staged", **options)
         self.assertTrue(single.single_stage)
         self.assertFalse(staged.single_stage)
-        self.assertIn(f"_single{12 if single.capacity > 128 else blocks}", single.kernel.key)
+        self.assertIn("_single", single.kernel.key)
         single.launch()
         staged.launch()
         return single.result(), staged.result(), single
@@ -454,11 +436,11 @@ class TestSingleStageTwins(unittest.TestCase):
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
             + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
-        for settings, (capacity, blocks) in product(cases, SHAPES):
-            with self.subTest(capacity=capacity, blocks=blocks, **settings):
+        for settings, capacity in product(cases, CAPACITIES):
+            with self.subTest(capacity=capacity, **settings):
                 data, physical = triplets.fixture(**settings)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data, blocks=blocks)
+                single, staged, _ = self._twins(data)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
@@ -474,13 +456,13 @@ class TestSingleStageTwins(unittest.TestCase):
     def test_patch_rings_match_staged_and_reference_cuda(self):
         """Pool rings of one to six members, listed or walked, in the linked active scan and the full sweep."""
         settings = ({}, {"seeded": True, "omega": 0.7}, {"seeded": True, "delay": 3, "iteration_offset": 1})
-        for (name, layout), pad, options, active, (capacity, blocks) in product(
-            triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), SHAPES
+        for (name, layout), pad, options, active, capacity in product(
+            triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), CAPACITIES
         ):
-            with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, blocks=blocks, **options):
+            with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, **options):
                 data, physical = triplets.linked_fixture(layout, pad=pad, active=active, **options)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data, linked=True, active=active, blocks=blocks)
+                single, staged, _ = self._twins(data, linked=True, active=active)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
@@ -653,8 +635,8 @@ class TestSingleStageTwins(unittest.TestCase):
         factor = np.stack(
             [np.where(indices[unit] >= 0, z[row, indices[unit]], 0.0) for row, unit in enumerate(units)]
         ).astype(np.float32)
-        for (capacity, blocks), active in product(SHAPES, (True, False)):
-            with self.subTest(capacity=capacity, blocks=blocks, active=active):
+        for capacity, active in product(CAPACITIES, (True, False)):
+            with self.subTest(capacity=capacity, active=active):
 
                 def padded(values, capacity=capacity):
                     result = np.zeros((3, capacity, *values.shape[1:]), dtype=values.dtype)
@@ -679,7 +661,7 @@ class TestSingleStageTwins(unittest.TestCase):
                     "iteration_offset": np.array(0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
-                single, staged, solve = self._twins(data, linked=True, active=active, blocks=blocks)
+                single, staged, solve = self._twins(data, linked=True, active=active)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=oracle[active])
                 rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
@@ -701,8 +683,8 @@ class TestSingleStageTwins(unittest.TestCase):
         for active in (True, False):
             layout = triplets._LINKED_LAYOUTS["loaded_ring"]
             fixtures.append(("patch", active, triplets.linked_fixture(layout, pad=30, seeded=True, active=active)[0]))
-        for (law, active, fixture), (capacity, blocks) in product(fixtures, SHAPES):
-            with self.subTest(law=law, active=active, capacity=capacity, blocks=blocks):
+        for (law, active, fixture), capacity in product(fixtures, CAPACITIES):
+            with self.subTest(law=law, active=active, capacity=capacity):
                 data = _resized(fixture, capacity)
                 linked = law == "patch"
                 options = {"candidate": True, "active": active, "linked": linked}
@@ -720,7 +702,7 @@ class TestSingleStageTwins(unittest.TestCase):
                 ]
                 self.assertTrue(loaded)
                 row = loaded[0]
-                single = triplets.DeviceSolve(data, transaction="single", blocks=blocks, **options)
+                single = triplets.DeviceSolve(data, transaction="single", **options)
                 records = single.records.numpy()
                 records[:, row // 3, 3] = 0.0
                 single.records.assign(records)
@@ -756,7 +738,7 @@ class TestSingleStageTwins(unittest.TestCase):
                 single, staged = solvers["single"], solvers["staged"]
                 self.assertEqual(single._sparse_contact_transaction, "single")
                 self.assertEqual(staged._sparse_contact_transaction, "staged")
-                self.assertIn("_contact_triplets_single16", single._pgs_solve_sparse_kernel.key)
+                self.assertIn("_contact_triplets_single", single._pgs_solve_sparse_kernel.key)
                 self.assertIn("_contact_records", single._sparse_contact_response_kernel.key)
                 self.assertNotIn("_contact_records", staged._sparse_contact_response_kernel.key)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
@@ -764,7 +746,7 @@ class TestSingleStageTwins(unittest.TestCase):
                 self.assertIsNone(staged._sparse_contact_records)
                 record = single.get_path_selection()["routes"]["sparse_mass_matrix"]
                 self.assertEqual(record["contact_transaction"], "single")
-                self.assertEqual(record["contact_transaction_launch_bounds"], [64, 16])
+                self.assertEqual(record["launch_bounds"], [64, 16])
                 trajectories = {name: self._rollout(solver, model) for name, solver in solvers.items()}
                 # Each step holds (first solve's impulses, body_q, body_qd).
                 first_single, first_staged = trajectories["single"][0][0], trajectories["staged"][0][0]

@@ -244,12 +244,7 @@ from .sparse_mass_matrix import (
 )
 from .staging import STATIC_SHARED_BYTES, arch_budget
 from .step_plan import AdmissionFacts, StepPlan, first_failed
-from .sweep_routes_sparse import (
-    _SPARSE_LOCAL_WORKSPACE_BYTES,
-    CONTACT_TRANSACTION_BLOCKS,
-    CONTACT_TRANSACTIONS,
-    contact_transaction_launch_bounds,
-)
+from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES, CONTACT_TRANSACTIONS
 from .tree_passes import (
     SERIAL_BLOCK_DIM,
     DynamicsData,
@@ -1773,7 +1768,7 @@ class SolverFeatherPGS(SolverBase):
                     DeprecationWarning,
                     stacklevel=_CONSTRUCTOR_CALLER,
                 )
-        # The sparse triplet transaction's flags, checked on every route; the sparse route applies them.
+        # The sparse triplet transaction's flag, checked on every route; the sparse route applies it.
         self._sparse_transaction_request = self._sparse_transaction_flags()
         # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
         # get_path_selection() reports their source as "environment".
@@ -4017,10 +4012,9 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_active_rows = False
         self._sparse_active_rows_reason = "Native sparse factors are not selected."
         self._sparse_contact_triplets_reason = "Native sparse factors are not selected."
-        # The admitted triplets' transaction ("single" or "staged"), its launch bounds and records.
+        # The admitted triplets' transaction ("single" or "staged") and its records.
         self._sparse_contact_transaction = None
         self._sparse_contact_transaction_reason = "Native sparse factors are not selected."
-        self._sparse_contact_transaction_launch_bounds = None
         self._sparse_contact_records = None
         self._sparse_max_row_support = None
         sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
@@ -4321,11 +4315,6 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_contact_transaction_reason = transaction_reason
             transaction_options["contact_transaction"] = transaction
             if transaction == "single":
-                blocks = self._sparse_transaction_request[1]
-                transaction_options["transaction_blocks"] = blocks
-                self._sparse_contact_transaction_launch_bounds = contact_transaction_launch_bounds(
-                    self.dense_max_constraints, transaction_blocks=blocks
-                )
                 # Static storage for graph capture: the builder writes the records of each step's
                 # triplets; linked sweeps add each anchor's ring members once per call.
                 width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self._friction_anchors_enabled else 0)
@@ -4525,7 +4514,7 @@ class SolverFeatherPGS(SolverBase):
         default and point friction the staged one; ``FEATHER_PGS_SPARSE_TRANSACTION``
         (``auto``, ``single`` or ``staged``, see :meth:`_sparse_transaction_flags`) overrides both.
         """
-        request = self._sparse_transaction_request[0]
+        request = self._sparse_transaction_request
         if request == "single":
             return "single", "FEATHER_PGS_SPARSE_TRANSACTION=single: one load group and one reduction per triplet."
         if request == "staged":
@@ -4543,28 +4532,18 @@ class SolverFeatherPGS(SolverBase):
         )
 
     @staticmethod
-    def _sparse_transaction_flags() -> tuple[str, int]:
-        """Return the triplet transaction and single-stage minimum blocks that the environment requests.
+    def _sparse_transaction_flags() -> str:
+        """Return the triplet transaction that the environment requests.
 
         ``FEATHER_PGS_SPARSE_TRANSACTION`` is one of :data:`~.sweep_routes_sparse.CONTACT_TRANSACTIONS`
-        (default ``auto``). ``FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS`` is one of
-        :data:`~.sweep_routes_sparse.CONTACT_TRANSACTION_BLOCKS`: the minimum resident blocks a
-        single-stage sweep of at most 128 rows requests, 16 (default, a 64-register budget) or
-        14 (72 registers); above 128 rows its launch bounds request 12. Every construction
-        checks both, so an invalid value raises on every route.
+        (default ``auto``). Every construction checks it, so an invalid value raises on every route.
         """
         transaction = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
         if transaction not in CONTACT_TRANSACTIONS:
             raise ValueError(
                 f"FEATHER_PGS_SPARSE_TRANSACTION must be one of {', '.join(CONTACT_TRANSACTIONS)}, got {transaction!r}"
             )
-        blocks = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "16") or "16"
-        allowed = tuple(str(value) for value in CONTACT_TRANSACTION_BLOCKS)
-        if blocks not in allowed:
-            raise ValueError(
-                f"FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS must be one of {', '.join(allowed)}, got {blocks!r}"
-            )
-        return transaction, int(blocks)
+        return transaction
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:

@@ -34,11 +34,9 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 TRANSACTIONS = ("staged", "single")
 
 
-def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16):
-    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request."""
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto"):
+    """Return the sparse sweep of the triplet tests."""
     options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
-    if candidate and blocks != 16:
-        options["transaction_blocks"] = blocks
     return sparse_kernel(
         capacity,
         dofs,
@@ -172,7 +170,7 @@ class DeviceSolve:
     (:func:`contact_records`), which follow the scalar inputs.
     """
 
-    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto", blocks=16):
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto"):
         self.device = wp.get_device(device)
         self.data = data
         self.linked = linked
@@ -186,7 +184,6 @@ class DeviceSolve:
             active=active,
             linked=linked,
             transaction=transaction,
-            blocks=blocks,
         )
         self.records = None
 
@@ -681,8 +678,8 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         active = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
         full = sparse_kernel(192, 12, 12, linked_rows=True, **options)
         point = sparse_kernel(192, 12, 12, active_rows=True, **options)
-        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single12_linked"))
-        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_single12_linked"), full.key)
+        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single_linked"))
+        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_single_linked"), full.key)
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
         options["contact_transaction"] = "staged"
         staged = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
@@ -780,14 +777,14 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
         model = _branched_model(4, 3, "cuda:0")
         for environment, suffix in (
-            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_single12_linked"),
+            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_single_linked"),
             (
                 {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_SPARSE_TRANSACTION": "staged"},
                 "_active_support_table_contact_triplets_linked",
             ),
             (
                 {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"},
-                "_18_12_support_table_contact_triplets_single12_linked",
+                "_18_12_support_table_contact_triplets_single_linked",
             ),
             ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "0"}, "_active_support_table_linked"),
             ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_18_12_support_table"),

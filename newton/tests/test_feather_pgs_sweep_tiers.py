@@ -185,7 +185,9 @@ class TestJacobiLaw(unittest.TestCase):
         text = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, momentum=True, pooled=False)
         self.assertNotIn("if (x_new != x_old) {", text)
         self.assertIn("const float row_share = row_diag * row_step;", text)
-        self.assertIn(f"row_bound = {bound('row_rhs', 'fabsf((r) - (row_rhs))', 'row_step', 'row_share * xi')};", text)
+        self.assertIn(
+            f"row_bound = {bound('row_rhs', 'fabsf((r) - (row_rhs))', 'row_share * xi', step='row_step')};", text
+        )
         self.assertIn("x_from = s_y[i];", text)
         self.assertIn("if (x_new != x_from) {", text)
         self.assertIn("(!(fabsf(x_new - x_from) <= row_bound))", text)

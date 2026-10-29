@@ -27,7 +27,7 @@ never extracted from another owner's source. No runtime method is selected here.
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .solve_policy import terms_bound
+from .solve_policy import Change, bound, terms_bound
 from .staging import Buffer
 
 Vector = Callable[[str], str]
@@ -489,12 +489,16 @@ class ResponseOperator:
         inverse = self.inverse(row)
         return f"{inverse} > 0.0f ? 1.0f / {inverse} : 0.0f"
 
-    def step_size(self, row: str) -> str:
-        """``1 / A_ii`` of row ``row`` as the exit law's bound scales by it (:func:`.solve_policy.bound`): the stored
-        inverse when the operator keeps one, else the law's fast reciprocal of the diagonal."""
+    def bound(self, rhs: str, terms: str, impulse: str, row: str) -> str:
+        """The exit law's bound of row ``row`` at ``impulse`` (:func:`.solve_policy.bound`), in the form its storage
+        gives without a division: impulse units from a stored inverse, velocity units from a stored diagonal."""
         if self.inverse is not None:
-            return self.inverse(row)
-        return f"exit_inverse({self.diagonal(row)})"
+            return bound(rhs, terms, impulse, step=self.inverse(row))
+        return bound(rhs, terms, impulse, diagonal=self.diagonal(row))
+
+    def change(self, delta: str, bound: str, kind: str, row: str) -> Change:
+        """Row ``row``'s change ``delta`` against its :meth:`bound`, as the exit law votes it."""
+        return Change(delta, bound, kind, self.value(row), scaled=self.inverse is None)
 
     def step(self, residual: str, row: str) -> str:
         """The Gauss-Seidel step ``-r / A_ii``."""

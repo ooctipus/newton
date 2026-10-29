@@ -500,20 +500,22 @@ def torque_sweep_source(op, policy: SolvePolicy = DEFAULT_POLICY):
             bound(
                 f"rhs_bias.data[off_dense + n + {k}]",
                 "0.0f",
-                f"exit_inverse(world_diag.data[off_dense + n + {k}])",
                 f"s_lam_dense[n + {k}]",
+                diagonal=f"world_diag.data[off_dense + n + {k}]",
             ),
             friction,
             f"world_diag.data[off_dense + n + {k}]",
+            scaled=True,
         )
         for k in (1, 2)
     )
     rescale_vote = vote(policy, rescale, flag="iteration_changed", pad=" " * 28)
     torsion = Change(
         "delta",
-        bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "exit_inverse(diagonal)", "old"),
+        bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "old", diagonal="diagonal"),
         str(PGS_CONSTRAINT_TYPE_TORSION),
         "diagonal",
+        scaled=True,
     )
     torsion_vote = vote(policy, (torsion,), flag="iteration_changed", pad=" " * 20)
     return f"""

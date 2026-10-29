@@ -187,13 +187,14 @@ class TestRowTail(unittest.TestCase):
         self.assertEqual(update.count("SYNC();"), 2)
 
     def test_the_exit_law_quiets_changes_at_the_rounding_floor(self):
-        """A change is loud beyond its row's bound, 2^-20 ((|b| + S) / A + |lambda|) at the old impulse."""
+        """A change is loud beyond its row's bound at the old impulse, in its storage's form: phi against
+        2^-20 (|b| + S + A |lambda|) from a stored diagonal."""
         vote = change_vote(RowLaws(regularize=False), (Change("d", "tau", "0", "A"),), "  ")
         self.assertEqual(vote, "  if ((!(fabsf(d) <= tau))) iteration_changed = 1;")
-        self.assertEqual(bound("b", "S", "s", "l"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
+        self.assertEqual(bound("b", "S", "l", step="s"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
         update = self._update(_Rows(diagonal=lambda row: f"A[{row}]"))
-        self.assertIn(f"float row_bound = {bound('rhs[i]', 'fabsf(jv)', 'exit_inverse(A[i])', 'old_impulse')};", update)
-        self.assertIn("(!(fabsf(delta_impulse) <= row_bound))", update)
+        self.assertIn(f"float row_bound = {bound('rhs[i]', 'fabsf(jv)', 'old_impulse', diagonal='A[i]')};", update)
+        self.assertIn("(!(fabsf(delta_impulse) * (A[i]) <= row_bound))", update)
         traced = change_vote(RowLaws(policy=SolvePolicy(readout="trace")), (Change("d", "tau", "0", "A"),), "")
         self.assertTrue(traced.startswith("if (d != 0.0f) solve_trace_change(fabsf(d) * (A), 0);"))
 

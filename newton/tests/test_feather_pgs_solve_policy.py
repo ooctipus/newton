@@ -35,7 +35,6 @@ from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate
 from newton._src.solvers.feather_pgs.solve_policy import (
     DEFAULT_POLICY,
-    EXIT_LAW,
     QUIET_LITERAL,
     SWEEP_READOUT,
     SWEEP_TRACE,
@@ -278,11 +277,11 @@ class TestSolvePolicy(unittest.TestCase):
             SolvePolicy(readout="every_sweep")
         self.assertEqual(
             (DEFAULT_POLICY.counts, DEFAULT_POLICY.suffix, DEFAULT_POLICY.preludes, DEFAULT_POLICY.operands),
-            (False, "", (EXIT_LAW,), {}),
+            (False, "", (), {}),
         )
         self.assertEqual(
             (SWEEPS.suffix, SWEEPS.preludes, SWEEPS.operands),
-            ("_sweeps", (EXIT_LAW, SWEEP_READOUT), {"readout": SolveReadout}),
+            ("_sweeps", (SWEEP_READOUT,), {"readout": SolveReadout}),
         )
 
     def test_equal_policies_share_cached_kernels(self):
@@ -405,13 +404,21 @@ class TestExitLaw(unittest.TestCase):
             SolvePolicy(velocity_change_tolerance=1.0e-3)
         self.assertEqual(repr(TRACE), "SolvePolicy(readout='trace')")
         self.assertEqual((TRACE.suffix, SWEEPS.suffix, DEFAULT_POLICY.suffix), ("_trace", "_sweeps", ""))
-        self.assertEqual((TRACE.preludes, TRACE.operands), ((EXIT_LAW, SWEEP_TRACE), {"readout": SolveTrace}))
+        self.assertEqual((TRACE.preludes, TRACE.operands), ((SWEEP_TRACE,), {"readout": SolveTrace}))
 
     def test_vote_bounds_each_change_by_its_floor(self):
-        """Vote a change loud beyond its row's bound, 2^-20 ((|b| + S) / A + |lambda|); a NaN change is loud; trace each
-        change's velocity."""
+        """Vote a change loud beyond its row's bound in its storage's form: phi against 2^-20 (|b| + S + A |lambda|)
+        from a stored diagonal, |dlambda| against 2^-20 ((|b| + S) / A + |lambda|) from a stored inverse; a NaN
+        change is loud; trace each change's velocity."""
         self.assertEqual(QUIET_LITERAL, "9.5367431640625e-07f")
-        self.assertEqual(bound("b", "S", "s", "l"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
+        self.assertEqual(bound("b", "S", "l", step="s"), "9.5367431640625e-07f * ((fabsf(b) + (S)) * (s) + fabsf(l))")
+        self.assertEqual(bound("b", "S", "l", diagonal="A"), "9.5367431640625e-07f * (fabsf(b) + (S) + (A) * fabsf(l))")
+        self.assertEqual(bound("b", "S", "0.0f", diagonal="A"), "9.5367431640625e-07f * (fabsf(b) + (S))")
+        for forms in ({}, {"step": "s", "diagonal": "A"}):
+            with self.assertRaises(ValueError):
+                bound("b", "S", "l", **forms)
+        scaled = Change("delta", "tau", "row_type", "diag[i]", scaled=True)
+        self.assertEqual(scaled.loud, "!(fabsf(delta) * (diag[i]) <= tau)")
         changes = (Change("delta", "tau", "row_type", "diag[i]"), Change("other", "rho", "2", "diag[j]"))
         expected = "    if ((!(fabsf(delta) <= tau)) || (!(fabsf(other) <= rho))) changed = 1;"
         self.assertEqual(vote(DEFAULT_POLICY, changes, flag="changed", pad="    "), expected)
@@ -545,9 +552,9 @@ class TestExitLaw(unittest.TestCase):
             snippet,
         )
         plain = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", **options)
-        snippet = _policy_snippet(self, plain, "fabsf(delta) <=")
-        torsion_bound = bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "exit_inverse(diagonal)", "old")
-        self.assertIn(f"(!(fabsf(delta) <= {torsion_bound}))", snippet)
+        snippet = _policy_snippet(self, plain, "fabsf(delta) * (diagonal) <=")
+        torsion_bound = bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "old", diagonal="diagonal")
+        self.assertIn(f"(!(fabsf(delta) * (diagonal) <= {torsion_bound}))", snippet)
         kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
         self.assertIs(kernel.adj.args[-1].type, SolveReadout)
 
@@ -558,7 +565,7 @@ class TestExitLaw(unittest.TestCase):
         snippet = _policy_snippet(self, kernel, QUIET_LITERAL)
         self.assertIn("if (sweep_stop) {", snippet)
         self.assertIn("sweep_stop = !sweep_violation_any;", snippet)
-        self.assertIn(f"(!(fabsf(excess) <= {bound('s_rhs[row]', 'fabsf(dot)', '1.0f', '0.0f')}))", snippet)
+        self.assertIn(f"(!(fabsf(excess) <= {bound('s_rhs[row]', 'fabsf(dot)', '0.0f', diagonal='1.0f')}))", snippet)
         traced = sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=TRACE)
         for text in (snippet, _policy_snippet(self, traced, "solve_trace_sweep(")):
             self.assertTrue("? omega * fmaxf(-residual, 0.0f) :" in text, "the unvisited-row bound ignores omega")

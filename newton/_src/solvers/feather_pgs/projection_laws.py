@@ -143,20 +143,6 @@ def friction_pair_from_metric(
         result = old - correction
         sticking = wp.length(result) <= radius
     if not sticking:
-        # Retain an already feasible sliding solution within the same relative
-        # accuracy as the root solve. Re-solving it can otherwise introduce
-        # roundoff cycles that prevent a stationary PGS sweep.
-        old_norm = wp.length(old)
-        residual_norm = wp.length(residual)
-        cross_residual = residual[0] * old[1] - residual[1] * old[0]
-        if (
-            old_norm > 0.0
-            and old_norm <= radius
-            and radius - old_norm <= 2.0e-7 * radius
-            and wp.dot(residual, old) <= 0.0
-            and wp.abs(cross_residual) <= 2.0e-7 * old_norm * residual_norm
-        ):
-            return old
         old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
         b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
         solution = wp.vec2(0.0)
@@ -221,8 +207,7 @@ def friction_pair(
     with ``|x| = radius``. Incremental sticking avoids perturbing fixed points. An
     orthonormal eigenbasis avoids cancellation in nearly singular blocks.
     Safeguarded Newton accelerates sliding; bisection retains a feasible
-    fallback. Feasible sliding impulses already satisfying the KKT conditions to
-    the same relative accuracy (2e-7) are retained to avoid roundoff cycles.
+    fallback.
     """
     scale, largest, smallest, axis = friction_pair_metric(a, c, d)
     return friction_pair_from_metric(scale, largest, smallest, axis, residual, old, radius, omega)

@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import sweep_routes_split
+from newton._src.solvers.feather_pgs.solve_policy import QUIET
 from newton._src.solvers.feather_pgs.sweep_routes_diag import tiled_row_kernel
 
 
@@ -163,8 +164,12 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             kernel = tiled_row_kernel(capacity, str(wp.get_device(device).arch))
                             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)
                         actual = impulses.numpy()[0, :3]
-                        if regime in ("fixed", "sliding_fixed"):
+                        if regime == "fixed":
                             np.testing.assert_array_equal(actual, initial[0, :3])
+                        elif regime == "sliding_fixed":
+                            # A feasible sliding impulse at its KKT point re-solves to itself within the exit law's
+                            # rounding floor, a quiet change.
+                            np.testing.assert_allclose(actual, initial[0, :3], rtol=QUIET, atol=0.0)
                         elif small_eigenvalue == 0.0 and not sliding:
                             # A singular sticking block has multiple impulse solutions.
                             np.testing.assert_allclose(tangent_mass @ actual[1:] + rhs[0, 1:3], 0.0, atol=1.0e-6)

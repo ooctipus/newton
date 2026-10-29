@@ -188,15 +188,10 @@ def _suite_sparse_sweeps():
     ):
         yield size, {**kwargs, "linked_rows": True}, True
     # Triplet transactions beside each law's default (FEATHER_PGS_SPARSE_TRANSACTION): point
-    # friction's single-stage opt-in and patch friction's staged one, and the 14-block launch
-    # bounds of single-stage sweeps at 128 rows or fewer (FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS).
+    # friction's single-stage opt-in and patch friction's staged one.
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12), (48, 18, 18), (48, 25, 16), (72, 18, 12), (80, 18, 18)):
-        single = {**triplets, "contact_transaction": "single"}
-        yield size, single, False
+        yield size, {**triplets, "contact_transaction": "single"}, False
         yield size, {**triplets, "linked_rows": True, "contact_transaction": "staged"}, True
-        if size[0] <= 128:
-            yield size, {**single, "transaction_blocks": 14}, False
-            yield size, {**triplets, "linked_rows": True, "transaction_blocks": 14}, True
 
 
 def _suite_diagonal_sweeps():
@@ -859,7 +854,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "linked_rows=True",
             "contact_transaction='single'",
             "contact_transaction='staged'",
-            "transaction_blocks=14",
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))

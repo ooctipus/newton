@@ -23,7 +23,7 @@ from .law_source import law_preludes
 from .projection_laws import PROJECTION_LAW
 from .response_operator import Block, CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _DENSE_META_ROW_TYPE_MASK, _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, block_argmax, bound, sweep_exit
+from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -1071,10 +1071,8 @@ def incremental_source(
     )
     vlim_old = "s_lam[i]" if accumulated else "0.0f"
     vlim_rhs = ctx.rhs("i")
-    vlim_bound = bound(
-        vlim_rhs, op.terms("residual_vlim", vlim_rhs, whole=op.residual_includes_rhs), op.step_size("i"), vlim_old
-    )
-    vlim_change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), op.value("i"))
+    vlim_bound = op.bound(vlim_rhs, op.terms("residual_vlim", vlim_rhs, whole=op.residual_includes_rhs), vlim_old, "i")
+    vlim_change = op.change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "i")
     vlim_pass = ""
     if has_dense_velocity_limit_rows:
         vlim_pass = f"""

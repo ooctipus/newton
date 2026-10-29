@@ -8,7 +8,8 @@ coordinates and values of its support (:class:`.response_operator.SparseFactor`)
 the factor-coordinate delta from ``v_hat``, staged per world and published once (``factor_velocity_delta``); the
 caller decodes it. A configuration chooses:
 
-- the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads;
+- the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads, with launch bounds
+  from the data (:func:`launch_bounds`);
 - the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
   table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
 - the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
@@ -41,7 +42,7 @@ from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .staging import Buffer, Staging, arch_budget
+from .staging import Buffer, Staging, arch_budget, resident_blocks
 from .sweep import (
     CONTACT,
     FRICTION,
@@ -61,24 +62,9 @@ _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
 CONTACT_TRANSACTIONS = ("auto", "single", "staged")
 """Triplet transactions of the sparse sweep; ``auto`` is ``single`` for linked rows, else ``staged``."""
-CONTACT_TRANSACTION_BLOCKS = (16, 14)
-"""Minimum resident blocks a single-stage sweep of at most 128 rows may request; 16 is the default."""
-
-
-def contact_transaction_launch_bounds(max_constraints: int, *, transaction_blocks: int = 16) -> tuple[int, int]:
-    """Return the launch bounds of a single-stage triplet sweep: 64 threads, minimum blocks per SM.
-
-    Above 128 rows, shared memory admits 12 blocks of two worlds; at or below,
-    ``transaction_blocks`` (one of :data:`CONTACT_TRANSACTION_BLOCKS`) sets the
-    register budget.
-
-    Args:
-        max_constraints: Row capacity per world.
-        transaction_blocks: Minimum resident blocks requested at or below 128 rows.
-    """
-    if transaction_blocks not in CONTACT_TRANSACTION_BLOCKS:
-        raise ValueError(f"transaction_blocks must be one of {CONTACT_TRANSACTION_BLOCKS}")
-    return 64, 12 if int(max_constraints) > 128 else int(transaction_blocks)
+REGISTER_BLOCKS = 16
+"""Resident blocks per SM within the sparse sweeps' register budget: 64 registers a thread, the register file's 64K
+over 16 blocks of 64 threads. Every sparse configuration compiles within it without local memory."""
 
 
 SPARSE_ABI = kernel_template.params(
@@ -115,6 +101,16 @@ THREADS = 64
 """Threads per block: ``64 / lanes`` worlds."""
 
 
+def launch_bounds(staging: Staging, device_arch=None) -> tuple[int, int]:
+    """The sparse sweep's launch bounds: 64 threads, and as many resident blocks per SM as its working set's shared
+    memory admits on ``device_arch`` (:func:`.staging.resident_blocks`), at most :data:`REGISTER_BLOCKS`.
+
+    ptxas fits the sweep's registers to that occupancy, so a configuration whose shared memory allows 16 blocks keeps
+    them however many registers its laws hold live, and one that shared memory limits keeps its registers.
+    """
+    return THREADS, min(REGISTER_BLOCKS, resident_blocks(staging.bytes, device_arch))
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------------------------------------------------
@@ -144,7 +140,6 @@ class SparseSweep:
     local: bool
     warm_start: bool
     policy: SolvePolicy
-    launch_bounds: tuple[int, int]
 
     @property
     def groups(self) -> int:
@@ -167,8 +162,7 @@ class SparseSweep:
         suffix = "_active" if self.active else ""
         suffix += "_support_table" if self.table else ""
         suffix += "_contact_triplets" if self.triplets else ""
-        # The minimum resident blocks of the launch bounds tell the single-stage variants apart.
-        suffix += f"_single{self.launch_bounds[1]}" if self.single_stage else ""
+        suffix += "_single" if self.single_stage else ""
         suffix += "_linked" if self.linked else ""
         suffix += "_velocity_limits" if self.velocity_limits else ""
         suffix += "_vacc" if self.accumulated else ""
@@ -196,7 +190,6 @@ def _resolve(
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
-    transaction_blocks: int = 16,
 ) -> SparseSweep:
     """Validate the factory's options and resolve the sweep they configure."""
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
@@ -217,7 +210,6 @@ def _resolve(
         raise ValueError("local factor storage requires a small complete articulated sweep")
     if contact_transaction not in CONTACT_TRANSACTIONS:
         raise ValueError(f"contact_transaction must be one of {CONTACT_TRANSACTIONS}")
-    launch_bounds = contact_transaction_launch_bounds(M, transaction_blocks=transaction_blocks)
     accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits)
     active = bool(active_rows)
     triplets = bool(contact_triplets) and (active or bool(linked_rows)) and bool(use_support_table) and M >= 3
@@ -239,7 +231,6 @@ def _resolve(
         local=bool(local_factors),
         warm_start=bool(warm_start),
         policy=solve_policy,
-        launch_bounds=launch_bounds,
     )
 
 
@@ -423,9 +414,8 @@ def active_violation(sweep: SparseSweep, op: SparseFactor) -> tuple[str, str, st
     of some zero-impulse unilateral row would make a loud change (its violation times ``omega``, as the row's own
     update would), and the largest such change with its row's kind."""
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
-    # A visit would give the row the impulse excess / A_ii: the change of its own velocity is the excess.
-    # A visit would change the row's own velocity by its excess: velocity units on both sides.
-    visit = Change("excess", bound("s_rhs[row]", "fabsf(dot)", "1.0f", "0.0f"), "kind", "1.0f")
+    # A visit would change the row's own velocity by its excess, at a zero impulse: velocity units on both sides.
+    visit = Change("excess", bound("s_rhs[row]", "fabsf(dot)", "0.0f", diagonal="1.0f"), "kind", "1.0f")
     code = f"""float sweep_violation = 0.0f;
 int sweep_violation_kind = -1;
 int sweep_violation_loud = 0;
@@ -533,12 +523,14 @@ def ordinary_rows(
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _triplet_vote(laws: RowLaws, pad: str) -> str:
-    """A triplet's vote under the exit law: the normal's change and the pair's (:func:`_tangent_state`)."""
+def _triplet_vote(laws: RowLaws, pad: str, *, normal_inverse: bool) -> str:
+    """A triplet's vote under the exit law: the normal's change and the pair's (:func:`_tangent_state`), each in its
+    storage's form: the tangents' and (unless ``normal_inverse``, the record's ``1 / W_nn``) the normal's from their
+    staged diagonals."""
     changes = (
-        Change("normal_change", "normal_bound", str(CONTACT), "s_diag[i]"),
-        Change("tangent_change", "tangent_bound", str(FRICTION), "s_diag[tangent]"),
-        Change("sibling_change", "sibling_bound", str(FRICTION), "s_diag[sibling]"),
+        Change("normal_change", "normal_bound", str(CONTACT), "s_diag[i]", scaled=not normal_inverse),
+        Change("tangent_change", "tangent_bound", str(FRICTION), "s_diag[tangent]", scaled=True),
+        Change("sibling_change", "sibling_bound", str(FRICTION), "s_diag[sibling]", scaled=True),
     )
     return change_vote(laws, changes, pad)
 
@@ -578,8 +570,8 @@ def _tangent_state(bounds: tuple[str, str] = ("0.0f", "0.0f")) -> str:
 def _pair_bounds(tangent_dot: str, sibling_dot: str, tangent_rhs: str, sibling_rhs: str) -> tuple[str, str]:
     """The bounds of a triplet's tangent pair from the reduced sums of its residuals, at its old impulses."""
     return (
-        bound(tangent_rhs, f"fabsf({tangent_dot})", "exit_inverse(s_diag[tangent])", "old_tangent"),
-        bound(sibling_rhs, f"fabsf({sibling_dot})", "exit_inverse(s_diag[sibling])", "old_sibling"),
+        bound(tangent_rhs, f"fabsf({tangent_dot})", "old_tangent", diagonal="s_diag[tangent]"),
+        bound(sibling_rhs, f"fabsf({sibling_dot})", "old_sibling", diagonal="s_diag[sibling]"),
     )
 
 
@@ -722,7 +714,7 @@ if (fuse) {{
     SUM(normal_dot);
     const float normal_residual = normal_dot + s_rhs[i];
     const float old_normal = s_impulse[i];
-    const float normal_bound = {bound("s_rhs[i]", "fabsf(normal_dot)", "exit_inverse(s_diag[i])", "old_normal")};
+    const float normal_bound = {bound("s_rhs[i]", "fabsf(normal_dot)", "old_normal", diagonal="s_diag[i]")};
     const float new_normal = ProjectionLaw::unilateral(
         ProjectionLaw::relaxed_step(old_normal, -normal_residual / s_diag[i], omega));
     const float normal_change = new_normal - old_normal;{ring}
@@ -735,7 +727,7 @@ if (fuse) {{
 {normal_move}
 {indent(pair, "    ")}
     if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-{_triplet_vote(laws, "        ")}
+{_triplet_vote(laws, "        ", normal_inverse=False)}
 {write_back}
     }}
     consumed_tangent = tangent;
@@ -877,7 +869,7 @@ if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
         const float normal_residual = normal_dot + normal_rhs;
         const float tangent_residual = tangent_dot + tangent_rhs;
         const float sibling_residual = sibling_dot + sibling_rhs;
-        const float normal_bound = {bound("normal_rhs", "fabsf(normal_dot)", "coupling.w", "old_normal")};
+        const float normal_bound = {bound("normal_rhs", "fabsf(normal_dot)", "old_normal", step="coupling.w")};
         const float new_normal = ProjectionLaw::unilateral(
             ProjectionLaw::relaxed_step(old_normal, -normal_residual * coupling.w, omega));
         const float normal_change = new_normal - old_normal;{ring}
@@ -889,7 +881,7 @@ if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
         if (lane == 0) s_impulse[i] = new_normal;
 {indent(pair, "        ")}
         if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-{_triplet_vote(laws, "            ")}
+{_triplet_vote(laws, "            ", normal_inverse=True)}
 {apply}
         }}
         consumed_tangent = tangent;
@@ -1036,7 +1028,6 @@ def sparse_source(
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
-    transaction_blocks: int = 16,
 ) -> tuple[str, Staging]:
     """The native body of the sparse sweep and its staging."""
     return _source(
@@ -1057,7 +1048,6 @@ def sparse_source(
             velocity_limit_law=velocity_limit_law,
             solve_policy=solve_policy,
             contact_transaction=contact_transaction,
-            transaction_blocks=transaction_blocks,
         )
     )
 
@@ -1081,7 +1071,6 @@ def sparse_kernel(
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     contact_transaction: str = "auto",
-    transaction_blocks: int = 16,
     device_arch=None,
 ) -> wp.Kernel:
     """The sparse sweep kernel.
@@ -1107,7 +1096,6 @@ def sparse_kernel(
         velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
         contact_transaction=contact_transaction,
-        transaction_blocks=transaction_blocks,
     )
     snippet, staging = _source(sweep)
     staging.check("the sparse sweep", arch_budget(device_arch))
@@ -1122,5 +1110,5 @@ def sparse_kernel(
         extra=extra,
         composed=True,
         native_name="sweep_sparse_native",
-        launch_bounds=sweep.launch_bounds if sweep.single_stage else None,
+        launch_bounds=launch_bounds(staging, device_arch),
     ).kernel()

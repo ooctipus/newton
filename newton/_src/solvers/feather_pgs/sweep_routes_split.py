@@ -419,8 +419,8 @@ def contact_units(sweep: LoopSweep, laws: RowLaws) -> tuple[str, str]:
     def unit_change(row: str, kind: int) -> Change:
         # The point unit's rows: their whole residuals r_<row> and old impulses o_<row> are in scope at the vote.
         rhs = rows.rhs(row)
-        unit_bound = bound(rhs, op.terms(f"r_{row}", rhs, whole=True), f"exit_inverse(w_{row})", f"o_{row}")
-        return Change(f"new_{row} - o_{row}", unit_bound, str(kind), f"w_{row}")
+        unit_bound = bound(rhs, op.terms(f"r_{row}", rhs, whole=True), f"o_{row}", diagonal=f"w_{row}")
+        return Change(f"new_{row} - o_{row}", unit_bound, str(kind), f"w_{row}", scaled=True)
 
     point_vote = (
         "if (new_n != o_n || new_t0 != o_t0 || new_t1 != o_t1) {\n"
@@ -432,9 +432,10 @@ def contact_units(sweep: LoopSweep, laws: RowLaws) -> tuple[str, str]:
     # A ring member's residual is folded into the block's right-hand side: the member votes on a zero bound of S_i.
     ring_change = Change(
         "updated - old",
-        bound(rows.rhs("ring_rows[a]"), "0.0f", "exit_inverse(ring_W[a * rows + a])", "old"),
+        bound(rows.rhs("ring_rows[a]"), "0.0f", "old", diagonal="ring_W[a * rows + a]"),
         f"(a < normals ? {CONTACT} : {FRICTION})",
         "ring_W[a * rows + a]",
+        scaled=True,
     )
     ring_vote = indent("if (updated != old) {\n" + change_vote(laws, (ring_change,), "    ") + "\n}", "    ")
     point = f"""const int t0 = n + 1, t1 = n + 2;

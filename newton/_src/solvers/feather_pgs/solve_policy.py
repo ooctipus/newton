@@ -20,12 +20,13 @@ term within ``phi_i`` of the one before, so the floor reads the one before, at h
 A sweep that visits only the rows it selected at entry also requires every unvisited zero-impulse unilateral row's
 would-be change to be quiet.
 
-A vote site computes each row's bound in impulse units, ``tau_i / A_ii`` (:func:`bound`), where its residual is
-reduced, and votes its change against it with one compare (:class:`Change`); a Jacobi step, whose ``phi_i`` is its
-change over its step size ``s_i``, votes against ``tau_i s_i``. An operator that does not form ``S_i`` passes a
-lower bound of it (by default the reduced velocity term, ``|sum_k t_ik| <= sum_k |t_ik|``), which makes the test
-stricter: a quiet vote always certifies ``phi_i <= tau_i``. A :class:`SolvePolicy` names the readout compiled into
-every sweep and keys their kernel caches.
+A vote site computes each row's bound where its residual is reduced (:func:`bound`), in the form its storage gives
+without a division, and votes its change against it with one compare (:class:`Change`): ``phi_i`` against ``tau_i``
+where the row keeps its diagonal ``A_ii``, ``|dlambda_i|`` against ``tau_i / A_ii`` where it keeps ``1 / A_ii``; a
+Jacobi step, whose ``phi_i`` is its change over its step size ``s_i``, votes against ``tau_i s_i``. An operator that
+does not form ``S_i`` passes a lower bound of it (by default the reduced velocity term,
+``|sum_k t_ik| <= sum_k |t_ik|``), which makes the test stricter: a quiet vote always certifies ``phi_i <= tau_i``. A
+:class:`SolvePolicy` names the readout compiled into every sweep and keys their kernel caches.
 
 With ``readout="sweeps"`` each sweep also counts, per world, how many sweeps every solve executed;
 ``readout="trace"`` adds, per solve, the sweep at which each absolute velocity tolerance of :data:`TRACE_GRID` would
@@ -186,30 +187,30 @@ QUIET_LITERAL = f"{QUIET!r}f"
 """:data:`QUIET` as a CUDA ``float`` literal (exact: a power of two)."""
 
 
-_EXIT_LAW = """    // The exit law's inverse of a row's diagonal: a bound's scale, to a few ulps.
-    const auto exit_inverse = [](float diagonal) -> float { return __fdividef(1.0f, diagonal); };"""
+def bound(rhs: str, terms: str, impulse: str, *, step: str | None = None, diagonal: str | None = None) -> str:
+    """The exit law's bound of a row update, in the form the row's storage gives without a division.
 
-EXIT_LAW = DevicePrelude(
-    "exit_law",
-    _EXIT_LAW,
-    _EXIT_LAW.replace("__fdividef(1.0f, diagonal)", "1.0f / diagonal").replace(", to a few ulps", ""),
-)
-"""Device helper of the exit law, which every sweep declares: ``exit_inverse(A)``, the fast reciprocal its bounds
-scale by when a row stores its diagonal rather than its inverse."""
-
-
-def bound(rhs: str, terms: str, step: str, impulse: str) -> str:
-    """The bound ``tau_i step = 2^-20 ((|b_i| + S_i) step + A_ii step |lambda_i|)`` of a row update's impulse change.
+    With ``diagonal`` (a row that keeps ``A_ii``): ``tau_i = 2^-20 (|b_i| + S_i + A_ii |lambda_i|)`` itself, against
+    which the vote reads ``phi_i`` (:attr:`Change.scaled`). With ``step`` (a row that keeps ``1 / A_ii``, or a Jacobi
+    step's ``s_i``): ``tau_i step = 2^-20 ((|b_i| + S_i) step + A_ii step |lambda_i|)``, against which the vote reads
+    the impulse change.
 
     Args:
         rhs: The right-hand side ``b_i`` of the residual the update reads.
         terms: ``S_i``, the magnitude of the terms the residual's velocity sum adds, or a lower bound of it.
-        step: The row's step size: ``1 / A_ii`` for a Gauss-Seidel step (``exit_inverse`` of a stored diagonal), or
-            a Jacobi step's ``s_i``.
-        impulse: The row's impulse before the update times ``A_ii step``: the impulse itself for a Gauss-Seidel
-            step, its share of one for a Jacobi step.
+        impulse: The row's impulse before the update; with ``step``, times ``A_ii step`` (the impulse itself for a
+            Gauss-Seidel step, its share of one for a Jacobi step). ``"0.0f"`` drops the term.
+        step: The row's step size, for a bound in impulse units.
+        diagonal: The row's diagonal ``A_ii``, for a bound in velocity units.
     """
-    return f"{QUIET_LITERAL} * ((fabsf({rhs}) + ({terms})) * ({step}) + fabsf({impulse}))"
+    if (step is None) == (diagonal is None):
+        raise ValueError("a bound takes either the row's step or its diagonal")
+    held = "" if impulse == "0.0f" else impulse
+    if diagonal is not None:
+        own = f" + ({diagonal}) * fabsf({held})" if held else ""
+        return f"{QUIET_LITERAL} * (fabsf({rhs}) + ({terms}){own})"
+    own = f" + fabsf({held})" if held else ""
+    return f"{QUIET_LITERAL} * ((fabsf({rhs}) + ({terms})) * ({step}){own})"
 
 
 @dataclass(frozen=True)
@@ -223,12 +224,13 @@ class Change:
     delta: str
     """The impulse change ``dlambda_i``."""
     bound: str
-    """The row's bound ``tau_i / A_ii`` (:func:`bound`)."""
+    """The row's bound: ``tau_i`` (:attr:`scaled`), else ``tau_i / A_ii`` or a Jacobi step's ``tau_i s_i``."""
     kind: str
     """The row's constraint type (the trace names its change by it)."""
     velocity: str
-    """Converts the impulse change into the row's velocity change for the trace: ``A_ii``, or a Jacobi step's inverse
-    size."""
+    """Converts the impulse change into the row's velocity change: ``A_ii``, or a Jacobi step's inverse size."""
+    scaled: bool = False
+    """Whether the bound is in velocity units (a row that keeps its diagonal), so the vote reads ``phi``."""
 
     @property
     def phi(self) -> str:
@@ -238,7 +240,8 @@ class Change:
     @property
     def loud(self) -> str:
         """Whether the change exceeds its bound."""
-        return f"!(fabsf({self.delta}) <= {self.bound})"
+        change = self.phi if self.scaled else f"fabsf({self.delta})"
+        return f"!({change} <= {self.bound})"
 
 
 def terms_bound(residual: str, rhs: str) -> str:
@@ -289,7 +292,7 @@ class SolvePolicy:
     @property
     def preludes(self) -> tuple[DevicePrelude, ...]:
         """Device preludes the sweep body declares under this policy, after its own."""
-        return (EXIT_LAW, *{"off": (), "sweeps": (SWEEP_READOUT,), "trace": (SWEEP_TRACE,)}[self.readout])
+        return {"off": (), "sweeps": (SWEEP_READOUT,), "trace": (SWEEP_TRACE,)}[self.readout]
 
     @property
     def operands(self) -> dict:
