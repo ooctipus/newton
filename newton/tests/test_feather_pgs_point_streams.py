@@ -82,15 +82,6 @@ _PATCH_ONLY = frozenset(
         "linked_rows=True, use_support_table=True, warm_start=False)",
         "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
-        # The same triplets in the staged transaction (the test pin transaction="staged").
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
-        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
-        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
-        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
-        "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
-        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
         # Paired factor sweeps over patch contact units.
         "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, False, contact_units=True)",
         "sweep_routes_local.paired_factor_kernel(192, 29, 23, 6, '120', False, True, contact_units=True)",
@@ -176,11 +167,6 @@ def _suite_sparse_sweeps():
         ((80, 18, 18), triplets),
     ):
         yield size, {**kwargs, "linked_rows": True}, True
-    # Triplet transactions beside each law's default: point friction's single-stage form and patch friction's
-    # staged one (test pins).
-    for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12), (48, 18, 18), (48, 25, 16), (72, 18, 12), (80, 18, 18)):
-        yield size, {**triplets, "contact_transaction": "single"}, False
-        yield size, {**triplets, "linked_rows": True, "contact_transaction": "staged"}, True
 
 
 def _suite_diagonal_sweeps():
@@ -227,11 +213,6 @@ def _readout_calls():
             {**triplets, "linked_rows": True, **readout},
             True,
         )
-        # Point friction's single-stage opt-in and patch friction's staged one count their sweeps too.
-        single = {**triplets, "contact_transaction": "single", **readout}
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, single, False
-        staged = {**triplets, "linked_rows": True, "contact_transaction": "staged", **readout}
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, staged, True
     factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
     for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
         kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
@@ -356,9 +337,6 @@ def _linked_sweep_calls():
             "linked_rows": True,
         }
         yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
-        # Patch friction's default is the single-stage transaction; pin the staged one beside it.
-        staged = {**kwargs, "contact_transaction": "staged"}
-        yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), staged
 
 
 def _sparse_contact_calls():
@@ -368,7 +346,7 @@ def _sparse_contact_calls():
     for dofs, prepare, table in itertools.product((8, 18), (False, True), (False, True)):
         kwargs = {"prepare_rows": prepare, "use_support_table": table}
         yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
-    # The triplet records of the single-stage transaction, which both laws can select.
+    # The block records of the sparse sweep's contact units, under either law.
     for dofs in (8, 18, 25):
         kwargs = {"prepare_rows": True, "use_support_table": True, "contact_records": True}
         yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
@@ -788,8 +766,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "velocity_limits=True",
             "warm_start=True",
             "linked_rows=True",
-            "contact_transaction='single'",
-            "contact_transaction='staged'",
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))

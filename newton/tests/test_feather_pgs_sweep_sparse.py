@@ -10,7 +10,7 @@ lane stores an impulse or a cached metric only after every lane has read it. The
 
 The configurations are the conformance routes' (``sparse``, ``sparse_triplets``,
 ``sparse_warm_start``, ``sparse_readout``, ``sparse_velocity_limits``, ``sparse_velocity_mimic``), the native
-sparse tasks' under both friction laws, and the transactions, schedules and policies their options select.
+sparse tasks' under both friction laws, and the contact units, schedules and policies their options select.
 """
 
 import itertools
@@ -53,30 +53,21 @@ CONFIGURATIONS = (
     ("sparse_warm_start", 64, 14, 10, {**_ACTIVE, "warm_start": True}, None),
     ("sparse_patch_small_world", 64, 14, 10, {**_TABLE, "lanes_per_world": 16, "linked_rows": True}, None),
     # The native sparse tasks.
-    ("patch_single12", 256, 18, 12, _PATCH, None),
-    ("patch_single16", 48, 18, 18, _PATCH, None),
-    ("point_staged", 112, 18, 12, _TRIPLETS, None),
+    ("patch_units_256", 256, 18, 12, _PATCH, None),
+    ("patch_units_48", 48, 18, 18, _PATCH, None),
+    ("point_units", 112, 18, 12, _TRIPLETS, None),
     ("velocity_limits_16_lanes", 64, 9, 9, {**_LIMITS, "lanes_per_world": 16}, None),
     ("explicit_rows_patch", 128, 43, 18, {"active_rows": True, "linked_rows": True}, None),
     ("explicit_rows_point", 56, 43, 18, {"active_rows": True}, None),
     ("full_sweep_table", 128, 27, 21, _TABLE, None),
     ("small_table_limits", 16, 6, 6, {**_TABLE, **_LIMITS, **_SMALL}, None),
     # Options the recipes select.
-    ("patch_staged", 112, 18, 12, {**_PATCH, "contact_transaction": "staged"}, None),
-    ("point_single", 256, 18, 12, {**_TRIPLETS, "contact_transaction": "single"}, None),
+    ("point_units_256", 256, 18, 12, _TRIPLETS, None),
     ("patch_without_triplets", 256, 18, 12, {**_ACTIVE, "linked_rows": True}, None),
-    ("patch_full_sweep_single", 112, 18, 12, {**_TABLE, "contact_triplets": True, "linked_rows": True}, None),
-    (
-        "patch_full_sweep_staged",
-        112,
-        18,
-        12,
-        {**_TABLE, "contact_triplets": True, "linked_rows": True, "contact_transaction": "staged"},
-        None,
-    ),
+    ("patch_full_sweep_units", 112, 18, 12, {**_TABLE, "contact_triplets": True, "linked_rows": True}, None),
     ("patch_warm_start", 48, 18, 12, {**_PATCH, "warm_start": True}, None),
     # Readouts.
-    ("point_staged_sweeps", 112, 18, 12, _TRIPLETS, {"readout": "sweeps"}),
+    ("point_units_sweeps", 112, 18, 12, _TRIPLETS, {"readout": "sweeps"}),
     ("explicit_rows_trace", 128, 43, 18, {"active_rows": True}, {"readout": "trace"}),
     ("patch_trace", 112, 18, 12, _PATCH, {"readout": "trace"}),
     (
@@ -128,28 +119,25 @@ class TestSparseSweepConfiguration(unittest.TestCase):
     def test_variants_resolve(self):
         """Raise for an invalid combination; otherwise build a composed variant of the declared ABI and dispatch.
 
-        Triplets need the support table and three rows; linked rows take part only in the active scan or a
-        transaction; ``"auto"`` takes the single-stage transaction for linked rows, whose launch bounds follow the
-        capacity.
+        Triplets need the support table and three rows; linked rows take part only in the active scan or a contact
+        unit; every variant states launch bounds of 64 threads.
         """
         grid = itertools.product(
             (False, True),  # active_rows
             (False, True),  # use_support_table
             (False, True),  # contact_triplets
             (False, True),  # linked_rows
-            ("auto", "single", "staged"),  # contact_transaction
             (False, True),  # velocity_limits
             (8, 32),  # lanes_per_world
             (False, True),  # local_factors
         )
         checked = 0
-        for active, table, triplets, linked, transaction, limits, lanes, local in grid:
+        for active, table, triplets, linked, limits, lanes, local in grid:
             options = {
                 "active_rows": active,
                 "use_support_table": table,
                 "contact_triplets": triplets,
                 "linked_rows": linked,
-                "contact_transaction": transaction,
                 "velocity_limits": limits,
                 "lanes_per_world": lanes,
                 "local_factors": local,
@@ -163,12 +151,11 @@ class TestSparseSweepConfiguration(unittest.TestCase):
                 checked += 1
                 _variant(template.name, f"sweep_sparse_{M}_{D}_{S}")
                 self.assertTrue(template.composed)
-                if template.launch_bounds is not None:
-                    self.assertEqual(template.launch_bounds[0], 64)
-        self.assertGreater(checked, 100)
+                self.assertEqual(template.launch_bounds[0], 64)
+        self.assertGreater(checked, 50)
 
     def test_rejects_invalid_options(self):
-        """Reject invalid capacities, lanes, layouts, transactions, laws and free-body rows."""
+        """Reject invalid capacities, lanes, layouts, laws and free-body rows."""
         cases = (
             ((16, 6, 4), {"mf_max_constraints": 1}),
             ((16, 6, 4), {"free_row_dofs": 6}),
@@ -180,7 +167,6 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             ((16, 18, 4), {"lanes_per_world": 16}),
             ((16, 6, 4), {"lanes_per_world": 8, "active_rows": True}),
             ((96, 6, 4), {"local_factors": True}),
-            ((16, 6, 4), {"contact_transaction": "fused"}),
             ((16, 6, 4), {"velocity_limit_law": "clamped"}),
         )
         for args, options in cases:
@@ -199,15 +185,14 @@ class TestSparseSweepConfiguration(unittest.TestCase):
                 self.assertEqual(staging.groups, 64 // options.get("lanes_per_world", 32))
 
     def test_first_lane_stores_after_every_lane_read(self):
-        """Store an impulse or a cached metric from the first lane only after a barrier behind every lane's read.
+        """Store an impulse from the first lane only after a barrier behind every lane's read.
 
-        A row's (and its pair's) impulse, the staged triplet's normal impulse and the metric cache's map entry are
-        stored after a barrier behind every lane's read of them: shuffles order execution, not memory.
+        A row's (and its pair's) impulse and a contact unit's normal impulse are stored after a barrier behind every
+        lane's read of them: shuffles order execution, not memory.
         """
         spans = (
             ("float old_impulse = row_impulse;", "if (lane == 0) s_impulse[i] = new_impulse;"),
             ("const float old_normal = s_impulse[i];", "if (lane == 0) s_impulse[i] = new_normal;"),
-            ("const int cached = id >= 0 ? s_metric_map[id] : -1;", "s_metric_map[id] = static_cast<signed char>"),
         )
         seen = set()
         for label, M, D, S, kwargs, policy in CONFIGURATIONS:
@@ -233,7 +218,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             sys.path.remove(root)
         for label in (
             "sparse_point",
-            "patch_single12",
+            "patch_units_256",
             "sparse_patch_small_world",
             "sparse_velocity_limits_accumulated",
         ):

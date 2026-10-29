@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check ordered contact transactions against physical sparse PGS references."""
+"""Check the sparse sweep's contact units against physical sparse PGS references."""
 
 import functools
 import os
@@ -30,13 +30,11 @@ from newton.tests.test_feather_pgs_sparse_research_admission import _branched_mo
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 CANDIDATE_OPTIONS = {"contact_triplets": True}
-# Both triplet transactions of the paired law: the staged one and the single-stage one.
-TRANSACTIONS = ("staged", "single")
 
 
-def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto"):
-    """Return the sparse sweep of the triplet tests."""
-    options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False):
+    """Return the sparse sweep of the triplet tests: with contact units (``candidate``) or the ordinary one."""
+    options = dict(CANDIDATE_OPTIONS) if candidate else {}
     return sparse_kernel(
         capacity,
         dofs,
@@ -62,7 +60,7 @@ def pair_metric(a, c, d):
 def contact_records(data, *, linked=False):
     """Return the block records the sparse contact builder writes for every contact triplet of ``data``.
 
-    The single-stage transaction reads them; the ring members of a linked sweep are its own.
+    The contact units read them; the ring members of a linked sweep are its own.
     """
     worlds, capacity, _ = data["row_factor"].shape
     dofs = data["reference_factor_delta"].shape[1]
@@ -166,11 +164,11 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iterat
 class DeviceSolve:
     """One ABI adapter shared by synthetic and preserved actual-input tests.
 
-    A single-stage triplet kernel also reads the triplets' block records
+    A kernel with contact units also reads the triplets' block records
     (:func:`contact_records`), which follow the scalar inputs.
     """
 
-    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto"):
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False):
         self.device = wp.get_device(device)
         self.data = data
         self.linked = linked
@@ -183,7 +181,6 @@ class DeviceSolve:
             candidate=candidate,
             active=active,
             linked=linked,
-            transaction=transaction,
         )
         self.records = None
 
@@ -229,8 +226,8 @@ class DeviceSolve:
             self.inputs.append(self.records)
 
     @property
-    def single_stage(self):
-        """Whether the kernel takes the single-stage triplet transaction."""
+    def units(self):
+        """Whether the kernel solves contact units (and reads their records)."""
         return self.records is not None
 
     def rebuild_records(self, data):
@@ -420,7 +417,7 @@ class TestSparseContactTriplets(unittest.TestCase):
     def test_host_admission_and_shared_memory_fallback_cuda(self):
         """Admit compatible triplets and preserve sparse fallback at resource limits."""
         model = _branched_model(4, 3, "cuda:0")
-        # The largest capacity whose staged point transaction fits the device's static budget, and one more row.
+        # The largest capacity whose point contact units fit the device's static budget, and one more row.
         budget = arch_budget(wp.get_device("cuda:0").arch)
         staging = functools.partial(
             sparse_staging,
@@ -429,7 +426,6 @@ class TestSparseContactTriplets(unittest.TestCase):
             active_rows=True,
             use_support_table=True,
             contact_triplets=True,
-            contact_transaction="staged",
         )
         low, high = 192, 1 << 16
         while high - low > 1:
@@ -475,7 +471,7 @@ class TestSparseContactTriplets(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_eight_sweep_physical_reference_cuda(self):
-        """Preserve the ordered physical solve across contact activation and friction cases, in both transactions."""
+        """Preserve the ordered physical solve across contact activation and friction cases."""
         cases = (
             [{"offset": value, "seeded": True} for value in (0, 29, 30, 184)]
             + [
@@ -491,12 +487,12 @@ class TestSparseContactTriplets(unittest.TestCase):
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
             + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
-        for settings, transaction in product(cases, TRANSACTIONS):
-            with self.subTest(settings=settings, transaction=transaction):
+        for settings in cases:
+            with self.subTest(settings=settings):
                 data, physical = fixture(**settings)
                 control = DeviceSolve(data, candidate=False)
-                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
-                self.assertEqual(candidate.single_stage, transaction == "single")
+                candidate = DeviceSolve(data, candidate=True)
+                self.assertTrue(candidate.units)
                 control.launch()
                 candidate.launch()
                 result = candidate.result()
@@ -569,26 +565,21 @@ class TestSparseContactTriplets(unittest.TestCase):
         }
         control = DeviceSolve(data, candidate=False)
         control.launch()
-        for transaction in TRANSACTIONS:
-            with self.subTest(transaction=transaction):
-                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
-                candidate.launch()
-                assert_output(self, data, *candidate.result(), physical=physical, reference=control.result())
+        candidate = DeviceSolve(data, candidate=True)
+        candidate.launch()
+        assert_output(self, data, *candidate.result(), physical=physical, reference=control.result())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_finite_fallback_and_distinct_live_worlds_cuda(self):
-        """Keep legal fallback rows and isolate each world's cached metric, in both transactions."""
-        for mode, transaction in product(
-            (
-                "two_live_slots",
-                "zero_normal_diag",
-                "negative_normal_diag",
-                "tail_normal",
-                "different_normal_support",
-            ),
-            TRANSACTIONS,
+        """Keep legal fallback rows and isolate each world's records."""
+        for mode in (
+            "two_live_slots",
+            "zero_normal_diag",
+            "negative_normal_diag",
+            "tail_normal",
+            "different_normal_support",
         ):
-            with self.subTest(mode=mode, transaction=transaction):
+            with self.subTest(mode=mode):
                 data, _ = fixture(seeded=True)
                 count = int(data["world_constraint_count"][0])
                 # Both warps of block0 must be live and physically different.
@@ -617,22 +608,17 @@ class TestSparseContactTriplets(unittest.TestCase):
                     data["diagonal"][:, 1] = np.sum(data["row_factor"][:, 1] ** 2, axis=1) + 1e-6
                     self.assertTrue(np.all(data["support_row_class"][:, 2:4] == 0))
                 control = DeviceSolve(data, candidate=False)
-                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
+                candidate = DeviceSolve(data, candidate=True)
                 control.launch()
                 candidate.launch()
                 assert_output(self, data, *candidate.result(), reference=control.result())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_graph_empty_regrow_changed_metric_cuda(self):
-        """Reset cached metrics or rewrite records as captured buffers change count, response and CFM."""
-        for transaction in TRANSACTIONS:
-            with self.subTest(transaction=transaction):
-                self._check_graph_empty_regrow(transaction)
-
-    def _check_graph_empty_regrow(self, transaction):
+        """Rewrite records as captured buffers change count, response and CFM."""
         data, _ = fixture(offset=30, seeded=True)
         control = DeviceSolve(data, candidate=False)
-        candidate = DeviceSolve(data, candidate=True, transaction=transaction)
+        candidate = DeviceSolve(data, candidate=True)
         control.launch()
         candidate.launch()
         with wp.ScopedCapture(device=candidate.device) as captured:
@@ -665,20 +651,16 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     """Fuse patch anchor units, pooling their ring loads, in the linked active and full sweeps."""
 
     def test_linked_factory_cpu(self):
-        """Admit ring-linked normals to the transaction in either sweep, and keep point variants unlinked.
-
-        Patch friction takes the single-stage transaction by default; the staged one stays reachable.
-        """
+        """Admit ring-linked normals to contact units in either sweep, and keep point variants unlinked."""
         options = {"use_support_table": True, "contact_triplets": True}
         active = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
         full = sparse_kernel(192, 12, 12, linked_rows=True, **options)
         point = sparse_kernel(192, 12, 12, active_rows=True, **options)
-        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single_linked"))
-        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_single_linked"), full.key)
+        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
+        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_linked"), full.key)
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
-        options["contact_transaction"] = "staged"
-        staged = sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
-        self.assertTrue(staged.key.endswith("_active_support_table_contact_triplets_linked"))
+        for kernel in (active, full, point):
+            self.assertIn("contact_records", kernel.adj.arg_types)
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):
@@ -688,39 +670,38 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_patch_triplet_admission_cpu(self):
         """Fuse patch triplets in the linked active scan or the full sweep; never in packed or free sweeps."""
         cases = (
-            # Probe changes, active rows, velocity limits, support table, fits; admitted, reason.
-            ({}, True, False, True, True, True, "active-row scan"),
-            ({}, False, False, True, True, True, "full ordered sweep"),
-            ({"_sparse_solve_lanes": 16}, False, False, True, True, False, "16-lane"),
-            ({}, False, True, True, True, False, "Velocity-limit"),
-            ({"_has_free_rigid_bodies": True}, False, False, True, True, False, "free-body"),
-            ({}, True, False, False, True, False, "support table"),
-            ({}, True, False, True, False, False, "room for the triplet transaction"),
-            ({"_route_pins": {"contact_units": None}}, True, False, True, True, False, "contact_units=None"),
+            # Probe changes, active rows, velocity limits, support table, lanes, fits; admitted, reason.
+            ({}, True, False, True, 32, True, True, "active-row scan"),
+            ({}, False, False, True, 32, True, True, "full ordered sweep"),
+            ({}, False, False, True, 16, True, False, "16-lane"),
+            ({}, False, True, True, 32, True, False, "Velocity-limit"),
+            ({"_has_free_rigid_bodies": True}, False, False, True, 32, True, False, "free-body"),
+            ({}, True, False, False, 32, True, False, "support table"),
+            ({}, True, False, True, 32, False, False, "room for contact units"),
+            ({"_route_pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
             # Point friction keeps its rule: triplets need the active-row scan.
-            ({"_friction_anchors_enabled": False}, False, False, True, True, False, "active-row scan"),
-            ({"_friction_anchors_enabled": False}, True, False, True, True, True, "point contacts fuse"),
+            ({"_friction_anchors_enabled": False}, False, False, True, 32, True, False, "active-row scan"),
+            ({"_friction_anchors_enabled": False}, True, False, True, 32, True, True, "point contacts fuse"),
         )
-        for changes, active, velocity, table, fits, admitted, phrase in cases:
-            probe = SimpleNamespace(
-                _friction_anchors_enabled=True, _has_free_rigid_bodies=False, _sparse_solve_lanes=32, _route_pins={}
-            )
+        for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
+            probe = SimpleNamespace(_friction_anchors_enabled=True, _has_free_rigid_bodies=False, _route_pins={})
             for name, value in changes.items():
                 setattr(probe, name, value)
-            with self.subTest(changes=changes, active=active, velocity=velocity, table=table, fits=fits):
+            with self.subTest(changes=changes, active=active, velocity=velocity, table=table, lanes=lanes, fits=fits):
                 decision, reason = SolverFeatherPGS._admit_sparse_contact_triplets(
                     probe,
                     active_rows=active,
                     velocity_candidate=velocity,
                     use_support_table=table,
+                    lanes=lanes,
                     fits=lambda fits=fits: fits,
                 )
                 self.assertEqual(decision, admitted)
                 self.assertIn(phrase, reason)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_linked_triplets_equal_linked_sweeps_bitwise_cuda(self):
-        """Match the same linked sweep without triplets bitwise (staged) or to rounding (single), and the reference.
+    def test_linked_triplets_equal_linked_sweeps_cuda(self):
+        """Match the same linked sweep without triplets to rounding, and the reference.
 
         Self-loops, two- and three-member rings, four- and six-member rings loaded only
         through their last member, a four-member loaded ring whose sliding anchors' radii
@@ -730,7 +711,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         seeded impulses, delayed friction and relaxation, in the linked active scan and in
         the full sweep. The six-member rings catch a fused radius, in either sweep, or a
         pair selection that stops after up to five members. The exit law stops both sweeps
-        on the same decisions: each change against the same floor as its ordinary update's.
+        within rounding of each other: each change against the same floor as its ordinary update's.
         """
         settings = (
             {},
@@ -739,25 +720,19 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             {"seeded": True, "delay": 3, "iteration_offset": 4},
             {"seeded": True, "omega": -0.5},
         )
-        for (name, layout), pad, options, active, transaction in product(
-            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), TRANSACTIONS
-        ):
-            with self.subTest(layout=name, pad=pad, active=active, transaction=transaction, **options):
+        for (name, layout), pad, options, active in product(_LINKED_LAYOUTS.items(), (0, 30), settings, (True, False)):
+            with self.subTest(layout=name, pad=pad, active=active, **options):
                 data, physical = linked_fixture(layout, pad=pad, active=active, **options)
                 control = DeviceSolve(data, candidate=False, active=active, linked=True)
-                candidate = DeviceSolve(data, candidate=True, active=active, linked=True, transaction=transaction)
+                candidate = DeviceSolve(data, candidate=True, active=active, linked=True)
                 self.assertIn("_contact_triplets", candidate.kernel.key)
                 self.assertIn("_linked", candidate.kernel.key)
-                self.assertEqual(candidate.single_stage, transaction == "single")
+                self.assertTrue(candidate.units)
                 self.assertNotIn("_contact_triplets", control.kernel.key)
                 control.launch()
                 candidate.launch()
                 delta, impulses = candidate.result()
-                if transaction == "staged":
-                    np.testing.assert_array_equal(delta, control.result()[0])
-                    np.testing.assert_array_equal(impulses, control.result()[1])
-                else:
-                    assert_output(self, data, delta, impulses, reference=control.result())
+                assert_output(self, data, delta, impulses, reference=control.result())
                 # The oracle pools each ring as the ordinary update does; a fused radius
                 # without the ring would leave it.
                 assert_output(self, data, delta, impulses, physical=physical)
@@ -767,9 +742,8 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
         model = _branched_model(4, 3, "cuda:0")
         for pins, suffix in (
-            ({}, "_active_support_table_contact_triplets_single_linked"),
-            ({"transaction": "staged"}, "_active_support_table_contact_triplets_linked"),
-            ({"active_rows": False}, "_18_12_support_table_contact_triplets_single_linked"),
+            ({}, "_active_support_table_contact_triplets_linked"),
+            ({"active_rows": False}, "_18_12_support_table_contact_triplets_linked"),
             ({"contact_units": None}, "_active_support_table_linked"),
             ({"active_rows": False, "contact_units": None}, "_18_12_support_table"),
         ):

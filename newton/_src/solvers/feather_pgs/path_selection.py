@@ -482,10 +482,6 @@ def _sparse_mass_matrix(solver) -> dict:
         "support_table": bool(solver._sparse_row_support.enabled),
         "contact_triplets": bool(solver._sparse_contact_triplets),
         "contact_triplets_reason": solver._sparse_contact_triplets_reason,
-        # The admitted triplets' transaction: "single" (one load group and reduction, per-triplet
-        # records) or "staged" (normal, then tangents, metric cache); None without triplets.
-        "contact_transaction": solver._sparse_contact_transaction,
-        "contact_transaction_reason": solver._sparse_contact_transaction_reason,
     }
     if size is not None:
         record.update(

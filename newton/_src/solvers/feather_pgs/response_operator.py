@@ -2286,13 +2286,12 @@ class SparseFactor(ResponseOperator):
         row: str = "i",
         sibling: str | None = None,
         paired: str = "false",
-        coupling: str | None = None,
     ) -> str:
         """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply`.
 
         With ``sibling``, a ``paired`` row (a first tangent) also reduces ``sibling_jv = Z_sibling . delta`` and
         ``pair_coupling = Z_row . Z_sibling`` in the same ``SUM`` and keeps the sibling's entries for
-        :meth:`apply_pair`; the coupling is summed only under the condition ``coupling`` when one is given.
+        :meth:`apply_pair`.
         """
         count = self.entries
         lines = [f"int indices[{count}];", f"float responses[{count}];"]
@@ -2311,7 +2310,6 @@ class SparseFactor(ResponseOperator):
         else:
             lines += [f"float sibling_responses[{count}];", f"float {out} = 0.0f;"]
             lines += ["float sibling_jv = 0.0f;", "float pair_coupling = 0.0f;"]
-            guard = f"if ({coupling}) " if coupling else ""
             body += [
                 f"const float sibling_value = {paired} && index >= 0",
                 f"    ? {self.element(sibling)} : 0.0f;",
@@ -2322,12 +2320,10 @@ class SparseFactor(ResponseOperator):
                 f"    const float velocity = {self.velocity.at('index')};",
                 f"    {out} += value * velocity;",
                 "    sibling_jv += sibling_value * velocity;",
-                f"    {guard}pair_coupling += value * sibling_value;",
+                "    pair_coupling += value * sibling_value;",
                 "}",
             ]
             reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling")
-            if coupling and self.lanes.parallel:
-                reduce = f"{self.lanes.reduce(out, 'sibling_jv')}\n{guard}{self.lanes.reduce('pair_coupling')}"
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
         return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
 

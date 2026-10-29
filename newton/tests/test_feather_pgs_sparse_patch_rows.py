@@ -38,38 +38,44 @@ def _admission_probe(**changes):
     return probe
 
 
-def _admit(probe, *, velocity=False, lanes=0):
-    return SolverFeatherPGS._admit_sparse_active_rows(probe, velocity_candidate=velocity, small_world_lanes=lanes)
+def _admit(probe, *, velocity=False, lanes=0, fits=True):
+    return SolverFeatherPGS._admit_sparse_active_rows(
+        probe, velocity_candidate=velocity, small_world_lanes=lanes, fits=lambda: fits
+    )
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
     def test_point_admission(self):
-        """Admit point friction's active rows unless velocity-limit rows or a pin keep the full sweep."""
-        for pins, velocity, lanes in (
-            ({}, False, 0),
-            ({}, False, 16),
-            ({"active_rows": False}, False, 0),
-            ({}, True, 0),
+        """Admit point rows at sweep entry unless velocity limits, a pin or the scan's size keep the full sweep."""
+        for pins, velocity, lanes, fits in (
+            ({}, False, 0, True),
+            ({}, False, 16, True),
+            ({"active_rows": False}, False, 0, True),
+            ({}, True, 0, True),
+            ({}, False, 0, False),
         ):
-            expected = not pins and not velocity
-            with self.subTest(pins=pins, velocity=velocity):
+            expected = not pins and not velocity and fits
+            with self.subTest(pins=pins, velocity=velocity, fits=fits):
                 probe = _admission_probe(_route_pins=pins)
-                active, reason = _admit(probe, velocity=velocity, lanes=lanes)
+                active, reason = _admit(probe, velocity=velocity, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 if active:
                     self.assertEqual(reason, "Point-contact normal and limit rows are selected at sweep entry.")
+                elif not pins and not velocity:
+                    self.assertIn("bitsets exceed shared memory", reason)
 
     def test_patch_admission_follows_small_worlds(self):
-        """Select patch rows at sweep entry unless a small world keeps its packed lanes (or a pin the full sweep)."""
-        for pins, lanes, expected, phrase in (
-            ({}, 0, True, "ring"),
-            ({"active_rows": False}, 0, False, "active_rows=False"),
-            ({}, 16, False, "16-lane"),
-            ({}, 8, False, "8-lane"),
+        """Select patch rows at sweep entry unless small worlds, a pin or the scan's working set keep the full sweep."""
+        for pins, lanes, fits, expected, phrase in (
+            ({}, 0, True, True, "ring"),
+            ({"active_rows": False}, 0, True, False, "active_rows=False"),
+            ({}, 16, True, False, "16-lane"),
+            ({}, 8, True, False, "8-lane"),
+            ({}, 0, False, False, "bitsets exceed shared memory"),
         ):
-            with self.subTest(pins=pins, lanes=lanes):
+            with self.subTest(pins=pins, lanes=lanes, fits=fits):
                 probe = _admission_probe(_friction_anchors_enabled=True, _route_pins=pins)
-                active, reason = _admit(probe, lanes=lanes)
+                active, reason = _admit(probe, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
 
@@ -155,11 +161,11 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             records["patch"]["sweep_kernel"].replace("_active", "", 1).replace("_linked", ""),
         )
 
-    def test_patch_keeps_the_sparse_route_when_bitsets_exceed_shared_memory(self):
-        """Keep the full patch sweep, not ordinary factors, when only the row bitsets overflow shared memory.
+    def test_sparse_route_keeps_the_full_sweep_when_bitsets_exceed_shared_memory(self):
+        """Keep the full sweep, not ordinary factors, under either friction law when only the row bitsets overflow.
 
         At the largest row capacity whose 18-DOF full sweep fits the device's static budget, the active
-        scan's bitsets do not: point friction, which sweeps by the scan, loses the sparse route there.
+        scan's bitsets do not: the solver admits the route by the sweep it launches, the full ordered one.
         """
         model = _branched_model(4, 3, "cuda:0")
         budget = arch_budget(wp.get_device("cuda:0").arch)
@@ -175,13 +181,15 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             "enable_joint_velocity_limits": False,
             "dense_max_constraints": low,
         }
-        patch_friction = SolverFeatherPGS(model, **options)
-        point = SolverFeatherPGS(model, friction_anchor_beta=0.0, **options)
-        self.assertEqual(patch_friction._sparse_mass_matrix_size, 18)
-        self.assertFalse(patch_friction._sparse_active_rows)
-        self.assertIn("bitsets exceed shared memory", patch_friction._sparse_active_rows_reason)
-        self.assertIsNone(point._sparse_mass_matrix_size)
-        self.assertIn(str(active.bytes), point._sparse_selection_reason)
+        full = staging(low)
+        for name, law in (("patch", {}), ("point", {"friction_anchor_beta": 0.0})):
+            with self.subTest(law=name):
+                solver = SolverFeatherPGS(model, **law, **options)
+                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertFalse(solver._sparse_active_rows)
+                self.assertIn("bitsets exceed shared memory", solver._sparse_active_rows_reason)
+                self.assertNotIn("_active", solver._pgs_solve_sparse_kernel.key)
+                self.assertIn(f"{full.bytes}/{budget}", solver._sparse_selection_reason)
 
     def test_small_worlds_keep_their_packed_patch_sweep(self):
         """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, with active rows pinned off."""
@@ -202,18 +210,20 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             for value_on, value_off in zip(on, off, strict=True):
                 np.testing.assert_array_equal(value_on, value_off)
 
-    def test_switched_off_patch_sweep_with_fused_triplets_is_bitwise(self):
-        """Step the full patch sweep bitwise whether or not it fuses anchor triplets in the staged form.
+    def test_switched_off_patch_sweep_with_fused_triplets_follows_it(self):
+        """Step the switched-off full patch sweep with fused anchor units as it steps without them, to rounding.
 
-        Pinned off the active-row scan, the full ordered sweep fuses its anchor units by the rule; pinned unfused it
-        runs the ordinary updates. A resting and a sliding biped world must step identically either way under the
-        staged transaction (pinned); the single-stage default rounds differently (test_feather_pgs_sparse_transaction).
+        Pinned off the active-row scan, the full ordered sweep solves its anchors as contact units on their Gram
+        blocks (in exact arithmetic the ordinary updates); pinned unfused it runs the ordinary updates. A resting and
+        a sliding biped world follow each other within the bounds of
+        :meth:`test_patch_history_follows_the_full_sweep`, whose two sweeps also differ by their arithmetic order
+        only.
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
         solvers = {}
         for triplets in ("1", "0"):
-            pins = {"active_rows": False, "transaction": "staged"}
+            pins = {"active_rows": False}
             if triplets == "0":
                 pins["contact_units"] = None
             with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
@@ -223,12 +233,23 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         self.assertRegex(solvers["0"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table$")
         self.assertFalse(solvers["1"]._sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
-        np.testing.assert_array_equal(runs["1"][0], runs["0"][0])
-        np.testing.assert_array_equal(runs["1"][1], runs["0"][1])
-        self.assertTrue(np.any(runs["0"][0][:, 1] < 4), "The sliding world must release anchors")
-        for fused, ordinary in zip(runs["1"][2], runs["0"][2], strict=True):
-            for value_fused, value_ordinary in zip(fused, ordinary, strict=True):
-                np.testing.assert_array_equal(value_fused, value_ordinary)
+        anchors, ordinary_anchors = runs["1"][0], runs["0"][0]
+        self.assertTrue(np.any(ordinary_anchors[:, 1] < 4), "The sliding world must release anchors")
+        np.testing.assert_array_equal(anchors[:, 0], ordinary_anchors[:, 0])
+        mismatched = anchors[:, 1] != ordinary_anchors[:, 1]
+        self.assertLessEqual(int(mismatched.sum()), 18, f"steps with different anchors: {np.flatnonzero(mismatched)}")
+        self.assertLessEqual(np.abs(anchors[:, 1] - ordinary_anchors[:, 1]).max(), 2)
+        states = list(zip(runs["1"][2], runs["0"][2], strict=True))
+        # The units must act on this fixture, or the comparison would prove nothing.
+        self.assertFalse(all(np.array_equal(unit[1], ordinary[1]) for unit, ordinary in states))
+        bodies = model.body_count // model.world_count
+        for world, pose_bound, velocity_bound in ((0, 5.0e-5, 1.0e-2), (1, 5.0e-5, 3.0e-2)):
+            with self.subTest(world=world):
+                body = slice(world * bodies, (world + 1) * bodies)
+                pose_gap = max(np.abs(unit[0][body, :3] - ordinary[0][body, :3]).max() for unit, ordinary in states)
+                velocity_gap = max(np.abs(unit[1][body] - ordinary[1][body]).max() for unit, ordinary in states)
+                self.assertLess(pose_gap, pose_bound)
+                self.assertLess(velocity_gap, velocity_bound)
 
     def test_patch_history_follows_the_full_sweep(self):
         """Keep the anchor-count trajectory of a resting and a sliding world near the full patch sweep's.

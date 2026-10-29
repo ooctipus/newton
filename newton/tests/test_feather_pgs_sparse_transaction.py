@@ -1,22 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the single-stage sparse contact transaction: its block records, its kernels and their twins.
+"""Check the sparse sweep's contact units: their block records, their kernels and their twins.
 
-The transaction applies the paired friction law of the staged transaction, so its CUDA
-twins match the staged sweep and the physical reference to rounding, not bitwise.
+A contact unit solves a normal and its friction pair on their Gram block, in exact arithmetic the ordinary sweep's
+row-by-row updates, so its CUDA twins match the ordinary sweep and the physical reference to rounding, not bitwise.
 """
 
 import re
 import unittest
 from itertools import product
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
@@ -68,13 +68,13 @@ def _resized(data, capacity):
     return resized
 
 
-def _assert_twins(test, data, single, staged, *, rtol=1.0e-5):
-    """Match the staged transaction's velocity delta and live impulses to ``rtol`` of each array's magnitude."""
+def _assert_twins(test, data, unit, ordinary, *, rtol=1.0e-5):
+    """Match the ordinary sweep's velocity delta and live impulses to ``rtol`` of each array's magnitude."""
     counts = data["world_constraint_count"]
-    live = np.arange(staged[1].shape[1])[None] < counts[:, None]
+    live = np.arange(ordinary[1].shape[1])[None] < counts[:, None]
     for name, actual, expected in (
-        ("delta", single[0], staged[0]),
-        ("impulses", single[1][live], staged[1][live]),
+        ("delta", unit[0], ordinary[0]),
+        ("impulses", unit[1][live], ordinary[1][live]),
     ):
         test.assertTrue(np.isfinite(actual).all(), name)
         magnitude = float(np.max(np.abs(expected), initial=0.0))
@@ -270,142 +270,94 @@ class TestContactRecordBuilder(unittest.TestCase):
         self.assertTrue(kernel.key.endswith("_prepared_support_table_contact_records"))
 
 
-class TestSingleStageTransaction(unittest.TestCase):
-    """The single-stage transaction's factory, sweep body, request and route record."""
+class TestContactUnits(unittest.TestCase):
+    """The sparse sweep's contact units: factory, sweep body and route record."""
 
-    def test_factory_resolves_the_law_default_and_launch_bounds_cpu(self):
-        """Take the single-stage transaction for linked rows by default, with per-shape launch bounds and records.
-
-        Point friction keeps the staged transaction unless asked; either law reaches either form.
-        """
+    def test_factory_reads_records_and_states_launch_bounds_cpu(self):
+        """Solve fused triplets as contact units from their records under either law, with per-shape launch bounds."""
         for capacity in (256, 192, 128, 96, 48):
             with self.subTest(capacity=capacity):
-                kernels = {
-                    (law, transaction): sparse_kernel(
-                        capacity,
-                        18,
-                        12,
-                        linked_rows=law == "patch",
-                        contact_transaction=transaction,
-                        **TRIPLETS,
-                    )
-                    for law, transaction in product(("patch", "point"), ("auto", "single", "staged"))
-                }
-                for (law, transaction), kernel in kernels.items():
-                    single = transaction == "single" or (transaction == "auto" and law == "patch")
+                for law in ("patch", "point"):
+                    kernel = sparse_kernel(capacity, 18, 12, linked_rows=law == "patch", **TRIPLETS)
                     linked = "_linked" if law == "patch" else ""
-                    suffix = f"_contact_triplets_single{linked}" if single else f"_contact_triplets{linked}"
-                    self.assertTrue(kernel.key.endswith(suffix), kernel.key)
-                    # Either transaction states the occupancy its shared memory admits, at most the register
-                    # budget's 16 blocks.
+                    self.assertTrue(kernel.key.endswith(f"_contact_triplets{linked}"), kernel.key)
+                    # The occupancy its shared memory admits, at most the register budget's 16 blocks.
                     threads, blocks = kernel.options["launch_bounds"]
                     self.assertEqual(threads, 64)
                     self.assertLessEqual(blocks, 16)
                     self.assertEqual(blocks == 16, capacity <= 128, (capacity, blocks))
+                    # The records follow the scalar inputs, before the outputs.
                     names = list(kernel.adj.arg_types)
-                    self.assertEqual("contact_records" in names, single)
-                    if single:
-                        # The records follow the scalar inputs, before the outputs.
-                        self.assertEqual(names[names.index("iteration_offset") + 1], "contact_records")
-                self.assertIs(kernels[("patch", "auto")], kernels[("patch", "auto")])
-        with self.assertRaises(ValueError):
-            sparse_kernel(64, 18, 12, **TRIPLETS, contact_transaction="fused")
+                    self.assertEqual(names[names.index("iteration_offset") + 1], "contact_records")
+        with self.assertRaises(TypeError):
+            sparse_kernel(64, 18, 12, **TRIPLETS, contact_transaction="single")
 
-    def test_single_stage_sweep_reduces_once_from_records_cpu(self):
-        """Reduce three residuals once from the record, without the staged metric cache, its capacity or walk.
+    def test_contact_unit_reduces_once_from_records_cpu(self):
+        """Reduce a unit's three residuals once, its pair's moved through the record's couplings; no metric cache.
 
-        The staged sweep keeps its cache, its map and its second reduction; only rings of
-        more than four members walk their parents on a visit. Lane 0 writes the impulses
-        every lane read only after a warp barrier.
+        Only rings of more than four members walk their parents on a visit. Lane 0 writes the
+        impulses every lane read only after a warp barrier.
         """
         for linked in (False, True):
             with self.subTest(linked=linked):
-                single = _snippet(
-                    sparse_kernel(256, 18, 12, linked_rows=linked, contact_transaction="single", **TRIPLETS)
-                )
-                staged = _snippet(
-                    sparse_kernel(256, 18, 12, linked_rows=linked, contact_transaction="staged", **TRIPLETS)
-                )
-                for text in (
-                    "metric_map",
-                    "metric_count",
-                    "friction_pair_cached(",
-                    "contact_metric_slot(",
-                ):
-                    self.assertIn(text, staged)
-                    self.assertNotIn(text, single)
+                snippet = _snippet(sparse_kernel(256, 18, 12, linked_rows=linked, **TRIPLETS))
+                for text in ("metric_map", "metric_count", "friction_pair_cached(", "contact_metric_slot("):
+                    self.assertNotIn(text, snippet)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked
-                self.assertRegex(single, rf"(normal|i) / 3\) \* {width}")
-                start = single.index("const int tangent_parent = world_row_parent.data[offset + tangent];")
-                transaction = single[start : single.index("consumed_tangent = tangent;", start)]
+                self.assertRegex(snippet, rf"(normal|i) / 3\) \* {width}")
+                start = snippet.index("const int tangent_parent = world_row_parent.data[offset + tangent];")
+                unit = snippet[start : snippet.index("consumed_tangent = tangent;", start)]
                 # One reduction of the three residuals together, and no other.
-                self.assertEqual(transaction.count("SUM("), 1)
-                self.assertIn("SUM(normal_dot, tangent_dot, sibling_dot);", transaction)
-                self.assertNotIn("__shfl", transaction)
-                self.assertIn("ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,", transaction)
-                self.assertIn("wp::vec2(tangent_residual + coupling.x * normal_change,", transaction)
-                self.assertIn("normal_residual * coupling.w", transaction)
-                self.assertEqual("normal_parent < 0" in transaction, not linked)
+                self.assertEqual(unit.count("SUM("), 1)
+                self.assertIn("SUM(normal_dot, tangent_dot, sibling_dot);", unit)
+                self.assertNotIn("__shfl", unit)
+                self.assertIn("ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,", unit)
+                self.assertIn("wp::vec2(tangent_residual + coupling.x * normal_change,", unit)
+                self.assertIn("normal_residual * coupling.w", unit)
+                self.assertEqual("normal_parent < 0" in unit, not linked)
                 # Linked visits pool listed members and walk only rings longer than four members.
-                self.assertEqual("ring.w >= 0" in transaction, linked)
-                self.assertEqual("make_int4(first, second, third, others)" in single, linked)
-                self.assertEqual(transaction.count("RING_LOAD("), int(linked))
+                self.assertEqual("ring.w >= 0" in unit, linked)
+                self.assertEqual("make_int4(first, second, third, others)" in snippet, linked)
+                self.assertEqual(unit.count("RING_LOAD("), int(linked))
                 # Every lane reads the visit's impulses with its rows, before the reduction, and a
                 # warp barrier orders all reads before lane 0's first write: shuffles order
                 # execution, not memory.
-                self.assertIn("SYNC();", transaction)
-                reduction = transaction.index("SUM(")
-                barrier = transaction.index("SYNC();")
-                self.assertLess(transaction.index("old_tangent = s_impulse[tangent]"), reduction)
-                self.assertLess(transaction.index("old_normal = s_impulse[i]"), reduction)
-                self.assertLess(barrier, transaction.index("if (lane == 0) s_impulse[i] = new_normal;"))
-                self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", transaction[barrier:]), [])
+                self.assertIn("SYNC();", unit)
+                reduction = unit.index("SUM(")
+                barrier = unit.index("SYNC();")
+                self.assertLess(unit.index("old_tangent = s_impulse[tangent]"), reduction)
+                self.assertLess(unit.index("old_normal = s_impulse[i]"), reduction)
+                self.assertLess(barrier, unit.index("if (lane == 0) s_impulse[i] = new_normal;"))
+                self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", unit[barrier:]), [])
 
-    def test_request_follows_the_law_cpu(self):
-        """Give patch friction the single-stage transaction and point friction the staged one, unless a pin says."""
-        for pins, patch, expected, phrase in (
-            ({}, True, "single", "Patch friction"),
-            ({}, False, "staged", "Point friction"),
-            ({"transaction": "staged"}, True, "staged", "test pin"),
-            ({"transaction": "single"}, False, "single", "test pin"),
-        ):
-            with self.subTest(pins=pins, patch=patch):
-                probe = SimpleNamespace(_friction_anchors_enabled=patch, _route_pins=pins)
-                transaction, reason = SolverFeatherPGS._request_sparse_contact_transaction(probe)
-                self.assertEqual(transaction, expected)
-                self.assertIn(phrase, reason)
-        with self.assertRaisesRegex(ValueError, "transaction pin"):
-            SolverFeatherPGS._request_sparse_contact_transaction(
-                SimpleNamespace(_friction_anchors_enabled=True, _route_pins={"transaction": "fused"})
-            )
-
-    def test_route_record_names_no_transaction_without_sparse_factors_cpu(self):
-        """Record the transaction fields of the sparse route even where the route is not selected."""
+    def test_route_record_names_no_transaction_cpu(self):
+        """Record the sparse route without a transaction field or switch: contact units are the one law."""
         solver = SolverFeatherPGS(_cpu_model())
         record = solver.get_path_selection()["routes"]["sparse_mass_matrix"]
-        self.assertIsNone(record["contact_transaction"])
+        self.assertNotIn("contact_transaction", record)
         self.assertNotIn("launch_bounds", record)
-        self.assertEqual(record["contact_transaction_reason"], "Native sparse factors are not selected.")
+        self.assertNotIn("FEATHER_PGS_SPARSE_TRANSACTION", environment_flags.FLAGS)
+        self.assertNotIn("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", environment_flags.FLAGS)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "The sparse sweep requires CUDA")
-class TestSingleStageTwins(unittest.TestCase):
-    """CUDA twins of the single-stage transaction: the staged sweep and the physical reference, to rounding."""
+class TestContactUnitTwins(unittest.TestCase):
+    """CUDA twins of the contact units: the ordinary sweep (the same law, row by row) and the physical reference, to
+    rounding."""
 
     def _twins(self, data, *, linked=False, active=True):
-        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve."""
-        options = {"candidate": True, "active": active, "linked": linked}
-        single = triplets.DeviceSolve(data, transaction="single", **options)
-        staged = triplets.DeviceSolve(data, transaction="staged", **options)
-        self.assertTrue(single.single_stage)
-        self.assertFalse(staged.single_stage)
-        self.assertIn("_single", single.kernel.key)
-        single.launch()
-        staged.launch()
-        return single.result(), staged.result(), single
+        """Launch the sweep with contact units and the ordinary one on ``data``; return both results and the unit
+        solve."""
+        unit = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked)
+        ordinary = triplets.DeviceSolve(data, candidate=False, active=active, linked=linked)
+        self.assertTrue(unit.units)
+        self.assertFalse(ordinary.units)
+        unit.launch()
+        ordinary.launch()
+        return unit.result(), ordinary.result(), unit
 
-    def test_point_triplets_match_staged_and_reference_cuda(self):
-        """Solve the point-law fixtures as the staged transaction and the physical reference do, at every bound."""
+    def test_point_units_match_ordinary_and_reference_cuda(self):
+        """Solve the point-law fixtures as the ordinary sweep and the physical reference do, at every bound."""
         cases = (
             [{"offset": value, "seeded": True} for value in (0, 29, 30)]
             + [{"activity": value} for value in ("late_activation", "deferred_activation", "seeded_retraction")]
@@ -416,9 +368,9 @@ class TestSingleStageTwins(unittest.TestCase):
             with self.subTest(capacity=capacity, **settings):
                 data, physical = triplets.fixture(**settings)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data)
-                _assert_twins(self, data, single, staged)
-                triplets.assert_output(self, data, *single, physical=physical)
+                unit, ordinary, _ = self._twins(data)
+                _assert_twins(self, data, unit, ordinary)
+                triplets.assert_output(self, data, *unit, physical=physical)
 
     def test_near_singular_tangents_match_the_reference_cuda(self):
         """Solve a nearly rank-one tangent block to the reference tolerance; rounding is amplified there."""
@@ -426,10 +378,10 @@ class TestSingleStageTwins(unittest.TestCase):
         for capacity in CAPACITIES:
             with self.subTest(capacity=capacity):
                 resized = _resized(data, capacity)
-                single, staged, _ = self._twins(resized)
-                triplets.assert_output(self, resized, *single, physical=physical, reference=staged)
+                unit, ordinary, _ = self._twins(resized)
+                triplets.assert_output(self, resized, *unit, physical=physical, reference=ordinary)
 
-    def test_patch_rings_match_staged_and_reference_cuda(self):
+    def test_patch_rings_match_ordinary_and_reference_cuda(self):
         """Pool rings of one to six members, listed or walked, in the linked active scan and the full sweep."""
         settings = ({}, {"seeded": True, "omega": 0.7}, {"seeded": True, "delay": 3, "iteration_offset": 1})
         for (name, layout), pad, options, active, capacity in product(
@@ -438,9 +390,9 @@ class TestSingleStageTwins(unittest.TestCase):
             with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, **options):
                 data, physical = triplets.linked_fixture(layout, pad=pad, active=active, **options)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data, linked=True, active=active)
-                _assert_twins(self, data, single, staged)
-                triplets.assert_output(self, data, *single, physical=physical)
+                unit, ordinary, _ = self._twins(data, linked=True, active=active)
+                _assert_twins(self, data, unit, ordinary)
+                triplets.assert_output(self, data, *unit, physical=physical)
 
     def test_ring_members_follow_the_pooling_walk_cuda(self):
         """List up to three other members of each anchor's ring in walk order, and mark longer rings to walk.
@@ -460,9 +412,9 @@ class TestSingleStageTwins(unittest.TestCase):
                 with self.subTest(layout=name, capacity=capacity, active=active):
                     data, physical = triplets.linked_fixture(triplets._LINKED_LAYOUTS[name], pad=30, active=active)
                     data = _resized(data, capacity)
-                    single, staged, solve = self._twins(data, linked=True, active=active)
-                    _assert_twins(self, data, single, staged)
-                    triplets.assert_output(self, data, *single, physical=physical)
+                    unit, ordinary, solve = self._twins(data, linked=True, active=active)
+                    _assert_twins(self, data, unit, ordinary)
+                    triplets.assert_output(self, data, *unit, physical=physical)
                     rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
                     for world, count in enumerate(data["world_constraint_count"]):
                         kinds, parents = data["row_type"][world], data["row_parent"][world]
@@ -475,8 +427,8 @@ class TestSingleStageTwins(unittest.TestCase):
                             self.assertEqual(int(ring[3]), listed)
                             self.assertEqual(list(ring[: max(listed, 0)]), members[: max(listed, 0)])
 
-    def test_more_triplets_than_the_staged_cache_cuda(self):
-        """Solve 17 loaded triplets in one world, beyond the staged cache's 12, from their records."""
+    def test_seventeen_loaded_triplets_cuda(self):
+        """Solve 17 loaded triplets in one world from their records."""
         pairs = 17
         dofs = pairs * 3
         indices = np.arange(dofs, dtype=np.int32).reshape(pairs, 3)
@@ -529,12 +481,12 @@ class TestSingleStageTwins(unittest.TestCase):
                     "iteration_offset": np.array(0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
-                single, staged, _ = self._twins(data)
-                _assert_twins(self, data, single, staged)
-                triplets.assert_output(self, data, *single, physical=physical)
+                unit, ordinary, _ = self._twins(data)
+                _assert_twins(self, data, unit, ordinary)
+                triplets.assert_output(self, data, *unit, physical=physical)
 
-    def test_more_linked_anchors_than_the_staged_cache_cuda(self):
-        """Pool 17 loaded anchors of self-loop and two-member rings in one world, beyond the staged cache's 12.
+    def test_seventeen_linked_anchors_cuda(self):
+        """Pool 17 loaded anchors of self-loop and two-member rings in one world.
 
         Each ring owns its coordinates, so its anchor's block couples the normal and the tangents
         while rings stay independent. Odd anchors share their ring with a second loaded normal on
@@ -637,9 +589,9 @@ class TestSingleStageTwins(unittest.TestCase):
                     "iteration_offset": np.array(0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
-                single, staged, solve = self._twins(data, linked=True, active=active)
-                _assert_twins(self, data, single, staged)
-                triplets.assert_output(self, data, *single, physical=oracle[active])
+                unit, ordinary, solve = self._twins(data, linked=True, active=active)
+                _assert_twins(self, data, unit, ordinary)
+                triplets.assert_output(self, data, *unit, physical=oracle[active])
                 rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
                 for row in anchor_rows:
                     members = _ring_members(parents, row)
@@ -647,13 +599,13 @@ class TestSingleStageTwins(unittest.TestCase):
                     self.assertEqual(int(rings[0, row // 3, 3]), len(members))
 
     def test_fused_visits_step_the_normal_with_the_record_cuda(self):
-        """Step a fused normal with its record's ``1/W_nn``: zeroed, it holds the normal where staged moves it.
+        """Step a fused normal with its record's ``1/W_nn``: zeroed, it holds the normal the ordinary sweep moves.
 
-        A triplet the single-stage guards decline takes the ordinary update, whose sweep equals
-        the staged one bit for bit, so matching the staged twin cannot show that the fused branch
-        ran. Zeroing ``1/W_nn`` in the record of one loaded triplet holds that normal at its initial
-        impulse through every sweep, which only the fused branch can do, for point triplets and
-        linked anchors in the active scan and the full sweep.
+        A triplet the unit's guards decline takes the ordinary update, so matching the ordinary twin
+        to rounding cannot show that the fused branch ran. Zeroing ``1/W_nn`` in the record of one
+        loaded triplet holds that normal at its initial impulse through every sweep, which only the
+        fused branch can do, for point triplets and linked anchors in the active scan and the full
+        sweep.
         """
         fixtures = [("point", True, triplets.fixture(offset=30, seeded=True)[0])]
         for active in (True, False):
@@ -663,11 +615,10 @@ class TestSingleStageTwins(unittest.TestCase):
             with self.subTest(law=law, active=active, capacity=capacity):
                 data = _resized(fixture, capacity)
                 linked = law == "patch"
-                options = {"candidate": True, "active": active, "linked": linked}
-                staged = triplets.DeviceSolve(data, transaction="staged", **options)
-                staged.launch()
+                ordinary = triplets.DeviceSolve(data, candidate=False, active=active, linked=linked)
+                ordinary.launch()
                 initial = data["initial_impulses"]
-                moved = np.abs(staged.result()[1] - initial)
+                moved = np.abs(ordinary.result()[1] - initial)
                 kinds, parents = data["row_type"][0], data["row_parent"][0]
                 loaded = [
                     row
@@ -678,60 +629,60 @@ class TestSingleStageTwins(unittest.TestCase):
                 ]
                 self.assertTrue(loaded)
                 row = loaded[0]
-                single = triplets.DeviceSolve(data, transaction="single", **options)
-                records = single.records.numpy()
+                unit = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked)
+                records = unit.records.numpy()
                 records[:, row // 3, 3] = 0.0
-                single.records.assign(records)
-                single.launch()
-                impulses = single.result()[1]
+                unit.records.assign(records)
+                unit.launch()
+                impulses = unit.result()[1]
                 live = np.flatnonzero(data["world_constraint_count"])
                 np.testing.assert_array_equal(impulses[live, row], initial[live, row])
                 self.assertTrue(np.all(moved[live, row] > 1.0e-3))
 
-    def test_solver_steps_match_the_staged_transaction_cuda(self):
-        """Build records in the contact builder and step with them as the staged transaction steps, both laws.
+    def test_solver_steps_match_the_ordinary_sweep_cuda(self):
+        """Build records in the contact builder and step with them as the ordinary sweep steps, both laws.
 
-        One solve from the same state matches the staged sweep's impulses to rounding, through
+        One solve from the same state matches the ordinary sweep's impulses to rounding, through
         the builder's records; a resting and a sliding biped then keep the same trajectory,
         within bounds that leave room for rounding to grow through contact switches. The first
-        solve must also differ from the staged one in some bit: the ordinary updates of declined
-        triplets equal the staged sweep's, so a bitwise match would mean nothing was fused.
+        solve must also differ from the ordinary one in some bit: a bitwise match would mean
+        nothing was fused.
         """
         model = standing_model("cuda:0", worlds=2)
         for law in ("patch", "point"):
             solvers = {}
-            for transaction in ("single", "staged"):
+            for fused in ("1", "0"):
                 options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
                 if law == "point":
                     options["friction_anchor_beta"] = 0.0
-                with mock.patch.dict(SolverFeatherPGS._route_pins, {"transaction": transaction}):
-                    solvers[transaction] = _make_solver(model, True, **options)
+                pins = {} if fused == "1" else {"contact_units": None}
+                with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
+                    solvers[fused] = _make_solver(model, True, **options)
             with self.subTest(law=law):
-                single, staged = solvers["single"], solvers["staged"]
-                self.assertEqual(single._sparse_contact_transaction, "single")
-                self.assertEqual(staged._sparse_contact_transaction, "staged")
-                self.assertIn("_contact_triplets_single", single._pgs_solve_sparse_kernel.key)
-                self.assertIn("_contact_records", single._sparse_contact_response_kernel.key)
-                self.assertNotIn("_contact_records", staged._sparse_contact_response_kernel.key)
+                unit, ordinary = solvers["1"], solvers["0"]
+                self.assertIn("_contact_triplets", unit._pgs_solve_sparse_kernel.key)
+                self.assertNotIn("_contact_triplets", ordinary._pgs_solve_sparse_kernel.key)
+                self.assertIn("_contact_records", unit._sparse_contact_response_kernel.key)
+                self.assertNotIn("_contact_records", ordinary._sparse_contact_response_kernel.key)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
-                self.assertEqual(single._sparse_contact_records.shape, (model.world_count, 32, width))
-                self.assertIsNone(staged._sparse_contact_records)
-                record = single.get_path_selection()["routes"]["sparse_mass_matrix"]
-                self.assertEqual(record["contact_transaction"], "single")
+                self.assertEqual(unit._sparse_contact_records.shape, (model.world_count, 32, width))
+                self.assertIsNone(ordinary._sparse_contact_records)
+                record = unit.get_path_selection()["routes"]["sparse_mass_matrix"]
+                self.assertNotIn("contact_transaction", record)
                 self.assertEqual(record["launch_bounds"], [64, 16])
                 trajectories = {name: self._rollout(solver, model) for name, solver in solvers.items()}
                 # Each step holds (first solve's impulses, body_q, body_qd).
-                first_single, first_staged = trajectories["single"][0][0], trajectories["staged"][0][0]
-                magnitude = float(np.max(np.abs(first_staged)))
+                first_unit, first_ordinary = trajectories["1"][0][0], trajectories["0"][0][0]
+                magnitude = float(np.max(np.abs(first_ordinary)))
                 self.assertGreater(magnitude, 0.0)
-                np.testing.assert_allclose(first_single, first_staged, rtol=1e-4, atol=1e-4 * magnitude)
-                self.assertFalse(np.array_equal(first_single, first_staged))
-                for (_, q_single, qd_single), (_, q_staged, qd_staged) in zip(
-                    trajectories["single"][1:], trajectories["staged"][1:], strict=True
+                np.testing.assert_allclose(first_unit, first_ordinary, rtol=1e-4, atol=1e-4 * magnitude)
+                self.assertFalse(np.array_equal(first_unit, first_ordinary))
+                for (_, q_unit, qd_unit), (_, q_ordinary, qd_ordinary) in zip(
+                    trajectories["1"][1:], trajectories["0"][1:], strict=True
                 ):
-                    self.assertTrue(np.isfinite(q_single).all() and np.isfinite(qd_single).all())
-                    np.testing.assert_allclose(q_single, q_staged, atol=1e-3)
-                    np.testing.assert_allclose(qd_single, qd_staged, atol=5e-2)
+                    self.assertTrue(np.isfinite(q_unit).all() and np.isfinite(qd_unit).all())
+                    np.testing.assert_allclose(q_unit, q_ordinary, atol=1e-3)
+                    np.testing.assert_allclose(qd_unit, qd_ordinary, atol=5e-2)
 
     @staticmethod
     def _rollout(solver, model, *, steps=20, dt=1.0 / 400.0):

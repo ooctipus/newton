@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -247,7 +248,7 @@ from .sparse_mass_matrix import (
 )
 from .staging import arch_budget, factor_budget
 from .step_plan import StepPlan, first_failed
-from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES, CONTACT_TRANSACTIONS
+from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .tree_passes import (
     SERIAL_BLOCK_DIM,
     DynamicsData,
@@ -3592,9 +3593,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_active_rows = False
         self._sparse_active_rows_reason = "Native sparse factors are not selected."
         self._sparse_contact_triplets_reason = "Native sparse factors are not selected."
-        # The admitted triplets' transaction ("single" or "staged") and its records.
-        self._sparse_contact_transaction = None
-        self._sparse_contact_transaction_reason = "Native sparse factors are not selected."
+        # The admitted contact units' block records.
         self._sparse_contact_records = None
         self._sparse_max_row_support = None
         if self._route_pins.get("placement") == "general":
@@ -3720,7 +3719,8 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_selection_reason = "Topology has no responsive row support."
             return
         # The sweep's shared working set (sweep_routes_sparse.sparse_staging) against the device's static budget:
-        # every shared-memory choice below reads both, and the sweep's factory checks the same.
+        # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
+        # set of the sweep it launches, which the sweep's factory checks the same way.
         budget = arch_budget(model.device.arch)
         staging = functools.partial(
             sweep_routes_sparse.sparse_staging,
@@ -3736,18 +3736,59 @@ class SolverFeatherPGS(SolverBase):
         active_rows, active_rows_reason = self._admit_sparse_active_rows(
             velocity_candidate=velocity_candidate,
             small_world_lanes=small_world_lanes,
+            fits=lambda: staging(active_rows=True).fits(budget),
         )
-        solve = staging()
-        if active_rows:
-            active = staging(active_rows=True)
-            if self._friction_anchors_enabled and not active.fits(budget):
-                # Patch friction admitted this route before it adopted the scan; keep it.
-                active_rows = False
-                active_rows_reason = (
-                    "Patch friction keeps the full ordered sweep: the row bitsets exceed shared memory."
+        shape = (self.world_count, self.dense_max_constraints, max_support)
+        offsets = self.articulation_world_dof_offset.numpy()
+        support_classes = None
+        if (
+            self._route_pins.get("row_support", True)
+            and not self._mimic_count
+            and np.all(articulated_counts == 1)
+            and size == self.max_world_dofs
+            and np.all(offsets[articulated] == 0)
+        ):
+            classes = tree.support_classes(body_masks, max_support)
+            if classes is not None:
+                table_bytes = sum(
+                    getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
                 )
-            else:
-                solve = active
+                table_bytes += 4 * self.world_count * self.dense_max_constraints
+                # Small batches with many support patterns can favor direct indices.
+                if table_bytes < 4 * int(np.prod(shape)):
+                    support_classes = classes
+        # Unsupported mixed worlds retain explicit row indices and their existing kernels.
+        use_support_table = support_classes is not None
+        # Reuse the local solver's small-world packing without changing this
+        # owner's row representation, sweep policy or velocity-limit phase.
+        lanes = small_world_lanes if small_world_lanes and not active_rows else 32
+        triplet_capacity = self.dense_max_constraints // 3
+        contact_triplets, contact_triplets_reason = self._admit_sparse_contact_triplets(
+            active_rows=active_rows,
+            velocity_candidate=velocity_candidate,
+            use_support_table=use_support_table,
+            lanes=lanes,
+            fits=lambda: (
+                triplet_capacity > 0
+                and staging(active_rows=active_rows, use_support_table=use_support_table, contact_triplets=True).fits(
+                    budget
+                )
+            ),
+        )
+        # Large resident workspaces regressed whole-step timing in measured
+        # small systems. Keep the global-row consumer when the cache is large.
+        local_factors = bool(
+            lanes < 32
+            and staging(lanes_per_world=lanes, local_factors=True).bytes <= min(budget, _SPARSE_LOCAL_WORKSPACE_BYTES)
+        )
+        sweep = {
+            "active_rows": active_rows,
+            "use_support_table": use_support_table,
+            "contact_triplets": contact_triplets,
+            "lanes_per_world": lanes,
+            "local_factors": local_factors,
+        }
+        solve = staging(**sweep)
         if not solve.fits(budget):
             self._sparse_selection_reason = (
                 f"Row capacity needs {solve.bytes} bytes of shared memory for sparse solving; limit is {budget}."
@@ -3773,6 +3814,10 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_size = size
         self._sparse_active_rows = active_rows
         self._sparse_active_rows_reason = active_rows_reason
+        self._sparse_contact_triplets = contact_triplets
+        self._sparse_contact_triplets_reason = contact_triplets_reason
+        self._sparse_solve_lanes = lanes
+        self._sparse_local_factors = local_factors
         self._sparse_max_row_support = int(max_support)
         self._sparse_velocity_limits = velocity_candidate
         # The sparse response kernel prepares the contact rows' metadata, CFM, bias and restitution.
@@ -3785,62 +3830,17 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_mass_matrix_indices = factor_indices(plan, model.device)
         self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         self._arrays.allocate(SPARSE_FACTOR, group=self.n_arts_by_size[size], nonzero=plan.nonzero_count)
-        shape = (self.world_count, self.dense_max_constraints, max_support)
-        offsets = self.articulation_world_dof_offset.numpy()
-        if (
-            self._route_pins.get("row_support", True)
-            and not self._mimic_count
-            and np.all(articulated_counts == 1)
-            and size == self.max_world_dofs
-            and np.all(offsets[articulated] == 0)
-        ):
-            classes = tree.support_classes(body_masks, max_support)
-            if classes is not None:
-                table_bytes = sum(
-                    getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
-                )
-                table_bytes += 4 * self.world_count * self.dense_max_constraints
-                # Small batches with many support patterns can favor direct indices.
-                if table_bytes < 4 * int(np.prod(shape)):
-                    self._sparse_row_support = row_supports(
-                        classes, self.world_count, self.dense_max_constraints, model.device
-                    )
-        # Unsupported mixed worlds retain explicit row indices and their existing kernels.
-        use_support_table = bool(self._sparse_row_support.enabled)
-        # Reuse the local solver's small-world packing without changing this
-        # owner's row representation, sweep policy or velocity-limit phase.
-        self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
-        triplet_capacity = self.dense_max_constraints // 3
-        transaction, transaction_reason = self._request_sparse_contact_transaction()
-        self._sparse_contact_triplets, self._sparse_contact_triplets_reason = self._admit_sparse_contact_triplets(
-            active_rows=active_rows,
-            velocity_candidate=velocity_candidate,
-            use_support_table=use_support_table,
-            # The selected transaction's working set: the staged one's metric cache, the single-stage one's none.
-            fits=lambda: (
-                triplet_capacity > 0
-                and staging(
-                    active_rows=active_rows,
-                    use_support_table=use_support_table,
-                    contact_triplets=True,
-                    contact_transaction=transaction,
-                ).fits(budget)
-            ),
-        )
-        transaction_options = {}
-        if self._sparse_contact_triplets:
-            self._sparse_contact_transaction = transaction
-            self._sparse_contact_transaction_reason = transaction_reason
-            transaction_options["contact_transaction"] = transaction
-            if transaction == "single":
-                # Static storage for graph capture: the builder writes the records of each step's
-                # triplets; linked sweeps add each anchor's ring members once per call.
-                width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self._friction_anchors_enabled else 0)
-                self._arrays.allocate(
-                    SPARSE_CONTACT_RECORDS, world=self.world_count, triplet=triplet_capacity, record=width
-                )
-        else:
-            self._sparse_contact_transaction_reason = "No contact triplets are admitted."
+        if use_support_table:
+            self._sparse_row_support = row_supports(
+                support_classes, self.world_count, self.dense_max_constraints, model.device
+            )
+        if contact_triplets:
+            # Static storage for graph capture: the builder writes the block records of each step's
+            # contact units; linked sweeps add each anchor's ring members once per call.
+            width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self._friction_anchors_enabled else 0)
+            self._arrays.allocate(
+                SPARSE_CONTACT_RECORDS, world=self.world_count, triplet=triplet_capacity, record=width
+            )
         index_shape = (1, 1, 1) if use_support_table else shape
         self._arrays.allocate(
             SPARSE_ROWS,
@@ -3865,30 +3865,18 @@ class SolverFeatherPGS(SolverBase):
             use_support_table=use_support_table,
             **({"contact_records": True} if self._sparse_contact_records is not None else {}),
         )
-        # Large resident workspaces regressed whole-step timing in measured
-        # small systems. Keep the global-row consumer when the cache is large.
-        self._sparse_local_factors = bool(
-            self._sparse_solve_lanes < 32
-            and staging(lanes_per_world=self._sparse_solve_lanes, local_factors=True).bytes
-            <= min(budget, _SPARSE_LOCAL_WORKSPACE_BYTES)
-        )
         self._pgs_solve_sparse_kernel = self._sweep_kernel(
             "sparse_pgs",
             sweep_routes_sparse.sparse_kernel,
             self.dense_max_constraints,
             self.max_world_dofs,
             max_support,
-            active_rows=active_rows,
-            use_support_table=use_support_table,
-            contact_triplets=self._sparse_contact_triplets,
+            **sweep,
             velocity_limits=self._sparse_velocity_limits,
-            lanes_per_world=self._sparse_solve_lanes,
-            local_factors=self._sparse_local_factors,
             warm_start=self.pgs_warmstart,
             linked_rows=self._friction_anchors_enabled,
             velocity_limit_law=self._velocity_limit_kernel_law(),
             device_arch=model.device.arch,
-            **transaction_options,
         )
 
     def _sweep_kernel(self, route: str, factory, *args, readout_budget: int | None = None, **kwargs):
@@ -3932,30 +3920,36 @@ class SolverFeatherPGS(SolverBase):
         lanes = 8 if self.max_world_dofs <= 8 else 16
         return lanes if staging(lanes_per_world=lanes).fits(budget) else 0
 
-    def _admit_sparse_active_rows(self, *, velocity_candidate: bool, small_world_lanes: int) -> tuple[bool, str]:
+    def _admit_sparse_active_rows(
+        self, *, velocity_candidate: bool, small_world_lanes: int, fits: Callable[[], bool]
+    ) -> tuple[bool, str]:
         """Decide whether the native sparse sweep selects its normal and limit rows at sweep entry, and why.
 
         Under this law a zero-impulse row that a sweep's earlier updates violate waits for
         the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
         pair is visited while any normal of its patch ring is selected or the pair holds
         impulse, which skips only pairs whose update would be a no-op. Small worlds keep
-        their packed lanes.
+        their packed lanes. Under either law, a scan whose row bitsets exceed shared memory
+        leaves the full ordered sweep.
 
         Args:
             velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
+            fits: Whether the active-row scan's working set fits shared memory, evaluated last.
         """
         if not self._route_pins.get("active_rows", True):
             return False, "A test pin keeps the full ordered sweep (active_rows=False)."
         if velocity_candidate:
             return False, "Velocity-limit rows keep full ordered sweeps."
-        if not self._friction_anchors_enabled:
-            return True, "Point-contact normal and limit rows are selected at sweep entry."
-        if small_world_lanes:
+        if self._friction_anchors_enabled and small_world_lanes:
             return False, (
                 f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
                 "of small worlds."
             )
+        if not fits():
+            return False, "The full ordered sweep: the active-row scan's row bitsets exceed shared memory."
+        if not self._friction_anchors_enabled:
+            return True, "Point-contact normal and limit rows are selected at sweep entry."
         return True, (
             "Normal and limit rows are selected at sweep entry; a patch friction pair (friction_anchor_beta > 0) "
             "while any normal of its ring is selected or the pair holds impulse."
@@ -3967,23 +3961,24 @@ class SolverFeatherPGS(SolverBase):
         active_rows: bool,
         velocity_candidate: bool,
         use_support_table: bool,
-        fits: bool,
+        lanes: int,
+        fits: Callable[[], bool],
     ) -> tuple[bool, str]:
         """Decide whether the sparse sweep fuses contact triplets, and why: wherever the row structure admits them.
 
         Point friction fuses them in the active-row scan. Patch friction fuses its anchor
         units, pooling their ring loads as the ordinary pair update does, in the active
         scan or else in the full ordered sweep; velocity-limit, free-body and packed
-        small-world sweeps keep ordinary updates. The staged patch transaction is
-        bitwise equal to the same sweep without it. The staged point transaction is too. The
-        single-stage transaction (:meth:`_request_sparse_contact_transaction`) differs
-        from the staged one by rounding only.
+        small-world sweeps keep ordinary updates. A fused triplet is a contact unit
+        on its Gram block (:func:`.sweep_routes_sparse.contact_units`): in exact arithmetic
+        the ordinary sweep's normal and pair updates, in one reduction and one apply.
 
         Args:
             active_rows: Whether the sweep selects its rows at sweep entry.
             velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             use_support_table: Whether rows read the shared support table.
-            fits: Whether the selected triplet transaction fits the row capacity and shared memory, evaluated last.
+            lanes: Lanes per world of the sweep.
+            fits: Whether contact units fit the row capacity and shared memory, evaluated last.
         """
         if "contact_units" in self._route_pins and self._route_pins["contact_units"] != "triplets":
             return False, "A test pin keeps unfused contact rows (contact_units=None)."
@@ -3991,38 +3986,18 @@ class SolverFeatherPGS(SolverBase):
             return False, "Triplets need the active-row scan."
         if not active_rows and (velocity_candidate or self._has_free_rigid_bodies):
             return False, "Velocity-limit and free-body sweeps keep ordinary updates."
-        if self._sparse_solve_lanes < 32:
-            return False, f"Small worlds keep their packed {self._sparse_solve_lanes}-lane full sweep."
+        if lanes < 32:
+            return False, f"Small worlds keep their packed {lanes}-lane full sweep."
         if not use_support_table:
             return False, "Triplets need the row support table."
         if not fits():
-            return False, "Row capacity or shared memory leaves no room for the triplet transaction."
-        # contact_transaction_reason records how the admitted triplets update.
+            return False, "Row capacity or shared memory leaves no room for contact units."
         if self._friction_anchors_enabled:
             sweep = "active-row scan" if active_rows else "full ordered sweep"
             where = f"patch anchor units pool their ring loads in the {sweep}"
         else:
             where = "point contacts fuse in the active-row scan"
         return True, f"Fused wherever the rows admit them: {where}."
-
-    def _request_sparse_contact_transaction(self) -> tuple[str, str]:
-        """Return the transaction admitted contact triplets take (``"single"`` or ``"staged"``), and why.
-
-        The single-stage transaction loads a triplet's rows with its block record, which
-        the sparse contact builder writes, and reduces its three residuals together; the
-        staged one reduces the normal, then the tangents, and caches tangent metrics in
-        shared memory. Both apply the paired friction law, so iterates differ by rounding
-        only. Patch friction (``friction_anchor_beta > 0``) takes the single-stage one and
-        point friction the staged one.
-        """
-        pinned = self._route_pins.get("transaction")
-        if pinned is not None:
-            if pinned not in CONTACT_TRANSACTIONS:
-                raise ValueError(f"The transaction pin must be one of {CONTACT_TRANSACTIONS}, got {pinned!r}")
-            return pinned, f"A test pin selects the {pinned} transaction."
-        if self._friction_anchors_enabled:
-            return "single", "Patch friction (friction_anchor_beta > 0) takes the single-stage transaction."
-        return "staged", "Point friction takes the staged transaction."
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -5366,7 +5341,7 @@ class SolverFeatherPGS(SolverBase):
                     omega,
                     int(friction_start_iteration),
                     int(iteration_offset),
-                    # The single-stage transaction reads the triplets' block records.
+                    # Contact units read the triplets' block records.
                     *(() if self._sparse_contact_records is None else (self._sparse_contact_records,)),
                 ],
                 outputs=[
