@@ -187,7 +187,7 @@ def local_owned_source(
     lanes = Lanes(L)
     free = FreeBodyZ(lanes) if MFR else None
     laws = RowLaws(regularize=contact_capable, policy=solve_policy)
-    factors = (CholeskySolve(P, "s_L", reciprocal=contact_capable, ascending=True),)
+    factors = (CholeskySolve(P, "s_L", reciprocal=True, ascending=True),)
     if S:
         factors += (CholeskySolve(S, "s_L_secondary", reciprocal=True, ascending=True),)
     op = LocalBlock(

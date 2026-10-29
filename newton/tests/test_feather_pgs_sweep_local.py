@@ -131,6 +131,9 @@ class TestLocalOwnedRoute(unittest.TestCase):
         self.assertIn("__shared__ LocalScratch localscratch[8];", body)
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
         self.assertIn("#undef s_A", body)
+        # Every local owner stages the factor's reciprocal diagonal and multiplies by it, contactless ones included.
+        self.assertIn("factor = factor != 0.0f ? 1.0f / factor : 0.0f;", body)
+        self.assertNotIn("value/diagonal", body)
 
 
 class TestPairedFactorRoute(unittest.TestCase):
