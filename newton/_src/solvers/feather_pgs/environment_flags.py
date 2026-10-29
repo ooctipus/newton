@@ -31,12 +31,6 @@ def _flag(name: str, kind: FlagKind, modules: tuple[str, ...], meaning: str) -> 
 _READ = (
     ("FEATHER_PGS_CONTACT_THREADS_X", "policy", _SOLVER, "Multiplier of the contact-build thread budget (default 1)."),
     (
-        "FEATHER_PGS_CONTACT_UPDATE",
-        "policy",
-        _SOLVER,
-        "sequential or unit overrides the contact_update argument (unset: the argument).",
-    ),
-    (
         "FEATHER_PGS_DEBUG_SNAPSHOTS",
         "diagnostic",
         _SOLVER,
@@ -97,12 +91,6 @@ _READ = (
         "policy",
         _SOLVER,
         "=0 keeps patch friction off the parallel tiers and keyed rows, on its serial sweeps (default on).",
-    ),
-    (
-        "FEATHER_PGS_PATCH_PARALLEL_SWEEPS",
-        "policy",
-        _SOLVER,
-        "Deprecated (warns): a positive count or auto overrides the deprecated mf_gs_parallel_linked_sweeps, the linked tiers' own budget; every tier follows one automatic budget rule.",
     ),
     (
         "FEATHER_PGS_PREDICTED_TWISTS",
@@ -211,24 +199,6 @@ _READ = (
         "policy",
         ("tree_kinetic_owner",),
         "=0 launches every captured held-tree repair (default 1: a repair after a finish of the same capture on the bank it published launches nothing).",
-    ),
-    (
-        "FEATHER_PGS_VELOCITY_LIMIT_LAW",
-        "policy",
-        _SOLVER,
-        "stateless or accumulated overrides the velocity_limit_law argument (unset: the argument).",
-    ),
-    (
-        "IL_NEWTON_FPGS_MF_WARMSTART",
-        "policy",
-        _SOLVER,
-        "Legacy alias: 1, true, yes or on enables contact warm start like mf_warmstart=True.",
-    ),
-    (
-        "IL_NEWTON_FPGS_MF_WARMSTART_DECAY",
-        "policy",
-        _SOLVER,
-        "Legacy alias: warm-start decay used with IL_NEWTON_FPGS_MF_WARMSTART (default mf_warmstart_decay).",
     ),
 )
 

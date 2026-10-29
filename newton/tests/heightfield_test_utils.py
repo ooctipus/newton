@@ -231,13 +231,11 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
-            articulated_contact_response="immediate",
             pgs_iterations=8,
             pgs_velocity_iterations=0,
             dense_max_constraints=100,
             mf_max_constraints=32,
             pgs_warmstart=False,
-            mf_warmstart=False,
         )
         if solver.pgs_iterations != 8 or solver.pgs_velocity_iterations != 0:
             raise AssertionError("Wrong actual iteration budget")

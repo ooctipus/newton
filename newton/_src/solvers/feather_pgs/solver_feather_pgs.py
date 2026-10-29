@@ -917,7 +917,6 @@ class SolverFeatherPGS(SolverBase):
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
         contact_friction_shared_anchor: bool = False,
-        contact_friction_anchor_limit: int = 0,
         contact_friction_scale: float = 1.0,
         contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
@@ -935,20 +934,11 @@ class SolverFeatherPGS(SolverBase):
         pgs_velocity_drive_mode: Literal["active", "freeze"] = "freeze",
         dense_max_constraints: int = 32,
         pgs_warmstart: bool = False,
-        mf_warmstart: bool = False,
-        mf_warmstart_decay: float = 1.0,
         pgs_mode: str = "split",
-        articulated_contact_response: Literal[
-            "immediate", "propagation", "propagation-fused", "propagation-colored"
-        ] = "immediate",
-        propagation_same_articulation_rows: bool = False,
-        propagation_cached_response: bool = True,
-        propagation_cached_response_max_bodies: int = 8,
         pgs_schedule: Literal["interleaved", "contact_then_internal", "physx_grasp"] = "interleaved",
         mf_max_constraints: int = 512,
         # Dense-path PGS kernel (matrix_free solves through the fused MF-GS kernel)
         pgs_kernel: str = "auto",
-        pgs_chunk_size: int | None = None,
         # Parallelism options
         use_parallel_streams: bool = True,
         double_buffer: bool = True,
@@ -971,7 +961,6 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_incremental_rows: int = 32,
         mf_gs_parallel_rows: int = 0,
         mf_gs_parallel_sweeps: int = 24,
-        mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = "auto",
         mf_gs_parallel_nesterov: bool = True,
         mf_gs_parallel_matrix_free: bool = False,
         mf_gs_parallel_linked_velocity_limit_pass: bool = False,
@@ -1125,10 +1114,6 @@ class SolverFeatherPGS(SolverBase):
                 the witnesses are separated along the contact normal. Applies to velocity-only point
                 friction (``friction_anchor_beta=0``); patch friction warns and uses its persistent
                 material anchors instead. Defaults to False.
-            contact_friction_anchor_limit (int, optional): Deprecated compatibility argument.
-                The old contact-index approximation has been removed. A positive value warns
-                and has no effect. Patch friction is enabled by default; use
-                ``friction_anchor_beta=0`` to explicitly select velocity-only point friction.
             contact_friction_articulation_pairs_only (bool, optional): Apply
                 ``contact_friction_gap_threshold`` only when
                 both contact bodies belong to non-free articulations. Contacts involving ground or a
@@ -1301,8 +1286,7 @@ class SolverFeatherPGS(SolverBase):
                 drive clamp of ``fuse_joint_velocity_limits`` is unaffected. Split mode, which has
                 no joint velocity-limit rows, applies neither law: where its free-body sweep has
                 velocity-limit rows it keeps the stateless clamp that ``get_path_selection()``
-                reports under ``routes.velocity_limits.free_body_sweep_law``. The environment variable
-                ``FEATHER_PGS_VELOCITY_LIMIT_LAW`` overrides the argument.
+                reports under ``routes.velocity_limits.free_body_sweep_law``.
                 ``get_path_selection()`` reports the law the serial sweeps apply under
                 ``routes.velocity_limits.law``, and the parallel tiers' law, accumulated under either
                 argument, under ``routes.sweep.tiers.velocity_limit_law``. Experimental. Defaults to
@@ -1330,8 +1314,7 @@ class SolverFeatherPGS(SolverBase):
                 sweep of split mode on any device and the split free-body sweep on CPU. Every other sweep keeps
                 ``"sequential"``; ``get_path_selection()`` records which sweep runs which law under
                 ``routes.sweep.contact_update``, and construction warns when a requested ``"unit"`` reaches only
-                some sweeps. ``FEATHER_PGS_CONTACT_UPDATE`` overrides the argument. Experimental. Defaults to
-                ``"sequential"``.
+                some sweeps. Experimental. Defaults to ``"sequential"``.
             mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
                 matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
                 most this many rows solve through a shared-memory response block instead of
@@ -1364,11 +1347,6 @@ class SolverFeatherPGS(SolverBase):
                 changes are at the rounding floor.
                 ``get_path_selection()`` reports each tier's budget and its rule under ``routes.sweep.tiers``.
                 Defaults to 24.
-            mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Deprecated: the tiers that serve
-                persistent patch friction (linked tiers) follow the budget rule of every tier, the default
-                ``"auto"``. A count, or ``None`` for exactly ``mf_gs_parallel_sweeps``, still sets the linked tiers'
-                budget, with a :class:`DeprecationWarning`, and so does the environment variable
-                ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``; omit both. Defaults to ``"auto"``.
             mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
             mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
                 ``Y^T y`` and ``J . dv`` from staged rows; row-sum-bound step scale). With ``m`` rows and ``D`` DOFs,
@@ -1442,11 +1420,6 @@ class SolverFeatherPGS(SolverBase):
                 or matrix-free row family exceeds its configured per-world capacity. The warning
                 reports the world, requested rows, row limit, and dropped contact/friction rows without a host
                 synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
-            mf_warmstart (bool, optional): Legacy compatibility alias for ``pgs_warmstart``
-                (this option was historically matrix-free-only). New callers should use
-                ``pgs_warmstart``. Defaults to False.
-            mf_warmstart_decay (float, optional): Legacy decay alias used when
-                ``mf_warmstart`` enables the unified mode. Defaults to 1.0.
             pgs_mode (str, optional): ``"split"`` forms a dense Delassus matrix for articulated rows and
                 uses matrix-free PGS for free-body contacts; it is the only CPU mode. ``"matrix_free"``
                 avoids that global matrix; CPU construction raises :class:`NotImplementedError`.
@@ -1457,30 +1430,6 @@ class SolverFeatherPGS(SolverBase):
                 Try matrix-free when assembly dominates (e.g. contact-rich hands); compact row sets with
                 many sweeps may favor split. Compare total cost and convergence at equal iteration
                 allowances. Defaults to ``"split"``.
-            articulated_contact_response (str, optional): Contact response for articulated rows.
-                ``"immediate"`` solves each contact row against the articulation's ``H^-1 J^T``
-                response. Defaults to ``"immediate"``.
-
-                .. deprecated:: 1.6
-                    ``"propagation"``, ``"propagation-fused"`` and ``"propagation-colored"``
-                    have no effect: they emit a :class:`DeprecationWarning`, run the
-                    ``"immediate"`` response and will be removed with this parameter.
-                    Omit the parameter.
-            propagation_same_articulation_rows (bool, optional): No effect.
-
-                .. deprecated:: 1.6
-                    It configured the deprecated propagation responses. ``True`` emits a
-                    :class:`DeprecationWarning`; omit the parameter.
-            propagation_cached_response (bool, optional): No effect.
-
-                .. deprecated:: 1.6
-                    It configured the deprecated propagation responses. ``False`` emits a
-                    :class:`DeprecationWarning`; omit the parameter.
-            propagation_cached_response_max_bodies (int, optional): No effect.
-
-                .. deprecated:: 1.6
-                    It configured the deprecated propagation responses. A value other than
-                    8 emits a :class:`DeprecationWarning`; omit the parameter.
             pgs_schedule (str, optional): Matrix-free row ordering. ``"interleaved"`` preserves the
                 legacy per-iteration dense+matrix-free sweep. ``"contact_then_internal"`` runs all
                 contact/friction sweeps first, then all internal articulation sweeps (drive, joint
@@ -1494,10 +1443,7 @@ class SolverFeatherPGS(SolverBase):
                 device. ``tiled_row`` stages the packed Delassus triangle in shared memory while it fits the
                 device's shared memory per block and reads the Delassus rows from global memory past that
                 (``routes.sweep.dense.staging``). Matrix-free mode owns its sweep dispatcher: an explicit
-                choice there warns and is ignored. ``tiled_contact`` and ``streaming`` are deprecated: they
-                warn, have no effect and select the ``auto`` kernel.
-            pgs_chunk_size (int, optional): Deprecated compatibility argument. It tuned the removed
-                streaming kernel; a value other than ``None`` warns and has no effect. Defaults to None.
+                choice there warns and is ignored.
             use_parallel_streams (bool, optional): Overlap independent work on separate CUDA streams: the
                 size groups, and the drive preparation beside inverse dynamics. It never selects the
                 dynamics evaluator. Defaults to True.
@@ -1536,12 +1482,10 @@ class SolverFeatherPGS(SolverBase):
                     "pgs_iterations": pgs_iterations,
                     "pgs_velocity_iterations": pgs_velocity_iterations,
                     "pgs_warmstart": pgs_warmstart,
-                    "mf_warmstart": mf_warmstart,
                     "enable_restitution": enable_restitution,
                     "pgs_contact_regularization": pgs_contact_regularization,
                     "pgs_debug": pgs_debug,
                     "contact_friction_position_iterations": contact_friction_position_iterations,
-                    "contact_friction_anchor_limit": contact_friction_anchor_limit,
                     "contact_friction_shared_anchor": contact_friction_shared_anchor,
                     "contact_shared_anchor": contact_shared_anchor,
                 },
@@ -1557,22 +1501,6 @@ class SolverFeatherPGS(SolverBase):
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         options = check_options(requested_options)
 
-        if pgs_kernel in ("tiled_contact", "streaming"):
-            warnings.warn(
-                f"pgs_kernel={pgs_kernel!r} is deprecated and has no effect, and will be removed in a future "
-                "release; the solver selects the 'auto' kernel. Omit pgs_kernel, and pass friction_anchor_beta=0 "
-                "for velocity-only point friction.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
-            pgs_kernel = "auto"
-        if pgs_chunk_size is not None:
-            warnings.warn(
-                "pgs_chunk_size is deprecated and has no effect, and will be removed in a future release; "
-                "it tuned the removed streaming kernel. Omit it.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
         self._requested_kernel_choices = {
             "cholesky_kernel": cholesky_kernel,
             "trisolve_kernel": trisolve_kernel,
@@ -1629,13 +1557,6 @@ class SolverFeatherPGS(SolverBase):
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
-        if options["contact_friction_anchor_limit"] > 0:
-            warnings.warn(
-                "contact_friction_anchor_limit is deprecated and ignored. Patch friction is enabled by default; "
-                "use friction_anchor_beta to adjust it or explicitly set zero to disable it.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         if self.contact_compliance and self._friction_anchors_enabled:
             raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
@@ -1652,8 +1573,6 @@ class SolverFeatherPGS(SolverBase):
         self.same_articulation_contact_gap_gate = options["same_articulation_contact_gap_gate"]
         self.articulation_pair_contact_gap_gate = options["articulation_pair_contact_gap_gate"]
         self.contact_shared_anchor = bool(contact_shared_anchor)
-        # The deprecated input must not reach legacy point-row writers or scale their friction.
-        self.contact_friction_anchor_limit = 0
         self.enable_joint_limits = enable_joint_limits
         self.enable_bilateral_preelimination = bool(enable_bilateral_preelimination)
         self.bilateral_preelimination_include_mimics = bool(bilateral_preelimination_include_mimics)
@@ -1687,105 +1606,12 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_velocity_drive_mode = pgs_velocity_drive_mode
         dense_max_constraints = options["dense_max_constraints"]
         self.warn_constraint_overflow = bool(warn_constraint_overflow)
-        if articulated_contact_response in ("propagation", "propagation-fused", "propagation-colored"):
-            warnings.warn(
-                f"articulated_contact_response={articulated_contact_response!r} is deprecated and has no effect: "
-                "the 'immediate' response runs, and the propagation responses will be removed. "
-                "Omit articulated_contact_response.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
-            articulated_contact_response = "immediate"
-        elif articulated_contact_response != "immediate":
-            raise ValueError(f"articulated_contact_response must be 'immediate', got {articulated_contact_response!r}")
-        self.articulated_contact_response = articulated_contact_response
-        for name, ignored in (
-            ("propagation_same_articulation_rows", bool(propagation_same_articulation_rows)),
-            ("propagation_cached_response", not propagation_cached_response),
-            ("propagation_cached_response_max_bodies", propagation_cached_response_max_bodies != 8),
-        ):
-            if ignored:
-                warnings.warn(
-                    f"{name} is deprecated and has no effect: it configured the propagation contact responses, "
-                    "which will be removed. Omit it.",
-                    DeprecationWarning,
-                    stacklevel=_CONSTRUCTOR_CALLER,
-                )
-        # ``mf_warmstart`` and its environment switch predate the unified
-        # contact-warm-start contract. Keep them as compatibility aliases, but
-        # map them onto the one all-route mode rather than retaining a second
-        # MF-only behavior.
-        _env_ws = os.getenv("IL_NEWTON_FPGS_MF_WARMSTART", "0").lower() in {"1", "true", "yes", "on"}
-        legacy_mf_warmstart = bool(mf_warmstart) or _env_ws
-        try:
-            legacy_mf_decay = float(os.getenv("IL_NEWTON_FPGS_MF_WARMSTART_DECAY", str(mf_warmstart_decay)))
-        except (TypeError, ValueError):
-            legacy_mf_decay = float(mf_warmstart_decay)
-        if not math.isfinite(legacy_mf_decay) or legacy_mf_decay < 0.0:
-            raise ValueError(f"mf_warmstart_decay must be finite and non-negative, got {legacy_mf_decay!r}")
-        # Effective legacy alias values (argument or IL_NEWTON_FPGS_* environment), for get_path_selection().
-        self._legacy_mf_warmstart = legacy_mf_warmstart
-        self._legacy_mf_warmstart_decay = legacy_mf_decay
-
-        requested_pgs_decay = options["pgs_warmstart_decay"]
-        self.pgs_warmstart = bool(pgs_warmstart) or legacy_mf_warmstart
-        self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
-        # FEATHER_PGS_VELOCITY_LIMIT_LAW overrides the argument, so recipes select the law without code changes.
-        check_velocity_limit_law(velocity_limit_law)
-        environment_law = os.environ.get("FEATHER_PGS_VELOCITY_LIMIT_LAW")
-        self.velocity_limit_law = (
-            check_velocity_limit_law(environment_law, source="FEATHER_PGS_VELOCITY_LIMIT_LAW")
-            if environment_law
-            else velocity_limit_law
-        )
-        # FEATHER_PGS_CONTACT_UPDATE overrides the argument, so recipes select the contact update without code changes.
-        check_contact_update(contact_update)
-        environment_update = os.environ.get("FEATHER_PGS_CONTACT_UPDATE")
-        self.contact_update = (
-            check_contact_update(environment_update, source="FEATHER_PGS_CONTACT_UPDATE")
-            if environment_update
-            else contact_update
-        )
-        # One budget rule for every parallel tier. The linked tiers' own budget and its
-        # FEATHER_PGS_PATCH_PARALLEL_SWEEPS override are deprecated: they still set the linked tiers' budget.
-        requested_linked_sweeps = _linked_sweeps_request(mf_gs_parallel_linked_sweeps, "mf_gs_parallel_linked_sweeps")
-        environment_linked_sweeps = os.environ.get("FEATHER_PGS_PATCH_PARALLEL_SWEEPS") or None
-        self.mf_gs_parallel_linked_sweeps = (
-            _linked_sweeps_request(environment_linked_sweeps, "FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
-            if environment_linked_sweeps
-            else requested_linked_sweeps
-        )
-        for name, given in (
-            ("mf_gs_parallel_linked_sweeps", requested_linked_sweeps != "auto"),
-            ("FEATHER_PGS_PATCH_PARALLEL_SWEEPS", environment_linked_sweeps is not None),
-        ):
-            if given:
-                warnings.warn(
-                    f"{name} is deprecated and will be removed in a future release: every parallel tier now sweeps "
-                    "the automatic budget, at least mf_gs_parallel_sweeps, under either friction law. Until then a "
-                    "count, or None for exactly mf_gs_parallel_sweeps, still sets the budget of the tiers that serve "
-                    "persistent patch friction; omit it.",
-                    DeprecationWarning,
-                    stacklevel=_CONSTRUCTOR_CALLER,
-                )
+        self.pgs_warmstart = bool(pgs_warmstart)
+        self.pgs_warmstart_decay = options["pgs_warmstart_decay"]
+        self.velocity_limit_law = check_velocity_limit_law(velocity_limit_law)
+        self.contact_update = check_contact_update(contact_update)
         # The sparse triplet transaction's flag, checked on every route; the sparse route applies it.
         self._sparse_transaction_request = self._sparse_transaction_flags()
-        # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
-        # get_path_selection() reports their source as "environment".
-        argument_decay = requested_pgs_decay if pgs_warmstart or not mf_warmstart else float(mf_warmstart_decay)
-        self._environment_options = frozenset(
-            name
-            for name, changed in (
-                ("mf_warmstart", legacy_mf_warmstart != bool(mf_warmstart)),
-                ("mf_warmstart_decay", legacy_mf_decay != float(mf_warmstart_decay)),
-                ("pgs_warmstart", self.pgs_warmstart != (bool(pgs_warmstart) or bool(mf_warmstart))),
-                ("pgs_warmstart_decay", self.pgs_warmstart_decay != argument_decay),
-                ("velocity_limit_law", self.velocity_limit_law != velocity_limit_law),
-                ("contact_update", self.contact_update != contact_update),
-                ("mf_gs_parallel_linked_sweeps", self.mf_gs_parallel_linked_sweeps != requested_linked_sweeps),
-            )
-            if changed
-        )
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
         self._ws_prev_dense_row_parent = None
@@ -7099,11 +6925,9 @@ class SolverFeatherPGS(SolverBase):
         """Return sticky capacity-overflow flags without enabling row telemetry.
 
         The keys ``dense`` and ``matrix_free`` identify row buffers whose
-        capacity omitted constraints; ``propagation`` is deprecated and always
-        ``False``: no route builds propagation rows. ``contacts`` remains for
-        compatibility and is always ``False`` too: a contact stream's count
-        never exceeds its rows (a collision pass clamps it and flags the drop in
-        its own capacity status).
+        capacity omitted constraints. A contact stream's count never exceeds its
+        rows: a collision pass clamps it and flags the drop in its own capacity
+        status.
         ``patch_frames`` identifies a captured step of patch friction whose
         ``contact_generation`` or contact count changed since the previous
         captured step of the same graph without a write Newton noted (such as
@@ -7134,7 +6958,7 @@ class SolverFeatherPGS(SolverBase):
         if wp.get_device(self.model.device).is_capturing:
             raise RuntimeError("Constraint capacity status must be read outside CUDA graph capture")
         dense, matrix_free = map(bool, self._constraint_capacity_status.numpy())
-        result = {"dense": dense, "matrix_free": matrix_free, "propagation": False, "contacts": False}
+        result = {"dense": dense, "matrix_free": matrix_free}
         frame_status = self._patch_frame_status()
         result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
         pool = getattr(self, "_contact_pool", None)
@@ -7209,8 +7033,6 @@ class SolverFeatherPGS(SolverBase):
         Returns ``0`` for every field when the telemetry was not enabled; these
         zeros do not establish absence of overflow. Use
         :meth:`check_constraint_capacity` for always-available overflow visibility.
-        The ``propagation_*`` fields are deprecated and always ``0``: no route
-        builds propagation rows.
         """
         words = {}
         if self._row_watermark_words is not None:
@@ -7226,7 +7048,7 @@ class SolverFeatherPGS(SolverBase):
         }
         result = {
             f"{family}_{field}": int(words.get(name.format(family), 0))
-            for family in ("dense", "mf", "propagation")
+            for family in ("dense", "mf")
             for field, name in fields.items()
         }
         result["contact_high_water"] = int(words.get("_row_watermark_contact", 0))
@@ -9548,25 +9370,9 @@ class SolverFeatherPGS(SolverBase):
 
         ``tiers`` lists ``(rows, min_rows)`` per tier. Every tier, under either friction
         law, sweeps :func:`.sweep_routes_tiers.tier_sweeps` of its row bound, at least
-        ``mf_gs_parallel_sweeps``. The deprecated ``mf_gs_parallel_linked_sweeps`` (or
-        ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``) still sets the linked (patch) tiers' budget
-        where given: a count, or ``mf_gs_parallel_sweeps`` for ``None``. A world stops
-        earlier under the sweeps' exit law.
+        ``mf_gs_parallel_sweeps``. A world stops earlier under the sweeps' exit law.
         """
         sweeps = int(self.mf_gs_parallel_sweeps)
-        linked = self.mf_gs_parallel_linked_sweeps
-        if self._friction_anchors_enabled and linked != "auto":
-            source = (
-                "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
-                if "mf_gs_parallel_linked_sweeps" in self._environment_options
-                else "mf_gs_parallel_linked_sweeps"
-            )
-            budget = sweeps if linked is None else int(linked)
-            reason = (
-                f"{source}={linked} (deprecated): every linked tier sweeps at most {budget} times; a world stops "
-                "earlier under the sweeps' exit law."
-            )
-            return [budget] * len(tiers), "mf_gs_parallel_linked_sweeps", reason
         reason = (
             f"auto: a tier serving up to R rows sweeps ceil({sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION} * pgs_iterations * "
             f"sqrt(R / 32)) times with pgs_iterations={int(self.pgs_iterations)}, at least "
@@ -9607,12 +9413,7 @@ class SolverFeatherPGS(SolverBase):
                 "No velocity-limit rows can exist: the sweep kernels keep their stateless build under "
                 f"velocity_limit_law={self.velocity_limit_law!r}."
             )
-        source = (
-            "FEATHER_PGS_VELOCITY_LIMIT_LAW"
-            if "velocity_limit_law" in self._environment_options
-            else "velocity_limit_law"
-        )
-        return self.velocity_limit_law, f"{source}={self.velocity_limit_law!r}."
+        return self.velocity_limit_law, f"velocity_limit_law={self.velocity_limit_law!r}."
 
     def _velocity_limit_kernel_law(self) -> str:
         """The ``velocity_limit_law`` argument of every matrix-free sweep kernel this solver builds."""
@@ -11143,18 +10944,3 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         preludes=(lane_group(32),),
         native_name="build_independent_sparse_contact_units_native",
     ).kernel()
-
-
-def _linked_sweeps_request(value, name: str) -> int | str | None:
-    """Validate the deprecated linked-tier budget: ``None``, ``"auto"`` or a positive count (decimal text included)."""
-    if value is None or value == "auto":
-        return value
-    count = value
-    if isinstance(value, str):
-        try:
-            count = int(value)
-        except ValueError:
-            count = None
-    if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 1:
-        raise ValueError(f"{name} must be None, 'auto' or a positive sweep count, got {value!r}")
-    return int(count)

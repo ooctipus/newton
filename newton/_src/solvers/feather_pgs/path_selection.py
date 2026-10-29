@@ -30,8 +30,6 @@ _APPLIED_ATTRIBUTES = {
     "double_buffer": "_double_buffer",
     "nvtx": "_nvtx",
     "row_watermark": "_row_watermark",
-    "mf_warmstart": "_legacy_mf_warmstart",
-    "mf_warmstart_decay": "_legacy_mf_warmstart_decay",
     "enable_bilateral_preelimination": "_preelim_active",
 }
 
@@ -91,36 +89,21 @@ def _streams_created(solver) -> bool:
     return any(stream is not None for stream in streams)
 
 
-def _linked_tier_sweeps(solver) -> int:
-    if solver._ink_rows <= 0:
-        return 0
-    return max((tier.sweeps for tier in solver._mf_gs_tiers if tier.linked_rows), default=0)
-
-
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
-    # Deprecated: selects nothing.
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
     "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
-    # Deprecated: no kernel reads it.
-    "pgs_chunk_size": lambda solver: None,
     "use_parallel_streams": _streams_created,
-    # Deprecated options that configured the propagation responses select nothing.
-    "propagation_same_articulation_rows": lambda solver: False,
-    "propagation_cached_response": lambda solver: False,
-    "propagation_cached_response_max_bodies": lambda solver: 0,
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
         solver._ink_rows > 0 and any(tier.velocity_limit_pass for tier in solver._mf_gs_tiers)
     ),
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in split mode, which
     # builds no matrix-free sweep and applies no law.
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
-    # The largest budget of the built linked (patch) tiers; 0 without them (deprecated option).
-    "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
     # A readout applies only where a sweep kernel carries its counters.
     "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
     # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
@@ -138,14 +121,12 @@ def applied_options(solver, init, arguments: dict) -> dict:
     construction's gates and clamps: an option whose owner, tier or stream was
     not built reports its off value (``False``, ``0`` or ``"off"``), and a row
     budget reports the rows the built tier serves. ``requested`` keeps the
-    request; ``routes`` names the owners. ``source`` is ``"environment"`` when an
-    ``IL_NEWTON_FPGS_*`` legacy alias or a ``FEATHER_PGS_*`` override changed
-    the applied value, ``"argument"`` when the requested value differs from the
-    declared default and ``"default"`` otherwise; Python cannot tell an omitted
-    option from one passed with its default value.
+    request; ``routes`` names the owners. ``source`` is ``"argument"`` when the
+    requested value differs from the declared default and ``"default"``
+    otherwise; Python cannot tell an omitted option from one passed with its
+    default value.
     """
     record = {}
-    environment = getattr(solver, "_environment_options", frozenset())
     for name, default in _declared_defaults(init).items():
         value = arguments.get(name, default)
         effective = _EFFECTIVE.get(name)
@@ -153,15 +134,11 @@ def applied_options(solver, init, arguments: dict) -> dict:
             applied = effective(solver)
         else:
             applied = getattr(solver, _APPLIED_ATTRIBUTES.get(name, name), value)
-        if name in environment:
-            source = "environment"
-        else:
-            source = "default" if _is_default(value, default) else "argument"
         record[name] = {
             "applied": json_value(applied),
             "requested": json_value(value),
             "default": json_value(default),
-            "source": source,
+            "source": "default" if _is_default(value, default) else "argument",
         }
     return record
 
@@ -777,7 +754,7 @@ def _tiers(solver) -> dict | None:
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             # The largest tier budget; each tier records its own. Every tier sweeps the automatic budget, at least
-            # mf_gs_parallel_sweeps (rule "auto"); the deprecated mf_gs_parallel_linked_sweeps still sets linked tiers'.
+            # mf_gs_parallel_sweeps (rule "auto").
             "sweeps": max(tier.sweeps for tier in tiers),
             "sweeps_rule": solver._par_sweeps_rule,
             "sweeps_reason": solver._par_sweeps_reason,

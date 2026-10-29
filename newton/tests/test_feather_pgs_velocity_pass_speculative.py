@@ -79,28 +79,21 @@ def _drop(
     scene="free",
     *,
     pgs_warmstart=False,
-    mf_warmstart=False,
 ):
     """Drop a body onto a plane; return heights, velocities, contact counts, routes."""
     model, body = _build(device, scene)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            pgs_velocity_iterations=velocity_iterations,
-            pgs_warmstart=pgs_warmstart,
-            mf_warmstart=mf_warmstart,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        angular_damping=0.0,
+        pgs_mode="matrix_free",
+        pgs_velocity_iterations=velocity_iterations,
+        pgs_warmstart=pgs_warmstart,
+    )
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
     heights, velocities, counts, routes = [], [], [], set()
-    pipeline = (
-        newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
-        if pgs_warmstart or mf_warmstart
-        else None
-    )
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest") if pgs_warmstart else None
     contacts = pipeline.contacts() if pipeline is not None else None
     for _ in range(steps):
         if pipeline is None:
@@ -148,14 +141,13 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     builder.add_shape_sphere(body, radius=RADIUS, cfg=cfg)
     builder.add_ground_plane(cfg=cfg)
     model = builder.finalize(device=device)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            pgs_velocity_iterations=velocity_iterations,
-            pgs_debug=True,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        angular_damping=0.0,
+        pgs_mode="matrix_free",
+        pgs_velocity_iterations=velocity_iterations,
+        pgs_debug=True,
+    )
     state_0, state_1 = model.state(), model.state()
     # A free body is driven through joint_qd; writing body_qd alone is discarded
     # by the forward kinematics the solver runs from joint state.
@@ -448,10 +440,6 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
         return newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_velocity_iterations=4, **kwargs)
 
     make(pgs_warmstart=True)
-    make(mf_warmstart=True)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
-        solver = make()
-        test.assertTrue(solver._mf_warmstart_enabled)
 
     # Exercise dense slot warm starting and MF identity warm starting through
     # the same velocity pass, not just their constructor paths.
@@ -459,7 +447,7 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
     _assert_landed(test, h, v, n, "dense warm start")
     test.assertEqual(routes, {PATH_DENSE})
 
-    h, v, n, routes = _drop(device, 4, mf_warmstart=True)
+    h, v, n, routes = _drop(device, 4, pgs_warmstart=True)
     _assert_landed(test, h, v, n, "matrix-free identity warm start")
     test.assertEqual(routes, {PATH_MATRIX_FREE})
 

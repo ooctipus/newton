@@ -93,7 +93,6 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
 
 _SQUEEZE_SOLVER = {
     "pgs_mode": "matrix_free",
-    "articulated_contact_response": "immediate",
     "pgs_iterations": 64,
     "pgs_velocity_iterations": 0,
     "pgs_beta": 0.05,

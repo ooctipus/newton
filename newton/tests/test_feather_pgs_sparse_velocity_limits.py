@@ -347,7 +347,6 @@ def _case(
             pgs_iterations=8,
             pgs_velocity_iterations=0,
             pgs_warmstart=False,
-            mf_warmstart=False,
             dense_max_constraints=32,
             mf_max_constraints=32,
             double_buffer=False,

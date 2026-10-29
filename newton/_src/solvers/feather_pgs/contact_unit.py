@@ -96,18 +96,14 @@ CONTACT_UNIT_STATE_FIELDS = 3
 """Per-row unit state: slide root, last applied load change, latch factor."""
 
 
-def check_contact_update(update: str, *, source: str = "contact_update") -> str:
+def check_contact_update(update: str) -> str:
     """Return ``update`` when it names a contact update.
-
-    Args:
-        update: The requested contact update.
-        source: The argument or environment variable that supplied ``update``, named in the error.
 
     Raises:
         ValueError: If ``update`` is not one of :data:`CONTACT_UPDATES`.
     """
     if update not in CONTACT_UPDATES:
-        raise ValueError(f"{source} must be one of {CONTACT_UPDATES}, got {update!r}")
+        raise ValueError(f"contact_update must be one of {CONTACT_UPDATES}, got {update!r}")
     return update
 
 

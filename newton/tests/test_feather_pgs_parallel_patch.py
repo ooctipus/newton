@@ -20,7 +20,6 @@ import itertools
 import math
 import os
 import unittest
-import warnings
 from fractions import Fraction
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -1006,7 +1005,6 @@ class TestKeyedPatchRows(unittest.TestCase):
 
 
 _SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
-_LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
 
 def _cpu_arm():
@@ -1101,7 +1099,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 enable_joint_velocity_limits=limits,
                 velocity_limit_activation_fraction=fraction,
                 velocity_limit_law=law,
-                _environment_options=frozenset(),
             )
             for name in ("_velocity_limit_sweep_law", "_parallel_velocity_limit_agreement"):
                 setattr(probe, name, MethodType(getattr(SolverFeatherPGS, name), probe))
@@ -1159,8 +1156,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], [24, 34])
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (34, "auto"))
                 self.assertEqual(tiers["velocity_limit_law"], "accumulated" if limits else None)
-                # The deprecated linked option applies the largest built linked tier's budget; point tiers none.
-                self.assertEqual(path_selection._EFFECTIVE["mf_gs_parallel_linked_sweeps"](probe), 34 if linked else 0)
                 # An infinite activation fraction reserves no velocity-limit row.
                 probe.velocity_limit_activation_fraction = float("inf")
                 self.assertIsNone(path_selection._tiers(probe)["velocity_limit_law"])
@@ -1179,27 +1174,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertEqual((tiers["family"], tiers["velocity_limit_law"]), ("incremental", law))
 
 
-_SWEEPS_FLAG = "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
-
-
 class TestTierSweeps(unittest.TestCase):
     """Budget every parallel tier by one automatic rule, at least ``mf_gs_parallel_sweeps``, under either law."""
-
-    def test_requests_are_validated(self):
-        """Accept None, "auto" and positive counts (decimal text too) as linked budgets; reject the rest."""
-        for value, expected in ((None, None), ("auto", "auto"), (64, 64), (np.int64(40), 40), ("48", 48)):
-            with self.subTest(value=value):
-                self.assertEqual(source._linked_sweeps_request(value, "option"), expected)
-        model = _cpu_arm()
-        for value in (0, -3, True, 2.5, "AUTO", "fast"):
-            with self.subTest(value=value), patch.dict(os.environ):
-                os.environ.pop(_SWEEPS_FLAG, None)
-                with self.assertRaisesRegex(ValueError, "mf_gs_parallel_linked_sweeps must be"):
-                    SolverFeatherPGS(model, mf_gs_parallel_linked_sweeps=value)
-                if isinstance(value, str):
-                    os.environ[_SWEEPS_FLAG] = value
-                    with self.assertRaisesRegex(ValueError, f"{_SWEEPS_FLAG} must be"):
-                        SolverFeatherPGS(model)
 
     def test_auto_budget_grows_with_iterations_and_tier_rows(self):
         """Sweep ceil(7/2 * pgs_iterations * sqrt(rows / 32)) times within every tier's bounds.
@@ -1245,83 +1221,21 @@ class TestTierSweeps(unittest.TestCase):
         self.assertEqual(wrong, [])
 
     def test_solver_budgets_every_tier(self):
-        """Budget point and linked tiers by one rule; the deprecated linked budget still sets the linked tiers'."""
+        """Budget point and linked tiers by one rule."""
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
-        for anchors, linked, environment in itertools.product((False, True), ("auto", None, 40), (False, True)):
-            if environment and linked == "auto":
-                continue
-            probe = SimpleNamespace(
-                _friction_anchors_enabled=anchors,
-                _environment_options=frozenset({"mf_gs_parallel_linked_sweeps"} if environment else ()),
-                mf_gs_parallel_linked_sweeps=linked,
-                mf_gs_parallel_sweeps=24,
-                pgs_iterations=12,
-            )
-            with self.subTest(anchors=anchors, linked=linked, environment=environment):
+        for anchors in (False, True):
+            probe = SimpleNamespace(_friction_anchors_enabled=anchors, mf_gs_parallel_sweeps=24, pgs_iterations=12)
+            with self.subTest(anchors=anchors):
                 budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
-                if anchors and linked != "auto":
-                    expected = 24 if linked is None else linked
-                    self.assertEqual((budgets, rule), ([expected] * 4, "mf_gs_parallel_linked_sweeps"))
-                    source_name = _SWEEPS_FLAG if environment else "mf_gs_parallel_linked_sweeps"
-                    self.assertTrue(reason.startswith(f"{source_name}={linked} (deprecated)"), reason)
-                    continue
                 self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
                 self.assertIn("ceil(7/2 * pgs_iterations * sqrt(R / 32))", reason)
                 self.assertIn("pgs_iterations=12", reason)
                 self.assertIn("at least mf_gs_parallel_sweeps=24 and at most 128", reason)
         # mf_gs_parallel_sweeps above the cap keeps its own budget; the reason states the bounds that way round.
-        probe = SimpleNamespace(
-            _friction_anchors_enabled=False,
-            _environment_options=frozenset(),
-            mf_gs_parallel_linked_sweeps="auto",
-            mf_gs_parallel_sweeps=160,
-            pgs_iterations=12,
-        )
+        probe = SimpleNamespace(_friction_anchors_enabled=False, mf_gs_parallel_sweeps=160, pgs_iterations=12)
         budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
         self.assertEqual((budgets, rule), ([160] * 4, "auto"))
         self.assertIn("at most 128 unless mf_gs_parallel_sweeps is larger", reason)
-
-    def test_linked_budget_is_deprecated(self):
-        """Warn for a linked budget or its override, keep honoring it, and record its source."""
-        default = inspect.signature(SolverFeatherPGS).parameters["mf_gs_parallel_linked_sweeps"].default
-        self.assertEqual(default, "auto")
-        model = _cpu_arm()
-        for environment, argument, expected, source_name in (
-            (None, "auto", "auto", "default"),
-            (None, None, None, "argument"),
-            ("64", "auto", 64, "environment"),
-            ("auto", 32, "auto", "environment"),
-            ("48", 48, 48, "argument"),
-        ):
-            with self.subTest(environment=environment, argument=argument), patch.dict(os.environ):
-                os.environ.pop(_SWEEPS_FLAG, None)
-                if environment is not None:
-                    os.environ[_SWEEPS_FLAG] = environment
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, mf_gs_parallel_linked_sweeps=argument)
-                deprecated = sorted(
-                    str(warning.message).split(" ", 1)[0]
-                    for warning in caught
-                    if issubclass(warning.category, DeprecationWarning) and "parallel tier" in str(warning.message)
-                )
-                given = (("mf_gs_parallel_linked_sweeps", argument != "auto"), (_SWEEPS_FLAG, environment is not None))
-                self.assertEqual(deprecated, sorted(name for name, present in given if present))
-                self.assertEqual(solver.mf_gs_parallel_linked_sweeps, expected)
-                selected = solver.get_path_selection()
-                option = selected["options"]["mf_gs_parallel_linked_sweeps"]
-                self.assertEqual((option["requested"], option["source"]), (argument, source_name))
-                self.assertEqual(option["applied"], 0)  # no tiers on CPU
-                self.assertEqual(selected["environment"]["applied"].get(_SWEEPS_FLAG), environment)
-        with patch.dict(os.environ), warnings.catch_warnings():
-            os.environ.pop(_SWEEPS_FLAG, None)
-            warnings.simplefilter("error", DeprecationWarning)
-            omitted = SolverFeatherPGS(model, friction_anchor_beta=0.2)
-        self.assertEqual((omitted.mf_gs_parallel_sweeps, omitted.mf_gs_parallel_linked_sweeps), (24, "auto"))
-        self.assertEqual(
-            omitted.get_path_selection()["options"]["mf_gs_parallel_linked_sweeps"],
-            {"applied": 0, "requested": "auto", "default": "auto", "source": "default"},
-        )
 
     def test_budget_carries_a_truncated_tier_to_the_serial_fixed_point(self):
         """Leave a two-sweep linked tier short of a sliding stance's serial fixed point, and reach it within budget.
@@ -1696,19 +1610,6 @@ def _exact_budget():
     return patch.object(sweep_routes_tiers, "TIER_SWEEPS_PER_ITERATION", Fraction(0))
 
 
-def _drop_budget_override(test):
-    """Run ``test`` without an exported ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``, which overrides every linked budget.
-
-    The tier tests rely on the automatic budget, raise it with ``mf_gs_parallel_sweeps``
-    or pin it (:func:`_exact_budget`); the deprecated override would replace the linked
-    tiers'. The environment is restored after the test.
-    """
-    environment = patch.dict(os.environ)
-    environment.start()
-    test.addCleanup(environment.stop)
-    os.environ.pop(_SWEEPS_FLAG, None)
-
-
 def _friction_pairs(solver, world):
     """Each friction pair's impulse magnitude and pooled budget ``mu * (ring's normal impulses)``."""
     count = int(solver.constraint_count.numpy()[world])
@@ -1726,10 +1627,6 @@ def _friction_pairs(solver, world):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
-    def setUp(self):
-        """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
-        _drop_budget_override(self)
-
     def test_patch_runs_linked_tiers_unless_switched_off(self):
         """Build linked tiers for patch friction unless the switch is 0, and point tiers for point friction.
 
@@ -1953,32 +1850,19 @@ class TestPatchParallelRoutes(unittest.TestCase):
         np.testing.assert_allclose(velocities[2000, True], velocities[2000, False], rtol=0.0, atol=1.0e-6)
 
     def test_every_tier_takes_the_automatic_budget(self):
-        """Build point and linked tiers with the automatic budget, at least mf_gs_parallel_sweeps, and record it.
-
-        The deprecated ``mf_gs_parallel_linked_sweeps`` still sets the linked tiers'
-        budget, a count or exactly ``mf_gs_parallel_sweeps`` for ``None``, and warns.
-        """
+        """Build point and linked tiers with the automatic budget, at least mf_gs_parallel_sweeps, and record it."""
         model = standing_model()
         options = {"dense_max_constraints": 64, "pgs_iterations": 8}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             built = {}
             for beta, sweeps in itertools.product((0.0, 0.2), (24, 40, 64)):
-                built[beta, sweeps, "auto"] = _matrix_free_solver(
+                built[beta, sweeps] = _matrix_free_solver(
                     model, beta=beta, parallel_rows=64, mf_gs_parallel_sweeps=sweeps, **options
                 )
-            for linked in (48, None):
-                with self.assertWarnsRegex(DeprecationWarning, "mf_gs_parallel_linked_sweeps is deprecated"):
-                    built[0.2, 24, linked] = _matrix_free_solver(
-                        model, beta=0.2, parallel_rows=64, mf_gs_parallel_linked_sweeps=linked, **options
-                    )
-        for (beta, sweeps, linked), solver in built.items():
-            with self.subTest(beta=beta, sweeps=sweeps, linked=linked):
-                if linked == "auto":
-                    # 7/2 * 8 * sqrt(rows / 32): 28 and 40 sweeps for 32 and 64 rows, at least mf_gs_parallel_sweeps.
-                    expected, rule = [max(28, sweeps), max(40, sweeps)], "auto"
-                else:
-                    budget = sweeps if linked is None else linked
-                    expected, rule = [budget, budget], "mf_gs_parallel_linked_sweeps"
+        for (beta, sweeps), solver in built.items():
+            with self.subTest(beta=beta, sweeps=sweeps):
+                # 7/2 * 8 * sqrt(rows / 32): 28 and 40 sweeps for 32 and 64 rows, at least mf_gs_parallel_sweeps.
+                expected, rule = [max(28, sweeps), max(40, sweeps)], "auto"
                 keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
                 self.assertEqual(len(keys), 2, keys)
                 for key, budget in zip(keys, expected, strict=True):
@@ -1988,8 +1872,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 tiers = selected["routes"]["sweep"]["tiers"]
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], expected)
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (max(expected), rule))
-                applied = selected["options"]["mf_gs_parallel_linked_sweeps"]["applied"]
-                self.assertEqual(applied, max(expected) if beta else 0)
                 state, _ = _rollout(model, solver, 2)
                 for name in _STATE_FIELDS:
                     self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
@@ -2012,10 +1894,6 @@ class TestPatchParallelPhysics(unittest.TestCase):
 
     # (friction_anchor_beta, mf_gs_parallel_rows): each law's serial sweep and tiers at their default budget.
     _ARMS = ((0.0, 0), (0.0, 32), (0.2, 0), (0.2, 32))
-
-    def setUp(self):
-        """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
-        _drop_budget_override(self)
 
     def _assert_budget(self, solver, parallel_rows):
         """Require the tiers to sweep the automatic budget of 32 rows at eight iterations."""
@@ -2232,8 +2110,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         }
         with patch.dict(os.environ):
             # The defaults, whatever the exported environment says: tiers admitted, the stateless law.
-            for name in (_SWITCH, _SWEEPS_FLAG, _LAW_FLAG):
-                os.environ.pop(name, None)
+            os.environ.pop(_SWITCH, None)
             arms = {
                 "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged),
                 "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),

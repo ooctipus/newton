@@ -92,7 +92,6 @@ def fixture(
         # whether the optional spin radius is zero or positive.
         "friction_anchor_beta": 0.0,
         "pgs_mode": "matrix_free",
-        "articulated_contact_response": "immediate",
         "pgs_iterations": 128,
         "pgs_velocity_iterations": 0,
         "pgs_beta": 0.05,
@@ -208,7 +207,6 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         model,
         contact_torsion_radius=radius,
         pgs_mode="matrix_free",
-        articulated_contact_response="immediate",
         pgs_iterations=64,
         pgs_velocity_iterations=0,
         pgs_beta=0.05,
@@ -545,9 +543,6 @@ class TestContactTorsion(unittest.TestCase):
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 fixture(0.01, **options)
-        with patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "1"}):
-            with self.assertRaises(ValueError):
-                fixture(0.01)
 
     def test_compliance_combination_rejected_at_construction(self):
         """Fail before stepping when both experimental responses are requested."""

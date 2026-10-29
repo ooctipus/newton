@@ -30,8 +30,8 @@ class TestPreeliminationSignature(unittest.TestCase):
     def test_legacy_joint_gap_position_is_preserved(self):
         """Bind a deprecated positional gap to the gap option without silently coercing it to a boolean."""
         parameters = list(inspect.signature(newton.solvers.SolverFeatherPGS).parameters.values())
-        self.assertEqual(parameters[12].name, "joint_limit_activation_gap")
-        arguments = [parameter.default for parameter in parameters[1:12]] + [0.123]
+        self.assertEqual(parameters[11].name, "joint_limit_activation_gap")
+        arguments = [parameter.default for parameter in parameters[1:11]] + [0.123]
         model = newton.ModelBuilder().finalize(device="cpu")
         with self.assertWarnsRegex(DeprecationWarning, "'joint_limit_activation_gap' positionally"):
             solver = newton.solvers.SolverFeatherPGS(model, *arguments, bilateral_preelimination_include_mimics=False)

@@ -194,13 +194,11 @@ def _make_solver(model, sparse, **overrides):
     """Change only the representation selection between comparison solvers."""
     options = {
         "pgs_mode": "matrix_free",
-        "articulated_contact_response": "immediate",
         "drive_mode": "augmented",
         "pgs_iterations": 32,
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,
         "pgs_warmstart": False,
-        "mf_warmstart": False,
         "dense_max_constraints": 32,
         "use_parallel_streams": True,
         "double_buffer": False,
@@ -540,12 +538,9 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 self.assertTrue(solver._mf_sweeps)
                 self.assertGreater(solver._packed_J.size, 1)
 
-    def test_warm_starts_are_admitted(self):
-        """Warm starts seed the sparse sweeps from carried impulses on models without free rigid bodies."""
-        model = _build_model()
-        for options in ({"pgs_warmstart": True}, {"mf_warmstart": True}):
-            with self.subTest(options=options):
-                self.assertEqual(_make_solver(model, True, **options)._sparse_mass_matrix_size, 9)
+    def test_warm_start_is_admitted(self):
+        """Warm start seeds the sparse sweeps from carried impulses on models without free rigid bodies."""
+        self.assertEqual(_make_solver(_build_model(), True, pgs_warmstart=True)._sparse_mass_matrix_size, 9)
 
 
 if __name__ == "__main__":

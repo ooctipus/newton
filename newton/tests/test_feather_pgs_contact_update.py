@@ -971,20 +971,15 @@ def _step(solver, model, steps):
 
 
 class TestContactUpdateSolver(unittest.TestCase):
-    """The ``contact_update`` option, its environment override, route record and launches."""
+    """The ``contact_update`` option, its route record and launches."""
 
     def test_sequential_is_the_unchanged_law(self):
-        """Run the unchanged sequential kernels for the default and an explicit or environment "sequential" law."""
+        """Run the unchanged sequential kernels for the default and an explicit "sequential" law."""
         states = []
         with _without_solver_environment():
-            for options, environment in (
-                ({}, {}),
-                ({"contact_update": "sequential"}, {}),
-                ({}, {"FEATHER_PGS_CONTACT_UPDATE": "sequential"}),
-            ):
-                with mock.patch.dict(os.environ, environment):
-                    model = _free_box_model()
-                    solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
+            for options in ({}, {"contact_update": "sequential"}):
+                model = _free_box_model()
+                solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
                 sweep = solver.get_path_selection()["routes"]["sweep"]
                 self.assertEqual(sweep["dense"], {"kernels": ["sweep_loop"]})
                 self.assertEqual(sweep["free_body_matrix_free"], "sweep_mf_loop")
@@ -1039,13 +1034,10 @@ class TestContactUpdateSolver(unittest.TestCase):
                     np.testing.assert_array_equal(out[k, : len(lam)].astype(np.float64), lam)
 
     def test_unit_option_runs_the_unit_loop_sweeps(self):
-        """Run both CPU loop sweeps' unit variants for contact_update="unit", from the argument or the environment."""
+        """Run both CPU loop sweeps' unit variants for contact_update="unit"."""
         with _without_solver_environment():
-            for options, environment in (
-                ({"contact_update": "unit"}, {}),
-                ({}, {"FEATHER_PGS_CONTACT_UPDATE": "unit"}),
-            ):
-                with self.subTest(options=options), mock.patch.dict(os.environ, environment):
+            for options in ({"contact_update": "unit"},):
+                with self.subTest(options=options):
                     model = _free_box_model()
                     with warnings.catch_warnings():
                         warnings.simplefilter("error")
@@ -1067,7 +1059,7 @@ class TestContactUpdateSolver(unittest.TestCase):
                     )
                     option = selected["options"]["contact_update"]
                     self.assertEqual(option["applied"], "unit")
-                    self.assertEqual(option["source"], "environment" if environment else "argument")
+                    self.assertEqual(option["source"], "argument")
                     with launched_kernels() as keys:
                         state = _step(solver, model, 20)
                     # The arm and the box share a world: one-iteration dense and free-body launches interleave.
@@ -1079,13 +1071,10 @@ class TestContactUpdateSolver(unittest.TestCase):
                     self.assertAlmostEqual(float(state.body_q.numpy()[1, 2]), 0.1, delta=2.0e-3)
 
     def test_invalid_contact_update_raises(self):
-        """Reject a contact update other than "sequential" or "unit", from the argument or the environment."""
+        """Reject a contact update other than "sequential" or "unit"."""
         with _without_solver_environment():
             with self.assertRaisesRegex(ValueError, "contact_update must be one of"):
                 SolverFeatherPGS(_free_box_model(), contact_update="block")
-            with mock.patch.dict(os.environ, {"FEATHER_PGS_CONTACT_UPDATE": "exact"}):
-                with self.assertRaisesRegex(ValueError, "FEATHER_PGS_CONTACT_UPDATE must be one of"):
-                    SolverFeatherPGS(_free_box_model())
 
     def test_sweeps_without_units_keep_the_sequential_law_and_warn(self):
         """Record the sweeps of a "unit" request that keep the sequential law, and warn once with them."""

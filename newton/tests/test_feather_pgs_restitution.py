@@ -115,7 +115,6 @@ def _make_solver(
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
     pgs_warmstart=False,
-    mf_warmstart=False,
     pgs_mode="matrix_free",
 ):
     """Construct a deterministic frictionless FeatherPGS test solver."""
@@ -128,16 +127,12 @@ def _make_solver(
         "pgs_cfm": 0.0,
         "pgs_omega": 1.0,
         "pgs_warmstart": pgs_warmstart,
-        "mf_warmstart": mf_warmstart,
     }
     if enable_restitution is not None:
         kwargs["enable_restitution"] = enable_restitution
     if restitution_velocity_threshold is not None:
         kwargs["restitution_velocity_threshold"] = restitution_velocity_threshold
-    # Keep a developer's environment from silently turning warm starting on in
-    # tests that are intended to be cold.
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        return newton.solvers.SolverFeatherPGS(model, **kwargs)
+    return newton.solvers.SolverFeatherPGS(model, **kwargs)
 
 
 def _reset_state(model, state, vertical_velocity):
@@ -899,12 +894,12 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
     # Both incident speeds used below must cross from this same authored pose.
     separation = IMPACT_FRACTION * 2.0 * DEFAULT_DT
     cases = (
-        ("matrix-free MF", "matrix_free", "free", True, False, PATH_MATRIX_FREE),
-        ("matrix-free dense", "matrix_free", "articulated", False, True, PATH_DENSE),
-        ("split MF", "split", "free", True, False, PATH_MATRIX_FREE),
-        ("split dense", "split", "articulated", False, True, PATH_DENSE),
+        ("matrix-free MF", "matrix_free", "free", PATH_MATRIX_FREE),
+        ("matrix-free dense", "matrix_free", "articulated", PATH_DENSE),
+        ("split MF", "split", "free", PATH_MATRIX_FREE),
+        ("split dense", "split", "articulated", PATH_DENSE),
     )
-    for label, pgs_mode, scene, mf_warmstart, pgs_warmstart, expected_path in cases:
+    for label, pgs_mode, scene, expected_path in cases:
         with test.subTest(warmstart=label):
             model, body = _build_plane_model(
                 device,
@@ -915,8 +910,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
             solver = _make_solver(
                 model,
                 velocity_iterations=0,
-                mf_warmstart=mf_warmstart,
-                pgs_warmstart=pgs_warmstart,
+                pgs_warmstart=True,
                 pgs_mode=pgs_mode,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")

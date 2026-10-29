@@ -342,8 +342,8 @@ class TestEnvironmentRecord(unittest.TestCase):
         self.assertEqual(
             fpgs_flags.record(environ),
             {
-                "applied": {"FEATHER_PGS_ROWS_THREADS_X": "2", "IL_NEWTON_FPGS_MF_WARMSTART": "0"},
-                "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED"],
+                "applied": {"FEATHER_PGS_ROWS_THREADS_X": "2"},
+                "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "IL_NEWTON_FPGS_MF_WARMSTART"],
                 "retired": [],
                 "isaac_lab": {},
             },

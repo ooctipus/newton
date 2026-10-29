@@ -300,19 +300,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["pgs_kernel"], {"applied": "loop", "requested": "auto", "default": "auto", "source": "default"}
         )
-        self.assertIsNone(options["pgs_chunk_size"]["applied"])
         self.assertEqual(options["contact_friction_gap_threshold"]["applied"], "inf")
         self.assertEqual(options["joint_limit_activation_gap"]["default"], "inf")
         self.assertFalse(options["fuse_joint_velocity_limits"]["applied"])
         self.assertEqual(options["sparse_mass_matrix"]["applied"], "off")
         self.assertEqual(options["cached_dynamics"]["applied"], "off")
-        # Split mode builds no matrix-free tier, CPU builds no stream, and the deprecated
-        # propagation_cached_response selects nothing.
+        # Split mode builds no matrix-free tier and CPU builds no stream.
         self.assertEqual(
             options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
         )
-        for name in ("use_parallel_streams", "propagation_cached_response"):
-            self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
+        self.assertEqual(
+            options["use_parallel_streams"], {"applied": False, "requested": True, "default": True, "source": "default"}
+        )
         solver = SolverFeatherPGS(
             model, angular_damping=0.1, friction_anchor_beta=0.0, pgs_iterations=7, mf_gs_parallel_rows=48
         )
@@ -339,16 +338,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 52 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 53rd
+        declaration order, so a positional call over the 44 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 45th
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:53]}
-        self.assertEqual((parameters[1].name, parameters[52].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:45]}
+        self.assertEqual((parameters[1].name, parameters[44].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -374,46 +373,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[53].name, "pgs_solve_readout")
-        with self.assertRaisesRegex(TypeError, r"takes at most 54 positional arguments but 55 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[53].default)
+        self.assertEqual(parameters[45].name, "pgs_solve_readout")
+        with self.assertRaisesRegex(TypeError, r"takes at most 46 positional arguments but 47 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[45].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
         model = _cpu_model()
         with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
-            SolverFeatherPGS(model, 0.05, contact_friction_anchor_limit=2, contact_shared_anchor=True)
+            SolverFeatherPGS(model, 0.05, contact_shared_anchor=True)
         messages = {str(item.message).split(" ")[0]: os.path.basename(item.filename) for item in recorded}
-        self.assertEqual(
-            messages,
-            dict.fromkeys(("Passing", "contact_friction_anchor_limit", "Patch"), os.path.basename(__file__)),
-        )
-
-    def test_cpu_options_record_legacy_alias_environment(self):
-        """Attribute an option the IL_NEWTON_FPGS_ warm-start aliases changed to the environment."""
-        with patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "1", "IL_NEWTON_FPGS_MF_WARMSTART_DECAY": "0.5"}):
-            options = SolverFeatherPGS(_cpu_model()).get_path_selection()["options"]
-        self.assertEqual(
-            options["mf_warmstart"], {"applied": True, "requested": False, "default": False, "source": "environment"}
-        )
-        self.assertEqual(
-            options["mf_warmstart_decay"], {"applied": 0.5, "requested": 1.0, "default": 1.0, "source": "environment"}
-        )
-        self.assertEqual(
-            options["pgs_warmstart"], {"applied": True, "requested": False, "default": False, "source": "environment"}
-        )
-        self.assertEqual(
-            options["pgs_warmstart_decay"],
-            {"applied": 0.5, "requested": 1.0, "default": 1.0, "source": "environment"},
-        )
-        with patch.dict(os.environ, {"IL_NEWTON_FPGS_MF_WARMSTART": "0", "IL_NEWTON_FPGS_MF_WARMSTART_DECAY": "0.5"}):
-            options = SolverFeatherPGS(_cpu_model()).get_path_selection()["options"]
-        self.assertEqual(options["mf_warmstart_decay"]["source"], "environment")
-        # Without the warm-start alias the decay alias leaves the unified decay alone.
-        self.assertEqual(
-            options["pgs_warmstart_decay"], {"applied": 1.0, "requested": 1.0, "default": 1.0, "source": "default"}
-        )
+        self.assertEqual(messages, dict.fromkeys(("Passing", "Patch"), os.path.basename(__file__)))
 
     def test_cpu_route_record_reports_known_selections(self):
         """Report the CPU loop sweep, the split free-body rows and the declined owners with their reasons."""
@@ -1438,46 +1409,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         ):
             with self.subTest(is_cpu=is_cpu, pgs_mode=mode, choice=choice), self.assertRaisesRegex(ValueError, message):
                 resolve_kernel_choices({**auto, **choice}, {}, is_cpu=is_cpu, pgs_mode=mode)
-
-    def test_contact_only_pgs_kernels_are_deprecated(self):
-        """Warn that the removed contact-only kernels have no effect and build the automatic solver.
-
-        ``tiled_contact`` and ``streaming`` select the automatic kernel in either mode, with the
-        default patch friction and joint limits, and ``pgs_chunk_size``, which tuned the streaming
-        kernel, is ignored. CPU construction of matrix-free mode stops at its device check, after
-        the warnings; there the request warns only that it is deprecated, not that matrix-free mode
-        ignores it.
-        """
-        model = _cpu_model()
-        reference = SolverFeatherPGS(model, enable_joint_limits=True).get_path_selection()
-        for kernel in ("tiled_contact", "streaming"):
-            with self.subTest(pgs_kernel=kernel):
-                with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
-                    warnings.simplefilter("always")
-                    solver = SolverFeatherPGS(model, pgs_kernel=kernel, pgs_chunk_size=16, enable_joint_limits=True)
-                deprecated = [item for item in recorded if issubclass(item.category, DeprecationWarning)]
-                self.assertEqual(len(deprecated), 2, [str(item.message) for item in recorded])
-                self.assertIn(f"pgs_kernel={kernel!r} is deprecated and has no effect", str(deprecated[0].message))
-                self.assertIn("pgs_chunk_size is deprecated and has no effect", str(deprecated[1].message))
-                for item in deprecated:
-                    self.assertEqual(os.path.basename(item.filename), os.path.basename(__file__))
-                self.assertEqual(solver.pgs_kernel, "loop")
-                self.assertTrue(solver._friction_anchors_enabled)
-                selected = solver.get_path_selection()
-                for key in ("routes", "pgs_kernel"):
-                    self.assertEqual(selected[key], reference[key], key)
-                self.assertEqual(
-                    selected["options"]["pgs_kernel"],
-                    {"applied": "loop", "requested": kernel, "default": "auto", "source": "argument"},
-                )
-                self.assertIsNone(selected["options"]["pgs_chunk_size"]["applied"])
-                with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
-                    warnings.simplefilter("always")
-                    with self.assertRaisesRegex(NotImplementedError, "pgs_mode='matrix_free' requires CUDA"):
-                        SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel=kernel)
-                self.assertEqual(
-                    [item.category for item in recorded if "pgs_kernel" in str(item.message)], [DeprecationWarning]
-                )
 
     @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free mode requires CUDA")
     def test_matrix_free_ignores_an_explicit_pgs_kernel(self):

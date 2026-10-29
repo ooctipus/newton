@@ -222,7 +222,6 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
             pgs_iterations=8,
             pgs_velocity_iterations=0,
             pgs_warmstart=False,
-            mf_warmstart=False,
             pgs_beta=0.07,
             pgs_cfm=2e-4,
             dense_max_constraints=32,

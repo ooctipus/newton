@@ -19,7 +19,6 @@ The CUDA tests run the kernels against a float64 reference and roll out solvers.
 import ast
 import inspect
 import itertools
-import os
 import re
 import unittest
 from types import SimpleNamespace
@@ -35,8 +34,6 @@ from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VE
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_rows
-
-_LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, accumulated sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
@@ -228,7 +225,6 @@ def _law_probe(**changes):
         "_free_rigid_body_count": 0,
         "velocity_limit_activation_fraction": 0.0,
         "velocity_limit_law": "accumulated",
-        "_environment_options": frozenset(),
     }
     probe.update(changes)
     return SimpleNamespace(**probe)
@@ -255,7 +251,6 @@ class TestVelocityLimitLawOption(unittest.TestCase):
                 "velocity_limit_law=",
             ),
             ({"velocity_limit_activation_fraction": float("inf")}, "stateless", "No velocity-limit rows"),
-            ({"_environment_options": frozenset({"velocity_limit_law"})}, "accumulated", _LAW_FLAG),
             ({"pgs_mode": "split"}, None, "Split mode"),
         ):
             with self.subTest(**{key: str(value) for key, value in changes.items()}):
@@ -271,10 +266,8 @@ class TestVelocityLimitLawOption(unittest.TestCase):
         no matrix-free sweep, so it applies neither law.
         """
         model = _cpu_arm()
-        with mock.patch.dict(os.environ):
-            os.environ.pop(_LAW_FLAG, None)
-            default = SolverFeatherPGS(model)
-            accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
+        default = SolverFeatherPGS(model)
+        accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
         self.assertEqual(default.velocity_limit_law, "stateless")
         self.assertEqual(accumulated.velocity_limit_law, "accumulated")
         for solver, requested in ((default, "stateless"), (accumulated, "accumulated")):
@@ -293,27 +286,6 @@ class TestVelocityLimitLawOption(unittest.TestCase):
             self.assertIn("Split mode", limits["law_reason"])
         with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
             SolverFeatherPGS(model, velocity_limit_law="clamped")
-
-    def test_environment_overrides_the_argument(self):
-        """Let FEATHER_PGS_VELOCITY_LIMIT_LAW override the argument and record the environment as the source."""
-        model = _cpu_arm()
-        with mock.patch.dict(os.environ, {_LAW_FLAG: "accumulated"}):
-            solver = SolverFeatherPGS(model)
-            explicit = SolverFeatherPGS(model, velocity_limit_law="accumulated")
-        self.assertEqual(solver.velocity_limit_law, "accumulated")
-        record = solver.get_path_selection()
-        self.assertEqual(record["options"]["velocity_limit_law"]["source"], "environment")
-        self.assertEqual(record["environment"]["applied"][_LAW_FLAG], "accumulated")
-        # An override that agrees with the argument changes nothing.
-        self.assertEqual(explicit.get_path_selection()["options"]["velocity_limit_law"]["source"], "argument")
-        with mock.patch.dict(os.environ, {_LAW_FLAG: "stateless"}):
-            self.assertEqual(SolverFeatherPGS(model, velocity_limit_law="accumulated").velocity_limit_law, "stateless")
-        # An unknown law names the variable that supplied it, not the argument.
-        with (
-            mock.patch.dict(os.environ, {_LAW_FLAG: "clamped"}),
-            self.assertRaisesRegex(ValueError, f"^{_LAW_FLAG} must be one of .*, got 'clamped'$"),
-        ):
-            SolverFeatherPGS(model)
 
 
 def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, law, iterations):

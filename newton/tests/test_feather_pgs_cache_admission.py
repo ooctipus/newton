@@ -35,7 +35,6 @@ def _held_tree_solver(law):
         _point_contact_paths=point,
         pgs_mode="matrix_free",
         _paired_response_primary_size=None,
-        articulated_contact_response="immediate",
         drive_mode="augmented",
         pgs_velocity_iterations=0,
         _connect_count=0,

@@ -24,7 +24,6 @@ _NUMBER_RULES = (
         False,
     ),
     ("contact_friction_scale", float, lambda value: not value < 0.0, "must be non-negative", False),
-    ("contact_friction_anchor_limit", int, lambda value: value >= 0, "must be non-negative", False),
     ("contact_speculative_scale", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("same_articulation_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),

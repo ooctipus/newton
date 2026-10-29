@@ -203,7 +203,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         options = {
             "pgs_mode": "matrix_free",
             "drive_mode": "augmented",
-            "articulated_contact_response": "immediate",
             "enable_joint_velocity_limits": False,
             "dense_max_constraints": low,
             "mf_gs_parallel_rows": 0,

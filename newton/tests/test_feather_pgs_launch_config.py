@@ -4,7 +4,6 @@
 import functools
 import inspect
 import unittest
-import warnings
 from unittest import mock
 
 import numpy as np
@@ -264,39 +263,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
         self.assertEqual(solver.tile_threads, 64)
-        self.assertEqual(solver.articulated_contact_response, "immediate")
-
-    def test_propagation_responses_are_deprecated(self):
-        """Warn that the propagation responses and their options have no effect, and run the immediate response."""
-        model = _build_chain_model(num_links=2, num_worlds=1)
-        for response in ("propagation", "propagation-fused", "propagation-colored"):
-            with self.subTest(response=response):
-                with self.assertWarnsRegex(DeprecationWarning, response):
-                    solver = SolverFeatherPGS(model, articulated_contact_response=response)
-                self.assertEqual(solver.articulated_contact_response, "immediate")
-                option = solver.get_path_selection()["options"]["articulated_contact_response"]
-                self.assertEqual((option["requested"], option["applied"]), (response, "immediate"))
-        for name, value, off in (
-            ("propagation_same_articulation_rows", True, False),
-            ("propagation_cached_response", False, False),
-            ("propagation_cached_response_max_bodies", 4, 0),
-        ):
-            with self.subTest(option=name):
-                with self.assertWarnsRegex(DeprecationWarning, name):
-                    solver = SolverFeatherPGS(model, **{name: value})
-                self.assertEqual(solver.get_path_selection()["options"][name]["applied"], off)
-        # Their former defaults select nothing, as before, and warn about nothing.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", DeprecationWarning)
-            SolverFeatherPGS(
-                model,
-                articulated_contact_response="immediate",
-                propagation_same_articulation_rows=False,
-                propagation_cached_response=True,
-                propagation_cached_response_max_bodies=8,
-            )
-        with self.assertRaisesRegex(ValueError, "articulated_contact_response"):
-            SolverFeatherPGS(model, articulated_contact_response="bad")
 
     def test_joint_limit_solver_compatibility_validation(self):
         model = _build_chain_model(num_links=2, num_worlds=1)

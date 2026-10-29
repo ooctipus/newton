@@ -1160,41 +1160,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="auto")
         self.assertEqual(solver.pgs_kernel, "loop")
 
-    def test_deprecated_anchor_limit_warns_instead_of_raising(self):
-        """Ignore the deprecated anchor limit without overriding the default or explicit opt-out."""
-        builder = newton.ModelBuilder()
-        body = builder.add_body()
-        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
-        model = builder.finalize(device="cpu")
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2)
-        self.assertEqual(solver.contact_friction_anchor_limit, 0)
-        self.assertTrue(solver._friction_anchors_enabled)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
-        if wp.is_cuda_available():
-            # The CUDA matrix-free route: the shim must warn and leave an explicit opt-out off.
-            cuda_model = builder.finalize(device="cuda:0")
-            with self.assertWarns(DeprecationWarning):
-                solver = newton.solvers.SolverFeatherPGS(
-                    cuda_model,
-                    contact_friction_anchor_limit=2,
-                    pgs_mode="matrix_free",
-                    friction_anchor_beta=0.0,
-                )
-            self.assertFalse(solver._friction_anchors_enabled)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, pgs_kernel="auto")
-        self.assertTrue(solver._friction_anchors_enabled)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.3)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.3)
-        with self.assertWarns(DeprecationWarning):
-            solver = newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=2, friction_anchor_beta=0.0)
-        self.assertFalse(solver._friction_anchors_enabled)
-        self.assertEqual(solver.contact_friction_anchor_limit, 0)
-        with self.assertRaisesRegex(ValueError, "contact_friction_anchor_limit must be non-negative"):
-            newton.solvers.SolverFeatherPGS(model, contact_friction_anchor_limit=-1)
-
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""
         for gate in ("contact_friction_gap_threshold", "contact_gap_gate"):

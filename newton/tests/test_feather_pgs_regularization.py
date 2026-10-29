@@ -179,7 +179,7 @@ def _stack_scene(device, g, pgs_mode="matrix_free", velocity_iterations=2):
         pgs_iterations=8,
         pgs_velocity_iterations=velocity_iterations,
         pgs_contact_regularization=g,
-        mf_warmstart=True,
+        pgs_warmstart=True,
     )
     return model, pipeline, solver, bodies
 
@@ -258,7 +258,7 @@ def test_regularization_documented_sag(test: unittest.TestCase, device):
     matrix-free route."""
     with wp.ScopedDevice(device):
         for rate in (60, 240):
-            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, mf_warmstart=True)
+            sag = _resting_box(device, 0.5, "matrix_free", rate, 3 * rate, pgs_warmstart=True)
             expected = _sag_formula(0.5, rate)
             test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"{rate} Hz: sag {sag * 1000:.2f} mm")
 
@@ -267,7 +267,7 @@ def test_regularization_split_route_documented_sag(test: unittest.TestCase, devi
     """The split route's standalone matrix-free kernel carries the same law as the
     fused kernel, so its resting box sags by the same formula (CPU-runnable)."""
     with wp.ScopedDevice(device):
-        sag = _resting_box(device, 0.5, "split", 60, 180, mf_warmstart=True)
+        sag = _resting_box(device, 0.5, "split", 60, 180, pgs_warmstart=True)
         expected = _sag_formula(0.5, 60)
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
@@ -312,7 +312,7 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
             pgs_iterations=8,
             pgs_velocity_iterations=2,
             pgs_contact_regularization=0.02,
-            mf_warmstart=True,
+            pgs_warmstart=True,
         )
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
@@ -518,7 +518,7 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             pgs_iterations=16,
             pgs_velocity_iterations=0,
             pgs_contact_regularization=g,
-            mf_warmstart=True,
+            pgs_warmstart=True,
         )
         s0, s1 = model.state(), model.state()
         control = model.control()
