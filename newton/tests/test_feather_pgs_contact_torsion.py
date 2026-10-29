@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate opt-in, load-bounded spin resistance on articulated contacts."""
 
-import os
 import unittest
 import warnings
 from types import SimpleNamespace
@@ -155,7 +154,7 @@ def torsion_neutral_route(solver):
     parallel-row admission that torsion clears, and the torsion specialization of the matrix-free
     sweep kernel. Reasons are text and lane timings are measurements; every other selection and
     applied option must match. Of the parallel-row record only the admission flag is dropped: the
-    zero-radius arm's follows its friction law and ``FEATHER_PGS_PATCH_PARALLEL_ROWS``, and
+    zero-radius arm's is admitted under either friction law, and
     :func:`assert_torsion_neutral_routes` requires the torsion arm's to be False.
     """
     record = _without_reasons(solver.get_path_selection())
@@ -175,8 +174,7 @@ def assert_torsion_neutral_routes(test, reference, selected_out):
     """Require a zero-radius and a selected-out torsion solver to share the pinned ordinary route.
 
     The selected-out arm runs the torsion sweep on ordinary rows, so it must decline the parallel
-    tiers (they have no torsion pass) and keyed rows whatever its friction law and
-    ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` say.
+    tiers (they have no torsion pass) and keyed rows whatever its friction law.
     """
     test.assertFalse(selected_out.get_path_selection()["routes"]["friction"]["parallel_rows"]["admitted"])
     route = torsion_neutral_route(reference)
@@ -384,30 +382,24 @@ class TestTorsionNeutralRoute(unittest.TestCase):
         The CUDA comparisons of a zero radius against a selected-out radius require equal neutral
         records before comparing states. Records are decided at construction, so both arms are
         built here in split mode, with the CUDA-only torsion mode check patched out, and neither
-        is stepped. ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` admits patch friction to the parallel rows
-        that torsion keeps a solver out of unless it is ``0``, as point friction is admitted: the
-        zero-radius arm is admitted in three of the four cases, the selected-out arm in none.
+        is stepped. Both friction laws are admitted to the parallel rows that torsion keeps a solver
+        out of: the zero-radius arm is admitted, the selected-out arm is not.
         """
         model = pads("cpu")
         split = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
         for law, options in (("point", {}), ("patch", PATCH_OPTIONS)):
-            for switch in (None, "0"):
-                with (
-                    self.subTest(law=law, FEATHER_PGS_PATCH_PARALLEL_ROWS=switch),
-                    patch.dict(os.environ),
-                    patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
-                ):
-                    os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
-                    if switch is not None:
-                        os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = switch
-                    reference = SolverFeatherPGS(model, contact_torsion_radius=0.0, **{**split, **options})
-                    selected_out = SolverFeatherPGS(
-                        model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(), **{**split, **options}
-                    )
-                    self.assertTrue(selected_out._contact_torsion_enabled)
-                    friction = reference.get_path_selection()["routes"]["friction"]
-                    self.assertEqual(friction["parallel_rows"]["admitted"], law == "point" or switch != "0")
-                    assert_torsion_neutral_routes(self, reference, selected_out)
+            with (
+                self.subTest(law=law),
+                patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
+            ):
+                reference = SolverFeatherPGS(model, contact_torsion_radius=0.0, **{**split, **options})
+                selected_out = SolverFeatherPGS(
+                    model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(), **{**split, **options}
+                )
+                self.assertTrue(selected_out._contact_torsion_enabled)
+                friction = reference.get_path_selection()["routes"]["friction"]
+                self.assertTrue(friction["parallel_rows"]["admitted"])
+                assert_torsion_neutral_routes(self, reference, selected_out)
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "Contact torsion currently requires CUDA")

@@ -17,19 +17,19 @@ from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
-from newton.tests.test_feather_pgs_path_selection import _cpu_model
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 DT = 1.0 / 400.0
+# The ordinary (unfused) contact updates, which these comparisons of the sweep laws hold fixed.
+_UNFUSED = {"contact_units": None}
 
 
 def _admission_probe(**changes):
     """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
     probe = SimpleNamespace(
-        _kernel_overrides={},
+        _route_pins={},
         _friction_anchors_enabled=False,
-        _patch_active_rows=False,
         max_world_dofs=18,
         dense_max_constraints=256,
     )
@@ -45,35 +45,34 @@ def _admit(probe, *, split=False, velocity=False, lanes=0):
 
 
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
-    def test_point_admission_ignores_the_patch_policy(self):
-        """Admit point friction's active rows exactly as before, whatever the patch policy says."""
-        for overrides, split, velocity, lanes in (
+    def test_point_admission(self):
+        """Admit point friction's active rows unless split, velocity-limit rows or a pin keep the full sweep."""
+        for pins, split, velocity, lanes in (
             ({}, False, False, 0),
             ({}, False, False, 16),
-            ({"sparse_active_contacts": False}, False, False, 0),
+            ({"active_rows": False}, False, False, 0),
             ({}, True, False, 8),
             ({}, False, True, 0),
         ):
-            expected = not overrides and not split and not velocity
-            for policy in (False, True):
-                with self.subTest(overrides=overrides, split=split, velocity=velocity, policy=policy):
-                    probe = _admission_probe(_kernel_overrides=overrides, _patch_active_rows=policy)
-                    active, reason = _admit(probe, split=split, velocity=velocity, lanes=lanes)
-                    self.assertEqual(active, expected)
-                    if active:
-                        self.assertEqual(reason, "Point-contact normal and limit rows are selected at sweep entry.")
+            expected = not pins and not split and not velocity
+            with self.subTest(pins=pins, split=split, velocity=velocity):
+                probe = _admission_probe(_route_pins=pins)
+                active, reason = _admit(probe, split=split, velocity=velocity, lanes=lanes)
+                self.assertEqual(active, expected)
+                if active:
+                    self.assertEqual(reason, "Point-contact normal and limit rows are selected at sweep entry.")
 
-    def test_patch_admission_follows_the_policy_and_small_worlds(self):
-        """Select patch rows at sweep entry unless the policy is off or a small world keeps its packed lanes."""
-        for policy, lanes, split, expected, phrase in (
-            (True, 0, False, True, "ring"),
-            (False, 0, False, False, "FEATHER_PGS_PATCH_ACTIVE_ROWS=0"),
-            (True, 16, False, False, "16-lane"),
-            (True, 8, False, False, "8-lane"),
-            (True, 0, True, False, "Split"),
+    def test_patch_admission_follows_small_worlds(self):
+        """Select patch rows at sweep entry unless a small world keeps its packed lanes (or a pin the full sweep)."""
+        for pins, lanes, split, expected, phrase in (
+            ({}, 0, False, True, "ring"),
+            ({"active_rows": False}, 0, False, False, "active_rows=False"),
+            ({}, 16, False, False, "16-lane"),
+            ({}, 8, False, False, "8-lane"),
+            ({}, 0, True, False, "Split"),
         ):
-            with self.subTest(policy=policy, lanes=lanes, split=split):
-                probe = _admission_probe(_friction_anchors_enabled=True, _patch_active_rows=policy)
+            with self.subTest(pins=pins, lanes=lanes, split=split):
+                probe = _admission_probe(_friction_anchors_enabled=True, _route_pins=pins)
                 active, reason = _admit(probe, split=split, lanes=lanes)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
@@ -87,7 +86,6 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
             (16, 64, {}, -1, 0),
             (17, 32, {}, 0, 0),
             (9, 65, {}, 0, 0),
-            (9, 32, {"FEATHER_PGS_SPARSE_SMALL_WORLDS": "0"}, 0, 0),
         ):
             with (
                 self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
@@ -100,31 +98,6 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 packed = staging(lanes_per_world=8 if dofs <= 8 else 16).bytes if packable else 1 << 20
                 lanes = SolverFeatherPGS._sparse_small_world_lanes(probe, staging, packed + slack)
                 self.assertEqual(lanes, expected)
-
-    def test_policy_reads_the_environment_once_and_reports_it(self):
-        """Read FEATHER_PGS_PATCH_ACTIVE_ROWS at construction and report it in the friction record."""
-        for environment, law, policy in (
-            ({}, "patch", True),
-            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "patch", False),
-            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "1"}, "patch", True),
-            ({}, "point", False),
-        ):
-            with self.subTest(environment=environment, law=law), mock.patch.dict(os.environ, environment, clear=True):
-                options = {"friction_anchor_beta": 0.0} if law == "point" else {}
-                solver = SolverFeatherPGS(_cpu_model(), **options)
-                self.assertEqual(solver._patch_active_rows, policy)
-                selected = solver.get_path_selection()
-                friction = selected["routes"]["friction"]
-                self.assertEqual(friction["law"], law)
-                if law == "patch":
-                    self.assertEqual("sparse active rows" in friction["reason"], not policy)
-                    # Linked triplets serve patch friction in either sweep: they are not among the
-                    # record's point-only owners.
-                    self.assertNotIn("triplets", friction["reason"])
-                self.assertEqual(
-                    selected["environment"]["applied"].get("FEATHER_PGS_PATCH_ACTIVE_ROWS"),
-                    environment.get("FEATHER_PGS_PATCH_ACTIVE_ROWS"),
-                )
 
 
 def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
@@ -161,9 +134,10 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
     def test_route_record_reports_linked_active_rows(self):
         """Run patch friction on the linked active-row kernel, and the full sweep when the policy is off."""
         model = _build_model()
-        point = _make_solver(model, True, friction_anchor_beta=0.0, dense_max_constraints=96)
-        patch_friction = _make_solver(model, True, dense_max_constraints=96)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}):
+        with mock.patch.dict(SolverFeatherPGS._route_pins, _UNFUSED):
+            point = _make_solver(model, True, friction_anchor_beta=0.0, dense_max_constraints=96)
+            patch_friction = _make_solver(model, True, dense_max_constraints=96)
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
             switched_off = _make_solver(model, True, dense_max_constraints=96)
         records = {
             name: solver.get_path_selection()["routes"]["sparse_mass_matrix"]
@@ -178,8 +152,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
                 self.assertEqual("_active" in record["sweep_kernel"], active)
                 self.assertEqual("_linked" in record["sweep_kernel"], linked)
         self.assertIn("ring", records["patch"]["active_rows_reason"])
-        self.assertIn("FEATHER_PGS_PATCH_ACTIVE_ROWS=0", records["off"]["active_rows_reason"])
-        # The policy switch restores the full sweep's kernel and launch.
+        self.assertIn("active_rows=False", records["off"]["active_rows_reason"])
+        # The pin restores the full sweep's kernel and launch.
         self.assertEqual(
             records["off"]["sweep_kernel"],
             records["patch"]["sweep_kernel"].replace("_active", "", 1).replace("_linked", ""),
@@ -216,10 +190,10 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         self.assertIn(str(active.bytes), point._sparse_selection_reason)
 
     def test_small_worlds_keep_their_packed_patch_sweep(self):
-        """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, whatever the policy."""
+        """Keep the packed 16-lane full sweep of a 9-DOF, 32-row patch world, bitwise, with active rows pinned off."""
         model = _build_model()
         solvers = {"on": _make_solver(model, True)}
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}):
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
             solvers["off"] = _make_solver(model, True)
         for solver in solvers.values():
             self.assertEqual(solver._sparse_solve_lanes, 16)
@@ -235,25 +209,20 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
                 np.testing.assert_array_equal(value_on, value_off)
 
     def test_switched_off_patch_sweep_with_fused_triplets_is_bitwise(self):
-        """Step the switched-off full patch sweep bitwise whether or not it fuses anchor triplets in the staged form.
+        """Step the full patch sweep bitwise whether or not it fuses anchor triplets in the staged form.
 
-        With ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1``, the suite recipe,
-        ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` keeps the full ordered sweep but fuses its
-        anchor units; the previous kernel needs the triplet flag off as well. A resting
-        and a sliding biped world must step identically either way under the staged
-        transaction (``FEATHER_PGS_SPARSE_TRANSACTION=staged``); the single-stage default
-        rounds differently (test_feather_pgs_sparse_transaction).
+        Pinned off the active-row scan, the full ordered sweep fuses its anchor units by the rule; pinned unfused it
+        runs the ordinary updates. A resting and a sliding biped world must step identically either way under the
+        staged transaction (pinned); the single-stage default rounds differently (test_feather_pgs_sparse_transaction).
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
         solvers = {}
         for triplets in ("1", "0"):
-            environment = {
-                "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0",
-                "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": triplets,
-                "FEATHER_PGS_SPARSE_TRANSACTION": "staged",
-            }
-            with mock.patch.dict(os.environ, environment):
+            pins = {"active_rows": False, "transaction": "staged"}
+            if triplets == "0":
+                pins["contact_units"] = None
+            with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
                 solvers[triplets] = _make_solver(model, True, **options)
         # The full ordered sweep: no "_active" between the support width and the table.
         self.assertRegex(solvers["1"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked$")
@@ -286,8 +255,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
-        solvers = {"active": _make_solver(model, True, **options)}
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}):
+        with mock.patch.dict(SolverFeatherPGS._route_pins, _UNFUSED):
+            solvers = {"active": _make_solver(model, True, **options)}
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
             solvers["full"] = _make_solver(model, True, **options)
         self.assertTrue(solvers["active"]._sparse_active_rows)
         self.assertFalse(solvers["full"]._sparse_active_rows)

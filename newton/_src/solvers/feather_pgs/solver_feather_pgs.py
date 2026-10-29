@@ -257,13 +257,12 @@ from .tree_passes import (
 from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law
 
-_SPARSE_CONTACT_DIRECT = os.environ.get("FEATHER_PGS_SPARSE_CONTACT_DIRECT") == "1"
 _MF_EXACT_ROWSUM = (
     os.environ.get("FEATHER_PGS_MF_EXACT_ROWSUM") == "1"
 )  # experiment: matrix-free sweep with the exact A-based step scale
-_TIER_BLOCKS = int(
-    os.environ.get("FEATHER_PGS_TIER_BLOCKS", "0")
-)  # experiment: parallel tiers grid-stride over per-tier world lists (0 = off)
+# Parallel tiers grid-stride over per-tier world lists from this many tiers on: one classify launch against
+# (tiers - 1) x worlds idle block entries.
+_TIER_LIST_MIN_TIERS = 3
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
 _FPGS_SYNC_TIMINGS_START = int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_START", "20"))
 _FPGS_SYNC_TIMINGS_COUNT = max(int(os.environ.get("FEATHER_PGS_SYNC_TIMINGS_COUNT", "1")), 0)
@@ -277,8 +276,8 @@ _MAX_CONTACT_REGULARIZATION = 1.0e6
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = ROW_SLOT_UNBOUNDED
 _CONTACT_BUILD_THREAD_CAP = 65536
-_CONTACT_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_CONTACT_THREADS_X", "1")))
-_ROWS_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_ROWS_THREADS_X", "4")))
+# The masked row builder's thread budget, in multiples of the contact-build cap.
+_ROWS_THREADS_X = 4
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _CONTACT_JACOBIAN_MAX_DOF = 10
 _JOINT_LIMIT_WARPS_PER_BLOCK = 4
@@ -835,10 +834,18 @@ class SolverFeatherPGS(SolverBase):
     that grows with the body's distance from the world origin.
     """
 
-    # Test hook: pin a kernel implementation regardless of the size heuristic
-    # (keys: cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel).
-    # sparse_mass_matrix=False retains the existing representation for comparisons.
-    _kernel_overrides: ClassVar[dict[str, str | bool]] = {}
+    # Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
+    # data can select runs on the test scenes. No option or environment variable sets one; the route record lists them
+    # (routes.pins). Keys:
+    #   storage "dense": no packed (native sparse) factor.     evaluator "ordinary": no held tree.
+    #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
+    #   producer "compact_jacobian": no local packets.         claims: the runtime claims kept, of ("resolved_worlds",).
+    #   active_rows False: full-order sparse sweeps.           contact_units None: unfused sparse contact triplets.
+    #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
+    #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
+    #   row_support False: sparse rows on explicit indices.
+    #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel, delassus_kernel: a dense kernel.
+    _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
@@ -1008,12 +1015,11 @@ class SolverFeatherPGS(SolverBase):
                 ``off`` disables these paired caches. Explicit choices override legacy cache
                 environment settings; ``auto`` retains those settings when present. Under ``auto``
                 the held-tree owner is admitted wherever its topology, representation and row policy
-                allow (``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0`` disables it). Explicit dense kernels
+                allow. Explicit dense kernels
                 disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
                 are unchanged. Where the held-tree owner is admitted, a diagonal-mass group of
                 world-fixed roots over one-coordinate prismatic or revolute leaves runs as its scalar
-                branches by default (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out);
-                :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
+                branches; :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -1328,7 +1334,7 @@ class SolverFeatherPGS(SolverBase):
                 sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Each tangent pair
                 takes one isotropic step, the serial pair solve's friction law, so a sliding pair converges to
                 maximal dissipation; under persistent patch friction it projects on its patch's pooled normal
-                load, and ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on the serial kernels. Each
+                load. Each
                 tier's sweep budget follows ``mf_gs_parallel_sweeps``. The tiers accumulate joint velocity-limit rows
                 (``routes.sweep.tiers.velocity_limit_law``). The worlds they decline keep the serial sweep and its
                 ``velocity_limit_law``, ``"stateless"`` by default, so tier and serial worlds share one fixed point
@@ -1497,6 +1503,8 @@ class SolverFeatherPGS(SolverBase):
         self._compliant_prepared = False
         # Read the FEATHER_PGS_* environment once; undeclared names are recorded, not rejected.
         self._environment_record = _environment_flags.record()
+        # The test pins in force at construction, which every admission reads and the route record lists.
+        self._route_pins = dict(type(self)._route_pins)
         super().__init__(model)
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         options = check_options(requested_options)
@@ -1513,7 +1521,7 @@ class SolverFeatherPGS(SolverBase):
         kernel_choices, self._explicit_dense_kernels, self._kernel_choice_reasons, ignored_choices = (
             resolve_kernel_choices(
                 self._requested_kernel_choices,
-                self._kernel_overrides,
+                self._route_pins,
                 is_cpu=model.device.is_cpu,
                 pgs_mode=pgs_mode,
             )
@@ -1610,8 +1618,6 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_warmstart_decay = options["pgs_warmstart_decay"]
         self.velocity_limit_law = check_velocity_limit_law(velocity_limit_law)
         self.contact_update = check_contact_update(contact_update)
-        # The sparse triplet transaction's flag, checked on every route; the sparse route applies it.
-        self._sparse_transaction_request = self._sparse_transaction_flags()
         self._ws_prev_dense_impulses = None
         self._ws_prev_dense_row_type = None
         self._ws_prev_dense_row_parent = None
@@ -1805,8 +1811,6 @@ class SolverFeatherPGS(SolverBase):
             and self.drive_mode == "augmented"
             and self.articulation_max_dofs > 0,
         )
-        # The switch is read here, at construction, like the environment record.
-        self._scalar_branches_requested = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
@@ -1820,9 +1824,7 @@ class SolverFeatherPGS(SolverBase):
         if sparse_diagonal_pair is not None:
             # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
             # the dense groups with it, the diagonal group as scalar branches or a held family.
-            scalar, _ = plan_scalar_branches(
-                self, requested=self._scalar_branches_requested, size=sparse_diagonal_pair[0]
-            )
+            scalar, _ = plan_scalar_branches(self, size=sparse_diagonal_pair[0])
             held = held_tree.compact_decline(self, sparse_diagonal_pair[0], scalar=scalar is not None)
             if held is not None:
                 sparse_diagonal_pair = None
@@ -2081,9 +2083,7 @@ class SolverFeatherPGS(SolverBase):
         self._point_contact_paths = self._law_agnostic_contact_paths and not self._friction_anchors_enabled
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
         # ring and keyed rows write the patch row law, so both can serve point and patch
-        # friction (Jacobi sweeps, not the serial patch sweep). Patch friction takes them
-        # by default; FEATHER_PGS_PATCH_PARALLEL_ROWS=0 keeps its serial sweeps and
-        # ordinary rows.
+        # friction (Jacobi sweeps, not the serial patch sweep).
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         # Patch friction on the dense route: the paired factor sweep walks patch
         # contact units, the resolved-world classifier skips worlds whose rows
@@ -2244,9 +2244,8 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_packed_rows()
         # Worlds of one limited articulation and at most one other get their
         # limit prefix and contact packets built in place for the local solve
-        # owners (row_packets.py), with the point or the patch row law;
-        # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below take patch
-        # friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0.
+        # owners (row_packets.py), with the point or the patch row law. The keyed
+        # rows below take point and patch friction.
         from . import row_packets  # noqa: PLC0415
 
         self._row_packets = None
@@ -2258,8 +2257,8 @@ class SolverFeatherPGS(SolverBase):
                     "Local packets implement the point and patch row laws; torsion and compliance keep ordinary rows.",
                 ),
                 (
-                    os.environ.get("FEATHER_PGS_ROW_PACKETS", "1") == "1",
-                    "FEATHER_PGS_ROW_PACKETS disables local packets.",
+                    self._route_pins.get("producer") in (None, "local_packets"),
+                    "A test pin selects another contact-row producer.",
                 ),
             )
         ) or row_packets.decline(self)
@@ -2270,8 +2269,7 @@ class SolverFeatherPGS(SolverBase):
                 if self._row_packets is not None
                 else "The local packet law does not admit this topology."
             )
-        # Keyed rows are on by policy wherever their producer admits the solver
-        # (keyed_rows.create_owner); FEATHER_PGS_KEYED_ROWS=0 opts out.
+        # Keyed rows serve wherever their producer admits the solver (keyed_rows.create_owner).
         self._keyed_rows = None
         if self._sparse_mass_matrix_size is not None:
             self._keyed_rows_reason = "Native sparse factors own the contact rows."
@@ -2280,11 +2278,9 @@ class SolverFeatherPGS(SolverBase):
         elif not self._parallel_contact_paths:
             self._keyed_rows_reason = (
                 "Keyed rows write the point and patch row laws; torsion and compliance keep ordinary rows."
-                if not self._law_agnostic_contact_paths
-                else "Patch friction keeps ordinary rows: FEATHER_PGS_PATCH_PARALLEL_ROWS=0 opts it out."
             )
-        elif os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") == "0":
-            self._keyed_rows_reason = "FEATHER_PGS_KEYED_ROWS=0 disables keyed rows."
+        elif self._route_pins.get("producer") not in (None, "keyed_rows"):
+            self._keyed_rows_reason = "A test pin selects another contact-row producer."
         else:
             from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
 
@@ -2364,9 +2360,7 @@ class SolverFeatherPGS(SolverBase):
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
         # then publishes: the compact diagonal's admission planned them.
-        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
-            self, requested=self._scalar_branches_requested
-        )
+        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
 
         # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
         # six-coordinate dense articulation. It writes the point and the patch row law; torsion and compliance keep
@@ -2405,17 +2399,6 @@ class SolverFeatherPGS(SolverBase):
         self._resolved_worlds_owner = classifier if classifier.enabled else None
         self._resolved_worlds = classifier.resolved
         self._resolved_worlds_reason = classifier.reason
-
-        self._free_body_gyro_kernel = None
-        if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
-            # A predictor experiment independent of contact scheduling. The
-            # effective six-DOF factor retains drive/armature contributions;
-            # physical COM inertia supplies only the gyroscopic correction.
-            if model.requires_grad or self.L_by_size.get(6) is None:
-                raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
-            from .free_body_gyro import correct_free_body_gyroscopic_predictor  # noqa: PLC0415
-
-            self._free_body_gyro_kernel = correct_free_body_gyroscopic_predictor
 
         self._place_dense_response()
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
@@ -3829,10 +3812,6 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_prepare_contacts = False
         self._sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
-        # Policy: patch friction may adopt the active-row scan's deferral law.
-        self._patch_active_rows = bool(
-            self._friction_anchors_enabled and os.environ.get("FEATHER_PGS_PATCH_ACTIVE_ROWS", "1") != "0"
-        )
         # Route details for get_path_selection(), set where the sparse owner is admitted.
         self._sparse_active_rows = False
         self._sparse_active_rows_reason = "Native sparse factors are not selected."
@@ -3853,21 +3832,15 @@ class SolverFeatherPGS(SolverBase):
         # state-cache lifecycle. The full ordered sweep pools linked patch normal
         # loads; carried impulses seed the factor delta (warm_start).
         split_candidate = (
-            self.pgs_mode == "split"
-            and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "1") == "1")
-            and self.pgs_kernel == "tiled_row"
-            and not self._has_free_rigid_bodies
+            self.pgs_mode == "split" and self.pgs_kernel == "tiled_row" and not self._has_free_rigid_bodies
         )
         velocity_candidate = (
-            self.pgs_mode == "matrix_free"
-            and self.enable_joint_velocity_limits
-            and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_VELOCITY_LIMITS", "1") == "1")
-            and not self._has_free_rigid_bodies
+            self.pgs_mode == "matrix_free" and self.enable_joint_velocity_limits and not self._has_free_rigid_bodies
         )
         for supported, reason in (
             (
-                sparse_choice == "on" or self._kernel_overrides.get("sparse_mass_matrix", True),
-                "Private sparse_mass_matrix override disables native sparse factors.",
+                sparse_choice == "on" or self._route_pins.get("storage") != "dense",
+                "A test pin keeps dense storage (storage='dense').",
             ),
             (model.device.is_cuda, "CPU uses ordinary factors; native sparse factors require CUDA."),
             (not model.requires_grad, "Gradient recording requires ordinary factors."),
@@ -3912,9 +3885,6 @@ class SolverFeatherPGS(SolverBase):
         # recipes retain their own admission and fallback, including when their
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
-        if self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1":
-            self._sparse_selection_reason = "The free-body gyro experiment retains ordinary factors."
-            return
         # A parallel tier that serves the active friction law owns the ordinary buffers.
         # Patch friction yields only to a parallel tier, which split mode never builds;
         # point friction keeps its unconditional yield. The yield reserves the dense route,
@@ -3932,8 +3902,7 @@ class SolverFeatherPGS(SolverBase):
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
             # sweep and keeps the resolved-world classifier. A parallel tier that
-            # mf_gs_parallel_rows requests (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)
-            # declines sparse factors first (above), so native sparse factors never
+            # mf_gs_parallel_rows requests declines sparse factors first (above), so native sparse factors never
             # serve free rigid bodies.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
@@ -4094,7 +4063,7 @@ class SolverFeatherPGS(SolverBase):
         shape = (self.world_count, self.dense_max_constraints, max_support)
         offsets = self.articulation_world_dof_offset.numpy()
         if (
-            self._kernel_overrides.get("sparse_row_support", True)
+            self._route_pins.get("row_support", True)
             and not self._mimic_count
             and np.all(articulated_counts == 1)
             and size == self.max_world_dofs
@@ -4176,7 +4145,6 @@ class SolverFeatherPGS(SolverBase):
         # small systems. Keep the global-row consumer when the cache is large.
         self._sparse_local_factors = bool(
             self._sparse_solve_lanes < 32
-            and os.environ.get("FEATHER_PGS_SPARSE_LOCAL_FACTORS", "1") != "0"
             and staging(lanes_per_world=self._sparse_solve_lanes, local_factors=True).bytes
             <= min(budget, _SPARSE_LOCAL_WORKSPACE_BYTES)
         )
@@ -4235,11 +4203,7 @@ class SolverFeatherPGS(SolverBase):
             staging: The sweep's working set for its options (:func:`.sweep_routes_sparse.sparse_staging`).
             budget: Static shared memory available to one block [B].
         """
-        if (
-            os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") == "0"
-            or self.max_world_dofs > 16
-            or self.dense_max_constraints > 64
-        ):
+        if self.max_world_dofs > 16 or self.dense_max_constraints > 64:
             return 0
         lanes = 8 if self.max_world_dofs <= 8 else 16
         return lanes if staging(lanes_per_world=lanes).fits(budget) else 0
@@ -4253,25 +4217,19 @@ class SolverFeatherPGS(SolverBase):
         the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
         pair is visited while any normal of its patch ring is selected or the pair holds
         impulse, which skips only pairs whose update would be a no-op. Small worlds keep
-        their packed lanes, and ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` keeps patch friction on
-        the full ordered sweep.
+        their packed lanes.
 
         Args:
             split_candidate: Whether split mode sweeps the sparse rows.
             velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             small_world_lanes: Lanes per world of a packed small-world sweep, 0 for whole warps.
         """
-        if not self._kernel_overrides.get("sparse_active_contacts", True):
-            return False, "A private sparse_active_contacts override disables the active-row scan."
+        if not self._route_pins.get("active_rows", True):
+            return False, "A test pin keeps the full ordered sweep (active_rows=False)."
         if split_candidate or velocity_candidate:
             return False, "Split and velocity-limit rows keep full ordered sweeps."
         if not self._friction_anchors_enabled:
             return True, "Point-contact normal and limit rows are selected at sweep entry."
-        if not self._patch_active_rows:
-            return False, (
-                "FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction (friction_anchor_beta > 0) on the full "
-                "ordered sweep."
-            )
         if small_world_lanes:
             return False, (
                 f"Patch friction (friction_anchor_beta > 0) keeps the packed {small_world_lanes}-lane full sweep "
@@ -4291,7 +4249,7 @@ class SolverFeatherPGS(SolverBase):
         use_support_table: bool,
         fits: bool,
     ) -> tuple[bool, str]:
-        """Decide whether the sparse sweep fuses contact triplets (``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1``), and why.
+        """Decide whether the sparse sweep fuses contact triplets, and why: wherever the row structure admits them.
 
         Point friction fuses them in the active-row scan. Patch friction fuses its anchor
         units, pooling their ring loads as the ordinary pair update does, in the active
@@ -4308,25 +4266,25 @@ class SolverFeatherPGS(SolverBase):
             use_support_table: Whether rows read the shared support table.
             fits: Whether the selected triplet transaction fits the row capacity and shared memory, evaluated last.
         """
-        if os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") != "1":
-            return False, "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
+        if "contact_units" in self._route_pins and self._route_pins["contact_units"] != "triplets":
+            return False, "A test pin keeps unfused contact rows (contact_units=None)."
         if not active_rows and not self._friction_anchors_enabled:
-            return False, "Requested, but triplets need the active-row scan."
+            return False, "Triplets need the active-row scan."
         if not active_rows and (split_candidate or velocity_candidate or self._has_free_rigid_bodies):
-            return False, "Requested, but split, velocity-limit and free-body sweeps keep ordinary updates."
+            return False, "Split, velocity-limit and free-body sweeps keep ordinary updates."
         if self._sparse_solve_lanes < 32:
-            return False, f"Requested, but small worlds keep their packed {self._sparse_solve_lanes}-lane full sweep."
+            return False, f"Small worlds keep their packed {self._sparse_solve_lanes}-lane full sweep."
         if not use_support_table:
-            return False, "Requested, but triplets need the row support table."
+            return False, "Triplets need the row support table."
         if not fits():
-            return False, "Requested, but row capacity or shared memory leaves no room for the triplet transaction."
+            return False, "Row capacity or shared memory leaves no room for the triplet transaction."
         # contact_transaction_reason records how the admitted triplets update.
         if self._friction_anchors_enabled:
             sweep = "active-row scan" if active_rows else "full ordered sweep"
             where = f"patch anchor units pool their ring loads in the {sweep}"
         else:
             where = "point contacts fuse in the active-row scan"
-        return True, f"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: {where}."
+        return True, f"Fused wherever the rows admit them: {where}."
 
     def _request_sparse_contact_transaction(self) -> tuple[str, str]:
         """Return the transaction admitted contact triplets take (``"single"`` or ``"staged"``), and why.
@@ -4335,40 +4293,17 @@ class SolverFeatherPGS(SolverBase):
         the sparse contact builder writes, and reduces its three residuals together; the
         staged one reduces the normal, then the tangents, and caches tangent metrics in
         shared memory. Both apply the paired friction law, so iterates differ by rounding
-        only. Patch friction (``friction_anchor_beta > 0``) takes the single-stage one by
-        default and point friction the staged one; ``FEATHER_PGS_SPARSE_TRANSACTION``
-        (``auto``, ``single`` or ``staged``, see :meth:`_sparse_transaction_flags`) overrides both.
+        only. Patch friction (``friction_anchor_beta > 0``) takes the single-stage one and
+        point friction the staged one.
         """
-        request = self._sparse_transaction_request
-        if request == "single":
-            return "single", "FEATHER_PGS_SPARSE_TRANSACTION=single: one load group and one reduction per triplet."
-        if request == "staged":
-            return "staged", (
-                "FEATHER_PGS_SPARSE_TRANSACTION=staged: the normal's reduction, then the tangents', with the metric "
-                "cache."
-            )
+        pinned = self._route_pins.get("transaction")
+        if pinned is not None:
+            if pinned not in CONTACT_TRANSACTIONS:
+                raise ValueError(f"The transaction pin must be one of {CONTACT_TRANSACTIONS}, got {pinned!r}")
+            return pinned, f"A test pin selects the {pinned} transaction."
         if self._friction_anchors_enabled:
-            return "single", (
-                "Patch friction (friction_anchor_beta > 0) takes the single-stage transaction by default "
-                "(FEATHER_PGS_SPARSE_TRANSACTION=staged keeps the staged one)."
-            )
-        return "staged", (
-            "Point friction keeps the staged transaction by default (FEATHER_PGS_SPARSE_TRANSACTION=single opts in)."
-        )
-
-    @staticmethod
-    def _sparse_transaction_flags() -> str:
-        """Return the triplet transaction that the environment requests.
-
-        ``FEATHER_PGS_SPARSE_TRANSACTION`` is one of :data:`~.sweep_routes_sparse.CONTACT_TRANSACTIONS`
-        (default ``auto``). Every construction checks it, so an invalid value raises on every route.
-        """
-        transaction = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
-        if transaction not in CONTACT_TRANSACTIONS:
-            raise ValueError(
-                f"FEATHER_PGS_SPARSE_TRANSACTION must be one of {', '.join(CONTACT_TRANSACTIONS)}, got {transaction!r}"
-            )
-        return transaction
+            return "single", "Patch friction (friction_anchor_beta > 0) takes the single-stage transaction."
+        return "staged", "Point friction takes the staged transaction."
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -5057,11 +4992,7 @@ class SolverFeatherPGS(SolverBase):
         from . import paired_components  # noqa: PLC0415
 
         self._paired_components = None
-        self._paired_components_reason = (
-            "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
-            if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1"
-            else paired_components.decline(self)
-        )
+        self._paired_components_reason = paired_components.decline(self)
         if self._paired_components_reason is None:
             self._paired_components = paired_components.PairedComponents(self)
             self._paired_components_reason = (
@@ -5108,15 +5039,7 @@ class SolverFeatherPGS(SolverBase):
                 )
                 # Large C128 batches benefit from small-world storage without
                 # reducing capacity. Avoid extra launches for small batches.
-                row_budgets = os.environ.get("FEATHER_PGS_DENSE_ROW_BUDGETS")
-                if (
-                    model.device.is_cuda
-                    and self.dense_max_constraints in (64, 128)
-                    and (
-                        row_budgets == "1"
-                        or (row_budgets is None and self.dense_max_constraints == 128 and self.world_count >= 1024)
-                    )
-                ):
+                if model.device.is_cuda and self.dense_max_constraints == 128 and self.world_count >= 1024:
                     self._pgs_solve_tiled_row_budgets = tuple(
                         self._sweep_kernel(
                             "tiled_row",
@@ -5257,15 +5180,9 @@ class SolverFeatherPGS(SolverBase):
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         if self._mf_sweeps:
             has_drive_rows = self.drive_mode == "physx_pgs"
-            # Preserve the explicit diagnostic override without hiding it in a
-            # cached factory: storage is part of the kernel specialization key.
-            # The selection sizes the resident row metadata with its choice.
-            force_stream_mf_impulses = os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
+            # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
+            # sizes the resident row metadata with its choice.
+            force_stream_mf_impulses = self._route_pins.get("mf_storage") == "streamed"
             storage = _MFGSStorage(
                 False, force_stream_mf_impulses, False, "Without CUDA no shared-memory storage applies."
             )
@@ -5351,7 +5268,7 @@ class SolverFeatherPGS(SolverBase):
                 if parallel_rows > 96:
                     tiers.append((parallel_rows, 96))
                 self._par_tiers = list(tiers)
-                if _TIER_BLOCKS > 0:
+                if len(tiers) >= _TIER_LIST_MIN_TIERS:
                     dev = model.device
                     self._tier_lo = wp.array([lo for _, lo in tiers], dtype=wp.int32, device=dev)
                     self._tier_hi = wp.array([hi for hi, _ in tiers], dtype=wp.int32, device=dev)
@@ -5359,7 +5276,7 @@ class SolverFeatherPGS(SolverBase):
                     self._tier_worlds = wp.empty((len(tiers), self.world_count), dtype=wp.int32, device=dev)
                     self._tier_count_views = [self._tier_counts[t : t + 1] for t in range(len(tiers))]
                     self._tier_world_views = [self._tier_worlds[t] for t in range(len(tiers))]
-                    self._tier_blocks = int(min(self.world_count, _TIER_BLOCKS))
+                    self._tier_blocks = int(self.world_count)
                 tier_sweeps, self._par_sweeps_rule, self._par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     tier = self._sweep_kernel(
@@ -7757,27 +7674,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
-        if self._free_body_gyro_kernel is not None:
-            wp.launch(
-                self._free_body_gyro_kernel,
-                dim=self.n_arts_by_size[6],
-                inputs=[
-                    self.group_to_art[6],
-                    self.is_free_rigid,
-                    model.articulation_start,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    state_aug.body_q_com,
-                    model.joint_X_p,
-                    model.body_inertia,
-                    self.L_by_size[6],
-                    stage3_qd,
-                    dt,
-                ],
-                outputs=[self.v_hat],
-                device=model.device,
-            )
         self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt)
 
     def _stage3_correct_free_root_velocity(
@@ -7790,9 +7686,7 @@ class SolverFeatherPGS(SolverBase):
         # runtime kinematic changes without changing graph topology.
         if not self._free_root_joint_count:
             return
-        # The retained clutter experiment replaces, never compounds, main's
-        # angular correction. Both paths still need linear transport once.
-        if self._free_rigid_body_count and self._free_body_gyro_kernel is None:
+        if self._free_rigid_body_count:
             wp.launch(
                 apply_free_root_velocity_corrections,
                 dim=self._free_root_joint_count,
@@ -8490,7 +8384,7 @@ class SolverFeatherPGS(SolverBase):
             # Sized for the bound in a capture whose launches bind: every replay runs them at the live
             # count and strides with the captured threads (ContactPool.launch); otherwise for the ready rows.
             rows = pool.launch_rows()
-            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP * _CONTACT_THREADS_X)
+            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP)
 
             self._build_friction_patches(state_in, contacts)
 
@@ -8550,8 +8444,8 @@ class SolverFeatherPGS(SolverBase):
 
             # The first admitted producer writes every contact row: local row packets, keyed rows,
             # the compact and sparse producers, then the general builder. Under patch friction this
-            # order is the row precedence: the local row packets and keyed rows (unless
-            # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) take their worlds' rows before the general builder's
+            # order is the row precedence: the local row packets and keyed rows take their worlds' rows before
+            # the general builder's
             # masked rows, and native sparse factors admit neither.
             # get_path_selection() records the same plan (routes.contact_rows).
             plan = contact_row_plan(self)
@@ -8627,8 +8521,7 @@ class SolverFeatherPGS(SolverBase):
                     # The dense builder has 32 lanes per worker. Give the scalar
                     # builder the contact-build thread budget; its live-prefix
                     # stride covers larger counts without visiting unused slots.
-                    # Retain the explicit full-capacity experiment for replay.
-                    sparse_contact_response_workers = rows if _SPARSE_CONTACT_DIRECT else contact_build_threads
+                    sparse_contact_response_workers = contact_build_threads
                     pool.launch(
                         response_builds_rows.sparse_pair_contact_rows_kernel,
                         sparse_contact_response_workers,
@@ -9293,8 +9186,7 @@ class SolverFeatherPGS(SolverBase):
 
         They pool each friction pair's cone over its patch ring and write the patch
         row law, so patch friction honors ``mf_gs_parallel_rows`` and keyed rows as
-        point friction does, unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps it on
-        its serial sweeps and ordinary rows. Every tier steps each friction pair
+        point friction does. Every tier steps each friction pair
         isotropically, so a sliding pair converges to the serial pair solve's maximal
         dissipation under either law; with per-row steps it did not, which moved
         body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction workloads, and
@@ -9316,17 +9208,11 @@ class SolverFeatherPGS(SolverBase):
             return True, "Point friction: parallel tiers and keyed rows serve it."
         if not self._law_agnostic_contact_paths:
             return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
-        if os.environ.get("FEATHER_PGS_PATCH_PARALLEL_ROWS") == "0":
-            return False, (
-                "Patch friction ignores mf_gs_parallel_rows and keyed rows and keeps its serial sweeps: "
-                "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 opts it out (default on)."
-            )
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
             "one isotropic step per pair, the serial pair solve's friction law. "
-            f"{self._parallel_velocity_limit_agreement()} "
-            "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 keeps patch friction on its serial sweeps."
+            f"{self._parallel_velocity_limit_agreement()}"
         )
 
     def _parallel_velocity_limit_agreement(self) -> str:

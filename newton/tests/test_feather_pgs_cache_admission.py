@@ -3,7 +3,6 @@
 
 """Keep cached dynamics independent from the sparse constraint-row policy."""
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -102,12 +101,11 @@ class TestHeldTreeContactLaw(unittest.TestCase):
 
         with (
             patch.object(SolverFeatherPGS, "_setup_sparse_mass_matrix", recording),
-            patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}),
         ):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                    # With the switch on (its default), both laws may run the parallel tiers.
+                    # Both laws may run the parallel tiers.
                     self.assertEqual(seen[-1], (*_CONTACT_LAWS[law], True))
                     self.assertEqual(
                         (solver._law_agnostic_contact_paths, solver._point_contact_paths), _CONTACT_LAWS[law]

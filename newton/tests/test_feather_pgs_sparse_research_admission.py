@@ -35,12 +35,10 @@ class _AdmissionProbe(SimpleNamespace):
     def _point_contact_paths(self):
         return self._law_agnostic_contact_paths and not self._friction_anchors_enabled
 
-    # Patch friction may run the parallel tiers unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0
-    # opts it out, which the probe's _patch_parallel_rows stands for: on in the probe,
-    # as in the solver by default.
+    # Patch friction may run the parallel tiers, as point friction may.
     @property
     def _parallel_contact_paths(self):
-        return self._point_contact_paths or (self._law_agnostic_contact_paths and self._patch_parallel_rows)
+        return self._law_agnostic_contact_paths
 
     @property
     def _patch_dense_paths(self):
@@ -50,7 +48,7 @@ class _AdmissionProbe(SimpleNamespace):
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
     return _AdmissionProbe(
-        _kernel_overrides={},
+        _route_pins={},
         pgs_mode="matrix_free",
         pgs_schedule="interleaved",
         drive_mode="augmented",
@@ -73,7 +71,6 @@ def _eligible_solver():
         _has_free_rigid_bodies=False,
         mf_gs_parallel_rows=0,
         mf_gs_incremental_rows=32,
-        _patch_parallel_rows=True,
     )
 
 
@@ -161,17 +158,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver._friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
-    def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
-        """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO": "1"}, clear=True):
-            solver = _eligible_solver()
-            with self.assertRaises(_TopologyReached):
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            solver._has_free_rigid_bodies = True
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
-
     def test_explicit_schedules_keep_their_solve_budget(self):
         """Do not silently replace a requested parallel solve."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
@@ -186,13 +172,11 @@ class TestSparseResearchAdmission(unittest.TestCase):
 
         Patch friction runs the recipe's parallel tier as point friction does, so the
         tier's request declines sparse factors in matrix-free mode. Split mode builds no
-        tier, and opted out with FEATHER_PGS_PATCH_PARALLEL_ROWS=0, patch friction keeps
-        its sparse route.
+        tier, so patch friction keeps its sparse route there.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for name, changes, declined in (
             ("parallel", {"mf_gs_parallel_rows": 48}, True),
-            ("switched_off", {"mf_gs_parallel_rows": 48, "_patch_parallel_rows": False}, False),
             ("split", {"mf_gs_parallel_rows": 48, "pgs_mode": "split", "pgs_kernel": "tiled_row"}, False),
         ):
             with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
@@ -211,18 +195,16 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_patch_route_claims_follow_the_recorded_precedence(self):
         """Claim a patch free-body world for a requested tier, then for the dense route.
 
-        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests (unless
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first; without it the free-body rule keeps
-        the world dense.
+        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests declines
+        sparse factors first; without it the free-body rule keeps the world dense.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for switch, declined in ((True, "competing"), (False, "free rigid bodies")):
-            with self.subTest(parallel_rows=switch), mock.patch.dict(os.environ, {}, clear=True):
+        for rows, declined in ((48, "competing"), (0, "free rigid bodies")):
+            with self.subTest(parallel_rows=rows), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
                 solver._friction_anchors_enabled = True
                 solver._has_free_rigid_bodies = True
-                solver.mf_gs_parallel_rows = 48
-                solver._patch_parallel_rows = switch
+                solver.mf_gs_parallel_rows = rows
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertIn(declined, solver._sparse_selection_reason)

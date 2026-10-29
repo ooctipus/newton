@@ -82,7 +82,7 @@ _PATCH_ONLY = frozenset(
         "linked_rows=True, use_support_table=True, warm_start=False)",
         "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
-        # The same triplets in the staged transaction (FEATHER_PGS_SPARSE_TRANSACTION=staged).
+        # The same triplets in the staged transaction (the test pin transaction="staged").
         "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
         "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
         "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
@@ -187,8 +187,8 @@ def _suite_sparse_sweeps():
         ((80, 18, 18), triplets),
     ):
         yield size, {**kwargs, "linked_rows": True}, True
-    # Triplet transactions beside each law's default (FEATHER_PGS_SPARSE_TRANSACTION): point
-    # friction's single-stage opt-in and patch friction's staged one.
+    # Triplet transactions beside each law's default: point friction's single-stage form and patch friction's
+    # staged one (test pins).
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12), (48, 18, 18), (48, 25, 16), (72, 18, 12), (80, 18, 18)):
         yield size, {**triplets, "contact_transaction": "single"}, False
         yield size, {**triplets, "linked_rows": True, "contact_transaction": "staged"}, True

@@ -1004,9 +1004,6 @@ class TestKeyedPatchRows(unittest.TestCase):
             self.assertEqual(text.count(golden), 1, golden)
 
 
-_SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
-
-
 def _cpu_arm():
     """A one-joint arm: enough for construction-time admission on CPU."""
     builder = newton.ModelBuilder()
@@ -1016,61 +1013,31 @@ def _cpu_arm():
 
 
 class TestPatchParallelAdmission(unittest.TestCase):
-    def test_switch_admits_patch_friction_by_default_and_records_why(self):
-        """Admit patch friction to the parallel rows by default, keep it serial under the opt-out, and record why.
-
-        Unset (or ``1``), ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` admits patch friction to the
-        parallel tiers and keyed rows; ``0`` keeps its serial sweeps and ordinary rows.
-        Point friction is admitted whatever the switch says. Tests that need either
-        patch route set the switch rather than rely on its default.
-        """
+    def test_both_laws_are_admitted_and_the_record_says_why(self):
+        """Admit point and patch friction to the parallel rows, record why, and keep torsion and compliance out."""
         model = _cpu_arm()
-        for beta, switch, admitted in (
-            (0.0, None, True),
-            (0.0, "0", True),
-            (0.0, "1", True),
-            (0.2, None, True),  # the default: on
-            (0.2, "0", False),
-            (0.2, "1", True),
-        ):
-            with self.subTest(beta=beta, switch=switch), patch.dict(os.environ):
-                os.environ.pop(_SWITCH, None)
-                if switch is not None:
-                    os.environ[_SWITCH] = switch
+        for beta in (0.0, 0.2):
+            with self.subTest(beta=beta):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 selected = solver.get_path_selection()
                 friction = selected["routes"]["friction"]
                 keyed = selected["routes"]["contact_rows"]["keyed_rows"]
-                self.assertEqual(solver._parallel_contact_paths, admitted)
-                self.assertEqual(friction["parallel_rows"]["admitted"], admitted)
-                self.assertEqual(selected["environment"]["applied"].get(_SWITCH), switch)
+                self.assertTrue(solver._parallel_contact_paths)
+                self.assertTrue(friction["parallel_rows"]["admitted"])
                 if beta == 0.0:
                     self.assertIn("Point friction", friction["parallel_rows"]["reason"])
                     continue
-                # Under the switch no point-contact owner is left to name.
-                self.assertEqual("keyed rows" in friction["reason"], not admitted)
-                self.assertEqual("need point friction" in friction["reason"], not admitted)
-                if admitted:
-                    self.assertIn("patch ring", friction["parallel_rows"]["reason"])
-                    self.assertNotIn("point contacts", keyed["reason"])
-                else:
-                    # The serial patch route; both reasons name the opt-out.
-                    self.assertIn("serial sweeps", friction["parallel_rows"]["reason"])
-                    self.assertNotIn("patch ring", friction["parallel_rows"]["reason"])
-                    self.assertIn(f"{_SWITCH}=0", friction["parallel_rows"]["reason"])
-                    self.assertIn(f"{_SWITCH}=0", keyed["reason"])
-        # Torsion and compliance (CUDA-only laws here) keep ordinary rows whatever the switch says.
+                self.assertNotIn("keyed rows", friction["reason"])
+                self.assertNotIn("need point friction", friction["reason"])
+                self.assertIn("patch ring", friction["parallel_rows"]["reason"])
+                self.assertNotIn("point contacts", keyed["reason"])
+        # Torsion and compliance (CUDA-only laws here) keep ordinary rows.
         other_law = SimpleNamespace(
             _regularization_enabled=False, _point_contact_paths=False, _law_agnostic_contact_paths=False
         )
-        for switch in (None, "0", "1"):
-            with self.subTest(law="torsion or compliance", switch=switch), patch.dict(os.environ):
-                os.environ.pop(_SWITCH, None)
-                if switch is not None:
-                    os.environ[_SWITCH] = switch
-                admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
-                self.assertFalse(admitted)
-                self.assertIn("torsion", reason)
+        admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
+        self.assertFalse(admitted)
+        self.assertIn("torsion", reason)
 
     def test_admission_says_where_the_tiers_share_the_serial_fixed_point(self):
         """Claim the serial sweep's fixed point for patch tiers only where both accumulate velocity-limit rows.
@@ -1103,9 +1070,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
             for name in ("_velocity_limit_sweep_law", "_parallel_velocity_limit_agreement"):
                 setattr(probe, name, MethodType(getattr(SolverFeatherPGS, name), probe))
             with self.subTest(limits=limits, fraction=fraction, law=law, schedule=schedule):
-                with patch.dict(os.environ):
-                    os.environ.pop(_SWITCH, None)
-                    admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
+                admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
                 self.assertTrue(admitted)
                 self.assertIn("one isotropic step per pair", reason)
                 self.assertEqual("share the serial sweep's fixed point" in reason, shared, reason)
@@ -1627,29 +1592,19 @@ def _friction_pairs(solver, world):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
-    def test_patch_runs_linked_tiers_unless_switched_off(self):
-        """Build linked tiers for patch friction unless the switch is 0, and point tiers for point friction.
+    def test_patch_runs_linked_tiers(self):
+        """Build linked tiers for patch friction and point tiers for point friction.
 
-        Opted out, patch friction keeps the route it had before the tiers learned the
-        ring: the serial sweep, or the incremental tier that the constructor's default
-        ``mf_gs_incremental_rows=32`` requests and an admitted parallel tier replaces.
-        Point friction builds its tiers whatever the switch says. Every tier, point or
-        linked, sweeps the automatic budget of 32 rows at eight iterations.
+        An admitted parallel tier replaces the incremental tier that ``mf_gs_incremental_rows=32`` requests. Every
+        tier, point or linked, sweeps the automatic budget of 32 rows at eight iterations.
         """
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
-            patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
-            serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, **options)
-            # Both tiers requested on the dense route (sparse factors off), so only the switch picks one.
-            over_incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
-            del os.environ[_SWITCH]  # the default
-            default_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
-            point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
-            os.environ[_SWITCH] = "0"  # the opt-out
-            opted_out = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
-            incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
-        for solver, linked in ((patch_tiers, True), (default_tiers, True), (point_tiers, False)):
+        patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
+        # Both tiers requested on the dense route (sparse factors off): the parallel one is built.
+        over_incremental = _matrix_free_solver(model, beta=0.2, parallel_rows=32, mf_gs_incremental_rows=32)
+        point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
+        for solver, linked in ((patch_tiers, True), (point_tiers, False)):
             self.assertEqual(solver._ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
             self.assertIsNone(solver._sparse_mass_matrix_size)
@@ -1662,22 +1617,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
             self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
             self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, "auto"))
-        # Opted out, patch friction keeps the serial route it had before the tiers learned the ring.
-        self.assertEqual(opted_out._ink_rows, 0)
-        self.assertEqual(opted_out._mf_gs_tiers, [])
-        expected, actual = serial.get_path_selection(), opted_out.get_path_selection()
-        for record in (expected, actual):
-            record["routes"]["contact_rows"]["keyed_rows"].pop("reason")
-        for name in ("sweep", "sparse_mass_matrix", "dynamics", "publication", "contact_rows"):
-            self.assertEqual(actual["routes"][name], expected["routes"][name], name)
-        # Held-tree lane widths are timed at construction; the owner is the route.
-        self.assertEqual(actual["routes"]["held_tree"]["owner"], expected["routes"]["held_tree"]["owner"])
-        self.assertEqual(actual["routes"]["stages"], expected["routes"]["stages"])
-        self.assertFalse(actual["routes"]["friction"]["parallel_rows"]["admitted"])
-        self.assertIn(f"{_SWITCH}=0", actual["routes"]["friction"]["parallel_rows"]["reason"])
-        # With the incremental tier requested too, the opt-out keeps it; otherwise the linked tiers replace it.
-        self.assertEqual((incremental._ink_rows, incremental._incremental_rows), (0, 32))
-        self.assertEqual(incremental.get_path_selection()["routes"]["sweep"]["tiers"]["family"], "incremental")
         self.assertEqual((over_incremental._ink_rows, over_incremental._incremental_rows), (32, 0))
         tiers = over_incremental.get_path_selection()["routes"]["sweep"]["tiers"]
         self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", True))
@@ -1685,14 +1624,12 @@ class TestPatchParallelRoutes(unittest.TestCase):
     def test_keyed_rows_record_names_the_launched_builders(self):
         """Name in the route record the keyed-row builders one step launches, under both laws.
 
-        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA, for patch
-        friction by default; the test sets FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out
-        cannot change the route. The keyed parallel tiers build the direct rows in the sweep, which every entry
+        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA, for point and
+        patch friction. The keyed parallel tiers build the direct rows in the sweep, which every entry
         points to; the scatter and the fallback are the row builders a step launches outside it.
         """
         model = standing_model()
-        with patch.dict(os.environ, {_SWITCH: "1"}):
-            os.environ.pop("FEATHER_PGS_KEYED_ROWS", None)
+        with patch.dict(os.environ):
             for law, beta in (("point", 0.0), ("patch", 0.2)):
                 with self.subTest(law=law):
                     solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
@@ -1729,9 +1666,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         dt = 1.0 / 240.0
         replays = {}
         for reuse in (None, "0"):
-            with patch.dict(os.environ, {_SWITCH: "1"}):
-                for name in ("FEATHER_PGS_KEYED_ROWS", "FEATHER_PGS_PATCH_FRAME_REUSE"):
-                    os.environ.pop(name, None)
+            with patch.dict(os.environ):
+                os.environ.pop("FEATHER_PGS_PATCH_FRAME_REUSE", None)
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
                 solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
@@ -1795,7 +1731,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         model = _pushed_sphere("cuda:0", limit=limit)
         built = {}
         # The pass is under test, not the budget: every tier sweeps at most 24 times.
-        with patch.dict(os.environ, {_SWITCH: "1"}), _exact_budget():
+        with patch.dict(os.environ), _exact_budget():
             for limits, requested in itertools.product((False, True), repeat=2):
                 built[limits, requested] = _matrix_free_solver(
                     model,
@@ -1853,7 +1789,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         """Build point and linked tiers with the automatic budget, at least mf_gs_parallel_sweeps, and record it."""
         model = standing_model()
         options = {"dense_max_constraints": 64, "pgs_iterations": 8}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             built = {}
             for beta, sweeps in itertools.product((0.0, 0.2), (24, 40, 64)):
                 built[beta, sweeps] = _matrix_free_solver(
@@ -1912,7 +1848,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         velocity = model.joint_qd.numpy()
         velocity[0::10] = 0.05  # the torsos drift sideways, loading the feet's friction without slipping
         model.joint_qd.assign(velocity)
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             states = {}
             for beta, parallel_rows in self._ARMS:
 
@@ -1950,7 +1886,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         expected = speed * speed / (2.0 * mu * gravity)
         model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
         distances = {}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             for beta, parallel_rows in self._ARMS:
                 ratios = []
 
@@ -1993,7 +1929,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         tangent_mass = np.array((sum(masses), sum(masses[1:])))
         model = _sliding_sphere("cuda:0", axes, masses, (1.0, 1.0))
         converged = {"mf_gs_parallel_sweeps": 2000}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             routes = {
                 "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000),
                 "tier": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
@@ -2042,7 +1978,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         model = sliding_stance("cuda:0")
         truncated = {"mf_gs_parallel_sweeps": 2}
         budgeted = {**truncated, "mf_gs_parallel_sweeps": 2000}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             routes = {"serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)}
             with _exact_budget():
                 routes["truncated"] = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **truncated)
@@ -2071,7 +2007,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         """
         model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Z), (3.0, 1.0), (1.0,))
         converged = {"mf_gs_parallel_sweeps": 2000}
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        with patch.dict(os.environ):
             serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)
             tier = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged)
         speeds = {}
@@ -2090,7 +2026,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         fingers, every joint velocity-limited (fourteen limit rows, no contacts), is
         too large for an 8-row tier, so its world keeps the serial sweep and the
         solver's ``velocity_limit_law``, stateless by default: it lands where the
-        serial route of ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` lands, to float order.
+        serial route (no tier requested) lands, to float order.
         The tiers accumulate velocity-limit rows, as the accumulated serial sweep
         does; on this step that law converges more than 1e-4 away (1.1e-3 in a
         float64 reference), and a 32-row tier that owns the world lands there. The
@@ -2108,18 +2044,14 @@ class TestPatchParallelPhysics(unittest.TestCase):
             "pgs_iterations": 2000,
             "mf_gs_parallel_sweeps": 2000,
         }
-        with patch.dict(os.environ):
-            # The defaults, whatever the exported environment says: tiers admitted, the stateless law.
-            os.environ.pop(_SWITCH, None)
-            arms = {
-                "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged),
-                "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
-            }
-            os.environ[_SWITCH] = "0"
-            arms["serial"] = _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged)
-            arms["accumulated"] = _matrix_free_solver(
-                model, beta=0.2, parallel_rows=8, velocity_limit_law="accumulated", **converged
-            )
+        arms = {
+            "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged),
+            "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
+            "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, **converged),
+            "accumulated": _matrix_free_solver(
+                model, beta=0.2, parallel_rows=0, velocity_limit_law="accumulated", **converged
+            ),
+        }
         for name, rows in (("declined", 8), ("owned", 32), ("serial", 0), ("accumulated", 0)):
             self.assertEqual(arms[name]._ink_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name]._mf_gs_tiers]

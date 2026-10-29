@@ -725,15 +725,14 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
 
     The non-crossing world's contact separates at the predictor. By default the
     resolved-world classifier skips that world: its contact takes no rows, since
-    zero impulse solves the world exactly. FEATHER_PGS_RESOLVED_WORLDS=0 turns the
-    classifier off, so the contact takes a matrix-free row beside the crossing
-    worlds' rows. Both routes must give every world its own result.
+    zero impulse solves the world exactly. A test pin drops the classifier's claim,
+    so the contact takes a matrix-free row beside the crossing worlds' rows. Both
+    routes must give every world its own result.
     """
     # (e, speed, mass, toi/dt); the third case is deliberately non-crossing.
     cases = ((0.25, 2.0, 1.0, 0.4), (0.75, 4.0, 10.0, 0.7), (1.0, 3.0, 0.5, 1.25), (0.0, 5.0, 2.0, 0.2))
-    # "1" is the default; pinning it keeps an exported "0" from merging the two routes.
     for resolved in ("1", "0"):
-        with test.subTest(FEATHER_PGS_RESOLVED_WORLDS=resolved):
+        with test.subTest(resolved_worlds=resolved):
             scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
             for restitution, speed, mass, impact_fraction in cases:
                 world = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -750,7 +749,8 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
                 scene.add_world(world)
             model = scene.finalize(device=device)
             # The solver admits the classifier only at construction.
-            with mock.patch.dict("os.environ", {"FEATHER_PGS_RESOLVED_WORLDS": resolved}):
+            pins = {} if resolved == "1" else {"claims": ()}
+            with mock.patch.object(newton.solvers.SolverFeatherPGS, "_route_pins", pins):
                 solver = _make_solver(model)
             classified = resolved == "1"
             classifier = solver.get_path_selection()["routes"]["resolved_worlds"]

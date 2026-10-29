@@ -52,32 +52,28 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
             solver._friction_anchors_enabled = patches
             for key, value in warm_start.items():
                 setattr(solver, key, value)
-            for environment in ({}, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}):
-                with (
-                    self.subTest(patches=patches, warm_start=warm_start, environment=environment),
-                    mock.patch.dict(os.environ, environment, clear=True),
-                    self.assertRaises(_TopologyReached),
-                ):
-                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            with (
+                self.subTest(patches=patches, warm_start=warm_start),
+                mock.patch.dict(os.environ, {}, clear=True),
+                self.assertRaises(_TopologyReached),
+            ):
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertEqual(solver.pgs_mode, "matrix_free")
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for changes, flag in (
-            ({}, "0"),
-            ({"pgs_warmstart": True, "_has_free_rigid_bodies": True}, "1"),
-            ({"_mf_warmstart_enabled": True, "_has_free_rigid_bodies": True}, "1"),
-            ({"_has_free_rigid_bodies": True}, "1"),
-            ({"drive_mode": "physx_pgs"}, "1"),
-            ({"pgs_schedule": "contact_then_internal"}, "1"),
-            ({"pgs_velocity_iterations": 1}, "1"),
-            ({"contact_compliance": True}, "1"),
+        for changes in (
+            {"_route_pins": {"storage": "dense"}},
+            {"pgs_warmstart": True, "_has_free_rigid_bodies": True},
+            {"_mf_warmstart_enabled": True, "_has_free_rigid_bodies": True},
+            {"_has_free_rigid_bodies": True},
+            {"drive_mode": "physx_pgs"},
+            {"pgs_schedule": "contact_then_internal"},
+            {"pgs_velocity_iterations": 1},
+            {"contact_compliance": True},
         ):
-            with (
-                self.subTest(changes=changes, flag=flag),
-                mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": flag}, clear=True),
-            ):
+            with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
                 solver.enable_joint_velocity_limits = True
                 for key, value in changes.items():
@@ -335,7 +331,7 @@ def _case(
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
     limits.reshape(2, -1)[:, -1] = np.inf
     model.joint_velocity_limit.assign(limits)
-    with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": str(int(enabled))}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"storage": "dense"}):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

@@ -33,13 +33,11 @@ class TestLaneCholeskyEmitter(unittest.TestCase):
 
 
 def _rollout(model, *, serial, steps=90, cached=True):
-    env = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(cached)),
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_RESOLVED_WORLDS": "0",
-        "FEATHER_PGS_TREE_REFERENCE": str(int(serial)),
-    }
-    with patch.dict(os.environ, env):
+    pins = {"storage": "dense", "claims": ()} if cached else {"evaluator": "ordinary", "claims": ()}
+    with (
+        patch.dict(os.environ, {"FEATHER_PGS_TREE_REFERENCE": str(int(serial))}),
+        patch.object(SolverFeatherPGS, "_route_pins", pins),
+    ):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

@@ -459,9 +459,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         kernels = ["contact_row_prelude", "populate_world_J_masked"]
         builder = {"method": method, "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
-        # Contact torsion keeps ordinary factors and serial sweeps under every patch route flag; its rows take the
-        # masked builder, as the zero-radius solver's do.
-        for flags in ({}, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
+        # Contact torsion keeps ordinary factors and serial sweeps; its rows take the masked builder, as the
+        # zero-radius solver's do.
+        for flags in ({},):
             with (
                 self.subTest(torsion=True, **flags),
                 patch.dict(os.environ, flags),
@@ -771,9 +771,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_route_record_reports_sparse_rows_and_tree_owner(self):
         """Report the active-row scan, triplets, sweep kernel and held-tree layout of the sparse route."""
         model = _build_model()
-        with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}):
-            point = _make_solver(model, True, friction_anchor_beta=0.0)
-            patch_friction = _make_solver(model, True)
+        point = _make_solver(model, True, friction_anchor_beta=0.0)
+        patch_friction = _make_solver(model, True)
         with assert_host_only():
             selected = point.get_path_selection()
             patch_selected = patch_friction.get_path_selection()
@@ -801,7 +800,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(patch_sparse["contact_transaction"])
         if patch_sparse["size"] is not None:
             self.assertIn("friction_anchor_beta", patch_sparse["active_rows_reason"])
-            self.assertIn("small worlds", patch_sparse["contact_triplets_reason"])
+            self.assertIn("Small worlds", patch_sparse["contact_triplets_reason"])
         tree = routes["held_tree"]
         self.assertEqual(tree["owner"] is None, point._tree_kinetic_state is None)
         for group in tree["groups"]:
@@ -815,12 +814,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
 
         model = _build(wp.get_device("cuda:0"), links=17)
-        environment = {
-            "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
-            "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-            "FEATHER_PGS_TREE_FOREST": "0",
-        }
-        with patch.dict(os.environ, environment):
+        with patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense", "grouping": "per_size"}):
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
@@ -841,7 +835,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(paired["two_stream_overlap"], solver._paired_general_solve_stream is not None)
         self.assertEqual(routes["sweep"]["paired_factor"], getattr(solver._paired_factor_solve_kernel, "key", None))
         self.assertEqual(routes["held_tree"]["owner"], "mixed")
-        self.assertIn("FEATHER_PGS_TREE_FOREST", routes["held_tree"]["layout_reason"])
+        self.assertIn("grouping='per_size'", routes["held_tree"]["layout_reason"])
         self.assertEqual(sorted(group["dofs"] for group in routes["held_tree"]["groups"]), [6, 17])
         self.assertIn(routes["free_rigid_bodies"]["owners"][0], ("paired_factor", "paired_response"))
         self.assertEqual(routes["resolved_worlds"]["enabled"], solver._resolved_worlds_owner is not None)
@@ -850,8 +844,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_route_record_is_json_across_routes(self):
         """Build a JSON-compliant record for every major admitted construction route.
 
-        Every case runs with ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` unset, its default (on); the
-        patch-friction parallel case also runs opted out (``=0``).
+        Patch friction takes the parallel tiers it requests, as point friction does.
         """
         # One free body beside the tripod: the tiers whiten a world's rows in the kernel for one articulation of
         # each size.
@@ -867,8 +860,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ),
             ({"sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers; opted
-            # out it builds none, whatever the requested budget.
+            # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
             patch_parallel,
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # 320 dense rows stream the row metadata (5120 bytes); the two-world grid keeps row types and parents
@@ -879,20 +871,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"sparse_mass_matrix": "off", "cached_dynamics": "off", "friction_anchor_beta": 0.0}, {}),
             ({"sparse_mass_matrix": "off", "cached_dynamics": "off"}, {}),
         )
-        built = opted_out = resident_rows = 0
-        for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "0")]:
-            with self.subTest(options=options, model=model_options, switch=switch):
+        built = resident_rows = 0
+        for options, model_options in cases:
+            with self.subTest(options=options, model=model_options):
                 try:
-                    # Set the switch as the arm says, whatever the exported environment holds.
-                    with patch.dict(os.environ):
-                        os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
-                        if switch is not None:
-                            os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = switch
-                        solver = _make_solver(_build_model(**model_options), True, **options)
+                    solver = _make_solver(_build_model(**model_options), True, **options)
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
-                opted_out += switch is not None
                 with assert_host_only():
                     selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
@@ -918,12 +904,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
                 self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
-                # Patch friction is admitted to the parallel tiers unless opted out, and the case that requests
-                # them builds them: ring-pooled (linked) tiers, where point friction builds point tiers.
+                # Patch friction is admitted to the parallel tiers, and the case that requests them builds them:
+                # ring-pooled (linked) tiers, where point friction builds point tiers.
                 patch_law = routes["friction"]["law"] == "patch"
-                self.assertEqual(routes["friction"]["parallel_rows"]["admitted"], not patch_law or switch != "0")
+                self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
                 if patch_law:
-                    self.assertEqual(parallel, options is patch_parallel[0] and switch != "0")
+                    self.assertEqual(parallel, options is patch_parallel[0])
                 if parallel:
                     self.assertEqual(tiers["linked_rows"], patch_law)
                     # Every tier steps each friction pair isotropically; linked tiers also pool the ring.
@@ -939,7 +925,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 if solver._ink_skip_rows() == 0:
                     self.assertNotIn("grouped", {entry["route"] for entry in routes["stages"]["response"].values()})
         self.assertGreaterEqual(built, 8)
-        self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
         self.assertGreaterEqual(
             resident_rows, 1, "A streamed-metadata route must keep its row types and parents resident"
         )
@@ -947,12 +932,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_private_override_validation_and_cpu_precedence(self):
         """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
         model = _cpu_model()
-        with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "invalid"}):
+        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "invalid"}):
             with self.assertRaisesRegex(ValueError, "cholesky_kernel"):
                 SolverFeatherPGS(model)
             explicit = SolverFeatherPGS(model, cholesky_kernel="loop").get_path_selection()
             self.assertIn("Explicit", explicit["routes"]["stages"]["factor"]["1"]["reason"])
-        with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "tiled"}):
+        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "tiled"}):
             solver = SolverFeatherPGS(model)
             self.assertEqual(solver.cholesky_kernel, "loop")
             reason = solver.get_path_selection()["routes"]["stages"]["factor"]["1"]["reason"]
@@ -1000,26 +985,22 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cache_selection_reports_environment_and_explicit_precedence(self):
         """Retain construction-time cache decisions after environment overrides change."""
         model = _build_model()
-        with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
+        with patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense"}):
             disabled = _make_solver(model, True)
-            forced = _make_solver(model, True, cached_dynamics="on")
-        # The switch disables the sparse factor's held group, and with it the native sparse factor, which only the
-        # held tree evaluates.
+            forced = _make_solver(model, True, cached_dynamics="on", sparse_mass_matrix="on")
+        # The pin keeps the native sparse factor out; an explicit sparse_mass_matrix='on' overrides it.
         self.assertEqual(disabled.get_path_selection()["sparse_mass_matrix"], "off")
-        self.assertIn("FEATHER_PGS_TREE_KINETIC_STATE", disabled.get_path_selection()["reasons"]["sparse_mass_matrix"])
+        self.assertIn("storage='dense'", disabled.get_path_selection()["reasons"]["sparse_mass_matrix"])
         self.assertEqual(forced.get_path_selection()["sparse_mass_matrix"], "on")
         self.assertEqual(forced.get_path_selection()["cached_dynamics"], "on")
         self.assertIn("Explicit", forced.get_path_selection()["reasons"]["cached_dynamics"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_sparse_auto_composes_existing_execution_choices(self):
-        """Select qualified split and velocity-limit paths without private switches."""
+        """Select qualified split and velocity-limit paths without pins."""
         model = _build_model()
-        flags = ("FEATHER_PGS_SPARSE_SPLIT", "FEATHER_PGS_SPARSE_VELOCITY_LIMITS")
         cases = ({"pgs_mode": "split"}, {"enable_joint_velocity_limits": True})
-        with patch.dict(os.environ):
-            for name in flags:
-                os.environ.pop(name, None)
+        with patch.dict(SolverFeatherPGS._route_pins):
             for options in cases:
                 with self.subTest(options=options):
                     solver = _make_solver(model, True, friction_anchor_beta=0.0, **options)
@@ -1032,10 +1013,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     selected = _make_solver(model, True, **options).get_path_selection()
                     self.assertEqual(selected["sparse_mass_matrix"], "on")
                     self.assertEqual(selected["cached_prediction"], "tree")
-            for name in flags:
-                os.environ[name] = "0"
+            SolverFeatherPGS._route_pins["storage"] = "dense"
             for options in cases:
-                with self.subTest(legacy_disabled=options):
+                with self.subTest(pinned_dense=options):
                     ordinary = _make_solver(model, True, friction_anchor_beta=0.0, **options)
                     self.assertEqual(ordinary.get_path_selection()["sparse_mass_matrix"], "off")
                     forced = _make_solver(model, True, sparse_mass_matrix="on", friction_anchor_beta=0.0, **options)
@@ -1057,14 +1037,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):
         """Honor explicit cache choices and retain automatic dense kernel requests."""
         model = _build_model()
-        # FEATHER_PGS_TREE_KINETIC_STATE=0 under auto declines the native sparse factor, which only the held tree
-        # evaluates; the dense groups' held tree takes the solver.
-        for choice, legacy, expected, sparse in (
-            ("on", "0", True, True),
-            ("off", "1", False, False),
-            ("auto", "0", True, False),
+        # The storage pin under auto keeps the native sparse factor out; the dense groups' held tree takes the solver.
+        for choice, pins, expected, sparse in (
+            ("on", {}, True, True),
+            ("off", {}, False, False),
+            ("auto", {"storage": "dense"}, True, False),
         ):
-            with self.subTest(choice=choice), patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": legacy}):
+            with self.subTest(choice=choice), patch.dict(SolverFeatherPGS._route_pins, pins):
                 solver = _make_solver(model, True, cached_dynamics=choice)
                 selected = solver.get_path_selection()
                 self.assertEqual(solver._sparse_mass_matrix_size is not None, sparse)
@@ -1099,8 +1078,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
         self.assertEqual(solver.get_path_selection()["cached_prediction"], "tree")
-        # FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0 retains ordinary dynamics.
-        with patch.dict(os.environ, {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "0"}):
+        # The evaluator pin retains ordinary dynamics.
+        with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
             solver = _make_solver(model, False, cached_dynamics="auto", friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
         # Cached trees require a fixed or free root; a revolute joint at the world is rejected.
@@ -1211,17 +1190,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_paired_factor_sweep_excludes_a_requested_patch_tier(self):
         """Serve a free-body world with the paired factor sweep even when a requested patch tier declined sparse factors.
 
-        Patch friction admits a tier that mf_gs_parallel_rows requests by default (the test sets
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out cannot change the route), and the tier declines
+        Patch friction admits a tier that mf_gs_parallel_rows requests, and the tier declines
         sparse factors before the free-body rule does, as the friction record says. The paired factor sweep then
         admitted on the dense route excludes the tiers and keyed rows, so it walks the patch contact units and no
         tier is built.
         """
         model = _branched_arm_and_box()
-        with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
-            solver = _make_solver(
-                model, True, dense_max_constraints=96, mf_gs_parallel_rows=32, mf_gs_parallel_matrix_free=True
-            )
+        solver = _make_solver(
+            model, True, dense_max_constraints=96, mf_gs_parallel_rows=32, mf_gs_parallel_matrix_free=True
+        )
         selected = solver.get_path_selection()
         routes = selected["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
@@ -1344,7 +1321,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             "delassus_kernel": "par_row_col",
             "pgs_kernel": "loop",
         }
-        with patch.dict(SolverFeatherPGS._kernel_overrides, {"cholesky_kernel": "tiled"}):
+        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "tiled"}):
             solver = SolverFeatherPGS(_cpu_model(), **choices)
         for name, value in choices.items():
             self.assertEqual(getattr(solver, name), value)

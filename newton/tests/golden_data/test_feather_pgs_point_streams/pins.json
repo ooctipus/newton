@@ -11,7 +11,6 @@
   "contact_torsion_device._group_world": "12ce61fd0b3666832aaa8831eb85d6ee50cdbf3e6bcd9c7f10713d9f5d5c7b98",
   "contact_torsion_device._jacobians": "8c04902aef63e698b9ffbf3975a98e64b3201112ac612cc7226713b8283bae2b",
   "device_proof._checksum_words": "539d4dfaf5523eb00eac977262740ec66706aa1a166614751c756013a3e15d62",
-  "free_body_gyro.correct_free_body_gyroscopic_predictor": "ce83c82632eda47fe622b051edf1bbe10eca8acf363d7be754fdac849aa035a4",
   "friction_patches._build": "dd4de3f9b439bf606b8b0b9c41cba9a2ddf29e5ede7787229b8e9134fe830b4d",
   "friction_patches._finish_and_store": "077e2e9391a1c0ea4b69e48b12ed08983269172d89d6883ab3171754753cd3ff",
   "friction_patches._invalidate_geometry_history": "4d74fee47e8f781f7d15f15ba3ec68da6df8aa8d38d864226ee69305cd69cb12",

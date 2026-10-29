@@ -7,7 +7,6 @@ The transaction applies the paired friction law of the staged transaction, so it
 twins match the staged sweep and the physical reference to rounding, not bitwise.
 """
 
-import os
 import re
 import unittest
 from itertools import product
@@ -18,7 +17,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
@@ -363,46 +361,23 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertLess(barrier, transaction.index("if (lane == 0) s_impulse[i] = new_normal;"))
                 self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", transaction[barrier:]), [])
 
-    def test_request_follows_the_law_and_the_flag_cpu(self):
-        """Give patch friction the single-stage transaction and point friction the staged one unless the flag says."""
-        for environment, patch, expected, phrase in (
+    def test_request_follows_the_law_cpu(self):
+        """Give patch friction the single-stage transaction and point friction the staged one, unless a pin says."""
+        for pins, patch, expected, phrase in (
             ({}, True, "single", "Patch friction"),
             ({}, False, "staged", "Point friction"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": "auto"}, True, "single", "by default"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": "staged"}, True, "staged", "=staged"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": "single"}, False, "single", "=single"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": ""}, False, "staged", "Point friction"),
+            ({"transaction": "staged"}, True, "staged", "test pin"),
+            ({"transaction": "single"}, False, "single", "test pin"),
         ):
-            with (
-                self.subTest(environment=environment, patch=patch),
-                mock.patch.dict(os.environ, environment, clear=True),
-            ):
-                probe = SimpleNamespace(
-                    _friction_anchors_enabled=patch,
-                    _sparse_transaction_request=SolverFeatherPGS._sparse_transaction_flags(),
-                )
+            with self.subTest(pins=pins, patch=patch):
+                probe = SimpleNamespace(_friction_anchors_enabled=patch, _route_pins=pins)
                 transaction, reason = SolverFeatherPGS._request_sparse_contact_transaction(probe)
                 self.assertEqual(transaction, expected)
                 self.assertIn(phrase, reason)
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(SolverFeatherPGS._sparse_transaction_flags(), "auto")
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_TRANSACTION": "fused"}, clear=True),
-            self.assertRaisesRegex(ValueError, "FEATHER_PGS_SPARSE_TRANSACTION"),
-        ):
-            SolverFeatherPGS._sparse_transaction_flags()
-        # =staged turns the patch default off; the launch bounds are a rule, not a flag.
-        self.assertEqual(environment_flags.FLAGS["FEATHER_PGS_SPARSE_TRANSACTION"].kind, "policy")
-        self.assertNotIn("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", environment_flags.FLAGS)
-
-    def test_invalid_flags_raise_on_every_route_cpu(self):
-        """Reject an invalid transaction flag at construction, also where no sparse sweep runs."""
-        model = _cpu_model()
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_TRANSACTION": "fused"}),
-            self.assertRaisesRegex(ValueError, "FEATHER_PGS_SPARSE_TRANSACTION"),
-        ):
-            SolverFeatherPGS(model)
+        with self.assertRaisesRegex(ValueError, "transaction pin"):
+            SolverFeatherPGS._request_sparse_contact_transaction(
+                SimpleNamespace(_friction_anchors_enabled=True, _route_pins={"transaction": "fused"})
+            )
 
     def test_route_record_names_no_transaction_without_sparse_factors_cpu(self):
         """Record the transaction fields of the sparse route even where the route is not selected."""
@@ -726,14 +701,10 @@ class TestSingleStageTwins(unittest.TestCase):
         for law in ("patch", "point"):
             solvers = {}
             for transaction in ("single", "staged"):
-                environment = {
-                    "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1",
-                    "FEATHER_PGS_SPARSE_TRANSACTION": transaction,
-                }
                 options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
                 if law == "point":
                     options["friction_anchor_beta"] = 0.0
-                with mock.patch.dict(os.environ, environment):
+                with mock.patch.dict(SolverFeatherPGS._route_pins, {"transaction": transaction}):
                     solvers[transaction] = _make_solver(model, True, **options)
             with self.subTest(law=law):
                 single, staged = solvers["single"], solvers["staged"]

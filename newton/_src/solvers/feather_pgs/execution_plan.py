@@ -52,7 +52,7 @@ def _select_mfgs_storage(
     Row metadata stays resident when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits.
     MF impulses stream only when they cannot fit alongside the world velocity and the dense state (a capacity
     choice, not a claim that global storage is faster), or on ``force_stream_mf_impulses`` (the solver's
-    ``FEATHER_PGS_MFGS_STREAM_LAMBDA`` reference override). Streamed metadata keeps the packed dense row types and
+    test pin ``mf_storage='streamed'``). Streamed metadata keeps the packed dense row types and
     parents resident when the launch grid of ``block_count`` blocks holds at most one block per SM, so they cannot
     cost concurrency, and the block then declares at most :data:`_MFGS_STATIC_SHARED_MAX_BYTES`. Both storage
     classes hold identical values, so results are bitwise identical.
@@ -83,7 +83,7 @@ def _select_mfgs_storage(
         reason += f" MF impulses stream: {with_impulses.bytes} bytes exceed the device's {budget}."
     elif force_stream_mf_impulses:
         stream_mf_impulses = True
-        reason += " MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)."
+        reason += " MF impulses stream on request (test pin mf_storage='streamed')."
     resident_row_metadata = False
     if not shared_metadata:
         candidate = staging(shared_metadata=False, resident_row_metadata=True, stream_mf_impulses=stream_mf_impulses)

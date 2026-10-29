@@ -166,6 +166,8 @@ def route_selection(solver) -> dict:
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
+        # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
+        "pins": json_value(dict(solver._route_pins)),
         # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
@@ -218,8 +220,7 @@ def _held_tree(solver) -> dict:
         "reason": solver._cached_dynamics_selection_reason,
         "layout_reason": getattr(owner, "forest_reason", None),
         # Whether a diagonal-mass group of world-fixed roots over one-coordinate
-        # leaves runs as scalar branches (by default; FEATHER_PGS_SCALAR_BRANCHES=0
-        # opts out).
+        # leaves runs as scalar branches.
         "scalar_branches": {
             "enabled": getattr(owner, "scalar", None) is not None,
             "reason": getattr(solver, "_scalar_branches_reason", None),
@@ -254,12 +255,12 @@ def _tree_group(group) -> dict:
         # compares the two banks word for word; "identity": the bank's pointers alone.
         "input_validation": "content" if group.bank_compare else "identity",
         # Within one graph capture, a repair after this group's finish on the bank it published
-        # launches nothing (FEATHER_PGS_TREE_REPAIR_SKIP=0 keeps it; motion-velocity layouts always launch).
+        # launches nothing (motion-velocity layouts always launch).
         "captured_repair_skip": bool(group.skip_captured_repairs),
         # On CUDA, a repair of more blocks than two listed grids lists the blocks that repair (and
         # compare) and repairs over the list: always inside a capture, eagerly when the groups should
-        # be stamped with the input bank or compared (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one
-        # launch per block; motion-velocity layouts always do).
+        # be stamped with the input bank or compared (motion-velocity layouts keep one launch per
+        # block).
         "classify_first": bool(group.classify_first),
         # How each repair of the latest graph capture was recorded, in order: "skipped", "one_pass" or
         # "classified", with "_compared" when it compares input banks; empty before any capture.
@@ -893,7 +894,6 @@ def _free_rigid_bodies(solver) -> dict:
         "count": count,
         "mixed_worlds": bool(solver._has_mixed_contacts),
         "owners": owners,
-        "implicit_gyro": solver._free_body_gyro_kernel is not None,
         "reason": "No free rigid bodies."
         if not count
         else "Owners that can solve free-body rows, in claim order; contacts are routed per world at run time.",
@@ -933,9 +933,6 @@ def _friction(solver) -> dict:
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
         if not solver._patch_dense_paths:
             owners.append("the resolved-world classifier")
-        # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
-        if not solver._patch_active_rows:
-            owners.append("sparse active rows")
         if owners:
             reason += f" Point-contact owners ({', '.join(owners)}) need point friction."
     return {

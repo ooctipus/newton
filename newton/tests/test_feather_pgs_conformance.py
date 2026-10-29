@@ -10,8 +10,9 @@ reference trajectory, whichever kernels serve it. A change may rewrite or merge
 kernels freely as long as the physics holds.
 
 Routes
-    A route is a set of constructor options, ``FEATHER_PGS_*`` variables and
-    import-time switches, patched for the whole run. Every run reads
+    A route is a set of constructor options, test-only axis pins
+    (``SolverFeatherPGS._route_pins``) and import-time switches, patched for
+    the whole run. Every run reads
     ``get_path_selection()["routes"]`` before its first step and asserts the
     record the route expects, so a test cannot silently run another route.
     Owners that claim worlds at run time (sparse factors, the incremental and
@@ -150,8 +151,8 @@ class Route:
     """``"cpu"`` or ``"cuda"``."""
     options: dict = dataclasses.field(default_factory=dict)
     """Constructor options that select the route."""
-    environment: dict = dataclasses.field(default_factory=dict)
-    """``FEATHER_PGS_*`` variables set while the solver is constructed and stepped."""
+    pins: dict = dataclasses.field(default_factory=dict)
+    """Axis values the route fixes where the rules would choose others (``SolverFeatherPGS._route_pins``)."""
     module: dict = dataclasses.field(default_factory=dict)
     """Attributes patched for the whole run: the solver module's import-time switches (``_MF_EXACT_ROWSUM`` and the
     like), or ``"module.attribute"`` of another FeatherPGS module."""
@@ -180,13 +181,13 @@ def route_value(routes: dict, path: str):
 
 @contextlib.contextmanager
 def route_context(route: Route):
-    """Set the route's environment and module switches, clearing every other solver variable."""
+    """Set the route's pins and module switches, clearing every solver variable of the environment."""
     names = [name for name in os.environ if name.startswith(("FEATHER_PGS_", "IL_NEWTON_FPGS_"))]
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ))
         for name in names:
             del os.environ[name]
-        os.environ.update(route.environment)
+        stack.enter_context(mock.patch.object(SolverFeatherPGS, "_route_pins", dict(route.pins)))
         for name, value in route.module.items():
             owner, _, attribute = name.rpartition(".")
             target = importlib.import_module(f"newton._src.solvers.feather_pgs.{owner}") if owner else solver_module
@@ -1129,9 +1130,9 @@ REFERENCE_CUDA = Route(
     "reference",
     "cuda",
     # The plain matrix-free Gauss-Seidel sweep over ordinary dynamics and rows: an explicit response kernel
-    # declines the local, paired and sparse-diagonal owners, and every world is solved (no resolved-world skip).
+    # declines the local, paired and sparse-diagonal owners, and every world is solved (no resolved-world claim).
     options={**_GENERAL, "hinv_jt_kernel": "tiled"},
-    environment={"FEATHER_PGS_RESOLVED_WORLDS": "0"},
+    pins={"claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
@@ -1211,7 +1212,9 @@ KEYED_PARALLEL = MF_PARALLEL_MATRIX_FREE.but(
 SPARSE = Route(
     "sparse",
     "cuda",
+    # The unfused sparse sweep, which models without the row support table run (g1).
     options=_MF,
+    pins={"contact_units": None},
     expect={
         "sweep.route": "sparse_pgs",
         "contact_rows.producer": "sparse_contact_response",
@@ -1223,8 +1226,8 @@ SPARSE = Route(
 SPARSE_TRIPLETS = Route(
     "sparse_triplets",
     "cuda",
+    # The default sparse route of a single tree with the row support table: fused contact triplets.
     options=_MF,
-    environment={"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"},
     expect={"sweep.route": "sparse_pgs", "sparse_mass_matrix.contact_triplets": True},
 )
 SPARSE_SPLIT = Route(
@@ -1253,7 +1256,7 @@ LOCAL_FOREST = Route(
     "cuda",
     # The franka recipe's route: local packets over one held forest per world.
     options=_MF,
-    environment={"FEATHER_PGS_TREE_FOREST": "1"},
+    pins={"grouping": "forest"},
     expect={
         "local_solve.enabled": True,
         "contact_rows.producer": "local_packets",
@@ -1277,7 +1280,7 @@ LOCAL_OWNED = Route(
     "local_owned",
     "cuda",
     options=_MF,
-    environment={"FEATHER_PGS_ROW_PACKETS": "0"},
+    pins={"producer": "compact_jacobian"},
     expect={
         "local_solve.enabled": True,
         "sweep.local.factory": "local_owned",
@@ -1290,7 +1293,7 @@ LOCAL_ORDINARY = Route(
     "cuda",
     # The clutter scenes' route: local owners over ordinary dynamics.
     options={**_MF, "cached_dynamics": "off"},
-    environment={"FEATHER_PGS_ROW_PACKETS": "0"},
+    pins={"producer": "compact_jacobian"},
     expect={"local_solve.enabled": True, "sweep.local.factory": "local_owned", "held_tree.owner": None},
 )
 PAIRED = Route(
@@ -1304,7 +1307,7 @@ PAIRED_FOREST = Route(
     "cuda",
     # The kuka recipes' route: the paired factor sweep over one held forest per world.
     options=_MF,
-    environment={"FEATHER_PGS_TREE_FOREST": "1"},
+    pins={"grouping": "forest"},
     expect={
         "paired_response.enabled": True,
         "paired_response.factor_coordinates": True,
@@ -1337,7 +1340,7 @@ SPARSE_DIAGONAL_TREE = Route(
     "cuda",
     # The franka-cabinet route: sparse-diagonal rows with the diagonal-mass group in a held tree.
     options=_MF,
-    environment={"FEATHER_PGS_SCALAR_BRANCHES": "0"},
+    pins={"star": "held"},
     module=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
@@ -1439,10 +1442,11 @@ def cuda_groups() -> list:
     vlimits = {"enable_joint_velocity_limits": True}
     groups = []
     for law in _laws():
-        legged = [SPARSE, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL]
+        # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
+        # its contact triplets.
+        triplets = [SPARSE_TRIPLETS] if law == "point" else []
+        legged = [SPARSE, *triplets, SPARSE_SPLIT, SPLIT_LOOP, MF_HELD, MF_GENERAL]
         legged += [MF_PARALLEL, KEYED_PARALLEL]
-        if law == "point":
-            legged.insert(1, SPARSE_TRIPLETS)
         groups += [
             Group(
                 _physics(scenes.box_drop(), law, 32),

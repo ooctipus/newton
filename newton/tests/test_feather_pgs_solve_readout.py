@@ -573,7 +573,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Build one solver per option set of ``variants`` on the route's model, with the route's overrides; a
         variant's options override the route's."""
         options = {**route["options"], "double_buffer": False, "pgs_iterations": BUDGET}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", route.get("overrides", {})):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", route.get("overrides", {})):
             return [SolverFeatherPGS(route["model"], **{**options, **variant}) for variant in variants]
 
     @staticmethod

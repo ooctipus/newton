@@ -8,7 +8,6 @@ import contextlib
 import functools
 import itertools
 import json
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,11 +81,8 @@ def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
 
     ``lanes`` fixes the held-tree lane width (several small trees per block); by default the trees' data chooses.
     """
-    environment = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_TREE_FOREST": str(int(forest)),
-    }
+    pins = {"storage": "dense"} if owner else {"evaluator": "ordinary"}
+    pins["grouping"] = "forest" if forest else "per_size"
     settings = {
         "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
@@ -95,7 +91,10 @@ def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
         "friction_anchor_beta": 0.0,
         **options,
     }
-    with patch.dict(os.environ, environment), fixed_lanes(lanes) if lanes is not None else contextlib.nullcontext():
+    with (
+        patch.object(SolverFeatherPGS, "_route_pins", pins),
+        fixed_lanes(lanes) if lanes is not None else contextlib.nullcontext(),
+    ):
         return SolverFeatherPGS(model, **settings)
 
 
@@ -466,7 +465,7 @@ def _input_mismatches(kernel, inputs):
     return mismatched
 
 
-def _cpu_owner(*, motion_velocity=False, worlds=2):
+def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA.
 
     ``motion_velocity`` builds the owner of a velocity-limit solver (whose matrix-free mode CPU
@@ -475,6 +474,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2):
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
     solver.enable_joint_velocity_limits = motion_velocity
+    solver._route_pins.update(pins or {})
     owner = HeldTree(solver)
     solver._tree_kinetic_state = owner
     solver._fk_id_cache_enabled = True
@@ -813,7 +813,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
 
         The next repair launches when the capture changes or ends, when the step reads another
         bank, when it needs geometry the finish did not compute, after any host call that changes
-        validity, requests or the step duration, under ``FEATHER_PGS_TREE_REPAIR_SKIP=0`` and for a
+        validity, requests or the step duration, under the test pin ``repair_skip=False`` and for a
         motion-velocity layout. CPU has no graph capture: launches are recorded, not run, and the
         capture id is stubbed.
         """
@@ -867,8 +867,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                 repairs(owner, functools.partial(owner.finish, banks[0], case[4], banks[1], DT, False), 7)
                 call()
                 self.assertEqual(begin(), everyone)
-        with patch.dict(os.environ, {"FEATHER_PGS_TREE_REPAIR_SKIP": "0"}):
-            switched = _cpu_owner()
+        switched = _cpu_owner(pins={"repair_skip": False})
         self.assertFalse(switched[2].skip_captured_repairs)
         self.assertEqual(step(switched), len(switched[2].groups))
         motion = _cpu_owner(motion_velocity=True)
@@ -1489,9 +1488,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         finish(case, s0, s1)
         self.assertEqual(begin(case, s0), ["repair"] * groups)  # another bank, no comparison
         self.assertTrue(banks and all(banks), banks)
-        with patch.dict(os.environ, {"FEATHER_PGS_TREE_REPAIR_CLASSIFY": "0"}):
-            self.assertEqual(tree_kinetic_owner.launch_switches(), (True, False))
-        self.assertEqual(tree_kinetic_owner.launch_switches(), (True, True))
+        self.assertEqual(tree_kinetic_owner.launch_switches({"repair_classify": False}), (True, False))
+        self.assertEqual(tree_kinetic_owner.launch_switches({}), (True, True))
 
     def check_owner_launches(self, device):
         """Run every launch form of ordinary and motion-velocity owners; each must match its kernel's parameters.

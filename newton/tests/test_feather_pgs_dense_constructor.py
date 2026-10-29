@@ -3,9 +3,7 @@
 
 """Exercise actual dense-kernel selection through a small real solver constructor."""
 
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -28,55 +26,41 @@ def _small_worlds(device, world_count=3):
 
 
 class TestFeatherPGSDenseConstructor(unittest.TestCase):
-    """Keep the dense row budgets behind their actual shape and flag guards."""
+    """Keep the dense row budgets behind their shape rule: 128 rows and 1024 or more worlds."""
 
     def _check_device(self, device, world_count=3, cases=None):
         model = _small_worlds(device, world_count)
         self.assertEqual(model.articulation_count, world_count)
         cases = cases or (
-            # budget flag, capacity, dense kernel
-            (None, 64, "tiled_row"),
-            ("0", 64, "tiled_row"),
-            ("1", 64, "tiled_row"),
-            ("1", 32, "tiled_row"),
-            ("1", 96, "tiled_row"),
-            (None, 128, "tiled_row"),
-            ("0", 128, "tiled_row"),
-            ("1", 128, "tiled_row"),
-            ("1", 64, "loop"),
+            # capacity, dense kernel
+            (64, "tiled_row"),
+            (32, "tiled_row"),
+            (96, "tiled_row"),
+            (128, "tiled_row"),
+            (64, "loop"),
         )
-        for budgets, capacity, mode in cases:
-            with self.subTest(device=str(device), budgets=budgets, capacity=capacity, mode=mode):
-                with patch.dict(os.environ):
-                    if budgets is None:
-                        os.environ.pop("FEATHER_PGS_DENSE_ROW_BUDGETS", None)
-                    else:
-                        os.environ["FEATHER_PGS_DENSE_ROW_BUDGETS"] = budgets
-                    if model.device.is_cpu and mode != "loop":
-                        with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
-                            newton.solvers.SolverFeatherPGS(model, pgs_kernel=mode)
-                        continue
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model,
-                        pgs_mode="split",
-                        pgs_kernel=mode,
-                        dense_max_constraints=capacity,
-                        mf_max_constraints=8,
-                        use_parallel_streams=False,
-                        double_buffer=False,
-                    )
+        for capacity, mode in cases:
+            with self.subTest(device=str(device), capacity=capacity, mode=mode):
+                if model.device.is_cpu and mode != "loop":
+                    with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
+                        newton.solvers.SolverFeatherPGS(model, pgs_kernel=mode)
+                    continue
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_mode="split",
+                    pgs_kernel=mode,
+                    dense_max_constraints=capacity,
+                    mf_max_constraints=8,
+                    use_parallel_streams=False,
+                    double_buffer=False,
+                )
                 # No fabricated device, mocked factory, patched constructor, or
                 # synthetic solver shell participates in these assertions.
                 self.assertEqual(solver.world_count, world_count)
                 self.assertEqual(solver.dense_max_constraints, capacity)
                 self.assertEqual(solver.C.shape, (world_count, capacity, capacity))
                 selected = solver._pgs_solve_tiled_row_budgets
-                eligible = (
-                    model.device.is_cuda
-                    and mode == "tiled_row"
-                    and capacity in (64, 128)
-                    and (budgets == "1" or (budgets is None and capacity == 128 and world_count >= 1024))
-                )
+                eligible = model.device.is_cuda and mode == "tiled_row" and capacity == 128 and world_count >= 1024
                 resolved_mode = mode if model.device.is_cuda else "loop"
                 self.assertEqual(solver.pgs_kernel, resolved_mode)
                 if resolved_mode == "tiled_row":
@@ -149,7 +133,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         del solver
 
     def test_cuda_constructor_large_capacity_default(self):
-        """Enable large C128 batches by default while preserving explicit opt-out."""
+        """Enable the row budgets for C128 batches of 1024 worlds or more."""
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("CUDA constructor selection requires a CUDA device")
@@ -157,12 +141,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
             self._check_device(
                 devices[0],
                 world_count=world_count,
-                cases=(
-                    (None, 128, "tiled_row"),
-                    ("0", 128, "tiled_row"),
-                    ("1", 128, "tiled_row"),
-                    (None, 64, "tiled_row"),
-                ),
+                cases=((128, "tiled_row"), (64, "tiled_row")),
             )
 
 

@@ -3,7 +3,6 @@
 """Integration checks for the sparse dynamics and contact path."""
 
 import functools
-import os
 import unittest
 from unittest import mock
 
@@ -205,7 +204,7 @@ def _make_solver(model, sparse, **overrides):
         "update_mass_matrix_interval": 4,
     }
     options.update(overrides)
-    with mock.patch.dict(SolverFeatherPGS._kernel_overrides, {"sparse_mass_matrix": sparse}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if sparse else {"storage": "dense"}):
         return SolverFeatherPGS(model, **options)
 
 
@@ -214,7 +213,7 @@ def _case(sparse, *, robot_count=1, prescribed=False):
     model = _build_model(robot_count=robot_count, prescribed=prescribed)
     # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
     # rows of worlds that all separate, stays off on the dense reference.
-    with mock.patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"claims": ()}):
         solver = _make_solver(
             model,
             sparse,
@@ -240,7 +239,7 @@ def _step(case):
 class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_shared_row_support_matches_explicit_indices(self):
         """Remove per-world indices while preserving contacts, limits and reset behavior."""
-        with mock.patch.dict(SolverFeatherPGS._kernel_overrides, {"sparse_row_support": False}):
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"row_support": False}):
             explicit = _case(True)
         shared = _case(True)
         self.assertFalse(explicit[1]._sparse_row_support.enabled)
@@ -427,7 +426,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         either friction law (test_feather_pgs_sparse_patch_rows covers it).
         """
         dense = _case(False, robot_count=2)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}):
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
             sparse = _case(True, robot_count=2)
         self.assertFalse(sparse[1]._sparse_active_rows)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)

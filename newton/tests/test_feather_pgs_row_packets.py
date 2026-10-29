@@ -4,7 +4,6 @@
 """The general row-packet producer builds a world's prefix and contact packets in place."""
 
 import inspect
-import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -655,13 +654,10 @@ def _arm(model, *, packets, swing_stride=3, friction_anchor_beta=0.0, swing=1.5,
     Every ``swing_stride``-th revolute joint starts at angle ``start`` and speed ``swing`` and is
     driven to ``target``; by default the arms swing over the boxes from rest.
     """
-    env = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_RESOLVED_WORLDS": "0",
-        "FEATHER_PGS_ROW_PACKETS": str(int(packets)),
-    }
-    with patch.dict(os.environ, env):
+    pins = {"storage": "dense", "claims": ()}
+    if not packets:
+        pins["producer"] = "compact_jacobian"
+    with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

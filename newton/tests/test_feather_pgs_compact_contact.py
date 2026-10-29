@@ -21,7 +21,6 @@ from newton._src.solvers.feather_pgs import (
     response_builds_dense,
     response_builds_rows,
 )
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.tests.feather_pgs_law_harness import group_rows
@@ -897,7 +896,6 @@ class TestCompactContact(unittest.TestCase):
             for enabled in (False, True):
                 with (
                     compact_boundary(enabled),
-                    mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(
                         newton.solvers.SolverFeatherPGS(
@@ -984,7 +982,6 @@ class TestCompactContact(unittest.TestCase):
             for enabled in (False, True):
                 with (
                     compact_boundary(enabled),
-                    mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(
                         newton.solvers.SolverFeatherPGS(

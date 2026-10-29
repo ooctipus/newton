@@ -11,7 +11,6 @@ shuffles included, so every lane width is checked on CPU as well.
 """
 
 import itertools
-import os
 import unittest
 from unittest.mock import patch
 
@@ -617,8 +616,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
     def _check_captured_owner_route(self, device, friction_anchor_beta):
         # Per world, a fixed-base arm with 0.8 rad/s revolute limits over a free box on the ground.
         model = mixed_tree._build(device, speed_limit=0.8)
-        owner = {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1", "FEATHER_PGS_TREE_KINETIC_STATE": "0"}
-        with patch.dict(os.environ, owner):
+        with patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",

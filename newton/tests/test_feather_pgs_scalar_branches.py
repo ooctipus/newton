@@ -14,7 +14,6 @@ routes integrate.
 import dataclasses
 import functools
 import json
-import os
 import unittest
 from unittest import mock
 
@@ -22,8 +21,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, path_selection, tree_passes, tree_scan
 from newton._src.solvers.feather_pgs import kernels as fk
+from newton._src.solvers.feather_pgs import path_selection, tree_passes, tree_scan
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
@@ -267,9 +266,7 @@ def recipe_solver(model, *, scalar, compact=True, **options):
     }
     with (
         compact_boundary(compact),
-        mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
-        # Read at construction, so an exported value cannot change the route.
-        mock.patch.dict(os.environ, {"FEATHER_PGS_SCALAR_BRANCHES": str(int(scalar))}),
+        mock.patch.dict(SolverFeatherPGS._route_pins, {} if scalar else {"star": "held"}),
     ):
         return SolverFeatherPGS(model, **arguments)
 
@@ -848,7 +845,7 @@ class _Pair:
         self.head = cpu_solver(model, size)
         self.mine = cpu_solver(model, size)
         self.route = route(self.head)
-        self.plan, self.reason = sb.plan_scalar_branches(self.mine, requested=True)
+        self.plan, self.reason = sb.plan_scalar_branches(self.mine)
         if self.plan is None:
             raise AssertionError(self.reason)
         self.state = sb.ScalarBranchState(self.mine, self.plan)
@@ -968,7 +965,7 @@ def check_owner_launches(test, device):
                 if device.is_cpu:
                     model = build_branch_model(device, worlds=2)
                     solver = cpu_solver(model, branch_size(model))
-                    solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+                    solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
                     owner = HeldTree(solver)
                 else:
                     model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
@@ -1039,17 +1036,17 @@ class TestScalarBranchRule(unittest.TestCase):
         """Admit prismatic leaf stars on FIXED and zero-coordinate D6 roots; leave revolute leaves to the held tree."""
         for kinds in (("revolute",), ("prismatic", "revolute")):
             with self.subTest(kinds=kinds):
-                plan, reason = sb.plan_scalar_branches(cpu_solver(build_branch_model(kinds=kinds), 7), requested=True)
+                plan, reason = sb.plan_scalar_branches(cpu_solver(build_branch_model(kinds=kinds), 7))
                 self.assertIsNone(plan)
                 self.assertIn("revolute leaves run in the held tree's diagonal-mass group", reason)
         for root in ("fixed", "d6"):
             with self.subTest(root=root):
                 model = build_branch_model(root=root)
                 solver = cpu_solver(model, 7)
-                plan, reason = sb.plan_scalar_branches(solver, requested=True)
+                plan, reason = sb.plan_scalar_branches(solver)
                 self.assertIsNotNone(plan, reason)
                 self.assertEqual((plan.size, plan.group_count), (7, model.world_count))
-                self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", reason)
+                self.assertIn("run as scalar branches", reason)
                 starts = model.articulation_start.numpy()
                 expected = np.concatenate(
                     [model.joint_qd_start.numpy()[starts[a] + 1] + np.arange(7) for a in solver.group_to_art[7].numpy()]
@@ -1102,17 +1099,17 @@ class TestScalarBranchRule(unittest.TestCase):
         """Report the request, the diagonal group and each decline of the solver or its model, with its reason."""
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", sb.plan_scalar_branches(solver, requested=False)[1])
-        self.assertIn(
-            "(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", sb.plan_scalar_branches(solver, requested=True)[1]
-        )
+        with mock.patch.dict(solver._route_pins, {"star": "held"}):
+            self.assertIn("star='held'", sb.plan_scalar_branches(solver)[1])
+        self.assertIn("run as scalar branches", sb.plan_scalar_branches(solver)[1])
         with mock.patch.object(solver, "_compact_diagonal_mass_size", None):
-            plan, reason = sb.plan_scalar_branches(solver, requested=True)
+            plan, reason = sb.plan_scalar_branches(solver)
             self.assertIsNone(plan)
             self.assertIn("No diagonal-mass group", reason)
-            # A model without a diagonal group gives the same reason with the request off.
-            self.assertEqual(sb.plan_scalar_branches(solver, requested=False)[1], reason)
-        plan, _reason = sb.plan_scalar_branches(solver, requested=True)
+            # A model without a diagonal group gives the same reason with the star pinned to the held tree.
+            with mock.patch.dict(solver._route_pins, {"star": "held"}):
+                self.assertEqual(sb.plan_scalar_branches(solver)[1], reason)
+        plan, _reason = sb.plan_scalar_branches(solver)
         self.assertIsNotNone(plan)
         # A drive row that reads another coordinate than its leaf's, and leaves out of coordinate order.
         q_index = solver._augmented_drive_q_index_by_dof.numpy()
@@ -1128,17 +1125,17 @@ class TestScalarBranchRule(unittest.TestCase):
             ("_augmented_drive_q_index_by_dof", q_index, "do not read its leaf coordinates"),
         ):
             with self.subTest(attribute=attribute), mock.patch.object(solver, attribute, value):
-                plan, reason = sb.plan_scalar_branches(solver, requested=True)
+                plan, reason = sb.plan_scalar_branches(solver)
                 self.assertIsNone(plan)
                 self.assertIn(words, reason)
         with self.subTest("gradients"), mock.patch.object(model, "requires_grad", True):
-            plan, reason = sb.plan_scalar_branches(solver, requested=True)
+            plan, reason = sb.plan_scalar_branches(solver)
             self.assertIsNone(plan)
             self.assertIn("exclude gradients and particles", reason)
         with self.subTest("particles"):
             particles = cpu_solver(build_branch_model(worlds=2, particle=True), 7)
             self.assertEqual(particles.model.particle_count, 1)
-            plan, reason = sb.plan_scalar_branches(particles, requested=True)
+            plan, reason = sb.plan_scalar_branches(particles)
             self.assertIsNone(plan)
             self.assertIn("exclude gradients and particles", reason)
 
@@ -1149,7 +1146,7 @@ class TestScalarBranchRule(unittest.TestCase):
         """
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
         owner = HeldTree(solver)
         self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
         self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"])
@@ -1160,7 +1157,7 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertTrue(owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
         owner.invalidate()
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_FOREST": "1"}):
+        with mock.patch.dict(solver._route_pins, {"grouping": "forest"}):
             forced = HeldTree(solver)
         self.assertIn("Scalar branches own", forced.forest_reason)
         self.assertEqual(len(forced.groups), 2)
@@ -1179,7 +1176,7 @@ class TestScalarBranchRule(unittest.TestCase):
         """
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
         owners = {"scalar": HeldTree(solver)}
         with mock.patch.object(solver, "_scalar_branches", None):
             owners["plain"] = HeldTree(solver)
@@ -1244,7 +1241,7 @@ class TestScalarBranchRule(unittest.TestCase):
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver)
         owner = HeldTree(solver)
         validate = DeviceProof.validate
         with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:
@@ -1276,7 +1273,7 @@ class TestScalarBranchRule(unittest.TestCase):
         """
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver, requested=True)
+        solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver)
         with mock.patch.object(solver, "_tree_kinetic_state", HeldTree(solver)):
             held = path_selection._held_tree(solver)
         json.dumps(held, allow_nan=False)
@@ -1290,32 +1287,6 @@ class TestScalarBranchRule(unittest.TestCase):
         # The tree layout's packing fields hold no value for a group without a tree layout.
         self.assertEqual((scalar["trees_per_block"], scalar["block_dim"]), (None, None))
         self.assertIsInstance(tree["trees_per_block"], int)
-
-    def test_scalar_branches_are_read_at_construction(self):
-        """Request scalar branches unless FEATHER_PGS_SCALAR_BRANCHES=0, as the solver's construction record holds it.
-
-        Newton is imported before each value is exported here, so a switch read at import would
-        not see it, and the record's ``environment.applied`` would contradict the route. The
-        registry declares the flag a default-on policy whose ``=0`` opts out.
-        """
-        flag = environment_flags.FLAGS["FEATHER_PGS_SCALAR_BRANCHES"]
-        self.assertEqual(flag.kind, "policy")
-        self.assertTrue(flag.meaning.startswith("=0 ") and flag.meaning.endswith("(default on)."), flag.meaning)
-        model = build_branch_model(worlds=2)
-        plan = mock.Mock(wraps=sb.plan_scalar_branches)
-        for value, requested in ((None, True), ("0", False), ("1", True)):
-            with (
-                self.subTest(value=value),
-                mock.patch.dict(os.environ),
-                mock.patch.object(sb, "plan_scalar_branches", plan),
-            ):
-                os.environ.pop("FEATHER_PGS_SCALAR_BRANCHES", None)
-                if value is not None:
-                    os.environ["FEATHER_PGS_SCALAR_BRANCHES"] = value
-                solver = SolverFeatherPGS(model, pgs_mode="split")
-                self.assertEqual(plan.call_args.kwargs, {"requested": requested})
-                applied = solver.get_path_selection()["environment"]["applied"]
-                self.assertEqual(applied.get("FEATHER_PGS_SCALAR_BRANCHES"), value)
 
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
@@ -2208,7 +2179,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         held, publication = record["routes"]["held_tree"], record["routes"]["publication"]
         self.assertEqual(held["owner"], "mixed")
         self.assertTrue(held["scalar_branches"]["enabled"])
-        self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", held["scalar_branches"]["reason"])
+        self.assertIn("run as scalar branches", held["scalar_branches"]["reason"])
         groups = {group["operator"]: group for group in held["groups"]}
         self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
         self.assertEqual(groups["ScalarBranchState"]["dofs"], STAR_LEAVES)
@@ -2222,7 +2193,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertEqual(publication["owner"], "cached")
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", head["held_tree"]["scalar_branches"]["reason"])
+        self.assertIn("star='held'", head["held_tree"]["scalar_branches"]["reason"])
         # Without the held-tree owner there is no compact diagonal, which only it evaluates, so no group to
         # branch: every route is the one of the same solver built without the flag.
         declined = recipe_solver(model, scalar=True, cached_dynamics="off")
@@ -2232,7 +2203,8 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("No diagonal-mass group", routes["held_tree"]["scalar_branches"]["reason"])
         plain = recipe_solver(model, scalar=False, cached_dynamics="off").get_path_selection()["routes"]
-        self.assertEqual(routes, plain)
+        # The plain arm pins the star to the held tree; every route but the pins record matches.
+        self.assertEqual({**routes, "pins": None}, {**plain, "pins": None})
 
 
 if __name__ == "__main__":

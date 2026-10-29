@@ -12,7 +12,6 @@ group per world spans its articulations (:class:`ForestHeldOperator`). :func:`de
 dynamics stay on the serial passes; :func:`install` installs the owner.
 """
 
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -215,7 +214,7 @@ def sparse_decline(solver, size, plan, *, velocity_limits, split) -> str | None:
 
     Only the held tree evaluates native sparse factors, so their admission reads this before choosing one.
     """
-    reason = options_decline(solver, sparse=True) or decline(solver, sparse=(velocity_limits, split))
+    reason = options_decline(solver) or decline(solver, sparse=(velocity_limits, split))
     if reason is not None:
         return reason
     view = _plan_view(solver.group_to_art[size], solver.art_to_world, operator_metadata(plan))
@@ -233,7 +232,7 @@ def compact_decline(solver, size, *, scalar) -> str | None:
 
     Only the held tree evaluates a compact diagonal, so the sparse-diagonal response reads this before choosing one.
     """
-    reason = options_decline(solver, sparse=False) or decline(solver, compact=size)
+    reason = options_decline(solver) or decline(solver, compact=size)
     if reason is not None:
         return reason
     try:
@@ -638,7 +637,7 @@ class HeldTree:
         self.solver = solver
         # One read of the kernel and launch switches for every group this owner composes.
         self.reference, self.clocked = kernel_switches()
-        skip, classify = launch_switches()
+        skip, classify = launch_switches(solver._route_pins)
         self.scalar = None
         if solver._sparse_mass_matrix_size is not None:
             # The native sparse factor: one complete group, which proves its own coverage (make_plan).
@@ -664,13 +663,12 @@ class HeldTree:
         # A size group of scalar branches (scalar_branches.py) is owned in place
         # of a tree group: one thread per coordinate, no tree plan.
         scalar = getattr(solver, "_scalar_branches", None)
-        default = forest_default(solver)
-        override = os.environ.get("FEATHER_PGS_TREE_FOREST")
-        forest = (override if override is not None else "1" if default else "0") == "1"
+        override = solver._route_pins.get("grouping")
+        forest = override == "forest" if override is not None else forest_default(solver)
         if forest and forest_supported(solver):
             operators = [ForestHeldOperator(solver)]
             self.forest_reason = (
-                "FEATHER_PGS_TREE_FOREST=1 selects one group per world."
+                "A test pin selects one group per world (grouping='forest')."
                 if override is not None
                 else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
             )
@@ -685,7 +683,7 @@ class HeldTree:
             elif forest:
                 self.forest_reason = "The world layout does not admit one forest group."
             elif override is not None:
-                self.forest_reason = "FEATHER_PGS_TREE_FOREST keeps per-size groups."
+                self.forest_reason = "A test pin keeps per-size groups (grouping='per_size')."
             else:
                 self.forest_reason = (
                     "Default: per-size groups (the layout admits no forest, has no prescribed root, or has a "
@@ -799,29 +797,22 @@ class HeldTree:
             group.finish(state, augmented, output, dt, refresh)
 
 
-def options_decline(solver, *, sparse: bool) -> str | None:
-    """Why the solver's options keep ordinary dynamics on the dense groups (``sparse``: on the native sparse factor's
-    group), or ``None``.
+def options_decline(solver) -> str | None:
+    """Why the solver's options keep ordinary dynamics, or ``None``.
 
-    ``cached_dynamics='off'``, an explicit dense kernel choice and the CPU keep the serial passes. Under ``auto``,
-    ``FEATHER_PGS_TREE_KINETIC_STATE=0`` (the sparse factor's group) and ``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0``
-    (the dense groups) disable the held tree. Only the held tree evaluates the native sparse factor and the compact
+    ``cached_dynamics='off'``, an explicit dense kernel choice and the CPU keep the serial passes; under ``auto`` a
+    test pin does too (``evaluator='ordinary'``). Only the held tree evaluates the native sparse factor and the compact
     diagonal, so their admissions read this before :func:`install` does.
     """
     choice = solver.cached_dynamics
-    if sparse:
-        switch, enabled = "FEATHER_PGS_TREE_KINETIC_STATE", os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "1")
-    else:
-        switch = "FEATHER_PGS_MIXED_TREE_KINETIC_STATE"
-        enabled = os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "1")
     if choice == "off":
         return "Explicit cached_dynamics='off' retains ordinary dynamics."
     if solver._explicit_dense_kernels:
         return "An explicit dense kernel choice retains ordinary dynamics."
     if solver.model.device.is_cpu:
         return "CPU uses ordinary dynamics; cached prediction requires CUDA."
-    if choice != "on" and enabled != "1":
-        return f"Disabled cache option: {switch}."
+    if choice != "on" and solver._route_pins.get("evaluator") == "ordinary":
+        return "A test pin keeps ordinary dynamics (evaluator='ordinary')."
     return None
 
 
@@ -835,8 +826,7 @@ def install(solver) -> None:
     """
     solver._tree_kinetic_state = None
     choice = solver.cached_dynamics
-    sparse = solver._sparse_mass_matrix_size is not None
-    reason = options_decline(solver, sparse=sparse)
+    reason = options_decline(solver)
     if reason is None:
         reason = decline(solver)
         if reason is None:

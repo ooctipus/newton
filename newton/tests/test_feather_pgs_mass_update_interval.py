@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -190,9 +189,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for forced in (False, True):
             model = _build("cuda:0", worlds=3)
-            with mock.patch.dict(
-                os.environ, {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1", "FEATHER_PGS_TREE_KINETIC_STATE": "0"}
-            ):
+            with mock.patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
                 solver = SolverFeatherPGS(
                     model, update_mass_matrix_interval=2, pgs_mode="split", friction_anchor_beta=0.0
                 )

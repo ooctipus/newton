@@ -3,7 +3,6 @@
 
 """The generic mixed-tree cache owner covers fixed-base arms together with free rigid bodies."""
 
-import os
 import unittest
 from unittest.mock import patch
 
@@ -259,24 +258,20 @@ def _rollout(
     """Roll out a scene and return the solver, its owner, the body pose trajectory and the final twists.
 
     ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS` under patch friction and to 8
-    otherwise. ``observe`` is called after every step with the solver and its contacts. ``scalar``
-    pins ``FEATHER_PGS_SCALAR_BRANCHES``, which the solver reads at construction; ``None`` leaves the
-    environment's value, by default on, under which the cabinet's drawers run as scalar branches of the
-    held-tree owner.
+    otherwise. ``observe`` is called after every step with the solver and its contacts. ``scalar=False``
+    pins the star to the held tree (``star='held'``); otherwise the cabinet's drawers run as scalar branches of
+    the held-tree owner.
     """
     if pgs_iterations is None:
         pgs_iterations = PATCH_PARITY_ITERATIONS if friction_anchor_beta > 0.0 else 8
-    env = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-    }
+    pins = {"storage": "dense"} if owner else {"evaluator": "ordinary"}
     # ``_rollout.forest``: False/True pins the group form; None takes the owner's default rule.
     forest = getattr(_rollout, "forest", False)
     if forest is not None:
-        env["FEATHER_PGS_TREE_FOREST"] = str(int(forest))
-    if scalar is not None:
-        env["FEATHER_PGS_SCALAR_BRANCHES"] = str(int(scalar))
-    with patch.dict(os.environ, env):
+        pins["grouping"] = "forest" if forest else "per_size"
+    if scalar is False:
+        pins["star"] = "held"
+    with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
             pgs_mode=pgs_mode,
@@ -421,7 +416,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
 
     def test_forest_group_owns_the_whole_world(self):
-        """With FEATHER_PGS_TREE_FOREST=1 one group owns the arm, the box and the tray of each world."""
+        """Pinned to the forest grouping, one group owns the arm, the box and the tray of each world."""
         model = _build(wp.get_device("cuda:0"), prescribed=True)
         _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
         self.assertIsNone(plain_owner)
@@ -446,7 +441,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
         A cabinet world keeps per-size groups: its drawers run as scalar branches (the default,
         pinned here so that an exported opt-out cannot change the route), which no forest spans,
-        and with FEATHER_PGS_SCALAR_BRANCHES=0 the forest would apply their diagonal family at a loss.
+        and with the star pinned to the held tree the forest would apply their diagonal family at a loss.
         """
         _rollout.forest = None
         try:
@@ -513,7 +508,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
         The drawers run as scalar branches by default (see
         :meth:`test_scalar_branches_own_the_cabinet_drawers`), which no forest spans, so the forest
-        takes them with FEATHER_PGS_SCALAR_BRANCHES=0.
+        takes them with the star pinned to the held tree.
         """
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
@@ -551,8 +546,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         diagonal-mass class the scalar rule admits, so the owner runs them one thread per
         coordinate instead of as a held diagonal family, and the arm's tree group beside them
         validates input banks by identity. Poses and twists stay within the per-size and forest
-        owners' bounds of ordinary dynamics. The rollout pins FEATHER_PGS_SCALAR_BRANCHES, so that
-        an exported opt-out cannot change the route; the scalar-branch tests cover the default.
+        owners' bounds of ordinary dynamics; the scalar-branch tests cover the rule.
         """
         from newton._src.solvers.feather_pgs.scalar_branches import ScalarBranchState  # noqa: PLC0415
 

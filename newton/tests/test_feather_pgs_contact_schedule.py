@@ -397,7 +397,6 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
     """Step a solver over the patch fixture's contacts; return each schedule build's rows before and outputs after."""
     with (
         compact_boundary(compact),
-        mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
     ):
         solver = newton.solvers.SolverFeatherPGS(
             model,

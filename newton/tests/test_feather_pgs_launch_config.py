@@ -469,7 +469,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
 
         forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
             reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
 
@@ -868,7 +868,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         """Compile and step streamed fusion with a wide reservation and non-default block size."""
         model = _build_chain_model()
         forced = {"cholesky_kernel": "tiled", "trisolve_kernel": "tiled", "hinv_jt_kernel": "tiled"}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
             solver = SolverFeatherPGS(
                 model,
                 tile_threads=128,

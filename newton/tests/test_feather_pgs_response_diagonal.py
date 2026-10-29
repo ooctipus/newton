@@ -151,7 +151,7 @@ def _run_mixed_response(
         static_plane=static_plane,
         **(model_kwargs or {}),
     )
-    with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": kernel}):
+    with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": kernel}):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
@@ -1474,7 +1474,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Keep factor coordinates with default patch friction and yield them to the general owner for torsion."""
         model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "auto"}):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "auto"}):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,
@@ -1729,7 +1729,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         """Keep torsion-eligible worlds on the general owner, which solves the appended torsion row."""
         model = _build_mixed_response_model("cuda:0", friction=0.7)
         solvers = {}
-        with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", {"hinv_jt_kernel": "par_row"}):
+        with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "par_row"}):
             for radius in (0.0, 0.01):
                 solvers[radius] = SolverFeatherPGS(
                     model,

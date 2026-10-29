@@ -32,6 +32,7 @@ _GETTERS = ("os.environ.get", "os.getenv")
 # Removed FEATHER_PGS_ switches that stale recipes may still set: undeclared, so the record lists them as unknown.
 _REMOVED_NAMES = [
     "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
+    "FEATHER_PGS_CONTACT_UPDATE",
     "FEATHER_PGS_COUPLED_JACOBI",
     "FEATHER_PGS_GROUPED_HINV",
     "FEATHER_PGS_GROUPED_HINV_MAX",
@@ -40,8 +41,10 @@ _REMOVED_NAMES = [
     "FEATHER_PGS_SIMPLE_WORLD_ZERO",
     "FEATHER_PGS_SINGLE_FACTOR",
     "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
+    "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS",
     "FEATHER_PGS_SPARSE_FACTOR",
     "FEATHER_PGS_SPARSE_GROUPED_DYNAMICS",
+    "FEATHER_PGS_TIER_BLOCKS",
     "FEATHER_PGS_WORLD_ROWS",
 ]
 
@@ -332,7 +335,7 @@ class TestEnvironmentRecord(unittest.TestCase):
     def test_record_classifies_names(self):
         """Record declared values, undeclared names, retired names and Isaac Lab-owned names separately."""
         environ = {
-            "FEATHER_PGS_ROWS_THREADS_X": "2",
+            "FEATHER_PGS_SYNC_TIMINGS_COUNT": "2",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_COUPLED_JACOBI": "1",
             "IL_NEWTON_FPGS_MF_WARMSTART": "0",
@@ -342,7 +345,7 @@ class TestEnvironmentRecord(unittest.TestCase):
         self.assertEqual(
             fpgs_flags.record(environ),
             {
-                "applied": {"FEATHER_PGS_ROWS_THREADS_X": "2"},
+                "applied": {"FEATHER_PGS_SYNC_TIMINGS_COUNT": "2"},
                 "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "IL_NEWTON_FPGS_MF_WARMSTART"],
                 "retired": [],
                 "isaac_lab": {},
@@ -354,7 +357,7 @@ class TestEnvironmentRecord(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
             "NEWTON_UNDECLARED_EXAMPLE": "1",
-            "FEATHER_PGS_ROWS_THREADS_X": "2",
+            "FEATHER_PGS_SYNC_TIMINGS_COUNT": "2",
         }
         self.assertEqual(
             core_flags.record_newton_environment(environ),
@@ -395,7 +398,7 @@ class TestSelectionEnvironment(unittest.TestCase):
     def test_solver_reports_construction_environment(self):
         """Report the FEATHER_PGS_ environment read at construction, detached from later changes."""
         flags = {
-            "FEATHER_PGS_RESOLVED_WORLDS": "1",
+            "FEATHER_PGS_PATCH_FRAME_REUSE": "1",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0",
             "FEATHER_PGS_COUPLED_JACOBI": "1",
@@ -405,7 +408,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         with _environment(flags):
             solver = newton.solvers.SolverFeatherPGS(model)
         expected = {
-            "applied": {"FEATHER_PGS_RESOLVED_WORLDS": "1"},
+            "applied": {"FEATHER_PGS_PATCH_FRAME_REUSE": "1"},
             "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
             "retired": [],
             "isaac_lab": {},
@@ -414,7 +417,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         self.assertEqual(selected["environment"], expected)
         selected["environment"]["unknown"].append("edited")
         selected["environment"]["applied"].clear()
-        with _environment({"FEATHER_PGS_KEYED_ROWS": "0"}):
+        with _environment({"FEATHER_PGS_PATCH_FRAME_REUSE": "0"}):
             self.assertEqual(solver.get_path_selection()["environment"], expected)
 
     def test_solver_records_removed_switches_silently(self):
@@ -450,7 +453,7 @@ class TestSelectionEnvironment(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0",
             "NEWTON_UNDECLARED_EXAMPLE": "1",
-            "FEATHER_PGS_ROWS_THREADS_X": "2",
+            "FEATHER_PGS_SYNC_TIMINGS_COUNT": "2",
         }
         model = _cpu_model()
         with _environment(flags):

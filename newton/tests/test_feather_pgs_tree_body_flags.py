@@ -11,7 +11,6 @@ notifications, also through replays of a graph captured before them, and the
 changes ordinary dynamics rejects raise its error before anything changes.
 """
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -377,7 +376,9 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
             for forest in ("1", "0"):
                 with (
                     self.subTest(law=law, forest=forest),
-                    mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_FOREST": forest}),
+                    mock.patch.object(
+                        SolverFeatherPGS, "_route_pins", {"grouping": "forest" if forest == "1" else "per_size"}
+                    ),
                 ):
                     runs = {}
                     for cached in ("off", "auto"):

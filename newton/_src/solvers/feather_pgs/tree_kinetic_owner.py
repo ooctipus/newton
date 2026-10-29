@@ -74,21 +74,16 @@ def kernel_switches():
     )
 
 
-def launch_switches():
-    """Read the held-tree repair launch switches, once per owner.
+def launch_switches(pins=None):
+    """Return the held-tree repair launch mapping, once per owner: ``(skip, classify)``.
 
-    ``FEATHER_PGS_TREE_REPAIR_SKIP=0`` launches the repair of every captured
-    step, also where every block would take the early exit.
-    ``FEATHER_PGS_TREE_REPAIR_CLASSIFY=0`` keeps the one-pass repair launch
-    over every block. The switches choose launches, not emitted code.
-
-    Returns:
-        ``(skip, classify)``.
+    A captured step's repair is skipped where every block would take the early exit, and the repair lists the blocks
+    to repair before repairing them. Test pins (``SolverFeatherPGS._route_pins``) ``repair_skip=False`` launch the
+    repair of every captured step and ``repair_classify=False`` keep the one-pass repair launch over every block. Both
+    choose launches, not emitted code.
     """
-    return (
-        os.environ.get("FEATHER_PGS_TREE_REPAIR_SKIP", "1") != "0",
-        os.environ.get("FEATHER_PGS_TREE_REPAIR_CLASSIFY", "1") != "0",
-    )
+    pins = pins or {}
+    return pins.get("repair_skip", True), pins.get("repair_classify", True)
 
 
 # Blocks per SM of a listed repair's grid: the most a CUDA SM keeps resident, so a
@@ -200,7 +195,7 @@ class TreeKineticState:
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
         self.bank_compare = bool(compare_banks) and not self.motion_velocity
-        switches = launch_switches()
+        switches = launch_switches(solver._route_pins)
         skip = switches[0] if skip is None else skip
         classify = switches[1] if classify is None else classify
         # A motion-velocity repair also compares the prescaled velocity, which the
@@ -275,11 +270,10 @@ class TreeKineticState:
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
         # Predicted body twists for the resolved-world classifier: the predictor publishes them for warp-sized
-        # trees whose scans keep to their lane groups; FEATHER_PGS_PREDICTED_TWISTS=0 leaves the classifier to its
-        # own kernel.
-        self.publishes_twists = (
-            native.publishes_twists(self.layout, self.schedules)
-            and os.environ.get("FEATHER_PGS_PREDICTED_TWISTS", "1") == "1"
+        # trees whose scans keep to their lane groups (the test pin predicted_twists=False leaves the classifier to
+        # its own kernel).
+        self.publishes_twists = native.publishes_twists(self.layout, self.schedules) and solver._route_pins.get(
+            "predicted_twists", True
         )
         self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
         if self.publishes_twists:

@@ -381,7 +381,7 @@ class TestResolvedWorlds(unittest.TestCase):
         facts = AdmissionFacts(
             forward_cuda=False, matrix_free=False, plain_sweep=True, regularized=False, velocity_limits=False
         )
-        solver = SimpleNamespace(model=SimpleNamespace(device=wp.get_device("cpu")), _facts=facts)
+        solver = SimpleNamespace(model=SimpleNamespace(device=wp.get_device("cpu")), _facts=facts, _route_pins={})
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)
         self.assertEqual(classifier.resolved.shape, (0,))
@@ -533,6 +533,7 @@ def _admissible_solver():
         body_response_dof_mask=1,
         body_has_response_dofs=1,
         _joint_limit_q_index=1,
+        _route_pins={},
     )
     for name in (
         "enable_bilateral_preelimination",
@@ -564,13 +565,10 @@ def _rollout(
     anchor when the patch finish began, which releases it (``released``), and, with the classifier,
     the worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
     """
-    env = {
-        "FEATHER_PGS_PREDICTED_TWISTS": str(int(published)),
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_RESOLVED_WORLDS": str(int(classifier)),
-    }
-    with patch.dict(os.environ, env):
+    pins = {"storage": "dense", "predicted_twists": bool(published)}
+    if not classifier:
+        pins["claims"] = ()
+    with patch.object(SolverFeatherPGS, "_route_pins", pins):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

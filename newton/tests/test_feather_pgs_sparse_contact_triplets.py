@@ -436,19 +436,19 @@ class TestSparseContactTriplets(unittest.TestCase):
             middle = (low + high) // 2
             low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
         cases = (
-            ("0", 192, {}, False),
-            ("1", 192, {}, True),
-            ("1", 40, {}, False),  # The tiny batch's support table costs more than explicit indices.
-            ("1", 192, {"sparse_active_contacts": False}, False),
-            ("1", 192, {"sparse_row_support": False}, False),
-            ("1", low, {}, True),
-            ("1", high, {}, False),
+            (192, {"contact_units": None}, False),
+            (192, {}, True),
+            (40, {}, False),  # The tiny batch's support table costs more than explicit indices.
+            (192, {"active_rows": False}, False),
+            (192, {"row_support": False}, False),
+            (low, {}, True),
+            (high, {}, False),
         )
-        for flag, capacity, overrides, selected in cases:
+        for capacity, pins, selected in cases:
             with (
-                self.subTest(flag=flag, capacity=capacity, overrides=overrides),
-                mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": flag}, clear=True),
-                mock.patch.dict(SolverFeatherPGS._kernel_overrides, overrides),
+                self.subTest(capacity=capacity, pins=pins),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.dict(SolverFeatherPGS._route_pins, pins),
             ):
                 solver = SolverFeatherPGS(
                     model,
@@ -691,30 +691,27 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_patch_triplet_admission_cpu(self):
         """Fuse patch triplets in the linked active scan or the full sweep; never in packed, split or free sweeps."""
         cases = (
-            # Probe changes, active rows, split, velocity limits, support table, fits, flag; admitted, reason.
-            ({}, True, False, False, True, True, "1", True, "active-row scan"),
-            ({}, False, False, False, True, True, "1", True, "full ordered sweep"),
-            ({"_sparse_solve_lanes": 16}, False, False, False, True, True, "1", False, "16-lane"),
-            ({}, False, True, False, True, True, "1", False, "split"),
-            ({}, False, False, True, True, True, "1", False, "velocity-limit"),
-            ({"_has_free_rigid_bodies": True}, False, False, False, True, True, "1", False, "free-body"),
-            ({}, True, False, False, False, True, "1", False, "support table"),
-            ({}, True, False, False, True, False, "1", False, "room for the triplet transaction"),
-            ({}, True, False, False, True, True, "0", False, "opt-in"),
+            # Probe changes, active rows, split, velocity limits, support table, fits; admitted, reason.
+            ({}, True, False, False, True, True, True, "active-row scan"),
+            ({}, False, False, False, True, True, True, "full ordered sweep"),
+            ({"_sparse_solve_lanes": 16}, False, False, False, True, True, False, "16-lane"),
+            ({}, False, True, False, True, True, False, "Split"),
+            ({}, False, False, True, True, True, False, "velocity-limit"),
+            ({"_has_free_rigid_bodies": True}, False, False, False, True, True, False, "free-body"),
+            ({}, True, False, False, False, True, False, "support table"),
+            ({}, True, False, False, True, False, False, "room for the triplet transaction"),
+            ({"_route_pins": {"contact_units": None}}, True, False, False, True, True, False, "contact_units=None"),
             # Point friction keeps its rule: triplets need the active-row scan.
-            ({"_friction_anchors_enabled": False}, False, False, False, True, True, "1", False, "active-row scan"),
-            ({"_friction_anchors_enabled": False}, True, False, False, True, True, "1", True, "point contacts fuse"),
+            ({"_friction_anchors_enabled": False}, False, False, False, True, True, False, "active-row scan"),
+            ({"_friction_anchors_enabled": False}, True, False, False, True, True, True, "point contacts fuse"),
         )
-        for changes, active, split, velocity, table, fits, flag, admitted, phrase in cases:
+        for changes, active, split, velocity, table, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
-                _friction_anchors_enabled=True, _has_free_rigid_bodies=False, _sparse_solve_lanes=32
+                _friction_anchors_enabled=True, _has_free_rigid_bodies=False, _sparse_solve_lanes=32, _route_pins={}
             )
             for name, value in changes.items():
                 setattr(probe, name, value)
-            with (
-                self.subTest(changes=changes, active=active, split=split, velocity=velocity, table=table, fits=fits),
-                mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": flag}, clear=True),
-            ):
+            with self.subTest(changes=changes, active=active, split=split, velocity=velocity, table=table, fits=fits):
                 decision, reason = SolverFeatherPGS._admit_sparse_contact_triplets(
                     probe,
                     active_rows=active,
@@ -774,20 +771,18 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_patch_host_admission_cuda(self):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
         model = _branched_model(4, 3, "cuda:0")
-        for environment, suffix in (
-            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_single_linked"),
-            (
-                {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_SPARSE_TRANSACTION": "staged"},
-                "_active_support_table_contact_triplets_linked",
-            ),
-            (
-                {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"},
-                "_18_12_support_table_contact_triplets_single_linked",
-            ),
-            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "0"}, "_active_support_table_linked"),
-            ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_18_12_support_table"),
+        for pins, suffix in (
+            ({}, "_active_support_table_contact_triplets_single_linked"),
+            ({"transaction": "staged"}, "_active_support_table_contact_triplets_linked"),
+            ({"active_rows": False}, "_18_12_support_table_contact_triplets_single_linked"),
+            ({"contact_units": None}, "_active_support_table_linked"),
+            ({"active_rows": False, "contact_units": None}, "_18_12_support_table"),
         ):
-            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True):
+            with (
+                self.subTest(pins=pins),
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.dict(SolverFeatherPGS._route_pins, pins),
+            ):
                 solver = SolverFeatherPGS(
                     model,
                     pgs_mode="matrix_free",
@@ -802,7 +797,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 key = solver._pgs_solve_sparse_kernel.key
                 self.assertTrue(key.endswith(suffix), key)
                 self.assertEqual(solver._sparse_contact_triplets, "contact_triplets" in suffix)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True):
             packed = _make_solver(_build_model(), True)
         self.assertEqual(packed._sparse_solve_lanes, 16)
         self.assertFalse(packed._sparse_contact_triplets)

@@ -16,7 +16,6 @@ response mask.
 """
 
 import math
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -685,8 +684,8 @@ def decline(solver) -> str | None:
     return first_failed(
         (
             (
-                os.environ.get("FEATHER_PGS_RESOLVED_WORLDS", "1") == "1",
-                "FEATHER_PGS_RESOLVED_WORLDS disables the classifier.",
+                "resolved_worlds" in solver._route_pins.get("claims", ("resolved_worlds",)),
+                "A test pin drops the resolved-world claim.",
             ),
             (
                 facts.matrix_free and solver.model.device.is_cuda,

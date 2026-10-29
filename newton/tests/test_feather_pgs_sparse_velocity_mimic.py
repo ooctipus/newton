@@ -33,7 +33,7 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
         solver._mimic_count = 1
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}, clear=True),
+            mock.patch.dict(os.environ, {}, clear=True),
             self.assertRaises(_TopologyReached),
         ):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
@@ -211,7 +211,7 @@ def _model(offset, scale, error, device="cuda:0"):
 def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_beta=0.0):
     model = _model(offset, scale, error)
     model.joint_velocity_limit.assign(np.tile([0.4, 0.25, 0.2], 2).astype(np.float32))
-    with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": str(int(enabled))}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"storage": "dense"}):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",

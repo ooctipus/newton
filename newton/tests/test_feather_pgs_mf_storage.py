@@ -6,7 +6,6 @@
 import functools
 import inspect
 import itertools
-import os
 import re
 import unittest
 from unittest import mock
@@ -294,7 +293,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         # Streaming them on request takes their bytes out of the block before the budget is checked.
         storage = select((256, 22528, 1551), 100352, 32, force_stream_mf_impulses=True)
         self.assertEqual(storage[:3], (False, True, True))
-        self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", storage.reason)
+        self.assertIn("MF impulses stream on request (test pin mf_storage='streamed')", storage.reason)
         self.assertIn("8576 <= 49152", storage.reason)
         # The request changes nothing where capacity streams them already, or where nothing is resident to free.
         for shape, blocks in (((256, 37248, 1551), 32), ((2304, 2304, 75), 16384)):
@@ -907,8 +906,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         """Take requested streamed MF impulses out of the block before keeping row types and parents resident.
 
         With 12288 matrix-free rows resident, the two-world block would declare more than 48 KiB of
-        static shared memory and keeps its row types and parents streamed. Requested through
-        ``FEATHER_PGS_MFGS_STREAM_LAMBDA``, the impulses stream instead and the remaining block keeps
+        static shared memory and keeps its row types and parents streamed. Requested through the test pin
+        ``mf_storage='streamed'``, the impulses stream instead and the remaining block keeps
         the row types and parents resident.
         """
         device = wp.get_device("cuda:0")
@@ -922,7 +921,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         }
         solvers = {}
         for request in ("0", "1"):
-            with mock.patch.dict(os.environ, {"FEATHER_PGS_MFGS_STREAM_LAMBDA": request}):
+            pins = {"mf_storage": "streamed"} if request == "1" else {}
+            with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, pins):
                 solvers[request] = fpgs.SolverFeatherPGS(model, **options)
         dofs = solvers["0"].max_world_dofs
         # The factor coordinates' bitmap (sweep_routes.FactorCoordinates): a word a 32 coordinates.
@@ -944,7 +944,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             ("streamed", "resident"),
         )
         reason = records["1"]["mf_gs_storage"]["reason"]
-        self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", reason)
+        self.assertIn("MF impulses stream on request (test pin mf_storage='streamed')", reason)
         self.assertIn(f"declares {128 + 4 * (dofs + bitmaps + 2 * 320)} <= 49152 bytes", reason)
         self.assertIn("_gmeta_smeta_glambda", records["1"]["mf_gs"])
 

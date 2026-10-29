@@ -10,9 +10,7 @@ product, and the leaf's pose, motion axis and body velocity follow from its
 coordinate and the model frames alone. This module evaluates such a size group with one thread per
 coordinate and no tree plan, so no body or coordinate cap applies. By default the
 held-tree owner composes it in place of a tree group (``held_tree.py``)
-wherever :func:`plan_scalar_branches` admits the group;
-``FEATHER_PGS_SCALAR_BRANCHES=0`` keeps the group on a tree group or on ordinary
-dynamics:
+wherever :func:`plan_scalar_branches` admits the group:
 
 * ``begin`` publishes the input state of articulations whose cache is invalid:
   the root pose, the articulation origin, and each leaf's pose and motion axis.
@@ -510,7 +508,7 @@ class ScalarBranchPlan:
     """The group's DOFs, sorted."""
 
 
-def plan_scalar_branches(solver, *, requested: bool, size: int | None = None) -> tuple[ScalarBranchPlan | None, str]:
+def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBranchPlan | None, str]:
     """Decide whether the solver's diagonal-mass group runs as scalar branches.
 
     The rule is topology only: the group must be the compact diagonal-mass size
@@ -525,8 +523,8 @@ def plan_scalar_branches(solver, *, requested: bool, size: int | None = None) ->
         size = solver._compact_diagonal_mass_size
     if size is None:
         return None, "No diagonal-mass group shares the sparse-diagonal response."
-    if not requested:
-        return None, "Off: FEATHER_PGS_SCALAR_BRANCHES=0 keeps the diagonal-mass group out of scalar branches."
+    if solver._route_pins.get("star") == "held":
+        return None, "A test pin keeps the diagonal-mass group in the held tree (star='held')."
     model = solver.model
     if model.requires_grad or model.particle_count:
         return None, "Scalar branches exclude gradients and particles."
@@ -558,7 +556,7 @@ def plan_scalar_branches(solver, *, requested: bool, size: int | None = None) ->
     )
     reason = (
         f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate prismatic "
-        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)."
+        "leaves run as scalar branches."
     )
     return plan, reason
 

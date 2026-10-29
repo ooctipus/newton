@@ -8,7 +8,6 @@ import inspect
 import textwrap
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -20,7 +19,7 @@ from newton.tests.feather_pgs_law_harness import contact_input
 from newton.tests.feather_pgs_patch_parity import row_law
 
 
-def _launch_workers(capacity, enabled):
+def _launch_workers(capacity):
     """Evaluate the actual sparse launch's host-only worker selection."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(implementation.SolverFeatherPGS._stage4_build_rows)))
     call = next(
@@ -41,22 +40,19 @@ def _launch_workers(capacity, enabled):
         # The rows contact launches are sized for (ContactPool.launch_rows), eagerly the ready rows.
         "rows": capacity,
         "contact_jacobian_workers": min(capacity, implementation._CONTACT_JACOBIAN_WORKER_CAP),
-        "contact_build_threads": min(
-            capacity, implementation._CONTACT_BUILD_THREAD_CAP * implementation._CONTACT_THREADS_X
-        ),
+        "contact_build_threads": min(capacity, implementation._CONTACT_BUILD_THREAD_CAP),
     }
-    with mock.patch.object(implementation, "_SPARSE_CONTACT_DIRECT", enabled, create=True):
-        if dimension.id != "contact_jacobian_workers":
-            assignment = next(
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == dimension.id for target in node.targets)
-            )
-            expression = ast.Expression(assignment.value)
-            values[dimension.id] = eval(
-                compile(expression, "<actual sparse worker selection>", "eval"), vars(implementation), values
-            )
+    if dimension.id != "contact_jacobian_workers":
+        assignment = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == dimension.id for target in node.targets)
+        )
+        expression = ast.Expression(assignment.value)
+        values[dimension.id] = eval(
+            compile(expression, "<actual sparse worker selection>", "eval"), vars(implementation), values
+        )
     return values[dimension.id]
 
 
@@ -187,8 +183,7 @@ class TestSparseResponseOwner(unittest.TestCase):
     def test_actual_host_launch_selection(self):
         """Expose scalar parallelism while bounding work for mostly unused capacity."""
         for capacity in (0, 1, 4096, 4353, 65536, 65569, 147456, 25231360):
-            self.assertEqual(_launch_workers(capacity, False), min(capacity, 65536))
-            self.assertEqual(_launch_workers(capacity, True), capacity)
+            self.assertEqual(_launch_workers(capacity), min(capacity, 65536))
 
     def test_cpu_mixed_complete_prefix(self):
         """Preserve every sparse response and inactive output above the old worker cap."""
@@ -196,10 +191,11 @@ class TestSparseResponseOwner(unittest.TestCase):
             values = _fixture("cpu", shared_anchor=shared_anchor)
             count = len(values["contact_slot"])
             expected = _expected(values, count)
-            for enabled in (False, True):
+            # The selected workers and the full capacity: the device stride covers either.
+            for workers in (_launch_workers(count), count):
                 values["sparse_row_dof"].fill_(-777)
                 values["sparse_row_jy"].fill_(np.nan)
-                _launch(values, _launch_workers(count, enabled), "cpu")
+                _launch(values, workers, "cpu")
                 np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
                 np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
@@ -210,12 +206,12 @@ class TestSparseResponseOwner(unittest.TestCase):
             values["contact_count"].assign(np.array([raw_count], dtype=np.int32))
             values["sparse_row_dof"].fill_(-777)
             values["sparse_row_jy"].fill_(np.nan)
-            _launch(values, _launch_workers(17, True), "cpu")
+            _launch(values, 17, "cpu")
             expected = _expected(values, raw_count)
             np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
             np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
         empty = _fixture("cpu", capacity=0)
-        _launch(empty, _launch_workers(0, True), "cpu")
+        _launch(empty, 0, "cpu")
         self.assertEqual(empty["sparse_row_dof"].numpy().size, 0)
 
     def test_cpu_persistent_tangent_anchors(self):
@@ -226,7 +222,7 @@ class TestSparseResponseOwner(unittest.TestCase):
         patches.point_a = wp.array(np.tile((0.23, -0.17, 0.41), (73, 1)), dtype=wp.vec3, device="cpu")
         patches.point_b = wp.array(np.tile((-0.12, 0.27, 0.32), (73, 1)), dtype=wp.vec3, device="cpu")
         expected = _expected(values, 73)
-        _launch(values, _launch_workers(73, False), "cpu")
+        _launch(values, _launch_workers(73), "cpu")
         np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
         np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
@@ -237,8 +233,7 @@ class TestSparseResponseOwner(unittest.TestCase):
         values = _fixture(device, capacity=65569)
         capacity = len(values["contact_slot"])
         owners = (values["sparse_row_dof"].ptr, values["sparse_row_jy"].ptr)
-        for enabled in (False, True):
-            workers = _launch_workers(capacity, enabled)
+        for workers in (_launch_workers(capacity), capacity):
             _launch(values, workers, device)
             with wp.ScopedCapture(device=device) as capture:
                 _launch(values, workers, device)

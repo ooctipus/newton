@@ -76,13 +76,10 @@ def _interleaved_legs(device, worlds=4):
 
 
 def _rollout(model, *, level_loop, steps=60):
-    env = {
-        "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1",
-        "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-        "FEATHER_PGS_RESOLVED_WORLDS": "0",
-        "FEATHER_PGS_TREE_REFERENCE": str(int(level_loop)),
-    }
-    with patch.dict(os.environ, env):
+    with (
+        patch.dict(os.environ, {"FEATHER_PGS_TREE_REFERENCE": str(int(level_loop))}),
+        patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense", "claims": ()}),
+    ):
         solver = SolverFeatherPGS(
             model,
             pgs_mode="matrix_free",
