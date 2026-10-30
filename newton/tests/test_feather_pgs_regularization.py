@@ -336,6 +336,8 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
                 DT,
                 1.0,
                 0.5,
+                1,
+                0,
             ],
             device=device,
         )

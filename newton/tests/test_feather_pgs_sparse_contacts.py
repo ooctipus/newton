@@ -536,7 +536,7 @@ class TestSparseContacts(unittest.TestCase):
                     wp.launch(
                         compute_world_contact_bias,
                         dim=9,
-                        inputs=[reference_rows, count, 9, 0.01, law["speculative_scale"], 1.0],
+                        inputs=[reference_rows, count, 9, 0.01, law["speculative_scale"], 1.0, 0, 0],
                         device=device,
                     )
                     geometric_rhs = reference_rhs.numpy().copy()
@@ -656,6 +656,8 @@ class TestSparseContacts(unittest.TestCase):
                 0.0123,
                 1.0,
                 1.0,
+                0,
+                0,
             ],
             device=device,
         )

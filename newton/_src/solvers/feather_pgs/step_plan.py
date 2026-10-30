@@ -88,7 +88,7 @@ class SolveRoute:
     route: Route
     """The rows the sweep solves: ``sparse_pgs``, ``sparse_diagonal`` or ``matrix_free_gs``."""
     driver: Route
-    """What drives the route's sweep each solve: ``direct``, ``debug_loop`` or ``contact_compliance``."""
+    """What drives the route's sweep each solve: ``direct`` or ``debug_loop``."""
 
 
 @dataclass(frozen=True)
@@ -257,11 +257,6 @@ def _solve(row: RouteRow) -> SolveRoute:
     if row.laws.debug_rows:
         driver = Route(
             "debug_loop", "pgs_debug launches the position solve one iteration per dispatch with host reads."
-        )
-    elif row.laws.compliance:
-        driver = Route(
-            "contact_compliance",
-            "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
         )
     else:
         driver = Route("direct", "The route sweeps all iterations in one dispatch.")

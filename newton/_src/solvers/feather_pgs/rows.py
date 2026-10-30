@@ -160,8 +160,7 @@ class RowLaws:
             options: The solver's options.
 
         Raises:
-            ValueError: For a negative or non-finite ``friction_anchor_beta``, patch friction with compliant contacts
-                or an invalid contact torsion selection.
+            ValueError: For a negative or non-finite ``friction_anchor_beta`` or an invalid contact torsion selection.
         """
         laws = cls()
         laws.model = model
@@ -175,25 +174,12 @@ class RowLaws:
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
             # friction. The ordinary constructor enables persistent patches.
-            if options.contact_compliance:
-                friction_anchor_beta = 0.0
-                laws.friction_anchor_beta_source = "default_compliance"
-                warnings.warn(
-                    "The selected contact material law uses velocity-only point friction; "
-                    "contact_compliance does not support persistent friction patches. "
-                    "Set friction_anchor_beta=0 explicitly to retain this law without the warning.",
-                    UserWarning,
-                    stacklevel=_CALLER,
-                )
-            else:
-                friction_anchor_beta = 0.2
-                laws.friction_anchor_beta_source = "default"
+            friction_anchor_beta = 0.2
+            laws.friction_anchor_beta_source = "default"
         laws.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(laws.friction_anchor_beta) or laws.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
         laws.friction_anchors_enabled = laws.friction_anchor_beta > 0.0
-        if options.contact_compliance and laws.friction_anchors_enabled:
-            raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
         if laws.friction_anchors_enabled and (options.contact_shared_anchor or options.contact_friction_shared_anchor):
             warnings.warn(
                 "Patch friction selects its own friction locations and carries tangential displacement. "
@@ -206,6 +192,8 @@ class RowLaws:
         # change w are the exact hard update and stay on the zero-cost path.
         laws.contact_w = float(np.float32(1.0 / (1.0 + options.pgs_contact_regularization)))
         laws.regularization_enabled = laws.contact_w < 1.0
+        # A weighted row law: contact rows step by their weights (the relative option's, or material contacts').
+        laws.weighted = laws.regularization_enabled or bool(options.contact_compliance)
         laws.effective_restitution_velocity_threshold = (
             options.restitution_velocity_threshold if options.enable_restitution else np.finfo(np.float32).max
         )

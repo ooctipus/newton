@@ -59,6 +59,12 @@ CONTACT_INPUT = (
     Field("speculative_scale", wp.float32, owner="options", attr="contact_speculative_scale"),
     Field("restitution_threshold", wp.float32, owner="laws", attr="effective_restitution_velocity_threshold"),
     Field("contact_w", wp.float32, owner="laws"),
+    # The contacts' material (contact_compliance): stiffness [N/m], damping [N s/m] and friction scale per contact;
+    # a contact of zero stiffness keeps the rigid law.
+    Field("material", wp.int32, owner="options", attr="contact_compliance"),
+    Field("stiffness", wp.float32, ("contact",), attr="contact_stiffness"),
+    Field("damping", wp.float32, ("contact",), attr="contact_damping"),
+    Field("friction_weight", wp.float32, ("contact",), attr="contact_friction_weight"),
     # The dense row records the producers write.
     *dense_rows.RECORDS,
 )

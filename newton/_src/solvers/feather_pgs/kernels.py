@@ -59,6 +59,7 @@ from .projection_laws import (
 )
 from .row_build import write_contact_row
 from .row_laws import (
+    contact_material_rhs,
     contact_restitution_rhs,
     joint_limit_side,
     limit_rhs,
@@ -2667,11 +2668,17 @@ def compute_world_contact_bias(
     dt: float,
     contact_speculative_scale: float,
     contact_w: float,
+    weighted: int,
+    material: int,
 ):
     """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
 
     The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
     ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS.
+
+    ``weighted`` rows take a weight: the relative regularization's, or a material contact's (``material``: a contact
+    whose writer stored a compliance ``eps`` and its rhs) ``d / (d + eps)`` from its final diagonal ``d``, in which the
+    regularized step (:func:`.projection_laws.regularized_delta`) is the material law's exact Gauss-Seidel step.
 
     One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
@@ -2681,15 +2688,21 @@ def compute_world_contact_bias(
     i = tid - world * max_constraints
     if i >= world_constraint_count[world]:
         return
-    inv_dt = 1.0 / dt
     kind = rows.row_type[world, i]
+    if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        eps = rows.row_eps[world, i]
+        if eps > 0.0:
+            diagonal = rows.diag[world, i]
+            rows.row_w[world, i] = diagonal / (diagonal + eps)
+            return
+    inv_dt = 1.0 / dt
     phi = rows.phi[world, i]
     target = rows.target[world, i]
     rhs, row_w = row_rhs(
         kind, phi, rows.row_beta[world, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
     )
     rows.rhs[world, i] = rhs
-    if contact_w < 1.0:
+    if weighted != 0:
         rows.row_w[world, i] = row_w
 
 
@@ -2857,7 +2870,10 @@ def build_mf_contact_rows(
     point is the root body's world-space COM position. The MF contact Jacobian
     uses contact position relative to that point:
         J = [d, r x d]   (r = p_contact - p_com_world)
-    A tangent row folds the row law's beta into its gap (matrix-free rows keep no beta).
+    A tangent row folds the row law's beta into its gap (matrix-free rows keep no beta). A material contact
+    (``contact_compliance``, positive stiffness) writes its normal's rhs and compliance
+    (:func:`.row_laws.contact_material_rhs`) and takes no restitution, its tangents the contact's friction scale, as
+    :func:`.row_build.write_contact_row` does.
     """
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
@@ -2879,6 +2895,11 @@ def build_mf_contact_rows(
         if body_b >= 0 and art_b >= 0 and data.response_dofs[art_b] > 0:
             response_body_b = body_b
         mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
+        stiffness = float(0.0)
+        if data.material != 0:
+            stiffness = data.stiffness[c]
+        if stiffness > 0.0:
+            restitution = 0.0
         # Allocation owns the row extent; recomputing eligibility can cross a
         # floating-point threshold and overwrite the following contact.
         rows = 1
@@ -2909,15 +2930,25 @@ def build_mf_contact_rows(
                 mf.restitution[world, row_idx] = restitution
             else:
                 tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+                if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+                    friction_mu *= data.friction_weight[c]
                 mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
                 mf.row_parent[world, row_idx] = slot
                 mf.row_mu[world, row_idx] = friction_mu
                 mf.phi[world, row_idx] = beta * tangent_phi
                 mf.restitution[world, row_idx] = 0.0
+            target = float(0.0)
             if has_target_velocity != 0:
-                mf.target[world, row_idx] = prescribed_target(
+                target = prescribed_target(
                     body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
                 )
+                mf.target[world, row_idx] = target
+            if data.material != 0:
+                eps = float(0.0)
+                if row == 0 and stiffness > 0.0:
+                    material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
+                    mf.rhs[world, row_idx] = material_rhs
+                mf.eps[world, row_idx] = eps
 
 
 @wp.func

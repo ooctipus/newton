@@ -860,6 +860,8 @@ def _general_bias(solver, rows, dt):
             dt,
             solver.options.contact_speculative_scale,
             1.0,
+            0,
+            0,
         ],
         device=device,
     )

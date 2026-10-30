@@ -215,7 +215,7 @@ def _dense_speculative_rhs(scale: float) -> float:
     wp.launch(
         compute_world_contact_bias,
         dim=1,
-        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 0.5, scale, 1.0],
+        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 0.5, scale, 1.0, 0, 0],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -254,6 +254,8 @@ def _mf_speculative_rhs(scale: float) -> float:
             scale,
             0.5,
             1,
+            0,
+            0,
         ],
         outputs=[
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),

@@ -5,7 +5,6 @@
 
 import unittest
 import warnings
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -44,22 +43,15 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
             np.testing.assert_array_equal(actual[name], reference[name], err_msg=name)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_compliance_opt_in_preserves_material_law(self):
-        """Keep dense and MF material responses identical to explicit point friction."""
+    def test_compliance_opt_in_keeps_default_patches(self):
+        """Resolve omitted patch gain to default patch friction alongside material contacts, without a warning, and
+        rest at the material's indentation on dense and MF rows."""
         for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                options = {"articulated": articulated, "enabled": True, "steps": 20, "friction_scale": 0.4}
-                with self.assertWarnsRegex(UserWarning, "velocity-only point friction"):
-                    actual, paths, solver, _ = run_fixture(**options, solver_options={"friction_anchor_beta": None})
-                reference, reference_paths, _, _ = run_fixture(**options, solver_options={"friction_anchor_beta": 0.0})
-                np.testing.assert_array_equal(actual, reference)
-                self.assertEqual(paths, reference_paths)
-                self.assertGreater(solver.compliance_contact_count, 0)
-                self.assertFalse(solver.laws.friction_anchors_enabled)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_explicit_patch_compliance_conflict_fails_before_step(self):
-        """Reject incompatible explicit requests before any simulation state can advance."""
-        with patch.object(SolverFeatherPGS, "step", side_effect=AssertionError("step must not run")):
-            with self.assertRaisesRegex(ValueError, "contact_compliance.*friction_anchor_beta"):
-                run_fixture(articulated=False, enabled=True, steps=1, solver_options={"friction_anchor_beta": 0.2})
+            with self.subTest(articulated=articulated), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                trace, _, solver, mass = run_fixture(
+                    articulated=articulated, enabled=True, solver_options={"friction_anchor_beta": None}
+                )
+                self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
+                self.assertTrue(solver.laws.friction_anchors_enabled)
+                self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)

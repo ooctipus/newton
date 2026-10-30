@@ -357,21 +357,26 @@ class TestColoredSweep(unittest.TestCase):
 
 
 def _conformance_tests():
-    """One conformance check per (scene, law): the gate's laws and the distance to its converged reference."""
-    for law in ("point", "patch"):
-        for scene in (tray(), conf.scenes.box_stack()):
-            physics = conf._physics(dataclasses.replace(scene, deterministic_contacts=True), law, 32)
-            group = conf.Group(physics, conf.REFERENCE_CUDA, ())
+    """One conformance check per (scene, law): the gate's laws and the distance to its converged reference; and the
+    compliant stack's material contacts, whose units step by the weights their slots stage."""
+    problems = [
+        conf._physics(dataclasses.replace(scene, deterministic_contacts=True), law, 32)
+        for law in ("point", "patch")
+        for scene in (tray(), conf.scenes.box_stack())
+    ]
+    problems.append(conf._physics(conf.scenes.compliant_stack(), "point", 32, "compliance", contact_compliance=True))
+    for physics in problems:
+        group = conf.Group(physics, conf.REFERENCE_CUDA, ())
 
-            def test(self, group=group):
-                # The reference runs first, outside the colored mapping.
-                conf.reference(group.physics, group.reference, self.device)
-                with colored():
-                    failures = conf._failures(conf.run_checks(group, _ROUTE, self.device))
-                self.assertFalse(failures, f"{group.name} through {_ROUTE.name}:\n{conf._message(failures)}")
+        def test(self, group=group):
+            # The reference runs first, outside the colored mapping.
+            conf.reference(group.physics, group.reference, self.device)
+            with colored():
+                failures = conf._failures(conf.run_checks(group, _ROUTE, self.device))
+            self.assertFalse(failures, f"{group.name} through {_ROUTE.name}:\n{conf._message(failures)}")
 
-            test.__doc__ = f"Check {group.name} through the colored mapping against the gate."
-            setattr(TestColoredSweep, f"test_{group.name}_conforms", test)
+        test.__doc__ = f"Check {group.name} through the colored mapping against the gate."
+        setattr(TestColoredSweep, f"test_{group.name}_conforms", test)
 
 
 _conformance_tests()

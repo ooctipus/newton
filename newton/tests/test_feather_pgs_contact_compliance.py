@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test opt-in contact compliance on native dense and matrix-free routes."""
+"""Material contacts (``contact_compliance``) on native dense and matrix-free rows, with real collision contacts."""
 
 import os
 import unittest
@@ -179,7 +179,6 @@ def run_native_hydro_fixture(*, articulated=True):
                 "body_z_m": float(output.body_q.numpy()[body, 2]),
                 "joint_velocity_m_s": float(output.joint_qd.numpy()[0]),
                 "normal_impulse_N_s": float(impulses.numpy()[0, row_types.numpy()[0] == 0].sum()),
-                "consumed_compliant_contacts": solver.compliance_contact_count,
             }
         for before, after in zip(inertia, (model.body_mass, model.body_com, model.body_inertia), strict=True):
             np.testing.assert_array_equal(before, after.numpy())
@@ -201,20 +200,18 @@ def run_native_hydro_fixture(*, articulated=True):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
 class TestContactComplianceIntegration(unittest.TestCase):
-    """Gate the experimental adapter against actual dense and MF contact paths."""
+    """Material contacts on actual dense and matrix-free contact paths."""
 
     def test_dense_articulated_support(self):
         """Recover finite-stiffness indentation on real dense articulated rows."""
-        trace, paths, solver, mass = run_fixture(articulated=True, enabled=True)
+        trace, paths, _solver, mass = run_fixture(articulated=True, enabled=True)
         self.assertEqual(paths, {0})
-        self.assertGreater(solver.compliance_contact_count, 0)
         self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)
 
     def test_mf_free_body_support(self):
         """Recover the same indentation on real matrix-free free-body rows."""
-        trace, paths, solver, mass = run_fixture(articulated=False, enabled=True)
+        trace, paths, _solver, mass = run_fixture(articulated=False, enabled=True)
         self.assertEqual(paths, {1})
-        self.assertGreater(solver.compliance_contact_count, 0)
         self.assertLess(abs(trace[-1, 2] - (0.05 - mass * 9.81 / 3000)), 2e-6)
 
     def test_default_off_exact_state(self):
@@ -228,9 +225,8 @@ class TestContactComplianceIntegration(unittest.TestCase):
         """Preserve hard-contact motion with zero stiffness even when compliance is ON."""
         for articulated in (False, True):
             hard, paths, _, _ = run_fixture(articulated=articulated, enabled=False, stiffness=0, steps=60)
-            noop, actual_paths, solver, _ = run_fixture(articulated=articulated, enabled=True, stiffness=0, steps=60)
+            noop, actual_paths, _solver, _ = run_fixture(articulated=articulated, enabled=True, stiffness=0, steps=60)
             self.assertEqual(actual_paths, paths)
-            self.assertEqual(solver.compliance_contact_count, 0)
             np.testing.assert_array_equal(hard, noop)
 
     def test_friction_uses_compliant_load_and_reducer_weight(self):
@@ -248,9 +244,7 @@ class TestContactComplianceIntegration(unittest.TestCase):
     def test_native_hydro_material_pipeline(self):
         """Apply native pressure-weighted hydro coefficients without overwriting fields."""
         result = run_native_hydro_fixture()
-        self.assertEqual(
-            result["compliant"]["consumed_compliant_contacts"], result["native_material"]["positive_stiffness_contacts"]
-        )
+        self.assertGreater(result["native_material"]["positive_stiffness_contacts"], 0)
         self.assertGreater(
             abs(result["compliant"]["normal_impulse_N_s"] - result["stock_law"]["normal_impulse_N_s"]), 1e-5
         )
@@ -262,9 +256,6 @@ class TestContactComplianceIntegration(unittest.TestCase):
         """Handle multiple MF hydro normals without indexing a dummy prescribed-target buffer."""
         result = run_native_hydro_fixture(articulated=False)
         self.assertGreater(result["native_material"]["positive_stiffness_contacts"], 1)
-        self.assertEqual(
-            result["compliant"]["consumed_compliant_contacts"], result["native_material"]["positive_stiffness_contacts"]
-        )
         self.assertTrue(np.isfinite(list(result["compliant"].values())).all())
 
 

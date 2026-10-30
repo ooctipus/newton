@@ -14,6 +14,8 @@ target and its stabilization. Every row builder and sweep that forms a row's
 * :func:`contact_rhs` is a contact normal row's law: Baumgarte correction of a
   penetrating row, capped by its bodies' depenetration speed where the route
   applies the cap, and the speculative bias of a separated row;
+* :func:`contact_material_rhs` is a material (compliant) contact normal's law:
+  its spring-dashpot bias and its compliance ``eps``;
 * :func:`contact_restitution_rhs` replaces a closing row's bias by the
   restitution target ``-target + e u`` where :func:`contact_restitution_fires`;
 * :func:`joint_limit_side`, :func:`velocity_limit_active` and :func:`mimic_phi`
@@ -101,6 +103,19 @@ def contact_rhs(
     else:
         rhs += speculative_scale * phi * inv_dt
     return rhs, row_w
+
+
+@ROW_LAW.law
+def contact_material_rhs(phi: float, target: float, stiffness: float, damping: float, dt: float) -> tuple[float, float]:
+    """Return a material contact normal row's ``rhs`` and its compliance ``eps`` [1/kg].
+
+    The contact pushes with ``F = max(0, -k phi' - c u')`` at the step's end, backward Euler in the force: the row
+    ``J v + rhs + eps lambda`` with ``eps = 1 / (dt (dt k + c'))``, ``rhs = k phi / (dt k + c') - target`` and
+    ``c' = c`` while ``phi <= 0``; a dashpot does not act across an open gap (``c' = 0``). The row takes neither
+    restitution nor the relative regularization: its dashpot is its rebound law, its ``eps`` physical.
+    """
+    denominator = dt * stiffness + wp.where(phi <= 0.0, damping, 0.0)
+    return stiffness * phi / denominator - target, 1.0 / (dt * denominator)
 
 
 @ROW_LAW.law

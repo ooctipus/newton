@@ -47,7 +47,6 @@ from ..semi_implicit.kernels_particle import (
     eval_triangle_forces,
 )
 from ..solver import SolverBase
-from . import contact_compliance as _contact_compliance
 from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import (
@@ -171,6 +170,7 @@ from .solver_fields import (
     BODY_INERTIA,
     CAPACITY_STATUS,
     CONTACT_RUNS,
+    DENSE_ROW_EPS,
     DENSE_ROW_WEIGHTS,
     DENSE_ROWS,
     DENSE_WARMSTART,
@@ -178,6 +178,7 @@ from .solver_fields import (
     FUSED_DIAGONAL_LIMITS,
     JOINT_FOREST,
     MF_COUNTERS,
+    MF_ROW_EPS,
     MF_ROW_WEIGHTS,
     MF_ROWS,
     MF_WARMSTART,
@@ -768,27 +769,13 @@ class SolverFeatherPGS(SolverBase):
                 an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
                 unmatched nonempty patterns raise ValueError. Experimental, with the
                 same compatibility limitations as the radius.
-            contact_compliance: Experimental opt-in implicit unilateral contact material response.
-                Positive ``Contacts.rigid_contact_stiffness`` [N/m] replaces the hard normal law;
-                zero stiffness remains hard. Uses exported damping [N s/m] (zero stays zero) and
-                applies exported friction quadrature weighting once to the existing pair friction.
-                Requires CUDA matrix-free/immediate/interleaved solving, full position friction,
-                no warm start, restitution, global contact regularization, debug, shared normal
-                anchors, persistent-patch friction, or friction-anchor reduction. Intentional
-                allocator exclusions are counted in ``compliance_skipped_contact_count``;
-                contact/row capacity loss remains an error even with warnings disabled.
-                With omitted ``friction_anchor_beta``, enabling compliance selects point friction
-                and warns; an explicit positive patch gain is rejected at construction.
-                CUDA graph capture is rejected. This
-                host-synchronizing experimental implementation is not a performance path and may
-                change without the normal deprecation period. Defaults to False.
-                Enabling this option with zero stiffness preserves the hard-contact law, not
-                the runtime cost of the default-OFF path.
-
-                .. experimental::
-
-                    The ``contact_compliance=True`` material response and its supported combinations
-                    may change without prior notice.
+            contact_compliance: Contacts of positive ``Contacts.rigid_contact_stiffness`` [N/m] are material
+                contacts: each pushes with ``F = max(0, -k phi - c u)`` at the step's end (backward Euler), with the
+                contact's ``rigid_contact_damping`` [N s/m] (no dashpot across an open gap), and its tangents take
+                the contact's ``rigid_contact_friction`` scale (zero meaning one). Zero stiffness keeps the rigid
+                law. The law is the row law's compliance ``eps = 1 / (dt (dt k + c))``: a material normal takes
+                neither restitution nor ``pgs_contact_regularization``. The contacts must carry the three
+                per-contact arrays. Placements whose sweeps read no row weights decline it. Defaults to False.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -1001,24 +988,6 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError("FeatherPGS has no gradients: build the model with requires_grad=False.")
         # Every option as requested, before any default resolution; get_path_selection() reports it.
         requested_options = dict(locals())
-        if contact_compliance:
-            _contact_compliance.validate_configuration(
-                model,
-                {
-                    "pgs_iterations": pgs_iterations,
-                    "pgs_warmstart": pgs_warmstart,
-                    "enable_restitution": enable_restitution,
-                    "pgs_contact_regularization": pgs_contact_regularization,
-                    "pgs_debug": pgs_debug,
-                    "contact_friction_position_iterations": contact_friction_position_iterations,
-                    "contact_friction_shared_anchor": contact_friction_shared_anchor,
-                    "contact_shared_anchor": contact_shared_anchor,
-                },
-            )
-        self.compliance_contact_count = 0
-        self.compliance_skipped_contact_count = 0
-        self._compliant_contacts = None
-        self._compliant_prepared = False
         # Read the FEATHER_PGS_* environment once; undeclared names are recorded, not rejected.
         self._environment_record = _environment_flags.record()
         # The test pins in force at construction, which every admission reads and the route record lists.
@@ -1408,6 +1377,9 @@ class SolverFeatherPGS(SolverBase):
         # kernels skip stores and their consumer kernels skip reads when
         # regularization is disabled.
         self._contact_row_w_dummy = self._arrays.placeholder(wp.float32, (1, 1), 1.0)
+        self._contact_row_eps_dummy = self._arrays.placeholder(wp.float32, (1, 1))
+        self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
+        self._bind_contact_material(None)
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
         # ring and keyed rows write the patch row law, so both can serve point and patch
         # friction (Jacobi sweeps, not the serial patch sweep).
@@ -1621,10 +1593,7 @@ class SolverFeatherPGS(SolverBase):
         # one-shot flag per row family; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
         self._track_row_capacity = (
-            self._row_watermark
-            or self.options.warn_constraint_overflow
-            or self.laws.contact_torsion_enabled
-            or self.options.contact_compliance
+            self._row_watermark or self.options.warn_constraint_overflow or self.laws.contact_torsion_enabled
         )
         # Dropped-row accounting is unconditional (see _row_dropped_all above);
         # _track_row_capacity now gates only the optional warning/watermark readbacks.
@@ -1998,11 +1967,6 @@ class SolverFeatherPGS(SolverBase):
             flags: State flags, which do not affect solver-owned impulse history.
         """
         del flags
-        if self.options.contact_compliance:
-            self._compliant_contacts = None
-            self._compliant_prepared = False
-            self.compliance_contact_count = 0
-            self.compliance_skipped_contact_count = 0
         if world_mask is not None and world_mask.shape[0] != self.forest.world_count:
             raise ValueError(
                 f"world_mask has length {world_mask.shape[0]}, expected {self.forest.world_count} (one entry per world)."
@@ -2376,7 +2340,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self.forest.has_free_rigid_bodies
             and not self._debug_buffers_enabled
-            and not self.laws.regularization_enabled
+            and not self.laws.weighted
             and self.laws.mimic_count == 0
             and self.laws.connect_count == 0
         )
@@ -3265,12 +3229,16 @@ class SolverFeatherPGS(SolverBase):
             )
         fused = self._fused_diagonal_joint_limits
         arrays.allocate(FUSED_DIAGONAL_LIMITS, **(sizes if fused else {"world": 1, "world_dof": 1}))
-        # Per-row weight is needed only when regularization is active because
-        # speculative and restitution rows selectively use the rigid law.
-        if self.laws.regularization_enabled:
+        # Per-row weights exist only for a weighted row law (relative regularization or material contacts), and
+        # per-row compliance only for material contacts.
+        if self.laws.weighted:
             arrays.allocate(DENSE_ROW_WEIGHTS, **sizes)
         else:
             self.row_w = self._contact_row_w_dummy
+        if self.options.contact_compliance:
+            arrays.allocate(DENSE_ROW_EPS, **sizes)
+        else:
+            self.row_eps = self._contact_row_eps_dummy
 
     def _allocate_mf_buffers(self, model):
         """Allocate buffers for matrix-free PGS path for free rigid body contacts.
@@ -3289,10 +3257,14 @@ class SolverFeatherPGS(SolverBase):
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
         arrays.allocate(MF_COUNTERS, world=worlds)
         arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
-        if self.laws.regularization_enabled and self.forest.has_free_rigid_bodies:
+        if self.laws.weighted and self.forest.has_free_rigid_bodies:
             arrays.allocate(MF_ROW_WEIGHTS, world=worlds, mf_row=rows)
         else:
             self.mf_row_w = self._contact_row_w_dummy
+        if self.options.contact_compliance and self.forest.has_free_rigid_bodies:
+            arrays.allocate(MF_ROW_EPS, world=worlds, mf_row=rows)
+        else:
+            self.mf_row_eps = self._contact_row_eps_dummy
 
         if not self.forest.has_free_rigid_bodies:
             # Only the ``is not None`` checks observe this on the inactive
@@ -3828,7 +3800,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_Z_b,
                 self.mf_row_mu,
                 self.mf_row_w,
-                int(self.laws.regularization_enabled),
+                int(self.laws.weighted),
             )
 
     def _launch_local_internal_solve(
@@ -3889,7 +3861,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_Z_a,
                     self.mf_Z_b,
                     self.mf_row_mu,
-                    int(self.laws.regularization_enabled),
+                    int(self.laws.weighted),
                     self.row_w,
                     self.mf_row_w,
                     iterations,
@@ -4208,7 +4180,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_w,
                 iterations,
                 omega,
-                int(self.laws.regularization_enabled),
+                int(self.laws.weighted),
                 int(friction_start_iteration),
                 int(iteration_offset),
             ]
@@ -4334,14 +4306,6 @@ class SolverFeatherPGS(SolverBase):
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
     ) -> None:
-        if self.options.contact_compliance:
-            _contact_compliance.solve(
-                self,
-                iterations=iterations,
-                friction_start_iteration=friction_start_iteration,
-                iteration_offset=iteration_offset,
-            )
-            return
         self._launch_matrix_free_gs_solve(
             dense_rhs=self.rhs,
             mf_meta=self.mf_meta_packed,
@@ -4361,6 +4325,19 @@ class SolverFeatherPGS(SolverBase):
 
     def _publish_contact_rows(self, rows) -> None:
         rows.publish(self)
+
+    def _bind_contact_material(self, contacts: Contacts | None) -> None:
+        """Bind the contacts' per-contact material for the writers (``contact_compliance``), or the placeholders.
+
+        An attribute test, no device read: contacts without the three arrays are refused.
+        """
+        names = ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction")
+        material = [self._contact_material_placeholder] * 3
+        if self.options.contact_compliance and contacts is not None:
+            material = [getattr(contacts, name, None) for name in names]
+            if any(array is None for array in material):
+                raise ValueError(f"contact_compliance requires the contacts' per-contact {', '.join(names)}")
+        self.contact_stiffness, self.contact_damping, self.contact_friction_weight = material
 
     def _follow_contacts(self, contacts: Contacts) -> None:
         """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on."""
@@ -4392,14 +4369,12 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self.laws.contact_torsion_enabled:
             validate_torsion_step(self)
-        if self.options.contact_compliance:
-            # Reject incompatible contact preprocessing before it can mutate the stream.
-            _contact_compliance.validate_step(self)
         # The configuration's checks come first; then the states', before any of them is read.
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
         if self.laws.contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
             self._device_torsion.begin_step(state_in, state_out)
+        self._bind_contact_material(contacts)
         if contacts is not None:
             self._follow_contacts(contacts)
         if self.options.pgs_warmstart:
@@ -5876,11 +5851,6 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
-        if self.options.contact_compliance:
-            _contact_compliance.start_step(self, contacts, dt)
-            # The allocator writes slots_needed only after intentional skip gates.
-            # Clear prior-step requests so an excluded contact cannot look overflowed.
-            self.contact_slots_needed.zero_()
         model = self.model
         max_constraints = self.dense_max_constraints
         # Every row producer writes the dense row records through one struct, and the joint row producers read
@@ -7335,6 +7305,8 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 self.options.contact_speculative_scale,
                 self.laws.contact_w,
+                int(self.laws.weighted),
+                int(self.options.contact_compliance),
             ],
             device=self.model.device,
         )
@@ -7369,7 +7341,7 @@ class SolverFeatherPGS(SolverBase):
                 self._diagonal_inverse_mass,
                 dt,
                 self.laws.effective_restitution_velocity_threshold,
-                int(self.laws.regularization_enabled),
+                int(self.laws.weighted),
             ],
             device=self.model.device,
         )
@@ -7446,7 +7418,6 @@ class SolverFeatherPGS(SolverBase):
     def _mf_pgs_setup(self, state_aug: State, dt: float):
         """MF PGS setup: whiten the free-body rows through each body's held factor, their diagonals and RHS."""
         model = self.model
-        self.mf_rhs.zero_()
         self.mf_eff_mass_inv.zero_()
         wp.launch(
             response_builds_rows.free_body_rows_kernel,
@@ -7465,6 +7436,8 @@ class SolverFeatherPGS(SolverBase):
                 self.options.contact_speculative_scale,
                 self.laws.effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
+                int(self.laws.weighted),
+                int(self.options.contact_compliance),
             ],
             outputs=[self.mf_eff_mass_inv, self.mf_row_w],
             device=model.device,

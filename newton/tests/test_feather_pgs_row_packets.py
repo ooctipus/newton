@@ -226,7 +226,16 @@ def _run_general(data, layout, beta):
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
-        inputs=[records, layout.counts, ROWS, data.dt, data.speculative_scale, data.contact_w],
+        inputs=[
+            records,
+            layout.counts,
+            ROWS,
+            data.dt,
+            data.speculative_scale,
+            data.contact_w,
+            int(data.contact_w < 1.0),
+            0,
+        ],
         device=device,
     )
     bias = rows.rhs.numpy().copy()

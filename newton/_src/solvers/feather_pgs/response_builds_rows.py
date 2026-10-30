@@ -272,6 +272,8 @@ def free_body_rows_kernel(
     contact_speculative_scale: float,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
+    weighted: int,
+    material: int,
     # outputs
     mf_eff_mass_inv: wp.array2d[float],
     mf_row_w: wp.array2d[float],
@@ -279,8 +281,8 @@ def free_body_rows_kernel(
     """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
 
     One thread per row slot (``world * mf_max_constraints + row``). A restitutive contact first stores its incident
-    velocity ``J v_hat`` from the writers' ``J``. The row weight is written
-    only when contacts are regularized (``contact_w < 1``).
+    velocity ``J v_hat`` from the writers' ``J``. ``weighted`` rows take a weight: the relative regularization's, or a
+    material contact's (``material``: its writer stored its rhs and compliance ``eps``) ``d / (d + eps)``.
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
@@ -306,6 +308,12 @@ def free_body_rows_kernel(
         )
         mf.incident[world, i] = incident
     mf_eff_mass_inv[world, i] = free_body_response(mf.Z_a, mf.Z_b, world, i, body_a, body_b, row_type, factors, pgs_cfm)
+    if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        eps = mf.eps[world, i]
+        if eps > 0.0:
+            # d / (d + eps) with the inverse diagonal 1 / d the response stores.
+            mf_row_w[world, i] = 1.0 / (1.0 + eps * mf_eff_mass_inv[world, i])
+            return
     target = float(0.0)
     if has_target_velocity != 0:
         target = mf.target[world, i]
@@ -325,7 +333,7 @@ def free_body_rows_kernel(
         restitution_velocity_threshold,
     )
     mf.rhs[world, i] = rhs
-    if contact_w < 1.0:
+    if weighted != 0:
         mf_row_w[world, i] = row_w
 
 

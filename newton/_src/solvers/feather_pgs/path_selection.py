@@ -46,7 +46,6 @@ def _applied(solver, name, requested):
 
 _BETA_REASONS = {
     "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
-    "default_compliance": "friction_anchor_beta omitted with contact_compliance: point friction.",
     "argument": "friction_anchor_beta passed explicitly.",
 }
 

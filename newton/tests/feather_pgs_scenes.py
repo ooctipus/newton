@@ -1623,35 +1623,39 @@ def compliant_drop(*, dampings: tuple[float, ...] = (0.0, 2.0, 20.0), stiffness:
     )
 
 
-def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0) -> Scene:
-    """C2: a 1 kg, 0.2 x 0.2 x 0.04 m plate whose centre of mass lies at (3, 1.5) cm rests on four compliant corner
-    contacts.
+def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0, contact_matching: str | None = None) -> Scene:
+    """C2: a 1 kg, 0.2 x 0.2 x 0.004 m plate whose centre of mass lies at (3, 1.5) cm rests on four compliant corner
+    contacts, frictionless.
 
     Rigid contacts leave the corner forces statically indeterminate; compliant
     ones give the unique elastic split
     ``F_i = m g [1/4 + e_x x_i / 4a² + e_y y_i / 4b²]`` = 1.349, 2.820, 2.085,
-    3.556 N, and a mean indentation ``m g / 4k``.
+    3.556 N, and a mean indentation ``m g / 4k``. The split is the normal law's
+    alone (no friction keeps impulses of the settling), and the plate is thin:
+    its 5e-4 rad tilt moves the corners' lever arms by their height below the
+    centre of mass, 2e-4 of the split at 2 cm, 2e-5 at 2 mm.
     """
-    mass, half, com = 1.0, (0.1, 0.1, 0.02), (0.03, 0.015)
+    mass, half, com = 1.0, (0.1, 0.1, 0.002), (0.03, 0.015)
 
     def build(device):
         builder = _builder()
-        builder.add_ground_plane(cfg=_cfg(mu=0.5))
+        builder.add_ground_plane(cfg=_cfg(mu=0.0))
         body = builder.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, half[2] + 0.0005)),
             com=wp.vec3(com[0], com[1], 0.0),
             mass=mass,
             inertia=_box_inertia(mass, *half),
         )
-        builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2], cfg=_cfg(mu=0.5, density=0.0))
+        builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2], cfg=_cfg(mu=0.0, density=0.0))
         return _finalize(builder, device)
 
     return Scene(
-        "compliant_plate",
+        "compliant_plate" if contact_matching is None else f"compliant_plate_{contact_matching}",
         build,
         dt=1.0 / 240.0,
         steps=240,
-        params={"mu": [0.5], "mass": mass, "half": half, "com": com, "stiffness": stiffness},
+        params={"mu": [0.0], "mass": mass, "half": half, "com": com, "stiffness": stiffness},
+        contact_matching=contact_matching,
         contact_stiffness=(stiffness,),
         contact_damping=(damping,),
         deterministic_contacts=True,
@@ -1659,7 +1663,9 @@ def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0) -> Scen
     )
 
 
-def compliant_stack(*, count: int = 4, stiffness: float = 2.0e4, damping: float = 100.0) -> Scene:
+def compliant_stack(
+    *, count: int = 4, stiffness: float = 2.0e4, damping: float = 100.0, contact_matching: str | None = None
+) -> Scene:
     """C3: ``count`` 0.5 kg, 0.1 m cubes stacked 0.5 mm apart on compliant ground, every interface compliant with
     four corner contacts: interface ``j`` (0 the ground) carries ``(n - j) m g`` and compresses
     ``(n - j) m g / 4k`` = 245, 184, 123, 61 um."""
@@ -1673,11 +1679,12 @@ def compliant_stack(*, count: int = 4, stiffness: float = 2.0e4, damping: float 
         return _finalize(builder, device)
 
     return Scene(
-        "compliant_stack",
+        "compliant_stack" if contact_matching is None else f"compliant_stack_{contact_matching}",
         build,
         dt=1.0 / 240.0,
         steps=360,
         params={"mu": [0.5], "mass": mass, "half": half, "count": count, "stiffness": stiffness},
+        contact_matching=contact_matching,
         contact_stiffness=(stiffness,),
         contact_damping=(damping,),
         deterministic_contacts=True,

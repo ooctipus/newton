@@ -133,7 +133,11 @@ DENSE_ROWS = FieldGroup(
 """Every world's dense rows: the system and the row records (with each row's sides)."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0))
-"""Per-row regularization weights (speculative and restitution rows keep the rigid law)."""
+"""Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
+law) or a material contact's ``d / (d + eps)``."""
+
+DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row")))
+"""Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
 
 WORLD_RESPONSE = FieldGroup(
     Field("J_world", wp.float32, ("world", "row", "world_dof")),
@@ -265,6 +269,8 @@ restitutive contact keeps its incident velocity ``J v_hat``. Packed metadata: fo
 effective mass, rhs, type and parent)."""
 
 MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0))
+
+MF_ROW_EPS = FieldGroup(Field("mf_row_eps", wp.float32, ("world", "mf_row")))
 
 MF_WARMSTART = FieldGroup(
     Field("_ws_prev_mf_impulses", wp.float32, ("world", "mf_row")),

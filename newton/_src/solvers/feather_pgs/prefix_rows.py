@@ -33,7 +33,7 @@ LAW = (
     Field("dt", wp.float32, owner="step"),
     Field("slot_counter", wp.int32, ("world",)),
     Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
-    *(field for field in RECORDS if field.name != "row_w"),
+    *(field for field in RECORDS if field.name not in ("row_w", "row_eps")),
 )
 """The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),
 the world's row counter and phase bounds, and the dense row records."""

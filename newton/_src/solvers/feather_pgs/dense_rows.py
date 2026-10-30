@@ -28,10 +28,12 @@ RECORDS = (
     Field("rhs", wp.float32, ("world", "row")),
     Field("diag", wp.float32, ("world", "row")),
     Field("row_w", wp.float32, ("world", "row")),
+    Field("row_eps", wp.float32, ("world", "row")),
     Field("sides", wp.vec2i, ("world", "row"), attr="_row_sides"),
 )
-"""Each dense row's kind, friction parent, coefficients, gap, targets and law outputs, and its sides (the
-articulations it touches: :func:`row_sides`), by world and row."""
+"""Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
+compliance ``row_eps`` among them), and its sides (the articulations it touches: :func:`row_sides`), by world and
+row."""
 
 DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
 
@@ -111,10 +113,12 @@ MF_RECORDS = (
         )
     ),
     Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity"),
+    Field("eps", wp.float32, ("world", "mf_row"), attr="mf_row_eps"),
 )
 """Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
 by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity
-(``J v_hat`` of a restitutive contact, stored by the build), rhs and target, by world and row."""
+(``J v_hat`` of a restitutive contact, stored by the build), rhs, target and material compliance, by world and
+row."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 

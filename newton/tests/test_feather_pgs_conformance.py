@@ -1033,8 +1033,22 @@ def compliant_drop_laws(run: Run) -> list:
     return laws
 
 
+def _split_bound(run: Run, cold: float) -> float:
+    """A compliant support's split bound: ``cold`` within a solve's budget, 1e-4 once a warm start converges it."""
+    return 1.0e-4 if run.options.get("pgs_warmstart") else cold
+
+
+def _normal_forces(run: Run) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The last step's contacts: their exported normal force magnitudes and the bodies of their two shapes."""
+    shape_body = model_data(run.scene)[0].shape_body
+    entry = run.contacts[-1]
+    bodies = [np.where(entry[k] >= 0, shape_body[np.maximum(entry[k], 0)], -1) for k in CONTACT_FIELDS[:2]]
+    return np.abs(np.einsum("ij,ij->i", entry["force"], entry["rigid_contact_normal"])), *bodies
+
+
 def plate_laws(run: Run) -> list:
-    """C2: the plate's corner contacts carry the unique elastic split within 2%, and it sinks by ``m g / 4k``."""
+    """C2: the plate's corner contacts carry the unique elastic split within 2% (1e-4 warm-started), and it sinks by
+    ``m g / 4k``."""
     params = run.scene.params
     half, com = params["half"], params["com"]
     _, expected, indentation = refs.plate_on_springs(params["mass"], *half[:2], *com, params["stiffness"])
@@ -1048,21 +1062,27 @@ def plate_laws(run: Run) -> list:
         np.add.at(measured, (point[mine, 0] > 0) + 2 * (point[mine, 1] > 0), normal[mine])
     sink = half[2] - run.body_q[-1, 0, 2]
     return [
-        ("corner force error [1]", float(np.abs(measured / expected - 1.0).max()), 2.0e-2),
+        ("corner force error [1]", float(np.abs(measured / expected - 1.0).max()), _split_bound(run, 2.0e-2)),
         ("indentation error [1]", abs(sink / indentation - 1.0), 2.0e-2),
     ]
 
 
 def stack_laws(run: Run) -> list:
-    """C3: each interface of the stack compresses by its load over its four contacts' stiffness, within 3%."""
+    """C3: each interface of the stack compresses by its load over its four contacts' stiffness, within 3%, and each
+    of its corner contacts carries a quarter of that load, the unique elastic split, within 3% (1e-4 warm-started)."""
     params = run.scene.params
-    expected = refs.stack_compression(params["count"], params["mass"], params["stiffness"])
-    z = run.body_q[-1, : params["count"], 2]
+    count = params["count"]
+    expected = refs.stack_compression(count, params["mass"], params["stiffness"])
+    z = run.body_q[-1, :count, 2]
     measured = np.r_[params["half"] - z[0], 2.0 * params["half"] - np.diff(z)]
-    return [
-        (f"interface {j} compression error [1]", abs(measured[j] / expected[j] - 1.0), 3.0e-2)
-        for j in range(params["count"])
+    laws = [
+        (f"interface {j} compression error [1]", abs(measured[j] / expected[j] - 1.0), 3.0e-2) for j in range(count)
     ]
+    # Box j rests on interface j (the ground's, j = 0), which carries the n - j boxes above it.
+    normal, body0, body1 = _normal_forces(run)
+    corner = (count - np.maximum(body0, body1)) * params["mass"] * scenes.GRAVITY / 4.0
+    laws.append(("corner force error [1]", float(np.abs(normal / corner - 1.0).max()), _split_bound(run, 3.0e-2)))
+    return laws
 
 
 def pad_laws(run: Run) -> list:
@@ -1129,7 +1149,9 @@ SCENE_LAWS = {
     "pinch_twist": pinch_laws,
     "compliant_drop": compliant_drop_laws,
     "compliant_plate": plate_laws,
+    "compliant_plate_latest": plate_laws,
     "compliant_stack": stack_laws,
+    "compliant_stack_latest": stack_laws,
     "compliant_pinch": pad_laws,
     "gripper": grasp_laws,
     "gripper_table": grasp_laws,
@@ -1325,7 +1347,7 @@ REFERENCE_CUDA = Route(
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 MF_TORSION = MF_DEFAULT.but("mf_torsion", expect={"friction.torsion": True})
-MF_COMPLIANCE = MF_DEFAULT.but("mf_compliance", expect={"sweep.driver": "contact_compliance"})
+MF_COMPLIANCE = MF_DEFAULT.but("mf_compliance", expect={"friction.compliance": True})
 MF_GENERAL = Route(
     "mf_general",
     "cuda",
@@ -1559,6 +1581,11 @@ def _laws(*laws):
 _WARM = {"pgs_warmstart": True}
 
 
+def COMPLIANT_SCENES() -> tuple:
+    """The CT benchmark's compliance scenes (C1-C4)."""
+    return (scenes.compliant_drop(), scenes.compliant_plate(), scenes.compliant_stack(), scenes.compliant_pinch())
+
+
 def cuda_groups() -> list:
     """Problems of the CUDA matrix: every route each scene admits, against the CUDA reference."""
     ref = REFERENCE_CUDA
@@ -1659,14 +1686,20 @@ def cuda_groups() -> list:
     for scene in (scenes.spin_decay(), scenes.pinch_twist(offsets=(0.004, 0.011, 0.02))):
         torsion = {"contact_torsion_radius": scene.params["spin_radius"]}
         groups.append(Group(_physics(scene, "point", 32, "torsion", **torsion), ref, (MF_TORSION,)))
-    compliance = {"contact_compliance": True, "enable_restitution": False}
-    for scene in (
-        scenes.compliant_drop(),
-        scenes.compliant_plate(),
-        scenes.compliant_stack(),
-        scenes.compliant_pinch(),
-    ):
-        groups.append(Group(_physics(scene, "point", 32, "compliance", **compliance), ref, (MF_COMPLIANCE,)))
+    for scene in COMPLIANT_SCENES():
+        routes = (MF_COMPLIANCE, MF_GENERAL.but("mf_general_compliance", expect={"friction.compliance": True}))
+        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, routes))
+    # Material contacts compose with warm start (the cold reference) and patch friction.
+    for scene in (scenes.compliant_plate(contact_matching="latest"), scenes.compliant_stack(contact_matching="latest")):
+        warm = MF_COMPLIANCE.but("mf_compliance_warm_start", options=_WARM)
+        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, (warm,)))
+    groups.append(
+        Group(
+            _physics(scenes.compliant_stack(), "patch", 32, "compliance", contact_compliance=True),
+            ref,
+            (MF_COMPLIANCE,),
+        )
+    )
     return groups
 
 
