@@ -1091,12 +1091,12 @@ def jcalc_motion_subspace(
         write_free_distance_motion_subspace(X_pa_world, x_child_com_world, qd_start, joint_S_s)
 
 
-@wp.kernel
-def eval_articulation_jacobian(
-    joint_articulation: wp.array[int],
-    articulation_start: wp.array[int],
-    articulation_end: wp.array[int],
-    articulation_mask: wp.array[bool],
+@wp.func
+def write_joint_jacobian_columns(
+    j: int,
+    out: int,
+    joint_start: int,
+    joint_end: int,
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -1113,31 +1113,20 @@ def eval_articulation_jacobian(
     J: wp.array3d[float],
     joint_S_s: wp.array[wp.spatial_vector],
 ):
-    """Write one joint's columns of its articulation's spatial Jacobian.
+    """Write tree joint ``j``'s DOF columns of its articulation's spatial Jacobian into ``J[out]``.
 
-    Row block ``i`` of ``J[a]`` (rows ``6 * i`` to ``6 * i + 5``) is the COM twist of the
-    child link of articulation ``a``'s ``i``-th joint, and column ``c`` belongs to its
-    ``c``-th DOF. The column of a DOF of joint ``j`` is the DOF's motion subspace, shifted
-    to each link's COM, on the links whose path to the root passes through ``j``, and
-    zero on every other link. One thread per joint writes its DOFs' columns down every
-    link row, so the selected articulations' Jacobians, links by DOFs, are written in
-    full and nothing else in ``J`` is.
+    Row block ``i`` of the Jacobian (rows ``6 * i`` to ``6 * i + 5``) is the COM twist of the
+    child link of the articulation's ``i``-th joint, and column ``c`` belongs to its ``c``-th DOF.
+    The column of a DOF of joint ``j`` is the DOF's motion subspace, shifted to each link's COM,
+    on the links whose path to the root passes through ``j``, and zero on every other link. The
+    joint's motion subspaces are written to ``joint_S_s`` at its model DOF indices.
+
+    Args:
+        j: Model index of the tree joint, in ``[joint_start, joint_end)``.
+        out: Index of the articulation's block in ``J``.
+        joint_start: Model index of the articulation's first joint.
+        joint_end: Model index past the articulation's last tree joint.
     """
-    j = wp.tid()
-    art_idx = joint_articulation[j]
-    if art_idx < 0:
-        return
-
-    if articulation_mask:
-        if not articulation_mask[art_idx]:
-            return
-
-    joint_start = articulation_start[art_idx]
-    joint_end = articulation_end[art_idx]
-    # Loop-closing joints past the tree joints have no columns.
-    if j >= joint_end:
-        return
-
     dof_start = joint_qd_start[j]
     dof_count = joint_qd_start[j + 1] - dof_start
     if dof_count == 0:
@@ -1179,11 +1168,136 @@ def eval_articulation_jacobian(
                 S = joint_S_s[dof_start + dof]
                 S_com = wp.spatial_vector(velocity_at_point(S, x_com_world), wp.spatial_bottom(S))
                 for k in range(6):
-                    J[art_idx, row_start + k, col_start + dof] = S_com[k]
+                    J[out, row_start + k, col_start + dof] = S_com[k]
         else:
             for dof in range(dof_count):
                 for k in range(6):
-                    J[art_idx, row_start + k, col_start + dof] = 0.0
+                    J[out, row_start + k, col_start + dof] = 0.0
+
+
+@wp.kernel
+def eval_articulation_jacobian(
+    joint_articulation: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_mask: wp.array[bool],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    J: wp.array3d[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+):
+    """Write one joint's columns of its articulation's spatial Jacobian into ``J[articulation]``.
+
+    One thread per model joint, so the selected articulations' Jacobians, links by DOFs, are
+    written in full and nothing else in ``J`` is (:func:`write_joint_jacobian_columns`).
+    """
+    j = wp.tid()
+    art_idx = joint_articulation[j]
+    if art_idx < 0:
+        return
+
+    if articulation_mask:
+        if not articulation_mask[art_idx]:
+            return
+
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_end[art_idx]
+    # Loop-closing joints past the tree joints have no columns.
+    if j >= joint_end:
+        return
+
+    write_joint_jacobian_columns(
+        j,
+        art_idx,
+        joint_start,
+        joint_end,
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_ancestor,
+        joint_q_start,
+        joint_qd_start,
+        joint_X_p,
+        joint_axis,
+        joint_q,
+        joint_dof_dim,
+        body_q,
+        body_com,
+        J,
+        joint_S_s,
+    )
+
+
+@wp.kernel
+def eval_view_jacobian(
+    articulation_ids: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_mask: wp.array[bool],
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    J: wp.array3d[float],
+    joint_S_s: wp.array[wp.spatial_vector],
+):
+    """Write one joint's columns of a view articulation's spatial Jacobian into ``J[slot]``.
+
+    One thread per (view slot, tree joint of the slot's articulation): only the view's joints
+    run (:func:`write_joint_jacobian_columns`).
+    """
+    slot, k = wp.tid()
+    art_idx = articulation_ids[slot]
+    if articulation_mask:
+        if not articulation_mask[art_idx]:
+            return
+
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_end[art_idx]
+    j = joint_start + k
+    if j >= joint_end:
+        return
+
+    write_joint_jacobian_columns(
+        j,
+        slot,
+        joint_start,
+        joint_end,
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_ancestor,
+        joint_q_start,
+        joint_qd_start,
+        joint_X_p,
+        joint_axis,
+        joint_q,
+        joint_dof_dim,
+        body_q,
+        body_com,
+        J,
+        joint_S_s,
+    )
 
 
 def eval_jacobian(
@@ -1303,20 +1417,9 @@ def transform_spatial_inertia(t: wp.transform, I: wp.spatial_matrix):
     return wp.mul(wp.mul(wp.transpose(T), I), T)
 
 
-@wp.kernel
-def compute_body_spatial_inertia(
-    body_inertia: wp.array[wp.mat33],
-    body_mass: wp.array[float],
-    body_q: wp.array[wp.transform],
-    # outputs
-    body_I_s: wp.array[wp.spatial_matrix],
-):
-    """Compute COM-referenced spatial inertia for each body in world frame."""
-    tid = wp.tid()
-
-    I_local = body_inertia[tid]
-    m = body_mass[tid]
-    X_wb = body_q[tid]
+@wp.func
+def body_spatial_inertia(I_local: wp.mat33, m: float, X_wb: wp.transform):
+    """Return a body's COM-referenced spatial inertia in world frame."""
     q = wp.transform_get_rotation(X_wb)
 
     r1 = wp.quat_rotate(q, wp.vec3(1.0, 0.0, 0.0))
@@ -1327,7 +1430,7 @@ def compute_body_spatial_inertia(
 
     # Spatial inertia about the COM in world coordinates.
     # fmt: off
-    body_I_s[tid] = wp.spatial_matrix(
+    return wp.spatial_matrix(
         m,   0.0, 0.0, 0.0,           0.0,           0.0,
         0.0, m,   0.0, 0.0,           0.0,           0.0,
         0.0, 0.0, m,   0.0,           0.0,           0.0,
@@ -1336,6 +1439,59 @@ def compute_body_spatial_inertia(
         0.0, 0.0, 0.0, I_world[2, 0], I_world[2, 1], I_world[2, 2],
     )
     # fmt: on
+
+
+@wp.kernel
+def compute_body_spatial_inertia(
+    body_inertia: wp.array[wp.mat33],
+    body_mass: wp.array[float],
+    body_q: wp.array[wp.transform],
+    # outputs
+    body_I_s: wp.array[wp.spatial_matrix],
+):
+    """Compute COM-referenced spatial inertia for each body in world frame."""
+    tid = wp.tid()
+    body_I_s[tid] = body_spatial_inertia(body_inertia[tid], body_mass[tid], body_q[tid])
+
+
+@wp.kernel
+def eval_view_link_spatial_inertia(
+    articulation_ids: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_mask: wp.array[bool],
+    joint_child: wp.array[int],
+    body_inertia: wp.array[wp.mat33],
+    body_mass: wp.array[float],
+    body_q: wp.array[wp.transform],
+    # outputs
+    link_I_s: wp.array2d[wp.spatial_matrix],
+):
+    """Compute the world-frame spatial inertia of each link of each view articulation, by (slot, tree joint)."""
+    slot, k = wp.tid()
+    art_idx = articulation_ids[slot]
+    if articulation_mask:
+        if not articulation_mask[art_idx]:
+            return
+    j = articulation_start[art_idx] + k
+    if j >= articulation_end[art_idx]:
+        return
+    link = joint_child[j]
+    link_I_s[slot, k] = body_spatial_inertia(body_inertia[link], body_mass[link], body_q[link])
+
+
+@wp.func
+def link_mass_matrix_term(
+    J: wp.array3d[float], out: int, row_start: int, dof_i: int, dof_j: int, I_s: wp.spatial_matrix
+):
+    """Return one link's term ``J_i^T I J_j`` of mass-matrix entry ``(dof_i, dof_j)``, from the link's 6 rows of ``J[out]``."""
+    sum_val = float(0.0)
+    for k in range(6):
+        for l in range(6):
+            J_ik = J[out, row_start + k, dof_i]
+            J_jl = J[out, row_start + l, dof_j]
+            sum_val += J_ik * I_s[k, l] * J_jl
+    return sum_val
 
 
 @wp.kernel
@@ -1387,16 +1543,43 @@ def eval_articulation_mass_matrix(
         # Compute contribution from this link: H += J_i^T * I_i * J_i
         for dof_i in range(articulation_dof_count):
             for dof_j in range(articulation_dof_count):
-                sum_val = float(0.0)
-
-                # J_i^T * I_i * J_j (for the 6 rows of this link)
-                for k in range(6):
-                    for l in range(6):
-                        J_ik = J[art_idx, row_start + k, dof_i]
-                        J_jl = J[art_idx, row_start + l, dof_j]
-                        sum_val += J_ik * I_s[k, l] * J_jl
-
+                sum_val = link_mass_matrix_term(J, art_idx, row_start, dof_i, dof_j, I_s)
                 H[art_idx, dof_i, dof_j] = H[art_idx, dof_i, dof_j] + sum_val
+
+
+@wp.kernel
+def eval_view_mass_matrix(
+    articulation_ids: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_end: wp.array[int],
+    articulation_mask: wp.array[bool],
+    joint_qd_start: wp.array[int],
+    link_I_s: wp.array2d[wp.spatial_matrix],
+    J: wp.array3d[float],
+    # outputs
+    H: wp.array3d[float],
+):
+    """Write mass-matrix entry ``(dof_i, dof_j)`` of a view articulation into ``H[slot]``, once.
+
+    One thread per (view slot, row, column): the entry sums the links' terms ``J_i^T I J_j`` in
+    link order, as the model-level kernel accumulates them, and is written once; entries past
+    the articulation's DOF count are not written.
+    """
+    slot, dof_i, dof_j = wp.tid()
+    art_idx = articulation_ids[slot]
+    if articulation_mask:
+        if not articulation_mask[art_idx]:
+            return
+    joint_start = articulation_start[art_idx]
+    joint_end = articulation_end[art_idx]
+    dof_count = joint_qd_start[joint_end] - joint_qd_start[joint_start]
+    if dof_i >= dof_count or dof_j >= dof_count:
+        return
+
+    acc = float(0.0)
+    for link_idx in range(joint_end - joint_start):
+        acc = acc + link_mass_matrix_term(J, slot, link_idx * 6, dof_i, dof_j, link_I_s[slot, link_idx])
+    H[slot, dof_i, dof_j] = acc
 
 
 @wp.kernel

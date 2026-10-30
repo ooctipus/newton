@@ -845,22 +845,87 @@ def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
     _assert_bits_equal(J[~selected], np.zeros_like(J_ref[~selected]))
 
 
-def test_articulation_view_jacobian_overwrites_view_blocks(test, device):
-    """Overwrite the Jacobians of the view's articulations, narrowed by a per-world mask, and nothing else."""
+def _view_slots(view):
+    """Return the Model articulation index of each slot of ``view``'s view-shaped outputs (world-major)."""
+    return view.articulation_ids.numpy().reshape(-1)
+
+
+def _view_selections():
+    """Return named per-world masks of the 3-world mixed model: every world, and world 1 only."""
+    return {"view": None, "world 1": np.array([False, True, False])}
+
+
+def test_articulation_view_jacobian_writes_view_slots(test, device):
+    """Write each selected view articulation's Jacobian into its slot of a view-shaped J, and nothing else.
+
+    Slot ``i`` holds the Jacobian of the view's ``i``-th articulation, bitwise the entries of the
+    model-level result for it. Slots outside a per-world mask, and entries past an articulation's links
+    and DOFs (a view of every articulation pads to its largest), keep the caller's values.
+    """
     model, state = _build_mixed_articulations(device)
     J_ref = newton.eval_jacobian(model, state).numpy()
+    extents = _jacobian_extents(model)
+
+    for pattern in ("fan", "*"):
+        view = newton.selection.ArticulationView(model, pattern, verbose=False)
+        shape = (view.count, 6 * view.max_joints_per_articulation, view.max_dofs_per_articulation)
+        for name, world_mask in _view_selections().items():
+            with test.subTest(pattern=pattern, selection=name):
+                J = _filled(shape, _SENTINEL, device)
+                view_mask = None if world_mask is None else wp.array(world_mask, dtype=bool, device=device)
+                test.assertIs(view.eval_jacobian(state, J, mask=view_mask), J)
+
+                selected = view.get_model_articulation_mask(mask=view_mask).numpy()
+                expected = np.full(shape, _SENTINEL, dtype=np.float32)
+                for slot, articulation in enumerate(_view_slots(view)):
+                    if selected[articulation]:
+                        rows, cols = extents[articulation]
+                        expected[slot, :rows, :cols] = J_ref[articulation, :rows, :cols]
+                _assert_bits_equal(J.numpy(), expected)
+
+
+def test_articulation_view_mass_matrix_writes_view_slots(test, device):
+    """Write each selected view articulation's mass matrix into its slot of a view-shaped H, each entry once.
+
+    Slot ``i`` holds the mass matrix of the view's ``i``-th articulation, bitwise the model-level result
+    for it, with the Jacobian computed internally or supplied from :meth:`eval_jacobian`. Slots outside
+    a per-world mask and entries past an articulation's DOFs keep the caller's values: nothing is cleared.
+    """
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    extents = _jacobian_extents(model)
+
+    for pattern in ("fan", "*"):
+        view = newton.selection.ArticulationView(model, pattern, verbose=False)
+        shape = (view.count, view.max_dofs_per_articulation, view.max_dofs_per_articulation)
+        for name, world_mask in _view_selections().items():
+            view_mask = None if world_mask is None else wp.array(world_mask, dtype=bool, device=device)
+            J = view.eval_jacobian(state, mask=view_mask)
+            for source, supplied in (("internal", None), ("supplied", J)):
+                with test.subTest(pattern=pattern, selection=name, jacobian=source):
+                    H = _filled(shape, _SENTINEL, device)
+                    test.assertIs(view.eval_mass_matrix(state, H, J=supplied, mask=view_mask), H)
+
+                    selected = view.get_model_articulation_mask(mask=view_mask).numpy()
+                    expected = np.full(shape, _SENTINEL, dtype=np.float32)
+                    for slot, articulation in enumerate(_view_slots(view)):
+                        if selected[articulation]:
+                            dofs = extents[articulation][1]
+                            expected[slot, :dofs, :dofs] = H_ref[articulation, :dofs, :dofs]
+                    _assert_bits_equal(H.numpy(), expected)
+
+
+def test_articulation_view_rejects_other_shapes(test, device):
+    """Refuse outputs and scratch that do not have the view's shapes, such as a model-wide Jacobian."""
+    model, state = _build_mixed_articulations(device)
     view = newton.selection.ArticulationView(model, "fan", verbose=False)
-    world_mask = np.array([False, True, False])
-
-    for name, mask in (("view", None), ("world 1", world_mask)):
-        with test.subTest(selection=name):
-            J = _filled(J_ref.shape, _SENTINEL, device)
-            view_mask = None if mask is None else wp.array(mask, dtype=bool, device=device)
-            test.assertIs(view.eval_jacobian(state, J, mask=view_mask), J)
-
-            selected = view.get_model_articulation_mask(mask=view_mask).numpy()
-            test.assertEqual(int(selected.sum()), 3 if mask is None else 1)
-            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, _jacobian_entries(model, selected, J_ref.shape))
+    joints, dofs = view.max_joints_per_articulation, view.max_dofs_per_articulation
+    with test.assertRaises(ValueError):
+        view.eval_jacobian(state, wp.zeros(_jacobian_shape(model), dtype=float, device=device))
+    with test.assertRaises(ValueError):
+        view.eval_mass_matrix(state, wp.zeros((view.count, dofs + 1, dofs + 1), dtype=float, device=device))
+    with test.assertRaises(ValueError):
+        view.eval_mass_matrix(state, body_I_s=wp.zeros(view.count * joints, dtype=wp.spatial_matrix, device=device))
 
 
 def test_articulation_view_of_every_articulation_matches_unmasked(test, device):
@@ -1146,63 +1211,42 @@ def test_articulation_view_api(test, device):
 
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
 
-    # Create ArticulationView for just robot_a
+    J_model = newton.eval_jacobian(model, state).numpy()
+    H_model = newton.eval_mass_matrix(model, state).numpy()
+
+    # Create ArticulationView for just robot_a: one pendulum, one joint and one DOF
     view_a = newton.selection.ArticulationView(model, pattern="robot_a")
+    test.assertEqual((view_a.max_joints_per_articulation, view_a.max_dofs_per_articulation), (1, 1))
 
-    # Test eval_jacobian via ArticulationView (convenience pattern)
+    # Test eval_jacobian via ArticulationView (convenience pattern): view-shaped, robot_a only
     J = view_a.eval_jacobian(state)
-    test.assertIsNotNone(J)
-    test.assertEqual(J.shape[0], model.articulation_count)
-
-    J_np = J.numpy()
-    # robot_a (index 0) should have non-zero Jacobian
-    test.assertNotEqual(np.abs(J_np[0]).max(), 0.0)
-    # robot_b (index 1) should be zero (not in view)
-    test.assertEqual(np.abs(J_np[1]).max(), 0.0)
+    test.assertEqual(J.shape, (1, 6, 1))
+    _assert_bits_equal(J.numpy()[0], J_model[0, :6, :1])
+    test.assertNotEqual(np.abs(J.numpy()).max(), 0.0)
 
     # Test eval_mass_matrix via ArticulationView (convenience pattern)
     H = view_a.eval_mass_matrix(state)
-    test.assertIsNotNone(H)
-    test.assertEqual(H.shape[0], model.articulation_count)
+    test.assertEqual(H.shape, (1, 1, 1))
+    _assert_bits_equal(H.numpy()[0], H_model[0, :1, :1])
+    test.assertNotEqual(H.numpy()[0, 0, 0], 0.0)
 
-    H_np = H.numpy()
-    # robot_a should have non-zero mass matrix
-    test.assertNotEqual(H_np[0, 0, 0], 0.0)
-    # robot_b should be zero
-    test.assertEqual(H_np[1, 0, 0], 0.0)
-
-    # Test with pre-allocated buffers (performance pattern)
+    # Test with pre-allocated view-shaped buffers (performance pattern), for robot_b
+    view_b = newton.selection.ArticulationView(model, pattern="robot_b")
     J2 = wp.zeros(
-        (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation),
+        (view_b.count, 6 * view_b.max_joints_per_articulation, view_b.max_dofs_per_articulation),
         dtype=float,
         device=device,
     )
     H2 = wp.zeros(
-        (model.articulation_count, model.max_dofs_per_articulation, model.max_dofs_per_articulation),
+        (view_b.count, view_b.max_dofs_per_articulation, view_b.max_dofs_per_articulation),
         dtype=float,
         device=device,
     )
 
-    # Create view for robot_b
-    view_b = newton.selection.ArticulationView(model, pattern="robot_b")
-
-    J2_returned = view_b.eval_jacobian(state, J2)
-    H2_returned = view_b.eval_mass_matrix(state, H2)
-
-    test.assertIs(J2_returned, J2)
-    test.assertIs(H2_returned, H2)
-
-    J2_np = J2.numpy()
-    H2_np = H2.numpy()
-
-    # robot_a is not in view_b. Its Jacobian block keeps the zeros of the zero-initialized
-    # J2, since the view leaves blocks outside it untouched; eval_mass_matrix zeroes its H2
-    # entries.
-    test.assertEqual(np.abs(J2_np[0]).max(), 0.0)
-    test.assertEqual(H2_np[0, 0, 0], 0.0)
-    # robot_b should have values
-    test.assertNotEqual(np.abs(J2_np[1]).max(), 0.0)
-    test.assertNotEqual(H2_np[1, 0, 0], 0.0)
+    test.assertIs(view_b.eval_jacobian(state, J2), J2)
+    test.assertIs(view_b.eval_mass_matrix(state, H2), H2)
+    _assert_bits_equal(J2.numpy()[0], J_model[1, :6, :1])
+    _assert_bits_equal(H2.numpy()[0], H_model[1, :1, :1])
 
 
 def test_floating_base_jacobian(test, device):
@@ -1481,8 +1525,20 @@ add_function_test(
 )
 add_function_test(
     TestJacobianMassMatrix,
-    "test_articulation_view_jacobian_overwrites_view_blocks",
-    test_articulation_view_jacobian_overwrites_view_blocks,
+    "test_articulation_view_jacobian_writes_view_slots",
+    test_articulation_view_jacobian_writes_view_slots,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_mass_matrix_writes_view_slots",
+    test_articulation_view_mass_matrix_writes_view_slots,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_rejects_other_shapes",
+    test_articulation_view_rejects_other_shapes,
     devices=devices,
 )
 add_function_test(

@@ -21,9 +21,8 @@ from ..sim import (
     eval_fk,
     eval_inverse_dynamics_force,
     eval_inverse_dynamics_passive,
-    eval_jacobian,
-    eval_mass_matrix,
 )
+from ..sim.articulation import eval_view_jacobian, eval_view_link_spatial_inertia, eval_view_mass_matrix
 from .deprecation import deprecate_nonkeyword_arguments
 
 if TYPE_CHECKING:
@@ -1327,6 +1326,21 @@ class ArticulationView:
 
         # articulation ids grouped by world
         self.articulation_ids = wp.array(articulation_ids, dtype=int, device=self.device)
+        # Tree-joint and DOF counts of the view's largest articulation, whatever joints and links the
+        # view selects: the shapes of the view-shaped Jacobian, ``(count, 6 * max_joints_per_articulation,
+        # max_dofs_per_articulation)``, and mass matrix, ``(count, max_dofs_per_articulation,
+        # max_dofs_per_articulation)``, of :meth:`eval_jacobian` and :meth:`eval_mass_matrix`.
+        view_articulations = [arti_id for world_articulations in articulation_ids for arti_id in world_articulations]
+        self.max_joints_per_articulation = max(
+            int(model_articulation_end[arti_id] - model_articulation_start[arti_id]) for arti_id in view_articulations
+        )
+        self.max_dofs_per_articulation = max(
+            int(
+                model_joint_qd_start[model_articulation_end[arti_id]]
+                - model_joint_qd_start[model_articulation_start[arti_id]]
+            )
+            for arti_id in view_articulations
+        )
         # Compact view-world index -> original model-world index. Global articulations
         # retain the sentinel world ``-1``.
         self.world_ids = wp.array(selected_world_ids, dtype=int, device=self.device)
@@ -2004,53 +2018,148 @@ class ArticulationView:
         eval_fk(self.model, target.joint_q, target.joint_qd, target, mask=articulation_mask)
 
     def eval_jacobian(self, state: State, J=None, joint_S_s=None, mask=None):
-        """Evaluate spatial Jacobian for articulations in this view.
+        """Evaluate the spatial Jacobian of each articulation in this view.
 
-        Computes the spatial Jacobian J that maps joint velocities to spatial
-        velocities of each link in world frame, matching ``state.body_qd`` under
-        Newton's public COM/world body-twist convention.
+        Computes the spatial Jacobian that maps an articulation's joint velocities to the
+        spatial velocities of its links in world frame, matching ``state.body_qd`` under
+        Newton's public COM/world body-twist convention. Slot ``i`` of ``J`` belongs to the
+        view's ``i``-th articulation in world-major order (the flattened
+        :attr:`articulation_ids`), whatever joints and links the view selects: rows ``6 * k``
+        to ``6 * k + 5`` hold the twist of the child link of its ``k``-th tree joint, and the
+        columns are its DOFs. An articulation with ``n`` tree joints and ``d`` DOFs fills
+        ``J[i, :6 * n, :d]`` in full, zero where a DOF does not move a link; nothing else in
+        ``J`` is written. Only the view's joints are evaluated.
 
         Args:
             state: The state containing body transforms (body_q).
-            J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs).
-               If None, allocates a zero-initialized array.
-            joint_S_s: Optional pre-allocated temp array for motion subspaces.
-            mask: Optional mask of articulations in this ArticulationView (all by default).
-                Blocks of articulations outside this view, or outside ``mask``, are left
-                unchanged, as in :func:`~newton.eval_jacobian`.
+            J: Optional output array, shape ``(count, 6 * max_joints_per_articulation,
+                max_dofs_per_articulation)`` of this view. If None, allocates a zero-initialized array.
+            joint_S_s: Optional scratch for the motion subspaces, shape ``(model.joint_dof_count,)``,
+                dtype ``wp.spatial_vector``; the view's DOFs are written. If None, allocates internally.
+            mask: Optional mask of articulations in this ArticulationView (all by default). Slots
+                outside it are left unchanged.
 
         Returns:
-            The Jacobian array J, or None if the model has no articulations.
+            The Jacobian array J.
+
+        Raises:
+            ValueError: If ``J`` does not have this view's Jacobian shape.
         """
-        articulation_mask = self._get_evaluation_mask(mask)
-        return eval_jacobian(self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask)
+        model = self.model
+        shape = (self.count, 6 * self.max_joints_per_articulation, self.max_dofs_per_articulation)
+        if J is None:
+            J = wp.zeros(shape, dtype=float, device=self.device)
+        elif tuple(J.shape) != shape:
+            raise ValueError(f"J has shape {J.shape}, expected this view's Jacobian shape {shape}.")
+        if joint_S_s is None:
+            joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=self.device)
+        wp.launch(
+            eval_view_jacobian,
+            dim=(self.count, self.max_joints_per_articulation),
+            inputs=[
+                self.articulation_ids.reshape((-1,)),
+                model.articulation_start,
+                model.articulation_end,
+                self._get_evaluation_mask(mask),
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_ancestor,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_X_p,
+                model.joint_axis,
+                state.joint_q,
+                model.joint_dof_dim,
+                state.body_q,
+                model.body_com,
+            ],
+            outputs=[J, joint_S_s],
+            device=self.device,
+        )
+        return J
 
     def eval_mass_matrix(self, state: State, H=None, J=None, body_I_s=None, joint_S_s=None, mask=None):
-        """Evaluate generalized mass matrix for articulations in this view.
+        """Evaluate the generalized mass matrix of each articulation in this view.
 
-        Computes the generalized mass matrix H = J^T * M * J, where J is the spatial
-        Jacobian and M is the block-diagonal spatial mass matrix. The resulting
-        matrix is consistent with kinetic energy computed from COM-referenced
-        body twists.
+        Computes ``H = J^T * M * J`` per articulation, where ``J`` is its spatial Jacobian
+        (:meth:`eval_jacobian`) and ``M`` the block-diagonal spatial mass matrix of its links.
+        The result is consistent with kinetic energy computed from COM-referenced body
+        twists. Slot ``i`` of ``H`` belongs to the view's ``i``-th articulation, as in
+        :meth:`eval_jacobian`: its ``d`` DOFs fill ``H[i, :d, :d]``, each entry written once,
+        and nothing else in ``H`` is written.
 
         Args:
             state: The state containing body transforms (body_q).
-            H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs).
-               If None, allocates internally.
-            J: Optional pre-computed Jacobian. If None, computes internally.
-            body_I_s: Optional pre-allocated temp array for spatial inertias.
-            joint_S_s: Optional pre-allocated temp array for motion subspaces.
-            mask: Optional mask of articulations in this ArticulationView (all by default).
-                Entries of articulations outside this view, or outside ``mask``, are zero,
-                as in :func:`~newton.eval_mass_matrix`.
+            H: Optional output array, shape ``(count, max_dofs_per_articulation,
+                max_dofs_per_articulation)`` of this view. If None, allocates a zero-initialized array.
+            J: Optional Jacobian of this view, from :meth:`eval_jacobian` with the same state and
+                mask. If None, computes it internally.
+            body_I_s: Optional scratch for the links' spatial inertias, shape
+                ``(count, max_joints_per_articulation)``, dtype ``wp.spatial_matrix``. If None,
+                allocates internally.
+            joint_S_s: Optional scratch for motion subspaces (only used if J is None), as in
+                :meth:`eval_jacobian`.
+            mask: Optional mask of articulations in this ArticulationView (all by default). Slots
+                outside it are left unchanged.
 
         Returns:
-            The mass matrix array H, or None if the model has no articulations.
+            The mass matrix array H.
+
+        Raises:
+            ValueError: If ``H``, ``J`` or ``body_I_s`` does not have this view's shape.
         """
+        model = self.model
+        joint_count, dof_count = self.max_joints_per_articulation, self.max_dofs_per_articulation
+        shape = (self.count, dof_count, dof_count)
+        if H is None:
+            H = wp.zeros(shape, dtype=float, device=self.device)
+        elif tuple(H.shape) != shape:
+            raise ValueError(f"H has shape {H.shape}, expected this view's mass-matrix shape {shape}.")
+        if J is None:
+            # The Jacobian writes every entry that the mass-matrix kernel reads: no clear needed.
+            J = wp.empty((self.count, 6 * joint_count, dof_count), dtype=float, device=self.device)
+            self.eval_jacobian(state, J, joint_S_s=joint_S_s, mask=mask)
+        elif tuple(J.shape) != (self.count, 6 * joint_count, dof_count):
+            raise ValueError(f"J has shape {J.shape}, expected this view's Jacobian shape.")
+        if body_I_s is None:
+            body_I_s = wp.empty((self.count, joint_count), dtype=wp.spatial_matrix, device=self.device)
+        elif tuple(body_I_s.shape) != (self.count, joint_count):
+            raise ValueError(f"body_I_s has shape {body_I_s.shape}, expected {(self.count, joint_count)}.")
+        articulation_ids = self.articulation_ids.reshape((-1,))
         articulation_mask = self._get_evaluation_mask(mask)
-        return eval_mass_matrix(
-            self.model, state, H, J=J, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=articulation_mask
+        wp.launch(
+            eval_view_link_spatial_inertia,
+            dim=(self.count, joint_count),
+            inputs=[
+                articulation_ids,
+                model.articulation_start,
+                model.articulation_end,
+                articulation_mask,
+                model.joint_child,
+                model.body_inertia,
+                model.body_mass,
+                state.body_q,
+            ],
+            outputs=[body_I_s],
+            device=self.device,
         )
+        wp.launch(
+            eval_view_mass_matrix,
+            dim=shape,
+            inputs=[
+                articulation_ids,
+                model.articulation_start,
+                model.articulation_end,
+                articulation_mask,
+                model.joint_qd_start,
+                body_I_s,
+                J,
+            ],
+            outputs=[H],
+            device=self.device,
+        )
+        return H
 
     def eval_inverse_dynamics_passive(
         self,
