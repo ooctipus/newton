@@ -586,6 +586,7 @@ class TestSparseContacts(unittest.TestCase):
         data = _contact_input(
             f,
             body_v=_full(4, wp.spatial_vector(0.0), wp.spatial_vector),
+            response_dofs=_array([f["plan"].dof_count], int),
             prescribed=_array([0], int),
             material_mu=_array([0.8] * 4),
             material_restitution=_array([0.4] * 4),

@@ -195,6 +195,7 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
                 contact_slot=slots,
                 contact_world=np.zeros(contacts, dtype=np.int32),
                 contact_path=np.zeros(contacts, dtype=np.int32),
+                articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
                 contact_friction_shared_anchor=friction_shared,
                 contact_friction_scale=0.8,
                 contact_shared_anchor=shared,

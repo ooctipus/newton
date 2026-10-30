@@ -748,7 +748,8 @@ def whitened_rows(jacobian, L) -> np.ndarray:
 
 def packed_coordinates(solver) -> np.ndarray:
     """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
-    rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side)."""
+    rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side). Every side holds response
+    coordinates (:func:`.dense_rows.row_sides`)."""
     sides, sizes = solver._row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
     dof = np.full((*sides.shape[:2], solver._packed_Z.shape[2]), -1, dtype=np.int32)
@@ -759,6 +760,8 @@ def packed_coordinates(solver) -> np.ndarray:
                 if art < 0:
                     continue
                 n, offset = int(sizes[art]), int(offsets[art])
+                if n <= 0 or offset < 0:
+                    raise AssertionError(f"world {world} row {row}: side {art} holds no response coordinates")
                 at = offset if solver._packed_dense else first
                 dof[world, row, at : at + n] = offset + np.arange(n)
                 first += n
@@ -782,8 +785,6 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
                 if art < 0:
                     continue
                 n, first = int(sizes[art]), int(offsets[art])
-                if n == 0:
-                    continue  # No response coordinates (a prescribed articulation): no entries.
                 held = (dof[world, row] >= first) & (dof[world, row] < first + n)
                 coordinates = dof[world, row, held]
                 jacobian[world, row, coordinates] = J[world, row, held]

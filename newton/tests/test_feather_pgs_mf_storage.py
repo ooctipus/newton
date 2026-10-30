@@ -7,6 +7,7 @@ import functools
 import inspect
 import itertools
 import re
+import textwrap
 import unittest
 from unittest import mock
 
@@ -16,6 +17,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
+from newton._src.solvers.feather_pgs.device_preludes import CPU_MATH, SHARED_STORAGE, dual_native
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_COUNT,
@@ -28,6 +30,7 @@ from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 # A large streamed-metadata shape without velocity-limit rows: 2304 dense and matrix-free rows over 75 coordinates.
 _LARGE_STREAMED_SHAPE = {
@@ -1028,6 +1031,128 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 for (_, bound), expected in zip(variants, eager, strict=True):
                     for name in outputs:
                         np.testing.assert_array_equal(_bits(_host(bound[name])), _bits(expected[name]), name)
+
+
+@functools.cache
+def _guarded_factor_marks(capacity: int, dofs: int) -> wp.Kernel:
+    """The matrix-free sweep's own marks of each world's dense rows (the text of
+    :meth:`.sweep_routes.FactorCoordinates.mark_sides`) into a bitmap of ``dofs`` coordinates that sits between two
+    guard words, one world after another on one thread. ``words`` takes, per world, the word below the bitmap, its
+    words, and the word above."""
+    marks = sweep_routes.FACTOR_COORDINATES
+    count = marks.words(dofs)
+    stride = count + 2
+    body = f"""    struct Guarded {{ unsigned below; unsigned marks[{count}]; unsigned above; }};
+    SHARED Guarded guarded;
+    for (int world = 0; world < world_constraint_count.shape[0]; ++world) {{
+        guarded.below = guarded.above = 0u;
+        for (int w = 0; w < {count}; ++w) guarded.marks[w] = 0u;
+        const int rows = world_constraint_count.data[world];
+        const int m_dense = rows < {capacity} ? rows : {capacity};
+        const int off_dense = world * {capacity};
+#define s_factor_marks guarded.marks
+{textwrap.indent(marks.mark_sides("m_dense", "0", "1"), "        ")}
+#undef s_factor_marks
+        words.data[world * {stride}] = guarded.below;
+        for (int w = 0; w < {count}; ++w) words.data[world * {stride} + 1 + w] = guarded.marks[w];
+        words.data[world * {stride} + {stride - 1}] = guarded.above;
+    }}"""
+
+    @wp.func_native(dual_native(body, preludes=(SHARED_STORAGE, CPU_MATH)))
+    def factor_marks(
+        world_constraint_count: wp.array[int],
+        row_sides: wp.array2d[wp.vec2i],
+        factors: BodyFactors,
+        words: wp.array[wp.uint32],
+    ): ...
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def guarded_factor_marks(
+        world_constraint_count: wp.array[int],
+        row_sides: wp.array2d[wp.vec2i],
+        factors: BodyFactors,
+        words: wp.array[wp.uint32],
+    ):
+        factor_marks(world_constraint_count, row_sides, factors, words)
+
+    return guarded_factor_marks
+
+
+def _pressed_probe(device):
+    """Two worlds, each a prismatic probe pressed between a kinematic free box and a welded block: articulations
+    without response coordinates (the forest plan elides the box, the block has none), so the probe's contacts are
+    dense rows between a responding articulation and one without coordinates."""
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    box = scene.add_body(xform=wp.transform(wp.vec3(-0.14, 0.0, 0.0), wp.quat_identity()), mass=1.0, is_kinematic=True)
+    scene.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
+    probe = scene.add_link(mass=1.0)
+    scene.add_shape_sphere(probe, radius=0.05)
+    scene.add_articulation([scene.add_joint_prismatic(parent=-1, child=probe, axis=newton.Axis.X)])
+    block = scene.add_link(mass=1.0)
+    scene.add_shape_box(block, hx=0.1, hy=0.1, hz=0.1)
+    weld = wp.transform(wp.vec3(0.14, 0.0, 0.0), wp.quat_identity())
+    scene.add_articulation([scene.add_joint_fixed(parent=-1, child=block, parent_xform=weld)])
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(scene, 2, spacing=(3.0, 0.0, 0.0))
+    return builder.finalize(device=device)
+
+
+def test_dense_rows_mark_only_sides_with_coordinates(test, device):
+    """The sweep marks the articulations of its dense rows' sides at their first world coordinate: a side without
+    response coordinates has none (-1), and its mark set bit 31 of the word below the bitmap, a stack word on the CPU
+    (intermittent segfaults) and a shared one on CUDA. A row's sides name only articulations that have coordinates,
+    so the sweep's own marks over the step's rows leave both guard words clear and set exactly the sides' bits.
+
+    The step builds its rows with the sweep's launch held back: the guarded marks stand in for it, so a stray mark
+    fails here every time instead of landing in storage nothing watches. Then the sweep solves the same rows."""
+    model = _pressed_probe(device)
+    solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    pipeline.collide(state_0, contacts)
+    with mock.patch.object(solver, "_launch_matrix_free_gs_solve"):
+        solver.step(state_0, state_1, None, contacts, 1.0 / 240.0)
+
+    response = solver.forest.articulation_response_dof_count.numpy()
+    test.assertEqual(response.tolist(), [0, 1, 0] * 2)  # box, probe, block per world
+    counts, sides = solver.constraint_count.numpy(), solver._row_sides.numpy()
+    capacity, dofs = sides.shape[1], solver.forest.max_world_dofs
+    test.assertGreaterEqual(counts.min(), 2)  # each world's two contacts reach the probe through dense rows
+
+    words = sweep_routes.FACTOR_COORDINATES.words(dofs)
+    marks = wp.zeros(model.world_count * (words + 2), dtype=wp.uint32, device=device)
+    wp.launch(
+        _guarded_factor_marks(capacity, dofs),
+        dim=1,
+        inputs=[solver.constraint_count, solver._row_sides, solver._body_factors(), marks],
+        device=device,
+    )
+    marks = marks.numpy().reshape(model.world_count, words + 2)
+    offsets = solver.forest.articulation_world_dof_offset.numpy()
+    for world in range(model.world_count):
+        test.assertEqual(int(marks[world, 0]), 0, f"world {world}: the marks wrote the word below the bitmap")
+        test.assertEqual(int(marks[world, -1]), 0, f"world {world}: the marks wrote the word above the bitmap")
+        rows = sides[world, : min(int(counts[world]), capacity)]
+        marked = sorted({int(offsets[art]) for art in rows.ravel() if art >= 0})
+        bits = [32 * w + b for w in range(words) for b in range(32) if (int(marks[world, 1 + w]) >> b) & 1]
+        test.assertEqual(bits, marked)
+        test.assertTrue(all(response[art] > 0 for art in rows.ravel() if art >= 0))
+
+    solver.step(state_0, state_1, None, contacts, 1.0 / 240.0)
+    test.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
+
+
+class TestFeatherPGSFactorMarks(unittest.TestCase):
+    pass
+
+
+add_function_test(
+    TestFeatherPGSFactorMarks,
+    "test_dense_rows_mark_only_sides_with_coordinates",
+    test_dense_rows_mark_only_sides_with_coordinates,
+    devices=get_test_devices(),
+)
 
 
 if __name__ == "__main__":

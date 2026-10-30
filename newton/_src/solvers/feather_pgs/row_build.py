@@ -241,7 +241,7 @@ def _write_contact_jacobian_lane(
     d2, a2, b2 = contact_row_frame(
         2, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
     )
-    sides = row_sides(art_a, art_b)
+    sides = row_sides(art_a, art_b, data.response_dofs)
     if a_in and lane < data.response_dofs[art_a]:
         at = jacobian_row(support, art_group_idx[art_a], art_a, sides)
         origin = data.origin[art_a]
@@ -415,7 +415,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         data.row_eps[world, r] = eps
     data.row_cfm[world, r] = data.cfm
     data.target[world, r] = target
-    data.sides[world, r] = row_sides(art_a, art_b)
+    data.sides[world, r] = row_sides(art_a, art_b, data.response_dofs)
     if with_rhs:
         inv_dt = 1.0 / data.dt
         rhs = float(0.0)

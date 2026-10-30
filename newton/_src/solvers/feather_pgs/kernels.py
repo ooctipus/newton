@@ -2252,7 +2252,7 @@ def populate_world_J_for_compact_size(
                     spin_b = -spin_entry(motion_b, normal)
 
         slot = data.slot[c] + row
-        sides = row_sides(art_a, art_b)
+        sides = row_sides(art_a, art_b, data.response_dofs)
         if group_a >= 0:
             at = jacobian_row(support, group_a, art_a, sides)
             if group_b == group_a:
@@ -2519,7 +2519,7 @@ def populate_world_J_for_size(
         rows = 1
         if data.slots_needed[c] >= 3:
             rows = data.slots_needed[c]
-        sides = row_sides(art_a, art_b)
+        sides = row_sides(art_a, art_b, data.response_dofs)
         at_a = wp.vec2i(0, 0)
         at_b = wp.vec2i(0, 0)
         if a_matches:

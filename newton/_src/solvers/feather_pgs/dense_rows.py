@@ -32,23 +32,44 @@ RECORDS = (
     Field("sides", wp.vec2i, ("world", "row"), attr="_row_sides"),
 )
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
-compliance ``row_eps`` among them), and its sides (the articulations it touches: :func:`row_sides`), by world and
-row."""
+compliance ``row_eps`` among them), and its sides (the articulations whose response coordinates it touches:
+:func:`row_sides`), by world and row."""
 
 DenseRows = field_group.struct("DenseRows", RECORDS, __name__)
 
 
 @wp.func
-def row_sides(art_a: int, art_b: int) -> wp.vec2i:
-    """A row's sides: the articulations it touches, the first by index, then the second or -1 (none, or the same).
+def row_side(art: int, response_dofs: wp.array[int]) -> int:
+    """``art`` as a row's side: itself where it has response coordinates, else -1.
 
+    An articulation without them (a prescribed free body the forest plan elides, or one without coordinates) has no
+    world coordinates (its ``articulation_world_dof_offset`` is -1). Its motion enters a row through the row's target
+    alone (:func:`.contact_laws.prescribed_target`).
+    """
+    side = int(-1)
+    if art >= 0:
+        if response_dofs[art] > 0:
+            side = art
+    return side
+
+
+@wp.func
+def row_sides(art_a: int, art_b: int, response_dofs: wp.array[int]) -> wp.vec2i:
+    """A row's sides, its support: the articulations of ``art_a`` and ``art_b`` that have response coordinates
+    (:func:`row_side`), the first by index, then the second or -1 (none, or the same).
+
+    Every side therefore holds coordinates at a first world coordinate, which every reader of the sides takes as given:
+    the packed rows' entries, the sweeps' factor coordinates (:class:`.sweep_routes.FactorCoordinates` marks a side
+    at that coordinate). The rows that name one articulation write its size group's articulation, which has them.
     Articulation indices ascend with a world's coordinates, so a packed row's entries (:mod:`.packed_rows`) ascend too.
     """
-    if art_a < 0 or art_a == art_b:
-        return wp.vec2i(art_b, -1)
-    if art_b < 0:
-        return wp.vec2i(art_a, -1)
-    return wp.vec2i(wp.min(art_a, art_b), wp.max(art_a, art_b))
+    a = row_side(art_a, response_dofs)
+    b = row_side(art_b, response_dofs)
+    if a < 0 or a == b:
+        return wp.vec2i(b, -1)
+    if b < 0:
+        return wp.vec2i(a, -1)
+    return wp.vec2i(wp.min(a, b), wp.max(a, b))
 
 
 @wp.struct
