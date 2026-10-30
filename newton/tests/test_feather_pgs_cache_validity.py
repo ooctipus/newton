@@ -1768,14 +1768,12 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         solver = SimpleNamespace(
             _compact_diagonal_mass_size=2,
             _sparse_mass_matrix_size=None,
-            _tree_kinetic_state=None,
             _execution_plan=SimpleNamespace(
                 use_diagonal_mass=lambda size: size == 4,
                 use_tiled_cholesky=lambda size: size >= 20,
                 selection_reasons=lambda size: {},
             ),
             _kernel_choice_reasons={"cholesky_kernel": "Automatic selection."},
-            _sparse_selection_reason="No sparse factors.",
             _cholesky_kernels_by_size=opaque(),
             _paired_response_primary_size=None,
             _paired_factor_coordinates=False,
@@ -1789,13 +1787,13 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 size_groups=list(sizes), n_arts_by_size=dict.fromkeys(sizes, 3), group_to_art=opaque()
             ),
         )
-        solver._tree_kinetic_state = object()
-        held = step_plan._factor(solver)
+        # The route row's sizes: the compact diagonal size 2, no native sparse factor.
+        row = SimpleNamespace(sizes={"packed": None, "diagonal": 2}, reasons={"K1": "No sparse factors."})
+        held = step_plan._factor(SimpleNamespace(**vars(row), evaluator="held"), solver)
         self.assertEqual(
             {size: route.name for size, route in held.items()}, {2: "none", **dict.fromkeys(sizes[1:], "held")}
         )
-        solver._tree_kinetic_state = None
-        routes = step_plan._factor(solver)
+        routes = step_plan._factor(SimpleNamespace(**vars(row), evaluator="ordinary"), solver)
         self.assertEqual(
             {size: route.name for size, route in routes.items()},
             {2: "none", 4: "diagonal", 6: "loop", 18: "loop", 24: "tiles", 25: "tiles"},

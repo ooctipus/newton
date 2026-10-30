@@ -1037,8 +1037,12 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _par_sweeps_reason="auto: ...",
                 _ink_rows=64,
                 _ink_sizes=(_DOFS, 0, 0, 0),
-                _ink_reason="The parallel tiers form the response of sizes [12] in-kernel.",
-                _keyed_rows=None,
+                routes=SimpleNamespace(
+                    row=SimpleNamespace(
+                        producer="general",
+                        reasons={"K4": "The parallel tiers form the response of sizes [12] in-kernel."},
+                    )
+                ),
                 laws=SimpleNamespace(friction_anchors_enabled=anchors),
             )
             with self.subTest(anchors=anchors, linked=linked):
@@ -1211,7 +1215,7 @@ class TestTierRule(unittest.TestCase):
             with self.subTest(changes=sorted(changes)):
                 probe = self._probe(**changes)
                 self.assertEqual((probe._ink_rows, probe._ink_sizes), (0, None))
-                self.assertIn(reason, probe._ink_reason)
+                self.assertIn(reason, probe.routes.reasons["K4"])
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""

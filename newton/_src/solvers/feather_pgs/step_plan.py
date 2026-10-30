@@ -11,9 +11,10 @@ sweep solves and what drives the sweep. ``step()`` launches through these tables
 the route record (:mod:`.path_selection`) reports them, and construction builds
 exactly the kernels they name, so the three cannot disagree.
 
-The plan reads construction's decisions (owners, the execution plan's resource
-choices, the options); it decides nothing that construction has not, and nothing
-in it changes after construction.
+The plan reads the solver's route (its row of the route table: the evaluator, the
+placement case and producer, the step family) and the mapping beside it (the
+execution plan's resource choices, the kernel choices); it decides nothing that
+construction has not, and nothing in it changes after construction.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from ...sim import ModelFlags
+from .route_table import RouteRow
 
 __all__ = ["Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
 
@@ -126,21 +128,19 @@ class StepPlan:
     compact producer's six-coordinate size (complete stores)."""
 
     @classmethod
-    def build(cls, solver) -> StepPlan:
-        """Read the plan from a constructed solver's decisions."""
-        factor = _factor(solver)
-        held = solver._tree_kinetic_state is not None
-        solve = _solve(solver)
-        response = _response(solver, solve)
+    def build(cls, row: RouteRow, solver) -> StepPlan:
+        """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
+        held = row.evaluator == "held"
+        solve = _solve(row, solver)
         return cls(
-            factor=MappingProxyType(factor),
-            trisolve=MappingProxyType({} if held else _trisolve(solver)),
-            response=MappingProxyType(response),
+            factor=MappingProxyType(_factor(row, solver)),
+            trisolve=MappingProxyType({} if held else _trisolve(row, solver)),
+            response=MappingProxyType(_response(row, solver, solve)),
             delassus=MappingProxyType(_delassus(solver, solve)),
             solve=solve,
             unread_mass_sizes=tuple(solver.forest.size_groups) if held else (),
             jacobian_clear_sizes=()
-            if solver._row_packets is not None or solver._keyed_rows is not None
+            if row.producer in ("local_packets", "keyed_rows")
             else tuple(size for size in solver.forest.size_groups if solver._memset_clears_jacobian(size)),
         )
 
@@ -172,15 +172,15 @@ def _route(solver, size: int, kernel: str, name: str, reason: str) -> Route:
     return Route(name, " ".join(part for part in (solver._kernel_choice_reasons[kernel], resource, reason) if part))
 
 
-def _factor(solver) -> dict[int, Route]:
+def _factor(row: RouteRow, solver) -> dict[int, Route]:
     plan = solver._execution_plan
-    held = solver._tree_kinetic_state is not None
+    held = row.evaluator == "held"
     routes = {}
     for size in solver.forest.size_groups:
-        if size == solver._compact_diagonal_mass_size:
+        if size == row.sizes["diagonal"]:
             route = "none", "The compact diagonal size stores its inverse mass directly; no dense factor."
-        elif size == solver._sparse_mass_matrix_size:
-            route = "none", solver._sparse_selection_reason
+        elif size == row.sizes["packed"]:
+            route = "none", row.reasons["K1"]
         elif held:
             route = "held", "The held tree refreshes the factor from its geometry in stage 1."
         elif plan.use_diagonal_mass(size):
@@ -193,15 +193,15 @@ def _factor(solver) -> dict[int, Route]:
     return routes
 
 
-def _trisolve(solver) -> dict[int, Route]:
+def _trisolve(row: RouteRow, solver) -> dict[int, Route]:
     plan = solver._execution_plan
     choice = solver.trisolve_kernel
     threshold = f"Automatic DOF threshold {solver.small_dof_threshold}."
     routes = {}
     for size in solver.forest.size_groups:
-        if size == solver._sparse_mass_matrix_size:
+        if size == row.sizes["packed"]:
             route = "sparse", "Native sparse factors solve in factor coordinates."
-        elif size == solver._compact_diagonal_mass_size:
+        elif size == row.sizes["diagonal"]:
             route = "compact_diagonal", "The compact diagonal size applies its stored inverse mass."
         elif plan.use_diagonal_mass(size):
             route = "diagonal", "Independent coordinates apply the diagonal inverse."
@@ -213,36 +213,33 @@ def _trisolve(solver) -> dict[int, Route]:
     return routes
 
 
-def _response(solver, solve: SolveRoute) -> dict[int, Route]:
+def _response(row: RouteRow, solver, solve: SolveRoute) -> dict[int, Route]:
     plan = solver._execution_plan
     sizes = solver.forest.size_groups
-    owner = solver._compact_contact_boundary or solver._sparse_mass_matrix_size is not None
+    owner = row.producer == "compact_contact_boundary" or row.case == "K1"
     routes = {}
     for size in sizes:
         route = None
         if not solve.assembles_delassus:
             if owner:
                 route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
-            elif solver._sparse_diagonal_contact_solve and size in (
-                solver._sparse_diagonal_response_size,
-                solver._sparse_diagonal_dense_size,
-            ):
+            elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
                 route = Route(
                     "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
                 )
-            elif solver._packed_response:
+            elif row.packed:
                 route = Route(
                     "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
                 )
         if route is None and plan.use_diagonal_mass(size):
             route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
         if route is None:
-            grouped, reason = _grouped(solver, size) if solver._grouped_response else (False, "")
+            grouped, reason = _grouped(row, size) if solver._grouped_response else (False, "")
             if grouped:
                 name = "grouped"
             elif plan.use_tiled_hinv_jt(size):
                 name = "tiles"
-            elif solver._local_internal_fast_path:
+            elif row.case == "K3":
                 name, reason = "lanes", f"{reason} A warp per articulation, skipping the worlds local owners solve."
             else:
                 name = "rows"
@@ -251,7 +248,7 @@ def _response(solver, solve: SolveRoute) -> dict[int, Route]:
     return routes
 
 
-def _grouped(solver, size: int) -> tuple[bool, str]:
+def _grouped(row: RouteRow, size: int) -> tuple[bool, str]:
     """Whether the grouped response solve (a warp per articulation, a lane per row) serves a size, and why.
 
     The data choose it: where the in-kernel tiers own rows, the response must skip each world's tier rows,
@@ -259,7 +256,7 @@ def _grouped(solver, size: int) -> tuple[bool, str]:
     """
     if int(size) > _GROUPED_VERIFIED_DOFS:
         return False, f"The grouped response solve is verified up to {_GROUPED_VERIFIED_DOFS} DOFs only."
-    if solver._ink_skip_rows() > 0:
+    if row.tier_rows > 0:
         return True, "Grouped: the in-kernel tiers need the grouped kernel's per-world row skip."
     return False, "No in-kernel tier rows to skip: the planned response kernel."
 
@@ -272,21 +269,15 @@ def _delassus(solver, solve: SolveRoute) -> dict[int, Route]:
     )
 
 
-def _solve(solver) -> SolveRoute:
-    matrix_free = solver._matrix_free
-    dense_split = not matrix_free
-    if matrix_free:
-        family = "matrix_free"
-    elif solver.forest.has_mixed_contacts:
-        family = "split_interleaved"
-    else:
-        family = "dense_split"
+def _solve(row: RouteRow, solver) -> SolveRoute:
+    family = row.family
+    dense_split = family != "matrix_free"
     # The CPU sweeps its assembled Delassus rows, a thread per world.
     if dense_split:
         route = Route("dense_loop", "The CPU sweeps the assembled Delassus rows on one thread per world.")
-    elif solver._sparse_mass_matrix_size is not None:
+    elif row.case == "K1":
         route = Route("sparse_pgs", "Native sparse factors own the sweep.")
-    elif solver._sparse_diagonal_contact_solve:
+    elif row.case == "K2":
         route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
     else:
         route = Route(
@@ -299,7 +290,7 @@ def _solve(solver) -> SolveRoute:
             "rebuilds the velocity, runs a one-iteration matrix-free sweep and adds its velocity change to "
             "the dense right-hand side.",
         )
-    elif dense_split and solver.options.pgs_debug:
+    elif dense_split and row.laws.debug_rows:
         driver = Route(
             "debug_loop", "pgs_debug launches one dense iteration per dispatch and reads the impulses back after each."
         )
@@ -313,11 +304,11 @@ def _solve(solver) -> SolveRoute:
                 else "."
             ),
         )
-    elif solver.options.pgs_debug:
+    elif row.laws.debug_rows:
         driver = Route(
             "debug_loop", "pgs_debug launches the position solve one iteration per dispatch with host reads."
         )
-    elif solver.options.contact_compliance:
+    elif row.laws.compliance:
         driver = Route(
             "contact_compliance",
             "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",

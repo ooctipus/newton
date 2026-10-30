@@ -1221,15 +1221,15 @@ class SolverFeatherPGS(SolverBase):
                 sparse_diagonal_pair = None
         self._sparse_diagonal_contact_solve = self.routes.claim("K2", sparse_diagonal_pair is not None)
         if declined:
-            self._sparse_diagonal_reason = declined
+            self.routes.reasons["K2"] = declined
         elif held is not None:
-            self._sparse_diagonal_reason = f"Only the held tree evaluates the compact diagonal. {held}"
+            self.routes.reasons["K2"] = f"Only the held tree evaluates the compact diagonal. {held}"
         elif sparse_diagonal_pair is None:
-            self._sparse_diagonal_reason = (
+            self.routes.reasons["K2"] = (
                 "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
             )
         else:
-            self._sparse_diagonal_reason = (
+            self.routes.reasons["K2"] = (
                 "One diagonal-mass articulation and one compact dense articulation per world share one owner."
             )
         if sparse_diagonal_pair is None:
@@ -1460,7 +1460,7 @@ class SolverFeatherPGS(SolverBase):
         self._local_internal_fast_path = self.routes.claim(
             "K3", local_base_supported and any(count > 0 for count in self._local_internal_art_counts.values())
         )
-        self._local_solve_reason = local_decline or (
+        self.routes.reasons["K3"] = local_decline or (
             "Worlds with one small non-free articulation (and at most one free body) solve in local shared memory."
             if self._local_internal_fast_path
             else "No world holds one non-free articulation of at most "
@@ -1536,10 +1536,10 @@ class SolverFeatherPGS(SolverBase):
         self._paired_response_secondary_groups = (
             wp.array(response_pair[2], dtype=wp.int32, device=model.device) if response_pair is not None else None
         )
-        self._factor_coordinates_reason = ("No paired response." if response_pair is None else None) or capable(
+        self.routes.reasons["K5"] = ("No paired response." if response_pair is None else None) or capable(
             "paired_factor", laws
         )
-        self._paired_factor_coordinates = self.routes.claim("K5", self._factor_coordinates_reason is None)
+        self._paired_factor_coordinates = self.routes.claim("K5", self.routes.reasons["K5"] is None)
         # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
         # uniform normal/tangent/tangent triples; the generic row path pools the patch load through the linked
         # normal rows instead.
@@ -1746,8 +1746,29 @@ class SolverFeatherPGS(SolverBase):
         self._resolved_worlds_reason = classifier.reason
 
         self._place_dense_response()
+        # The route: the row of the route table the class takes. The step plan and the route record read it.
+        diagonal = self.routes.case == "K2"
+        route = self.routes.finish(
+            self.laws.set,
+            evaluator="held" if self._tree_kinetic_state is not None else "ordinary",
+            producer=contact_row_plan(self).producer,
+            packed=self._packed_response,
+            # CUDA sweeps the rows matrix-free; the CPU sweeps its assembled rows, interleaved with the free-body
+            # rows where a world holds both.
+            family="matrix_free"
+            if self._matrix_free
+            else "split_interleaved"
+            if self.forest.has_mixed_contacts
+            else "dense_split",
+            tier_rows=self._ink_skip_rows(),
+            sizes={
+                "packed": self._sparse_mass_matrix_size,
+                "diagonal": self._sparse_diagonal_response_size if diagonal else None,
+                "dense": self._sparse_diagonal_dense_size if diagonal else None,
+            },
+        )
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
-        self._plan = StepPlan.build(self)
+        self._plan = StepPlan.build(route, self)
         self._build_stage_kernels()
         self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
@@ -1805,7 +1826,10 @@ class SolverFeatherPGS(SolverBase):
         fallbacks; it does not predict dynamic per-world branches.
 
         ``routes`` records every construction-time owner and variant that decides
-        which kernels run: ``routes.stages`` the step plan's per-size stage routes
+        which kernels run: ``routes.row`` the route, the route table's row the
+        step plan and the owners' entries read (evaluator, placement case,
+        contact-row producer, packed rows, step family, tier rows, the case
+        owners' sizes and each case's reason), ``routes.stages`` the step plan's per-size stage routes
         (factor, predictor solve, response, Delassus) that ``step()`` launches,
         each with its reason (the kernel choice, the size's resource rule), the
         held-tree owner and its lane layouts, the contact-row
@@ -1850,13 +1874,13 @@ class SolverFeatherPGS(SolverBase):
         """
         cached = self._tree_kinetic_state is not None
         selection = {
-            "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
+            "sparse_mass_matrix": "on" if self.routes.row.case == "K1" else "off",
             "cached_dynamics": "on" if cached else "off",
             "publication": "cached" if cached else "ordinary",
             "pgs_kernel": "matrix_free" if self._matrix_free else "loop",
             "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
             "reasons": {
-                "sparse_mass_matrix": self._sparse_selection_reason,
+                "sparse_mass_matrix": self.routes.row.reasons["K1"],
                 "cached_dynamics": self._cached_dynamics_selection_reason,
                 "publication": "Paired cache owns next-state publication."
                 if cached
@@ -2663,7 +2687,7 @@ class SolverFeatherPGS(SolverBase):
             )
         )
         if declined is not None:
-            self._sparse_selection_reason = declined
+            self.routes.reasons["K1"] = declined
             return
         # Decide ownership before omitting dense buffers. Explicit research
         # recipes retain their own admission and fallback, including when their
@@ -2675,19 +2699,19 @@ class SolverFeatherPGS(SolverBase):
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
             # sweep and keeps the resolved-world classifier. Native sparse factors never serve free rigid bodies.
-            self._sparse_selection_reason = (
+            self.routes.reasons["K1"] = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
             return
         response_dofs = self.forest.response_dof_count
         if velocity_candidate and (self.forest.has_prescribed_response or np.any(self._kinematic_dof_mask_host)):
-            self._sparse_selection_reason = "Sparse velocity rows do not support prescribed-coordinate topology."
+            self.routes.reasons["K1"] = "Sparse velocity rows do not support prescribed-coordinate topology."
             return
         free_rigid = self.forest.is_free_rigid_host != 0
         articulated = np.flatnonzero((response_dofs > 0) & ~free_rigid)
         sizes = np.unique(response_dofs[articulated])
         if len(sizes) != 1:
-            self._sparse_selection_reason = "Native sparse factors require one articulated response DOF size."
+            self.routes.reasons["K1"] = "Native sparse factors require one articulated response DOF size."
             return
         size = int(sizes[0])
         # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
@@ -2696,7 +2720,7 @@ class SolverFeatherPGS(SolverBase):
             or size not in self.forest.crba_dof_joint_offset_by_size
             or size in self.forest.diagonal_mass_sizes
         ):
-            self._sparse_selection_reason = (
+            self.routes.reasons["K1"] = (
                 "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
             )
             return
@@ -2714,14 +2738,14 @@ class SolverFeatherPGS(SolverBase):
         # Velocity rows can benefit from factor-coordinate response even for a
         # serial chain; this owner does not require zeros in the mass factor.
         if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
-            self._sparse_selection_reason = "Topology has no usable sparse factor layout for this row policy."
+            self.routes.reasons["K1"] = "Topology has no usable sparse factor layout for this row policy."
             return
         # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
         from . import held_tree  # noqa: PLC0415
 
         held = held_tree.sparse_decline(self, size, plan, velocity_limits=velocity_candidate)
         if held is not None:
-            self._sparse_selection_reason = f"Only the held tree evaluates native sparse factors. {held}"
+            self.routes.reasons["K1"] = f"Only the held tree evaluates native sparse factors. {held}"
             return
 
         mimic_dofs = None
@@ -2735,7 +2759,7 @@ class SolverFeatherPGS(SolverBase):
             )
         body_masks, max_support = row_support(self.forest, model, plan, articulated, articulated_counts, mimic_dofs)
         if not max_support:
-            self._sparse_selection_reason = "Topology has no responsive row support."
+            self.routes.reasons["K1"] = "Topology has no responsive row support."
             return
         # The sweep's shared working set (sweep_routes_sparse.sparse_staging) against the device's static budget:
         # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
@@ -2809,7 +2833,7 @@ class SolverFeatherPGS(SolverBase):
         }
         solve = staging(**sweep)
         if not solve.fits(budget):
-            self._sparse_selection_reason = (
+            self.routes.reasons["K1"] = (
                 f"Row capacity needs {solve.bytes} bytes of shared memory for sparse solving; limit is {budget}."
             )
             return
@@ -2821,12 +2845,12 @@ class SolverFeatherPGS(SolverBase):
             shared_limit // shared_bytes_per_warp,
         )
         if self._sparse_factor_warps_per_block < 1:
-            self._sparse_selection_reason = (
+            self.routes.reasons["K1"] = (
                 f"One sparse factor warp needs {shared_bytes_per_warp} bytes of shared memory; limit is {shared_limit}."
             )
             return
 
-        self._sparse_selection_reason = (
+        self.routes.reasons["K1"] = (
             f"Automatic sparse selection: {size}-DOF topology and row policy admitted; "
             f"solve uses {solve.bytes}/{budget} bytes of shared memory."
         )
@@ -7288,12 +7312,12 @@ class SolverFeatherPGS(SolverBase):
         ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement
         (:meth:`_admit_parallel_contact_paths`). Their row bound is the dense row capacity, at most
         :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
-        response they form. ``_ink_rows`` is 0 without tiers and ``_ink_reason`` says why or why not
-        (``routes.sweep.tiers``). The local packets and the keyed rows read this before the tiers are built.
+        response they form. ``_ink_rows`` is 0 without tiers and the route table's K4 reason says why or why not
+        (``routes.row.reasons``). The local packets and the keyed rows read this before the tiers are built.
         """
         pinned = self._route_pins.get("tiers")
         self._ink_rows, self._ink_sizes = 0, None
-        self._ink_reason = self.routes.taken("K4") or first_failed(
+        reason = self.routes.taken("K4") or first_failed(
             (
                 (self._mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
                 (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
@@ -7308,14 +7332,15 @@ class SolverFeatherPGS(SolverBase):
                 (self._parallel_contact_paths, self._parallel_contact_paths_reason),
             )
         )
-        if self._ink_reason is None:
-            sizes, self._ink_reason = self._build_inkernel_response_meta()
+        if reason is None:
+            sizes, reason = self._build_inkernel_response_meta()
             rows = min(int(self.dense_max_constraints), int(pinned or sweep_routes_tiers.TIER_MAX_ROWS))
             rows -= rows % 4
             if self.routes.claim("K4", sizes is not None and rows > 0):
                 self._ink_sizes, self._ink_rows = sizes, rows
             elif sizes is not None:
-                self._ink_reason = f"The dense row capacity {self.dense_max_constraints} holds no tier of four rows."
+                reason = f"The dense row capacity {self.dense_max_constraints} holds no tier of four rows."
+        self.routes.reasons["K4"] = reason
 
     def _build_inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
         """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.

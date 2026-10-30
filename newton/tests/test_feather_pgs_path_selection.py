@@ -478,8 +478,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # A stand-in for the CUDA-only grouped response: the plan reads host state only, and the record its table.
         solver._grouped_response = True
         for skip, route in ((0, "rows"), (8, "grouped")):
-            with self.subTest(skip_rows=skip), patch.object(solver, "_ink_skip_rows", lambda skip=skip: skip):
-                solver._plan = StepPlan.build(solver)
+            with self.subTest(skip_rows=skip):
+                solver._plan = StepPlan.build(dataclasses.replace(solver.routes.row, tier_rows=skip), solver)
                 selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
                 response = selected["routes"]["stages"]["response"]
@@ -1138,7 +1138,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["sweep"]["tiers"])
         self.assertFalse(routes["contact_rows"]["keyed_rows"]["enabled"])
         self.assertEqual(solver._ink_rows, 0)
-        self.assertIn("case K5", solver._ink_reason)
+        self.assertIn("case K5", solver.routes.row.reasons["K4"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_contact_graph_and_reset(self):

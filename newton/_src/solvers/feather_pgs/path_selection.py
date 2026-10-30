@@ -147,15 +147,23 @@ def _counts(counts) -> dict:
 
 
 def route_selection(solver) -> dict:
-    """Describe every construction-time owner and variant that decides which kernels run."""
+    """Describe every construction-time owner and variant that decides which kernels run.
+
+    The owners' records take whether they hold the class, their sizes and their reasons from the solver's route
+    (``routes.row``, :class:`.route_table.RouteRow`); the rest of each record is the owner's own structure.
+    """
     from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time flags
+
+    row = solver.routes.row
 
     return {
         "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.forest.n_arts_by_size.items()},
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
+        # The route: the row of the route table the class takes, its axes and each placement case's reason.
+        "row": json_value(row.record()),
         # The row laws every owner's admission reads (route_table.Laws).
-        "laws": solver.laws.set.record(),
+        "laws": row.laws.record(),
         # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
@@ -197,7 +205,7 @@ def _held_tree_groups(solver) -> tuple:
     # Scalar branch groups hold no tree layout.
     if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
         return "forest", groups
-    return ("tree" if solver._sparse_mass_matrix_size is not None else "mixed"), groups
+    return ("tree" if solver.routes.row.case == "K1" else "mixed"), groups
 
 
 def _held_tree(solver) -> dict:
@@ -382,16 +390,16 @@ def _row_builder(solver, plan, size, source) -> dict:
 
 
 def _contact_rows(solver, source) -> dict:
-    point = bool(solver.laws.set.point)
-    # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
-    # contact row; the general builder serves only solvers no earlier producer took.
+    row = solver.routes.row
+    point = bool(row.laws.point)
+    # The plan _stage4_build_rows dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
     methods = None
     if plan.producer == "general":
         methods = {str(int(size)): method for size, method in plan.methods.items()}
     packets = solver._row_packets
     return {
-        "producer": plan.producer,
+        "producer": row.producer,
         "law": plan.law,
         # Every producer, every size: the builder method, its kernels in launch order and the law they write,
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
@@ -399,16 +407,16 @@ def _contact_rows(solver, source) -> dict:
         "general_method_by_dof": methods,
         "point_contact_paths": point,
         "row_packets": {
-            "enabled": packets is not None,
+            "enabled": row.producer == "local_packets",
             "reason": solver._row_packets_reason,
             "primary_dofs": None if packets is None else int(packets.primary),
             "secondary_dofs": None if packets is None else int(packets.secondary),
             "mimic_rows": None if packets is None else int(packets.mimics),
             "packets": None if packets is None else int(packets.packets),
         },
-        "keyed_rows": {"enabled": solver._keyed_rows is not None, "reason": solver._keyed_rows_reason},
+        "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver._keyed_rows_reason},
         "compact_contact": {
-            "boundary": bool(solver._compact_contact_boundary),
+            "boundary": row.producer == "compact_contact_boundary",
             "reason": solver._compact_contact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),
@@ -429,22 +437,23 @@ def _contact_consumers(solver) -> dict:
 
 
 def _local_solve(solver) -> dict:
-    enabled = bool(solver._local_internal_fast_path)
-    # The candidate counts predate sparse admission, which can retire the owners; report built owners only.
+    row = solver.routes.row
+    enabled = row.case == "K3"
     return {
         "enabled": enabled,
         "internal_articulations_by_dof": _counts(solver._local_internal_art_counts) if enabled else {},
         "pair_articulations_by_dof": _counts(solver._local_pair_art_counts) if enabled else {},
         "residual_articulations_by_dof": _counts(solver._local_residual_art_counts) if enabled else {},
-        "reason": solver._local_solve_reason,
+        "reason": row.reasons["K3"],
     }
 
 
 def _paired_response(solver) -> dict:
+    row = solver.routes.row
     primary = solver._paired_response_primary_size
     if primary is None:
         return {"enabled": False, "reason": solver._paired_response_reason}
-    factor = bool(solver._paired_factor_coordinates)
+    factor = row.case == "K5"
     overlap = solver._paired_general_solve_stream is not None
     return {
         "enabled": True,
@@ -452,7 +461,7 @@ def _paired_response(solver) -> dict:
         "secondary_dofs": int(solver._paired_response_secondary_size),
         "factor_coordinates": factor,
         # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
-        "factor_coordinates_reason": solver._factor_coordinates_reason,
+        "factor_coordinates_reason": row.reasons["K5"],
         "contact_triples": bool(solver._factor_coordinate_contact_triples),
         "contact_units": bool(solver._factor_coordinate_contact_units),
         "components": solver._paired_components is not None,
@@ -468,23 +477,25 @@ def _paired_response(solver) -> dict:
 
 
 def _sparse_diagonal(solver) -> dict:
+    row = solver.routes.row
     return {
-        "enabled": bool(solver._sparse_diagonal_contact_solve),
-        "response_dofs": json_value(solver._sparse_diagonal_response_size),
-        "dense_dofs": int(solver._sparse_diagonal_dense_size),
+        "enabled": row.case == "K2",
+        "response_dofs": json_value(row.sizes["diagonal"]),
+        "dense_dofs": int(row.sizes["dense"] or 0),
         "contact_triples": bool(solver._sparse_diagonal_contact_triples),
         "contact_units": bool(solver._sparse_diagonal_contact_units),
         "speculative_contact_batches": bool(solver._sparse_diagonal_speculative_contact_batches),
         "fused_joint_limits": bool(solver._fused_diagonal_joint_limits),
-        "reason": solver._sparse_diagonal_reason,
+        "reason": row.reasons["K2"],
     }
 
 
 def _sparse_mass_matrix(solver) -> dict:
-    size = solver._sparse_mass_matrix_size
+    row = solver.routes.row
+    size = row.sizes["packed"]
     record = {
         "size": json_value(size),
-        "reason": solver._sparse_selection_reason,
+        "reason": row.reasons["K1"],
         "velocity_limits": bool(solver._sparse_velocity_limits),
         "active_rows": bool(solver._sparse_active_rows),
         "active_rows_reason": solver._sparse_active_rows_reason,
@@ -509,6 +520,7 @@ def _sparse_mass_matrix(solver) -> dict:
 
 
 def _sweep(solver) -> dict:
+    row = solver.routes.row
     solve = solver._plan.solve
     route, driver = solve.route.name, solve.driver.name
     dense_split = solve.assembles_delassus
@@ -530,9 +542,9 @@ def _sweep(solver) -> dict:
             else "Skipped: without free rigid bodies no matrix-free row exists.",
         }
     local = None
-    if solver._local_internal_fast_path:
+    if row.case == "K3":
         local = {
-            "factory": "row_packets" if solver._row_packets is not None else "local_owned",
+            "factory": "row_packets" if row.producer == "local_packets" else "local_owned",
             "internal": _keys_by_size(solver._pgs_solve_local_internal_kernels),
             "pair": _keys_by_size(solver._pgs_solve_local_pair_kernels),
             "residual": _keys_by_size(solver._pgs_solve_local_residual_kernels),
@@ -702,13 +714,14 @@ def _mf_gs_storage(solver) -> dict | None:
 
 
 def _tiers(solver) -> dict | None:
+    row = solver.routes.row
     tiers = list(solver._mf_gs_tiers)
     if not tiers:
         return None
     return {
-        "family": "keyed_parallel" if solver._keyed_rows is not None else "parallel",
+        "family": "keyed_parallel" if row.producer == "keyed_rows" else "parallel",
         # Why the class takes the tiers (case K4: the in-kernel response's shape).
-        "inkernel_response_reason": solver._ink_reason,
+        "inkernel_response_reason": row.reasons["K4"],
         # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
         "linked_rows": all(tier.linked_rows for tier in tiers),
         # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
@@ -786,17 +799,18 @@ def _velocity_limits(solver) -> dict:
 
 
 def _free_rigid_bodies(solver) -> dict:
+    row = solver.routes.row
     count = int(solver.forest.free_rigid_body_count)
     owners = []
     if count:
         if not solver._matrix_free:
             owners.append("split_matrix_free_rows")
         else:
-            if solver._sparse_mass_matrix_size is not None:
+            if row.case == "K1":
                 owners.append("sparse_free_rows")
             if solver._paired_response_primary_size is not None:
-                owners.append("paired_factor" if solver._paired_factor_coordinates else "paired_response")
-            # Built local kernels only: sparse admission retires the local owners after their candidates.
+                owners.append("paired_factor" if row.case == "K5" else "paired_response")
+            # Built local kernels only.
             if solver._pgs_solve_local_pair_kernels:
                 owners.append("local_pair")
             if solver._pgs_solve_local_residual_kernels:

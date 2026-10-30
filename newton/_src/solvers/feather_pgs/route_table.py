@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-__all__ = ["CAPABILITIES", "CASES", "Laws", "RouteTable", "capable"]
+__all__ = ["CAPABILITIES", "CASES", "Laws", "RouteRow", "RouteTable", "capable"]
 
 
 @dataclass(frozen=True)
@@ -180,17 +180,22 @@ whose owner fits the class claims it. A class no case claims keeps the general p
 
 
 class RouteTable:
-    """The placement axis: the case of the solver's class, decided once in :data:`CASES` order.
+    """The placement axis: the case of the solver's class, decided once in :data:`CASES` order, and the route row.
 
     Construction asks the owners in that order. Each tests only its own fit (topology, sizes, capability, the device's
-    budget) after :meth:`taken`, which says why an earlier case holds the class, and :meth:`claim` gives the class to
-    the first that fits. The producers and the runtime claims read :attr:`case`. The test pin
-    ``placement="general"`` keeps every class general.
+    budget) after :meth:`taken`, which says why an earlier case holds the class, :meth:`claim` gives the class to
+    the first that fits, and each writes its case's reason. The producers and the runtime claims read :attr:`case`;
+    once they have decided, :meth:`finish` sets :attr:`row`, the route the step plan and the record read. The test
+    pin ``placement="general"`` keeps every class general.
     """
 
     def __init__(self, pins):
         self.case = "K6"
         """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
+        self.reasons: dict[str, str | None] = {}
+        """Why each asked case holds the class or does not, written by its owner."""
+        self.row: RouteRow | None = None
+        """The route of the class, once :meth:`finish` has set it."""
         self._general = pins.get("placement") == "general"
         self._asked = -1
 
@@ -214,3 +219,41 @@ class RouteTable:
                 raise RuntimeError(f"Case {case} claims a class it was not offered.")
             self.case = case
         return fits
+
+    def finish(self, laws: Laws, **axes) -> RouteRow:
+        """Set the route of the solver's class (:attr:`row`) from the laws, the decided case and its reasons, and
+        the other ``axes`` (:class:`RouteRow`'s fields), and return it."""
+        self.row = RouteRow(laws=laws, case=self.case, reasons=dict(self.reasons), **axes)
+        return self.row
+
+
+@dataclass(frozen=True)
+class RouteRow:
+    """The solver's route: the row of the route table its class takes, fixed once every owner has decided.
+
+    The step plan (:meth:`.step_plan.StepPlan.build`) and the route record read the row, not the owners' state.
+    """
+
+    laws: Laws
+    """Axis 2: the row laws."""
+    evaluator: str
+    """Axis 1: ``"held"`` (the held tree evaluates the dynamics) or ``"ordinary"``."""
+    case: str
+    """Axis 3: the placement case (:data:`CASES`, or ``"K6"`` general)."""
+    producer: str
+    """Axis 3: the producer of the contact rows (:func:`.contact_row_plan.contact_row_plan`)."""
+    packed: bool
+    """Axis 3: the matrix-free sweeps read the dense rows packed by support, so no size builds a response."""
+    family: str
+    """Axis 4: the step family, ``"matrix_free"`` on CUDA, the CPU's ``"split_interleaved"`` or ``"dense_split"``."""
+    tier_rows: int
+    """Axis 4: the dense rows of the worlds the Jacobi tiers own (case K4; 0 without tiers)."""
+    sizes: dict[str, int | None]
+    """The case owners' sizes: ``"packed"`` (K1's factored size), ``"diagonal"`` and ``"dense"`` (K2's pair)."""
+    reasons: dict[str, str | None]
+    """Why each case holds the class or does not (:attr:`RouteTable.reasons`)."""
+
+    def record(self) -> dict:
+        """The row's axes and each case's reason as a JSON-compliant record (``routes.row``; the laws are
+        ``routes.laws``)."""
+        return {name: value for name, value in asdict(self).items() if name != "laws"}

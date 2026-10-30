@@ -170,7 +170,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver.forest.has_free_rigid_bodies = True
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertIn("free rigid bodies", solver._sparse_selection_reason)
+                self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
         # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
         for anchors in (False, True):
             with (
@@ -190,7 +190,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver._route_pins = {"tiers": 32}
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
-            self.assertIn("Jacobi tiers", solver._sparse_selection_reason)
+            self.assertIn("Jacobi tiers", solver.routes.reasons["K1"])
 
     def test_patch_free_body_worlds_keep_the_dense_route(self):
         """Keep a patch-friction world with free rigid bodies on the dense route, as the free-body rule says."""
@@ -201,7 +201,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver.forest.has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
-            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
+            self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):

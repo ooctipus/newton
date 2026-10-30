@@ -84,6 +84,7 @@ def install_cpu_keyed_rows(solver):
     solver.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     solver._ink_rows = 4
     solver.routes.case = "K4"
+    solver.routes.row = dataclasses.replace(solver.routes.row, case="K4", producer="keyed_rows")
     solver._keyed_rows = keyed_rows.KeyedRows(solver)
 
 
