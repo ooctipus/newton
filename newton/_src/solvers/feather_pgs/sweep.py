@@ -22,9 +22,9 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   (:func:`contact_unit`, :class:`UnitOperator`): the placement reduces the unit's terms once and applies its changes
   once, the pair's terms moved by the normal's change;
 - the **Jacobi law** steps every row of a world at once instead, a lane each (:class:`JacobiRows`,
-  :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, the radial projection of each friction
-  pair, Nesterov's momentum with adaptive restart and the relative change vote, the operator forming each row's
-  residual from the impulses;
+  :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, isotropic in each friction block's scaled
+  coordinates, the radial projection of each block onto its disk or ball, Nesterov's momentum with adaptive restart
+  and the relative change vote, the operator forming each row's residual from the impulses;
 - the **exit** is the exit law (:mod:`.solve_policy`): each change votes against the rounding floor of its update
   (:func:`change_vote`) and the end of the sweep stops a world none of whose updates was loud (:func:`end_sweep`);
 - the **publication** writes the impulses and velocities back.
@@ -1313,7 +1313,9 @@ class JacobiRows:
     ``types`` each row's constraint type is staged (``s_type``), which the
     trace names its change by. With ``weighted`` the lane also keeps whether
     its row is a contact (``row_contact``), whose weight the weighted Jacobi
-    law reads (:func:`jacobi_sweeps`).
+    law reads (:func:`jacobi_sweeps`). Under ``torsion`` a contact's friction
+    block is its pair and its spin row after it (contact torsion), else its
+    pair.
     """
 
     capacity: int
@@ -1322,6 +1324,7 @@ class JacobiRows:
     rows: str = "n_rows"
     types: bool = False
     weighted: bool = False
+    torsion: bool = False
 
     def buffers(self) -> tuple[Buffer, ...]:
         """The rows' state and metadata."""
@@ -1339,13 +1342,13 @@ class JacobiRows:
         parent: str,
         mu: str,
         unilateral: tuple[int, ...],
-        torsion: bool = False,
         pad: str = "    ",
     ) -> str:
         """Stage each row, lane-strided: its impulses at their warm start, its metadata (native expressions at row
         ``i``) and its kind, its diagonal formed later (:func:`jacobi_scale`). ``unilateral`` lists the row types that
-        clamp at zero; with ``torsion`` a contact's spin row is of its friction pair's kind (projected with it)."""
-        friction = f"row_type == {FRICTION} || row_type == {TORSION}" if torsion else f"row_type == {FRICTION}"
+        clamp at zero; under torsion a contact's spin row is of its friction pair's kind (stepped and projected with
+        it)."""
+        friction = f"row_type == {FRICTION} || row_type == {TORSION}" if self.torsion else f"row_type == {FRICTION}"
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
             f"else if ({friction}) kind = {JACOBI_FRICTION};",
@@ -1410,8 +1413,10 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
     ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
     the simultaneous steps from diverging where many rows couple through one body. The diagonal ``A_ii + cfm`` (the
     row's compliance) is formed here and a row without a positive one is marked for freezing (``frozen``,
-    :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds). The formed diagonal is the lane's
-    ``row_diag``, which the exit law reads.
+    :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds), but for a friction row: a tangent that
+    moves nothing takes its block's step (:func:`isotropic_friction_step`) and still spends its share of the disk on
+    its residual, as the sweeps' pair law does. The formed diagonal is the lane's ``row_diag``, which the exit law
+    reads.
     """
     return indent(
         "\n".join(
@@ -1419,20 +1424,26 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
                 f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;",
                 f"const float diag_i = {aii} + {cfm};",
                 "row_diag = diag_i;",
-                "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i; else { s_step[i] = 0.0f; frozen = 1; }",
+                "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i;",
+                f"else {{ s_step[i] = 0.0f; frozen = s_kind[i] != {JACOBI_FRICTION}; }}",
             ]
         ),
         pad,
     )
 
 
-def isotropic_pair_step(rows: JacobiRows, pad: str = "    ") -> str:
-    """Give both tangents of every friction pair the smaller of their steps, then synchronize.
+def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
+    """Give every row of a friction block one step in the block's scaled coordinates, then synchronize.
 
-    The radial projection onto the friction disk is then the projection in the pair's own metric, so a sliding pair
-    converges to maximal dissipation (the Gauss-Seidel pair solve's friction law). A row keeps its own step when its
-    sibling is not an admitted friction row of the same normal, or when either step is zero (a zero-Jacobian tangent
-    would otherwise freeze its live sibling). The pair's first tangent's lane handles it.
+    A block is a contact's friction pair, and under torsion its spin row after it. Its friction law's set is the disk
+    ``|t| <= mu lambda_n``, or the ball ``|(t / mu, s / mu_t)| <= lambda_n``: round in the coordinates
+    ``(t, s mu / mu_t)``, where the radial projection (:func:`_jacobi_projection`) is the nearest point. Stepped
+    isotropically there, by the smallest of the block's rows' steps in those coordinates, a block's fixed point
+    ``x = P(x - S r)`` makes its friction oppose its slip in the law's metric: maximal dissipation, the sweeps' friction
+    law. A row's step in its own coordinate is the block's step times its coordinate's scale squared: a tangent's 1, the
+    spin row's ``(mu_t / mu)^2``. A row without a step of its own (a tangent that moves nothing) takes the block's; a
+    block with none keeps its zero steps. Without a tangent coefficient (``mu = 0``) the projection pins the tangents
+    and the spin row keeps its own step. The block's first tangent's lane handles it.
     """
     F = JACOBI_FRICTION
     lines = [
@@ -1442,10 +1453,30 @@ def isotropic_pair_step(rows: JacobiRows, pad: str = "    ") -> str:
         f"        if (j < {rows.rows} && s_kind[j] == {F} && s_parent[j] == s_parent[i]) {{",
         "            const float step_a = s_step[i];",
         "            const float step_b = s_step[j];",
-        "            if (step_a > 0.0f && step_b > 0.0f) {",
-        "                const float step_pair = fminf(step_a, step_b);",
-        "                s_step[i] = step_pair;",
-        "                s_step[j] = step_pair;",
+        # The block's step: the smallest positive one.
+        "            float step_block = step_a > 0.0f ? step_a : step_b;",
+        "            if (step_b > 0.0f) step_block = fminf(step_block, step_b);",
+    ]
+    if rows.torsion:
+        lines += [
+            "            const int k = i + 2;",
+            "            const float mu = s_mu[i];",
+            f"            if (k < {rows.rows} && s_kind[k] == {F} && s_parent[k] == s_parent[i] && mu > 0.0f) {{",
+            # The spin coordinate's scale squared, (mu_t / mu)^2: zero pins the spin, whose step then stays.
+            "                const float ratio = s_mu[k] / mu;",
+            "                const float spin_scale = ratio * ratio;",
+            "                const float step_spin = s_step[k];",
+            "                if (spin_scale > 0.0f && step_spin > 0.0f) {",
+            "                    const float spin_block = step_spin / spin_scale;",
+            "                    step_block = step_block > 0.0f ? fminf(step_block, spin_block) : spin_block;",
+            "                }",
+            "                if (step_block > 0.0f && spin_scale > 0.0f) s_step[k] = step_block * spin_scale;",
+            "            }",
+        ]
+    lines += [
+        "            if (step_block > 0.0f) {",
+        "                s_step[i] = step_block;",
+        "                s_step[j] = step_block;",
         "            }",
         "        }",
         "    }",
@@ -1493,17 +1524,17 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str, torsion: bool = False) -> str:
+def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
     """Project each friction row's update radially onto its pair's disk of radius ``mu`` times the normal load.
 
     The load is the pair's normal's fresh impulse (``pooled``: the sum over its patch ring of normals, in ring order
     from its own). One warp exchanges the fresh updates by shuffle (a pooled load reads the ring's staged ones, and
     the warp synchronizes before the impulses are stored again); several warps stage them in ``s_x``. The pair's
-    tangents project together, each on its own lane. Under ``torsion`` the pair and its contact's spin row (its
+    tangents project together, each on its own lane. Under torsion the pair and its contact's spin row (its
     normal's row plus three) project together, radially onto their elliptic cone in the scaled impulse
     (:func:`.projection_laws.ball`).
     """
-    if torsion:
+    if rows.torsion:
         return _jacobi_triple_projection(rows, pooled=pooled, pad=pad)
     F, n = JACOBI_FRICTION, rows.rows
     disk = "radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2({first}, {second}), radius)[0]"
@@ -1645,12 +1676,12 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
 def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, pad: str = "    ") -> str:
     """The Jacobi sweeps of a world's rows over the response operator ``op`` (its Jacobi actions), at most ``sweeps``.
 
-    Both tangents of a friction pair first take one step (:func:`isotropic_pair_step`). Each sweep, every admitted
-    row steps at once from the extrapolated impulses ``y``: its residual ``r = b' + (A y)_i``
-    (:meth:`~.ResponseOperator.jacobi_residual`, after the operator's :meth:`~.ResponseOperator.gather`), then
-    ``y_i - s_step_i r`` clamped at zero for a unilateral row, or zero for a friction row while friction is delayed.
-    Each friction row is then projected radially onto
-    its pair's disk (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
+    The rows of each friction block first take one step, isotropic in the block's scaled coordinates
+    (:func:`isotropic_friction_step`). Each sweep, every admitted row steps at once from the extrapolated impulses
+    ``y``: its residual ``r = b' + (A y)_i`` (:meth:`~.ResponseOperator.jacobi_residual`, after the operator's
+    :meth:`~.ResponseOperator.gather`), then ``y_i - s_step_i r`` clamped at zero for a unilateral row, or zero for a
+    friction row while friction is delayed. Each friction block is then projected radially onto its disk, or under
+    torsion its ball (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
     momentum and adaptive restart, each row votes its change under the exit law (:func:`change_vote`:
     its step from the extrapolated impulse over its step size, which is the row's residual there for an unclamped row,
     against its floor; the trace names it by the row's staged type, :attr:`JacobiRows.types`), and the sweep ends
@@ -1662,6 +1693,8 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         raise ValueError("the trace names the Jacobi rows' changes by their staged types")
     if laws.regularize and not rows.weighted:
         raise ValueError("the weighted Jacobi law reads the weights of the contact rows its store marks")
+    if laws.torsion != rows.torsion:
+        raise ValueError("the Jacobi rows' friction blocks follow the laws' torsion")
     weight = ""
     if laws.regularize:
         # The lane's row's weight, fixed through the sweeps: a contact's stored one, or a material contact's from the
@@ -1675,7 +1708,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     block = rows.threads > 32
     lines = [
         rows.freeze(pad),
-        isotropic_pair_step(rows, pad),
+        isotropic_friction_step(rows, pad),
         # The lane's row: its residual at zero impulse and its step size, fixed through the sweeps.
         f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
         f"{pad}const float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
@@ -1689,7 +1722,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         op.gather(inner),
         _jacobi_step(rows, op, laws, inner),
         f"{inner}int iteration_changed = 0;",
-        _jacobi_projection(rows, pooled=pooled, pad=inner, torsion=laws.torsion),
+        _jacobi_projection(rows, pooled=pooled, pad=inner),
         _jacobi_momentum(rows, pad=inner),
         f"{inner}{{",
         f"{inner}    const int i = lane;",

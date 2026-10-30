@@ -136,7 +136,7 @@ def parallel_source(
     material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
-    Jacobi law, a thread per row; under ``torsion`` a contact's spin row projects with its pair.
+    Jacobi law, a thread per row; under ``torsion`` a contact's spin row steps and projects with its pair.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then whitens the rows in the kernel
     (:class:`.WhitenedRows`, ``inkernel_response = (NA, NB, OA, OB)``), from the group Jacobians or the keyed rows'
@@ -163,7 +163,9 @@ def parallel_source(
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
     laws = RowLaws(regularize=bool(weighted), material=bool(material), torsion=torsion, policy=solve_policy)
-    store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted))
+    store = JacobiRows(
+        AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted), torsion=torsion
+    )
     whitened = WhitenedRows(
         NA,
         NB,
@@ -194,11 +196,7 @@ def parallel_source(
     }
     if operands is not None:
         metadata = {name: getattr(operands, name) for name in metadata}
-    loads = store.loads(
-        **metadata,
-        unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT),
-        **({"torsion": True} if torsion else {}),
-    )
+    loads = store.loads(**metadata, unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT))
 
     def scale(aii, bound, pad):
         return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)

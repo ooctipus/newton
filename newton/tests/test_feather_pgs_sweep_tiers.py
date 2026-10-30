@@ -125,13 +125,14 @@ class TestParallelTier(unittest.TestCase):
                 self.assertTrue(body.rstrip().endswith("SYNC();"), body[-200:])
 
     def test_formed_diagonals_freeze_their_rows_after_the_staging(self):
-        """A row the formed diagonal freezes changes its kind only once every lane has read the kinds."""
+        """A row the formed diagonal freezes changes its kind only once every lane has read the kinds; a friction row
+        is never frozen: it takes its block's step."""
         source = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})
-        self.assertIn("else { s_step[i] = 0.0f; frozen = 1; }", source)
+        self.assertIn("else { s_step[i] = 0.0f; frozen = s_kind[i] != 1; }", source)
         self.assertNotIn("s_kind[i] = -1", source)
         freeze = source.index("if (frozen) s_kind[lane] = -1;\n    SYNC();")
         self.assertLess(source.index("bound += fabsf(Ji[d]) * s_colsum[d];"), freeze)
-        self.assertLess(freeze, source.index("step_pair = fminf(step_a, step_b)"))
+        self.assertLess(freeze, source.index("float step_block = step_a > 0.0f ? step_a : step_b;"))
 
     def test_several_warps_stop_on_the_block_vote(self):
         one = _source((64, 32, 18, "120"), {"rows": 32, "sweeps": 1, **_INK})

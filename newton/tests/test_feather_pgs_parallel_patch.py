@@ -112,11 +112,12 @@ def parallel_sweep_reference(
     ``|A|`` over admitted rows (A-based tiers and exact row sums) or the
     row-sum bound ``sum_d |P_id| sum_j |Q_jd|`` of the matrix-free tiers, with
     ``(P, Q) = (J, Y)`` or the whitened rows ``(Z, Z)`` of the in-kernel
-    response. With the isotropic ``pair_step``, every tier's law, both rows of a
-    friction pair take the smaller of their two steps, unless the sibling is not an
-    admitted friction row of the same normal or either step is zero; ``"per_row"``
-    keeps each row's own step, the retired law that turns a sliding pair's
-    friction. Every sweep steps all rows from the extrapolated impulses, clamps
+    response. A friction row is admitted whatever its diagonal. With the isotropic
+    ``pair_step``, every tier's law, both rows of a friction pair take the smallest
+    of their positive steps (a tangent that moves nothing takes its sibling's),
+    unless the sibling is not an admitted friction row of the same normal;
+    ``"per_row"`` keeps each row's own step, the retired law that turns a sliding
+    pair's friction. Every sweep steps all rows from the extrapolated impulses, clamps
     normal and limit rows, scales each tangent pair into its disk (the ring's
     pooled normal load when ``linked``), restarts momentum against the last step
     and stops once no row changes. ``velocity_limit_pass`` then pushes every
@@ -132,7 +133,7 @@ def parallel_sweep_reference(
     else:
         diag = case["diag"].astype(np.float64)
         P, Q = J, Y
-    kinds = np.where((kinds >= 0) & (diag > 0.0), kinds, -1)
+    kinds = np.where((kinds >= 0) & ((diag > 0.0) | (kinds == 1)), kinds, -1)
     admitted = kinds >= 0
     if matrix_free and not exact:
         bound = np.abs(P) @ np.abs(Q[admitted]).sum(axis=0)
@@ -145,8 +146,9 @@ def parallel_sweep_reference(
             parent, sibling = parents[row], row + 1
             if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
                 continue
-            if step[row] > 0.0 and step[sibling] > 0.0:
-                step[row] = step[sibling] = min(step[row], step[sibling])
+            positive = [value for value in (step[row], step[sibling]) if value > 0.0]
+            if positive:
+                step[row] = step[sibling] = min(positive)
     b = case["rhs"] + J @ v - A @ lam0
     x, y, t = lam0.copy(), lam0.copy(), 1.0
     for sweep in range(sweeps):
@@ -543,11 +545,11 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
 
 
 def _tier_texts(rows: int):
-    """The emitter's text of a ``rows``-row tier's pair projections, point and pooled, and of its isotropic pair step."""
+    """The emitter's text of a ``rows``-row tier's pair projections, point and pooled, and of its isotropic step."""
     store = emitter.JacobiRows(rows, 32 * ((rows + 31) // 32))
     point = emitter._jacobi_projection(store, pooled=False, pad="        ")
     pooled = emitter._jacobi_projection(store, pooled=True, pad="        ")
-    return point, pooled, emitter.isotropic_pair_step(store, "    ")
+    return point, pooled, emitter.isotropic_friction_step(store, "    ")
 
 
 class TestParallelPatchReference(unittest.TestCase):
@@ -1511,6 +1513,32 @@ def _sliding_sphere(device, axes, masses, speed, *, mu=0.5):
     return model
 
 
+def _spinning_sphere(device, *, speed, spin, mu=0.5):
+    """A sphere on prismatic x, y and z joints and a yaw joint over the ground, sliding at ``speed`` along x and
+    spinning at ``spin`` about the vertical: one contact, whose friction pair and, under contact torsion, spin row
+    (the shapes' default torsional friction, ``mu_t / mu = 0.01`` m) brake both."""
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, mu
+    parent, joints = -1, []
+    for axis in (newton.Axis.X, newton.Axis.Y, newton.Axis.Z):
+        body = builder.add_link(mass=0.01, inertia=wp.mat33(np.eye(3) * 1.0e-5), lock_inertia=True)
+        joints.append(builder.add_joint_prismatic(parent=parent, child=body, axis=axis))
+        parent = body
+    sphere = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 1.0e-3), lock_inertia=True)
+    joints.append(builder.add_joint_revolute(parent=parent, child=sphere, axis=newton.Axis.Z))
+    builder.add_shape_sphere(sphere, radius=0.05, cfg=cfg)
+    builder.add_articulation(joints)
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    q, qd = model.joint_q.numpy(), model.joint_qd.numpy()
+    q[2] = 0.049  # the vertical joint: the sphere rests 1 mm deep
+    qd[0], qd[3] = speed, spin
+    model.joint_q.assign(q)
+    model.joint_qd.assign(qd)
+    return model
+
+
 def _pushed_sphere(device, *, limit=0.5, dt=1.0 / 240.0):
     """A resting sphere on x, y and z joints limited to ``limit``; a constant force on x adds ``2 * limit`` each step.
 
@@ -1949,8 +1977,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
     def test_lone_live_tangent_keeps_its_friction(self):
         """Brake a sphere whose second tangent no joint moves as the serial sweep brakes it.
 
-        The isotropic step leaves a pair alone when either step is zero: the zero
-        Jacobian of the frozen tangent must not stop the live one.
+        The tangent without a Jacobian takes the live one's step: its zero step must
+        not stop the live one.
         """
         model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Z), (3.0, 1.0), (1.0,))
         with patch.dict(os.environ):
@@ -1964,6 +1992,30 @@ class TestPatchParallelPhysics(unittest.TestCase):
         # Six steps of mu * g at the sphere's weight over the four-fold chain mass brake it by about 0.03 m/s.
         self.assertLess(speeds["serial"], 1.0 - 0.01)
         self.assertAlmostEqual(speeds["tier"], speeds["serial"], delta=1.0e-5)
+
+    def test_sliding_spinning_triple_keeps_the_serial_friction(self):
+        """Brake a sphere that slides and spins under contact torsion as the serial sweep brakes it.
+
+        The friction triple steps isotropically in its ball's scaled coordinates, so its
+        fixed point opposes the slip and the spin in the law's metric (maximal
+        dissipation), the serial sweep's: both decay as the serial sweep's. A spin row
+        stepped by its own diagonal, ten times its isotropic step here, turns the
+        friction towards the spin: the spin stops early and the slide late.
+        """
+        model = _spinning_sphere("cuda:0", speed=1.0, spin=20.0)
+        with patch.dict(os.environ):
+            serial = _matrix_free_solver(model, beta=0.0, parallel_rows=0, pgs_iterations=2000, contact_torsion=True)
+            tier = _matrix_free_solver(model, beta=0.0, parallel_rows=32, sweeps=2000, contact_torsion=True)
+        velocities = {}
+        for name, solver in (("serial", serial), ("tier", tier)):
+            state, _ = _rollout(model, solver, 24)
+            velocities[name] = state.joint_qd.numpy()[[0, 3]].astype(np.float64)
+        _assert_tier_owned(self, tier, 32)
+        # Twenty-four steps of the elliptic law brake the slide by about 0.5 m/s and the spin by about 1.3 rad/s; the
+        # spin row's own step would turn the friction towards the spin (about 0.2 m/s and 4 rad/s).
+        self.assertLess(velocities["serial"][0], 0.6)
+        self.assertLess(velocities["serial"][1], 19.5)
+        np.testing.assert_allclose(velocities["tier"], velocities["serial"], rtol=1.0e-4)
 
     def test_declined_world_keeps_the_serial_sweep(self):
         """Sweep a world the linked tiers decline serially, at the tiers' fixed point.

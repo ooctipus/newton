@@ -94,23 +94,18 @@ def check_unequal_tangent_solution(test, case, actual, *, atol):
 
 TIERS_OPEN = frozenset(
     (
-        "angle=0 small=0 sliding",
-        "angle=0 small=0 sliding_fixed",
         "angle=0 small=0.0001 sticking",
         "angle=0 small=1e-06 sticking",
         "angle=0 small=1e-06 weak_sliding",
     )
 )
-"""The unequal tangent cases the Jacobi tiers' radial pair rule misses, in two ways (CT's tiers law, ``f81e5717``,
-replaces the rule with the block solve).
-
-- ``small=0`` at angle 0, sliding: the first tangent has no Jacobian but a right-hand side. The tiers drop the
-  zero-diagonal row and saturate the other tangent, ([0, -0.3]); the general sweep's pair law spends the disk on both
-  velocities ([-0.18, -0.24]). The two placements' laws differ on this input.
-- Ill-conditioned blocks: ``small=1e-06`` (conditioned 7e6), sticking and weak sliding, and ``small=0.0001``
-  sticking (7e4; the float64 reference reaches it within 2.5e-7, the float32 tiers stop 1.3e-4 short on CUDA). The
-  tiers' fixed point is the solution, but 2000 Jacobi sweeps leave the soft direction short of it; a pair law that
-  solves the block exactly reaches it in one sweep.
+"""The unequal tangent cases the Jacobi tiers leave short of their solution: ill-conditioned blocks, ``small=1e-06``
+(conditioned 7e6), sticking and weak sliding, and ``small=0.0001`` sticking (7e4; the float64 reference reaches it
+within 2.5e-7, the float32 tiers stop 1.3e-4 short on CUDA). The tiers' fixed point is the solution, but a pair steps
+isotropically, by the smaller of its steps, so the block's soft direction closes by about the inverse of its
+condition number per sweep: after 2000 sweeps the three stop 1.3e-4, 5.6e-2 and 0.13 short, after 20000 1.3e-4,
+1.3e-2 and 0. A pair law that solved each block exactly reaches them in one sweep, at a cost per sweep the tiers do
+not pay (37% of allegro's step).
 """
 
 
@@ -251,7 +246,7 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
     def test_unequal_tangent_masses_on_the_tiers_open(self):
         """Solve :data:`TIERS_OPEN` through the Jacobi tiers.
 
-        Known failure: the tiers' radial pair rule; CT's tiers law (``f81e5717``) replaces it with the block solve.
+        Known failure: the ill-conditioned blocks' soft direction, which the isotropic step closes past the budget.
         """
         self._solve_on_the_tiers([case for case in unequal_tangent_cases() if case["name"] in TIERS_OPEN])
 
