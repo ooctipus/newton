@@ -464,47 +464,53 @@ def chain(*, links: int = 3) -> Scene:
     )
 
 
+def _four_bar_builder() -> newton.ModelBuilder:
+    """The four-bar of :func:`four_bar`: crank and rocker hang 0.2 m from pivots at ``x = 0`` and ``0.4`` (``z0 = 0.6``),
+    the coupler joins the crank's tip to the rocker's through a ball loop joint; only the crank is driven."""
+    builder = _builder()
+    base, root = _fixed_base(builder)
+    z0 = 0.6
+    crank = _link_box(builder, wp.transform(wp.vec3(0.0, 0.0, z0 - 0.1)), half=(0.02, 0.02, 0.1), mass=0.32)
+    j_crank = builder.add_joint_revolute(
+        base,
+        crank,
+        axis=newton.Axis.Y,
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, z0)),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)),
+        target_ke=50.0,
+        target_kd=5.0,
+    )
+    coupler = _link_box(builder, wp.transform(wp.vec3(0.2, 0.0, z0 - 0.2)), half=(0.2, 0.02, 0.02), mass=0.64)
+    j_coupler = builder.add_joint_revolute(
+        crank,
+        coupler,
+        axis=newton.Axis.Y,
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)),
+        child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0)),
+    )
+    rocker = _link_box(builder, wp.transform(wp.vec3(0.4, 0.0, z0 - 0.1)), half=(0.02, 0.02, 0.1), mass=0.32)
+    j_rocker = builder.add_joint_revolute(
+        base,
+        rocker,
+        axis=newton.Axis.Y,
+        parent_xform=wp.transform(wp.vec3(0.4, 0.0, z0)),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)),
+    )
+    builder.add_articulation([root, j_crank, j_coupler, j_rocker])
+    builder.add_joint_ball(
+        coupler,
+        rocker,
+        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0)),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)),
+    )
+    return builder
+
+
 def four_bar(*, crank_target: float = 0.6) -> Scene:
     """A planar four-bar: two grounded revolute links closed by a ball loop joint, only the crank driven."""
 
     def build(device):
-        builder = _builder()
-        base, root = _fixed_base(builder)
-        z0 = 0.6
-        crank = _link_box(builder, wp.transform(wp.vec3(0.0, 0.0, z0 - 0.1)), half=(0.02, 0.02, 0.1), mass=0.32)
-        j_crank = builder.add_joint_revolute(
-            base,
-            crank,
-            axis=newton.Axis.Y,
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, z0)),
-            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)),
-            target_ke=50.0,
-            target_kd=5.0,
-        )
-        coupler = _link_box(builder, wp.transform(wp.vec3(0.2, 0.0, z0 - 0.2)), half=(0.2, 0.02, 0.02), mass=0.64)
-        j_coupler = builder.add_joint_revolute(
-            crank,
-            coupler,
-            axis=newton.Axis.Y,
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)),
-            child_xform=wp.transform(wp.vec3(-0.2, 0.0, 0.0)),
-        )
-        rocker = _link_box(builder, wp.transform(wp.vec3(0.4, 0.0, z0 - 0.1)), half=(0.02, 0.02, 0.1), mass=0.32)
-        j_rocker = builder.add_joint_revolute(
-            base,
-            rocker,
-            axis=newton.Axis.Y,
-            parent_xform=wp.transform(wp.vec3(0.4, 0.0, z0)),
-            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)),
-        )
-        builder.add_articulation([root, j_crank, j_coupler, j_rocker])
-        builder.add_joint_ball(
-            coupler,
-            rocker,
-            parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0)),
-            child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)),
-        )
-        return _finalize(builder, device)
+        return _finalize(_four_bar_builder(), device)
 
     def control(model, control, state, step):
         if step == 0:
@@ -518,6 +524,104 @@ def four_bar(*, crank_target: float = 0.6) -> Scene:
         params={"crank_target": crank_target},
         control=control,
         tags=frozenset({"loop_joints"}),
+    )
+
+
+def loaded_four_bar(*, crank_target: float = 0.6) -> Scene:
+    """The four-bar stopped at its rocker by a static box: the crank's drive load (about 30 N m) crosses the loop
+    closure into the contact, so the contact lies in the closure's span (LC design §3.2)."""
+
+    def build(device):
+        builder = _four_bar_builder()
+        builder.add_shape_box(-1, xform=wp.transform(wp.vec3(0.36, 0.0, 0.55)), hx=0.02, hy=0.1, hz=0.1, cfg=_cfg())
+        return _finalize(builder, device)
+
+    def control(model, control, state, step):
+        if step == 0:
+            _set_targets(model, control, {1: crank_target})
+
+    return Scene(
+        "loaded_four_bar",
+        build,
+        dt=1.0 / 240.0,
+        steps=120,
+        params={"crank_target": crank_target},
+        control=control,
+        contact_matching="latest",
+        tags=frozenset({"loop_joints", "contacts"}),
+    )
+
+
+def five_bar_leg(*, trunk_mass: float = 2.0, radius: float = 0.01) -> Scene:
+    """A planar parallel leg standing on its foot: a trunk on a vertical slider, two thighs driven to hold their
+    pose and two shins closed at the foot by a ball loop joint. The foot sphere on the first shin's tip, on the loop,
+    carries the trunk's weight into the ground (LC design §3.2)."""
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=0.8))
+        thigh, shin = 0.2, 0.3
+        half = np.sqrt(0.5)
+        knees_x = thigh * half
+        drop = thigh * half + np.sqrt(shin**2 - knees_x**2)
+        hip = np.array([0.0, 0.0, radius + 0.0005 + drop])
+        foot = np.array([0.0, 0.0, radius + 0.0005])
+        silent = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False)
+
+        def link(center, mass, half_extents):
+            body = builder.add_link(
+                xform=wp.transform(wp.vec3(*center)), mass=mass, inertia=_box_inertia(mass, *half_extents)
+            )
+            builder.add_shape_box(body, hx=half_extents[0], hy=half_extents[1], hz=half_extents[2], cfg=silent)
+            return body
+
+        trunk = link(hip, trunk_mass, (0.1, 0.05, 0.05))
+        joints = [builder.add_joint_prismatic(-1, trunk, axis=newton.Axis.Z, parent_xform=wp.transform(wp.vec3(*hip)))]
+        shins = []
+        for sign in (1.0, -1.0):
+            knee = hip + np.array([sign * knees_x, 0.0, -thigh * half])
+            upper = link(0.5 * (hip + knee), 0.2, (0.015, 0.015, 0.5 * thigh))
+            joints.append(
+                builder.add_joint_revolute(
+                    trunk,
+                    upper,
+                    axis=newton.Axis.Y,
+                    child_xform=wp.transform(wp.vec3(*(hip - 0.5 * (hip + knee)))),
+                    target_ke=60.0,
+                    target_kd=1.5,
+                )
+            )
+            lower = link(0.5 * (knee + foot), 0.1, (0.01, 0.01, 0.5 * shin))
+            joints.append(
+                builder.add_joint_revolute(
+                    upper,
+                    lower,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(wp.vec3(*(knee - 0.5 * (hip + knee)))),
+                    child_xform=wp.transform(wp.vec3(*(knee - 0.5 * (knee + foot)))),
+                )
+            )
+            shins.append((lower, foot - 0.5 * (knee + foot)))
+        builder.add_shape_sphere(
+            shins[0][0], xform=wp.transform(wp.vec3(*shins[0][1])), radius=radius, cfg=_cfg(mu=0.8)
+        )
+        builder.add_articulation(joints)
+        builder.add_joint_ball(
+            shins[0][0],
+            shins[1][0],
+            parent_xform=wp.transform(wp.vec3(*shins[0][1])),
+            child_xform=wp.transform(wp.vec3(*shins[1][1])),
+        )
+        return _finalize(builder, device)
+
+    return Scene(
+        "five_bar_leg",
+        build,
+        dt=1.0 / 240.0,
+        steps=240,
+        params={"trunk_mass": trunk_mass},
+        contact_matching="latest",
+        tags=frozenset({"loop_joints", "contacts"}),
     )
 
 

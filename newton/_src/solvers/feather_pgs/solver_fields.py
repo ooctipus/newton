@@ -209,12 +209,10 @@ PREELIMINATION = FieldGroup(
     Field("_preelim_nB", wp.int32, ("preelim",), grad=False),
     Field("_preelim_S", wp.float32, ("preelim_block",), grad=False),
     Field("_preelim_LS", wp.float32, ("preelim_block",), grad=False),
-    # Relative diagonal regularization of the S factor, rebuilt each step from the current S diagonal.
-    Field("_preelim_reg", wp.float32, ("preelim_row",), grad=False),
-    # The projection's block weights y = S^-1 (J_B v + b_B).
+    # A projection's block weights (the predictor's, then the leave's).
     Field("_preelim_weight", wp.float32, ("preelim_row",), grad=False),
 )
-"""Fixed-capacity bilateral pre-elimination buffers, ``PREELIM_MAX_ROWS`` rows per eliminating articulation."""
+"""Fixed-capacity bilateral elimination buffers, ``PREELIM_MAX_ROWS`` rows per eliminating articulation."""
 
 Preelim = field_group.struct(
     "Preelim",
@@ -227,18 +225,14 @@ Preelim = field_group.struct(
                 "_preelim_nB",
                 "_preelim_S",
                 "_preelim_LS",
-                "_preelim_reg",
                 "_preelim_weight",
             )
         ),
-        Field("reg_rel", wp.float32, attr="_preelim_reg_rel"),
-        Field("reg_floor", wp.float32, attr="_preelim_reg_floor"),
     ),
     __name__,
 )
-"""The pre-elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows and their
-count, its Schur complement, factor and regularization, the projection's weights, and the regularization's relative
-scale and floor."""
+"""The bilateral elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows (kept, then
+dropped) and its kept count, its Gram block and pivoted factor, and a projection's weights."""
 
 SPARSE_FACTOR = FieldGroup(
     Field("_sparse_Linv", wp.float32, ("group", "nonzero"), grad=False),

@@ -427,38 +427,6 @@ def dense_index(stride: int, i: int, j: int):
     return i * stride + j
 
 
-@wp.func
-def dense_cholesky(
-    n: int,
-    A: wp.array[float],
-    R: wp.array[float],
-    A_start: int,
-    R_start: int,
-    # outputs
-    L: wp.array[float],
-):
-    # compute the Cholesky factorization of A = L L^T with diagonal regularization R
-    for j in range(n):
-        s = A[A_start + dense_index(n, j, j)] + R[R_start + j]
-
-        for k in range(j):
-            r = L[A_start + dense_index(n, j, k)]
-            s -= r * r
-
-        s = wp.sqrt(s)
-        invS = 1.0 / s
-
-        L[A_start + dense_index(n, j, j)] = s
-
-        for i in range(j + 1, n):
-            s = A[A_start + dense_index(n, i, j)]
-
-            for k in range(j):
-                s -= L[A_start + dense_index(n, i, k)] * L[A_start + dense_index(n, j, k)]
-
-            L[A_start + dense_index(n, i, j)] = s * invS
-
-
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
 def prepare_fused_diagonal_joint_limits(
     joints: JointTable,
@@ -1574,6 +1542,33 @@ PREELIM_MAX_ROWS = 8
 Robotiq 2F-85 needs 7: one mimic + two 3-row connect closures)."""
 
 _preelim_vec = wp.types.vector(length=PREELIM_MAX_ROWS, dtype=wp.float32)
+_preelim_ivec = wp.types.vector(length=PREELIM_MAX_ROWS, dtype=wp.int32)
+
+
+@wp.func
+def pivoted_cholesky(n: int, A: wp.array[float], A_start: int, floor: float, L: wp.array[float]) -> int:
+    """Factor the ``n x n`` block ``A`` (row-major at ``A_start``) in row order, dropping each row whose pivot falls to
+    ``floor`` or below: such a row depends on the rows kept before it. ``L`` (the same layout) holds the factor over
+    the kept rows, a dropped row's column zero. Returns the kept rows as a bit mask."""
+    kept = int(0)
+    for j in range(n):
+        s = A[A_start + dense_index(n, j, j)]
+        for k in range(j):
+            r = L[A_start + dense_index(n, j, k)]
+            s -= r * r
+        if s > floor:
+            d = wp.sqrt(s)
+            L[A_start + dense_index(n, j, j)] = d
+            for i in range(j + 1, n):
+                acc = A[A_start + dense_index(n, i, j)]
+                for k in range(j):
+                    acc -= L[A_start + dense_index(n, i, k)] * L[A_start + dense_index(n, j, k)]
+                L[A_start + dense_index(n, i, j)] = acc / d
+            kept = kept | (1 << j)
+        else:
+            for i in range(j, n):
+                L[A_start + dense_index(n, i, j)] = 0.0
+    return kept
 
 
 @wp.func

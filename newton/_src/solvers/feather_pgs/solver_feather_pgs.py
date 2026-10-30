@@ -2369,15 +2369,13 @@ class SolverFeatherPGS(SolverBase):
             preelim_row=n_pe * PREELIM_MAX_ROWS,
             preelim_block=n_pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS,
         )
-        self._preelim_reg_rel = 1.0e-3
-        self._preelim_reg_floor = max(self.options.pgs_cfm, 1.0e-7)
         self._preelim_count = n_pe
         self._preelim_active = True
 
     def _stage4_bilateral_preelim(self) -> None:
-        """Pre-eliminate the bilateral blocks on the packed rows (:data:`.response_builds_rows.ELIMINATION`).
+        """Eliminate the bilateral blocks on the packed rows (:data:`.response_builds_rows.ELIMINATION`).
 
-        Form and factor each articulation's block ``S = Z_B^T Z_B + R``, then correct every other row, its
+        Form each articulation's block ``G = Z_B^T Z_B`` and its pivoted factor, then correct every other row, its
         right-hand side and its diagonal. Runs once the right-hand sides are final (bias and restitution) and
         before the warm start, whose impulses the corrected rows then carry.
         """
@@ -2423,8 +2421,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage6_project_bilateral_velocity(self) -> None:
-        """Enforce J_B v_out = -b_B once, right after v_out is seeded with v_hat: the block weights, then ``v -= P^T
-        L^-T Z_B y`` (:func:`.packed_rows.project_kernel`)."""
+        """Enforce J_B v_out = -b_B once, after v_out holds the predictor and every warm start: the block weights, then
+        ``v -= P^T L^-T Z_B y`` (:func:`.packed_rows.project_kernel`)."""
         dense = int(self._packed_dense)
         for size in self.forest.size_groups:
             wp.launch(
@@ -4779,8 +4777,8 @@ class SolverFeatherPGS(SolverBase):
             with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
                 self._stage4_apply_world_contact_restitution(dt, matrix_free=True)
                 if self._preelim_active:
-                    # Bilateral pre-elimination: fold mimic/connect coupling into the packed rows, their
-                    # right-hand sides and diagonals (the rows' closed-loop inertia).
+                    # Bilateral elimination: the other rows take the closed-loop response, their right-hand sides
+                    # and diagonals (the rows' closed-loop inertia).
                     self._stage4_bilateral_preelim()
 
                 # Initialize v_out = v_hat before GS loop

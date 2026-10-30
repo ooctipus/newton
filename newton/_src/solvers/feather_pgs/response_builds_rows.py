@@ -70,17 +70,18 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     PREELIM_MAX_ROWS,
     BodyFactors,
+    _preelim_ivec,
     _preelim_vec,
-    dense_cholesky,
     dense_index,
     factor_leave,
     factor_whiten,
     free_body_factor,
+    pivoted_cholesky,
     preelim_solve,
 )
 from .paired_components import FREE_BODY_DOFS, PAIRED_COMPONENT_THREADS, PairedComponentData
 from .prefix_rows import PrefixLaw, limits, prefix_rows
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import BILATERAL_PIVOT, PROJECTION_LAW
 from .response_builds_dense import _indent, _Vec6, whiten_six
 from .response_operator import FreeBodyZ
 from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
@@ -835,17 +836,25 @@ SPARSE_PAIR = SparsePairBuild(
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Bilateral pre-elimination: the Schur transform of the packed rows
+# Bilateral elimination: the exact Schur transform of the packed rows
 # ---------------------------------------------------------------------------------------------------------------------
 #
-# An articulation's selected bilateral rows (mimic, connect) form a block ``B``. On the packed rows (:mod:`.packed_rows`,
-# ``Z_i = L^-1 P J_i^T`` on each side) the transform factors ``S = Z_B^T Z_B + R`` (``R`` relative to ``S``'s diagonal)
-# and replaces every other row's side on the articulation by ``Z'_i = Z_i - Z_B S^-1 (Z_B^T Z_i)``, so that
-# ``Z_B^T Z'_i ~ 0``: a sweep's impulses, applied as ``u += Z'_i delta``, keep the closures, and the diagonals
-# ``|Z'_i|^2 + cfm`` are the closed-loop effective masses. The velocity is projected once, ``v -= P^T L^-T Z_B S^-1
-# (J_B v + b_B)``, in place of the eliminated rows' Baumgarte work; then ``Z_B^T u = J_B v = -b_B``, so a corrected row
-# reads ``Z'_i^T u = J_i v + y_i^T b_B`` (``y_i = S^-1 Z_B^T Z_i``), which its right-hand side takes back:
-# ``rhs_i -= y_i^T b_B``. The block's rows keep theirs. A block row has one side, its articulation.
+# An articulation's bilateral rows (mimic, connect) form a block ``B``. On the packed rows (:mod:`.packed_rows`,
+# ``Z_i = L^-1 P J_i^T`` on each side) the transform forms ``G = Z_B^T Z_B`` and its pivoted factor
+# (:func:`.kernels.pivoted_cholesky`): a row whose pivot falls to :data:`.projection_laws.BILATERAL_PIVOT` of ``G``'s
+# largest diagonal depends on the kept rows (a planar loop's out-of-plane axis, a mimic a closure fixes) and leaves the
+# block. With ``P_B = Z_B G^-1 Z_B^T`` over the kept rows, ``Pi = I - P_B`` is the exact projector onto the closures:
+#
+# - correct: every other row's side on the articulation becomes ``Pi Z_i = Z_i - Z_B y_i`` (``y_i = G^-1 Z_B^T Z_i``),
+#   its diagonal ``|Pi Z_i|^2 + cfm`` (the closed-loop effective mass); its right-hand side takes back
+#   ``y_i^T b_B``;
+# - project: the velocity, once, ``v -= P^T L^-T Z_B G^-1 (J_B v + b_B)``, after every warm-start install.
+#
+# Then ``Z_B^T u = -b_B`` and a sweep's impulse, ``u += Pi Z_i delta``, keeps it, so a corrected row reads ``(Pi
+# Z_i)^T u = J_i v + y_i^T b_B``, which its folded right-hand side takes back. ``Pi`` is idempotent, so the contacts
+# solve on the closed-loop Delassus ``Z^T Pi Z`` exactly (no compliance). The block's rows keep their entries and stay
+# in the sweep: they hold in exact arithmetic, and their visits absorb the corrected rows' float32 leakage, without
+# which collinear contact rows of a jammed loop drift in their null space and never meet the exit law.
 
 
 @wp.func
@@ -934,11 +943,11 @@ def bilateral_setup_kernel(
     packed_Z: wp.array3d[float],
     n_dofs: int,
 ):
-    """Select an articulation's block (:func:`bilateral_rows`), form ``S = Z_B^T Z_B`` and factor ``S + R``.
+    """Select an articulation's block (:func:`bilateral_rows`), form ``G = Z_B^T Z_B`` and factor it with pivoting.
 
-    One thread per articulation of the size group, after the packed rows' build. ``R_pp = reg_rel S_pp + reg_floor``:
-    relative to the row's own diagonal, so that a near-redundant closure axis (float32 cancellation noise around a
-    zero pivot) stays positive at any mass scale; the redundant axis turns ``reg_rel`` soft.
+    One thread per articulation of the size group, after the packed rows' build. The kept rows come first in
+    ``preelim.slots`` (``preelim.nB`` of them) with their factor (stride ``nB``); the dropped rows follow, so that
+    :func:`bilateral_correct_kernel` keeps every row of the block.
     """
     group = wp.tid()
     art = group_to_art[group]
@@ -965,19 +974,39 @@ def bilateral_setup_kernel(
         n_dofs,
         preelim.slots,
     )
-    preelim.nB[pe] = m
+    preelim.nB[pe] = 0
     if m == 0:
         return
     s_base = pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS
+    largest = float(0.0)
     for p in range(m):
         sp = preelim.slots[base + p]
         for q in range(m):
             preelim.S[s_base + dense_index(m, p, q)] = packed_product(
                 packed_Z, world, sp, first, preelim.slots[base + q], first, n_dofs
             )
+        largest = wp.max(largest, preelim.S[s_base + dense_index(m, p, p)])
+    kept = pivoted_cholesky(m, preelim.S, s_base, BILATERAL_PIVOT * largest, preelim.LS)
+    # Kept rows first (with their factor, stride c), then the dropped ones.
+    rows = _preelim_ivec()
+    order = _preelim_ivec()
+    c = int(0)
+    for j in range(m):
+        rows[j] = preelim.slots[base + j]
+        if ((kept >> j) & 1) != 0:
+            order[c] = j
+            c += 1
+    for a in range(c):
+        for b in range(a + 1):
+            preelim.LS[s_base + dense_index(c, a, b)] = preelim.LS[s_base + dense_index(m, order[a], order[b])]
+    d = c
+    for j in range(m):
+        if ((kept >> j) & 1) == 0:
+            order[d] = j
+            d += 1
     for p in range(m):
-        preelim.reg[base + p] = preelim.reg_rel * preelim.S[s_base + dense_index(m, p, p)] + preelim.reg_floor
-    dense_cholesky(m, preelim.S, preelim.reg, s_base, base, preelim.LS)
+        preelim.slots[base + p] = rows[order[p]]
+    preelim.nB[pe] = c
 
 
 @wp.kernel(enable_backward=False)
@@ -995,13 +1024,13 @@ def bilateral_correct_kernel(
     world_rhs: wp.array2d[float],
     world_diag: wp.array2d[float],
 ):
-    """Correct every other row's sides on the blocks' articulations, ``Z'_i = Z_i - Z_B y_i`` with ``y_i = S^-1 Z_B^T
-    Z_i``, take ``y_i^T b_B`` back from its right-hand side and store its diagonal ``|Z'_i|^2 + cfm`` (the squares
-    summed in entry order, the padding's zeros included; in the worlds the general solver owns). One thread per world
-    row, after the right-hand sides are final.
+    """Correct every other row's sides on the blocks' articulations, ``Pi Z_i = Z_i - Z_B y_i`` with ``y_i = G^-1
+    Z_B^T Z_i``, take ``y_i^T b_B`` back from its right-hand side and store its diagonal ``|Pi Z_i|^2 + cfm`` (the
+    squares summed in entry order, the padding's zeros included; in the worlds the general solver owns). One thread
+    per world row, after the right-hand sides are final.
 
-    A side the block does not see (``Z_B^T Z_i`` exactly zero) keeps its entries; the block's rows keep theirs for the
-    projection.
+    A side the block does not see (``Z_B^T Z_i`` exactly zero) keeps its entries; the block's rows, kept or dropped,
+    keep theirs for the projection and the sweep.
     """
     tid = wp.tid()
     capacity = row_sides.shape[1]
@@ -1020,7 +1049,7 @@ def bilateral_correct_kernel(
             continue
         m = preelim.nB[pe]
         base = pe * PREELIM_MAX_ROWS
-        for p in range(m):
+        for p in range(PREELIM_MAX_ROWS):
             if preelim.slots[base + p] == row:
                 return
         n_dofs = response_dofs[art]
@@ -1068,8 +1097,8 @@ def bilateral_weights_kernel(
     velocity: wp.array[float],
     n_dofs: int,
 ):
-    """The projection's block weights ``y = S^-1 (J_B v + b_B)`` (``preelim.weight``), one thread per articulation of
-    the size group; :func:`.packed_rows.project_kernel` then applies ``-Z_B y``."""
+    """The projection's block weights ``y = G^-1 (J_B v + b_B)`` over the kept rows (``preelim.weight``), one thread
+    per articulation of the size group; :func:`.packed_rows.project_kernel` then applies ``-Z_B y``."""
     group = wp.tid()
     art = group_to_art[group]
     pe = preelim.art_to_preelim[art]
@@ -1096,14 +1125,14 @@ def bilateral_weights_kernel(
 
 @dataclasses.dataclass(frozen=True)
 class BilateralElimination:
-    """The Schur transform of the packed rows by a bilateral block, and its projection.
+    """The exact Schur transform of the packed rows by a bilateral block, and its projection.
 
     Attributes:
-        setup: Select, form and factor each articulation's block (:func:`bilateral_setup_kernel`).
+        setup: Select, form and factor each articulation's block with pivoting (:func:`bilateral_setup_kernel`).
         correct: Correct the other rows and their right-hand sides and diagonals (:func:`bilateral_correct_kernel`),
             once the right-hand sides are final.
-        weights: The projection's block weights (:func:`bilateral_weights_kernel`), once after the velocity is seeded
-            with the predictor; :func:`.packed_rows.project_kernel` applies them.
+        weights: The projection's block weights (:func:`bilateral_weights_kernel`), once the velocity holds the
+            predictor and every warm start; :func:`.packed_rows.project_kernel` applies them.
     """
 
     setup: wp.Kernel
@@ -1114,7 +1143,7 @@ class BilateralElimination:
 ELIMINATION = BilateralElimination(
     setup=bilateral_setup_kernel, correct=bilateral_correct_kernel, weights=bilateral_weights_kernel
 )
-"""The bilateral pre-elimination of the packed rows."""
+"""The bilateral elimination of the packed rows."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

@@ -30,6 +30,10 @@ PAIR_FLOOR = wp.constant(2.0e-7)
 """The pair's rounding floor, about two float32 ulps of its impulse: the root solve stops within it of the disk's
 radius, and a sliding impulse that already meets the disk problem's KKT conditions within it is kept."""
 
+BILATERAL_PIVOT = wp.constant(1.0e-5)
+"""The bilateral block's pivot tolerance relative to its largest Gram diagonal: a row whose pivot falls to it depends
+on the rows kept before it (a planar loop's out-of-plane axis, a mimic a closure fixes) and leaves the block."""
+
 PROJECTION_LAW = LawFamily("ProjectionLaw")
 """The projection laws' family; native code calls ``ProjectionLaw::friction_pair(...)``."""
 

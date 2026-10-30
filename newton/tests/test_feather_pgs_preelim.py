@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
+from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
 
 
@@ -62,6 +63,38 @@ def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: i
         state_0, state_1 = state_1, state_0
         gap_max = max(gap_max, _loop_anchor_gap(model, state_0))
     return solver, model, state_0, gap_max
+
+
+def _run_scene(scene: scenes.Scene, iterations: int, eliminate: bool = True):
+    """Step a catalogue scene with the bilateral elimination (or the iterative closure rows); return the solver, every
+    step's body positions and the largest contact impulse."""
+    model = scene.build(wp.get_device())
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_iterations=iterations,
+        pgs_beta=0.1,
+        dense_max_constraints=128,
+        enable_bilateral_preelimination=eliminate,
+    )
+    pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    positions, loaded = [], 0.0
+    for step in range(scene.steps):
+        pipeline.collide(state_0, contacts)
+        state_0.clear_forces()
+        if scene.control is not None:
+            scene.control(model, control, state_0, step)
+        solver.step(state_0, state_1, control, contacts, scene.dt)
+        state_0, state_1 = state_1, state_0
+        positions.append(state_0.body_q.numpy()[:, :3].astype(np.float64))
+        count = int(solver.constraint_count.numpy()[0])
+        contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        if contact_rows.any():
+            loaded = max(loaded, float(np.max(solver.impulses.numpy()[0, :count][contact_rows])))
+    return solver, np.array(positions), loaded
 
 
 def _build_overcapacity_mixed_bilateral_model():
@@ -267,6 +300,28 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(solver._preelim_active)
         self.assertGreater(loaded, 0.1, "the contacts carried no load")
         self.assertLess(worst, 1.0e-5, f"loaded contacts opened the closure by {worst:.2e} m")
+
+    def test_loaded_loops_converge_at_the_contacts_rate(self):
+        """The elimination gives the contacts the closed-loop response, so a loop that carries contact load converges
+        at the contacts' own rate, where closure rows in the sweep converge at the closure's coupling to them.
+
+        The five-bar leg stands on its foot, which sits on the loop: 16 sweeps reach the converged trajectory (512
+        sweeps) within 1e-6 m. The four-bar is stopped at its rocker, so the crank's drive load (about 30 N m) crosses
+        the closure into a four-point face contact whose split is statically indeterminate: that contact problem sets
+        its 16-sweep error (3.1e-6 m, the same with the closure exact or regularized), 2000 times below the
+        iterative closure rows' (7.3e-3 m). LC design §3.
+        """
+        for scene, bound in ((scenes.five_bar_leg(), 1.0e-6), (scenes.loaded_four_bar(), 1.0e-5)):
+            with self.subTest(scene=scene.name):
+                solver, fast, loaded = _run_scene(scene, 16)
+                _, converged, _ = _run_scene(scene, 512)
+                _, rows, _ = _run_scene(scene, 16, eliminate=False)
+                self.assertTrue(solver._preelim_active)
+                self.assertGreater(loaded, 1.0e-3, "the contact carried no load")
+                error = float(np.abs(fast - converged).max())
+                rows_error = float(np.abs(rows - converged).max())
+                self.assertLess(error, bound, f"{scene.name}: 16 sweeps miss the converged trajectory by {error:.2e} m")
+                self.assertGreater(rows_error, 100.0 * max(error, 1.0e-9), f"{scene.name}: rows {rows_error:.2e} m")
 
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""
