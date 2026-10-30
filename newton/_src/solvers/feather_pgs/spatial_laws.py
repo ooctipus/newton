@@ -530,6 +530,24 @@ def coordinate_force(
 
 
 @wp.func
+def drive_stiffness(ke: float, kd: float, dt: float) -> float:
+    """Return the implicit stiffness ``K = ke dt^2 + kd dt`` an augmented drive adds to its coordinate's mass."""
+    return ke * dt * dt + kd * dt
+
+
+@wp.func
+def drive_force(
+    ke: float, kd: float, q: float, qd: float, q_target: float, qd_target: float, effort_limit: float, dt: float
+) -> float:
+    """Return an augmented drive's explicit force ``u0 = -(ke (q - q_target + dt qd) + kd (qd - qd_target))``,
+    clamped to a positive effort limit (the actuator's force range)."""
+    u0 = -(ke * (q - q_target + dt * qd) + kd * (qd - qd_target))
+    if effort_limit > 0.0:
+        u0 = wp.clamp(u0, -effort_limit, effort_limit)
+    return u0
+
+
+@wp.func
 def joint_force(
     joint_type: int,
     joint_S_s: wp.array[wp.spatial_vector],

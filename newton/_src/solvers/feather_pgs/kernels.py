@@ -73,7 +73,7 @@ from .row_laws import (
     velocity_limit_active,
 )
 from .solver_fields import Connects, LocalOwners, Mimics
-from .spatial_laws import free_root_transport, point_velocity
+from .spatial_laws import drive_force, drive_stiffness, free_root_transport, point_velocity
 from .tree_passes import (
     DynamicsData,
     articulation_tau,
@@ -1018,16 +1018,20 @@ def prepare_articulation_augmented_drives(
             if ke <= 0.0 and kd <= 0.0:
                 continue
 
-            K = ke * dt * dt + kd * dt
+            K = drive_stiffness(ke, kd, dt)
             if K <= 0.0:
                 continue
 
-            q = joint_q[coord_start + axis]
-            qd = joint_qd[dof_index]
-            u0 = -(ke * (q - joint_target_pos[target_start + axis] + dt * qd) + kd * (qd - joint_target_vel[dof_index]))
-            effort_limit = joint_effort_limit[dof_index]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
+            u0 = drive_force(
+                ke,
+                kd,
+                joint_q[coord_start + axis],
+                joint_qd[dof_index],
+                joint_target_pos[target_start + axis],
+                joint_target_vel[dof_index],
+                joint_effort_limit[dof_index],
+                dt,
+            )
 
             row_index = articulation * max_dofs + slot
             row_dof_index[row_index] = dof_index

@@ -53,6 +53,7 @@ from .solver_fields import (
     SIZE_GROUPED_SOLVE,
     STATE_AUX,
 )
+from .spatial_laws import drive_force, drive_stiffness
 from .tree_plan import TreePlan
 
 __all__ = ["TreeFactor", "prepare_augmented_drives"]
@@ -74,27 +75,29 @@ def prepare_augmented_drives(
     row_K: wp.array[float],
     drive_tau: wp.array[float],
 ):
-    """Evaluate dynamic drive terms from an immutable DOF-to-row topology."""
+    """Each coordinate's augmented drive, ``K`` (:func:`.spatial_laws.drive_stiffness`) and ``u0``
+    (:func:`.spatial_laws.drive_force`), from the immutable DOF-to-row topology."""
     dof = wp.tid()
     drive_tau[dof] = 0.0
-
     row = drive_row_by_dof[dof]
     if row < 0:
         return
-
     ke = joint_target_ke[dof]
     kd = joint_target_kd[dof]
-    K = ke * dt * dt + kd * dt
+    K = drive_stiffness(ke, kd, dt)
     if K <= 0.0:
         row_K[row] = 0.0
         return
-
-    q = joint_q[drive_q_index_by_dof[dof]]
-    qd = joint_qd[dof]
-    u0 = -(ke * (q - joint_target_pos[drive_target_index_by_dof[dof]] + dt * qd) + kd * (qd - joint_target_vel[dof]))
-    effort_limit = joint_effort_limit[dof]
-    if effort_limit > 0.0:
-        u0 = wp.clamp(u0, -effort_limit, effort_limit)
+    u0 = drive_force(
+        ke,
+        kd,
+        joint_q[drive_q_index_by_dof[dof]],
+        joint_qd[dof],
+        joint_target_pos[drive_target_index_by_dof[dof]],
+        joint_target_vel[dof],
+        joint_effort_limit[dof],
+        dt,
+    )
     row_K[row] = K
     drive_tau[dof] = u0
 

@@ -53,6 +53,8 @@ from . import cached_state_binding
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
+    drive_force,
+    drive_stiffness,
     joint_frame_pose,
     motion_axis,
     transform_compose,
@@ -115,27 +117,28 @@ def _drive_terms(
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
 ):
-    """Explicit force ``u0`` and implicit stiffness ``K`` of the augmented drive law.
-
-    The law of ``_prepare_augmented_joint_drives_by_dof``: an undriven
-    coordinate and a nonpositive ``K`` contribute neither.
-    """
+    """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
+    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): an undriven coordinate and a
+    nonpositive ``K`` contribute neither."""
     u0 = float(0.0)
     stiffness = float(0.0)
     if drive_row_by_dof[dof] >= 0:
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
-        K = ke * dt * dt + kd * dt
+        K = drive_stiffness(ke, kd, dt)
         if K <= 0.0:
             stiffness = 0.0
         else:
-            u0 = -(
-                ke * (q - joint_target_pos[drive_target_index_by_dof[dof]] + dt * qd)
-                + kd * (qd - joint_target_vel[dof])
+            u0 = drive_force(
+                ke,
+                kd,
+                q,
+                qd,
+                joint_target_pos[drive_target_index_by_dof[dof]],
+                joint_target_vel[dof],
+                joint_effort_limit[dof],
+                dt,
             )
-            effort_limit = joint_effort_limit[dof]
-            if effort_limit > 0.0:
-                u0 = wp.clamp(u0, -effort_limit, effort_limit)
             stiffness = K
     return u0, stiffness
 
@@ -403,7 +406,7 @@ def prepare_listed_augmented_drives(
     row_K: wp.array[float],
     drive_tau: wp.array[float],
 ):
-    """``_prepare_augmented_joint_drives_by_dof`` over listed DOFs: those whose drives no branch predict folds."""
+    """``tree_factor.prepare_augmented_drives`` over listed DOFs: those whose drives no branch predict folds."""
     dof = dofs[wp.tid()]
     drive_tau[dof] = 0.0
     row = drive_row_by_dof[dof]
