@@ -32,7 +32,7 @@ from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_select
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import RING
-from newton._src.solvers.feather_pgs.joint_table import JointTable, effective
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -461,7 +461,7 @@ def prescaled_joint_velocity(model):
         prescale_joint_velocity_limits,
         dim=threads,
         inputs=[
-            field_group.upload(JointTable, model.device, model, **effective(model)),
+            field_group.upload(JointTable, model.device, model),
             model.articulation_count,
             lanes,
             wp.full(1, -1, dtype=wp.int32, device=model.device),  # drive slots: unread without the fused clamp

@@ -19,8 +19,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, joint_table
+from newton._src.solvers.feather_pgs import joint_table
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+)
 from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
@@ -552,94 +556,58 @@ def _held_operator(model, arts, parents, counts, **attributes):
     return SimpleNamespace(plan=plan, host=operator_metadata(mass), **attributes)
 
 
-class TestEffectiveRowData(unittest.TestCase):
-    """The per-coordinate row data the rows read, published from the live model arrays (joint_table.publish_effective):
-    none on a prescribed coordinate."""
+def _rows_of_kind(solver, model, states, kind):
+    """Step ``solver`` once from ``states[0]`` (then swap the states) and count its dense rows of ``kind``."""
+    solver.step(states[0], states[1], model.control(), None, 1.0e-3)
+    states.reverse()
+    count = int(solver.constraint_count.numpy()[0])
+    return int(np.count_nonzero(solver.row_type.numpy()[0, :count] == kind))
 
-    def test_a_prescribed_coordinate_gives_no_limit_or_drive(self):
-        """A kinematic link's coordinate takes infinite position limits, no velocity limit and no drive gains."""
-        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        links = [scene.add_link(mass=1.0, inertia=INERTIA) for _ in range(2)]
-        root = scene.add_joint_free(links[0])
-        joint = scene.add_joint_revolute(
-            links[0], links[1], axis=newton.Axis.Y, limit_lower=-0.2, limit_upper=0.2, target_ke=5.0, target_kd=1.0
-        )
-        scene.add_articulation([root, joint])
-        model = scene.finalize(device="cpu")
-        prescribed = np.zeros(model.joint_dof_count, dtype=np.int32)
-        prescribed[6] = 1
-        data = {name: array.numpy() for name, array in joint_table.effective(model, prescribed).items()}
-        self.assertEqual((data["joint_limit_lower"][6], data["joint_limit_upper"][6]), (-np.inf, np.inf))
-        self.assertEqual(
-            (data["joint_velocity_limit"][6], data["joint_target_ke"][6], data["joint_target_kd"][6]), (0.0, 0.0, 0.0)
-        )
-        np.testing.assert_array_equal(data["joint_limit_lower"][:6], model.joint_limit_lower.numpy()[:6])
 
-    def test_a_model_source_must_pass_the_effective_data(self):
-        """The joint table reads the solver's published row data: an upload from a model raises unless it passes it."""
-        scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        link = scene.add_link(mass=1.0, inertia=INERTIA)
-        scene.add_articulation([scene.add_joint_revolute(-1, link, axis=newton.Axis.Y, limit_lower=-0.2)])
-        model = scene.finalize(device="cpu")
-        with self.assertRaisesRegex(ValueError, "_joint_target_ke"):
-            field_group.upload(joint_table.JointTable, "cpu", model)
-        table = field_group.upload(joint_table.JointTable, "cpu", model, **joint_table.effective(model))
-        self.assertAlmostEqual(float(table.joint_limit_lower.numpy()[0]), -0.2, places=6)
+class TestPrescribedCoordinateRows(unittest.TestCase):
+    """The rows read the model's live limits and skip a prescribed coordinate where they read them
+    (:data:`.joint_table.JOINTS`)."""
 
-    def test_model_writes_reach_the_rows_without_a_notification(self):
-        """Gains and limits written to the model mid-run reach the rows at the next step, with no notification.
+    def test_model_writes_reach_the_rows_and_a_prescribed_coordinate_takes_none(self):
+        """Limits written to the model mid-run reach the rows at the next step, with no notification, and a prescribed
+        coordinate takes no limit row whatever the model holds.
 
-        Each step publishes the row data from the live model arrays, so a write the model change flags do not
-        announce (a velocity limit) or that the caller does not announce (Isaac Lab's runtime gain writes) is read;
-        a prescribed coordinate keeps no limit and no drive whatever the model holds.
+        A chain of three hinges whose root link is kinematic starts every joint past its upper limit: the default
+        activation gap makes both sides of each finite limit a row, so the two dynamic coordinates take four
+        position-limit rows (and, with velocity limits, four velocity-limit rows) and the prescribed one none. Writing
+        an unlimited position and velocity limit to the last coordinate leaves two of each.
         """
-        written = {
-            "joint_limit_lower": [-0.3, -0.2, -0.1],
-            "joint_limit_upper": [0.1, 0.2, 0.3],
-            "joint_velocity_limit": [1.5, 2.5, 3.5],
-            "joint_target_ke": [7.0, 8.0, 9.0],
-            "joint_target_kd": [0.7, 0.8, 0.9],
-        }
-        none = {
-            "joint_limit_lower": -np.inf,
-            "joint_limit_upper": np.inf,
-            "joint_velocity_limit": 0.0,
-            "joint_target_ke": 0.0,
-            "joint_target_kd": 0.0,
-        }
         for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
             with self.subTest(device=device):
-                # A chain of three hinges whose root link is kinematic: its coordinate is prescribed.
                 scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
                 links = [scene.add_link(mass=1.0, inertia=INERTIA, is_kinematic=index == 0) for index in range(3)]
                 joints = [
                     scene.add_joint_revolute(
-                        links[index - 1] if index else -1,
-                        link,
-                        axis=newton.Axis.Y,
-                        limit_lower=-0.5,
-                        limit_upper=0.5,
-                        target_ke=4.0,
-                        target_kd=0.5,
+                        links[index - 1] if index else -1, link, axis=newton.Axis.Y, limit_lower=-0.5, limit_upper=0.5
                     )
                     for index, link in enumerate(links)
                 ]
                 scene.add_articulation(joints)
                 model = scene.finalize(device=device)
-                solver = SolverFeatherPGS(model, angular_damping=0.0)
-                state, out, control = model.state(), model.state(), model.control()
-                solver.step(state, out, control, None, 1.0e-3)
-                for name, values in written.items():
-                    getattr(model, name).assign(np.asarray(values, np.float32))
-                solver.step(out, state, control, None, 1.0e-3)
-                table = joint_table.bind(solver)
-                for name, values in written.items():
-                    published = solver.laws.effective_rows[name]
-                    # The joint table the rows read holds the published array: none on the prescribed coordinate,
-                    # the written values on the dynamic ones.
-                    self.assertEqual(getattr(table, name).ptr, published.ptr, name)
-                    self.assertEqual(float(published.numpy()[0]), none[name], name)
-                    np.testing.assert_allclose(published.numpy()[1:], values[1:], rtol=1.0e-6, err_msg=name)
+                velocity_limits = model.device.is_cuda
+                solver = SolverFeatherPGS(
+                    model, angular_damping=0.0, enable_joint_limits=True, enable_joint_velocity_limits=velocity_limits
+                )
+                for name in ("joint_limit_lower", "joint_limit_upper", "joint_velocity_limit"):
+                    # The joint table holds the model's live arrays.
+                    self.assertEqual(getattr(joint_table.bind(solver), name).ptr, getattr(model, name).ptr, name)
+                states = [model.state(), model.state()]
+                states[0].joint_q.assign(np.full(3, 0.8, np.float32))
+                model.joint_velocity_limit.assign(np.full(3, 2.0, np.float32))
+                self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_LIMIT), 4)
+                if velocity_limits:
+                    self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), 4)
+                model.joint_limit_lower.assign(np.asarray([-0.5, -0.5, -np.inf], np.float32))
+                model.joint_limit_upper.assign(np.asarray([0.5, 0.5, np.inf], np.float32))
+                model.joint_velocity_limit.assign(np.asarray([1.0, 1.0, 0.0], np.float32))
+                self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_LIMIT), 2)
+                if velocity_limits:
+                    self.assertEqual(_rows_of_kind(solver, model, states, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), 2)
 
 
 class TestTreePlanKinematicBodies(unittest.TestCase):

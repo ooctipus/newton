@@ -53,7 +53,6 @@ from . import execution_plan as _execution_plan
 from . import (
     field_group,
     host_index,
-    joint_table,
     kernel_template,
     packed_rows,
     prefix_rows,
@@ -1274,15 +1273,10 @@ class SolverFeatherPGS(SolverBase):
             and self.forest.size_groups
             and max(self.forest.size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
         )
-        # The row laws' tables: the contact law, speed limits, the effective row data, the joint-limit tables, the
-        # mimic and connect plans, contact torsion and the materials.
+        # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and connect plans,
+        # contact torsion and the materials.
         self.laws = RowLaws.build(
-            model,
-            self.forest,
-            options,
-            matrix_free=self._matrix_free,
-            kinematic_dof_mask=self._kinematic_dof_mask,
-            mirrors=self._debug_buffers_enabled,
+            model, self.forest, options, matrix_free=self._matrix_free, mirrors=self._debug_buffers_enabled
         )
         self._build_preelimination_plan(model)
         # Axis 2 of the route table, the row laws, which every owner's admission reads (route_table.capable).
@@ -2030,8 +2024,8 @@ class SolverFeatherPGS(SolverBase):
         The effective armature also holds the least armature that keeps the mass matrix of a deep
         articulation within float32 factorization (:func:`conditioning_armature`).
 
-        The coordinate mask also decides the effective row data each step publishes
-        (:func:`.joint_table.publish_effective`): none on a prescribed coordinate.
+        The coordinate mask is the rows' prescribed coordinates (:data:`.joint_table.JOINTS`): none takes a row on
+        it alone.
 
         Returns:
             ``(armature, joint_mask, dof_mask, floor)`` for :meth:`_apply_kinematic_state`.
@@ -5657,9 +5651,6 @@ class SolverFeatherPGS(SolverBase):
 
         if not getattr(state_aug, "_featherstone_augmented", False):
             self._allocate_state_aux_vars(model, state_aug, requires_grad)
-        # The step's row data from the live model arrays: a write to the model's gains or limits reaches the rows
-        # without a notification.
-        joint_table.publish_effective(model, self._kinematic_dof_mask, self.laws.effective_rows)
 
         return state_aug
 
@@ -6939,7 +6930,7 @@ class SolverFeatherPGS(SolverBase):
                             self.forest.art_to_world,
                             self.forest.articulation_world_dof_offset,
                             self.forest.articulation_dof_start,
-                            self.laws._joint_velocity_limit,
+                            model.joint_velocity_limit,
                             self.laws.velocity_limit_slot,
                             self.laws.velocity_limit_sign,
                             self.options.pgs_cfm,

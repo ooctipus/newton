@@ -11,7 +11,7 @@ import newton
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
-from newton._src.solvers.feather_pgs.joint_table import JointTable, effective
+from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau_and_augmented_drives,
     populate_physx_drive_J_for_size,
@@ -206,7 +206,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                             model,
                             articulation_dof_start=model.joint_qd_start.numpy()[:-1],
                             art_to_world=np.repeat([0, 1], 4),
-                            **effective(model),
                         ),
                         state.joint_q,
                         control.joint_target_q,

@@ -18,12 +18,14 @@ import warp as wp
 from . import field_group
 from .dense_rows import RECORDS
 from .device_preludes import substitute
-from .field_group import Field
+from .field_group import Field, FieldGroup
+from .joint_table import JOINTS
 
 LAW = (
     Field("limit_q_index", wp.int32, ("dof",), owner="laws", attr="joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), owner="laws", attr="_joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), owner="laws", attr="_joint_limit_upper"),
+    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    FieldGroup(*JOINTS)["prescribed"],
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
     Field("activation_gap", wp.float32, owner="options", attr="joint_limit_activation_gap"),
     Field("beta", wp.float32, owner="options", attr="pgs_beta"),
@@ -33,12 +35,13 @@ LAW = (
     Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
     *(field for field in RECORDS if field.name != "row_w"),
 )
-"""The prefix law's inputs, the world's row counter and phase bounds, and the dense row records."""
+"""The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),
+the world's row counter and phase bounds, and the dense row records."""
 
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
 VELOCITY_LAW = (
-    Field("velocity_limit", wp.float32, ("dof",), owner="laws", attr="_joint_velocity_limit"),
+    Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
     Field("vhat", wp.float32, ("dof",), attr="v_hat"),
     Field("activation", wp.float32, owner="options", attr="velocity_limit_activation_fraction"),
 )
@@ -72,7 +75,7 @@ def limits(coordinates, dof: str, law: str) -> tuple:
         f"""            dof = {dof};
             side = index & 1;
             const int qi = {law}limit_q_index.data[dof];
-            if (qi >= 0) {{
+            if (qi >= 0 && {law}prescribed.data[dof] == 0) {{
                 const auto limit = RowLaw::joint_limit_side({law}q.data[qi], {law}lower.data[dof],
                                                             {law}upper.data[dof], side, {law}activation_gap);
                 active = limit.v0;
@@ -92,7 +95,8 @@ def velocity_limits(coordinates, dof: str, law: str) -> tuple:
         f"""            dof = {dof};
             side = index & 1;
             const float limit = {law}velocity_limit.data[dof];
-            active = RowLaw::velocity_limit_active(limit, {law}vhat.data[dof], {law}activation);
+            active = {law}prescribed.data[dof] == 0 && RowLaw::velocity_limit_active(limit, {law}vhat.data[dof],
+                                                                                     {law}activation);
             type = 4;
             target = -limit;
             d0 = d;

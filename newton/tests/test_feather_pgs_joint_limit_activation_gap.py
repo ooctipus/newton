@@ -51,6 +51,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
                 joint_dof_dim=[[0, 1]],
                 joint_limit_lower=[lower],
                 joint_limit_upper=[upper],
+                prescribed=[0],
                 art_to_world=[0],
             ),
             wp.array([q], dtype=wp.float32, device=device),

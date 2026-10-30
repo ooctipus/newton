@@ -24,6 +24,7 @@ import warp as wp
 from . import field_group
 from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
 from .field_group import Field, FieldGroup, SolverArrays
+from .joint_table import JOINTS
 from .row_laws import contact_depenetration_cap, contact_restitution_rhs, contact_rhs, joint_limit_side, limit_rhs
 from .step_plan import first_failed
 
@@ -34,8 +35,9 @@ RESOLVED_WORLD_INPUT = (
     Field("world_dof_indices", wp.int32, ("world", "world_dof"), owner="forest"),
     Field("world_dof_count", wp.int32, ("world",), owner="forest"),
     Field("limit_q_index", wp.int32, ("dof",), owner="laws", attr="joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), owner="laws", attr="_joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), owner="laws", attr="_joint_limit_upper"),
+    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    FieldGroup(*JOINTS)["prescribed"],
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
     Field("v_hat", wp.float32, ("dof",)),
     Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
@@ -176,7 +178,8 @@ def check_world_limits(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
             valid = False
             continue
         qi = data.limit_q_index[dof]
-        if qi < 0:
+        if qi < 0 or data.prescribed[dof] != 0:
+            # No limit, or a prescribed coordinate: no limit row (joint_table.JOINTS).
             continue
         if qi >= data.q.shape[0] or dof >= data.lower.shape[0] or dof >= data.upper.shape[0]:
             valid = False

@@ -8,8 +8,6 @@
 - the contact law: the friction law (patch friction with ``friction_anchor_beta > 0``, else point friction), the
   regularization weight, the restitution threshold, the shape materials and the contact torsion selection;
 - the rigid bodies' speed limits;
-- the effective per-coordinate row data (:func:`.joint_table.publish_effective`): limits and drive gains with none on a
-  prescribed coordinate;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
 - the mimic and connect plans (the bilateral rows' tables);
 - the velocity-limit law and the velocity prescale's launch;
@@ -31,7 +29,7 @@ import warp as wp
 
 from ...sim import Model
 from ...sim.enums import BodyFlags, JointType
-from . import host_index, joint_table, prefix_rows
+from . import host_index, prefix_rows
 from .configuration import Options
 from .contact_torsion import configure_contact_torsion
 from .dense_rows import RowSupport
@@ -138,10 +136,9 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
 class RowLaws:
     """The row laws' tables of one model and its options (:meth:`build`).
 
-    The tables keep the names they had on the solver, without the leading underscore, except two kinds: the tables
-    uploaded by field groups (:data:`.solver_fields.MIMIC_PLAN`, :data:`.solver_fields.CONNECT_PLAN`) keep their
-    fields' names, and the effective row data keeps its private names (``_joint_limit_lower``, ...:
-    :data:`.joint_table.EFFECTIVE`), which :func:`.field_group.upload` refuses to take from a model.
+    The tables keep the names they had on the solver, without the leading underscore, except the tables uploaded by
+    field groups (:data:`.solver_fields.MIMIC_PLAN`, :data:`.solver_fields.CONNECT_PLAN`), which keep their fields'
+    names.
     """
 
     set: Laws
@@ -156,7 +153,6 @@ class RowLaws:
         options: Options,
         *,
         matrix_free: bool,
-        kinematic_dof_mask: wp.array,
         mirrors: bool = False,
     ) -> RowLaws:
         """Resolve the row laws and build their tables.
@@ -166,8 +162,6 @@ class RowLaws:
             forest: The forest plan.
             options: The solver's options.
             matrix_free: The matrix-free formulation (CUDA).
-            kinematic_dof_mask: Each coordinate the body flags make kinematic (the live mask; the effective row data
-                has none on these).
             mirrors: Keep debug mirrors of the mirrored fields.
 
         Raises:
@@ -237,13 +231,6 @@ class RowLaws:
         laws.has_rigid_body_velocity_limits = (
             laws.rigid_body_max_linear_velocity is not None and laws.rigid_body_max_angular_velocity is not None
         )
-
-        # The per-coordinate gains and limits the rows read: the model's live arrays, with none on a prescribed
-        # coordinate, published every step (joint_table.publish_effective).
-        laws.effective_rows = {name: wp.empty_like(getattr(model, name)) for name in joint_table.EFFECTIVE}
-        for name, array in laws.effective_rows.items():
-            setattr(laws, "_" + name, array)
-        joint_table.publish_effective(model, kinematic_dof_mask, laws.effective_rows)
 
         laws._joint_limit_tables(model)
         # Mimic/connect plans must exist before capacity selection so the row census

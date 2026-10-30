@@ -296,10 +296,7 @@ def upload(struct_type, device, source=None, /, **values):
 
     Each field takes ``values[field.name]``, else ``source``'s attribute (a host plan),
     else stays empty: a struct that several owners share may leave fields an owner
-    does not use unset. A field that reads a solver's private array derived from a model
-    array (attribute ``_name``, such as the effective row data the solver publishes every
-    step) is never taken from the raw ``name`` a model source holds: the upload raises
-    instead, so a caller binds from the solver or passes the field.
+    does not use unset.
     """
     data = struct_type()
     for field in _STRUCT_FIELDS[struct_type]:
@@ -308,11 +305,6 @@ def upload(struct_type, device, source=None, /, **values):
             value = values[field.name]
         elif source is not None and hasattr(source, attr):
             value = getattr(source, attr)
-        elif source is not None and attr.startswith("_") and hasattr(source, attr[1:]):
-            raise ValueError(
-                f"{struct_type.key}.{field.name} reads the solver's {attr}, not the source's {attr[1:]}: bind from the "
-                f"solver or pass {field.name}"
-            )
         else:
             continue
         if not field.dims:

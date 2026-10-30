@@ -503,7 +503,7 @@ def prepare_fused_diagonal_joint_limits(
     active = int(0)
     rhs_lower = float(0.0)
     rhs_upper = float(0.0)
-    if global_dof >= 0 and fused_limit_dof_mask[global_dof] != 0:
+    if global_dof >= 0 and fused_limit_dof_mask[global_dof] != 0 and joints.prescribed[global_dof] == 0:
         q_index = limit_q_index[global_dof]
         if q_index >= 0:
             q = joint_q[q_index]
@@ -1217,7 +1217,7 @@ def allocate_physx_drive_slots(
             dof = qd_start + axis
             stiffness = joints.joint_target_ke[dof]
             damping = joints.joint_target_kd[dof]
-            if stiffness <= 0.0 and damping <= 0.0:
+            if (stiffness <= 0.0 and damping <= 0.0) or joints.prescribed[dof] != 0:
                 continue
 
             drive_slot[dof] = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
@@ -1462,6 +1462,8 @@ def build_joint_limit_rows_for_size(
         q_start = joints.joint_q_start[j]
         for axis in range(axis_count):
             dof = qd_start + axis
+            if joints.prescribed[dof] != 0:
+                continue
             q_val = joint_q[q_start + axis]
             lower = joints.joint_limit_lower[dof]
             upper = joints.joint_limit_upper[dof]
@@ -1906,7 +1908,7 @@ def allocate_joint_velocity_limit_slots(
             dof = qd_start + axis
             # A non-positive limit is unlimited (PhysX pins ``recipResponse`` off for ``unitResponse <= 0``);
             # a positive fraction admits only a DOF whose speed reaches that fraction of the limit.
-            if not velocity_limit_active(
+            if joints.prescribed[dof] != 0 or not velocity_limit_active(
                 joints.joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction
             ):
                 continue
