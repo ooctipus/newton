@@ -31,8 +31,8 @@ def _compute_body_q_com_kernel(
 class _InverseDynamicsScratchBuffer:
     """Internal scratch buffers for :func:`eval_inverse_dynamics_passive`.
 
-    Holds the RNEA per-body and per-DOF arrays, the mass-matrix Jacobian
-    scratch, and the constant-zero inputs that the compensation passes
+    Holds the RNEA per-body and per-DOF arrays, the motion-subspace and
+    spatial-inertia scratch, and the constant-zero inputs that the compensation passes
     feed into :func:`eval_rigid_tau` and :func:`eval_rigid_id`. All buffers
     are sized for the topology supplied at construction time; rebuilding
     the model with a different body, joint, articulation, or DOF count
@@ -45,11 +45,8 @@ class _InverseDynamicsScratchBuffer:
     def __init__(
         self,
         body_count: int,
-        articulation_count: int,
         joint_dof_count: int,
         joint_target_q_count: int,
-        max_dofs_per_articulation: int,
-        max_joints_per_articulation: int,
         world_count: int,
         device: Devicelike | None = None,
     ):
@@ -58,30 +55,19 @@ class _InverseDynamicsScratchBuffer:
         Args:
             body_count: Total number of rigid bodies across all articulations
                 (matches :attr:`Model.body_count`).
-            articulation_count: Number of articulations (matches
-                :attr:`Model.articulation_count`).
             joint_dof_count: Total number of joint DOFs across all
                 articulations (matches :attr:`Model.joint_dof_count`).
             joint_target_q_count: Length of :attr:`Model.joint_target_q`
                 (coord- or DOF-shaped depending on
                 :data:`newton.use_coord_layout_targets`), used to size the
                 constant-zero position-target input.
-            max_dofs_per_articulation: Per-articulation DOF count (inclusive
-                of floating-base root DOFs, if any). Matches
-                :attr:`Model.max_dofs_per_articulation`.
-            max_joints_per_articulation: Maximum number of joints in any
-                articulation, used to size the per-articulation Jacobian
-                scratch. Matches :attr:`Model.max_joints_per_articulation`.
             world_count: Number of local simulation worlds, used to size the
                 local-and-global constant-zero gravity vector consumed by the
                 Coriolis compensation pass. Matches :attr:`Model.world_count`.
             device: Warp device on which the buffers are allocated.
         """
         bc = body_count
-        ac = articulation_count
         jdc = joint_dof_count
-        max_dofs = max_dofs_per_articulation
-        max_links = max_joints_per_articulation
 
         # RNEA scratch (rewritten by every compensation pass).
         self.body_I_m = wp.empty(bc, dtype=wp.spatial_matrix, device=device)
@@ -95,9 +81,6 @@ class _InverseDynamicsScratchBuffer:
         self.body_f_s = wp.empty(bc, dtype=wp.spatial_vector, device=device)
         self.body_a_s = wp.empty(bc, dtype=wp.spatial_vector, device=device)
         self.body_ft_s = wp.empty(bc, dtype=wp.spatial_vector, device=device)
-
-        # Reused as the eval_mass_matrix Jacobian scratch.
-        self.J = wp.empty((ac, max_links * 6, max_dofs), dtype=wp.float32, device=device)
 
         # Constant-zero inputs (allocated once, never written). The position
         # target buffer is sized separately: it is indexed via
@@ -451,28 +434,31 @@ def eval_inverse_dynamics_passive(
 
     scratch = _InverseDynamicsScratchBuffer(
         body_count=model.body_count,
-        articulation_count=model.articulation_count,
         joint_dof_count=model.joint_dof_count,
         joint_target_q_count=model.joint_target_q.shape[0],
-        max_dofs_per_articulation=model.max_dofs_per_articulation,
-        max_joints_per_articulation=model.max_joints_per_articulation,
         world_count=model.world_count,
         device=model.device,
     )
 
     if mass_matrix is not None:
-        # eval_jacobian writes the Jacobians of the selected articulations
-        # in scratch.J, the only entries eval_mass_matrix reads;
-        # jcalc_motion_subspace overwrites every selected DOF of
-        # scratch.joint_S_s; compute_body_spatial_inertia fully overwrites
-        # every body's scratch.body_I_s; eval_mass_matrix zeros mass_matrix
-        # internally. No pre-zeroing required here.
-        eval_jacobian(model, state, J=scratch.J, joint_S_s=scratch.joint_S_s, mask=mask)
+        # The model-wide Jacobian scratch is allocated only for the mass matrix.
+        # eval_jacobian writes the Jacobians of the selected articulations in it,
+        # the only entries eval_mass_matrix reads; jcalc_motion_subspace
+        # overwrites every selected DOF of scratch.joint_S_s;
+        # compute_body_spatial_inertia fully overwrites every body's
+        # scratch.body_I_s; eval_mass_matrix zeros mass_matrix internally. No
+        # pre-zeroing required here.
+        J = wp.empty(
+            (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation),
+            dtype=wp.float32,
+            device=model.device,
+        )
+        eval_jacobian(model, state, J=J, joint_S_s=scratch.joint_S_s, mask=mask)
         eval_mass_matrix(
             model,
             state,
             H=mass_matrix,
-            J=scratch.J,
+            J=J,
             body_I_s=scratch.body_I_s,
             joint_S_s=scratch.joint_S_s,
             mask=mask,
