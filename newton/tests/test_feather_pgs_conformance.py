@@ -64,7 +64,9 @@ Metrics
       forces (and the angular balance of free rigid bodies under point
       friction), which checks the force export on every route;
     - scene laws: sliding acceleration ``g (sin a - mu cos a)`` and no creep on
-      the incline, rebound ``v+ = -e u``, speed limits, the spring hinge's
+      the incline (on CPU also at every step and every budget from 32 to 2,000
+      sweeps, :func:`incline_steady_slide_laws`), rebound ``v+ = -e u``, speed
+      limits, the spring hinge's
       discrete oscillator, the compliant rest height ``r - m g / k``, torsional
       stiction and spin-up, the lifted box following the gripper, and the
       exported force on a pressed key balancing its drive.
@@ -839,6 +841,36 @@ def incline_laws(run: Run) -> list:
             expected = scenes.GRAVITY * (math.sin(angle) - mu * math.cos(angle))
             measured = (speed[-1] - speed[start]) / ((run.scene.steps - start) * dt)
             laws.append((f"world {world} sliding acceleration error [1]", abs(measured / expected - 1.0), 2.0e-3))
+    return laws
+
+
+INCLINE_BUDGETS = (32, 64, 128, 256, 512, 1000, 2000)
+"""Sweep budgets of :func:`incline_steady_slide_laws`: from the gate budget to near convergence. A solve that runs to
+its budget on a cycle stops at a phase that depends on the budget, so one budget can miss it."""
+
+
+def incline_steady_slide_laws(run: Run) -> list:
+    """The sliding box accelerates at ``g (sin(angle) - mu cos(angle))`` at every step, to the sweep's noise.
+
+    Per step after the first third, the downhill speed's change over ``dt`` against the analytic acceleration: the
+    worst step within 3e-4 and the window's mean within 2e-5. Under both laws, a friction pair kept only where its
+    root solve would stop at once stays within 1e-4 and 9e-6 at every budget of :data:`INCLINE_BUDGETS` on the CPU
+    split route (re-solving every pair: 2e-4 and 7e-6); keeping pairs to ``2^-20``, looser than the root solve's own
+    stop, left contact rows cycling against the held pairs: single steps 5e-4 to 1.4e-3 off under point friction and
+    means up to 2.3e-5 (2026-10-30).
+    """
+    params, dt = run.scene.params, run.scene.dt
+    angle, downhill = params["angle"], np.asarray(params["downhill"])
+    start = run.scene.steps // 3
+    laws = []
+    for world, mu in enumerate(params["mu"]):
+        if mu > math.tan(angle):
+            continue
+        expected = scenes.GRAVITY * (math.sin(angle) - mu * math.cos(angle))
+        speed = run.body_qd[:, world, :3] @ downhill
+        error = np.diff(speed[start:]) / (dt * expected) - 1.0
+        laws.append((f"world {world} worst step's sliding acceleration error [1]", float(np.abs(error).max()), 3.0e-4))
+        laws.append((f"world {world} mean sliding acceleration error [1]", abs(float(error.mean())), 2.0e-5))
     return laws
 
 
@@ -1826,6 +1858,27 @@ def _add_reference_tests() -> None:
 
 
 _add_reference_tests()
+
+
+def _add_incline_budget_tests() -> None:
+    for law in _laws():
+        physics = _physics(scenes.incline(), law, 32)
+
+        def test(self, physics=physics):
+            rows = []
+            for budget in INCLINE_BUDGETS:
+                run = run_physics(physics, CPU_SPLIT, self.device, budget)
+                rows += [
+                    (f"{budget} sweeps: {name}", value, bound) for name, value, bound in incline_steady_slide_laws(run)
+                ]
+            failures = _failures(rows)
+            self.assertFalse(failures, f"{physics.name} through {CPU_SPLIT.name}:\n{_message(failures)}")
+
+        test.__doc__ = f"Check that {physics.name} slides steadily through {CPU_SPLIT.name} at every budget."
+        setattr(TestFeatherPGSConformanceCPU, f"test_{physics.name}_slides_steadily_at_every_budget", test)
+
+
+_add_incline_budget_tests()
 
 
 if __name__ == "__main__":

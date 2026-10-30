@@ -75,6 +75,68 @@ def test_friction_pair_solves_the_disk_problem(test, device):
 
 
 @wp.kernel
+def _pair_from_metric(
+    scale: wp.array[float],
+    largest: wp.array[float],
+    smallest: wp.array[float],
+    axis: wp.array[wp.vec2],
+    residual: wp.array[wp.vec2],
+    old: wp.array[wp.vec2],
+    radius: wp.array[float],
+    omega: wp.array[float],
+    out: wp.array[wp.vec2],
+):
+    i = wp.tid()
+    out[i] = laws.friction_pair_from_metric(
+        scale[i], largest[i], smallest[i], axis[i], residual[i], old[i], radius[i], omega[i]
+    )
+
+
+def test_friction_pair_keeps_a_sliding_pair_at_its_solution(test, device):
+    """Keep a sliding pair already at its disk problem's solution to the floor, bit for bit, at any radius.
+
+    The hold is the root solve's own stop (:data:`~.projection_laws.PAIR_FLOOR`): the impulse on its circle and the
+    residual anti-parallel to it, both within the floor. Impulses ``(3, 4) 2^e`` have exact norms ``5 2^e`` and
+    residuals ``-2^k`` times them exact cross products; radii 0 or 2 ulps above that norm (1.9e-7 of the radius, inside
+    the floor) keep the impulse, including radii under 1e-15 that the squared-norm screen leaves to the test; 8 ulps
+    above (outside the floor, inside the screen) and 4e-6 above (outside the screen) re-solve it.
+    """
+    rng = np.random.default_rng(71)
+    n = 4096
+    values = twin_inputs("friction_pair_from_metric", rng, n, device)
+    exponent = rng.integers(-60, 57, n)
+    sign = rng.choice([-1.0, 1.0], (n, 2))
+    legs = np.where(rng.integers(0, 2, n)[:, None] == 0, [3.0, 4.0], [4.0, 3.0])
+    old = (sign * legs * np.ldexp(1.0, exponent)[:, None]).astype(np.float32)
+    norm = np.ldexp(5.0, exponent).astype(np.float32)
+    residual = (-old * np.ldexp(1.0, rng.integers(-2, 7, n))[:, None]).astype(np.float32)
+    ulp = np.nextafter(norm, np.float32(np.inf)) - norm
+    radii = {
+        "on the circle": (norm, True),
+        "2 ulps inside": (norm + 2 * ulp, True),
+        "8 ulps inside": (norm + 8 * ulp, False),
+        "4e-6 inside": (norm * np.float32(1.0 + 4.0e-6), False),
+    }
+    for name, (radius, kept) in radii.items():
+        with test.subTest(radius=name):
+            out = call(
+                _pair_from_metric,
+                n,
+                device,
+                **{k: values[k] for k in ("scale", "largest", "smallest", "axis", "omega")},
+                residual=residual,
+                old=old,
+                radius=radius.astype(np.float32),
+                out=np.zeros((n, 2), np.float32),
+            )["out"].numpy()
+            held = np.all(out == old, axis=1)
+            if kept:
+                test.assertTrue(held.all(), f"{int((~held).sum())} of {n} re-solved, radius {radius[~held][:3]}")
+            else:
+                test.assertFalse(held.any(), f"{int(held.sum())} of {n} kept")
+
+
+@wp.kernel
 def _scalar_laws(
     old: wp.array[float],
     residual: wp.array[float],

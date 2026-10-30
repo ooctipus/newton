@@ -27,6 +27,10 @@ import warp as wp
 from .law_source import LawFamily
 from .row_laws import ROW_FRICTION
 
+PAIR_FLOOR = wp.constant(2.0e-7)
+"""The pair's rounding floor, about two float32 ulps of its impulse: the root solve stops within it of the disk's
+radius, and a sliding impulse that already meets the disk problem's KKT conditions within it is kept."""
+
 PROJECTION_LAW = LawFamily("ProjectionLaw")
 """The projection laws' family; native code calls ``ProjectionLaw::friction_pair(...)``."""
 
@@ -133,6 +137,12 @@ def friction_pair_from_metric(
         return wp.vec2(0.0)
     perpendicular = wp.vec2(-axis[1], axis[0])
     residual_rotated = wp.vec2(wp.dot(axis, residual), wp.dot(perpendicular, residual)) / scale
+    # The hold test below reads |old|. Squared norms screen it without a root, beside the sticking test: a pair the
+    # test keeps has |old|^2 within three floors of radius^2 (squaring doubles the floor; rounding adds under one), so
+    # ten floors pass every pair it keeps. A radius under 1e-15 skips the screen, which keeps its operands normal.
+    old_norm_sq = wp.dot(old, old)
+    radius_sq = radius * radius
+    near_circle = radius < 1.0e-15 or wp.abs(old_norm_sq - radius_sq) <= 10.0 * PAIR_FLOOR * radius_sq
     result = old
     sticking = bool(False)
     if largest > 0.0 and (smallest > 0.0 or residual_rotated[1] == 0.0):
@@ -143,6 +153,20 @@ def friction_pair_from_metric(
         result = old - correction
         sticking = wp.length(result) <= radius
     if not sticking:
+        # A sliding pair already at its disk problem's solution to the rounding floor keeps its impulse: on its circle
+        # within the floor of the radius, and its residual anti-parallel to it within the floor (the KKT conditions, at
+        # the floor the root solve stops at). Its re-solve could move it only within that floor.
+        if near_circle:
+            old_norm = wp.length(old)
+            cross_residual = residual[0] * old[1] - residual[1] * old[0]
+            if (
+                old_norm > 0.0
+                and old_norm <= radius
+                and radius - old_norm <= PAIR_FLOOR * radius
+                and wp.dot(residual, old) <= 0.0
+                and wp.abs(cross_residual) <= PAIR_FLOOR * old_norm * wp.length(residual)
+            ):
+                return old
         old_rotated = wp.vec2(wp.dot(axis, old), wp.dot(perpendicular, old))
         b = wp.vec2(largest * old_rotated[0], smallest * old_rotated[1]) - residual_rotated
         solution = wp.vec2(0.0)
@@ -167,7 +191,7 @@ def friction_pair_from_metric(
                 norm = wp.length(trial)
                 # The stopping error is relative to the impulse budget. The
                 # caller projects after relaxation; keep bisection for hard cases.
-                if wp.abs(norm - radius) <= 2.0e-7 * radius or (alpha == 0.0 and norm <= radius):
+                if wp.abs(norm - radius) <= PAIR_FLOOR * radius or (alpha == 0.0 and norm <= radius):
                     solution = trial
                     converged = True
                     break
@@ -207,7 +231,8 @@ def friction_pair(
     with ``|x| = radius``. Incremental sticking avoids perturbing fixed points. An
     orthonormal eigenbasis avoids cancellation in nearly singular blocks.
     Safeguarded Newton accelerates sliding; bisection retains a feasible
-    fallback.
+    fallback. A sliding impulse that already meets the disk problem's KKT
+    conditions at the rounding floor (:data:`PAIR_FLOOR`) is kept.
     """
     scale, largest, smallest, axis = friction_pair_metric(a, c, d)
     return friction_pair_from_metric(scale, largest, smallest, axis, residual, old, radius, omega)
