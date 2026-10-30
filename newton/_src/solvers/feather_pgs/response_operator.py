@@ -272,16 +272,25 @@ class CholeskySolve:
         return f"if ({lane} < {n}) ({self.inverse})[{lane}] = 1.0f / ({self.lower})[{lane} * {n} + {lane}];"
 
     def stage(self, source: Vector, lane: str, width: int | str) -> str:
-        """Copy the factor from ``source`` into ``lower``, lane-strided; a reciprocal solve's diagonal becomes ``1 / L_ii``."""
+        """Copy the factor from ``source`` into ``lower``, lane-strided; a reciprocal solve's diagonal becomes ``1 / L_ii``.
+
+        The reciprocals take a loop of their own over the diagonal, so the copy's loads carry no division (whose slow
+        path, a call, would order them one after another)."""
         n = self.size
-        count, step = (n * n, n + 1) if isinstance(n, int) else (f"{n} * {n}", f"{n} + 1")
-        reciprocal = (
-            f"\n    if (i % {step} == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;" if self.reciprocal else ""
-        )
+        count, step = (n * n, n + 1) if isinstance(n, int) else (f"{n} * {n}", f"({n} + 1)")
+        if not self.reciprocal:
+            return (
+                f"for (int i = {lane}; i < {count}; i += {width}) {{\n"
+                f"    float factor = {_at(source, 'i')};\n"
+                f"    ({self.lower})[i] = factor;\n"
+                "}"
+            )
         return (
-            f"for (int i = {lane}; i < {count}; i += {width}) {{\n"
-            f"    float factor = {_at(source, 'i')};{reciprocal}\n"
-            f"    ({self.lower})[i] = factor;\n"
+            f"for (int i = {lane}; i < {count}; i += {width})\n"
+            f"    if (i % {step} != 0) ({self.lower})[i] = {_at(source, 'i')};\n"
+            f"for (int i = {lane}; i < {n}; i += {width}) {{\n"
+            f"    const float factor = {_at(source, f'i * {step}')};\n"
+            f"    ({self.lower})[i * {step}] = factor != 0.0f ? 1.0f / factor : 0.0f;\n"
             "}"
         )
 

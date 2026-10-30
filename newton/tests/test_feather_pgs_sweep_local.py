@@ -132,7 +132,7 @@ class TestLocalOwnedRoute(unittest.TestCase):
         self.assertIn("#define s_A localscratch[SUB].s_A", body)
         self.assertIn("#undef s_A", body)
         # Every local owner stages the factor's reciprocal diagonal and multiplies by it, contactless ones included.
-        self.assertIn("factor = factor != 0.0f ? 1.0f / factor : 0.0f;", body)
+        self.assertIn("(s_L)[i * 10] = factor != 0.0f ? 1.0f / factor : 0.0f;", body)
         self.assertNotIn("value/diagonal", body)
 
 
@@ -181,7 +181,9 @@ class TestResponseOperators(unittest.TestCase):
     def test_reciprocal_cholesky_multiplies_by_the_staged_inverse_diagonal(self):
         solve = CholeskySolve(3, "s_L", reciprocal=True, ascending=True)
         staged = solve.stage(lambda i: f"L[{i}]", "lane", 32)
-        self.assertIn("if (i % 4 == 0) factor = factor != 0.0f ? 1.0f / factor : 0.0f;", staged)
+        # The reciprocals take a loop of their own: the copy's loads carry no division.
+        self.assertIn("if (i % 4 != 0) (s_L)[i] = L[(i)];", staged)
+        self.assertIn("(s_L)[i * 4] = factor != 0.0f ? 1.0f / factor : 0.0f;", staged)
         out = lambda i: f"x[{i}]"  # noqa: E731
         # The leaf-first factor: factor row ``row`` writes the vector's physical position ``3 - 1 - row``.
         self.assertIn("x[(3-1-(row))]=value*diagonal;", solve.whiten(out, out))
