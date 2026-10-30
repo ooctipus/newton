@@ -250,6 +250,8 @@ TWIN_SAMPLES = 4096
 TWIN_TOLERANCES = {
     "friction_pair": ("radius", 1.0e-5),
     "friction_pair_from_metric": ("radius", 1.0e-5),
+    "friction_ball": ("load", 1.0e-5),
+    "friction_ball_from_metric": ("load", 1.0e-5),
 }
 """Laws whose two renderings agree to their solve's tolerance rather than bitwise: ``(input that scales the
 results, or None for the largest result, bound)``. They test convergence and sticking against tolerances, and the
@@ -416,6 +418,41 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "smallest": np.maximum((a * d - c * c) / largest, 0.0).astype(np.float32),
             "axis": axis.astype(np.float32),
             **pair,
+        }
+    if name.startswith(("friction_ball", "jacobi_rotation")):
+        block = spd3(rng, n).astype(np.float64)
+        mu = rng.uniform(0.0, 2.0, n)
+        mu[::19] = 0.0
+        mu_t = mu * rng.uniform(0.0, 0.2, n)
+        mu_t[::23] = 0.0
+        load = rng.uniform(0.0, 2.0, n)
+        load[::17] = 0.0
+        coefficients = np.stack([mu, mu, mu_t], 1)
+        triple = {
+            "residual": rng.normal(size=(n, 3)).astype(np.float32),
+            "old": (rng.normal(size=(n, 3)) * coefficients * load[:, None]).astype(np.float32),
+            "mu": mu.astype(np.float32),
+            "mu_t": mu_t.astype(np.float32),
+            "load": load.astype(np.float32),
+            "omega": rng.choice([1.0, 0.8, 1.2], n).astype(np.float32),
+        }
+        if name == "jacobi_rotation":
+            vectors, _ = np.linalg.qr(rng.normal(size=(n, 3, 3)))
+            p, q = np.array([[0, 1], [0, 2], [1, 2]])[rng.integers(0, 3, n)].T
+            return {"matrix": block.astype(np.float32), "vectors": vectors.astype(np.float32), "p": p, "q": q}
+        if name == "friction_ball_metric":
+            return {"block": block.astype(np.float32), **{k: triple[k] for k in ("mu", "mu_t")}}
+        if name == "friction_ball":
+            return {"block": block.astype(np.float32), **triple}
+        # The block's metric (friction_ball_metric's decomposition, in float64).
+        scaled = block * coefficients[:, :, None] * coefficients[:, None, :]
+        scale = np.maximum(np.einsum("nii->ni", scaled).max(axis=1), 1.0e-20)
+        values, vectors = np.linalg.eigh(scaled / scale[:, None, None])
+        return {
+            "scale": scale.astype(np.float32),
+            "values": np.maximum(values, 0.0).astype(np.float32),
+            "vectors": vectors.astype(np.float32),
+            **triple,
         }
     if name == "speed_row":
         return {

@@ -14,7 +14,9 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 * friction at a fixed normal load: :func:`friction_pair`, the bounded solve of a
   tangent pair on its disk, composed of :func:`friction_pair_metric` and
   :func:`friction_pair_from_metric` for sweeps that keep a pair's block across
-  iterations;
+  iterations; and :func:`friction_ball`, the joint solve of the pair and the
+  spin row on their elliptic cone (the pair law's scheme in three dimensions,
+  :func:`friction_ball_metric` and :func:`friction_ball_from_metric`);
 * velocity limits: :func:`velocity_limit_update`, the unrelaxed unilateral law
   of a velocity-limit row, and its free-body speed form :func:`speed_row`.
 """
@@ -233,6 +235,179 @@ def friction_pair(
     """
     scale, largest, smallest, axis = friction_pair_metric(a, c, d)
     return friction_pair_from_metric(scale, largest, smallest, axis, residual, old, radius, omega)
+
+
+BALL_POLISH = 1
+"""Exact Jacobi sweeps that polish ``wp.eig3``'s eigenbasis in :func:`friction_ball_metric`. Its four approximate
+sweeps leave off-diagonal terms up to 5e-3 of the scaled block on some float32 blocks, and the triple's solution
+errors to 2e-4 of its load; one exact sweep brings both to the rounding floor (2e-7 and 2e-6)."""
+
+
+@PROJECTION_LAW.law
+def jacobi_rotation(matrix: wp.mat33, vectors: wp.mat33, p: int, q: int) -> tuple[wp.mat33, wp.mat33]:
+    """Zero a symmetric matrix's ``(p, q)`` entry by a rotation ``R`` in that plane: ``(R^T matrix R, vectors R)``.
+
+    Golub and Van Loan's ``schur2``; ``vectors`` holds eigenvectors in its columns, rotated with the matrix.
+    """
+    off = matrix[p, q]
+    if off == 0.0:
+        return matrix, vectors
+    theta = (matrix[q, q] - matrix[p, p]) / (2.0 * off)
+    t = 1.0 / (wp.abs(theta) + wp.sqrt(theta * theta + 1.0))
+    if theta < 0.0:
+        t = -t
+    c = 1.0 / wp.sqrt(t * t + 1.0)
+    s = t * c
+    first = wp.vec3(wp.where(p == 0, 1.0, 0.0), wp.where(p == 1, 1.0, 0.0), wp.where(p == 2, 1.0, 0.0))
+    second = wp.vec3(wp.where(q == 0, 1.0, 0.0), wp.where(q == 1, 1.0, 0.0), wp.where(q == 2, 1.0, 0.0))
+    rotation = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    rotation = rotation + (c - 1.0) * (wp.outer(first, first) + wp.outer(second, second))
+    rotation = rotation + s * (wp.outer(first, second) - wp.outer(second, first))
+    return wp.transpose(rotation) * matrix * rotation, vectors * rotation
+
+
+@PROJECTION_LAW.law
+def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Return the eigen-decomposition :func:`friction_ball` solves in: ``(scale, values, vectors)``.
+
+    ``block`` is the Delassus block of the rows ``(t1, t2, s)``. In the scaled impulse
+    ``y = (t1 / mu, t2 / mu, s / mu_t)`` it is ``C block C``, ``C = diag(mu, mu, mu_t)``, here divided by its largest
+    diagonal ``scale``. ``vectors`` holds its unit eigenvectors in columns and ``values`` their eigenvalues, clamped
+    at zero: ``wp.eig3``'s, polished by :data:`BALL_POLISH` exact Jacobi sweeps. A sweep whose block stays fixed
+    computes it once and calls :func:`friction_ball_from_metric`.
+    """
+    coefficients = wp.vec3(mu, mu, mu_t)
+    scaled = wp.cw_mul(block, wp.outer(coefficients, coefficients))
+    scale = wp.max(wp.max(wp.max(scaled[0, 0], scaled[1, 1]), scaled[2, 2]), 1.0e-20)
+    scaled = scaled / scale
+    vectors, values = wp.eig3(scaled)
+    diagonal = wp.transpose(vectors) * scaled * vectors
+    for _ in range(wp.static(BALL_POLISH)):
+        diagonal, vectors = jacobi_rotation(diagonal, vectors, 0, 1)
+        diagonal, vectors = jacobi_rotation(diagonal, vectors, 0, 2)
+        diagonal, vectors = jacobi_rotation(diagonal, vectors, 1, 2)
+    values = wp.vec3(wp.max(diagonal[0, 0], 0.0), wp.max(diagonal[1, 1], 0.0), wp.max(diagonal[2, 2], 0.0))
+    return scale, values, vectors
+
+
+@PROJECTION_LAW.law(inline="default")
+def friction_ball_from_metric(
+    scale: float,
+    values: wp.vec3,
+    vectors: wp.mat33,
+    residual: wp.vec3,
+    old: wp.vec3,
+    mu: float,
+    mu_t: float,
+    load: float,
+    omega: float,
+) -> wp.vec3:
+    """Solve the friction triple of :func:`friction_ball` from its block's :func:`friction_ball_metric`.
+
+    The pair law's scheme in the scaled impulse ``y``, on the ball ``|y| <= load``: incremental sticking by the
+    block inverse, the hold of a sliding impulse at the KKT conditions' rounding floor (:data:`PAIR_FLOOR`), and
+    Newton on the reciprocal norm of ``y(alpha) = (Y + alpha I)^-1 b`` in the eigenbasis, bisection its guard.
+    """
+    if load <= 0.0:
+        return wp.vec3(0.0)
+    # A zero coefficient pins its component: its scaled impulse, gradient and change are zero.
+    reciprocal = wp.where(mu > 0.0, 1.0 / mu, 0.0)
+    old_scaled = wp.cw_mul(old, wp.vec3(reciprocal, reciprocal, wp.where(mu_t > 0.0, 1.0 / mu_t, 0.0)))
+    coefficients = wp.vec3(mu, mu, mu_t)
+    gradient = wp.cw_mul(residual, coefficients)
+    old_rotated = wp.transpose(vectors) * old_scaled
+    residual_rotated = (wp.transpose(vectors) * gradient) / scale
+    largest = wp.max(wp.max(values[0], values[1]), values[2])
+    change = wp.vec3(0.0)
+    sticking = bool(False)
+    invertible = (values[0] > 0.0 or residual_rotated[0] == 0.0) and (values[1] > 0.0 or residual_rotated[1] == 0.0)
+    if largest > 0.0 and invertible and (values[2] > 0.0 or residual_rotated[2] == 0.0):
+        step = wp.vec3(
+            wp.where(values[0] > 0.0, residual_rotated[0] / values[0], 0.0),
+            wp.where(values[1] > 0.0, residual_rotated[1] / values[1], 0.0),
+            wp.where(values[2] > 0.0, residual_rotated[2] / values[2], 0.0),
+        )
+        # Incremental sticking preserves a feasible zero-residual impulse exactly.
+        change = -(vectors * step)
+        sticking = wp.length(old_scaled + change) <= load
+    if not sticking:
+        # A sliding impulse already at its ball problem's solution to the rounding floor keeps its impulse: on the
+        # sphere within the floor of the load, its gradient anti-parallel to it within the floor.
+        load_sq = load * load
+        if load < 1.0e-15 or wp.abs(wp.dot(old_scaled, old_scaled) - load_sq) <= 10.0 * PAIR_FLOOR * load_sq:
+            old_norm = wp.length(old_scaled)
+            if (
+                old_norm > 0.0
+                and old_norm <= load
+                and load - old_norm <= PAIR_FLOOR * load
+                and wp.dot(gradient, old_scaled) <= 0.0
+                and wp.length(wp.cross(gradient, old_scaled)) <= PAIR_FLOOR * old_norm * wp.length(gradient)
+            ):
+                return old
+        b = wp.cw_mul(values, old_rotated) - residual_rotated
+        solution = wp.vec3(0.0)
+        hi = wp.length(b) / load
+        if hi > 0.0:
+            # Both bounds are <= the multiplier root (|y| >= |b_k| / (values_k + alpha), |b| / (largest + alpha)).
+            # The reciprocal norm is increasing and concave, giving Newton a useful step near singularity.
+            lo = wp.max(hi - largest, 0.0)
+            lo = wp.max(wp.max(lo, wp.abs(b[0]) / load - values[0]), wp.abs(b[1]) / load - values[1])
+            lo = wp.max(lo, wp.abs(b[2]) / load - values[2])
+            alpha = lo
+            converged = bool(False)
+            for _ in range(8):
+                inv = wp.vec3(
+                    wp.where(values[0] + alpha > 0.0, 1.0 / (values[0] + alpha), 0.0),
+                    wp.where(values[1] + alpha > 0.0, 1.0 / (values[1] + alpha), 0.0),
+                    wp.where(values[2] + alpha > 0.0, 1.0 / (values[2] + alpha), 0.0),
+                )
+                trial = old_rotated - wp.cw_mul(residual_rotated + alpha * old_rotated, inv)
+                norm = wp.length(trial)
+                if wp.abs(norm - load) <= PAIR_FLOOR * load or (alpha == 0.0 and norm <= load):
+                    solution = trial
+                    converged = True
+                    break
+                if norm > load:
+                    lo = alpha
+                else:
+                    hi = alpha
+                slope = wp.dot(wp.cw_mul(trial, trial), inv)
+                candidate = alpha
+                if slope > 0.0:
+                    candidate = alpha + (norm / load - 1.0) * norm * norm / slope
+                alpha = 0.5 * (lo + hi)
+                if candidate > lo and candidate < hi:
+                    alpha = candidate
+            if not converged:
+                for _ in range(24):
+                    alpha = 0.5 * (lo + hi)
+                    if wp.length(wp.cw_div(b, values + wp.vec3(alpha))) > load:
+                        lo = alpha
+                    else:
+                        hi = alpha
+                solution = wp.cw_div(b, values + wp.vec3(hi))
+        change = vectors * (solution - old_rotated)
+    return old + omega * wp.cw_mul(change, coefficients)
+
+
+@PROJECTION_LAW.law(inline="default")
+def friction_ball(
+    block: wp.mat33, residual: wp.vec3, old: wp.vec3, mu: float, mu_t: float, load: float, omega: float
+) -> wp.vec3:
+    """Minimize the friction triple's quadratic on its elliptic cone at a fixed normal load, then apply relaxation.
+
+    The triple is the friction pair and the spin row of a contact, ``block`` their Delassus block and ``residual``
+    their residuals at ``old``. The cone is ``|(t1 / mu, t2 / mu, s / mu_t)| <= load``: the friction coefficient
+    ``mu`` and the torsional one ``mu_t`` (a length) bound the impulses jointly, as maximal dissipation on a patch
+    does. A zero coefficient pins its component; without spin (``mu_t = 0``) the triple is the pair, solved by
+    :func:`friction_pair` bit for bit. The caller projects the relaxed result back onto the cone.
+    """
+    if mu_t <= 0.0:
+        tangents = wp.vec2(residual[0], residual[1])
+        pair = friction_pair(block[0, 0], block[0, 1], block[1, 1], tangents, wp.vec2(old[0], old[1]), mu * load, omega)
+        return wp.vec3(pair[0], pair[1], 0.0)
+    scale, values, vectors = friction_ball_metric(block, mu, mu_t)
+    return friction_ball_from_metric(scale, values, vectors, residual, old, mu, mu_t, load, omega)
 
 
 @PROJECTION_LAW.law

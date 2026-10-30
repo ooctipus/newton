@@ -374,6 +374,8 @@ _BUILTIN_KINDS = {
     "max": _FIRST,
     "min": _FIRST,
     "clamp": _FIRST,
+    "cw_div": _FIRST,
+    "cw_mul": _FIRST,
     "normalize": _FIRST,
     "cross": _VECTOR,
     "transform_point": _VECTOR,
@@ -404,6 +406,8 @@ _BUILTIN_KINDS = {
     "transform_multiply": _TRANSFORM,
 }
 _OPERATOR_FUNCTIONS = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div", ast.Mod: "mod"}
+# Warp builtins with several results, of float arguments: their C++ form takes the results as output arguments.
+_TUPLE_BUILTINS = {"eig3": (("wp::mat33", _MATRIX), ("wp::vec3", _VECTOR))}
 
 
 def _kind(annotation) -> str:
@@ -559,6 +563,9 @@ class _Renderer:
             self.emit(indent, f"return {self.expr(node.value)};")
 
     def render_assign(self, target, value, indent: str, node):
+        if isinstance(target, ast.Tuple) and self.tuple_builtin(value) is not None:
+            self.render_tuple_builtin(target, value, indent, node)
+            return
         if isinstance(target, ast.Tuple):
             callee = _law_of(self.resolve_call(value)) if isinstance(value, ast.Call) else None
             if callee is None or len(callee.results) != len(target.elts):
@@ -593,6 +600,32 @@ class _Renderer:
             self.declare(target.id, kind)
             return
         self.emit(indent, f"{self.target(target)[0]} = {text};")
+
+    @staticmethod
+    def tuple_builtin(value) -> str | None:
+        """The name of the tuple-valued Warp builtin ``value`` calls, if it calls one."""
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)):
+            return None
+        func = value.func
+        named = isinstance(func.value, ast.Name) and func.value.id == "wp" and func.attr in _TUPLE_BUILTINS
+        return func.attr if named else None
+
+    def render_tuple_builtin(self, target: ast.Tuple, value: ast.Call, indent: str, node):
+        """Declare the results of a tuple-valued builtin and pass them as its output arguments."""
+        name = self.tuple_builtin(value)
+        results = _TUPLE_BUILTINS[name]
+        if len(target.elts) != len(results) or not all(isinstance(element, ast.Name) for element in target.elts):
+            self.fail(node, f"wp.{name} binds {len(results)} names")
+        if value.keywords:
+            self.fail(node, "keyword arguments")
+        outputs = []
+        for element, (ctype, kind) in zip(target.elts, results, strict=True):
+            if not self.declared(element.id):
+                self.emit(indent, f"{ctype} {self.cname(element.id)};")
+                self.declare(element.id, kind)
+            outputs.append(self.cname(element.id))
+        arguments = [self.expr(argument) for argument in value.args] + outputs
+        self.emit(indent, f"wp::{name}({', '.join(arguments)});")
 
     def target(self, node) -> tuple[str, str]:
         """The C++ variable and kind an assignment updates: laws assign whole local values."""
