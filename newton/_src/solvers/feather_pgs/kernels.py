@@ -59,6 +59,7 @@ from .friction_patches import (
 )
 from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
+    ball,
     disk,
 )
 from .row_build import contact_torsion_mu, write_contact_row
@@ -3000,7 +3001,8 @@ def _transport_warmstart_contact(
     row_mu: wp.array2d[float],
     impulses: wp.array2d[float],
 ):
-    """Transport the cached tangent frame and enforce the current contact cone."""
+    """Transport the cached tangent frame and enforce the current contact cone: the disk, or with the contact's spin
+    row (contact torsion) the elliptic cone of the pair and the spin (:func:`.projection_laws.ball`)."""
     normal_impulse = impulses[world, slot]
     if not wp.isfinite(normal_impulse) or wp.dot(normal, previous_normal) <= 0.0:
         normal_impulse = 0.0
@@ -3023,6 +3025,18 @@ def _transport_warmstart_contact(
     tangent = wp.vec2(wp.dot(tangent_world, new_t0), wp.dot(tangent_world, new_t1))
     magnitude = wp.length(tangent)
     radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
+    spin = slot + CONTACT_SPIN_ROW
+    if spin < count and row_type[world, spin] == PGS_CONSTRAINT_TYPE_TORSION and row_parent[world, spin] == slot:
+        # The spin about the normal needs no frame transport: the pair and the spin project onto their cone.
+        triple = wp.vec3(tangent[0], tangent[1], impulses[world, spin])
+        if not wp.isfinite(magnitude) or not wp.isfinite(triple[2]) or normal_impulse <= 0.0:
+            triple = wp.vec3(0.0)
+        else:
+            triple = ball(triple, row_mu[world, slot + 1], row_mu[world, spin], normal_impulse)
+        impulses[world, slot + 1] = triple[0]
+        impulses[world, slot + 2] = triple[1]
+        impulses[world, spin] = triple[2]
+        return
     if not wp.isfinite(magnitude) or radius <= 0.0:
         tangent = wp.vec2(0.0)
     else:
@@ -3114,6 +3128,21 @@ def gather_mf_warmstart(
                 ):
                     mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
                 # else: leave 0
+    # The spin row (contact torsion): carried as the friction rows are.
+    new_r = new_slot + CONTACT_SPIN_ROW
+    prev_r = prev_slot + CONTACT_SPIN_ROW
+    if (
+        matched
+        and prev_slot >= 0
+        and new_r < count
+        and new_r < mf_max_c
+        and prev_r < mf_max_c
+        and mf.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and mf.row_parent[world, new_r] == new_slot
+        and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and prev_mf_row_parent[world, prev_r] == prev_slot
+    ):
+        mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
         _transport_warmstart_contact(
@@ -3229,6 +3258,21 @@ def gather_dense_warmstart(
                     and prev_dense_row_parent[world, prev_r] == prev_slot
                 ):
                     world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
+    # The spin row (contact torsion): carried as the friction rows are.
+    new_r = new_slot + CONTACT_SPIN_ROW
+    prev_r = prev_slot + CONTACT_SPIN_ROW
+    if (
+        matched
+        and prev_slot >= 0
+        and new_r < count
+        and new_r < max_constraints
+        and prev_r < max_constraints
+        and rows.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and rows.row_parent[world, new_r] == new_slot
+        and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and prev_dense_row_parent[world, prev_r] == prev_slot
+    ):
+        world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
         _transport_warmstart_contact(
