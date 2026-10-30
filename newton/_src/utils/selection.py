@@ -1978,8 +1978,7 @@ class ArticulationView:
         """Return the Model articulation mask for an evaluation, or ``None`` if it selects every articulation.
 
         A view of every Model articulation selects them all by default, and the
-        unmasked evaluation then gives the same values while clearing whole
-        buffers with one memset instead of a kernel over every block.
+        unmasked evaluation then gives the same values without a mask to read.
         """
         if mask is None and self.count == self.model.articulation_count:
             return None
