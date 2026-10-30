@@ -826,10 +826,10 @@ def _sweep_record(**fields):
 def _policy_solver(*, readout="sweeps", skipped=("position",), **attributes):
     """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
     return SimpleNamespace(
-        pgs_solve_readout=readout,
         _solve_policy=SolvePolicy(readout=readout),
         _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, skipped_passes=tuple(skipped)),
         **attributes,
+        options=SimpleNamespace(pgs_solve_readout=readout),
     )
 
 

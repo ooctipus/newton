@@ -33,9 +33,9 @@ LANES = 32
 RESOLVED_WORLD_INPUT = (
     Field("world_dof_indices", wp.int32, ("world", "world_dof"), owner="forest"),
     Field("world_dof_count", wp.int32, ("world",), owner="forest"),
-    Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
+    Field("limit_q_index", wp.int32, ("dof",), owner="laws", attr="joint_limit_q_index"),
+    Field("lower", wp.float32, ("dof",), owner="laws", attr="_joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="laws", attr="_joint_limit_upper"),
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
     Field("v_hat", wp.float32, ("dof",)),
     Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
@@ -59,11 +59,11 @@ RESOLVED_WORLD_INPUT = (
     Field("predicted_twist", wp.spatial_vector, ("body",), owner="classifier", attr="twists"),
     Field("use_published", wp.int32, owner="classifier", attr="published"),
     Field("dt", wp.float32, owner="step"),
-    Field("beta", wp.float32, attr="pgs_beta"),
-    Field("speculative_scale", wp.float32, attr="contact_speculative_scale"),
-    Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
-    Field("restitution_threshold", wp.float32, attr="_effective_restitution_velocity_threshold"),
-    Field("shared_anchor", wp.int32, attr="contact_shared_anchor"),
+    Field("beta", wp.float32, owner="options", attr="pgs_beta"),
+    Field("speculative_scale", wp.float32, owner="options", attr="contact_speculative_scale"),
+    Field("activation_gap", wp.float32, owner="options", attr="joint_limit_activation_gap"),
+    Field("restitution_threshold", wp.float32, owner="laws", attr="effective_restitution_velocity_threshold"),
+    Field("shared_anchor", wp.int32, owner="options", attr="contact_shared_anchor"),
     Field("absolute_margin", wp.float32, owner="classifier"),
     Field("relative_margin", wp.float32, owner="classifier"),
 )
@@ -81,8 +81,8 @@ RAW_CONTACTS = (
     Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
     Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
     Field("shape_body", wp.int32, ("shape",), owner="model"),
-    Field("shape_mu", wp.float32, ("shape",), attr="shape_material_mu"),
-    Field("shape_restitution", wp.float32, ("shape",), attr="shape_material_restitution"),
+    Field("shape_mu", wp.float32, ("shape",), owner="laws", attr="shape_material_mu"),
+    Field("shape_restitution", wp.float32, ("shape",), owner="laws", attr="shape_material_restitution"),
 )
 """The collision pipeline's contacts and the shapes' bodies and materials, before any row exists."""
 
@@ -656,17 +656,15 @@ def decline(solver) -> str | None:
     connect, drives, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
-    laws = solver._laws
+    laws = solver.laws.set
     exact = {
-        "_mimic_count": 0,
-        "_connect_count": 0,
         "_preelim_count": 0,
         "_sparse_mass_matrix_size": None,
         "_keyed_rows": None,
-        "drive_slot": None,
     }
+    # No mimic, connect or drive rows.
+    laws_exact = {"mimic_count": 0, "connect_count": 0, "drive_slot": None}
     false = (
-        "enable_bilateral_preelimination",
         "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
@@ -692,10 +690,12 @@ def decline(solver) -> str | None:
                 and not laws.regularized
                 and not laws.velocity_limits
                 and all(getattr(solver, name, object()) == value for name, value in exact.items())
+                and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
+                and solver.options.enable_bilateral_preelimination is False
                 and all(getattr(solver, name, None) is False for name in false)
                 and (solver.forest.max_world_dofs or 33) <= 32
                 and all(getattr(solver.forest, name) is not None for name in required)
-                and getattr(solver, "_joint_limit_q_index", None) is not None,
+                and solver.laws.joint_limit_q_index is not None,
                 "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
                 "regularization, device or world width).",
             ),
@@ -719,7 +719,7 @@ class ResolvedWorlds:
         self.solver = solver
         declined = decline(solver)
         self.enabled = declined is None
-        if self.enabled and not solver._laws.point:
+        if self.enabled and not solver.laws.set.point:
             self.reason = (
                 "Admitted: interleaved matrix-free patch-friction rows whose kinds are all unilateral; a world "
                 "resolves only if its checked rows fit every contact route."
@@ -736,7 +736,7 @@ class ResolvedWorlds:
         # matrix-free capacities (finalize_resolved_worlds_bounded); point friction
         # keeps no such bound.
         self.row_bound = None
-        if self.enabled and not solver._laws.point:
+        if self.enabled and not solver.laws.set.point:
             self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
         device = solver.model.device
         worlds = solver.forest.world_count if self.enabled else 0
@@ -777,14 +777,16 @@ class ResolvedWorlds:
         # Absent rigid-body speed limits read as unbounded.
         limits = {
             name: self.unbounded
-            if getattr(solver, "rigid_body_" + name) is None
-            else getattr(solver, "rigid_body_" + name)
+            if getattr(solver.laws, "rigid_body_" + name) is None
+            else getattr(solver.laws, "rigid_body_" + name)
             for name in ("max_linear_velocity", "max_angular_velocity", "max_depenetration_velocity")
         }
         data = field_group.bind(
             ResolvedWorldInput,
             solver=solver,
             forest=solver.forest,
+            laws=solver.laws,
+            options=solver.options,
             model=solver.model,
             state_in=state_in,
             state_aug=state_aug,
@@ -792,7 +794,7 @@ class ResolvedWorlds:
             classifier=self,
             dt=dt,
         )
-        raw = field_group.bind(RawContacts, solver=solver, model=solver.model, contacts=contacts)
+        raw = field_group.bind(RawContacts, solver=solver, laws=solver.laws, model=solver.model, contacts=contacts)
         pool = solver._contact_pool
         launch(
             data,

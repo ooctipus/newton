@@ -53,12 +53,12 @@ _SUPPORTED_TYPES = (
 )
 
 
-def configure_contact_torsion(solver, radius, indices, patterns):
-    """Validate the experimental opt-in and resolve stable shape-name selectors."""
+def configure_contact_torsion(laws, radius, indices, patterns):
+    """Validate the experimental opt-in and resolve stable shape-name selectors into the row laws' tables."""
     radius = float(radius)
     if not np.isfinite(radius) or radius < 0:
         raise ValueError("contact_torsion_radius must be finite and non-negative [m]")
-    if radius > 0 and solver.contact_compliance:
+    if radius > 0 and laws.options.contact_compliance:
         raise ValueError("contact_torsion_radius > 0 is not validated with contact_compliance")
     if indices is not None and patterns is not None:
         raise ValueError("Use either contact_torsion_shape_indices or contact_torsion_shape_patterns")
@@ -66,8 +66,7 @@ def configure_contact_torsion(solver, radius, indices, patterns):
     if indices is not None:
         indices = tuple(indices)
         if any(
-            not isinstance(i, Integral) or isinstance(i, bool) or i < 0 or i >= solver.model.shape_count
-            for i in indices
+            not isinstance(i, Integral) or isinstance(i, bool) or i < 0 or i >= laws.model.shape_count for i in indices
         ):
             raise ValueError("contact_torsion_shape_indices contains invalid global shape indices")
         indices = tuple(int(i) for i in indices)
@@ -84,42 +83,43 @@ def configure_contact_torsion(solver, radius, indices, patterns):
                 regex = re.compile(pattern)
             except re.error as error:
                 raise ValueError("Invalid contact_torsion_shape_patterns regex") from error
-            matches = set(match_labels(solver.model.shape_label, regex))
+            matches = set(match_labels(laws.model.shape_label, regex))
             if not matches:
                 raise ValueError(f"contact_torsion_shape_patterns matched no shapes: {pattern!r}")
             selected.update(matches)
         selected = frozenset(selected)
     if radius > 0 and selected is not None:
-        types = solver.model.shape_type.numpy()
+        types = laws.model.shape_type.numpy()
         unsupported = [i for i in selected if types[i] not in _SUPPORTED_TYPES]
         if unsupported:
             raise ValueError(f"Unsupported contact torsion shape indices: {unsupported}")
-    solver._contact_torsion_radius = radius
-    solver._contact_torsion_enabled = radius > 0
-    solver._contact_torsion_shape_indices = indices
-    solver._contact_torsion_shape_patterns = patterns
-    solver._contact_torsion_shape_set = selected
-    solver._torsion_stats = {}
+    laws.contact_torsion_radius = radius
+    laws.contact_torsion_enabled = radius > 0
+    laws.contact_torsion_shape_indices = indices
+    laws.contact_torsion_shape_patterns = patterns
+    laws.contact_torsion_shape_set = selected
+    laws.torsion_stats = {}
     if radius > 0:
-        _validate_torsion_mode(solver)
+        _validate_torsion_mode(laws)
 
 
-def _validate_torsion_mode(solver):
-    """Reject unsupported construction and runtime mode combinations."""
+def _validate_torsion_mode(laws):
+    """Reject unsupported construction and runtime mode combinations (of the row laws' options)."""
+    options = laws.options
     if (
-        not solver.model.device.is_cuda
-        or solver.model.requires_grad
-        or solver.pgs_schedule != "interleaved"
-        or solver.pgs_warmstart
-        or solver.pgs_debug
-        or solver.contact_compliance
-        or not solver.enable_contact_friction
+        not laws.model.device.is_cuda
+        or laws.model.requires_grad
+        or options.pgs_schedule != "interleaved"
+        or options.pgs_warmstart
+        or options.pgs_debug
+        or options.contact_compliance
+        or not options.enable_contact_friction
     ):
         raise ValueError(
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
             "interleaved, without warmstart, compliance, or debug"
         )
-    if solver.pgs_velocity_iterations > 0 and solver.enable_bilateral_preelimination:
+    if options.pgs_velocity_iterations > 0 and options.enable_bilateral_preelimination:
         raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
@@ -192,11 +192,11 @@ def _contact_groups(solver, state, contacts):
     row_types = solver.row_type.numpy()
     parents = solver.row_parent.numpy()
     row_counts = solver.constraint_count.numpy()
-    patches = bool(solver._friction_anchors_enabled)
-    owners = solver._friction_patches.current.owner.numpy()[:count] if patches else None
+    patches = bool(solver.laws.friction_anchors_enabled)
+    owners = solver.laws.friction_patches.current.owner.numpy()[:count] if patches else None
     groups = {}
     rejected = set()
-    selected = solver._contact_torsion_shape_set
+    selected = solver.laws.contact_torsion_shape_set
     admitted = 0
     for c in range(count):
         world, slot = int(worlds[c]), int(slots[c])
@@ -288,7 +288,7 @@ def _group_budget(solver, group, row_mu):
     if not anchors or not touching:
         return None
     coefficient = float(row_mu[group[0].world, anchors[0].slot + 1])
-    if solver._friction_anchors_enabled:
+    if solver.laws.friction_anchors_enabled:
         coefficient *= len(anchors)
     if coefficient <= 0:
         return None
@@ -297,7 +297,7 @@ def _group_budget(solver, group, row_mu):
 
 def validate_torsion_step(solver):
     """Reject incompatible runtime state before any solver stage consumes it."""
-    _validate_torsion_mode(solver)
+    _validate_torsion_mode(solver.laws)
     if capturing(solver.model.device):
         device = getattr(solver, "_device_torsion", None)
         if device is None or not device.deferred_errors:
@@ -382,7 +382,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     if getattr(solver, "_device_torsion", None) is not None:
         solver._device_torsion.prepare(state, augmented_state, contacts)
         return
-    solver._torsion_stats = {"rows": 0, "groups": []}
+    solver.laws.torsion_stats = {"rows": 0, "groups": []}
     if contacts is None:
         return
     # The allocator rolls counters back on failure; count <= capacity cannot
@@ -442,7 +442,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
         # The sweep reads the group's coefficient from its own row; anchor tangent
         # rows carry it divided by the anchor count under persistent patches.
         fields["row_mu"][world, row] = coefficient
-        fields["row_cfm"][world, row] = solver.pgs_cfm
+        fields["row_cfm"][world, row] = solver.options.pgs_cfm
         for witness in group:
             membership[world, witness.slot] = row
         normal = lead.normal
@@ -474,7 +474,7 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
                     if 0 <= local < size:
                         rows[index, row, first + local] += sign * _dot3(normal, motions[global_dof, 3:])
                 joint = int(ancestor[joint])
-        solver._torsion_stats["groups"].append(
+        solver.laws.torsion_stats["groups"].append(
             {
                 "world": int(world),
                 "row": row,
@@ -486,8 +486,8 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
                 "gap_max_m": max(w.gap for w in touching),
             }
         )
-    solver._torsion_stats["rows"] = len(solver._torsion_stats["groups"])
-    if not solver._torsion_stats["rows"]:
+    solver.laws.torsion_stats["rows"] = len(solver.laws.torsion_stats["groups"])
+    if not solver.laws.torsion_stats["rows"]:
         return
     for name, values in fields.items():
         getattr(solver, name).assign(values)

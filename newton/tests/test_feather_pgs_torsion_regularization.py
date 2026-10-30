@@ -36,13 +36,13 @@ class TestTorsionRegularization(unittest.TestCase):
         reach = response != 0.0
         rows = np.count_nonzero(reach[types != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT], axis=0)
         pairs = sum(
-            reach[n + 1] | reach[n + 2] for group in solver._torsion_stats["groups"] for n in group["anchor_rows"]
+            reach[n + 1] | reach[n + 2] for group in solver.laws.torsion_stats["groups"] for n in group["anchor_rows"]
         )
-        adds = solver.pgs_iterations * (rows + pairs)
+        adds = solver.options.pgs_iterations * (rows + pairs)
         magnitude = np.maximum(np.abs(result["v_hat"]), np.abs(expected)).astype(np.float32)
         np.testing.assert_array_less(np.abs(result["v_out"] - expected), adds * np.spacing(magnitude) / 2 + 2e-5)
-        self.assertTrue(solver._torsion_stats["groups"])
-        for group in solver._torsion_stats["groups"]:
+        self.assertTrue(solver.laws.torsion_stats["groups"])
+        for group in solver.laws.torsion_stats["groups"]:
             load = sum(max(float(impulses[n]), 0.0) for n in group["normal_rows"])
             sliding = sum(float(np.linalg.norm(impulses[n + 1 : n + 3])) for n in group["anchor_rows"])
             spin = abs(float(impulses[group["row"]])) / group["effective_radius_m"]
@@ -60,7 +60,7 @@ class TestTorsionRegularization(unittest.TestCase):
                     pgs_iterations=16,
                     pgs_contact_regularization=regularization,
                 )
-                group = solver._torsion_stats["groups"][0]
+                group = solver.laws.torsion_stats["groups"][0]
                 impulse = result["impulses"][0]
                 # Two equal 0.3kg bodies close at 0.1m/s each: rigid lambda=.03Ns.
                 normal = sum(float(impulse[n]) for n in group["normal_rows"])
@@ -137,7 +137,7 @@ class TestTorsionRegularization(unittest.TestCase):
                     )
             contacts.rigid_contact_count.zero_()
             solver.step(initial, model.state(), model.control(), contacts, dt)
-            self.assertEqual(solver._torsion_stats["rows"], 0)
+            self.assertEqual(solver.laws.torsion_stats["rows"], 0)
 
 
 if __name__ == "__main__":

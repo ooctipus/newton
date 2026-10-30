@@ -133,7 +133,7 @@ def _permuted_slots(solver, contacts, shift):
         contact_path=solver.contact_path,
         contact_world=solver.contact_world,
         contact_slots_needed=solver.contact_slots_needed,
-        _friction_patches=solver._friction_patches,
+        laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
         _sparse_mass_matrix_size=None,
         _matrix_free=solver._matrix_free,
         # The bodies' factors, which whitened the rows.
@@ -369,8 +369,8 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             standing=True,
             device="cpu",
         )
-        solver, patches = case[1], case[1]._friction_patches
-        decay = solver.pgs_warmstart_decay
+        solver, patches = case[1], case[1].laws.friction_patches
+        decay = solver.options.pgs_warmstart_decay
 
         def seeded_step():
             with recorded_patch_seeds() as seeds:

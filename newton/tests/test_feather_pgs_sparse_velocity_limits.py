@@ -34,7 +34,12 @@ from newton.tests.feather_pgs_patch_parity import (
     contact_rows,
 )
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
-from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _ForestProbe, _TopologyReached
+from newton.tests.test_feather_pgs_sparse_research_admission import (
+    _change,
+    _eligible_solver,
+    _ForestProbe,
+    _TopologyReached,
+)
 
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
@@ -48,10 +53,10 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         warm_starts = ({}, {"pgs_warmstart": True})
         for patches, warm_start in itertools.product((False, True), warm_starts):
             solver = _eligible_solver()
-            solver.enable_joint_velocity_limits = True
-            solver._friction_anchors_enabled = patches
+            solver.options.enable_joint_velocity_limits = True
+            solver.laws.friction_anchors_enabled = patches
             for key, value in warm_start.items():
-                setattr(solver, key, value)
+                _change(solver, key, value)
             with (
                 self.subTest(patches=patches, warm_start=warm_start),
                 mock.patch.dict(os.environ, {}, clear=True),
@@ -73,9 +78,9 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
-                solver.enable_joint_velocity_limits = True
+                solver.options.enable_joint_velocity_limits = True
                 for key, value in changes.items():
-                    setattr(solver, key, value)
+                    _change(solver, key, value)
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertFalse(solver._sparse_velocity_limits)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
@@ -363,13 +368,13 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
         np.testing.assert_array_equal(candidate[1]._sparse_mass_matrix_status.numpy(), 0)
-        if candidate[1]._friction_anchors_enabled:
+        if candidate[1].laws.friction_anchors_enabled:
             # Called unbound so that suites reusing this check (mimic rows) inherit it.
             TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
 
     def _assert_patch(self, reference, candidate):
         """Match patch rows and contact impulses, the pooled Coulomb bound and the anchor lifecycle."""
-        self.assertTrue(reference[1]._friction_anchors_enabled)
+        self.assertTrue(reference[1].laws.friction_anchors_enabled)
         # Keyed by contact: ring parents and patch rows are slots of per-world atomic reservations.
         rows = contact_rows(reference[1], reference[-1])
         candidate_rows = contact_rows(candidate[1], candidate[-1])
@@ -391,7 +396,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             np.testing.assert_allclose(jacobian, old_j[world, :count], atol=3e-5, rtol=3e-4)
             np.testing.assert_allclose(z @ z.T, old_j[world, :count] @ old_y[world, :count].T, atol=3e-5, rtol=3e-4)
             # Patch ring parents name other contacts' slots; _assert_patch compares them by contact.
-            for name in ("row_type",) if old._friction_anchors_enabled else ("row_type", "row_parent"):
+            for name in ("row_type",) if old.laws.friction_anchors_enabled else ("row_type", "row_parent"):
                 np.testing.assert_array_equal(
                     getattr(new, name).numpy()[world, :count], getattr(old, name).numpy()[world, :count]
                 )
@@ -509,7 +514,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                 self.assertFalse(reference[1]._sparse_velocity_limits)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
                 self.assertTrue(candidate[1]._matrix_free)
-                self.assertEqual(candidate[1].pgs_iterations, 8)
+                self.assertEqual(candidate[1].options.pgs_iterations, 8)
                 for step in range(4):
                     sparse_scene.step(reference)
                     sparse_scene.step(candidate)
@@ -579,10 +584,10 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     sparse_scene.step(candidate)
                     self._assert_state(reference, candidate)
                     np.testing.assert_array_equal(
-                        candidate[1].velocity_limit_slot.numpy(), reference[1].velocity_limit_slot.numpy()
+                        candidate[1].laws.velocity_limit_slot.numpy(), reference[1].laws.velocity_limit_slot.numpy()
                     )
                 if np.isinf(fraction):
-                    np.testing.assert_array_equal(candidate[1].velocity_limit_slot.numpy(), -1)
+                    np.testing.assert_array_equal(candidate[1].laws.velocity_limit_slot.numpy(), -1)
 
 
 if __name__ == "__main__":

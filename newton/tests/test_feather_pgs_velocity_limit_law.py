@@ -31,6 +31,7 @@ import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.rows import RowLaws
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_rows
@@ -150,7 +151,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
     def test_solver_passes_its_law_to_every_sweep_it_builds(self):
         """Pass ``velocity_limit_law`` at every call of a sweep factory that takes one in the solver module.
 
-        The solver builds each matrix-free sweep with ``_velocity_limit_kernel_law()``, so its kernels apply the
+        The solver builds each matrix-free sweep with ``laws.velocity_limit_kernel_law()``, so its kernels apply the
         law that ``routes.velocity_limits.law`` reports. A call that omits the argument builds the stateless law
         under either option. A sweep built through ``_sweep_kernel(route, factory, ...)``, which applies the solve
         policy, is a call of its factory.
@@ -207,26 +208,24 @@ def _cpu_arm():
 
 
 def _law_probe(**changes):
-    """A stand-in with the attributes the sweep-law decision reads: a matrix-free solver with joint limits."""
-    probe = {
-        "_matrix_free": True,
+    """A stand-in for the row laws the sweep-law decision reads: a matrix-free solver's, with joint limits."""
+    options = {
         "pgs_schedule": "interleaved",
         "enable_joint_velocity_limits": True,
-        "_has_rigid_body_velocity_limits": False,
-        "free_rigid_body_count": 0,
         "velocity_limit_activation_fraction": 0.0,
         "velocity_limit_law": "accumulated",
     }
-    probe.update(changes)
-    # The forest plan's fact, beside the solver's options.
-    forest = SimpleNamespace(free_rigid_body_count=probe.pop("free_rigid_body_count"))
-    return SimpleNamespace(**probe, forest=forest)
+    laws = {"matrix_free": True, "has_rigid_body_velocity_limits": False}
+    forest = {"free_rigid_body_count": 0}
+    for name, value in changes.items():
+        (options if name in options else forest if name in forest else laws)[name] = value
+    return SimpleNamespace(**laws, options=SimpleNamespace(**options), forest=SimpleNamespace(**forest))
 
 
 class TestVelocityLimitLawOption(unittest.TestCase):
     def test_sweep_law_follows_the_schedule_and_the_rows(self):
         """Build the requested law where velocity-limit rows exist, except under PhysX's grasp schedule."""
-        decide = SolverFeatherPGS._velocity_limit_sweep_law
+        decide = RowLaws.velocity_limit_sweep_law
         for changes, law, words in (
             ({}, "accumulated", "velocity_limit_law='accumulated'"),
             ({"velocity_limit_law": "stateless"}, "stateless", "velocity_limit_law='stateless'"),
@@ -237,14 +236,14 @@ class TestVelocityLimitLawOption(unittest.TestCase):
             (
                 {
                     "enable_joint_velocity_limits": False,
-                    "_has_rigid_body_velocity_limits": True,
+                    "has_rigid_body_velocity_limits": True,
                     "free_rigid_body_count": 1,
                 },
                 "accumulated",
                 "velocity_limit_law=",
             ),
             ({"velocity_limit_activation_fraction": float("inf")}, "stateless", "No velocity-limit rows"),
-            ({"_matrix_free": False}, None, "CPU's split sweeps"),
+            ({"matrix_free": False}, None, "CPU's split sweeps"),
         ):
             with self.subTest(**{key: str(value) for key, value in changes.items()}):
                 probe = _law_probe(**changes)
@@ -261,8 +260,8 @@ class TestVelocityLimitLawOption(unittest.TestCase):
         model = _cpu_arm()
         default = SolverFeatherPGS(model)
         accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
-        self.assertEqual(default.velocity_limit_law, "stateless")
-        self.assertEqual(accumulated.velocity_limit_law, "accumulated")
+        self.assertEqual(default.options.velocity_limit_law, "stateless")
+        self.assertEqual(accumulated.options.velocity_limit_law, "accumulated")
         for solver, requested in ((default, "stateless"), (accumulated, "accumulated")):
             selected = solver.get_path_selection()
             self.assertEqual(

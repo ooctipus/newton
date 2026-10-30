@@ -27,58 +27,81 @@ class _ForestProbe(SimpleNamespace):
         raise _TopologyReached
 
 
-class _AdmissionProbe(SimpleNamespace):
-    # The row laws, from the probe's fields as Laws.build reads a solver's (a CUDA model without gradients).
+class _LawsProbe(SimpleNamespace):
+    """The probe's row-law tables, with the laws axis read from them and the probe's options as ``Laws.build`` reads
+    a solver's (a CUDA model without gradients)."""
+
     @property
-    def _laws(self):
+    def set(self):
+        options = self.options
         return Laws(
-            contact="patch" if self._friction_anchors_enabled else "point",
-            regularized=self._regularization_enabled,
-            torsion=self._contact_torsion_enabled,
-            compliance=self.contact_compliance,
+            contact="patch" if self.friction_anchors_enabled else "point",
+            regularized=self.regularization_enabled,
+            torsion=self.contact_torsion_enabled,
+            compliance=options.contact_compliance,
             limits=True,
-            velocity_limits=self.enable_joint_velocity_limits,
-            drives=self.drive_mode,
-            schedule=self.pgs_schedule,
-            velocity_pass=self.pgs_velocity_iterations != 0,
-            warm_start=self.pgs_warmstart,
-            debug_rows=self._debug_buffers_enabled,
-            preelimination=self._preelim_active,
-            mimic=bool(self._mimic_count),
-            connect=bool(self._connect_count),
+            velocity_limits=options.enable_joint_velocity_limits,
+            drives=options.drive_mode,
+            schedule=options.pgs_schedule,
+            velocity_pass=options.pgs_velocity_iterations != 0,
+            warm_start=options.pgs_warmstart,
+            debug_rows=options.pgs_debug,
+            preelimination=False,
+            mimic=bool(self.mimic_count),
+            connect=bool(self.connect_count),
             loops=self.forest.has_loop_joints,
-            iterations=self.pgs_iterations > 0,
+            iterations=options.pgs_iterations > 0,
             forward_cuda=True,
         )
 
+
+class _AdmissionProbe(SimpleNamespace):
     # Patch friction may run the parallel tiers, as point friction may.
     @property
     def _parallel_contact_paths(self):
-        return self._laws.agnostic
+        return self.laws.set.agnostic
 
 
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
-    return _AdmissionProbe(
-        _route_pins={},
+    forest = _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=False)
+    options = SimpleNamespace(
         pgs_schedule="interleaved",
         drive_mode="augmented",
-        _parallel_augmented_drive_topology=True,
         pgs_iterations=8,
         pgs_velocity_iterations=0,
         enable_joint_velocity_limits=False,
         pgs_warmstart=False,
-        _debug_buffers_enabled=False,
-        _regularization_enabled=False,
-        _preelim_active=False,
-        _contact_torsion_enabled=False,
-        _friction_anchors_enabled=False,
+        pgs_debug=False,
         contact_compliance=False,
-        _mimic_count=0,
-        _connect_count=0,
-        _sparse_diagonal_contact_solve=False,
-        forest=_ForestProbe(has_loop_joints=False, has_free_rigid_bodies=False),
     )
+    return _AdmissionProbe(
+        _route_pins={},
+        _parallel_augmented_drive_topology=True,
+        _preelim_active=False,
+        _sparse_diagonal_contact_solve=False,
+        forest=forest,
+        options=options,
+        laws=_LawsProbe(
+            options=options,
+            forest=forest,
+            regularization_enabled=False,
+            contact_torsion_enabled=False,
+            friction_anchors_enabled=False,
+            mimic_count=0,
+            connect_count=0,
+        ),
+    )
+
+
+def _change(solver, name, value):
+    """Set a probe's field: an option in its options record, its forest plan in both places that read it."""
+    if name == "forest":
+        solver.forest = solver.laws.forest = value
+    elif hasattr(solver.options, name):
+        setattr(solver.options, name, value)
+    else:
+        setattr(solver, name, value)
 
 
 def _branched_model(branches, depth, device):
@@ -140,7 +163,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertRaises(_TopologyReached),
             ):
                 solver = _eligible_solver()
-                solver._friction_anchors_enabled = anchors
+                solver.laws.friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_free_rigid_bodies_keep_the_dense_route(self):
@@ -149,7 +172,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
         for anchors in (False, True):
             with self.subTest(friction_anchors=anchors), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
-                solver._friction_anchors_enabled = anchors
+                solver.laws.friction_anchors_enabled = anchors
                 solver.forest.has_free_rigid_bodies = True
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
@@ -162,7 +185,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertRaises(_TopologyReached),
             ):
                 solver = _eligible_solver()
-                solver._friction_anchors_enabled = anchors
+                solver.laws.friction_anchors_enabled = anchors
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_a_tier_pin_keeps_dense_storage(self):
@@ -180,7 +203,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
-            solver._friction_anchors_enabled = True
+            solver.laws.friction_anchors_enabled = True
             solver.forest.has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)

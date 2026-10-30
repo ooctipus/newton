@@ -1448,7 +1448,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 )
 
                 self.assertIsNone(reference_solver._paired_response_primary_size)
-                self.assertEqual(paired_solver._friction_anchors_enabled, label == "patch")
+                self.assertEqual(paired_solver.laws.friction_anchors_enabled, label == "patch")
                 self.assertEqual(paired_solver._paired_response_primary_size, 23)
                 self.assertEqual(paired_solver._paired_response_secondary_size, 6)
                 self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
@@ -1533,18 +1533,18 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 mf_max_constraints=32,
                 friction_anchor_beta=0.0,
             )
-        self.assertTrue(solvers[0.0]._friction_anchors_enabled)
+        self.assertTrue(solvers[0.0].laws.friction_anchors_enabled)
         self.assertTrue(solvers[0.0]._paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
         self.assertFalse(solvers[0.0]._factor_coordinate_contact_triples)
         self.assertTrue(solvers[0.0]._factor_coordinate_contact_units)
         self.assertIn("_units", solvers[0.0]._paired_factor_solve_kernel.key)
         self.assertTrue(solvers[0.0].get_path_selection()["routes"]["paired_response"]["contact_units"])
-        self.assertFalse(point._friction_anchors_enabled)
+        self.assertFalse(point.laws.friction_anchors_enabled)
         self.assertTrue(point._paired_factor_coordinates)
         self.assertTrue(point._factor_coordinate_contact_triples)
         self.assertFalse(point._factor_coordinate_contact_units)
-        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertTrue(solvers[0.01].laws.contact_torsion_enabled)
         self.assertIsNotNone(solvers[0.01]._paired_response_primary_size)
         self.assertFalse(solvers[0.01]._paired_factor_coordinates)
         self.assertFalse(solvers[0.01]._factor_coordinate_contact_triples)
@@ -1645,7 +1645,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
-        self.assertTrue(general_solver._regularization_enabled)
+        self.assertTrue(general_solver.laws.regularization_enabled)
         self.assertFalse(general_solver._local_internal_fast_path)
         self.assertTrue(local_solver._local_internal_fast_path)
         owners = [sample[5] for sample in local]
@@ -1673,8 +1673,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
-        self.assertTrue(general_solver._friction_anchors_enabled)
-        self.assertTrue(local_solver._friction_anchors_enabled)
+        self.assertTrue(general_solver.laws.friction_anchors_enabled)
+        self.assertTrue(local_solver.laws.friction_anchors_enabled)
         self.assertFalse(general_solver._local_internal_fast_path)
         self.assertTrue(local_solver._local_internal_fast_path)
         self.assertIn(PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, [sample[5] for sample in local])
@@ -1778,7 +1778,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     contact_torsion_radius=radius,
                 )
         self.assertTrue(solvers[0.0]._local_internal_fast_path)
-        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertTrue(solvers[0.01].laws.contact_torsion_enabled)
         self.assertFalse(solvers[0.01]._local_internal_fast_path)
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")

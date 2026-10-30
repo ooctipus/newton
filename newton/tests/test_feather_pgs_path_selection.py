@@ -155,8 +155,7 @@ def _resting_arms_and_box(*links, device="cpu"):
 def _plan_stand_in(law, sizes=(108, 6), **attributes):
     """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
     values = {
-        "_friction_anchors_enabled": law == "patch",
-        "_laws": plain_laws(contact=law),
+        "laws": SimpleNamespace(friction_anchors_enabled=law == "patch", set=plain_laws(contact=law)),
         "forest": SimpleNamespace(size_groups=list(sizes)),
         "_row_packets": None,
         "_keyed_rows": None,
@@ -323,7 +322,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
-        solver.pgs_iterations = 3
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, pgs_iterations=3)
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
 
     def test_positional_options_warn_and_build_the_keyword_solver(self):
@@ -504,7 +503,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 sweeps = [key for key in keys if key in (dense, free_body)]
                 if sweep["driver"] == "split_interleaved":
                     # One one-iteration dense sweep, then one free-body sweep, per iteration.
-                    self.assertEqual(sweeps, [dense, free_body] * solver.pgs_iterations)
+                    self.assertEqual(sweeps, [dense, free_body] * solver.options.pgs_iterations)
                 else:
                     self.assertEqual(sweep["driver"], "dense_split")
                     self.assertEqual(sweeps, [dense] if free_body is None else [dense, free_body])
@@ -1253,7 +1252,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])
         self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
         for solver, contacts, _state in runs:
-            self.assertTrue(solver._friction_anchors_enabled)
+            self.assertTrue(solver.laws.friction_anchors_enabled)
             self.assertIsNone(solver._sparse_mass_matrix_size)
             self.assertIsNone(solver.get_path_selection()["routes"]["sweep"]["tiers"])
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)

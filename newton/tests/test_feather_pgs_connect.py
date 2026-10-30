@@ -153,7 +153,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
             solver.forest.loop_joint_articulation,
             np.array([-1, -1, -1, 0], dtype=np.int32),
         )
-        np.testing.assert_array_equal(solver._connect_art.numpy(), np.array([0], dtype=np.int32))
+        np.testing.assert_array_equal(solver.laws._connect_art.numpy(), np.array([0], dtype=np.int32))
 
     def test_standalone_world_root_is_not_loop_joint(self):
         """Do not treat an unrelated unowned world-root joint as a closure."""
@@ -174,7 +174,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(model)
         self.assertFalse(solver.forest.has_loop_joints)
-        self.assertEqual(solver._connect_count, 0)
+        self.assertEqual(solver.laws.connect_count, 0)
         np.testing.assert_array_equal(
             solver.forest.loop_joint_articulation,
             np.array([-1, -1], dtype=np.int32),
@@ -245,7 +245,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
         self.assertEqual(
-            getattr(solver, "_connect_count", 0),
+            solver.laws.connect_count,
             1,
             "closure row lost — loop joint attributed to the wrong articulation",
         )

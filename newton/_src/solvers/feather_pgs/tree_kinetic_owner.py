@@ -183,7 +183,7 @@ class TreeKineticState:
 
         self.sparse = sparse_owner
         self.solver = solver = sparse_owner.solver
-        self.motion_velocity = bool(solver.enable_joint_velocity_limits)
+        self.motion_velocity = bool(solver.options.enable_joint_velocity_limits)
         self._motion_binding = None
         model, device = solver.model, solver.model.device
         # Direct construction is also used by CPU physical representation tests.
@@ -532,7 +532,7 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic state excludes gradient/alternate augmented ownership")
         if self.admission is not None and not self.admission(self.solver):
             raise RuntimeError("Tree kinetic configuration changed; reconstruct and recapture")
-        if bool(self.solver.enable_joint_velocity_limits) != self.motion_velocity:
+        if bool(self.solver.options.enable_joint_velocity_limits) != self.motion_velocity:
             raise RuntimeError("Tree kinetic motion-velocity contract changed; reconstruct and recapture")
         if dt is None or not math.isfinite(dt) or dt <= 0:
             raise ValueError("Tree kinetic state requires a positive finite step duration")

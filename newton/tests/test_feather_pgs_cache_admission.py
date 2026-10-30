@@ -28,12 +28,12 @@ def _held_tree_solver(law):
     """Describe a dense-route solver that every other held-tree admission term accepts."""
     return SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
-        _laws=plain_laws(**_CONTACT_LAWS[law]),
         _sparse_mass_matrix_size=None,
         _fk_id_cache_available=True,
         _parallel_augmented_drive_topology=True,
         _compact_diagonal_mass_size=None,
         forest=SimpleNamespace(size_groups=[9]),
+        laws=SimpleNamespace(set=plain_laws(**_CONTACT_LAWS[law])),
     )
 
 
@@ -41,14 +41,12 @@ def _sparse_tree_solver(**changes):
     """Describe a native sparse route that every sparse tree-owner admission term accepts."""
     solver = SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
-        _laws=plain_laws(),
         _sparse_mass_matrix_size=18,
-        _mimic_count=0,
         _sparse_velocity_limits=False,
-        _mimic_valid_np=None,
         _fk_id_cache_available=True,
         _parallel_augmented_drive_topology=True,
         forest=SimpleNamespace(has_free_rigid_bodies=False, has_prescribed_response=False),
+        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, mimic_valid_np=None),
     )
     for name, value in changes.items():
         setattr(solver, name, value)
@@ -78,7 +76,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         seen = []
 
         def recording(solver, source):
-            seen.append((solver._laws.agnostic, solver._laws.point, solver._parallel_contact_paths))
+            seen.append((solver.laws.set.agnostic, solver.laws.set.point, solver._parallel_contact_paths))
             return setup(solver, source)
 
         with (
@@ -89,7 +87,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                     # Both laws are law-agnostic and may run the parallel tiers.
                     self.assertEqual(seen[-1], (True, law == "point", True))
-                    self.assertEqual(solver._laws.contact, law)
+                    self.assertEqual(solver.laws.set.contact, law)
 
 
 if __name__ == "__main__":

@@ -224,7 +224,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         for beta, point in ((None, False), (0.0, True)):
             with self.subTest(beta=beta):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                self.assertEqual(solver._laws.point, point)
+                self.assertEqual(solver.laws.set.point, point)
                 plan = contact_row_plan(solver)
                 self.assertEqual(plan.producer, "general")
                 self.assertEqual(plan.methods, {12: "masked_combined"})
@@ -523,7 +523,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 with mock.patch.dict(SolverFeatherPGS._route_pins, {"placement": "general"}):
                     reference = make_solver(**friction_kwargs)
                 self.assertTrue(optimized._sparse_diagonal_contact_solve)
-                self.assertEqual(optimized._friction_anchors_enabled, label == "patch")
+                self.assertEqual(optimized.laws.friction_anchors_enabled, label == "patch")
                 # Point contacts are uniform triples; patch contacts are units of one or three rows.
                 self.assertEqual(optimized._sparse_diagonal_contact_triples, label == "point")
                 self.assertEqual(optimized._sparse_diagonal_contact_units, label == "patch")
@@ -578,7 +578,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             for radius in (0.0, 0.01)
         }
         self.assertTrue(solvers[0.0]._sparse_diagonal_contact_solve)
-        self.assertTrue(solvers[0.01]._contact_torsion_enabled)
+        self.assertTrue(solvers[0.01].laws.contact_torsion_enabled)
         self.assertFalse(solvers[0.01]._sparse_diagonal_contact_solve)
         self.assertFalse(solvers[0.01]._sparse_diagonal_contact_triples)
 
@@ -629,7 +629,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         model.body_inertia.assign(body_inertia)
         model.body_com.assign(body_com)
         solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-        self.assertFalse(solver._step % solver.update_mass_matrix_interval == 0)
+        self.assertFalse(solver._step % solver.options.update_mass_matrix_interval == 0)
         masked = step()
 
         # Parallel-axis inertia about the hinge: 2 + m * 0.1^2 (+ armature).
@@ -638,7 +638,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         # The next global refresh must agree with the masked refresh.
         for _ in range(2):
             step()
-        self.assertTrue(solver._step % solver.update_mass_matrix_interval == 0)
+        self.assertTrue(solver._step % solver.options.update_mass_matrix_interval == 0)
         np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the CUDA trajectory requires CUDA")

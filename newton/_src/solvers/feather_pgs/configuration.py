@@ -5,9 +5,15 @@
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
+from .contact_unit import check_contact_update
 from .solve_policy import SOLVE_READOUTS
+from .velocity_limit_law import check_velocity_limit_law
+
+MAX_CONTACT_REGULARIZATION = 1.0e6
+"""The largest ``pgs_contact_regularization``: larger values are not numerically useful in the float32 solve."""
 
 
 def _finite_nonnegative(value: float) -> bool:
@@ -52,11 +58,87 @@ _CHOICE_RULES = (
 )
 
 
-def check_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the numeric options coerced to their types, after checking every option of the rule tables.
+# The switches the solver applies as booleans.
+_BOOLEANS = (
+    "contact_friction_shared_anchor",
+    "contact_friction_articulation_pairs_only",
+    "contact_shared_anchor",
+    "enable_bilateral_preelimination",
+    "bilateral_preelimination_include_mimics",
+    "enable_restitution",
+    "warn_constraint_overflow",
+    "pgs_warmstart",
+    "row_watermark",
+    "contact_compliance",
+)
+
+
+@dataclass(frozen=True)
+class Options:
+    """Every option of :class:`.SolverFeatherPGS`, as the solver applies it (:func:`check_options`).
+
+    Numbers are coerced and checked by the rule tables, choices checked, the switches of :data:`_BOOLEANS` made
+    booleans and ``pgs_velocity_iterations`` clamped at zero; every other option is as given.
+    ``friction_anchor_beta`` is the request (``None`` for the default): the row laws resolve it.
+    """
+
+    angular_damping: Any
+    update_mass_matrix_interval: Any
+    enable_contact_friction: Any
+    contact_friction_gap_threshold: Any
+    contact_friction_position_iterations: int
+    contact_friction_shared_anchor: bool
+    contact_friction_scale: float
+    contact_shared_anchor: bool
+    enable_joint_limits: Any
+    enable_bilateral_preelimination: bool
+    joint_limit_activation_gap: float
+    enable_joint_velocity_limits: Any
+    velocity_limit_activation_fraction: float
+    pgs_iterations: Any
+    pgs_velocity_iterations: int
+    pgs_beta: Any
+    pgs_cfm: Any
+    pgs_omega: Any
+    pgs_contact_regularization: float
+    pgs_velocity_drive_mode: str
+    dense_max_constraints: int
+    pgs_warmstart: bool
+    pgs_schedule: str
+    mf_max_constraints: int
+    nvtx: Any
+    pgs_debug: Any
+    drive_mode: str
+    row_watermark: bool
+    restitution_velocity_threshold: float
+    contact_speculative_scale: float
+    contact_gap_gate: float
+    contact_friction_articulation_pairs_only: bool
+    enable_restitution: bool
+    same_articulation_contact_gap_gate: float
+    articulation_pair_contact_gap_gate: float
+    pgs_warmstart_decay: float
+    warn_constraint_overflow: bool
+    friction_anchor_beta: Any
+    pgs_solve_readout: str
+    velocity_limit_law: str
+    contact_update: str
+    bilateral_preelimination_include_mimics: bool
+    contact_torsion_radius: Any
+    contact_torsion_shape_indices: Any
+    contact_torsion_shape_patterns: Any
+    contact_compliance: bool
+
+
+def check_options(options: Mapping[str, Any]) -> Options:
+    """Return every option as the solver applies it (:class:`Options`), after checking each.
+
+    Args:
+        options: The constructor's options by keyword (more keys are ignored).
 
     Raises:
-        ValueError: naming the first option, numbers first and in table order, that is not admissible.
+        ValueError: naming the first option, numbers first and in table order, then the choices, that is not
+            admissible, or a regularization above :data:`MAX_CONTACT_REGULARIZATION`.
     """
     checked = {}
     for name, coerce, admits, requirement, given in _NUMBER_RULES:
@@ -71,7 +153,17 @@ def check_options(options: Mapping[str, Any]) -> dict[str, Any]:
     for name, choices in _CHOICE_RULES:
         if options[name] not in choices:
             raise ValueError(f"{name} must be one of {choices}, got {options[name]!r}")
-    return checked
+    if checked["pgs_contact_regularization"] > MAX_CONTACT_REGULARIZATION:
+        raise ValueError(
+            f"pgs_contact_regularization must be at most {MAX_CONTACT_REGULARIZATION:g}; "
+            "larger values are not numerically useful in the float32 solve"
+        )
+    checked.update({name: bool(options[name]) for name in _BOOLEANS})
+    checked["pgs_velocity_iterations"] = max(int(options["pgs_velocity_iterations"]), 0)
+    checked["mf_max_constraints"] = int(options["mf_max_constraints"])
+    checked["velocity_limit_law"] = check_velocity_limit_law(options["velocity_limit_law"])
+    checked["contact_update"] = check_contact_update(options["contact_update"])
+    return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})
 
 
 # The kernels the CPU runs, and the choices a test pin may fix on CUDA.

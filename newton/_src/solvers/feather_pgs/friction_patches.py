@@ -123,7 +123,7 @@ class FrictionPatches:
 
 PATCH_ROW_LAW = (
     Field("patches", FrictionPatches, owner="friction_patches", attr="view"),
-    Field("beta", wp.float32, attr="friction_anchor_beta"),
+    Field("beta", wp.float32, owner="laws", attr="friction_anchor_beta"),
 )
 
 PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
@@ -146,7 +146,7 @@ def patch_row_law(solver) -> "PatchRowLaw":
     the contact's friction points instead of a patch friction location. Bound every step: contact-pool growth
     replaces the patch view.
     """
-    return field_group.bind(PatchRowLaw, solver=solver, friction_patches=solver._friction_patches)
+    return field_group.bind(PatchRowLaw, laws=solver.laws, friction_patches=solver.laws.friction_patches)
 
 
 @wp.func

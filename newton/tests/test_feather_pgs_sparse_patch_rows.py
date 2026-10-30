@@ -29,9 +29,9 @@ def _admission_probe(**changes):
     """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
     probe = SimpleNamespace(
         _route_pins={},
-        _friction_anchors_enabled=False,
         dense_max_constraints=256,
         forest=SimpleNamespace(max_world_dofs=18),
+        laws=SimpleNamespace(friction_anchors_enabled=False),
     )
     for name, value in changes.items():
         setattr(probe, name, value)
@@ -74,7 +74,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
             ({}, 0, False, False, "bitsets exceed shared memory"),
         ):
             with self.subTest(pins=pins, lanes=lanes, fits=fits):
-                probe = _admission_probe(_friction_anchors_enabled=True, _route_pins=pins)
+                probe = _admission_probe(laws=SimpleNamespace(friction_anchors_enabled=True), _route_pins=pins)
                 active, reason = _admit(probe, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
@@ -116,7 +116,7 @@ def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
         qd[model.joint_qd_start.numpy()[model.articulation_start.numpy()[slide_world]]] = speed
         state.joint_qd.assign(qd)
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    patches = solver._friction_patches
+    patches = solver.laws.friction_patches
     anchors, contact_counts, states = [], [], []
     for _ in range(steps):
         pipeline.collide(state, contacts)

@@ -186,7 +186,7 @@ class TestPatchMixedTreeSteps(TestMixedTreeSteps):
         """Add close contact impulses and the anchor lifecycle to the inherited physical checks."""
         super().assert_pair(cases)
         for case in cases:
-            self.assertTrue(case[1]._friction_anchors_enabled)
+            self.assertTrue(case[1].laws.friction_anchors_enabled)
             self.assertFalse(case[1]._point_contact_paths)
         # Per contact, within 5e-3 of its normal impulse: in the reordered fixture world 2's contact
         # slides off an impact at steps 9-13, where 1e-6 rounding moves the ordinary route's own
@@ -215,14 +215,14 @@ class TestPatchMixedTreeSteps(TestMixedTreeSteps):
         cases = [step(case) for case in cases]
         self.assert_pair(cases)
         for case in cases:
-            patches = case[1]._friction_patches
+            patches = case[1].laws.friction_patches
             self.assertGreater(np.count_nonzero(patches.view.weight.numpy()), 0)
             self.assertGreater(np.count_nonzero(patches.previous.valid.numpy()), 0)
             self.assertGreater(float(np.linalg.norm(patches.previous.tangent_impulse.numpy())), 0.0)
         cases = [step(case) for case in cases]
         self.assert_pair(cases)
         for case in cases:
-            self.assertTrue(np.any(case[1]._friction_patches.current.source.numpy() >= 0))
+            self.assertTrue(np.any(case[1].laws.friction_patches.current.source.numpy() >= 0))
 
 
 if __name__ == "__main__":

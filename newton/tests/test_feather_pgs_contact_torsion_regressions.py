@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise contact-torsion lifecycle and row-storage safety across steps."""
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -28,17 +29,17 @@ class TestContactTorsionRegressions(unittest.TestCase):
     def test_previous_friction_rows_are_not_current_rows(self):
         """Reject stale tangent metadata when a later step admits only a normal."""
         _, solver, model, initial, contacts = fixture(0.01, center_only=True)
-        self.assertEqual(solver._torsion_stats["rows"], 1)
-        solver.contact_friction_gap_threshold = -1.0
+        self.assertEqual(solver.laws.torsion_stats["rows"], 1)
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, contact_friction_gap_threshold=-1.0)
         solver.step(initial, model.state(), model.control(), contacts, 0.0025)
-        self.assertEqual(solver._torsion_stats["rows"], 0)
+        self.assertEqual(solver.laws.torsion_stats["rows"], 0)
 
     def test_both_tangent_rows_must_belong_to_current_normal(self):
         """Reject a missing or mismatched second tangent, not just the first."""
         for invalid in ("count", "type", "parent"):
             with self.subTest(invalid=invalid):
                 _, solver, _model, initial, contacts = fixture(0.01, center_only=True)
-                row = solver._torsion_stats["groups"][0]["normal_rows"][0]
+                row = solver.laws.torsion_stats["groups"][0]["normal_rows"][0]
                 if invalid == "count":
                     counts = solver.constraint_count.numpy()
                     counts[0] = row + 2
@@ -74,7 +75,7 @@ class TestContactTorsionRegressions(unittest.TestCase):
     def test_torsion_respects_relaxation(self):
         """Apply half the unconstrained spin correction at omega one half."""
         result, solver, *_ = fixture(100.0, center_only=True, pgs_iterations=1, pgs_omega=0.5)
-        self.assertEqual(solver._torsion_stats["rows"], 1)
+        self.assertEqual(solver.laws.torsion_stats["rows"], 1)
         spin = np.abs(result["v_out"].reshape(2, 6)[:, 5])
         np.testing.assert_allclose(spin, 0.5, atol=1e-4)
 

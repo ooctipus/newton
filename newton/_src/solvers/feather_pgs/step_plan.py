@@ -299,7 +299,7 @@ def _solve(solver) -> SolveRoute:
             "rebuilds the velocity, runs a one-iteration matrix-free sweep and adds its velocity change to "
             "the dense right-hand side.",
         )
-    elif dense_split and solver.pgs_debug:
+    elif dense_split and solver.options.pgs_debug:
         driver = Route(
             "debug_loop", "pgs_debug launches one dense iteration per dispatch and reads the impulses back after each."
         )
@@ -313,21 +313,21 @@ def _solve(solver) -> SolveRoute:
                 else "."
             ),
         )
-    elif solver.pgs_debug:
+    elif solver.options.pgs_debug:
         driver = Route(
             "debug_loop", "pgs_debug launches the position solve one iteration per dispatch with host reads."
         )
-    elif solver.contact_compliance:
+    elif solver.options.contact_compliance:
         driver = Route(
             "contact_compliance",
             "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
         )
-    elif route.name == "matrix_free_gs" and solver.pgs_schedule == "contact_then_internal":
+    elif route.name == "matrix_free_gs" and solver.options.pgs_schedule == "contact_then_internal":
         driver = Route(
             "contact_then_internal",
             "Contact rows sweep all iterations in one dispatch, then internal rows in a second.",
         )
-    elif route.name == "matrix_free_gs" and solver.pgs_schedule == "physx_grasp":
+    elif route.name == "matrix_free_gs" and solver.options.pgs_schedule == "physx_grasp":
         driver = Route(
             "physx_grasp", "Each iteration launches the drive and limit, contact and velocity-limit row phases in turn."
         )

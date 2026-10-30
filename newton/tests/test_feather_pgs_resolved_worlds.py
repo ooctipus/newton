@@ -381,8 +381,8 @@ class TestResolvedWorlds(unittest.TestCase):
         """Keep unsupported solvers disabled without raising or launching."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
-            _laws=plain_laws(forward_cuda=False),
             _route_pins={},
+            laws=SimpleNamespace(set=plain_laws(forward_cuda=False)),
         )
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)
@@ -469,9 +469,9 @@ class TestResolvedWorlds(unittest.TestCase):
         """Admit persistent patch friction on the dense route, not under torsion or compliance."""
         solver = _admissible_solver()
         self.assertTrue(rw.supported(solver))
-        solver._laws = plain_laws(torsion=True)
+        solver.laws.set = plain_laws(torsion=True)
         self.assertFalse(rw.supported(solver))
-        solver._laws = plain_laws(contact="patch")
+        solver.laws.set = plain_laws(contact="patch")
         self.assertTrue(rw.supported(solver))
         solver._sparse_mass_matrix_size = 23
         self.assertFalse(rw.supported(solver))
@@ -520,15 +520,10 @@ class TestResolvedWorlds(unittest.TestCase):
 def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     solver = SimpleNamespace(
-        _laws=plain_laws(),
-        _mimic_count=0,
-        _connect_count=0,
         _preelim_count=0,
         _sparse_mass_matrix_size=None,
         _keyed_rows=None,
-        drive_slot=None,
         model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
-        _joint_limit_q_index=1,
         _route_pins={},
         forest=SimpleNamespace(
             max_world_dofs=29,
@@ -537,9 +532,10 @@ def _admissible_solver():
             body_response_dof_mask=1,
             body_has_response_dofs=1,
         ),
+        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, connect_count=0, drive_slot=None, joint_limit_q_index=1),
+        options=SimpleNamespace(enable_bilateral_preelimination=False),
     )
     for name in (
-        "enable_bilateral_preelimination",
         "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
@@ -596,7 +592,7 @@ def _rollout(
     states[0].joint_qd.assign(qd)
     held = []
     if history is not None:
-        patches = solver._friction_patches
+        patches = solver.laws.friction_patches
         finish = patches.finish
 
         def finish_and_record(*args, **kwargs):
@@ -715,7 +711,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
                 solver, poses, masks = _rollout(
                     model, classifier=True, friction_anchor_beta=None, history=history, solver_kwargs=solver_kwargs
                 )
-                self.assertTrue(solver._friction_anchors_enabled)
+                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertIsNotNone(solver._resolved_worlds_owner)
                 self.assertEqual(
                     solver._resolved_worlds_owner.row_bound, (solver.dense_max_constraints, solver.mf_max_constraints)

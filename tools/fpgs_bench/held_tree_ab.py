@@ -54,6 +54,7 @@ record lacks an array the other holds.
 
 import argparse
 import contextlib
+import dataclasses
 import os
 import sys
 import unittest.mock
@@ -418,7 +419,9 @@ class Recorder:
             with unittest.mock.patch.dict(SolverFeatherPGS._route_pins, {"star": "held", "evaluator": "ordinary"}):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
-            solver.enable_joint_velocity_limits = owner_options.get("motion", False)
+            solver.options = solver.laws.options = dataclasses.replace(
+                solver.options, enable_joint_velocity_limits=owner_options.get("motion", False)
+            )
             admitted = held_tree.admitted
             if forest:
                 # Admission is CUDA-only; both arms lift it to build the forest group on any device.

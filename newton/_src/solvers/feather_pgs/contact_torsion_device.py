@@ -472,7 +472,7 @@ class DeviceTorsionPreparation:
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver.forest.world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
-        selected = solver._contact_torsion_shape_set
+        selected = solver.laws.contact_torsion_shape_set
         self.selected = wp.array(
             np.array([selected is None or i in selected for i in range(solver.model.shape_count)], dtype=np.int32),
             dtype=int,
@@ -586,7 +586,7 @@ class DeviceTorsionPreparation:
         if contacts.rigid_contact_max > self.capacity:
             raise ValueError("Contact torsion capacity mismatch; recreate the solver for the new contact buffer")
         stiffness = contacts.rigid_contact_stiffness
-        patches = s._friction_anchors_enabled
+        patches = s.laws.friction_anchors_enabled
         wp.launch(
             _gather,
             dim=self.capacity,
@@ -616,7 +616,7 @@ class DeviceTorsionPreparation:
                 s.row_parent,
                 s.constraint_count,
                 int(patches),
-                s._friction_patches.current.owner if patches else self._dummy_owner,
+                s.laws.friction_patches.current.owner if patches else self._dummy_owner,
                 w,
             ],
             device=device,
@@ -644,7 +644,7 @@ class DeviceTorsionPreparation:
             dim=self.capacity,
             inputs=[
                 w,
-                s.pgs_cfm,
+                s.options.pgs_cfm,
                 s.forest.body_to_articulation,
                 s.forest.prescribed_articulation,
                 augmented_state.body_v_s,
@@ -700,10 +700,10 @@ def enable_device_torsion(solver, *, deferred_errors=False):
     solver after fixing the input instead of reusing an invalid captured graph.
     Warm up one eager step before capturing, to allocate rollback buffers.
     """
-    if not solver._contact_torsion_enabled:
+    if not solver.laws.contact_torsion_enabled:
         raise ValueError("Enable a positive contact_torsion_radius before device preparation")
     if capturing(solver.model.device):
         raise RuntimeError("Configure device torsion before CUDA graph capture")
     solver._device_torsion = DeviceTorsionPreparation(solver, deferred_errors=deferred_errors)
-    solver._torsion_stats = {"device_resident": True, "rows": None, "groups": None}
+    solver.laws.torsion_stats = {"device_resident": True, "rows": None, "groups": None}
     return solver._device_torsion

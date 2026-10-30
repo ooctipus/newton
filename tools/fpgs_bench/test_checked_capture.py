@@ -210,12 +210,11 @@ def legacy_manager():
     """Build the audited legacy row flags and reset-each-call collision counters."""
     solver = fpgs()
     del solver.constraint_capacity_status, solver.check_constraint_capacity
-    solver.warn_constraint_overflow = solver._track_row_capacity = True
+    solver._track_row_capacity = True
+    solver.options = SimpleNamespace(warn_constraint_overflow=True, contact_compliance=False)
+    solver.laws = SimpleNamespace(friction_patches=SimpleNamespace(capacity=8), friction_anchor_beta=0.2)
     solver._row_overflow_warning_emitted = FlagArray([0, 0, 0])
     solver._max_contacts_alloc = 8
-    solver._friction_patches = SimpleNamespace(capacity=8)
-    solver.friction_anchor_beta = 0.2
-    solver.contact_compliance = False
     solver.contact_torsion_radius = 0.0
     pipeline = collision_pipeline()
     narrow = pipeline.narrow_phase
@@ -329,7 +328,7 @@ class TestLegacyCapacitySurvey(unittest.TestCase):
             elif failure == "contacts":
                 manager._contacts.rigid_contact_count.values[0] = 9
             else:
-                manager._solver._friction_patches.capacity = 4
+                manager._solver.laws.friction_patches.capacity = 4
             with self.subTest(failure=failure), patch.dict(os.environ, {"FPGS_BENCH_LEGACY_CAPACITY": "1"}):
                 with self.assertRaises(RuntimeError):
                     checked.check_solver("feather_pgs", manager._solver, entry)

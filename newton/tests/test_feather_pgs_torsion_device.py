@@ -132,9 +132,6 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         model=model,
         dense_max_constraints=dense,
         _max_contacts_alloc=capacity,
-        _contact_torsion_shape_set=None,
-        _friction_anchors_enabled=patches,
-        _friction_patches=SimpleNamespace(current=SimpleNamespace(owner=arr(owner, int))),
         contact_path=zero(capacity, int),
         contact_slot=arr(slots, int),
         contact_world=arr(world_ids, int),
@@ -147,7 +144,6 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         _row_sides=wp.zeros((worlds, dense), dtype=wp.vec2i, device=model.device),
         _row_dropped_dense=zero(worlds, int),
         _contact_torsion_group=full((worlds, dense), -1),
-        pgs_cfm=0.003,
         contact_torsion_radius=0.01,
         J_by_size={size: zero((worlds, dense, size)) for size in (3, 6)},
         forest=SimpleNamespace(
@@ -161,6 +157,12 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
             prescribed_articulation=arr(prescribed, int),
             group_to_art={size: arr(np.flatnonzero(response_sizes == size).astype(np.int32), int) for size in (3, 6)},
         ),
+        laws=SimpleNamespace(
+            contact_torsion_shape_set=None,
+            friction_anchors_enabled=patches,
+            friction_patches=SimpleNamespace(current=SimpleNamespace(owner=arr(owner, int))),
+        ),
+        options=SimpleNamespace(pgs_cfm=0.003),
     )
     # A size-group solver: the producers write each size group's rows (dense_rows.jacobian_row).
     solver.forest.size_groups = [3, 6]
@@ -231,9 +233,11 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 err_msg=f"J{size}",
             )
         stats = preparer.read_stats()
-        self.assertEqual(stats["rows"], expected._torsion_stats["rows"])
+        self.assertEqual(stats["rows"], expected.laws.torsion_stats["rows"])
         actual_groups = sorted(stats["groups"], key=lambda group: (group["world"], group["row"]))
-        expected_groups = sorted(expected._torsion_stats["groups"], key=lambda group: (group["world"], group["row"]))
+        expected_groups = sorted(
+            expected.laws.torsion_stats["groups"], key=lambda group: (group["world"], group["row"])
+        )
         for actual_group, expected_group in zip(actual_groups, expected_groups, strict=True):
             for name in expected_group:
                 np.testing.assert_allclose(actual_group[name], expected_group[name], rtol=2e-6, atol=2e-6)
@@ -336,7 +340,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                     points[:, 2] = 0.002
                     contacts.rigid_contact_point0.assign(points)
                 elif scenario == "selector":
-                    solver._contact_torsion_shape_set = {0}
+                    solver.laws.contact_torsion_shape_set = {0}
                 else:
                     # Adjacent normals match, but the endpoints do not. The
                     # greedy oracle tests every member, not only its seed.
@@ -502,7 +506,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                     row_watermark=True,
                     **PATCH_OPTIONS,
                 )
-                self.assertGreater(solver._connect_count, 0)
+                self.assertGreater(solver.laws.connect_count, 0)
                 if device_preparation:
                     enable_device_torsion(solver)
                 a, z = model.state(), model.state()

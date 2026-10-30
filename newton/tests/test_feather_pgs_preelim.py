@@ -3,6 +3,7 @@
 
 """Tests for bilateral (mimic + connect) pre-elimination in SolverFeatherPGS."""
 
+import dataclasses
 import inspect
 import unittest
 import warnings
@@ -35,9 +36,9 @@ class TestPreeliminationSignature(unittest.TestCase):
         model = newton.ModelBuilder().finalize(device="cpu")
         with self.assertWarnsRegex(DeprecationWarning, "'joint_limit_activation_gap' positionally"):
             solver = newton.solvers.SolverFeatherPGS(model, *arguments, bilateral_preelimination_include_mimics=False)
-        self.assertEqual(solver.joint_limit_activation_gap, 0.123)
-        self.assertIs(solver.enable_bilateral_preelimination, False)
-        self.assertIs(solver.bilateral_preelimination_include_mimics, False)
+        self.assertEqual(solver.options.joint_limit_activation_gap, 0.123)
+        self.assertIs(solver.options.enable_bilateral_preelimination, False)
+        self.assertIs(solver.options.bilateral_preelimination_include_mimics, False)
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
@@ -98,7 +99,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
                 self.assertTrue(np.isfinite(a).all())
                 np.testing.assert_array_equal(a, b)
         for solver in solvers:
-            self.assertTrue(solver.bilateral_preelimination_include_mimics)
+            self.assertTrue(solver.options.bilateral_preelimination_include_mimics)
             self.assertTrue(solver._preelim_active)
             count = int(solver._preelim_nB.numpy()[0])
             slots = solver._preelim_slots.numpy()[:count]
@@ -214,7 +215,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
-        solver.pgs_iterations = 0
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, pgs_iterations=0)
         pipeline.collide(state_0, contacts)
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)

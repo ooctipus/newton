@@ -461,19 +461,19 @@ def plan(solver):
     secondary articulation. Mimic rows belong to the primary alone.
     """
     sizes = sorted(int(size) for size in solver.forest.size_groups)
-    if not 1 <= len(sizes) <= 2 or len(solver._joint_limit_sizes) != 1:
+    if not 1 <= len(sizes) <= 2 or len(solver.laws.joint_limit_sizes) != 1:
         return None
-    primary = int(next(iter(solver._joint_limit_sizes)))
+    primary = int(next(iter(solver.laws.joint_limit_sizes)))
     if primary not in sizes or solver.forest.n_arts_by_size[primary] != solver.forest.world_count:
         return None
     secondary = next((size for size in sizes if size != primary), 0)
     if secondary and solver.forest.n_arts_by_size[secondary] != solver.forest.world_count:
         return None
-    if solver._mimic_sizes - {primary} or solver._connect_count:
+    if solver.laws.mimic_sizes - {primary} or solver.laws.connect_count:
         return None
     mimics = 0
-    if solver._mimic_art_start is not None and solver._mimic_art_list is not None:
-        starts = solver._mimic_art_start.numpy()
+    if solver.laws._mimic_art_start is not None and solver.laws._mimic_art_list is not None:
+        starts = solver.laws._mimic_art_start.numpy()
         mimics = int(np.max(np.diff(starts))) if len(starts) > 1 else 0
     if mimics + 2 * primary > solver._local_residual_max_rows:
         return None
@@ -488,19 +488,19 @@ def topology_supported(solver, primary, mimics):
         return False
     if np.any(solver._local_primary_articulation.numpy() < 0):
         return False
-    if solver._mimic_art_start is None or solver._mimic_art_list is None:
+    if solver.laws._mimic_art_start is None or solver.laws._mimic_art_list is None:
         return mimics == 0
     return validate_prefix_topology(
         solver.forest.group_to_art[primary].numpy(),
         solver.forest.art_to_world.numpy(),
         solver.forest.articulation_dof_start.numpy(),
-        solver._mimic_art_start.numpy(),
-        solver._mimic_art_list.numpy(),
-        solver._mimic_dof0.numpy(),
-        solver._mimic_dof1.numpy(),
+        solver.laws._mimic_art_start.numpy(),
+        solver.laws._mimic_art_list.numpy(),
+        solver.laws._mimic_dof0.numpy(),
+        solver.laws._mimic_dof1.numpy(),
         primary,
         mimics,
-        solver._mimic_world.numpy(),
+        solver.laws._mimic_world.numpy(),
     )
 
 
@@ -561,8 +561,10 @@ class LocalRowPackets:
             self.prefix,
             solver=solver,
             forest=solver.forest,
+            laws=solver.laws,
+            options=solver.options,
             model=solver.model,
-            mimics=solver,
+            mimics=solver.laws,
             mimic_model=solver.model,
             state_in=state_in,
             packets=self._packets,

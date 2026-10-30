@@ -179,7 +179,7 @@ def _over_budget_rows(model) -> int:
         max_world_dofs=probe.forest.max_world_dofs,
         max_row_dofs=probe._sparse_max_row_support,
         active_rows=probe._sparse_active_rows,
-        linked_rows=probe._friction_anchors_enabled,
+        linked_rows=probe.laws.friction_anchors_enabled,
     )
     budget = arch_budget(model.device.arch)
     low, high = 1, 1 << 16

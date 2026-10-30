@@ -3,6 +3,7 @@
 
 """Check explicit motion velocity without conflating raw-state force operands."""
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -26,7 +27,7 @@ def fixture(floating, device):
     for item in (solver, reference):
         # Exercise the motion/predictor kernels directly on CPU too; complete
         # velocity-limit solving remains CUDA/matrix-free and is tested below.
-        item.enable_joint_velocity_limits = True
+        item.options = item.laws.options = dataclasses.replace(item.options, enable_joint_velocity_limits=True)
         item._fk_id_cache_enabled = False
         item._passive_spring_stiffness.fill_(0.27)
         item._passive_spring_ref.fill_(-0.1)
@@ -100,8 +101,8 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 if exclude_driven:
                     slots = np.full(model.joint_dof_count, -1, dtype=np.int32)
                     slots[excluded] = 0
-                    reference._vel_limit_drive_slot_arg = wp.array(slots, dtype=int, device=device)
-                    reference._vel_limit_skip_driven = 1
+                    reference.laws.vel_limit_drive_slot_arg = wp.array(slots, dtype=int, device=device)
+                    reference.laws.vel_limit_skip_driven = 1
                 rng = np.random.default_rng(413)
                 raw = rng.uniform(-0.8, 0.8, model.joint_dof_count).astype(np.float32)
                 raw[count:] *= 0.03

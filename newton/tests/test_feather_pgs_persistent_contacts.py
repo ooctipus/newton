@@ -102,7 +102,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver._ws_prev_mf_impulses.assign(previous)
         # Seed both owners of the previous solve's tangent impulse. Persistent
         # anchors take precedence over the contact-matched cache when carried.
-        patches = solver._friction_patches
+        patches = solver.laws.friction_patches
         tangent, _ = contact_tangent_basis(-old_normal)
         tangent *= 0.5
         if patches.current.flipped.numpy()[0]:

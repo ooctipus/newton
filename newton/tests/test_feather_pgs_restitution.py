@@ -810,7 +810,7 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.6,
     )
     solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(solver.pgs_velocity_iterations, 0)
+    test.assertEqual(solver.options.pgs_velocity_iterations, 0)
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
     test.assertFalse(solver._debug_buffers_enabled)
     test.assertIsNone(solver._debug_position_v_out)
@@ -827,13 +827,13 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         restitution=0.0,
     )
     zero_solver = _make_solver(zero_model, velocity_iterations=0)
-    test.assertEqual(zero_solver.pgs_velocity_iterations, 0)
+    test.assertEqual(zero_solver.options.pgs_velocity_iterations, 0)
 
     zero_model.shape_material_restitution.fill_(0.6)
     zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
     default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
-    test.assertAlmostEqual(default_solver.restitution_velocity_threshold, 0.5)
+    test.assertAlmostEqual(default_solver.options.restitution_velocity_threshold, 0.5)
 
 
 def test_restitution_can_be_disabled_without_changing_materials(test, device):
@@ -844,9 +844,9 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
         enable_restitution=False,
         restitution_velocity_threshold=0.75,
     )
-    test.assertIs(solver.shape_material_restitution, model.shape_material_restitution)
-    test.assertAlmostEqual(solver.restitution_velocity_threshold, 0.75)
-    test.assertGreater(solver._effective_restitution_velocity_threshold, 1.0e30)
+    test.assertIs(solver.laws.shape_material_restitution, model.shape_material_restitution)
+    test.assertAlmostEqual(solver.options.restitution_velocity_threshold, 0.75)
+    test.assertGreater(solver.laws.effective_restitution_velocity_threshold, 1.0e30)
 
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT

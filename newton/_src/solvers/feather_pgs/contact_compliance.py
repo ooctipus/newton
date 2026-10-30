@@ -90,7 +90,7 @@ def validate_step(solver):
     if getattr(solver, "contact_torsion_radius", 0.0) > 0:
         raise ValueError("contact_compliance is not validated with contact_torsion_radius > 0")
     # The persistent-patch implementation allocates a dummy buffer even when OFF.
-    if getattr(solver, "friction_anchor_beta", 0.0) > 0 or getattr(solver, "_friction_anchors_enabled", False):
+    if solver.laws.friction_anchor_beta > 0 or solver.laws.friction_anchors_enabled:
         raise ValueError("contact_compliance is not validated with friction_anchor_beta > 0")
 
 
@@ -190,7 +190,7 @@ def _prepare_compliant_rows(self):
                 raise RuntimeError("Contact map no longer points to an effective MF normal row")
             self._compliant_mf_gamma[world, slot] = gamma
             self._compliant_mf_base[world, slot] = bias - (mf_target[world, slot] if mf_target is not None else 0.0)
-            mf_inv[world, slot] = 1.0 / (1.0 / mf_inv[world, slot] - self.pgs_cfm + gamma)
+            mf_inv[world, slot] = 1.0 / (1.0 / mf_inv[world, slot] - self.options.pgs_cfm + gamma)
             children = (mf_parent[world] == slot) & (mf_type[world] == 2)
             mf_mu[world, children] *= friction_weight
         active += 1
@@ -229,7 +229,7 @@ def solve(solver, *, iterations, friction_start_iteration, iteration_offset):
             dense_rhs=solver.rhs,
             mf_meta=solver.mf_meta_packed,
             iterations=1,
-            omega=solver.pgs_omega,
+            omega=solver.options.pgs_omega,
             friction_start_iteration=friction_start_iteration,
             iteration_offset=iteration_offset + iteration,
         )

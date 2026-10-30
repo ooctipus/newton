@@ -236,7 +236,7 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
             mf_max_constraints=32,
             pgs_warmstart=False,
         )
-        if solver.pgs_iterations != 8 or solver.pgs_velocity_iterations != 0:
+        if solver.options.pgs_iterations != 8 or solver.options.pgs_velocity_iterations != 0:
             raise AssertionError("Wrong actual iteration budget")
     return NS(
         case=case,

@@ -318,6 +318,8 @@ def run_candidate(data, aux, law=None):
 # Solver and forest-plan attributes that launch_contacts binds, by the struct field they fill.
 _LAUNCH_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "solver"}
 _FOREST_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "forest"}
+_LAWS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "laws"}
+_OPTIONS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "options"}
 
 
 def launch_solver(data, aux, *, anchors, beta=0.0):
@@ -335,9 +337,13 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
         L_by_size={6: data.factor},
         J_by_size={6: data.Z},
         _mark_independent_sparse_contact_candidates_kernel=object(),
-        _friction_anchors_enabled=anchors,
-        _friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
-        friction_anchor_beta=beta,
+        laws=SimpleNamespace(
+            **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},
+            friction_anchors_enabled=anchors,
+            friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
+            friction_anchor_beta=beta,
+        ),
+        options=SimpleNamespace(**{name: getattr(data, field) for name, field in _OPTIONS_FIELDS.items()}),
         # Launches sized by contact rows go through the pool, eagerly here.
         _contact_pool=ContactPool(device=aux.device, rows=16),
     )
@@ -594,7 +600,7 @@ def assert_patch_tangent_law(solver, contacts):
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
     path, needed = solver.contact_path.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
-    phi, beta, view = solver.phi.numpy(), solver.row_beta.numpy(), solver._friction_patches.view.phi.numpy()
+    phi, beta, view = solver.phi.numpy(), solver.row_beta.numpy(), solver.laws.friction_patches.view.phi.numpy()
     anchors = 0
     for c in range(count):
         if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
@@ -602,7 +608,7 @@ def assert_patch_tangent_law(solver, contacts):
         tangents = slice(int(slot[c]) + 1, int(slot[c]) + 3)
         np.testing.assert_array_equal(phi[world[c], tangents], view[c], err_msg=f"contact {c} phi")
         np.testing.assert_array_equal(
-            beta[world[c], tangents], np.float32(solver.friction_anchor_beta), err_msg=f"contact {c} beta"
+            beta[world[c], tangents], np.float32(solver.laws.friction_anchor_beta), err_msg=f"contact {c} beta"
         )
         anchors += 1
     return anchors
@@ -765,7 +771,7 @@ class TestCompactContact(unittest.TestCase):
                 # The contact input, the compact boundary and the row law: point friction is the patch law
                 # with beta 0 and a disabled view.
                 self.assertEqual(len(inputs), 3)
-                law, view = inputs[2], solver._friction_patches.view
+                law, view = inputs[2], solver.laws.friction_patches.view
                 self.assertEqual(law.beta, 0.375 if anchors else 0.0)
                 self.assertEqual(law.patches.enabled, int(anchors))
                 for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
@@ -1006,7 +1012,7 @@ class TestCompactContact(unittest.TestCase):
                         )
                     )
             for solver, enabled in zip(solvers, (False, True), strict=True):
-                self.assertTrue(solver._friction_anchors_enabled)
+                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertTrue(solver._sparse_diagonal_contact_units)
                 self.assertEqual(solver._compact_contact_boundary, enabled)
             records = check_compact_records(self, solvers, "patch")
@@ -1059,7 +1065,7 @@ class TestCompactContact(unittest.TestCase):
             # support's ring serial, in speculative batches.
             self.assertEqual(independent, [True] * len(solvers), "A patch ring must schedule independently")
             self.assertEqual(serial, [True] * len(solvers), "Patch rings on a coupled coordinate must stay serial")
-            self.assertTrue(solvers[0]._friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
+            self.assertTrue(solvers[0].laws.friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
 
     def test_cuda_complete_owners_and_two_graphs(self):
         """Check real device owners and repeated graph outputs without launching CUDA on CPU hosts."""

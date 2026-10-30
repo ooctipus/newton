@@ -346,11 +346,13 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         (TestFeatherPGSMixedTreePatchFixture), but a box yaw of 1e-6 rad moves
         it on CPU, changing validity bits while the twists still agree.
         """
-        self.assertEqual(owner_solver._friction_anchors_enabled, plain_solver._friction_anchors_enabled)
-        if not plain_solver._friction_anchors_enabled:
+        self.assertEqual(owner_solver.laws.friction_anchors_enabled, plain_solver.laws.friction_anchors_enabled)
+        if not plain_solver.laws.friction_anchors_enabled:
             return
         if loaded:
-            self.assertTrue(plain_solver._friction_patches.previous.valid.numpy().any(), "Resting boxes hold anchors")
+            self.assertTrue(
+                plain_solver.laws.friction_patches.previous.valid.numpy().any(), "Resting boxes hold anchors"
+            )
         assert_history_close(plain_solver, owner_solver)
 
     def test_free_body_group_matches_the_ordinary_route(self):
@@ -564,7 +566,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                     model, owner=False, friction_anchor_beta=beta, attrs=recipe
                 )
                 self.assertIsNone(plain_owner)
-                self.assertTrue(plain_solver.enable_joint_velocity_limits)
+                self.assertTrue(plain_solver.options.enable_joint_velocity_limits)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, attrs=recipe
                 )
@@ -606,7 +608,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                     model, owner=False, friction_anchor_beta=beta, swing_joint=1
                 )
                 self.assertIsNone(plain_owner)
-                self.assertEqual(int(plain_solver._mimic_count), model.world_count)
+                self.assertEqual(int(plain_solver.laws.mimic_count), model.world_count)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, swing_joint=1
                 )
@@ -712,7 +714,7 @@ def _box_anchor_corners(model, solver, contacts, box=4):
     count = int(contacts.rigid_contact_count.numpy()[0])
     bodies_per_world = model.body_count // model.world_count
     shape_body = model.shape_body.numpy()
-    carriers = np.flatnonzero(solver._friction_patches.view.weight.numpy()[:count] > 0.0)
+    carriers = np.flatnonzero(solver.laws.friction_patches.view.weight.numpy()[:count] > 0.0)
     corners = [set() for _ in range(model.world_count)]
     for shapes, points in (
         (contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_point0.numpy()),
@@ -752,12 +754,12 @@ class TestFeatherPGSMixedTreePatchFixture(unittest.TestCase):
 
             def observe(solver, contacts, model=model, corners=corners, valid=valid):
                 corners.append(_box_anchor_corners(model, solver, contacts))
-                valid.append(solver._friction_patches.previous.valid.numpy().copy())
+                valid.append(solver.laws.friction_patches.previous.valid.numpy().copy())
 
             solver, _owner, _trajectory, final_qd = _rollout(
                 model, owner=False, friction_anchor_beta=0.2, observe=observe
             )
-            self.assertEqual(solver.pgs_iterations, PATCH_PARITY_ITERATIONS)
+            self.assertEqual(solver.options.pgs_iterations, PATCH_PARITY_ITERATIONS)
             histories.append(valid)
             if mass_scale != 1.0:
                 continue

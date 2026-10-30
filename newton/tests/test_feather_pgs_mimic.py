@@ -100,8 +100,8 @@ class TestFeatherPGSMimic(unittest.TestCase):
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model)
 
-        self.assertEqual(solver._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
-        self.assertEqual(solver._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
+        self.assertEqual(solver.laws._mimic_art_start.numpy().tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(solver.laws._mimic_art_list.numpy().tolist(), [0, 1, 2, 3])
 
     def test_disabled_mimic_is_ignored(self):
         """Verify a disabled mimic constraint leaves the follower joint uncoupled."""

@@ -440,11 +440,11 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 owner = SimpleNamespace(
                     model=SimpleNamespace(articulation_count=3, device=wp.get_device("cpu")),
                     _step=step,
-                    update_mass_matrix_interval=2,
                     _force_mass_update=force,
                     _tree_kinetic_state=SimpleNamespace(refresh=calls.append),
                     _mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
+                    options=SimpleNamespace(update_mass_matrix_interval=2),
                 )
                 SolverFeatherPGS._stage1_crba(owner, owner, None)
                 self.assertEqual(calls, [owner])

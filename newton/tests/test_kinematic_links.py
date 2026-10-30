@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -786,7 +787,7 @@ def test_kinematic_runtime_toggle(
     model = builder.finalize(device=device)
     solver = solver_fn(model)
     if isinstance(solver, newton.solvers.SolverFeatherPGS):
-        solver.update_mass_matrix_interval = 100
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, update_mass_matrix_interval=100)
     collision_pipeline, contacts = _create_contacts(model, solver)
 
     state_0, state_1 = model.state(), model.state()

@@ -175,8 +175,8 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         """Preserve velocity-only rows and omit anchor state with ``friction_anchor_beta=0``."""
         model, _jaws, _box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.0)
-        self.assertFalse(solver._friction_anchors_enabled)
-        self.assertFalse(hasattr(solver._friction_patches, "current"))
+        self.assertFalse(solver.laws.friction_anchors_enabled)
+        self.assertFalse(hasattr(solver.laws.friction_patches, "current"))
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn")  # no matching needed
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
@@ -187,7 +187,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             s0.clear_forces()
             solver.step(s0, s1, control, contacts, 0.005)
             s0, s1 = s1, s0
-        self.assertEqual(float(np.abs(solver._friction_patches.view.phi.numpy()).max()), 0.0)
+        self.assertEqual(float(np.abs(solver.laws.friction_patches.view.phi.numpy()).max()), 0.0)
         row_type = solver.row_type.numpy()
         friction = row_type == PGS_CONSTRAINT_TYPE_FRICTION
         self.assertGreater(int(friction.sum()), 0)
@@ -221,7 +221,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         )
         self.assertLess(abs(drift_on_02), 5.0e-5, f"anchored pinch (beta 0.2) drifted {drift_on_02:.2e} m")
         # the held contacts are anchored (not sliding) at the end of the hold
-        valid = solver_on._friction_patches.current.valid.numpy()
+        valid = solver_on.laws.friction_patches.current.valid.numpy()
         self.assertGreater(int(valid.sum()), 0)
         flat_off, _, _ = _run_squeeze(0.0, steps, friction_anchor_beta=0.0)
         # sticky matching replays body-local witness points; anchors must still hold
@@ -240,7 +240,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         dt = 1.0 / 60.0
         drift, solver, _ = _run_squeeze(5.0, int(3.0 / dt), dt=dt, friction_anchor_beta=0.05)
         self.assertLess(abs(drift), 1.0e-3, f"anchored pinch at 60 Hz drifted {drift:.2e} m")
-        sources = solver._friction_patches.current.source.numpy()
+        sources = solver.laws.friction_patches.current.source.numpy()
         self.assertGreater(int((sources >= 0).sum()), 0, "anchors were re-created instead of carried")
 
     def test_anchors_do_not_oppose_genuine_sliding(self):
@@ -256,7 +256,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         # every loaded contact slid this step, so its anchor was dropped
         n = int(contacts.rigid_contact_count.numpy()[0])
         if n > 0:
-            self.assertEqual(int(solver._friction_patches.current.valid.numpy()[:n].sum()), 0)
+            self.assertEqual(int(solver.laws.friction_patches.current.valid.numpy()[:n].sum()), 0)
 
     def test_row_builders_store_anchor_separation_per_route(self):
         """Store raw separation in dense rows and gain-scaled separation in the other routes."""
@@ -278,7 +278,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                 s0, s1 = s1, s0
             n = int(contacts.rigid_contact_count.numpy()[0])
             self.assertGreater(n, 0)
-            fa = solver._friction_patches.view.phi.numpy()[:n]
+            fa = solver.laws.friction_patches.view.phi.numpy()[:n]
             slot = solver.contact_slot.numpy()[:n]
             path = solver.contact_path.numpy()[:n]
             checked = {0: 0, 1: 0}
@@ -491,21 +491,21 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model, friction_anchor_beta=0.2, dense_max_constraints=4, mf_max_constraints=4
         )
-        self.assertFalse(solver.pgs_warmstart)
-        n = solver._friction_patches.previous.valid.shape[0]
+        self.assertFalse(solver.options.pgs_warmstart)
+        n = solver.laws.friction_patches.previous.valid.shape[0]
         # The fills below stand for a stored frame that used every slot.
-        solver._friction_patches.stored.fill_(n)
+        solver.laws.friction_patches.stored.fill_(n)
         worlds = np.arange(n, dtype=np.int32) % 2
         for mask, expect_cleared in (
             (None, (True, True)),
             ((True, False), (True, False)),
             ((False, True), (False, True)),
         ):
-            solver._friction_patches.previous.valid.fill_(1)
-            solver._friction_patches.previous_world.assign(worlds)
+            solver.laws.friction_patches.previous.valid.fill_(1)
+            solver.laws.friction_patches.previous_world.assign(worlds)
             wm = None if mask is None else wp.array(mask, dtype=wp.bool, device=device)
             solver.reset(model.state(), wm)
-            valid = solver._friction_patches.previous.valid.numpy()
+            valid = solver.laws.friction_patches.previous.valid.numpy()
             for world, cleared in enumerate(expect_cleared):
                 sel = valid[worlds == world]
                 np.testing.assert_array_equal(sel, 0 if cleared else 1, err_msg=f"mask={mask} world={world}")

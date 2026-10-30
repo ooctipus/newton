@@ -82,7 +82,7 @@ class TestTreeMimicCache(unittest.TestCase):
                     solver = solver_for(model, enabled)
                     self.assertEqual(solver._tree_kinetic_state is not None, enabled)
                     self.assertTrue(solver._sparse_velocity_limits)
-                    self.assertEqual(solver._mimic_count, 2)
+                    self.assertEqual(solver.laws.mimic_count, 2)
                     first, second, control = model.state(), model.state(), model.control()
                     newton.eval_fk(model, first.joint_q, first.joint_qd, first)
                     pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
@@ -126,7 +126,7 @@ class TestTreeMimicCache(unittest.TestCase):
                         case[0].check_constraint_capacity()
                         contact_seen |= bool(case[-1].rigid_contact_count.numpy()[0])
                         np.testing.assert_array_equal(
-                            case[0].mimic_slot.numpy() >= 0, model.constraint_mimic_enabled.numpy()
+                            case[0].laws.mimic_slot.numpy() >= 0, model.constraint_mimic_enabled.numpy()
                         )
                     for name in split.STATE_FIELDS:
                         np.testing.assert_allclose(

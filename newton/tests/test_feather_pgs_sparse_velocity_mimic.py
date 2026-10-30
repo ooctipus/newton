@@ -29,8 +29,8 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
     def test_mimic_velocity_owner_reaches_topology(self):
         """Admit a same-articulation mimic under the explicit velocity owner."""
         solver = _eligible_solver()
-        solver.enable_joint_velocity_limits = True
-        solver._mimic_count = 1
+        solver.options.enable_joint_velocity_limits = True
+        solver.laws.mimic_count = 1
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         with (
             mock.patch.dict(os.environ, {}, clear=True),
@@ -256,7 +256,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                 candidate = _case(True, offset, scale, error, friction_anchor_beta=beta)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
                 self.assertFalse(candidate[1]._sparse_row_support.enabled)
-                self.assertEqual(candidate[1]._mimic_count, 2)
+                self.assertEqual(candidate[1].laws.mimic_count, 2)
                 for step in range(4):
                     sparse_scene.step(reference)
                     sparse_scene.step(candidate)
@@ -267,7 +267,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                             kinds = candidate[1].row_type.numpy()[world, :count]
                             for kind in (MIMIC, VELOCITY_LIMIT, CONTACT):
                                 self.assertIn(kind, kinds)
-                            row = int(candidate[1].mimic_slot.numpy()[world])
+                            row = int(candidate[1].laws.mimic_slot.numpy()[world])
                             expected = 0.07 * error / sparse_scene.DT
                             self.assertAlmostEqual(candidate[1].rhs.numpy()[world, row], expected, places=5)
 

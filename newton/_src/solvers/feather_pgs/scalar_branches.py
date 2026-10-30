@@ -528,7 +528,7 @@ def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBran
     model = solver.model
     if model.requires_grad or model.particle_count:
         return None, "Scalar branches exclude gradients and particles."
-    if solver.enable_joint_velocity_limits:
+    if solver.options.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the diagonal-mass group on its ordinary dynamics."
     if size not in solver.forest.direct_diagonal_inertia_sizes:
         return None, "The diagonal-mass group has coordinates that do not each move one body."
@@ -657,7 +657,7 @@ class ScalarBranchState:
             raise RuntimeError("Scalar branches exclude gradient and alternate augmented ownership")
         if self.admission is not None and not self.admission(solver):
             raise RuntimeError("Scalar branch configuration changed; reconstruct and recapture")
-        if solver.enable_joint_velocity_limits:
+        if solver.options.enable_joint_velocity_limits:
             raise RuntimeError("Scalar branches exclude joint velocity limits; reconstruct and recapture")
         if dt is None or not math.isfinite(dt) or dt <= 0:
             raise ValueError("Scalar branches require a positive finite step duration")

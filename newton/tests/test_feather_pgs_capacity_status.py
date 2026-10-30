@@ -206,7 +206,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 if capacity >= 640:
                     solver.check_constraint_capacity()
                     self.assertEqual(int(solver.constraint_count.numpy()[0]), count * 3)
-                    residual = velocity + solver.pgs_beta * (old_position - depths.astype(np.float64)) / dt
+                    residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
                     self.assertGreaterEqual(float(residual.min()), -2.0e-6)
                     self.assertGreaterEqual(float(forces[:, 2].min()), -1.0e-7)
                     np.testing.assert_allclose(dt * forces[:, 2] * residual, 0.0, atol=1.0e-7)

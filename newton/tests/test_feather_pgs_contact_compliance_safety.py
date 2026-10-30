@@ -38,7 +38,10 @@ class TestContactComplianceSafety(unittest.TestCase):
 
     def test_input_overflow_and_reduction_rejected(self):
         """Fail explicitly for lost candidates or unqualified body-pair reduction."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=self.device),
+            laws=SimpleNamespace(friction_anchor_beta=0.0, friction_anchors_enabled=False),
+        )
         with self.assertRaisesRegex(RuntimeError, "overflowing contact"):
             start_step(solver, self.contacts(count=5), 0.005)
         contacts = self.contacts()
@@ -48,7 +51,10 @@ class TestContactComplianceSafety(unittest.TestCase):
 
     def test_capture_and_torsion_rejected(self):
         """Prevent silent capture fallback or an unvalidated friction-law combination."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=self.device),
+            laws=SimpleNamespace(friction_anchor_beta=0.0, friction_anchors_enabled=False),
+        )
         contacts = self.contacts()
         with wp.ScopedCapture(device=self.device):
             with self.assertRaisesRegex(RuntimeError, "CUDA graph"):
@@ -59,7 +65,10 @@ class TestContactComplianceSafety(unittest.TestCase):
 
     def test_nonfinite_inputs_rejected(self):
         """Reject invalid time steps instead of emitting infinite row coefficients."""
-        solver = SimpleNamespace(model=SimpleNamespace(device=self.device))
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=self.device),
+            laws=SimpleNamespace(friction_anchor_beta=0.0, friction_anchors_enabled=False),
+        )
         contacts = self.contacts()
         for dt in (0, -1, float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "dt"):
@@ -69,16 +78,19 @@ class TestContactComplianceSafety(unittest.TestCase):
         """Reject positive persistent-anchor bias but permit a disabled dummy patch buffer."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=self.device),
-            friction_anchor_beta=0.0,
-            _friction_patches=object(),
-            _contact_torsion_enabled=False,
             _sparse_mass_matrix_size=None,
+            laws=SimpleNamespace(
+                friction_anchor_beta=0.0,
+                friction_anchors_enabled=False,
+                friction_patches=object(),
+                contact_torsion_enabled=False,
+            ),
         )
         start_step(solver, self.contacts(), 0.005)
-        solver.friction_anchor_beta = 0.2
+        solver.laws.friction_anchor_beta = 0.2
         with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
             start_step(solver, self.contacts(), 0.005)
-        solver.contact_compliance = True
+        solver.options = SimpleNamespace(contact_compliance=True)
         with self.assertRaisesRegex(ValueError, "friction_anchor_beta"):
             SolverFeatherPGS.step(solver, None, None, None, None, 0.005)
 

@@ -394,9 +394,9 @@ def _owner_solver(device, *, anchors, beta=0.0):
             art_group_idx=ints(2 * worlds),
         ),
         J_by_size={size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)},
-        _friction_anchors_enabled=anchors,
-        _friction_patches=SimpleNamespace(view=view),
-        friction_anchor_beta=beta,
+        laws=SimpleNamespace(
+            friction_anchors_enabled=anchors, friction_patches=SimpleNamespace(view=view), friction_anchor_beta=beta
+        ),
         # The owner's placeholders come from the solver's allocator.
         _arrays=SolverArrays(None, wp.get_device(device)),
     )
@@ -598,7 +598,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                 with mock.patch.object(rp.TopologyPin, "read", return_value=None):
                     owner = rp.LocalRowPackets(solver, PRIMARY, SECONDARY, 0)
                 for beta in (0.5, 0.125) if anchors else (0.0,):
-                    solver.friction_anchor_beta = beta
+                    solver.laws.friction_anchor_beta = beta
                     contact_input = rp.ContactInput()
                     with (
                         mock.patch.object(rp.wp, "launch_tiled") as tiled,
@@ -622,7 +622,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                         self.assertIsInstance(inputs[2], rp.PatchRowLaw.cls)
                         laws.append(inputs[2])
                     self.assertIs(tiled.call_args_list[0].kwargs["inputs"][3], owner.packet)
-                    view = solver._friction_patches.view
+                    view = solver.laws.friction_patches.view
                     for law in laws:
                         self.assertEqual(law.beta, beta)
                         self.assertEqual(law.patches.enabled, int(anchors))
@@ -741,10 +741,10 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-        if solver._friction_anchors_enabled:
+        if solver.laws.friction_anchors_enabled:
             # Each rollout collides on its own state, so anchor history is compared on shared contacts only.
-            self.assertTrue(plain_solver._friction_patches.previous.valid.numpy().any(), "The boxes hold anchors")
-            self.assertTrue(solver._friction_patches.previous.valid.numpy().any(), "The boxes hold anchors")
+            self.assertTrue(plain_solver.laws.friction_patches.previous.valid.numpy().any(), "The boxes hold anchors")
+            self.assertTrue(solver.laws.friction_patches.previous.valid.numpy().any(), "The boxes hold anchors")
         return solver
 
     def test_arm_and_box_match_the_ordinary_producers(self):
@@ -759,7 +759,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         model = _build(wp.get_device("cuda:0"), worlds=6, mimic=True)
         solver = self._compare(model)
         self.assertEqual(solver._row_packets.mimics, 1)
-        self.assertEqual(int(solver._mimic_count), 6)
+        self.assertEqual(int(solver.laws.mimic_count), 6)
 
     def test_longer_arm_takes_the_same_owner(self):
         """Nothing in the owner is sized for one arm: a five-joint arm is admitted the same way."""
@@ -780,7 +780,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PRESS) for enabled in (False, True))
         self.assertIsNone(plain.solver._row_packets)
         self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
-        self.assertTrue(packets.solver._friction_anchors_enabled)
+        self.assertTrue(packets.solver.laws.friction_anchors_enabled)
         routes = packets.solver.get_path_selection()["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["contact_rows"]["producer"], "local_packets")
@@ -819,7 +819,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         self.assertGreater(anchors, 0)
         self.assertGreater(carried, 0, "Anchors must carry tangential phi")
         assert_rows_close(*(contact_rows(arm.solver, contacts) for arm in (plain, packets)))
-        self.assertTrue(plain.solver._friction_patches.previous.valid.numpy().any(), "Pressed boxes hold anchors")
+        self.assertTrue(plain.solver.laws.friction_patches.previous.valid.numpy().any(), "Pressed boxes hold anchors")
         assert_history_close(plain.solver, packets.solver)
 
     def test_patch_rings_match_the_ordinary_producers(self):
@@ -835,12 +835,12 @@ class TestRowPacketsCUDA(unittest.TestCase):
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PADS) for enabled in (False, True))
         self.assertIsNone(plain.solver._row_packets)
         self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
-        self.assertTrue(packets.solver._friction_anchors_enabled)
+        self.assertTrue(packets.solver.laws.friction_anchors_enabled)
         self._step_pad_rings(plain, packets)
 
     def _step_pad_rings(self, plain, packets):
         """Step both routes on the plain route's contacts and compare their patch rings."""
-        scale, poses = plain.solver.contact_friction_scale, []
+        scale, poses = plain.solver.options.contact_friction_scale, []
         for step in range(_PAD_STEPS):
             contacts = _step(plain)
             _step(packets, contacts)
@@ -882,7 +882,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
         ):
             with self.subTest(**kwargs):
                 solver = self._compare(_build(wp.get_device("cuda:0"), **kwargs), friction_anchor_beta=0.2)
-                self.assertTrue(solver._friction_anchors_enabled)
+                self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertEqual((solver._row_packets.primary, solver._row_packets.mimics), layout)
 
 

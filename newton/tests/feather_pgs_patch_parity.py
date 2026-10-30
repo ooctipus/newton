@@ -106,7 +106,7 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
     arrays = route_arrays(solver, route)
     if incident and route == 0 and solver._sparse_mass_matrix_size is not None:
         arrays["rhs"] = arrays["rhs"] + solver._sparse_row_incident.numpy()
-    patches = getattr(solver, "_friction_patches", None)
+    patches = solver.laws.friction_patches
     view = patches.view if patches is not None and patches.view.weight.shape[0] else None
     routed = [c for c in range(count) if path[c] == route and slot[c] >= 0 and needed[c] > 0]
     owner = {}
@@ -230,7 +230,7 @@ def assert_history_close(a, b, *, atol=2e-5, rtol=7e-4):
     contact, so both must have stepped the same contacts with the same contact
     capacity.
     """
-    first, second = (getattr(x, "_friction_patches", x) for x in (a, b))
+    first, second = (x.laws.friction_patches if hasattr(x, "laws") else x for x in (a, b))
     if first.capacity != second.capacity:
         raise AssertionError(
             f"Patch histories hold {first.capacity} and {second.capacity} contact slots; construct both solvers "
@@ -263,7 +263,7 @@ def assert_loaded_anchors(solver, contacts, *, carried=True, reset_worlds=()):
     anchors.
     """
     rows = contact_rows(solver, contacts)
-    patches = solver._friction_patches
+    patches = solver.laws.friction_patches
     valid, source = patches.previous.valid.numpy(), patches.current.source.numpy()
     worlds = solver.contact_world.numpy()
     anchors = [c for c, record in rows.items() if len(record["types"]) == 3 and record["parents"][0] not in (-1, c)]
@@ -307,7 +307,7 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     """
     baked = not solver._matrix_free
     rows = contact_rows(solver, contacts, jacobian=baked or jacobian)
-    patches = solver._friction_patches
+    patches = solver.laws.friction_patches
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     owner = patches.current.owner.numpy()[:count]
     weight = patches.view.weight.numpy()[:count]
@@ -328,8 +328,8 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     record = {
         "normals": {},
         "regions": {},
-        "gain": max(float(solver.pgs_beta), float(solver.contact_speculative_scale)) / dt,
-        "friction_gain": float(solver.friction_anchor_beta) / dt,
+        "gain": max(float(solver.options.pgs_beta), float(solver.options.contact_speculative_scale)) / dt,
+        "friction_gain": float(solver.laws.friction_anchor_beta) / dt,
     }
     members = {}
     for c, row in rows.items():
@@ -520,7 +520,7 @@ def anchor_sites(solver, contacts):
     A site does not change when float32 rounding moves an anchor's rows to
     another member of its support edge, unlike the contact index that carries it.
     """
-    patches = solver._friction_patches
+    patches = solver.laws.friction_patches
     previous = patches.previous
     count = min(int(contacts.rigid_contact_count.numpy()[0]), patches.capacity)
     valid = previous.valid.numpy()[:count]
@@ -582,7 +582,7 @@ def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
     beyond float32 rounding of its rotation into the body frame. Returns the
     number of anchors checked.
     """
-    patches = solver._friction_patches
+    patches = solver.laws.friction_patches
     count = min(int(contacts.rigid_contact_count.numpy()[0]), patches.capacity)
     valid = patches.previous.valid.numpy()[:count]
     tangent = patches.previous.tangent_impulse.numpy()[:count]

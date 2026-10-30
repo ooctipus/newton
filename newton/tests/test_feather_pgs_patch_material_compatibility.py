@@ -24,8 +24,8 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         builder.add_shape_sphere(body, radius=0.05)
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion_radius=0.0)
-        self.assertEqual(solver.friction_anchor_beta, 0.2)
-        self.assertTrue(solver._friction_anchors_enabled)
+        self.assertEqual(solver.laws.friction_anchor_beta, 0.2)
+        self.assertTrue(solver.laws.friction_anchors_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_torsion_opt_in_keeps_default_patches(self):
@@ -36,10 +36,10 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
             actual, solver, *_ = fixture(0.01, friction_anchor_beta=None, **options)
         self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
         reference, explicit, *_ = fixture(0.01, friction_anchor_beta=0.2, **options)
-        self.assertTrue(solver._friction_anchors_enabled)
-        self.assertTrue(explicit._friction_anchors_enabled)
-        self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
-        self.assertGreater(solver._torsion_stats["rows"], 0)
+        self.assertTrue(solver.laws.friction_anchors_enabled)
+        self.assertTrue(explicit.laws.friction_anchors_enabled)
+        self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
+        self.assertGreater(solver.laws.torsion_stats["rows"], 0)
         for name in reference:
             np.testing.assert_array_equal(actual[name], reference[name], err_msg=name)
 
@@ -55,7 +55,7 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
                 np.testing.assert_array_equal(actual, reference)
                 self.assertEqual(paths, reference_paths)
                 self.assertGreater(solver.compliance_contact_count, 0)
-                self.assertFalse(solver._friction_anchors_enabled)
+                self.assertFalse(solver.laws.friction_anchors_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_explicit_patch_compliance_conflict_fails_before_step(self):

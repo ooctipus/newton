@@ -88,26 +88,26 @@ class Laws:
         return self.agnostic and self.contact == "patch"
 
     @classmethod
-    def build(cls, solver) -> Laws:
-        """Read the laws from a solver whose options, plans (mimic, connect, pre-elimination) and torsion are set."""
-        model = solver.model
+    def build(cls, laws, options, model, *, preelimination: bool) -> Laws:
+        """Read the laws from the row laws' tables (:class:`.rows.RowLaws`: friction, regularization, torsion, mimic
+        and connect plans), the options and the model, with the bilateral pre-elimination decision."""
         return cls(
-            contact="patch" if solver._friction_anchors_enabled else "point",
-            regularized=bool(solver._regularization_enabled),
-            torsion=bool(solver._contact_torsion_enabled),
-            compliance=bool(solver.contact_compliance),
-            limits=bool(solver.enable_joint_limits),
-            velocity_limits=bool(solver.enable_joint_velocity_limits),
-            drives=solver.drive_mode,
-            schedule=solver.pgs_schedule,
-            velocity_pass=solver.pgs_velocity_iterations != 0,
-            warm_start=bool(solver.pgs_warmstart),
-            debug_rows=bool(solver.pgs_debug),
-            preelimination=bool(solver._preelim_active),
-            mimic=bool(solver._mimic_count),
-            connect=bool(solver._connect_count),
-            loops=bool(solver.forest.has_loop_joints),
-            iterations=solver.pgs_iterations > 0,
+            contact="patch" if laws.friction_anchors_enabled else "point",
+            regularized=bool(laws.regularization_enabled),
+            torsion=bool(laws.contact_torsion_enabled),
+            compliance=bool(options.contact_compliance),
+            limits=bool(options.enable_joint_limits),
+            velocity_limits=bool(options.enable_joint_velocity_limits),
+            drives=options.drive_mode,
+            schedule=options.pgs_schedule,
+            velocity_pass=options.pgs_velocity_iterations != 0,
+            warm_start=bool(options.pgs_warmstart),
+            debug_rows=bool(options.pgs_debug),
+            preelimination=bool(preelimination),
+            mimic=bool(laws.mimic_count),
+            connect=bool(laws.connect_count),
+            loops=bool(laws.forest.has_loop_joints),
+            iterations=options.pgs_iterations > 0,
             forward_cuda=bool(model.device.is_cuda and not model.requires_grad),
         )
 

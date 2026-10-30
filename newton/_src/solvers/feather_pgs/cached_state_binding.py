@@ -25,6 +25,7 @@ def publication(solver, state_in, state_aug, state_out, dt):
         PublicationData,
         solver=solver,
         forest=solver.forest,
+        options=solver.options,
         model=solver.model,
         state_in=state_in,
         state_aug=state_aug,

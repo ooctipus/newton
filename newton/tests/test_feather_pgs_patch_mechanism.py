@@ -1123,7 +1123,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                 solver = newton.solvers.SolverFeatherPGS(
                     model, pgs_iterations=4, pgs_warmstart=warmstart, pgs_warmstart_decay=0.8, **mode
                 )
-                self.assertGreater(solver.friction_anchor_beta, 0.0)
+                self.assertGreater(solver.laws.friction_anchor_beta, 0.0)
                 arrays = (
                     (solver.row_parent, solver.row_mu, solver.impulses),
                     (solver.mf_row_parent, solver.mf_row_mu, solver.mf_impulses),
@@ -1134,7 +1134,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 control = model.control()
                 paths = set()
-                with _record_patch_routes(solver._friction_patches) as calls:
+                with _record_patch_routes(solver.laws.friction_patches) as calls:
                     for step, dt in enumerate(dts):
                         pipeline.collide(state, contacts)
                         state.clear_forces()
@@ -1162,7 +1162,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                         state, out = out, state
                         self.assertEqual([(name, tuple(routes.enabled)) for name, routes in calls], expected)
                         calls.clear()
-                    self.assertFalse(np.any(solver._friction_patches.previous.valid.numpy()))
+                    self.assertFalse(np.any(solver.laws.friction_patches.previous.valid.numpy()))
                 if device == "cpu":
                     self.assertLessEqual({0, 1}, paths, "contacts must use the dense and matrix-free routes")
 
@@ -2511,7 +2511,7 @@ class _SolverTwin:
             if not reuse:
                 stack.enter_context(mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_FRAME_REUSE": "0"}))
             self.solver = SolverFeatherPGS(self.model, **options)
-        self.patches = self.solver._friction_patches
+        self.patches = self.solver.laws.friction_patches
         self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
         self.streams = [self.pipeline.contacts(), self.pipeline.contacts()]
         self.states = [self.model.state(), self.model.state()]
@@ -2654,7 +2654,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                         solver = SolverFeatherPGS(model, **options)
                     friction = solver.get_path_selection()["routes"]["friction"]
                     self.assertEqual(friction["frame_reuse"]["enabled"], reused)
-                    self.assertEqual(solver._friction_patches.reuse_frames, reused)
+                    self.assertEqual(solver.laws.friction_patches.reuse_frames, reused)
                     if options:
                         self.assertIn("Point friction", friction["frame_reuse"]["reason"])
                         self.assertIsNone(friction["pair_sort"])
@@ -2666,9 +2666,9 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     # The live sort does not depend on frame reuse.
                     pair_sort = friction["pair_sort"]
                     self.assertTrue(pair_sort["live"])
-                    self.assertEqual(pair_sort["live"], solver._friction_patches.live_sort)
-                    self.assertEqual(pair_sort["capacity"], solver._friction_patches.capacity)
-                    self.assertEqual(pair_sort["key_bits"], solver._friction_patches.key_bits)
+                    self.assertEqual(pair_sort["live"], solver.laws.friction_patches.live_sort)
+                    self.assertEqual(pair_sort["capacity"], solver.laws.friction_patches.capacity)
+                    self.assertEqual(pair_sort["key_bits"], solver.laws.friction_patches.key_bits)
                     self.assertIn("only the live slots", pair_sort["reason"])
 
     def test_frame_reuse_opt_out_changes_only_frame_reuse(self):
@@ -2679,7 +2679,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with _flags(reuse=reuse):
                 solver = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
             routes[reuse] = solver.get_path_selection()
-            self.assertTrue(solver._friction_patches.live_sort)
+            self.assertTrue(solver.laws.friction_patches.live_sort)
         self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", routes["0"]["routes"]["friction"]["frame_reuse"]["reason"])
         for selected in routes.values():
             del selected["routes"]["friction"]["frame_reuse"]
@@ -2792,8 +2792,8 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with self.subTest(reuse=reuse):
                 with _flags(reuse=reuse):
                     solver = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
-                real, calls = solver._friction_patches.frame_status, []
-                solver._friction_patches.frame_status = SimpleNamespace(
+                real, calls = solver.laws.friction_patches.frame_status, []
+                solver.laws.friction_patches.frame_status = SimpleNamespace(
                     numpy=lambda real=real, calls=calls: calls.append("read") or real.numpy(),
                     zero_=lambda real=real, calls=calls: calls.append("clear") or real.zero_(),
                 )

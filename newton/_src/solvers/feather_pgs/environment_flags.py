@@ -37,7 +37,7 @@ _READ = (
     (
         "FEATHER_PGS_PATCH_FRAME_REUSE",
         "policy",
-        _SOLVER,
+        ("rows",),
         "=0 sorts the patch pairs of every build, small frames over their whole capacity, instead of keeping them on captured builds that reuse the previous captured build's contact frame (default on).",
     ),
     (

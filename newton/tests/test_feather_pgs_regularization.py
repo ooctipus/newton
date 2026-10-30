@@ -347,7 +347,7 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model)
-        test.assertFalse(solver._regularization_enabled)
+        test.assertFalse(solver.laws.regularization_enabled)
         test.assertIs(solver.row_w, solver._contact_row_w_dummy)
         test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
         test.assertEqual(solver.row_w.shape, (1, 1))

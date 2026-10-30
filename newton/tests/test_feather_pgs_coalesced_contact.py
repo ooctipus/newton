@@ -18,6 +18,8 @@ from newton.tests.feather_pgs_patch_parity import point_row_law
 from newton.tests.test_feather_pgs_compact_contact import (
     _FOREST_FIELDS,
     _LAUNCH_FIELDS,
+    _LAWS_FIELDS,
+    _OPTIONS_FIELDS,
     OUTPUTS,
     fixture,
     install_prefix,
@@ -200,9 +202,13 @@ class TestCoalescedContact(unittest.TestCase):
             J_by_size={6: data.Z},
             _mark_independent_sparse_contact_candidates_kernel=marker,
             # Point friction: the patch row law with beta 0 and a disabled view.
-            _friction_anchors_enabled=False,
-            friction_anchor_beta=0.0,
-            _friction_patches=SimpleNamespace(view=point_row_law("cpu", 16).patches),
+            laws=SimpleNamespace(
+                **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},
+                friction_anchors_enabled=False,
+                friction_anchor_beta=0.0,
+                friction_patches=SimpleNamespace(view=point_row_law("cpu", 16).patches),
+            ),
+            options=SimpleNamespace(**{name: getattr(data, field) for name, field in _OPTIONS_FIELDS.items()}),
             # Launches sized by contact rows go through the pool, eagerly here.
             _contact_pool=ContactPool(device="cpu", rows=16),
         )

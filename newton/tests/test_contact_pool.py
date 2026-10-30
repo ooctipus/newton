@@ -610,7 +610,7 @@ def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
     test.assertEqual(contacts.rigid_contact_max, rows)
     test.assertIs(solver._contact_pool, pipeline._contact_pool)
     test.assertEqual(solver.contact_slot.shape, (rows,))
-    test.assertEqual(solver._friction_patches.capacity, rows)
+    test.assertEqual(solver.laws.friction_patches.capacity, rows)
 
     def simulate():
         pipeline.collide(state_0, contacts)
@@ -724,7 +724,7 @@ def test_feather_pgs_grows_mid_run(test, device):
     test.assertEqual(pool.growth_count, 1)
     test.assertEqual(solver._contact_pool.ready, rows)
     test.assertEqual(solver.contact_slot.shape, (rows,))
-    test.assertEqual(solver._friction_patches.capacity, rows)
+    test.assertEqual(solver.laws.friction_patches.capacity, rows)
     test.assertEqual(contacts.rigid_contact_max, rows)
     solver.check_constraint_capacity()
     np.testing.assert_allclose(state.body_q.numpy(), reference.body_q.numpy(), rtol=0.0, atol=1.0e-5)

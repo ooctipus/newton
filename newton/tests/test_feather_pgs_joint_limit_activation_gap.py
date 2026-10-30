@@ -215,7 +215,7 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
         pgs_schedule="physx_grasp",
     )
     if not use_warp_builder:
-        solver._joint_limit_warp_kernels.clear()
+        solver.laws.joint_limit_warp_kernels.clear()
 
     samples = []
     for _ in range(4):
@@ -266,9 +266,9 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
         reference_solver, reference = _run_joint_limit_trajectory(use_warp_builder=False)
         warp_solver, actual = _run_joint_limit_trajectory(use_warp_builder=True)
 
-        self.assertFalse(reference_solver._joint_limit_warp_kernels)
-        self.assertTrue(any(kernel is not None for kernel in warp_solver._joint_limit_warp_kernels.values()))
-        self.assertEqual(reference_solver.pgs_schedule, "physx_grasp")
+        self.assertFalse(reference_solver.laws.joint_limit_warp_kernels)
+        self.assertTrue(any(kernel is not None for kernel in warp_solver.laws.joint_limit_warp_kernels.values()))
+        self.assertEqual(reference_solver.options.pgs_schedule, "physx_grasp")
         self.assertEqual(len(reference), len(actual))
         for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
             self.assertEqual(observed["counts"], expected["counts"], f"row counts differed at step {step}")

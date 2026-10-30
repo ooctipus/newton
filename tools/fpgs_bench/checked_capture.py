@@ -146,7 +146,7 @@ def install_collision_storage_overrides(harness, pipeline_type, report: dict, sa
 def legacy_row_status(solver, entry: dict) -> None:
     """Read the baseline's existing sticky row warnings without adding kernels."""
     flags = solver._row_overflow_warning_emitted
-    if not solver.warn_constraint_overflow or not solver._track_row_capacity:
+    if not solver.options.warn_constraint_overflow or not solver._track_row_capacity:
         raise RuntimeError("Legacy row warning recording must remain enabled")
     if flags is None or flags.shape != (3,) or flags.device.is_capturing:
         raise RuntimeError("Unexpected legacy sticky row warning storage")
@@ -157,8 +157,8 @@ def legacy_row_status(solver, entry: dict) -> None:
     entry["capacities"] = {name: int(getattr(solver, name)) for name in ("dense_max_constraints", "mf_max_constraints")}
     entry["capacity_coverage"] = "Existing sticky row warnings only; contacts checked separately at boundaries"
     entry["contact_law"] = {
-        "friction_anchor_beta": float(solver.friction_anchor_beta),
-        "contact_compliance": bool(solver.contact_compliance),
+        "friction_anchor_beta": float(solver.laws.friction_anchor_beta),
+        "contact_compliance": bool(solver.options.contact_compliance),
         "contact_torsion_radius": float(solver.contact_torsion_radius),
     }
     if any(values):
@@ -214,9 +214,9 @@ def legacy_collision_status(manager, result: dict) -> None:
     result["contact_storage"] = {
         "contact_pool": int(contacts.rigid_contact_max),
         "solver_scratch": int(solver._max_contacts_alloc),
-        "friction_patch": int(solver._friction_patches.capacity),
+        "friction_patch": int(solver.laws.friction_patches.capacity),
     }
-    if min(solver._max_contacts_alloc, solver._friction_patches.capacity) < contacts.rigid_contact_max:
+    if min(solver._max_contacts_alloc, solver.laws.friction_patches.capacity) < contacts.rigid_contact_max:
         raise RuntimeError("Legacy contact pool exceeds solver or friction-patch storage")
     reducer = narrow.global_contact_reducer
     if reducer is not None:

@@ -71,7 +71,7 @@ def topology_plan(solver):
     joint_dof = model.joint_qd_start.numpy()
     joint_type = model.joint_type.numpy()
     velocity_mask, position_mask = 0, 0
-    q_index = solver._joint_limit_q_index_host
+    q_index = solver.laws.joint_limit_q_index_host
     for column, size in enumerate(sizes):
         arts = solver.forest.group_to_art[size].numpy()
         if len(arts) != solver.forest.world_count or not np.array_equal(
@@ -97,7 +97,10 @@ def topology_plan(solver):
                 if joint_type[joint] in (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6):
                     for dof in range(joint_dof[joint], joint_dof[joint + 1]):
                         mask |= 1 << (int(dof - starts[art]) + block_offsets[column])
-                elif solver.enable_joint_velocity_limits and joint_type[joint] not in (JointType.FIXED, JointType.FREE):
+                elif solver.options.enable_joint_velocity_limits and joint_type[joint] not in (
+                    JointType.FIXED,
+                    JointType.FREE,
+                ):
                     raise ValueError("unsupported moving joint velocity-limit law")
             masks.add(mask)
         if len(masks) != 1:
@@ -111,7 +114,7 @@ def topology_plan(solver):
         sizes[1] if len(sizes) == 2 else 0,
         *block_offsets,
         solver._ink_rows,
-        solver.enable_joint_velocity_limits,
+        solver.options.enable_joint_velocity_limits,
         velocity_mask,
         position_mask,
     )

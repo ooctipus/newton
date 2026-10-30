@@ -13,7 +13,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
+from newton._src.solvers.feather_pgs.rows import joint_limit_warp_kernel
 from newton.tests.feather_pgs_law_harness import group_rows
 
 
@@ -119,7 +119,7 @@ def _warp_rows(problem, resolved=None, warps_per_block=4):
         sides=wp.zeros(outputs[2].shape, dtype=wp.vec2i, device=problem.device),
     )
     wp.launch_tiled(
-        _get_joint_limit_warp_kernel(problem.size, warps_per_block),
+        joint_limit_warp_kernel(problem.size, warps_per_block),
         dim=[(problem.articulation_count + warps_per_block - 1) // warps_per_block],
         inputs=[
             problem.articulation_count,

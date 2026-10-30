@@ -5,6 +5,7 @@
 
 import collections
 import contextlib
+import dataclasses
 import functools
 import itertools
 import json
@@ -472,7 +473,9 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     """
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-    solver.enable_joint_velocity_limits = motion_velocity
+    solver.options = solver.laws.options = dataclasses.replace(
+        solver.options, enable_joint_velocity_limits=motion_velocity
+    )
     solver._route_pins.update(pins or {})
     owner = HeldTree(solver)
     solver._tree_kinetic_state = owner
@@ -1530,7 +1533,9 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
                     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-                    solver.enable_joint_velocity_limits = motion
+                    solver.options = solver.laws.options = dataclasses.replace(
+                        solver.options, enable_joint_velocity_limits=motion
+                    )
                     owner = HeldTree(solver)
                     groups = []
                     for group in owner.groups:

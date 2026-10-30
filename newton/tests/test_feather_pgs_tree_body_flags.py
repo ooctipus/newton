@@ -634,7 +634,7 @@ class TestEffectiveRowData(unittest.TestCase):
                 solver.step(out, state, control, None, 1.0e-3)
                 table = joint_table.bind(solver)
                 for name, values in written.items():
-                    published = getattr(solver, "_" + name)
+                    published = solver.laws.effective_rows[name]
                     # The joint table the rows read holds the published array: none on the prescribed coordinate,
                     # the written values on the dynamic ones.
                     self.assertEqual(getattr(table, name).ptr, published.ptr, name)

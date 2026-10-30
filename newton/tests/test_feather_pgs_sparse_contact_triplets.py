@@ -680,12 +680,32 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({}, True, False, True, 32, False, False, "room for contact units"),
             ({"_route_pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
             # Point friction keeps its rule: triplets need the active-row scan.
-            ({"_friction_anchors_enabled": False}, False, False, True, 32, True, False, "active-row scan"),
-            ({"_friction_anchors_enabled": False}, True, False, True, 32, True, True, "point contacts fuse"),
+            (
+                {"laws": SimpleNamespace(friction_anchors_enabled=False)},
+                False,
+                False,
+                True,
+                32,
+                True,
+                False,
+                "active-row scan",
+            ),
+            (
+                {"laws": SimpleNamespace(friction_anchors_enabled=False)},
+                True,
+                False,
+                True,
+                32,
+                True,
+                True,
+                "point contacts fuse",
+            ),
         )
         for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
-                _friction_anchors_enabled=True, _route_pins={}, forest=SimpleNamespace(has_free_rigid_bodies=False)
+                _route_pins={},
+                forest=SimpleNamespace(has_free_rigid_bodies=False),
+                laws=SimpleNamespace(friction_anchors_enabled=True),
             )
             for name, value in changes.items():
                 setattr(probe, name, value)

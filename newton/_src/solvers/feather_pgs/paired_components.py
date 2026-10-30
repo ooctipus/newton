@@ -60,7 +60,7 @@ PAIRED_COMPONENT_THREADS = 128
 def decline(solver) -> str | None:
     """Why the solver's paired worlds cannot be split into components, or ``None`` when they can: the laws
     components implement (``route_table.CAPABILITIES``), then their fit."""
-    return capable("components", solver._laws) or first_failed(
+    return capable("components", solver.laws.set) or first_failed(
         (
             (solver._paired_factor_coordinates, "Components need the paired factor-coordinate sweep."),
             (

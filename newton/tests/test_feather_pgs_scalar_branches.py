@@ -1122,7 +1122,12 @@ class TestScalarBranchRule(unittest.TestCase):
         offsets = dict(solver.forest.crba_dof_joint_offset_by_size)
         offsets[7] = wp.array(np.roll(np.arange(1, 8), 1), dtype=int, device=model.device)
         for label, attribute, value, words in (
-            ("enable_joint_velocity_limits", "enable_joint_velocity_limits", True, "velocity limits"),
+            (
+                "options.enable_joint_velocity_limits",
+                "options",
+                dataclasses.replace(solver.options, enable_joint_velocity_limits=True),
+                "velocity limits",
+            ),
             (
                 "forest.direct_diagonal_inertia_sizes",
                 "forest",
@@ -1553,7 +1558,7 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
             axes = solver.joint_S_s.numpy()[dofs, :3].astype(np.float64)
             normals = contacts.rigid_contact_normal.numpy()[: len(pairs)].astype(np.float64)
             along = np.sum(normals * axes, axis=1)
-            closed_form = along * along / _key_inertia(model, keys, dofs, axes) + solver.pgs_cfm
+            closed_form = along * along / _key_inertia(model, keys, dofs, axes) + solver.options.pgs_cfm
     return {
         "impulses": np.asarray(impulses),
         "travel": np.asarray(travel),
@@ -1655,7 +1660,7 @@ class TestGripperContactBound(unittest.TestCase):
         """The head's press at eight sweeps, the converged reference's, ``pgs_beta`` and the loaded world."""
         solver, head = self._press()
         _, reference = self._press(iterations=GRIPPER_REFERENCE_ITERATIONS)
-        return head, reference, solver.pgs_beta, int(np.argmax(np.abs(head["impulses"]).max(axis=0)))
+        return head, reference, solver.options.pgs_beta, int(np.argmax(np.abs(head["impulses"]).max(axis=0)))
 
     def test_bound_admits_a_pose_shift(self):
         """Admit a one-spacing shift of the tip's contact witness, another float order of its pose.
@@ -2178,7 +2183,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         reference = recipe_solver(model, scalar=False, pins=_ORDINARY, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
         self.assertIsNone(reference._tree_kinetic_state)
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
-        _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
+        _assert_gripper_switch(self, *presses, beta=head.options.pgs_beta, dt=DT)
 
     def test_revolute_leaves_run_in_the_held_diagonal_group(self):
         """A star with revolute leaves stays out of scalar branches: the held tree's diagonal-mass group owns it."""

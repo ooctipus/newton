@@ -21,13 +21,13 @@ from .device_preludes import substitute
 from .field_group import Field
 
 LAW = (
-    Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
-    Field("lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
-    Field("upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
+    Field("limit_q_index", wp.int32, ("dof",), owner="laws", attr="joint_limit_q_index"),
+    Field("lower", wp.float32, ("dof",), owner="laws", attr="_joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="laws", attr="_joint_limit_upper"),
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
-    Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
-    Field("beta", wp.float32, attr="pgs_beta"),
-    Field("cfm", wp.float32, attr="pgs_cfm"),
+    Field("activation_gap", wp.float32, owner="options", attr="joint_limit_activation_gap"),
+    Field("beta", wp.float32, owner="options", attr="pgs_beta"),
+    Field("cfm", wp.float32, owner="options", attr="pgs_cfm"),
     Field("dt", wp.float32, owner="step"),
     Field("slot_counter", wp.int32, ("world",)),
     Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
@@ -38,9 +38,9 @@ LAW = (
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
 VELOCITY_LAW = (
-    Field("velocity_limit", wp.float32, ("dof",), attr="_joint_velocity_limit"),
+    Field("velocity_limit", wp.float32, ("dof",), owner="laws", attr="_joint_velocity_limit"),
     Field("vhat", wp.float32, ("dof",), attr="v_hat"),
-    Field("activation", wp.float32, attr="velocity_limit_activation_fraction"),
+    Field("activation", wp.float32, owner="options", attr="velocity_limit_activation_fraction"),
 )
 """The joint velocity-limit family's inputs."""
 

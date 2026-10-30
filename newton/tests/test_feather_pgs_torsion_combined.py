@@ -48,7 +48,7 @@ class TestTorsionCombined(unittest.TestCase):
                     baseline, result, solver, *_ = self.check_pair(
                         regularization, velocity, center_only=True, spin=100.0
                     )
-                    group = solver._torsion_stats["groups"][0]
+                    group = solver.laws.torsion_stats["groups"][0]
                     normals = group["normal_rows"]
                     self.assertAlmostEqual(
                         float(baseline["impulses"][0, normals].sum()), 0.03 / (1 + regularization), delta=2e-7
@@ -84,7 +84,7 @@ class TestTorsionCombined(unittest.TestCase):
         """Refund sliding and spin even for the narrow positive initial-gap tolerance."""
         for gap in (0.5e-6, 0.01):
             _, _, solver, *_ = self.check_pair(0.01, 16, center_only=True, spin=100.0, **PATCH_OPTIONS)
-            group = solver._torsion_stats["groups"][0]
+            group = solver.laws.torsion_stats["groups"][0]
             n = int(solver.constraint_count.numpy()[0])
             before = solver.impulses.numpy()[0, :n].copy()
             phi = solver.phi.numpy()

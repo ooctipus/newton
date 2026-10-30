@@ -22,7 +22,7 @@ from newton._src.sim import BodyFlags, JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import prescale_joint_velocity_limits
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _velocity_prescale_launch
+from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_mixed_tree_free_body as mixed_tree
 
@@ -499,7 +499,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
 
         def launch(starts, *, cuda):
             # The articulations end at the last joint.
-            return _velocity_prescale_launch(np.asarray(starts), joint_count=int(starts[-1]), cuda=cuda)
+            return velocity_prescale_launch(np.asarray(starts), joint_count=int(starts[-1]), cuda=cuda)
 
         self.assertEqual(launch(np.array([0], dtype=np.int32), cuda=True), (1, 0))
         self.assertEqual(launch([0, 21, 22, 43, 44], cuda=False), (1, 4))
@@ -514,12 +514,12 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
 
     def test_launch_requires_articulations_to_end_at_the_last_joint(self):
         """Reject joints past the last articulation, whose DOFs no lane would write."""
-        self.assertEqual(_velocity_prescale_launch(np.array([0, 4, 7]), joint_count=7, cuda=True), (4, 32))
+        self.assertEqual(velocity_prescale_launch(np.array([0, 4, 7]), joint_count=7, cuda=True), (4, 32))
         # Without articulations the launcher copies every DOF.
-        self.assertEqual(_velocity_prescale_launch(np.array([0]), joint_count=7, cuda=True), (1, 0))
+        self.assertEqual(velocity_prescale_launch(np.array([0]), joint_count=7, cuda=True), (1, 0))
         for cuda in (False, True):
             with self.subTest(cuda=cuda), self.assertRaisesRegex(ValueError, "articulation_start"):
-                _velocity_prescale_launch(np.array([0, 4, 7]), joint_count=9, cuda=cuda)
+                velocity_prescale_launch(np.array([0, 4, 7]), joint_count=9, cuda=cuda)
 
     def test_launcher_writes_every_dof_without_a_copy(self):
         """Write each DOF of a solver model's work velocity in one launch, bit for bit like the serial prescale."""
@@ -529,8 +529,8 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 # CPU solvers reject velocity limits (matrix-free mode needs CUDA), but the launcher is the same.
                 solver = SolverFeatherPGS(model)
                 self.assertEqual(
-                    (solver._velocity_prescale_lanes, solver._velocity_prescale_threads),
-                    _velocity_prescale_launch(
+                    (solver.laws.velocity_prescale_lanes, solver.laws.velocity_prescale_threads),
+                    velocity_prescale_launch(
                         model.articulation_start.numpy(),
                         joint_count=model.joint_count,
                         cuda=wp.get_device(device).is_cuda,
@@ -544,8 +544,10 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 with _recording_copies(destinations):
                     solver._launch_velocity_prescale(state.joint_qd, solver.qd_work)
                 self.assertEqual(destinations, [])
-                drive_slot = solver._vel_limit_drive_slot_arg.numpy()
-                expected = _serial(_model_layout(model, joint_qd, drive_slot), solver._vel_limit_skip_driven, device)
+                drive_slot = solver.laws.vel_limit_drive_slot_arg.numpy()
+                expected = _serial(
+                    _model_layout(model, joint_qd, drive_slot), solver.laws.vel_limit_skip_driven, device
+                )
                 self.assertFalse(np.array_equal(expected, joint_qd))
                 _assert_bits_equal(solver.qd_work.numpy(), expected)
                 _assert_bits_equal(state.joint_qd.numpy(), joint_qd)
@@ -563,12 +565,12 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                         drive_mode=drive_mode,
                     )
                     # The fused clamp skips driven DOFs; only physx_pgs drives allocate drive rows.
-                    self.assertEqual(solver._vel_limit_skip_driven, int(drive_mode == "physx_pgs"))
-                    lanes, threads = _velocity_prescale_launch(
+                    self.assertEqual(solver.laws.vel_limit_skip_driven, int(drive_mode == "physx_pgs"))
+                    lanes, threads = velocity_prescale_launch(
                         model.articulation_start.numpy(), joint_count=model.joint_count, cuda=True
                     )
                     self.assertEqual(
-                        (solver._velocity_prescale_lanes, solver._velocity_prescale_threads), (lanes, threads)
+                        (solver.laws.velocity_prescale_lanes, solver.laws.velocity_prescale_threads), (lanes, threads)
                     )
                     self.assertEqual(threads % 32, 0)
                     routes = solver.get_path_selection()["routes"]
@@ -577,10 +579,10 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     dofs = model.joint_dof_count
                     joint_qd = (np.random.default_rng(7).normal(size=dofs) * 3.0).astype(np.float32)
                     drive_slot = np.full(dofs, -1, dtype=np.int32)
-                    if solver._vel_limit_skip_driven:
+                    if solver.laws.vel_limit_skip_driven:
                         # A previous step allocated drive rows for every other DOF.
                         drive_slot[::2] = np.arange((dofs + 1) // 2, dtype=np.int32)
-                        solver.drive_slot.assign(drive_slot)
+                        solver.laws.drive_slot.assign(drive_slot)
                     state, following = model.state(), model.state()
                     state.joint_qd.assign(joint_qd)
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -592,7 +594,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     self.assertIs(stage3_qd, solver.qd_work)
                     self.assertFalse(any(destination is solver.qd_work for destination in destinations))
                     expected = _serial(
-                        _model_layout(model, joint_qd, drive_slot), solver._vel_limit_skip_driven, device
+                        _model_layout(model, joint_qd, drive_slot), solver.laws.vel_limit_skip_driven, device
                     )
                     self.assertFalse(np.array_equal(expected, joint_qd))
                     _assert_bits_equal(solver.qd_work.numpy(), expected)
@@ -681,7 +683,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         self.assertEqual(len(predicted), 2)
         self.assertTrue(all(prescaled is solver.qd_work for prescaled in launches))
 
-        drive_slot = solver._vel_limit_drive_slot_arg.numpy()
+        drive_slot = solver.laws.vel_limit_drive_slot_arg.numpy()
         scaled = 0
         for replay in range(3):
             # An episode reset between env steps, as a training loop does.
@@ -690,7 +692,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             wp.capture_launch(capture.graph)
             for substep in range(2):
                 source = inputs[substep].numpy()
-                expected = _serial(_model_layout(model, source, drive_slot), solver._vel_limit_skip_driven, device)
+                expected = _serial(_model_layout(model, source, drive_slot), solver.laws.vel_limit_skip_driven, device)
                 _assert_bits_equal(consumed[substep].numpy(), expected, f"replay={replay} substep={substep}")
                 scaled += int(np.count_nonzero(expected != source))
         self.assertGreater(scaled, 0)

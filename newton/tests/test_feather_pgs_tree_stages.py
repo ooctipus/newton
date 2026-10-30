@@ -3,6 +3,7 @@
 
 """The held-tree finish and repair are authored stage functions over one tree-group operand."""
 
+import dataclasses
 import re
 import unittest
 from pathlib import Path
@@ -238,7 +239,9 @@ class TestTreeKineticStages(unittest.TestCase):
         for alternate in (False, True):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-            solver.enable_joint_velocity_limits = alternate
+            solver.options = solver.laws.options = dataclasses.replace(
+                solver.options, enable_joint_velocity_limits=alternate
+            )
             owner = HeldTree(solver)
             state, output, control = model.state(), model.state(), model.control()
             rng = np.random.default_rng(41)

@@ -71,7 +71,7 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
     if compact is None:
         compact = getattr(solver, "_compact_diagonal_mass_size", None)
     model = solver.model
-    reason = capable("held", solver._laws)
+    reason = capable("held", solver.laws.set)
     if reason is not None:
         return reason
     if model.particle_count:
@@ -80,8 +80,8 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
         velocity_limits = sparse
         if solver.forest.has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
-        if solver._mimic_count and not (
-            velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
+        if solver.laws.mimic_count and not (
+            velocity_limits and solver.laws.mimic_valid_np is not None and np.all(solver.laws.mimic_valid_np)
         ):
             return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
     else:

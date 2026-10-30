@@ -52,8 +52,8 @@ PREFIX_INPUT = (
     ROW_MAPS["starts"],
     *LAW,
     *VELOCITY_LAW,
-    Field("velocity_slots", wp.int32, ("velocity_row",), attr="velocity_limit_slot"),
-    Field("velocity_signs", wp.float32, ("velocity_row",), attr="velocity_limit_sign"),
+    Field("velocity_slots", wp.int32, ("velocity_row",), owner="laws", attr="velocity_limit_slot"),
+    Field("velocity_signs", wp.float32, ("velocity_row",), owner="laws", attr="velocity_limit_sign"),
 )
 """The keyed prefix's inputs and the dense rows it writes (:data:`.prefix_rows.LAW`); without joint velocity limits,
 their tables take placeholders."""
@@ -383,7 +383,7 @@ class KeyedRows:
         solver._arrays.placeholder(wp.float32)
         self._topology = TopologyPin.read(solver.model, TOPOLOGY)
         # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
-        self.patch = bool(solver._friction_anchors_enabled)
+        self.patch = bool(solver.laws.friction_anchors_enabled)
         self.law = patch_row_law(solver)
 
     def validate_notification(self, flags=ModelFlags.ALL):
@@ -402,7 +402,16 @@ class KeyedRows:
             if field.owner == "solver" and len(field.dims) == 1 and getattr(s, field.attr or field.name) is None
         }
         p = field_group.bind(
-            PrefixInput, self.prefix, solver=s, model=s.model, maps=m, state_in=state_in, dt=dt, **absent
+            PrefixInput,
+            self.prefix,
+            solver=s,
+            laws=s.laws,
+            options=s.options,
+            model=s.model,
+            maps=m,
+            state_in=state_in,
+            dt=dt,
+            **absent,
         )
         self.contact_input = None
         self.data.maps, self.data.prefix = m, p
@@ -465,7 +474,7 @@ def create_owner(solver):
     """Admit one bounded complete numerical law where the in-kernel parallel tiers (``_ink_sizes``) take the rows: the
     laws keyed rows implement (``route_table.CAPABILITIES``), then their fit."""
     supported = (
-        capable("keyed_rows", solver._laws) is None
+        capable("keyed_rows", solver.laws.set) is None
         and solver._ink_sizes is not None
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
         and not solver._fused_diagonal_joint_limits

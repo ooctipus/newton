@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qualify load-bounded spin friction during the unbiased velocity post-pass."""
 
+import dataclasses
 import unittest
 
 import numpy as np
@@ -88,7 +89,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
 
     def _assert_budget(self, result, solver):
         """Check the shared final-load budget and nonnegative normal impulses."""
-        for group in solver._torsion_stats["groups"]:
+        for group in solver.laws.torsion_stats["groups"]:
             impulse = result["impulses"][group["world"]]
             normal = sum(max(float(impulse[n]), 0.0) for n in group["normal_rows"])
             sliding = sum(float(np.linalg.norm(impulse[n + 1 : n + 3])) for n in group["anchor_rows"])
@@ -161,7 +162,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         original, solver, model, state, contacts = fixture(
             0.01, spin=100.0, center_only=True, pgs_velocity_iterations=4, **PATCH_OPTIONS
         )
-        group = solver._torsion_stats["groups"][0]
+        group = solver.laws.torsion_stats["groups"][0]
         count = int(solver.constraint_count.numpy()[0])
         before_lambda = solver.impulses.numpy()[0, :count].copy()
         self.assertGreater(abs(float(before_lambda[group["row"]])), 1e-8)
@@ -189,7 +190,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
         # prior velocity-pass retirement in a reused membership buffer.
         output = model.state()
         solver.step(state, output, model.control(), contacts, 0.0025)
-        group = solver._torsion_stats["groups"][0]
+        group = solver.laws.torsion_stats["groups"][0]
         self.assertEqual(int(solver._contact_torsion_group.numpy()[0, group["row"]]), -1)
         self.assertGreater(abs(float(solver.impulses.numpy()[0, group["row"]])), 1e-8)
         np.testing.assert_allclose(output.body_qd.numpy(), original["body_qd"], atol=2e-5)
@@ -234,7 +235,7 @@ class TestTorsionVelocitySolve(unittest.TestCase):
     def test_runtime_incompatible_mutation_rejected(self):
         """Reject unsupported mutation before stepping an allocated torsion solver."""
         _, solver, model, state, contacts = fixture(0.01, pgs_velocity_iterations=4)
-        solver.pgs_warmstart = True
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, pgs_warmstart=True)
         with self.assertRaisesRegex(ValueError, "warmstart"):
             solver.step(state, model.state(), model.control(), contacts, 0.0025)
 

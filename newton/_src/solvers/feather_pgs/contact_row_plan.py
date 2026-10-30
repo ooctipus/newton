@@ -68,7 +68,7 @@ def contact_row_plan(solver) -> ContactRowPlan:
       for one or two such sizes; ``masked``, one launch per size for three or more); wider sizes take
       ``per_contact``.
     """
-    law = "patch" if solver._friction_anchors_enabled else "point"
+    law = "patch" if solver.laws.friction_anchors_enabled else "point"
     sizes = solver.forest.size_groups
     if solver._row_packets is not None:
         return ContactRowPlan("local_packets", law, dict.fromkeys(sizes, "local_packets"))

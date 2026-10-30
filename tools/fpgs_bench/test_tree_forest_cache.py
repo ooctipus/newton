@@ -4,6 +4,7 @@
 """Check complete cached publication with distinct group/articulation/world IDs."""
 
 import contextlib
+import dataclasses
 import unittest
 from unittest.mock import patch
 
@@ -66,7 +67,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
     for item in (solver, reference):
-        item.enable_joint_velocity_limits = motion
+        item.options = item.laws.options = dataclasses.replace(item.options, enable_joint_velocity_limits=motion)
         item._fk_id_cache_enabled = False
         item._passive_spring_stiffness.fill_(0.27)
         item._passive_spring_ref.fill_(-0.1)

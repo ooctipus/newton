@@ -81,7 +81,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         # The box is each row's one body (the ground has none): its side's Jacobian.
         J_a, J_b = (J[0, :rows] for J in free_body_jacobians(solver))
         J = np.where((solver.mf_body_a.numpy()[0, :rows] >= 0)[:, None], J_a, J_b)
-        expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.pgs_cfm
+        expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
         np.testing.assert_allclose(1.0 / solver.mf_eff_mass_inv.numpy()[0, :rows], expected, rtol=1e-5)
 
 

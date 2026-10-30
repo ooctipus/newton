@@ -43,7 +43,7 @@ def pads(device, *, mu=0.5, separation=0.0, restitution=0.0):
     return b.finalize(device=device)
 
 
-# The host reference of the torsion rows, which records its groups (solver._torsion_stats).
+# The host reference of the torsion rows, which records its groups (solver.laws.torsion_stats).
 HOST_TORSION = {"torsion_preparation": "host"}
 
 
@@ -267,9 +267,9 @@ def patch_rows(points, *, slots, slots_needed, row_type, parents, mu, patches_en
         row_parent=wp.array([parents], dtype=int, device="cpu"),
         row_mu=wp.array([mu], dtype=float, device="cpu"),
         constraint_count=wp.array([len(row_type)], dtype=int, device="cpu"),
-        _friction_anchors_enabled=patches_enabled,
-        _friction_patches=patches,
-        _contact_torsion_shape_set=None,
+        laws=SimpleNamespace(
+            friction_anchors_enabled=patches_enabled, friction_patches=patches, contact_torsion_shape_set=None
+        ),
     )
     if patches_enabled:
         # Linking reads no impulses.
@@ -409,7 +409,7 @@ class TestTorsionNeutralRoute(unittest.TestCase):
                 selected_out = SolverFeatherPGS(
                     model, contact_torsion_radius=0.01, contact_torsion_shape_indices=(), **{**split, **options}
                 )
-                self.assertTrue(selected_out._contact_torsion_enabled)
+                self.assertTrue(selected_out.laws.contact_torsion_enabled)
                 friction = reference.get_path_selection()["routes"]["friction"]
                 self.assertTrue(friction["parallel_rows"]["admitted"])
                 assert_torsion_neutral_routes(self, reference, selected_out)
@@ -433,16 +433,16 @@ class TestContactTorsion(unittest.TestCase):
         self.assertGreater(np.max(np.abs(baseline["body_qd"][:, 5])), 0.9)
         result, solver, *_ = fixture(0.01, spin=1.0, center_only=True)
         self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
-        self.assertGreater(solver._torsion_stats["rows"], 0)
+        self.assertGreater(solver.laws.torsion_stats["rows"], 0)
 
     def test_zero_friction_and_zero_load(self):
         """Apply no torsion when friction or compressive normal load vanishes."""
         for options in ({"mu": 0.0}, {"closing": 0.0}, {"separation": 0.004}):
             actual, solver, *_ = fixture(0.01, **options)
             if "closing" in options:
-                self.assertGreater(solver._torsion_stats["rows"], 0)
+                self.assertGreater(solver.laws.torsion_stats["rows"], 0)
             else:
-                self.assertEqual(solver._torsion_stats["rows"], 0)
+                self.assertEqual(solver.laws.torsion_stats["rows"], 0)
             active = actual["row_type"] == 7
             self.assertLess(np.abs(actual["impulses"][active]).max(initial=0), 1e-9)
 
@@ -477,7 +477,7 @@ class TestContactTorsion(unittest.TestCase):
                 response = actual["response"][0, :count].T @ impulse
                 # Factor-coordinate accumulation, left once (packed_rows): rounding of about 1e-5 of the velocity.
                 np.testing.assert_allclose(actual["v_out"] - actual["v_hat"], response, atol=2e-5, rtol=2e-5)
-                for group in solver._torsion_stats["groups"]:
+                for group in solver.laws.torsion_stats["groups"]:
                     rows = group["normal_rows"]
                     budget = 0.5 * sum(max(float(impulse[r]), 0) for r in rows)
                     used = sum(float(np.linalg.norm(impulse[r + 1 : r + 3])) for r in rows)
@@ -489,7 +489,7 @@ class TestContactTorsion(unittest.TestCase):
         outputs = []
         for count in (1, 2, 4):
             result, solver, *_ = fixture(0.01, spin=100.0, center_only=True, center_count=count)
-            self.assertEqual(solver._torsion_stats["rows"], 1)
+            self.assertEqual(solver.laws.torsion_stats["rows"], 1)
             outputs.append(result["body_qd"])
         for output in outputs[1:]:
             np.testing.assert_allclose(output, outputs[0], atol=2e-5)
@@ -501,7 +501,7 @@ class TestContactTorsion(unittest.TestCase):
         count = contacts.rigid_contact_count.numpy()
         contacts.rigid_contact_count.zero_()
         solver.step(initial, output, model.control(), contacts, 0.0025)
-        self.assertEqual(solver._torsion_stats["rows"], 0)
+        self.assertEqual(solver.laws.torsion_stats["rows"], 0)
         contacts.rigid_contact_count.assign(count)
         solver.reset(initial)
         solver.step(initial, output, model.control(), contacts, 0.0025)
@@ -529,7 +529,7 @@ class TestContactTorsion(unittest.TestCase):
         for selection in ({"contact_torsion_shape_indices": (0,)}, {"contact_torsion_shape_patterns": (".*",)}):
             result, solver, *_ = fixture(0.01, center_only=True, **selection)
             self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
-            self.assertEqual(solver._torsion_stats["rows"], 1)
+            self.assertEqual(solver.laws.torsion_stats["rows"], 1)
 
     def test_invalid_input_and_unsupported_modes(self):
         """Reject invalid scopes and modes rather than silently ignoring spin friction."""
@@ -587,10 +587,10 @@ class TestContactTorsionWithPatches(unittest.TestCase):
                 warnings.simplefilter("always")
                 _, solver, *_ = fixture(0.01, center_only=True, **{**PATCH_OPTIONS, **options})
             self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
-            self.assertTrue(solver._contact_torsion_enabled)
-            self.assertTrue(solver._friction_anchors_enabled)
-            self.assertAlmostEqual(solver.friction_anchor_beta, 0.2)
-            self.assertEqual(solver._torsion_stats["rows"], 1)
+            self.assertTrue(solver.laws.contact_torsion_enabled)
+            self.assertTrue(solver.laws.friction_anchors_enabled)
+            self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
+            self.assertEqual(solver.laws.torsion_stats["rows"], 1)
 
     def test_patch_regions_pool_the_spin_budget(self):
         """Share mu times the region's pooled normal load between anchor sliding and spin."""
@@ -599,8 +599,8 @@ class TestContactTorsionWithPatches(unittest.TestCase):
                 actual, solver, *_ = fixture(
                     0.01, spin=100.0, sliding=10.0, sat=not center_only, center_only=center_only, **PATCH_OPTIONS
                 )
-                self.assertEqual(solver._torsion_stats["rows"], 1)
-                group = solver._torsion_stats["groups"][0]
+                self.assertEqual(solver.laws.torsion_stats["rows"], 1)
+                group = solver.laws.torsion_stats["groups"][0]
                 self.assertEqual(len(group["anchor_rows"]), anchors)
                 self.assertGreaterEqual(len(group["normal_rows"]), anchors)
                 self.assertAlmostEqual(group["mu"], 0.5, places=6)
@@ -620,19 +620,19 @@ class TestContactTorsionWithPatches(unittest.TestCase):
     def test_single_anchor_spin_stops_below_bound(self):
         """Stop a slow spin that a lone patch anchor cannot resist on its own."""
         baseline, solver, *_ = fixture(0.0, spin=1.0, center_only=True, **PATCH_OPTIONS)
-        self.assertTrue(solver._friction_anchors_enabled)
+        self.assertTrue(solver.laws.friction_anchors_enabled)
         self.assertGreater(np.max(np.abs(baseline["body_qd"][:, 5])), 0.9)
         result, solver, *_ = fixture(0.01, spin=1.0, center_only=True, **PATCH_OPTIONS)
         self.assertLess(np.max(np.abs(result["body_qd"][:, 5])), 1e-4)
-        self.assertEqual(len(solver._torsion_stats["groups"][0]["anchor_rows"]), 1)
+        self.assertEqual(len(solver.laws.torsion_stats["groups"][0]["anchor_rows"]), 1)
 
     def test_held_box_yaw_torque_threshold(self):
         """Hold a resting box below mu * N * radius and let it spin above, with patch friction."""
         radius, mu, mass = 0.05, 0.5, 0.3
         bound = mu * mass * 9.81 * radius
         held, solver = held_box(radius, 0.5 * bound, mu=mu, mass=mass)
-        self.assertEqual(solver._torsion_stats["rows"], 1)
-        self.assertEqual(len(solver._torsion_stats["groups"][0]["anchor_rows"]), 2)
+        self.assertEqual(solver.laws.torsion_stats["rows"], 1)
+        self.assertEqual(len(solver.laws.torsion_stats["groups"][0]["anchor_rows"]), 2)
         self.assertLess(abs(held), 1e-3)
         released, _ = held_box(radius, 2.0 * bound, mu=mu, mass=mass)
         self.assertGreater(released, 1.0)

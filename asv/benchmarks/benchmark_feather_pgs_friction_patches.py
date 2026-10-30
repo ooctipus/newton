@@ -173,7 +173,7 @@ def run(
         "warp": wp.__version__,
         "worlds": worlds,
         "tiles": tiles,
-        "beta": solver.friction_anchor_beta,
+        "beta": solver.laws.friction_anchor_beta,
         "steps": steps,
         "warmstart": warmstart,
         "frozen_contacts": frozen_contacts,
@@ -191,7 +191,7 @@ def run(
     if profile_stages:
         # Keep instrumentation and its synchronization out of the captured
         # throughput measurement. Two steps exercise both state buffers.
-        with _time_patch_sort(solver._friction_patches) as sort_spans:
+        with _time_patch_sort(solver.laws.friction_patches) as sort_spans:
             with wp.ScopedTimer("contact_stages", cuda_filter=wp.TIMING_ALL, print=False) as timer:
                 step(s0, s1)
                 step(s1, s0)

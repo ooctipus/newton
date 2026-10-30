@@ -32,7 +32,7 @@ def _make_solver(model, *, warmstart: bool):
 
 def _history_specs(solver):
     specs = []
-    if solver.pgs_warmstart:
+    if solver.options.pgs_warmstart:
         specs.append(("dense impulses", solver.impulses, 7.0, 0.0))
     if solver._ws_prev_mf_impulses is not None:
         specs.extend(

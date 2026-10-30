@@ -29,7 +29,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import field_group, keyed_rows, path_selection, sweep_routes_tiers
-from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import RING
@@ -43,6 +42,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prescale_joint_velocity_limits,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import position_pass
 from newton.tests.feather_pgs_patch_parity import (
@@ -451,9 +451,9 @@ def prescaled_joint_velocity(model):
     ``maxJointVelocity`` ratio), and predicts the step's velocity from the
     result. Split mode, which builds this module's CPU rows, has no velocity
     limits and predicts from the unscaled velocity. The launch takes the
-    solver's lanes and thread count (``_velocity_prescale_launch``).
+    solver.s lanes and thread count (``rows.velocity_prescale_launch``).
     """
-    lanes, threads = source._velocity_prescale_launch(
+    lanes, threads = velocity_prescale_launch(
         model.articulation_start.numpy(), joint_count=model.joint_count, cuda=model.device.is_cuda
     )
     qd = wp.clone(model.joint_qd)
@@ -742,7 +742,10 @@ class TestParallelPatchReference(unittest.TestCase):
         """Build the last-word pass exactly for linked tiers with joint velocity limits."""
         decide = SolverFeatherPGS._parallel_velocity_limit_pass
         for anchors, limits in itertools.product((False, True), repeat=2):
-            probe = SimpleNamespace(_friction_anchors_enabled=anchors, enable_joint_velocity_limits=limits)
+            probe = SimpleNamespace(
+                laws=SimpleNamespace(friction_anchors_enabled=anchors),
+                options=SimpleNamespace(enable_joint_velocity_limits=limits),
+            )
             with self.subTest(anchors=anchors, limits=limits):
                 self.assertEqual(decide(probe), anchors and limits)
 
@@ -784,7 +787,7 @@ class TestParallelPatchReference(unittest.TestCase):
         _rollout(model, solver, 1)
         (size,) = solver.forest.size_groups
         mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
-        case = with_velocity_limit_rows(split_world_case(solver)[0], mass_matrix, limits, solver.pgs_cfm)
+        case = with_velocity_limit_rows(split_world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         speeds = {}
         for sweeps, last_word in itertools.product((2, 2000), (False, True)):
@@ -864,7 +867,7 @@ def _general_bias(solver, rows, dt):
             rhs.shape[1],
             dt,
             1.0,
-            solver.contact_speculative_scale,
+            solver.options.contact_speculative_scale,
             1.0,
             1.0,
             *position_pass(device),
@@ -912,10 +915,10 @@ class TestKeyedPatchRows(unittest.TestCase):
         }
         general = SolverFeatherPGS(model, **options)
         keyed = SolverFeatherPGS(model, **options)
-        keyed._friction_patches = general._friction_patches
+        keyed.laws.friction_patches = general.laws.friction_patches
         install_cpu_keyed_rows(keyed)
         if late_beta is not None:
-            general.friction_anchor_beta = keyed.friction_anchor_beta = late_beta
+            general.laws.friction_anchor_beta = keyed.laws.friction_anchor_beta = late_beta
         state, out = model.state(), model.state()
         velocity = state.joint_qd.numpy()
         velocity[0], velocity[11] = 0.05, -0.04
@@ -1017,7 +1020,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                 self.assertNotIn("point contacts", keyed["reason"])
         # Torsion and compliance (CUDA-only laws here) keep ordinary rows.
-        other_law = SimpleNamespace(_laws=plain_laws(torsion=True))
+        other_law = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(torsion=True)))
         admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
         self.assertFalse(admitted)
         self.assertIn("torsion", reason)
@@ -1040,16 +1043,24 @@ class TestPatchParallelAdmission(unittest.TestCase):
             (True, 0.0, "stateless", "interleaved", False),
             (True, 0.0, "accumulated", "physx_grasp", False),  # the grasp schedule keeps PhysX's clamp
         ):
-            probe = SimpleNamespace(
-                _laws=plain_laws(contact="patch", velocity_limits=limits, schedule=schedule),
-                _matrix_free=True,
+            options = SimpleNamespace(
                 pgs_schedule=schedule,
                 enable_joint_velocity_limits=limits,
                 velocity_limit_activation_fraction=fraction,
                 velocity_limit_law=law,
             )
-            for name in ("_velocity_limit_sweep_law", "_parallel_velocity_limit_agreement"):
-                setattr(probe, name, MethodType(getattr(SolverFeatherPGS, name), probe))
+            laws = SimpleNamespace(
+                set=plain_laws(contact="patch", velocity_limits=limits, schedule=schedule),
+                matrix_free=True,
+                has_rigid_body_velocity_limits=False,
+                options=options,
+                forest=SimpleNamespace(free_rigid_body_count=0),
+            )
+            laws.velocity_limit_sweep_law = MethodType(RowLaws.velocity_limit_sweep_law, laws)
+            probe = SimpleNamespace(_matrix_free=True, laws=laws, options=options)
+            probe._parallel_velocity_limit_agreement = MethodType(
+                SolverFeatherPGS._parallel_velocity_limit_agreement, probe
+            )
             with self.subTest(limits=limits, fraction=fraction, law=law, schedule=schedule):
                 admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
                 self.assertTrue(admitted)
@@ -1085,9 +1096,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _ink_sizes=(_DOFS, 0, 0, 0),
                 _ink_reason="The parallel tiers form the response of sizes [12] in-kernel.",
                 _keyed_rows=None,
-                _friction_anchors_enabled=anchors,
-                enable_joint_velocity_limits=limits,
-                velocity_limit_activation_fraction=0.0,
+                laws=SimpleNamespace(friction_anchors_enabled=anchors),
+                options=SimpleNamespace(enable_joint_velocity_limits=limits, velocity_limit_activation_fraction=0.0),
             )
             with self.subTest(anchors=anchors, linked=linked, limits=limits):
                 tiers = path_selection._tiers(probe)
@@ -1099,7 +1109,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (34, "auto"))
                 self.assertEqual(tiers["velocity_limit_law"], "accumulated" if limits else None)
                 # An infinite activation fraction reserves no velocity-limit row.
-                probe.velocity_limit_activation_fraction = float("inf")
+                probe.options.velocity_limit_activation_fraction = float("inf")
                 self.assertIsNone(path_selection._tiers(probe)["velocity_limit_law"])
 
 
@@ -1151,7 +1161,11 @@ class TestTierSweeps(unittest.TestCase):
         """Budget point and linked tiers by one rule."""
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
         for anchors in (False, True):
-            probe = SimpleNamespace(_friction_anchors_enabled=anchors, _route_pins={}, pgs_iterations=12)
+            probe = SimpleNamespace(
+                _route_pins={},
+                laws=SimpleNamespace(friction_anchors_enabled=anchors),
+                options=SimpleNamespace(pgs_iterations=12),
+            )
             with self.subTest(anchors=anchors):
                 budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
                 self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
@@ -1159,7 +1173,11 @@ class TestTierSweeps(unittest.TestCase):
                 self.assertIn("pgs_iterations=12", reason)
                 self.assertIn("at most 128", reason)
         # A test pin sets every tier's budget.
-        probe = SimpleNamespace(_friction_anchors_enabled=False, _route_pins={"tier_sweeps": 160}, pgs_iterations=12)
+        probe = SimpleNamespace(
+            _route_pins={"tier_sweeps": 160},
+            laws=SimpleNamespace(friction_anchors_enabled=False),
+            options=SimpleNamespace(pgs_iterations=12),
+        )
         budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
         self.assertEqual((budgets, rule), ([160] * 4, "pinned"))
         self.assertIn("tier_sweeps=160", reason)
@@ -1677,7 +1695,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 self.assertIsNotNone(solver._keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
                 tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
                 self.assertEqual((tiers["family"], tiers["linked_rows"]), ("keyed_parallel", True))
-                self.assertEqual(solver._friction_patches.reuse_frames, reuse is None)
+                self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
                 pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
@@ -1693,7 +1711,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 # Eager pairs load every kernel and buffer the graph launches; eager builds always sort.
                 for _ in range(2):
                     pair()
-                outcomes = _admitted_modes(solver._friction_patches)
+                outcomes = _admitted_modes(solver.laws.friction_patches)
                 # The eager steps queued buffer clears the graph does not wait for (seed_double_buffer_events).
                 wp.synchronize_device(model.device)
                 with scoped_capture_after_gc(device=model.device) as capture:

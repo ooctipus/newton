@@ -198,12 +198,12 @@ CONTACT_RUNS = FieldGroup(
 """Contact runs of each world and shape block under sorted contacts (``record_world_contact_runs``)."""
 
 VELOCITY_LIMIT_SLOTS = FieldGroup(
-    Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1),
-    Field("velocity_limit_sign", wp.float32, ("limit_row",)),
+    Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
+    Field("velocity_limit_sign", wp.float32, ("limit_row",), owner="laws"),
 )
 """Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
 
-DRIVE_SLOTS = FieldGroup(Field("drive_slot", wp.int32, ("dof",), fill=-1))
+DRIVE_SLOTS = FieldGroup(Field("drive_slot", wp.int32, ("dof",), fill=-1, owner="laws"))
 """Each DOF's PhysX drive row slot."""
 
 DENSE_CONTACT_UNITS = FieldGroup(
@@ -376,33 +376,33 @@ BODY_MAPS = FieldGroup(
 """Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
 
 MIMIC_PLAN = FieldGroup(
-    Field("_mimic_art_start", wp.int32, ("articulation_bound",), grad=False),
-    Field("_mimic_art_list", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_valid", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_world", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_dof0", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_dof1", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_q0", wp.int32, ("mimic",), grad=False),
-    Field("_mimic_q1", wp.int32, ("mimic",), grad=False),
+    Field("_mimic_art_start", wp.int32, ("articulation_bound",), grad=False, owner="laws"),
+    Field("_mimic_art_list", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_valid", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_world", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_dof0", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_dof1", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_q0", wp.int32, ("mimic",), grad=False, owner="laws"),
+    Field("_mimic_q1", wp.int32, ("mimic",), grad=False, owner="laws"),
 )
 """The static per-mimic lookup tables: each articulation's valid mimics (CSR) and each mimic's DOFs and coordinates."""
 
-MIMIC_SLOTS = FieldGroup(Field("mimic_slot", wp.int32, ("mimic",), fill=-1, grad=False))
+MIMIC_SLOTS = FieldGroup(Field("mimic_slot", wp.int32, ("mimic",), fill=-1, grad=False, owner="laws"))
 
 CONNECT_PLAN = FieldGroup(
-    Field("_connect_art", wp.int32, ("closure",), grad=False),
-    Field("_connect_body_p", wp.int32, ("closure",), grad=False),
-    Field("_connect_body_c", wp.int32, ("closure",), grad=False),
-    Field("_connect_anchor_p", wp.vec3, ("closure",), grad=False),
-    Field("_connect_anchor_c", wp.vec3, ("closure",), grad=False),
-    Field("_connect_parent_prescribed", wp.int32, ("closure",), grad=False),
-    Field("_connect_world", wp.int32, ("closure",), grad=False),
-    Field("_connect_valid", wp.int32, ("closure",), grad=False),
-    Field("_connect_enabled", wp.int32, ("closure",), grad=False),
+    Field("_connect_art", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_body_p", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_body_c", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_anchor_p", wp.vec3, ("closure",), grad=False, owner="laws"),
+    Field("_connect_anchor_c", wp.vec3, ("closure",), grad=False, owner="laws"),
+    Field("_connect_parent_prescribed", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_world", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_valid", wp.int32, ("closure",), grad=False, owner="laws"),
+    Field("_connect_enabled", wp.int32, ("closure",), grad=False, owner="laws"),
 )
 """The static per-closure lookup tables of the enforced loop closures."""
 
-CONNECT_SLOTS = FieldGroup(Field("connect_slot", wp.int32, ("closure",), fill=-1, grad=False))
+CONNECT_SLOTS = FieldGroup(Field("connect_slot", wp.int32, ("closure",), fill=-1, grad=False, owner="laws"))
 
 Mimics = field_group.struct(
     "Mimics",

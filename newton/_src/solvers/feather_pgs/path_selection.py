@@ -25,12 +25,24 @@ from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 
-# Options whose applied value lives under another attribute after construction.
+# Options whose applied value lives under another attribute of the solver after construction.
 _APPLIED_ATTRIBUTES = {
     "nvtx": "_nvtx",
     "row_watermark": "_row_watermark",
     "enable_bilateral_preelimination": "_preelim_active",
 }
+
+
+def _applied(solver, name, requested):
+    """An option's applied value: the row laws' resolved friction beta, the solver's attribute where it keeps one
+    (:data:`_APPLIED_ATTRIBUTES`, capacities, the torsion selection), else the options record's value."""
+    if name == "friction_anchor_beta":
+        return solver.laws.friction_anchor_beta
+    attribute = _APPLIED_ATTRIBUTES.get(name, name)
+    if hasattr(solver, attribute):
+        return getattr(solver, attribute)
+    return getattr(solver.options, name, requested)
+
 
 _BETA_REASONS = {
     "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
@@ -80,9 +92,9 @@ def _is_default(value, default) -> bool:
 _EFFECTIVE = {
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in the CPU's split mode,
     # which builds no matrix-free sweep and applies no law.
-    "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
+    "velocity_limit_law": lambda solver: solver.laws.velocity_limit_sweep_law()[0],
     # A readout applies only where a sweep kernel carries its counters.
-    "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
+    "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver._solve_readout.kernels else "off",
     # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
     "contact_update": lambda solver: (
         "unit" if solver._dense_contact_unit or solver._free_body_contact_unit else "sequential"
@@ -110,7 +122,7 @@ def applied_options(solver, init, arguments: dict) -> dict:
         if effective is not None:
             applied = effective(solver)
         else:
-            applied = getattr(solver, _APPLIED_ATTRIBUTES.get(name, name), value)
+            applied = _applied(solver, name, value)
         record[name] = {
             "applied": json_value(applied),
             "requested": json_value(value),
@@ -146,7 +158,7 @@ def route_selection(solver) -> dict:
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
         # The row laws every owner's admission reads (route_table.Laws).
-        "laws": solver._laws.record(),
+        "laws": solver.laws.set.record(),
         # The per-stage dispatch tables step() launches through (step_plan.StepPlan).
         "stages": solver._plan.record(),
         "held_tree": _held_tree(solver),
@@ -373,7 +385,7 @@ def _row_builder(solver, plan, size, source) -> dict:
 
 
 def _contact_rows(solver, source) -> dict:
-    point = bool(solver._laws.point)
+    point = bool(solver.laws.set.point)
     # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
     # contact row; the general builder serves only solvers no earlier producer took.
     plan = contact_row_plan(solver)
@@ -533,9 +545,9 @@ def _sweep(solver) -> dict:
         "reason": solve.route.reason,
         "driver": driver,
         "driver_reason": solve.driver.reason,
-        "schedule": solver.pgs_schedule,
-        "iterations": int(solver.pgs_iterations),
-        "velocity_iterations": int(solver.pgs_velocity_iterations),
+        "schedule": solver.options.pgs_schedule,
+        "iterations": int(solver.options.pgs_iterations),
+        "velocity_iterations": int(solver.options.pgs_velocity_iterations),
         "mf_meta_pack": mf_meta_pack,
         "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
         "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
@@ -596,7 +608,7 @@ def _sweep_kernels(solver, record) -> set:
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and how a solve counts."""
     counted = solver._solve_readout.kernels
-    if solver.pgs_solve_readout == "off":
+    if solver.options.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
     elif record["driver"] == "direct":
         reason = "Each launch of a counted kernel solves its worlds."
@@ -609,7 +621,7 @@ def _readout(solver, record) -> dict:
             "world in no slot and not as skipped."
         )
     return {
-        "mode": solver.pgs_solve_readout if counted else "off",
+        "mode": solver.options.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         # Passes whose solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
         "skipped_passes": list(solver._solve_readout.skipped_passes) if counted else [],
@@ -638,7 +650,7 @@ def _contact_update(solver, record) -> dict:
         unit.append(record["dense"]["kernels"][0])
     if solver._free_body_contact_unit:
         unit.append(record["free_body_matrix_free"])
-    requested = solver.contact_update
+    requested = solver.options.contact_update
     sequential = []
     if requested == "unit":
         sequential = sorted(_sweep_kernels(solver, record) - set(unit))
@@ -732,7 +744,7 @@ def _tiers(solver) -> dict | None:
 def _tier_velocity_limit_law(solver, tiers) -> str | None:
     # The law the built tier kernels give joint velocity-limit rows; one construction call builds every tier with
     # it. None where no such row can exist. The tiers serve dense rows only, so free-body limits never reach them.
-    if not solver.enable_joint_velocity_limits or np.isinf(solver.velocity_limit_activation_fraction):
+    if not solver.options.enable_joint_velocity_limits or np.isinf(solver.options.velocity_limit_activation_fraction):
         return None
     return tiers[0].velocity_limit_law
 
@@ -768,7 +780,7 @@ def _publication(solver) -> dict:
 
 
 def _velocity_limits(solver) -> dict:
-    if not solver.enable_joint_velocity_limits:
+    if not solver.options.enable_joint_velocity_limits:
         joint, reason = "off", "enable_joint_velocity_limits is False."
     elif solver._sparse_velocity_limits:
         joint, reason = "sparse_factor_rows", "Native sparse factors solve velocity-limit rows in factor coordinates."
@@ -782,20 +794,20 @@ def _velocity_limits(solver) -> dict:
             "activation fraction and model joint velocity limits).",
         )
     free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
-    limits = bool(solver._has_rigid_body_velocity_limits)
+    limits = bool(solver.laws.has_rigid_body_velocity_limits)
     matrix_free = solver._matrix_free
     model = solver.model
-    prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
+    prescale = solver.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
     # The law the matrix-free sweep kernels were built with; the fused drive clamp keeps PhysX's.
-    law, law_reason = solver._velocity_limit_sweep_law()
+    law, law_reason = solver.laws.velocity_limit_sweep_law()
     return {
         "joint": joint,
         "reason": reason,
         "law": law,
         "law_reason": law_reason,
         # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
-        "prescale_lanes": int(solver._velocity_prescale_lanes) if prescale else 0,
-        "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
+        "prescale_lanes": int(solver.laws.velocity_prescale_lanes) if prescale else 0,
+        "activation_fraction": json_value(solver.options.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
@@ -819,7 +831,7 @@ def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
             "an accumulated impulse; the rows end every iteration. The CPU's free-body loop applies this law; "
             "velocity_limit_law selects the law of the matrix-free sweeps and does not apply here."
         )
-    if solver._has_rigid_body_velocity_limits:
+    if solver.laws.has_rigid_body_velocity_limits:
         return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
     return None, "No free-body velocity-limit rows: the rigid-body speed attributes are not registered."
 
@@ -874,24 +886,24 @@ def _pair_sort(patches) -> dict:
 
 
 def _friction(solver) -> dict:
-    patch = bool(solver._friction_anchors_enabled)
-    reason = _BETA_REASONS[solver._friction_anchor_beta_source]
+    patch = bool(solver.laws.friction_anchors_enabled)
+    reason = _BETA_REASONS[solver.laws.friction_anchor_beta_source]
     if patch:
         owners = []
         # Contact regularization keeps them off under either law (parallel_rows.reason).
-        if not solver._parallel_contact_paths and not solver._regularization_enabled:
+        if not solver._parallel_contact_paths and not solver.laws.regularization_enabled:
             owners.append("keyed rows and parallel matrix-free tiers")
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
-        if not solver._laws.patch:
+        if not solver.laws.set.patch:
             owners.append("the resolved-world classifier")
         if owners:
             reason += f" Point-contact owners ({', '.join(owners)}) need point friction."
     return {
         "law": "patch" if patch else "point",
-        "friction_anchor_beta": json_value(solver.friction_anchor_beta),
-        "anchor_beta_source": solver._friction_anchor_beta_source,
-        "torsion": bool(solver._contact_torsion_enabled),
-        "compliance": bool(solver.contact_compliance),
+        "friction_anchor_beta": json_value(solver.laws.friction_anchor_beta),
+        "anchor_beta_source": solver.laws.friction_anchor_beta_source,
+        "torsion": bool(solver.laws.contact_torsion_enabled),
+        "compliance": bool(solver.options.contact_compliance),
         # Whether the parallel tiers and keyed rows may serve this law; routes.sweep.tiers and
         # routes.contact_rows.keyed_rows report whether the recipe built them.
         "parallel_rows": {
@@ -900,10 +912,10 @@ def _friction(solver) -> dict:
         },
         "reason": reason,
         "frame_reuse": {
-            "enabled": solver._friction_patches.reuse_frames,
-            "reason": solver._patch_frame_reuse_reason,
+            "enabled": solver.laws.friction_patches.reuse_frames,
+            "reason": solver.laws.patch_frame_reuse_reason,
         },
-        "pair_sort": _pair_sort(solver._friction_patches) if patch else None,
+        "pair_sort": _pair_sort(solver.laws.friction_patches) if patch else None,
     }
 
 
@@ -932,8 +944,8 @@ def _dynamics(solver) -> dict:
         else sorted(int(size) for size in solver.forest.size_groups if size not in solver._plan.unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
         "preelimination": bool(solver._preelim_active),
-        "mimic_rows": int(solver._mimic_count or 0),
-        "connect_rows": int(solver._connect_count or 0),
+        "mimic_rows": int(solver.laws.mimic_count or 0),
+        "connect_rows": int(solver.laws.connect_count or 0),
         "loop_joints": bool(solver.forest.has_loop_joints),
         "prescribed_response": bool(solver.forest.has_prescribed_response),
         "armature_floor": _armature_floor(solver),

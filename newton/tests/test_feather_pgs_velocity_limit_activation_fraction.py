@@ -111,9 +111,9 @@ class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
     def test_solver_accepts_and_defaults_velocity_limit_activation_fraction(self):
         model = newton.ModelBuilder().finalize()
 
-        self.assertEqual(SolverFeatherPGS(model).velocity_limit_activation_fraction, 0.0)
+        self.assertEqual(SolverFeatherPGS(model).options.velocity_limit_activation_fraction, 0.0)
         self.assertEqual(
-            SolverFeatherPGS(model, velocity_limit_activation_fraction=0.7).velocity_limit_activation_fraction,
+            SolverFeatherPGS(model, velocity_limit_activation_fraction=0.7).options.velocity_limit_activation_fraction,
             0.7,
         )
 

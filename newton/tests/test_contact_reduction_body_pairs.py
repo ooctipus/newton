@@ -1093,7 +1093,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                         **kwargs,
                     )
                     if iters is None:
-                        self.assertEqual(solver.pgs_iterations, 12)
+                        self.assertEqual(solver.options.pgs_iterations, 12)
                     return solver
 
                 self._compare(

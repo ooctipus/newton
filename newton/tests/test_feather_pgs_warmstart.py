@@ -3,6 +3,7 @@
 
 """Tests for identity-matched FeatherPGS contact warm start."""
 
+import dataclasses
 import inspect
 import unittest
 
@@ -291,7 +292,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 newton.solvers.SolverFeatherPGS(model, pgs_warmstart_decay=value)
 
         solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True, pgs_warmstart_decay=0.25)
-        self.assertEqual(solver.pgs_warmstart_decay, 0.25)
+        self.assertEqual(solver.options.pgs_warmstart_decay, 0.25)
 
     def test_contacts_none_is_valid(self):
         model = newton.ModelBuilder().finalize(device="cpu")
@@ -355,7 +356,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(match[b_contact]), 0)
         self.assertLess(int(match[a_contact]), 0)
 
-        solver.pgs_iterations = 0
+        solver.options = solver.laws.options = dataclasses.replace(solver.options, pgs_iterations=0)
         solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
         slots = solver.contact_slot.numpy()[:count]
         b_slot = int(slots[b_contact])
@@ -430,8 +431,8 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         """pgs_warmstart=True is the single all-contact warm-start mode."""
         model = _build_press()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=4)
-        self.assertTrue(solver.pgs_warmstart)
-        self.assertTrue(solver.pgs_warmstart)
+        self.assertTrue(solver.options.pgs_warmstart)
+        self.assertTrue(solver.options.pgs_warmstart)
 
 
 if __name__ == "__main__":
