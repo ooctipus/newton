@@ -256,9 +256,8 @@ class TestTreeKernelSwitches(unittest.TestCase):
         state.joint_q.assign(joint_q)
         state.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
-        augmented = solver._prepare_augmented_state(state, model.state(), model.control())
         self.assertGreater(np.max(np.abs(state.body_q.numpy() - expected.body_q.numpy())), 1e-2)
-        owner.begin(state, augmented, state.joint_qd, dt, True)
+        owner.begin(state, solver, state.joint_qd, dt, True)
         np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
         np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
         # Finish integrates a solved velocity once and publishes every coordinate and body of the next state.
@@ -268,7 +267,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
             array = getattr(output, name)
             array.assign(np.full(array.numpy().shape, np.nan, np.float32))
-        owner.finish(state, augmented, output, dt, False)
+        owner.finish(state, solver, output, dt, False)
         for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
             self.assertTrue(np.isfinite(getattr(output, name).numpy()).all(), name)
         coordinates, dofs = q_start[revolute], qd_start[revolute]

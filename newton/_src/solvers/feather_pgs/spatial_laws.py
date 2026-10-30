@@ -368,7 +368,6 @@ def joint_transform(
     if joint_type == JointType.D6:
         position = wp.vec3(0.0)
         rotation = wp.quat_identity()
-        # Unrolled so the joint transform stays differentiable.
         if lin_axis_count > 0:
             position += joint_axis[axis_start + 0] * joint_q[q_start + 0]
         if lin_axis_count > 1:

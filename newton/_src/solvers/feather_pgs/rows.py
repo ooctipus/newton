@@ -167,7 +167,7 @@ class RowLaws:
         laws.model = model
         laws.forest = forest
         laws.options = options
-        laws._arrays = SolverArrays(laws, model.device, requires_grad=model.requires_grad)
+        laws._arrays = SolverArrays(laws, model.device)
 
         # The friction law. How friction_anchor_beta was resolved, for get_path_selection().
         friction_anchor_beta = options.friction_anchor_beta
@@ -220,7 +220,6 @@ class RowLaws:
                 float("inf"),
                 dtype=wp.float32,
                 device=model.device,
-                requires_grad=model.requires_grad,
             )
         laws.has_rigid_body_velocity_limits = (
             laws.rigid_body_max_linear_velocity is not None and laws.rigid_body_max_angular_velocity is not None
@@ -243,15 +242,11 @@ class RowLaws:
         if model.shape_material_mu is not None:
             laws.shape_material_mu = model.shape_material_mu
         else:
-            laws.shape_material_mu = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
+            laws.shape_material_mu = wp.zeros((1,), dtype=wp.float32, device=model.device)
         if model.shape_material_restitution is not None:
             laws.shape_material_restitution = model.shape_material_restitution
         else:
-            laws.shape_material_restitution = wp.zeros(
-                (1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad
-            )
+            laws.shape_material_restitution = wp.zeros((1,), dtype=wp.float32, device=model.device)
 
         # The joint velocity prescale's lanes per articulation and threads (it writes every DOF of qd_work).
         if model.joint_count:
@@ -310,7 +305,7 @@ class RowLaws:
                 size: joint_limit_warp_kernel(size, warps_per_block=JOINT_LIMIT_WARPS_PER_BLOCK)
                 for size in self.joint_limit_sizes
             }
-            if model.device.is_cuda and not model.requires_grad
+            if model.device.is_cuda
             else {}
         )
 

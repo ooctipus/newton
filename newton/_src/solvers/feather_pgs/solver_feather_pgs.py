@@ -198,7 +198,6 @@ from .solver_fields import (
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
     STATE_AUX,
-    STATE_GRAD_SCRATCH,
     WORLD_RESPONSE,
     WORLD_ROW_STATE,
     Connects,
@@ -994,7 +993,12 @@ class SolverFeatherPGS(SolverBase):
                 Restitution coefficients are averaged across the two shapes after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
+
+        Raises:
+            ValueError: For a model that records gradients (``requires_grad``): FeatherPGS has no gradients.
         """
+        if model.requires_grad:
+            raise ValueError("FeatherPGS has no gradients: build the model with requires_grad=False.")
         # Every option as requested, before any default resolution; get_path_selection() reports it.
         requested_options = dict(locals())
         if contact_compliance:
@@ -1060,8 +1064,8 @@ class SolverFeatherPGS(SolverBase):
         # pgs_debug, which keeps the solver's other diagnostics, keeps them too.
         self._debug_stage3_snapshot_flag = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
         self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
-        # The solver's device fields (solver_fields): one device and the model's gradient policy.
-        self._arrays = SolverArrays(self, model.device, requires_grad=model.requires_grad)
+        # The solver's device fields (solver_fields), on the model's device.
+        self._arrays = SolverArrays(self, model.device)
         self._pgs_convergence_log: list[np.ndarray] = []
         # Per-step, per-iteration NCP / MDP residual log for the matrix_free
         # debug path. Each entry is an ndarray of shape
@@ -1090,17 +1094,16 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
-        self._fk_id_cache_available = bool(model.articulation_count and model.joint_count and not model.requires_grad)
+        self._fk_id_cache_available = bool(model.articulation_count and model.joint_count)
         # The held tree's cache of next-step dynamics (held_tree.install enables it); ordinary dynamics derive
         # them from the state at every step, on CUDA as on the CPU.
         self._fk_id_cache_enabled = False
         self._fk_id_cache_source_state = None
         self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        if model.body_count and not model.requires_grad:
-            # Allocate the solver-owned augmented state here rather than on the first step(): a
-            # wp.zeros() issued inside a CUDA graph capture becomes a memset node that replays every
-            # launch and wiped the cached bias forces (body_f_s) at the first substep of each replay.
-            self._allocate_state_aux_vars(model, self, False)
+        # Allocate the solver-owned augmented state here rather than on the first step(): a
+        # wp.zeros() issued inside a CUDA graph capture becomes a memset node that replays every
+        # launch and wiped the cached bias forces (body_f_s) at the first substep of each replay.
+        self._allocate_state_aux_vars(model)
 
         self.forest: ForestPlan | None = None
         # The model's joint forest (Model.joint_ancestor): conditioning depths, body maps, CRBA's ancestor test.
@@ -1113,7 +1116,6 @@ class SolverFeatherPGS(SolverBase):
         self.forest = ForestPlan.build(model, forest, self._kinematic_dof_mask_host)
         self._compact_contact_jacobian = bool(
             model.device.is_cuda
-            and not model.requires_grad
             and self.forest.body_response_dof_mask is not None
             and self.forest.size_groups
             and max(self.forest.size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
@@ -1128,13 +1130,11 @@ class SolverFeatherPGS(SolverBase):
         self._setup_passive_joint_forces(model)
         self._setup_fused_diagonal_joint_limits(model)
         # The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
-        # without gradients wherever each coordinate has one owning drive row. The held tree's admission, which the
+        # wherever each coordinate has one owning drive row. The held tree's admission, which the
         # representations only it evaluates (the compact diagonal, the native sparse factor) read before they are
         # chosen, needs them; ordinary dynamics drop them once the held tree declines (below) and evaluate drives
         # with the joint forces.
-        self._setup_parallel_augmented_drive_topology(
-            model, not model.requires_grad and self.forest.articulation_max_dofs > 0
-        )
+        self._setup_parallel_augmented_drive_topology(model, self.forest.articulation_max_dofs > 0)
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
@@ -1236,7 +1236,6 @@ class SolverFeatherPGS(SolverBase):
             size
             for size in self.forest.size_groups
             if model.device.is_cuda
-            and not model.requires_grad
             and not self._preelim_active
             and size >= _PERSISTENT_HINV_JT_MIN_DOF
             and size + 6 <= 32
@@ -1544,7 +1543,7 @@ class SolverFeatherPGS(SolverBase):
         self._allocate_mf_buffers(model)
         self._body_factors_data = self._build_body_factors()
         self.mf_target_velocity = (
-            wp.zeros_like(self.mf_rhs, requires_grad=model.requires_grad)
+            wp.zeros_like(self.mf_rhs)
             if self.forest.has_prescribed_response
             else self._arrays.placeholder(wp.float32, (1, 1))
         )
@@ -2368,7 +2367,6 @@ class SolverFeatherPGS(SolverBase):
         self._fused_diagonal_limit_dof_mask_host = np.zeros(model.joint_dof_count, dtype=np.int32)
         supported = bool(
             model.device.is_cuda
-            and not model.requires_grad
             and model.joint_dof_count > 0
             and self.options.enable_joint_limits
             and self.options.enable_contact_friction
@@ -3003,9 +3001,7 @@ class SolverFeatherPGS(SolverBase):
             arrays.release(STAGE3_SNAPSHOTS)
 
         self._diagonal_inverse_mass = (
-            wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            if self.forest.diagonal_mass_sizes
-            else arrays.placeholder(wp.float32)
+            wp.zeros_like(model.joint_qd) if self.forest.diagonal_mass_sizes else arrays.placeholder(wp.float32)
         )
         self._fused_diagonal_limit_dof_mask = (
             wp.array(self._fused_diagonal_limit_dof_mask_host, dtype=wp.int32, device=model.device)
@@ -3129,9 +3125,8 @@ class SolverFeatherPGS(SolverBase):
             return
 
         device = model.device
-        requires_grad = model.requires_grad
         arrays = self._arrays
-        self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self._dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device)
         double_buffered = self._double_buffer and device.is_cuda
         self._H_bufs = [{}, {}] if double_buffered else None
         self._J_bufs = [{}, {}] if double_buffered else None
@@ -3180,9 +3175,7 @@ class SolverFeatherPGS(SolverBase):
             for name, array in buffers.items():
                 getattr(self, f"{name}_by_size")[size] = array
             self.diag_by_size[size] = (
-                wp.zeros(
-                    (n_arts, self.dense_max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad
-                )
+                wp.zeros((n_arts, self.dense_max_constraints), dtype=wp.float32, device=device)
                 if size in self._hinv_jt_diag_sizes and not sparse_response
                 else self._dummy_hinv_diag
             )
@@ -3197,7 +3190,7 @@ class SolverFeatherPGS(SolverBase):
         # is captured, and grow with any other contact stream the solver consumes (see _follow_contacts).
         self._contact_pool = model_contact_pool(model, device)
         contact_fields = [
-            ContactField(name, wp.int32, requires_grad=requires_grad)
+            ContactField(name, wp.int32)
             for name in (
                 "contact_world",
                 "contact_slot",
@@ -3244,7 +3237,7 @@ class SolverFeatherPGS(SolverBase):
         sizes = {"world": self.forest.world_count, "row": self.dense_max_constraints, "world_dof": world_dof}
         # The world-indexed J and Y of the routes that build a response in the world layout.
         if self._sparse_diagonal_contact_solve or self._sparse_mass_matrix_size is not None:
-            arrays.allocate(WORLD_RESPONSE, requires_grad=False, world=1, row=1, world_dof=1)
+            arrays.allocate(WORLD_RESPONSE, world=1, row=1, world_dof=1)
         elif self._mf_sweeps:
             # The matrix-free sweeps read the packed rows (_place_dense_response): no world layout.
             arrays.release(WORLD_RESPONSE)
@@ -3305,7 +3298,7 @@ class SolverFeatherPGS(SolverBase):
             # Only the ``is not None`` checks observe this on the inactive
             # path, where no free rigid body owns a speed row.
             self.rigid_velocity_limit_slot = (
-                wp.full((1,), -1, dtype=wp.int32, device=model.device, requires_grad=model.requires_grad)
+                wp.full((1,), -1, dtype=wp.int32, device=model.device)
                 if self.laws.has_rigid_body_velocity_limits and model.body_count > 0
                 else None
             )
@@ -3337,7 +3330,6 @@ class SolverFeatherPGS(SolverBase):
                 -1,
                 dtype=wp.int32,
                 device=model.device,
-                requires_grad=model.requires_grad,
             )
         else:
             self.rigid_velocity_limit_slot = None
@@ -3712,7 +3704,7 @@ class SolverFeatherPGS(SolverBase):
         # With independent components the paired factor sweep and the general
         # matrix-free sweep touch disjoint coordinates of a split world, so
         # they fork after response preparation and join before publication.
-        # Components are admitted on CUDA without gradients, under the factor-coordinate sweep's plain policy.
+        # Components are admitted on CUDA, under the factor-coordinate sweep's plain policy.
         paired_overlap = bool(
             self._paired_components is not None
             and self._paired_factor_solve_kernel is not None
@@ -4400,11 +4392,14 @@ class SolverFeatherPGS(SolverBase):
     ):
         if self.laws.contact_torsion_enabled:
             validate_torsion_step(self)
-            if getattr(self, "_device_torsion", None) is not None:
-                self._device_torsion.begin_step(state_in, state_out)
         if self.options.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
+        # The configuration's checks come first; then the states', before any of them is read.
+        if state_in.requires_grad or state_out.requires_grad:
+            raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
+        if self.laws.contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
+            self._device_torsion.begin_step(state_in, state_out)
         if contacts is not None:
             self._follow_contacts(contacts)
         if self.options.pgs_warmstart:
@@ -4430,7 +4425,8 @@ class SolverFeatherPGS(SolverBase):
 
         if control is None:
             control = model.control(clone_variables=False)
-        state_aug = self._prepare_augmented_state(state_in, state_out, control)
+        # The step's state-derived dynamics are the solver's own (no state carries them: there are no gradients).
+        state_aug = self
         self._last_debug_state_aug = state_aug
 
         if collide_done_event is not None and state_in.particle_count > 0:
@@ -5066,33 +5062,10 @@ class SolverFeatherPGS(SolverBase):
                 max_blocks=self._contact_capacity_blocks,
             )
 
-    def _prepare_augmented_state(
-        self,
-        state_in: State,
-        state_out: State,
-        control: Control,
-    ) -> State:
-        requires_grad = state_in.requires_grad
-        state_aug = state_out if requires_grad else self
-        model = self.model
-
-        if not getattr(state_aug, "_featherstone_augmented", False):
-            self._allocate_state_aux_vars(model, state_aug, requires_grad)
-
-        return state_aug
-
-    def _allocate_state_aux_vars(self, model, target, requires_grad):
-        """Allocate the state-derived dynamics (maximal coordinates) on ``target``."""
-        if not model.body_count:
-            return
-        arrays = SolverArrays(target, model.device, requires_grad=requires_grad)
-        arrays.allocate(STATE_AUX, dof=model.joint_dof_count, body=model.body_count)
-        if requires_grad:
-            # Scratch of trisolve_loop's custom gradient.
-            arrays.allocate(STATE_GRAD_SCRATCH, dof=model.joint_dof_count)
-        else:
-            target.joint_solve_tmp = None
-        target._featherstone_augmented = True
+    def _allocate_state_aux_vars(self, model):
+        """Allocate the state-derived dynamics (maximal coordinates) on the solver."""
+        if model.body_count:
+            self._arrays.allocate(STATE_AUX, dof=model.joint_dof_count, body=model.body_count)
 
     def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
         model = self.model
@@ -5717,7 +5690,6 @@ class SolverFeatherPGS(SolverBase):
                     self.L_by_size[6],
                     stage3_qd,
                     dt,
-                    model.requires_grad,
                     apply_transport,
                 ],
                 outputs=[self.v_hat],
@@ -6942,7 +6914,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._packed_support, self._packed_dense = 1, False
             sizes = {"world": 1, "row": 1, "support": 1}
-        self._arrays.allocate(packed_rows.PACKED_ROWS, requires_grad=False, **sizes)
+        self._arrays.allocate(packed_rows.PACKED_ROWS, **sizes)
 
     def _place_dense_response(self) -> None:
         """Where the dense rows' response lives (``_packed_response`` and ``_packed_response_reason``).

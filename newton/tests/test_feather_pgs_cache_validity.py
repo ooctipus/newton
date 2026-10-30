@@ -479,7 +479,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     solver._fk_id_cache_enabled = True
     states = [model.state(), model.state()]
     solver._last_step_dt = DT
-    return model, solver, owner, states, solver._prepare_augmented_state(states[0], states[1], model.control())
+    return model, solver, owner, states, solver
 
 
 class TestFeatherPGSInputBank(unittest.TestCase):
@@ -1553,23 +1553,22 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                         groups.append((group, kernels))
                     states, control = [model.state(), model.state()], model.control()
                     solver._last_step_dt = DT
-                    augmented = solver._prepare_augmented_state(states[0], states[1], control)
                     # A motion-velocity owner reads a prescaled velocity bank of its own.
                     velocities = [wp.clone(state.joint_qd) if motion else state.joint_qd for state in states]
                     for source, refresh in ((0, True), (1, False)):
                         state, output, velocity = states[source], states[1 - source], velocities[source]
-                        owner.begin(state, augmented, velocity, DT, refresh)
+                        owner.begin(state, solver, velocity, DT, refresh)
                         solver.mass_update_mask.fill_(1)
-                        owner.refresh(augmented)
-                        owner.predict(state, augmented, control, velocity, DT)
+                        owner.refresh(solver)
+                        owner.predict(state, solver, control, velocity, DT)
                         solver.v_out.assign(solver.v_hat)
-                        owner.finish(state, augmented, output, DT, refresh)
+                        owner.finish(state, solver, output, DT, refresh)
                     # A copy of the bank the last finish published, one coordinate changed.
                     states[1].assign(states[0])
                     coordinates = states[1].joint_q.numpy()
                     coordinates[0] += np.float32(0.01)
                     states[1].joint_q.assign(coordinates)
-                    owner.begin(states[1], augmented, velocities[1], DT, False, state_out=states[0])
+                    owner.begin(states[1], solver, velocities[1], DT, False, state_out=states[0])
                     # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
                     # free body and an arm), and every kind would still run with one group's classified forms skipped.
                     for group, kernels in groups:
@@ -1838,7 +1837,6 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         state_in = model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
         matrices = list(solver.H_by_size.values())
         self.assertTrue(matrices)
 
@@ -1857,13 +1855,13 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 patch.object(wp, "launch_tiled", launch),
                 patch.object(wp.array, "zero_", zero),
             ):
-                solver._stage1_crba(state_aug, None)
+                solver._stage1_crba(solver, None)
             return [array for array in matrices if any(item is array for item in touched)]
 
         refreshed = []
         solver._tree_kinetic_state = SimpleNamespace(refresh=refreshed.append)
         self.assertEqual(touched_matrices(), [])
-        self.assertEqual(refreshed, [state_aug])
+        self.assertEqual(refreshed, [solver])
         solver._tree_kinetic_state = None
         self.assertEqual(len(touched_matrices()), len(matrices))
 

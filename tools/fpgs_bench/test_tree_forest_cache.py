@@ -115,15 +115,13 @@ class TestTreeForestCache(unittest.TestCase):
                 control.joint_f.assign(rng.uniform(-0.2, 0.2, model.joint_dof_count).astype(np.float32))
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 solver._last_step_dt = reference._last_step_dt = dt
-                ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-                velocity = reference._stage1_fk_id(state, ref_aug, model.state())
-                reference._stage1_drives(state, ref_aug, control, dt)
-                rhs = ref_aug.joint_tau.numpy().reshape(arts, count).astype(float)
+                velocity = reference._stage1_fk_id(state, reference, model.state())
+                reference._stage1_drives(state, reference, control, dt)
+                rhs = reference.joint_tau.numpy().reshape(arts, count).astype(float)
                 physical = physical_mass(model, state)
-                augmented = solver._prepare_augmented_state(state, output, control)
-                augmented.joint_tau.zero_()
-                owner.begin(state, augmented, velocity, dt, True)
-                np.testing.assert_allclose(augmented.body_v_s.numpy(), ref_aug.body_v_s.numpy(), atol=3e-6, rtol=3e-5)
+                solver.joint_tau.zero_()
+                owner.begin(state, solver, velocity, dt, True)
+                np.testing.assert_allclose(solver.body_v_s.numpy(), reference.body_v_s.numpy(), atol=3e-6, rtol=3e-5)
                 geometry = owner.geometric.numpy()
                 expected = np.empty_like(rhs)
                 for group, art in enumerate(groups):
@@ -132,10 +130,10 @@ class TestTreeForestCache(unittest.TestCase):
                     np.testing.assert_allclose(geometry[group], packed, atol=3e-6, rtol=3e-5)
                     expected[art] = np.linalg.solve(block + np.diag(solver.R_by_size[count].numpy()[group]), rhs[art])
                 solver.mass_update_mask.fill_(1)
-                operator.refresh(augmented)
-                owner.predict(state, augmented, control, velocity, dt)
+                operator.refresh(solver)
+                owner.predict(state, solver, control, velocity, dt)
                 np.testing.assert_allclose(
-                    augmented.joint_qdd.numpy().reshape(arts, count), expected, atol=4e-5, rtol=4e-4
+                    solver.joint_qdd.numpy().reshape(arts, count), expected, atol=4e-5, rtol=4e-4
                 )
                 held = operator.data.W.numpy().copy()
                 # A failed last factor must poison only its mapped articulation,
@@ -143,24 +141,24 @@ class TestTreeForestCache(unittest.TestCase):
                 status = np.zeros(arts, np.int32)
                 status[-1] = 1
                 operator.data.status.assign(status)
-                owner.predict(state, augmented, control, velocity, dt)
-                bad = ~np.isfinite(augmented.joint_qdd.numpy().reshape(arts, count)).all(axis=1)
+                owner.predict(state, solver, control, velocity, dt)
+                bad = ~np.isfinite(solver.joint_qdd.numpy().reshape(arts, count)).all(axis=1)
                 np.testing.assert_array_equal(np.flatnonzero(bad), groups[-1:])
                 operator.data.status.zero_()
                 owner.status.zero_()
-                owner.predict(state, augmented, control, velocity, dt)
+                owner.predict(state, solver, control, velocity, dt)
                 solver.v_out.assign(solver.v_hat)
                 output.body_q.fill_(wp.transform(wp.vec3(123.0), wp.quat_identity()))
                 output.body_qd.fill_(wp.spatial_vector(123.0))
-                owner.finish(state, augmented, output, dt, False)
+                owner.finish(state, solver, output, dt, False)
                 public_state(self, model, output)
                 generation = owner.data.generation.numpy().copy()
-                owner.begin(output, augmented, output.joint_qd, dt, False)
+                owner.begin(output, solver, output.joint_qd, dt, False)
                 np.testing.assert_array_equal(owner.data.generation.numpy(), generation)
                 mask = wp.array([False, True, False], dtype=wp.bool, device=device)
                 owner.invalidate(mask)
                 np.testing.assert_array_equal(owner.data.current_valid.numpy(), [1, 1, 0, 0, 1, 1])
-                owner.begin(output, augmented, output.joint_qd, dt, False)
+                owner.begin(output, solver, output.joint_qd, dt, False)
                 np.testing.assert_array_equal(owner.data.generation.numpy() - generation, np.isin(groups, [2, 3]))
                 np.testing.assert_array_equal(owner.data.current_valid.numpy(), 1)
                 # A late request belongs to one articulation, independently of
@@ -170,7 +168,7 @@ class TestTreeForestCache(unittest.TestCase):
                 requests = np.zeros(arts, np.int32)
                 requests[-1] = 1
                 solver._mass_update_requested.assign(requests)
-                owner.begin(output, augmented, output.joint_qd, dt, False)
+                owner.begin(output, solver, output.joint_qd, dt, False)
                 np.testing.assert_array_equal(owner.data.generation.numpy() - generation, groups == arts - 1)
                 np.testing.assert_array_equal(owner.geometry_valid.numpy(), groups == arts - 1)
                 solver._mass_update_requested.zero_()
@@ -179,24 +177,24 @@ class TestTreeForestCache(unittest.TestCase):
                     wp.copy(getattr(bank, name), getattr(output, name))
                 # Identity alone does not cover a copy: every group repairs.
                 generation = owner.data.generation.numpy().copy()
-                owner.begin(bank, augmented, bank.joint_qd, dt, False)
+                owner.begin(bank, solver, bank.joint_qd, dt, False)
                 np.testing.assert_array_equal(owner.data.generation.numpy(), generation + 1)
                 # Comparing the copy with the bank the finish published keeps every cache,
                 # except under prescaled motion, which validates by identity.
                 solver.v_out.assign(solver.v_hat)
-                owner.finish(bank, augmented, output, dt, False)
+                owner.finish(bank, solver, output, dt, False)
                 copy = model.state()
                 for name in native.STATE_FIELDS:
                     wp.copy(getattr(copy, name), getattr(output, name))
                 generation = owner.data.generation.numpy().copy()
-                owner.begin(copy, augmented, copy.joint_qd, dt, False, state_out=output)
+                owner.begin(copy, solver, copy.joint_qd, dt, False, state_out=output)
                 np.testing.assert_array_equal(owner.data.generation.numpy(), generation + int(motion))
                 bank = copy
                 if device.startswith("cuda"):
                     with wp.ScopedCapture(device=device) as capture:
                         owner.invalidate(mask)
-                        owner.begin(bank, augmented, bank.joint_qd, dt, False)
-                        owner.predict(bank, augmented, control, bank.joint_qd, dt)
+                        owner.begin(bank, solver, bank.joint_qd, dt, False)
+                        owner.predict(bank, solver, control, bank.joint_qd, dt)
                     generation = owner.data.generation.numpy().copy()
                     for _ in range(3):
                         wp.capture_launch(capture.graph)
@@ -205,7 +203,7 @@ class TestTreeForestCache(unittest.TestCase):
                     )
                     np.testing.assert_array_equal(owner.data.current_valid.numpy(), 1)
                 solver.mass_update_mask.zero_()
-                operator.refresh(augmented)
+                operator.refresh(solver)
                 np.testing.assert_array_equal(operator.data.W.numpy(), held)
                 np.testing.assert_array_equal(state.joint_qd.numpy(), raw)
                 np.testing.assert_array_equal(owner.status.numpy(), 0)
@@ -246,26 +244,24 @@ class TestTreeForestCache(unittest.TestCase):
         state, output, control = model.state(), model.state(), model.control()
         state.joint_qd.assign(np.linspace(-0.3, 0.4, model.joint_dof_count, dtype=np.float32))
         reference._last_step_dt = solver._last_step_dt = native.DT
-        ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-        reference._stage1_fk_id(state, ref_aug, model.state())
-        reference._stage1_drives(state, ref_aug, control, native.DT)
-        rhs = ref_aug.joint_tau.numpy().astype(float)
+        reference._stage1_fk_id(state, reference, model.state())
+        reference._stage1_drives(state, reference, control, native.DT)
+        rhs = reference.joint_tau.numpy().astype(float)
         physical = physical_mass(model, state)
-        augmented = solver._prepare_augmented_state(state, output, control)
-        augmented.joint_tau.zero_()
-        owner.begin(state, augmented, state.joint_qd, native.DT, True)
+        solver.joint_tau.zero_()
+        owner.begin(state, solver, state.joint_qd, native.DT, True)
         solver.mass_update_mask.fill_(1)
-        operator.refresh(augmented)
-        owner.predict(state, augmented, control, state.joint_qd, native.DT)
+        operator.refresh(solver)
+        owner.predict(state, solver, control, state.joint_qd, native.DT)
         regularization = np.empty(model.joint_dof_count)
         for group, art in enumerate(operator.plan.group_to_art.numpy()):
             regularization[art * mass.dof_count : (art + 1) * mass.dof_count] = solver.R_by_size[
                 mass.dof_count
             ].numpy()[group]
         expected = np.linalg.solve(physical + np.diag(regularization), rhs)
-        np.testing.assert_allclose(augmented.joint_qdd.numpy(), expected, atol=4e-5, rtol=4e-4)
+        np.testing.assert_allclose(solver.joint_qdd.numpy(), expected, atol=4e-5, rtol=4e-4)
         solver.v_out.assign(solver.v_hat)
-        owner.finish(state, augmented, output, native.DT, False)
+        owner.finish(state, solver, output, native.DT, False)
         probe = model.state()
         newton.eval_fk(model, output.joint_q, output.joint_qd, probe)
         for name in ("body_q", "body_qd"):

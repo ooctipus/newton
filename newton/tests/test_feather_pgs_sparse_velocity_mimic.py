@@ -31,7 +31,7 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
         solver = _eligible_solver()
         solver.options.enable_joint_velocity_limits = True
         solver.laws.mimic_count = 1
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with (
             mock.patch.dict(os.environ, {}, clear=True),
             self.assertRaises(_TopologyReached),

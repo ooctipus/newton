@@ -49,7 +49,7 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         Warm starting is admitted without free rigid bodies: the sparse sweep
         seeds its factor delta with the carried impulses' response.
         """
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         warm_starts = ({}, {"pgs_warmstart": True})
         for patches, warm_start in itertools.product((False, True), warm_starts):
             solver = _eligible_solver()
@@ -66,7 +66,7 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for changes in (
             {"_route_pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},

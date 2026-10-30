@@ -1006,23 +1006,22 @@ def check_owner_launches(test, device):
                 test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
                 states, control = [model.state(), model.state()], model.control()
                 solver._last_step_dt = DT
-                augmented = solver._prepare_augmented_state(states[0], states[1], control)
                 for source, refresh in ((0, True), (1, False)):
                     state, output = states[source], states[1 - source]
-                    owner.begin(state, augmented, state.joint_qd, DT, refresh)
-                    owner.scalar.launch_other_drives(state, augmented, control, DT)
+                    owner.begin(state, solver, state.joint_qd, DT, refresh)
+                    owner.scalar.launch_other_drives(state, solver, control, DT)
                     solver.mass_update_mask.fill_(1)
-                    owner.refresh(augmented)
-                    owner.predict(state, augmented, control, state.joint_qd, DT)
+                    owner.refresh(solver)
+                    owner.predict(state, solver, control, state.joint_qd, DT)
                     solver.v_out.assign(solver.v_hat)
-                    owner.finish(state, augmented, output, DT, refresh)
+                    owner.finish(state, solver, output, DT, refresh)
                 # A copy of the bank the last finish published, one coordinate changed: identity validation
                 # launches the one-pass repair, which compares nothing.
                 states[1].assign(states[0])
                 coordinates = states[1].joint_q.numpy()
                 coordinates[0] += np.float32(0.01)
                 states[1].joint_q.assign(coordinates)
-                owner.begin(states[1], augmented, states[1].joint_qd, DT, False, state_out=states[0])
+                owner.begin(states[1], solver, states[1].joint_qd, DT, False, state_out=states[0])
             for group, kernels in groups:
                 if group is owner.scalar:
                     ran = {kernel for kernel, _ in launched}
@@ -1158,16 +1157,12 @@ class TestScalarBranchRule(unittest.TestCase):
                 plan, reason = sb.plan_scalar_branches(solver)
                 self.assertIsNone(plan)
                 self.assertIn(words, reason)
-        with self.subTest("gradients"), mock.patch.object(model, "requires_grad", True):
-            plan, reason = sb.plan_scalar_branches(solver)
-            self.assertIsNone(plan)
-            self.assertIn("exclude gradients and particles", reason)
         with self.subTest("particles"):
             particles = cpu_solver(build_branch_model(worlds=2, particle=True), 7)
             self.assertEqual(particles.model.particle_count, 1)
             plan, reason = sb.plan_scalar_branches(particles)
             self.assertIsNone(plan)
-            self.assertIn("exclude gradients and particles", reason)
+            self.assertIn("exclude particles", reason)
 
     def test_owner_composes_the_scalar_group(self):
         """Compose the scalar group beside the arm's tree group, keep the forest off it, and validate both.
@@ -1212,7 +1207,6 @@ class TestScalarBranchRule(unittest.TestCase):
             owners["plain"] = HeldTree(solver)
         s0, s1 = model.state(), model.state()
         solver._last_step_dt = DT
-        augmented = solver._prepare_augmented_state(s0, s1, model.control())
         kinds = {}
         for owner in owners.values():
             for group in owner.groups:
@@ -1244,9 +1238,9 @@ class TestScalarBranchRule(unittest.TestCase):
                     # Nothing that compares is bound where nothing may compare.
                     bound = {key for key in ("bank", "bank_repair") if record["kernels"][key] is not None}
                     self.assertEqual(bound, {"bank_repair"} if compare else set())
-                launches(lambda owner=owner: owner.finish(s0, augmented, s1, DT, False))
+                launches(lambda owner=owner: owner.finish(s0, solver, s1, DT, False))
                 self.assertEqual(
-                    launches(lambda owner=owner: owner.begin(s0, augmented, s0.joint_qd, DT, False, state_out=s1)),
+                    launches(lambda owner=owner: owner.begin(s0, solver, s0.joint_qd, DT, False, state_out=s1)),
                     copy_back,
                 )
 

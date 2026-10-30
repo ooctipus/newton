@@ -38,7 +38,7 @@ class TestContactComplianceLaw(unittest.TestCase):
 
     def test_unsupported_solver_modes_rejected(self):
         """Reject settings whose update law has not been wired or validated."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for key, value in (
             ("pgs_contact_regularization", 0.01),
             ("pgs_warmstart", True),

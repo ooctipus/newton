@@ -49,8 +49,6 @@ class Laws:
     """The position solve has a positive iteration budget."""
     cuda: bool
     """The device is CUDA, which runs the native bodies written for CUDA only (``cuda_native``)."""
-    gradients: bool
-    """The model records gradients (``requires_grad``): only kernels with adjoints may run."""
 
     PLAIN = "no warm start, debug rows or bilateral pre-elimination"
 
@@ -94,7 +92,6 @@ class Laws:
             loops=bool(laws.forest.has_loop_joints),
             iterations=options.pgs_iterations > 0,
             cuda=bool(model.device.is_cuda),
-            gradients=bool(model.requires_grad),
         )
 
     def record(self) -> dict:
@@ -105,7 +102,6 @@ class Laws:
 # Each requirement a placement or schedule may hold: (test of the laws, what it requires).
 _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
-    "forward": (lambda laws: not laws.gradients, "no gradient recording"),
     "plain": (lambda laws: laws.plain, Laws.PLAIN),
     "agnostic": (lambda laws: laws.agnostic, "the point or patch row law (no torsion, no compliance)"),
     "unregularized": (lambda laws: not laws.regularized, "the unregularized contact law"),
@@ -123,11 +119,10 @@ _REQUIREMENTS = {
 
 CAPABILITIES = {
     # The held tree's evaluation of the dynamics, on either device (its topology fit is the held groups' own proof).
-    "held": ("forward", "no_connect", "no_loops", "no_debug_rows"),
+    "held": ("no_connect", "no_loops", "no_debug_rows"),
     # The packed placement of a single tree: native sparse factors and their sweep.
     "packed": (
         "cuda",
-        "forward",
         "iterations",
         "no_debug_rows",
         "unregularized",
@@ -138,17 +133,17 @@ CAPABILITIES = {
         "no_loops",
     ),
     # On-chip blocks of a world's rows (local owners), claimed per world at run time.
-    "local": ("cuda", "forward", "plain", "no_velocity_limits", "no_torsion"),
+    "local": ("cuda", "plain", "no_velocity_limits", "no_torsion"),
     # The local owners' row producer: limit prefix and contact packets built in place.
     "row_packets": ("agnostic", "limits", "unregularized"),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
     "paired_factor": ("cuda", "plain", "unregularized", "iterations", "no_velocity_limits", "no_torsion"),
     # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("cuda", "forward", "plain", "unregularized", "no_compliance", "no_mimic", "no_connect"),
+    "components": ("cuda", "plain", "unregularized", "no_compliance", "no_mimic", "no_connect"),
     # The Jacobi tiers of dense trees beside a free body (case K4).
     "tiers": ("cuda",),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "forward", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
+    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
     # The compact boundary's row producer of a star beside a six-coordinate arm.
     "compact": ("agnostic",),
     # The colored mapping of the free-body rows' contact units.

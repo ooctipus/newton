@@ -18,8 +18,8 @@ def make_plan(model, operator, *, complete=True):
     worlds, arts = int(model.world_count), int(model.articulation_count)
     if worlds < 1 or arts < 1 or model.joint_count != model.body_count:
         raise ValueError("Cached trees require complete articulation and body ownership")
-    if model.requires_grad or model.particle_count:
-        raise ValueError("Cached trees exclude gradients and particles")
+    if model.particle_count:
+        raise ValueError("Cached trees exclude particles")
     starts = model.articulation_start.numpy()
     group = operator.plan.group_to_art.numpy()
     art_world = operator.plan.art_to_world.numpy()

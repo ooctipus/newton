@@ -79,7 +79,6 @@ def plain_laws(**changes) -> Laws:
         "loops": False,
         "iterations": True,
         "cuda": True,
-        "gradients": False,
     }
     return Laws(**{**laws, **changes})
 

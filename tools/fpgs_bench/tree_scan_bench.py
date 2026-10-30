@@ -215,10 +215,10 @@ def _held_tree(shape, worlds, device, lanes=None, schedules=None):
     return model, solver
 
 
-def _repair(owner, state_in, augmented, dt):
+def _repair(owner, state_in, solver, dt):
     """A repair of every group: the caches invalidated, then a begin."""
     owner.invalidate()
-    owner.begin(state_in, augmented, state_in.joint_qd, dt, True)
+    owner.begin(state_in, solver, state_in.joint_qd, dt, True)
 
 
 def bench_lanes(args, device):
@@ -247,9 +247,8 @@ def bench_lanes(args, device):
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             dt = 1.0 / 240.0
             solver._last_step_dt = dt
-            augmented = solver._prepare_augmented_state(state_in, model.state(), control)
 
-            repair = functools.partial(_repair, owner, state_in, augmented, dt)
+            repair = functools.partial(_repair, owner, state_in, solver, dt)
             repair()
             row = {
                 "shape": shape,
@@ -259,8 +258,8 @@ def bench_lanes(args, device):
                 "schedules": group.schedules.tag[1:],
                 "rule": group.layout.lanes == rule and schedules is None,
             }
-            finish = functools.partial(owner.finish, state_in, augmented, state_out, dt, False)
-            predict = functools.partial(owner.predict, state_in, augmented, control, state_in.joint_qd, dt)
+            finish = functools.partial(owner.finish, state_in, solver, state_out, dt, False)
+            predict = functools.partial(owner.predict, state_in, solver, control, state_in.joint_qd, dt)
             row["finish"] = _time(finish, args.samples, device)
             row["predict"] = _time(predict, args.samples, device)
             row["repair"] = _time(repair, args.samples, device)

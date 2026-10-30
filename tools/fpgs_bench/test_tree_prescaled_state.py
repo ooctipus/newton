@@ -95,7 +95,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
             with self.subTest(device=device, floating=floating):
                 model, solver, reference, operator, owner, mass = fixture(floating, device)
                 self.assertNotEqual(tuple(mass.permutation), tuple(range(mass.dof_count - 1, -1, -1)))
-                state, output, control = model.state(), model.state(), model.control()
+                state, control = model.state(), model.control()
                 count, dt = mass.dof_count, split.DT
                 rng = np.random.default_rng(413)
                 raw = rng.uniform(-0.8, 0.8, model.joint_dof_count).astype(np.float32)
@@ -105,7 +105,6 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 control.joint_f.assign(rng.normal(0, 0.13, model.joint_dof_count).astype(np.float32))
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 reference._last_step_dt = solver._last_step_dt = dt
-                augmented = solver._prepare_augmented_state(state, output, control)
                 physical = physical_mass(model, state)
                 matrices = [physical[w * count : (w + 1) * count, w * count : (w + 1) * count] for w in range(2)]
                 previous_generation = None
@@ -115,10 +114,9 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     model.joint_velocity_limit.fill_(limit)
                     if reference._fk_id_cache_enabled:
                         reference._fk_id_cache_valid.zero_()
-                    ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-                    motion = reference._stage1_fk_id(state, ref_aug, model.state())
-                    reference._stage1_drives(state, ref_aug, control, dt)
-                    rhs = ref_aug.joint_tau.numpy().reshape(2, count).astype(float)
+                    motion = reference._stage1_fk_id(state, reference, model.state())
+                    reference._stage1_drives(state, reference, control, dt)
+                    rhs = reference.joint_tau.numpy().reshape(2, count).astype(float)
                     actual_motion = motion.numpy()
                     self.assertEqual(motion.ptr, reference.qd_work.ptr)
                     if epoch < 2:
@@ -128,16 +126,16 @@ class TestPrescaledTreeContract(unittest.TestCase):
                             np.testing.assert_array_equal(actual_motion[:6], raw[:6])
                     else:
                         np.testing.assert_array_equal(actual_motion, raw)
-                    augmented.joint_tau.zero_()
+                    solver.joint_tau.zero_()
                     if captured is not None and epoch != 4:
                         wp.capture_launch(captured)
                     else:
-                        owner.begin(state, augmented, motion, dt, epoch in (0, 4))
+                        owner.begin(state, solver, motion, dt, epoch in (0, 4))
                         if epoch == 0:
                             solver.mass_update_mask.fill_(1)
-                            operator.refresh(augmented)
+                            operator.refresh(solver)
                             held = solver._sparse_Linv.numpy().copy()
-                        owner.predict(state, augmented, control, motion, dt)
+                        owner.predict(state, solver, control, motion, dt)
                     generation = owner.data.generation.numpy().copy()
                     if previous_generation is not None:
                         np.testing.assert_array_equal(generation - previous_generation, [int(epoch != 3), 0])
@@ -153,7 +151,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         expected[world * count : (world + 1) * count] = np.linalg.solve(
                             matrix + np.diag(solver.R_by_size[count].numpy()[world]), rhs[world]
                         )
-                    np.testing.assert_allclose(augmented.joint_qdd.numpy(), expected, atol=3e-5, rtol=3e-4)
+                    np.testing.assert_allclose(solver.joint_qdd.numpy(), expected, atol=3e-5, rtol=3e-4)
                     velocity = actual_motion.astype(float) + dt * expected
                     if floating:
                         for world in range(2):
@@ -167,8 +165,8 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     np.testing.assert_array_equal(owner.status.numpy(), 0)
                     if epoch == 0 and device.startswith("cuda"):
                         with wp.ScopedCapture(device=device) as capture:
-                            owner.begin(state, augmented, motion, dt, False)
-                            owner.predict(state, augmented, control, motion, dt)
+                            owner.begin(state, solver, motion, dt, False)
+                            owner.predict(state, solver, control, motion, dt)
                         captured = capture.graph
                 current = owner.data.current_valid.numpy().copy()
                 generation = owner.data.generation.numpy().copy()
@@ -180,12 +178,12 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 ]
                 for value in invalid:
                     with self.assertRaises(RuntimeError):
-                        owner.begin(state, augmented, value, dt, False)
+                        owner.begin(state, solver, value, dt, False)
                     np.testing.assert_array_equal(owner.data.current_valid.numpy(), current)
                     np.testing.assert_array_equal(owner.data.generation.numpy(), generation)
                 other = wp.array(raw, dtype=float, device=device)
                 with self.assertRaisesRegex(RuntimeError, "differs from the current-cache binding"):
-                    owner.predict(state, augmented, control, other, dt)
+                    owner.predict(state, solver, control, other, dt)
 
     def test_current_motion_cpu(self):
         """Match raw passive forces and prescaled bias across mutable working epochs."""

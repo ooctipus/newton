@@ -32,9 +32,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
-    apply_free_root_transport_to_predictor,
     integrate_generalized_joints,
-    remove_free_root_transport_from_qdd,
 )
 from newton.solvers import SolverFeatherPGS
 
@@ -298,14 +296,13 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         self.assertIsNone(solver.get_path_selection()["cached_prediction"])
         self.assertEqual(solver.forest.free_root_joint_count, 1)
         state_in, state_out = model.state(), model.state()
-        state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
 
         qd_np = np.array((2.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
         qdd_np = np.array((0.3, -0.4, 0.5, 0.1, -0.2, 0.25), dtype=np.float32)
         state_in.joint_qd.assign(qd_np)
         solver.qd_work.assign(qd_np)
-        state_aug.joint_qdd.assign(qdd_np)
-        solver._stage3_compute_v_hat(state_in, state_aug, DT, solver.qd_work)
+        solver.joint_qdd.assign(qdd_np)
+        solver._stage3_compute_v_hat(state_in, solver, DT, solver.qd_work)
         transport = np.cross(qd_np[3:6], qd_np[0:3])
         expected_v_hat = qd_np + qdd_np * DT
         expected_v_hat[0:3] += transport * DT
@@ -313,11 +310,11 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
 
         v_out_np = np.array((1.8, 0.1, -0.15, 0.05, 19.5, 0.25), dtype=np.float32)
         solver.v_out.assign(v_out_np)
-        solver._stage6_update_qdd(state_in, state_aug, DT)
+        solver._stage6_update_qdd(state_in, solver, DT)
         expected_qdd = (v_out_np - qd_np) / DT
         expected_qdd[0:3] -= transport
-        np.testing.assert_allclose(state_aug.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
-        solver._stage6_integrate(state_in, state_aug, state_out, DT)
+        np.testing.assert_allclose(solver.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
+        solver._stage6_integrate(state_in, solver, state_out, DT)
         np.testing.assert_allclose(state_out.joint_qd.numpy(), v_out_np, rtol=1e-6, atol=1e-6)
 
     def test_compact_root_metadata_includes_standalone_joint(self):
@@ -335,46 +332,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         solver = SolverFeatherPGS(model)
         np.testing.assert_array_equal(solver.forest.free_root_joint_indices.numpy(), (joint_a, joint_b))
-
-    def test_zero_transport_keeps_nonzero_gradient(self):
-        """Differentiate both corrections through an exact-zero transport value."""
-        device = wp.get_device()
-        root_indices = wp.array((0,), dtype=wp.int32, device=device)
-        qd_starts = wp.array((0,), dtype=wp.int32, device=device)
-        kinematic_mask = wp.zeros(1, dtype=wp.int32, device=device)
-        seed = wp.array((0.0, 1.0, 0.0, 0.0, 0.0, 0.0), dtype=wp.float32, device=device)
-
-        qd_predictor = wp.array((0.0, 0.0, 0.0, 0.0, 0.0, 3.0), dtype=wp.float32, device=device, requires_grad=True)
-        v_hat = wp.zeros(6, dtype=wp.float32, device=device, requires_grad=True)
-        with wp.Tape() as predictor_tape:
-            wp.launch(
-                apply_free_root_transport_to_predictor,
-                dim=1,
-                inputs=[root_indices, qd_starts, kinematic_mask, qd_predictor, DT],
-                outputs=[v_hat],
-                device=device,
-            )
-        predictor_tape.backward(grads={v_hat: seed})
-        expected_predictor_grad = np.zeros(6, dtype=np.float32)
-        expected_predictor_grad[0] = 3.0 * DT
-        np.testing.assert_array_equal(v_hat.numpy(), np.zeros(6, dtype=np.float32))
-        np.testing.assert_allclose(qd_predictor.grad.numpy(), expected_predictor_grad, rtol=1e-6, atol=1e-7)
-
-        qd_conversion = wp.array((0.0, 0.0, 0.0, 0.0, 0.0, 3.0), dtype=wp.float32, device=device, requires_grad=True)
-        qdd = wp.zeros(6, dtype=wp.float32, device=device, requires_grad=True)
-        with wp.Tape() as conversion_tape:
-            wp.launch(
-                remove_free_root_transport_from_qdd,
-                dim=1,
-                inputs=[root_indices, qd_starts, kinematic_mask, qd_conversion],
-                outputs=[qdd],
-                device=device,
-            )
-        conversion_tape.backward(grads={qdd: seed})
-        expected_conversion_grad = np.zeros(6, dtype=np.float32)
-        expected_conversion_grad[0] = -3.0
-        np.testing.assert_array_equal(qdd.numpy(), np.zeros(6, dtype=np.float32))
-        np.testing.assert_allclose(qd_conversion.grad.numpy(), expected_conversion_grad, rtol=1e-6, atol=1e-7)
 
     def test_captured_step_matches_uncaptured(self):
         """Replaying a captured collide+step reproduces the uncaptured trajectory.

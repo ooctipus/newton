@@ -30,7 +30,7 @@ launch sites call them directly. The arithmetic of a step is one function per re
 every kernel that runs the step:
 
 - the Warp kernels call Warp functions (``free_body_response``, ``sparse_pair_slots``, ``packed_product``...),
-  one expression tree on both devices, with its adjoint;
+  one expression tree on both devices;
 - the native kernels call the operator's emitters (:meth:`.FreeBodyZ.pack` writes the row word that
   :meth:`.FreeBodyZ.consume` decodes; :func:`factor_rows` packs factor rows from their support, the layout
   :class:`.SparseFactor` reads; :meth:`.FactorRows.transposed` is the factor product of a lane per coordinate).

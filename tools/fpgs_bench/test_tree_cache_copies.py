@@ -31,18 +31,17 @@ class TestTreeCacheCopies(unittest.TestCase):
         model = model_fixture(device, reordered=True)
         solver = make_solver(model, permuted=True)
         owner = HeldTree(solver)
-        state, output, control = model.state(), model.state(), model.control()
+        state, output = model.state(), model.state()
         state.joint_qd.assign(np.linspace(-0.2, 0.3, model.joint_dof_count, dtype=np.float32))
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        augmented = solver._prepare_augmented_state(state, output, control)
-        owner.begin(state, augmented, state.joint_qd, DT, True)
+        owner.begin(state, solver, state.joint_qd, DT, True)
         solver.v_out.assign(state.joint_qd)
-        owner.finish(state, augmented, output, DT, True)
+        owner.finish(state, solver, output, DT, True)
         bank = copy_state(model, output)
         before = generations(owner)
         geometry = [group.geometric.numpy().copy() for group in owner.groups]
         # The caches were published into ``output``; its exact copy keeps them.
-        owner.begin(bank, augmented, bank.joint_qd, DT, True, state_out=output)
+        owner.begin(bank, solver, bank.joint_qd, DT, True, state_out=output)
         for group, previous, mass in zip(owner.groups, before, geometry, strict=True):
             np.testing.assert_array_equal(group.data.generation.numpy(), previous)
             np.testing.assert_array_equal(group.geometric.numpy(), mass)
@@ -60,7 +59,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             values[body, 0] += np.float32(0.03)
             field.assign(values)
             before = generations(owner)
-            owner.begin(partial, augmented, partial.joint_qd, DT, True, state_out=bank)
+            owner.begin(partial, solver, partial.joint_qd, DT, True, state_out=bank)
             for group, previous in zip(owner.groups, before, strict=True):
                 expected = previous.copy()
                 if group is target:
@@ -85,7 +84,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             values[index] += np.float32(0.025)
             field.assign(values)
             before = generations(owner)
-            owner.begin(changed, augmented, changed.joint_qd, DT, True, state_out=bank)
+            owner.begin(changed, solver, changed.joint_qd, DT, True, state_out=bank)
             for group, previous in zip(owner.groups, before, strict=True):
                 expected = previous.copy()
                 if group is target:
@@ -97,7 +96,7 @@ class TestTreeCacheCopies(unittest.TestCase):
         mask = wp.array([False, True, False], dtype=wp.bool, device=device)
         owner.invalidate(mask)
         before = generations(owner)
-        owner.begin(bank, augmented, bank.joint_qd, DT, True)
+        owner.begin(bank, solver, bank.joint_qd, DT, True)
         for group, previous in zip(owner.groups, before, strict=True):
             arts = group.sparse.plan.group_to_art.numpy()
             worlds = solver.forest.art_to_world.numpy()[arts]
@@ -105,14 +104,14 @@ class TestTreeCacheCopies(unittest.TestCase):
 
         # Publication may omit next mass terms; an exact copy cannot manufacture them.
         solver.v_out.assign(bank.joint_qd)
-        owner.finish(bank, augmented, output, DT, False)
+        owner.finish(bank, solver, output, DT, False)
         bank = copy_state(model, output)
         target = owner.groups[0]
         requests = np.zeros(model.articulation_count, np.int32)
         requests[target.sparse.plan.group_to_art.numpy()[0]] = 1
         solver._mass_update_requested.assign(requests)
         before = generations(owner)
-        owner.begin(bank, augmented, bank.joint_qd, DT, False, state_out=output)
+        owner.begin(bank, solver, bank.joint_qd, DT, False, state_out=output)
         for group, previous in zip(owner.groups, before, strict=True):
             expected = previous.copy()
             if group is target:

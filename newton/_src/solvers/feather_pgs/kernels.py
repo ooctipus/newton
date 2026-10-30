@@ -554,7 +554,6 @@ def _light_apply_free_root_velocity_corrections(
     cholesky: wp.array3d[float],
     joint_qd: wp.array[float],
     dt: float,
-    requires_grad: bool,
     apply_transport: bool,
     v_hat: wp.array[float],
 ):
@@ -574,29 +573,27 @@ def _light_apply_free_root_velocity_corrections(
     if is_free_rigid[art] == 0:
         return
     predicted_world = wp.vec3(v_hat[d + 3], v_hat[d + 4], v_hat[d + 5])
-    if not requires_grad:
-        if (
-            w[0] == 0.0
-            and w[1] == 0.0
-            and (w[2] == 0.0)
-            and (predicted_world[0] == 0.0)
-            and (predicted_world[1] == 0.0)
-            and (predicted_world[2] == 0.0)
-        ):
-            return
+    if (
+        w[0] == 0.0
+        and w[1] == 0.0
+        and (w[2] == 0.0)
+        and (predicted_world[0] == 0.0)
+        and (predicted_world[1] == 0.0)
+        and (predicted_world[2] == 0.0)
+    ):
+        return
     inertia = body_inertia[body]
-    if not requires_grad:
-        if (
-            inertia[0, 0] == inertia[1, 1]
-            and inertia[1, 1] == inertia[2, 2]
-            and (inertia[0, 1] == 0.0)
-            and (inertia[0, 2] == 0.0)
-            and (inertia[1, 0] == 0.0)
-            and (inertia[1, 2] == 0.0)
-            and (inertia[2, 0] == 0.0)
-            and (inertia[2, 1] == 0.0)
-        ):
-            return
+    if (
+        inertia[0, 0] == inertia[1, 1]
+        and inertia[1, 1] == inertia[2, 2]
+        and (inertia[0, 1] == 0.0)
+        and (inertia[0, 2] == 0.0)
+        and (inertia[1, 0] == 0.0)
+        and (inertia[1, 2] == 0.0)
+        and (inertia[2, 0] == 0.0)
+        and (inertia[2, 1] == 0.0)
+    ):
+        return
     group = art_group_index[art]
     # The angular block of the leaf-first factor P H P^T = L L^T: physical coordinate 3 + r is factor row 2 - r, so
     # with ``lower[r] = L[2 - r]`` the block is ``lower lower^T``.
@@ -628,7 +625,6 @@ def apply_free_root_velocity_corrections(
     cholesky: wp.array3d[float],
     joint_qd: wp.array[float],
     dt: float,
-    requires_grad: bool,
     apply_transport: bool,
     v_hat: wp.array[float],
 ):
@@ -646,7 +642,6 @@ def apply_free_root_velocity_corrections(
         cholesky,
         joint_qd,
         dt,
-        requires_grad,
         apply_transport,
         v_hat,
     )

@@ -446,7 +446,7 @@ def _body_maps(plan, model):
             plan.articulation_dof_start_host,
             plan.response_dof_count,
         )
-        SolverArrays(None, model.device, requires_grad=model.requires_grad).upload(
+        SolverArrays(None, model.device).upload(
             BODY_MAPS,
             owner=maps,
             body_to_joint=body_to_joint,

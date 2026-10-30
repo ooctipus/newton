@@ -676,8 +676,7 @@ def decline(solver) -> str | None:
             (laws.agnostic, "Contact torsion and compliance rows are outside the contact laws it classifies."),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
-                not laws.gradients
-                and laws.plain
+                laws.plain
                 and not laws.regularized
                 and not laws.velocity_limits
                 and solver.routes.case not in ("K1", "K2")
@@ -763,7 +762,7 @@ class ResolvedWorlds:
                 self.resolved.zero_()
             return
         solver = self.solver
-        if contacts is None or getattr(state_in, "requires_grad", False):
+        if contacts is None:
             self.resolved.zero_()
             return
         # Absent rigid-body speed limits read as unbounded.

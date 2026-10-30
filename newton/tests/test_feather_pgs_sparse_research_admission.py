@@ -49,7 +49,6 @@ class _LawsProbe(SimpleNamespace):
             loops=self.forest.has_loop_joints,
             iterations=options.pgs_iterations > 0,
             cuda=True,
-            gradients=False,
         )
 
 
@@ -132,13 +131,13 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_general_sparse_admission_reaches_topology(self):
         """Keep ordinary eligible trees on the general sparse selection path."""
         solver = _eligible_solver()
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_removed_packed_route_flags_reach_general_sparse(self):
         """Admit the general sparse route under either friction law when a recipe sets the removed flags."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         flags = dict.fromkeys(
             (
                 "FEATHER_PGS_G1_CHAIN_SCAN",
@@ -163,7 +162,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
 
     def test_free_rigid_bodies_keep_the_dense_route(self):
         """A world pairing an articulation with free rigid bodies declines the sparse route, for both friction laws."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for anchors in (False, True):
             with self.subTest(friction_anchors=anchors), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
@@ -185,7 +184,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
 
     def test_a_tier_pin_keeps_dense_storage(self):
         """Keep the dense storage the Jacobi tiers need where a test pin builds them on a single tree."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
             solver._route_pins = {"tiers": 32}
@@ -195,7 +194,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
 
     def test_patch_free_body_worlds_keep_the_dense_route(self):
         """Keep a patch-friction world with free rigid bodies on the dense route, as the free-body rule says."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
             solver.laws.friction_anchors_enabled = True

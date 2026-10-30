@@ -4,13 +4,12 @@
 """Declarative device fields: one declaration per field, from allocation to the Warp structs kernels take.
 
 A :class:`Field` names a device array (or a scalar) once: its element type,
-its shape as dimension names, its fill, whether it takes a gradient, and where
-a binding finds it. Everything else derives from it:
+its shape as dimension names, its fill, and where a binding finds it.
+Everything else derives from it:
 
 - :class:`FieldGroup` holds fields that share dimensions and are allocated
   together; :meth:`SolverArrays.allocate` allocates a group on its owner, each
-  field as the owner's attribute of the field's name, with the owner's device
-  and gradient policy;
+  field as the owner's attribute of the field's name, on the owner's device;
 - :func:`struct` generates the Warp struct of a set of fields, so a kernel
   takes one argument where it listed every array;
 - :func:`bind` fills an instance of such a struct from the objects that hold
@@ -44,8 +43,6 @@ class Field:
     """Shape as dimension names, resolved at allocation, or fixed lengths; ``()`` is a scalar."""
     fill: Any = 0
     """Initial value: 0 zeros the array, another value fills it, ``None`` leaves it uninitialized."""
-    grad: bool = True
-    """Allocate a gradient when the allocation asks for gradients."""
     owner: str = "solver"
     """Role of the object a :func:`bind` reads the field from (a keyword of the call)."""
     attr: str | None = None
@@ -89,37 +86,33 @@ class FieldGroup:
 
 
 class SolverArrays:
-    """Allocates field groups on an owner with one device and gradient policy.
+    """Allocates field groups on an owner with one device.
 
     Args:
         owner: The object whose attributes the fields become.
         device: Device of every array.
-        requires_grad: Allocate gradients for the fields that take them.
     """
 
-    def __init__(self, owner, device, *, requires_grad: bool = False):
+    def __init__(self, owner, device):
         self.owner = owner
         self.device = device
-        self.requires_grad = bool(requires_grad)
         self._placeholders: dict[tuple, wp.array] = {}
 
-    def array(self, field: Field, sizes: dict[str, int], requires_grad: bool | None = None) -> wp.array:
-        """Allocate one field at the given sizes (``requires_grad`` overrides the allocator's policy)."""
+    def array(self, field: Field, sizes: dict[str, int]) -> wp.array:
+        """Allocate one field at the given sizes."""
         shape = field.shape(sizes)
-        grad = (self.requires_grad if requires_grad is None else requires_grad) and field.grad
         if field.fill is None:
-            return wp.empty(shape, dtype=field.dtype, device=self.device, requires_grad=grad)
+            return wp.empty(shape, dtype=field.dtype, device=self.device)
         if isinstance(field.fill, (int, float)) and field.fill == 0:
-            return wp.zeros(shape, dtype=field.dtype, device=self.device, requires_grad=grad)
-        return wp.full(shape, field.fill, dtype=field.dtype, device=self.device, requires_grad=grad)
+            return wp.zeros(shape, dtype=field.dtype, device=self.device)
+        return wp.full(shape, field.fill, dtype=field.dtype, device=self.device)
 
-    def allocate(self, group, /, *, owner=None, requires_grad: bool | None = None, **sizes: int) -> dict[str, wp.array]:
+    def allocate(self, group, /, *, owner=None, **sizes: int) -> dict[str, wp.array]:
         """Allocate every field of ``group`` at ``sizes`` and give it to its owner.
 
         Args:
             group: The fields.
             owner: Where the arrays go instead of the allocator's owner: an object (attributes) or a dict (items).
-            requires_grad: Overrides the allocator's gradient policy for this group.
             sizes: The size of every dimension name the fields use.
 
         Returns:
@@ -128,7 +121,7 @@ class SolverArrays:
         owner = self.owner if owner is None else owner
         arrays = {}
         for field in group:
-            array = self.array(field, sizes, requires_grad)
+            array = self.array(field, sizes)
             arrays[field.name] = array
             if isinstance(owner, dict):
                 owner[field.name] = array
@@ -164,8 +157,7 @@ class SolverArrays:
         owner = self.owner if owner is None else owner
         arrays = {}
         for field in group:
-            grad = self.requires_grad and field.grad
-            array = wp.array(values[field.name], dtype=field.dtype, device=self.device, requires_grad=grad)
+            array = wp.array(values[field.name], dtype=field.dtype, device=self.device)
             arrays[field.name] = array
             if isinstance(owner, dict):
                 owner[field.name] = array
@@ -187,7 +179,7 @@ class SolverArrays:
         key = (dtype, tuple(shape), fill)
         array = self._placeholders.get(key)
         if array is None:
-            array = self.array(Field("placeholder", dtype, tuple(shape), fill=fill, grad=False), {})
+            array = self.array(Field("placeholder", dtype, tuple(shape), fill=fill), {})
             self._placeholders[key] = array
         return array
 

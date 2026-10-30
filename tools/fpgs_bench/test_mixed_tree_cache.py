@@ -143,14 +143,12 @@ class TestMixedTreeCache(unittest.TestCase):
                 item._passive_spring_ref.fill_(-0.07)
                 item._passive_joint_damping.fill_(0.12)
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            aug = solver._prepare_augmented_state(state, output, control)
-            ref = reference._prepare_augmented_state(state, model.state(), control)
-            reference._stage1_fk_id(state, ref, model.state())
-            reference._stage1_drives(state, ref, control, DT)
-            rhs = ref.joint_tau.numpy().astype(float)
+            reference._stage1_fk_id(state, reference, model.state())
+            reference._stage1_drives(state, reference, control, DT)
+            rhs = reference.joint_tau.numpy().astype(float)
             physical = physical_mass(model, state)
-            aug.joint_tau.zero_()
-            owner.begin(state, aug, state.joint_qd, DT, True)
+            solver.joint_tau.zero_()
+            owner.begin(state, solver, state.joint_qd, DT, True)
             np.testing.assert_allclose(solver.joint_S_s.numpy(), reference.joint_S_s.numpy(), atol=4e-6, rtol=3e-5)
             np.testing.assert_allclose(solver.body_v_s.numpy(), reference.body_v_s.numpy(), atol=4e-6, rtol=3e-5)
             expected = np.zeros(model.joint_dof_count)
@@ -169,7 +167,7 @@ class TestMixedTreeCache(unittest.TestCase):
                         lower[index] = np.linalg.cholesky(block + np.diag(solver.R_by_size[n].numpy()[index]))
                         solver.L_by_size[n].assign(lower)
             solver.mass_update_mask.fill_(1)
-            owner.refresh(aug)
+            owner.refresh(solver)
             held = {
                 group.layout.dofs: (
                     solver._diagonal_inverse_mass.numpy().copy()
@@ -178,20 +176,20 @@ class TestMixedTreeCache(unittest.TestCase):
                 )
                 for group in owner.groups
             }
-            owner.predict(state, aug, control, state.joint_qd, DT)
+            owner.predict(state, solver, control, state.joint_qd, DT)
             np.testing.assert_allclose(solver.joint_qdd.numpy(), expected, atol=5e-5, rtol=5e-4)
             np.testing.assert_allclose(solver.v_hat.numpy(), raw + DT * expected, atol=4e-6, rtol=3e-5)
             solver.v_out.assign(solver.v_hat)
-            owner.finish(state, aug, output, DT, False)
+            owner.finish(state, solver, output, DT, False)
             public_state(self, model, output)
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
-            owner.begin(output, aug, output.joint_qd, DT, False)
+            owner.begin(output, solver, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
             mask = wp.array([False, True, False], dtype=wp.bool, device=device)
             owner.invalidate(mask)
             np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), [1, 1, 0, 0, 1, 1])
-            owner.begin(output, aug, output.joint_qd, DT, False)
+            owner.begin(output, solver, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 arts = group.sparse.plan.group_to_art.numpy()
                 np.testing.assert_array_equal(
@@ -201,7 +199,7 @@ class TestMixedTreeCache(unittest.TestCase):
             requests[-1] = 1
             solver._mass_update_requested.assign(requests)
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
-            owner.begin(output, aug, output.joint_qd, DT, False)
+            owner.begin(output, solver, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 arts = group.sparse.plan.group_to_art.numpy()
                 np.testing.assert_array_equal(
@@ -213,11 +211,11 @@ class TestMixedTreeCache(unittest.TestCase):
                 wp.copy(getattr(bank, key), getattr(output, key))
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
             # The copy holds the words of the bank the caches were stamped with: no group repairs.
-            owner.begin(bank, aug, bank.joint_qd, DT, False, state_out=output)
+            owner.begin(bank, solver, bank.joint_qd, DT, False, state_out=output)
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
             solver.mass_update_mask.zero_()
-            owner.refresh(aug)
+            owner.refresh(solver)
             for group in owner.groups:
                 value = solver._diagonal_inverse_mass if group.sparse.diagonal else solver.L_by_size[group.layout.dofs]
                 np.testing.assert_array_equal(value.numpy(), held[group.layout.dofs])
@@ -225,8 +223,8 @@ class TestMixedTreeCache(unittest.TestCase):
                 wp.synchronize()  # Complete fixture allocations before graph capture.
                 with wp.ScopedCapture(device=device) as capture:
                     owner.invalidate(mask)
-                    owner.begin(bank, aug, bank.joint_qd, DT, False)
-                    owner.predict(bank, aug, control, bank.joint_qd, DT)
+                    owner.begin(bank, solver, bank.joint_qd, DT, False)
+                    owner.predict(bank, solver, control, bank.joint_qd, DT)
                 generation = [group.data.generation.numpy().copy() for group in owner.groups]
                 for _ in range(3):
                     wp.capture_launch(capture.graph)

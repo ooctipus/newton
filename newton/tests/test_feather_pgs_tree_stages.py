@@ -212,8 +212,7 @@ class TestTreeKineticStages(unittest.TestCase):
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
-        state, output, control = model.state(), model.state(), model.control()
-        augmented = solver._prepare_augmented_state(state, output, control)
+        state, control = model.state(), model.control()
         other = wp.clone(state.joint_qd)
         self.assertTrue(owner.groups)
         for group in owner.groups:
@@ -221,9 +220,9 @@ class TestTreeKineticStages(unittest.TestCase):
                 self.assertFalse(group.motion_velocity)
                 before = {name: array.numpy().copy() for name, array in _state_arrays(group).items()}
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.begin(state, augmented, other, DT, True)
+                    group.begin(state, solver, other, DT, True)
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.predict(state, augmented, control, other, DT)
+                    group.predict(state, solver, control, other, DT)
                 for name, array in _state_arrays(group).items():
                     np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
 
@@ -243,11 +242,10 @@ class TestTreeKineticStages(unittest.TestCase):
                 solver.options, enable_joint_velocity_limits=alternate
             )
             owner = HeldTree(solver)
-            state, output, control = model.state(), model.state(), model.control()
+            state, output = model.state(), model.state()
             rng = np.random.default_rng(41)
             state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            augmented = solver._prepare_augmented_state(state, output, control)
             nan = wp.full(state.joint_qd.shape, float("nan"), dtype=float, device=device)
             for group in owner.groups:
                 for name, kernel, published in (
@@ -256,7 +254,7 @@ class TestTreeKineticStages(unittest.TestCase):
                 ):
                     with self.subTest(alternate=alternate, layout=group.layout.root_families, kernel=name):
                         self.assertEqual(group.motion_velocity, alternate)
-                        data = group._publication(state, augmented, published, DT)
+                        data = group._publication(state, solver, published, DT)
                         start = {key: array.numpy().copy() for key, array in _state_arrays(group, data).items()}
                         plain = _launch(group, kernel, data, state.joint_qd, start)
                         poisoned = _launch(group, kernel, data, nan, start)

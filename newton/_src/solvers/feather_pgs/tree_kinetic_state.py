@@ -57,16 +57,16 @@ HeldPlan = field_group.struct("HeldPlan", HELD_PLAN, __name__)
 
 
 KINETIC_CACHE = field_group.FieldGroup(
-    Field("bias", wp.float32, ("group", "dof"), fill=None, grad=False, owner="cache"),
-    Field("com_offset", wp.vec3, ("group", "body"), fill=None, grad=False, owner="cache"),
-    Field("geometric", wp.float32, ("group", "entry"), fill=None, grad=False, owner="cache"),
+    Field("bias", wp.float32, ("group", "dof"), fill=None, owner="cache"),
+    Field("com_offset", wp.vec3, ("group", "body"), fill=None, owner="cache"),
+    Field("geometric", wp.float32, ("group", "entry"), fill=None, owner="cache"),
     Field("current_valid", wp.int32, ("articulation",), owner="solver", attr="_fk_id_cache_valid"),
-    Field("geometry_valid", wp.int32, ("group",), grad=False, owner="cache"),
-    Field("generation", wp.int64, ("group",), grad=False, owner="cache"),
-    Field("geometry_generation", wp.int64, ("group",), fill=-1, grad=False, owner="cache"),
-    Field("status", wp.int32, ("group",), grad=False, owner="cache"),
-    Field("source_q", wp.uint64, ("group",), grad=False, owner="cache"),
-    Field("source_qd", wp.uint64, ("group",), grad=False, owner="cache"),
+    Field("geometry_valid", wp.int32, ("group",), owner="cache"),
+    Field("generation", wp.int64, ("group",), owner="cache"),
+    Field("geometry_generation", wp.int64, ("group",), fill=-1, owner="cache"),
+    Field("status", wp.int32, ("group",), owner="cache"),
+    Field("source_q", wp.uint64, ("group",), owner="cache"),
+    Field("source_qd", wp.uint64, ("group",), owner="cache"),
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
 """The held tree's cache. Geometry, forces and source tags follow factor groups (the cache allocates them);

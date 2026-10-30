@@ -9,8 +9,8 @@ gives it two renderings:
 
 * the Warp function: :meth:`LawFamily.law` returns ``wp.func`` of the
   definition, which Warp kernels call like any other Warp function. Warp
-  compiles it for every device, with its adjoint, in the calling module's
-  options (``fuse_fp`` included);
+  compiles it for every device, in the calling module's options (``fuse_fp``
+  included);
 * the CUDA function: a static member of the family's struct, which native
   sweeps call as ``Family::law(...)`` after declaring the family's device
   prelude, :meth:`LawFamily.prelude` (whose CPU twin serves native bodies that
@@ -21,8 +21,7 @@ gives it two renderings:
   of the hand-written text it replaces.
 
 Warp kernels call the Warp function rather than reach the CUDA text through
-``wp.func_native``: a native function has no adjoint (its gradient is silently
-zero), and the Warp function keeps their results bit for bit. The two
+``wp.func_native``: the Warp function keeps their results bit for bit. The two
 renderings compute the same operations in the same order but are lowered
 differently, Warp merging each branch's values with ``wp::where``, so the CUDA
 compiler may fuse a multiply-add in one and not in the other, and Warp negates a scalar by subtracting it from zero. Laws without

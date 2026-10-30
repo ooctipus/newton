@@ -40,8 +40,7 @@ arguments; the plan (:class:`.tree_plan.TreePlan`) supplies the rest:
     :func:`choose_schedule` picks one from the plan's data (sizes, depth,
     chain packing), never from a timing. The CPU path of every schedule is the
     serial one: a native scan's ``#else`` branch, and :func:`serial_scan` and
-    :func:`serial_path` for Warp kernels (differentiable, the general route's
-    passes).
+    :func:`serial_path` for Warp kernels (the general route's passes).
 
 SERIAL and LEVEL compute every node's result from its parent's final one, so
 they agree bit for bit; the jump, chain and interval schedules regroup the same
@@ -924,15 +923,13 @@ def tree_scan(
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Warp serial scans (the general route's fallback: differentiable, any size)
+# Warp serial scans (the general route's fallback: any size)
 # ---------------------------------------------------------------------------------------------------------------------
 
 
 @functools.cache
 def serial_scan(combine: Combine, direction: Direction, own, result=None, *, store_total: bool = False):
     """Return the Warp serial schedule of ``combine``: one thread visits a joint range once, node by node.
-
-    The scans are differentiable by Warp's tape (checked against central differences).
 
     The scan runs over nodes ``start`` to ``end - 1`` of a parent-first range in place on body-indexed values:
     ``parent[i]`` is the slot of node ``i``'s parent (``-1`` at a root) and ``slot[i]`` node ``i``'s own. The
@@ -941,9 +938,7 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, sto
     ``DOWN`` (:data:`TRANSFORM`, :data:`TWIST`): each node's own value ``own(node, data)`` (a twist hook returns
     the twist and its own bias acceleration) is composed with its parent's result, stored at its slot and handed
     to ``result(node, value, data)``. The parent's result comes from registers when it is the previous node
-    (a chain), else from memory: one read of the tree per scan. The register copy keeps the scan
-    differentiable: Warp's tape replays the loop body backwards, where the node replayed before a node is the
-    one after it in parent-first order, never its parent, so the replay reads the parent from memory.
+    (a chain), else from memory: one read of the tree per scan.
 
     ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent, with each
     node's :attr:`.tree_plan.TreePlan.up_flags` in ``flags``: a node's value is ``own(node, children, data)``,
@@ -951,8 +946,7 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, sto
     its value at its parent's slot and later siblings add theirs; the value is handed to ``result``. With
     ``store_total`` the node's slot then holds its value, else its children's sum (a leaf stores its zero).
 
-    Each form sets every slot it reads, so it leaves memory as its first run did when run again: Warp's tape
-    replays a calling function's forward, stores and all, before the adjoint of the scan reads the sums back.
+    Each form sets every slot it reads, so it leaves memory as its first run did when run again.
     """
     has_result = result is not None
     if direction is Direction.UP:
@@ -1060,8 +1054,7 @@ def serial_path(visit):
     The walk runs over the depth-first positions (:class:`.tree_plan.TreePlan`'s ``dfs_order``,
     ``dfs_position`` and ``dfs_end``) from the tree's root ``start`` to ``node``'s, visiting each node whose
     subtree interval holds ``node``'s position, rather than following parent pointers: no state passes between
-    iterations, so Warp's tape differentiates it (its replay of a pointer walk runs with the last pointer and
-    loses the gradient). ``value`` is the walk's own operand (a column's force); ``data`` (the pass's arrays)
+    iterations. ``value`` is the walk's own operand (a column's force); ``data`` (the pass's arrays)
     and ``context`` (the walk's own scalars) pass through.
     """
 

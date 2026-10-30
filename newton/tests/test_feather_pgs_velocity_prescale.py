@@ -550,7 +550,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 state, following = model.state(), model.state()
                 state.joint_qd.assign(joint_qd)
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                solver._prepare_augmented_state(state, following, model.control())
                 solver.qd_work.fill_(_UNWRITTEN)
                 destinations = []
                 with _recording_copies(destinations):

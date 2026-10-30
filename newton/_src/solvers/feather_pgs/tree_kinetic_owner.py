@@ -528,8 +528,6 @@ class TreeKineticState:
         )
 
     def _validate_call(self, state, state_aug, dt):
-        if state.requires_grad or state_aug is not self.solver:
-            raise RuntimeError("Tree kinetic state excludes gradient/alternate augmented ownership")
         if self.admission is not None and not self.admission(self.solver):
             raise RuntimeError("Tree kinetic configuration changed; reconstruct and recapture")
         if bool(self.solver.options.enable_joint_velocity_limits) != self.motion_velocity:

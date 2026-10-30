@@ -304,9 +304,8 @@ class Recorder:
         control.joint_f.assign(rng.uniform(-0.1, 0.1, model.joint_dof_count).astype(np.float32))
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         solver._last_step_dt = DT
-        augmented = solver._prepare_augmented_state(state, output, control)
         for name in _PARTIAL:
-            getattr(augmented, name).zero_()
+            getattr(solver, name).zero_()
         for array in (solver.articulation_origin, getattr(solver, "_body_inertia_terms", None)):
             if isinstance(array, wp.array):
                 array.zero_()
@@ -326,8 +325,8 @@ class Recorder:
                 "output.body_q": output.body_q,
                 "output.body_qd": output.body_qd,
                 "v_hat": solver.v_hat,
-                "joint_qdd": augmented.joint_qdd,
-                "joint_tau": augmented.joint_tau,
+                "joint_qdd": solver.joint_qdd,
+                "joint_tau": solver.joint_tau,
                 "stiffness": solver._passive_spring_stiffness,
                 "spring_ref": solver._passive_spring_ref,
                 "damping": solver._passive_joint_damping,
@@ -339,17 +338,17 @@ class Recorder:
 
         for step in range(steps):
             velocity = scaled if motion else state.joint_qd
-            owner.begin(state, augmented, velocity, DT, step == 0)
+            owner.begin(state, solver, velocity, DT, step == 0)
             self.snapshot(f"{tag}/{step}/begin", groups, extra())
             solver.mass_update_mask.fill_(1)
-            refresh(augmented)
-            owner.predict(state, augmented, control, velocity, DT)
+            refresh(solver)
+            owner.predict(state, solver, control, velocity, DT)
             self.snapshot(f"{tag}/{step}/predict", groups, extra())
             solver.v_out.assign(solver.v_hat)
-            owner.finish(state, augmented, output, DT, step % 2 == 0)
+            owner.finish(state, solver, output, DT, step % 2 == 0)
             self.snapshot(f"{tag}/{step}/finish", groups, extra())
             # The next step starts from the published state; a repeated begin keeps the cache.
-            owner.begin(output, augmented, scaled if motion else output.joint_qd, DT, False)
+            owner.begin(output, solver, scaled if motion else output.joint_qd, DT, False)
             self.snapshot(f"{tag}/{step}/repeat", groups, extra())
             state, output = output, state
             state.body_f.assign(rng.normal(0, 0.1, (model.body_count, 6)).astype(np.float32))
@@ -361,23 +360,23 @@ class Recorder:
                     group._classify_switch, group._repair_grid, group._classify_above = True, 1, 0
                     group._bind_kernels()
             velocity = scaled if motion else state.joint_qd
-            owner.begin(state, augmented, velocity, DT, False)
+            owner.begin(state, solver, velocity, DT, False)
             solver.mass_update_mask.fill_(1)
-            refresh(augmented)
-            owner.predict(state, augmented, control, velocity, DT)
+            refresh(solver)
+            owner.predict(state, solver, control, velocity, DT)
             solver.v_out.assign(solver.v_hat)
-            owner.finish(state, augmented, output, DT, False)
+            owner.finish(state, solver, output, DT, False)
             # The caller copies the published bank back into the input bank and changes one coordinate: the
             # stamps name the output bank, so the repair compares the banks (identity alone for prescaled motion).
             state.assign(output)
             coordinates = state.joint_q.numpy()
             coordinates[0] += np.float32(0.01)
             state.joint_q.assign(coordinates)
-            owner.begin(state, augmented, scaled if motion else state.joint_qd, DT, False, state_out=output)
+            owner.begin(state, solver, scaled if motion else state.joint_qd, DT, False, state_out=output)
             self.snapshot(f"{tag}/{form}/begin", groups, extra())
         world_mask = wp.array([True] + [False] * (solver.forest.world_count - 1), dtype=wp.bool, device=self.device)
         owner.invalidate(world_mask)
-        owner.begin(state, augmented, scaled if motion else state.joint_qd, DT, False)
+        owner.begin(state, solver, scaled if motion else state.joint_qd, DT, False)
         self.snapshot(f"{tag}/reset/begin", groups, extra())
 
     def single_scenes(self):

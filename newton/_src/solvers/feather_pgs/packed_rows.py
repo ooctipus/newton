@@ -51,8 +51,8 @@ from .response_operator import CholeskySolve, Reversed
 __all__ = ["PACKED_ROWS", "PACKED_SIDES", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
 
 PACKED_ROWS = FieldGroup(
-    Field("_packed_J", wp.float32, ("world", "row", "support"), grad=False),
-    Field("_packed_Z", wp.float32, ("world", "row", "support"), grad=False),
+    Field("_packed_J", wp.float32, ("world", "row", "support")),
+    Field("_packed_Z", wp.float32, ("world", "row", "support")),
 )
 """Each dense row's packed entries: world coordinate, Jacobian and whitened value."""
 

@@ -526,8 +526,8 @@ def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBran
     if solver._route_pins.get("star") == "held":
         return None, "A test pin keeps the diagonal-mass group in the held tree (star='held')."
     model = solver.model
-    if model.requires_grad or model.particle_count:
-        return None, "Scalar branches exclude gradients and particles."
+    if model.particle_count:
+        return None, "Scalar branches exclude particles."
     if solver.options.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the diagonal-mass group on its ordinary dynamics."
     if size not in solver.forest.direct_diagonal_inertia_sizes:
@@ -653,8 +653,6 @@ class ScalarBranchState:
 
     def _validate_call(self, state, state_aug, dt):
         solver = self.solver
-        if state.requires_grad or state_aug is not solver:
-            raise RuntimeError("Scalar branches exclude gradient and alternate augmented ownership")
         if self.admission is not None and not self.admission(solver):
             raise RuntimeError("Scalar branch configuration changed; reconstruct and recapture")
         if solver.options.enable_joint_velocity_limits:

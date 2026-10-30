@@ -3,10 +3,10 @@
 
 """The general route's dynamics passes: FK, inverse dynamics, joint forces, composite inertia and CRBA.
 
-One thread per articulation (CRBA: per articulation and column) in Warp, so the
-passes run on the CPU and record on Warp's tape when a model requires gradients.
-Each pass is a :mod:`.tree_scan` schedule over the articulation's tree joints
-with the pass's per-node laws, all from :mod:`.spatial_laws`, as hooks:
+One thread per articulation (CRBA: per articulation and column) in Warp, on
+either device. Each pass is a :mod:`.tree_scan` schedule over the
+articulation's tree joints with the pass's per-node laws, all from
+:mod:`.spatial_laws`, as hooks:
 
 * :data:`fk_id`: TRANSFORM down from each joint's pose in its parent,
   ``X_p X_j X_c^-1``, publishing COM poses; then TWIST down from each joint's
@@ -446,11 +446,7 @@ _MASS_COLUMN = serial_path(_mass_entries)
 
 @wp.func
 def coordinate_joint(coordinate: int, first: int, last: int, joint_qd_start: wp.array[int]) -> int:
-    """The joint among ``first`` to ``last - 1`` whose coordinate range holds ``coordinate``, or ``-1``.
-
-    A function without an early exit: Warp's tape replays a function's loop, but not a loop in a kernel's own
-    body or one left by ``break``, whose result the gradient pass would not see.
-    """
+    """The joint among ``first`` to ``last - 1`` whose coordinate range holds ``coordinate``, or ``-1``."""
     joint = int(-1)
     for j in range(first, last):
         if coordinate >= joint_qd_start[j] and coordinate < joint_qd_start[j + 1]:
@@ -477,8 +473,8 @@ def crba_fill(
 
     ``records`` holds the composite records (or the bodies' own, for one-body articulations). The walk tests
     the joint forest's depth-first intervals in place of following ``joint_ancestor``
-    (:func:`.tree_scan.serial_path`) and the column's joint comes from a search without an early exit, so the
-    tape differentiates the pass; each entry is written once (:func:`_mass_entries`).
+    (:func:`.tree_scan.serial_path`) and the column's joint comes from :func:`coordinate_joint`; each entry is
+    written once (:func:`_mass_entries`).
     """
     tid = wp.tid()
     group = tid // n_dofs

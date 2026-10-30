@@ -115,16 +115,14 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                     dt, count = 0.004, mass.dof_count
                     reference._last_step_dt = dt
-                    ref_aug = reference._prepare_augmented_state(state, model.state(), control)
-                    reference._stage1_fk_id(state, ref_aug, model.state())
-                    reference._stage1_drives(state, ref_aug, control, dt)
-                    rhs = ref_aug.joint_tau.numpy().reshape(2, count).astype(float)
-                    augmented = solver._prepare_augmented_state(state, output, control)
-                    augmented.joint_tau.zero_()
-                    owner.begin(state, augmented, state.joint_qd, dt, True)
+                    reference._stage1_fk_id(state, reference, model.state())
+                    reference._stage1_drives(state, reference, control, dt)
+                    rhs = reference.joint_tau.numpy().reshape(2, count).astype(float)
+                    solver.joint_tau.zero_()
+                    owner.begin(state, solver, state.joint_qd, dt, True)
                     public_state(self, model, state)
                     np.testing.assert_allclose(
-                        augmented.body_v_s.numpy(), ref_aug.body_v_s.numpy(), atol=2e-6, rtol=2e-5
+                        solver.body_v_s.numpy(), reference.body_v_s.numpy(), atol=2e-6, rtol=2e-5
                     )
                     physical = physical_mass(model, state)
                     matrices = [physical[i * count : (i + 1) * count, i * count : (i + 1) * count] for i in range(2)]
@@ -133,25 +131,25 @@ class TestTreePhysicalCPU(unittest.TestCase):
                         expected = matrix[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
                         np.testing.assert_allclose(geometry[group], expected, atol=3e-6, rtol=3e-5)
                     solver.mass_update_mask.fill_(1)
-                    operator.refresh(augmented)
-                    owner.predict(state, augmented, control, state.joint_qd, dt)
+                    operator.refresh(solver)
+                    owner.predict(state, solver, control, state.joint_qd, dt)
                     for group, matrix in enumerate(matrices):
                         held_matrix = matrix + np.diag(solver.R_by_size[count].numpy()[group])
                         expected = np.linalg.solve(held_matrix, rhs[group])
-                        actual = augmented.joint_qdd.numpy().reshape(2, count)[group]
+                        actual = solver.joint_qdd.numpy().reshape(2, count)[group]
                         np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-4)
                     solver.v_out.assign(solver.v_hat)
-                    owner.finish(state, augmented, output, dt, False)
+                    owner.finish(state, solver, output, dt, False)
                     public_state(self, model, output)
                     before = owner.data.generation.numpy().copy()
-                    owner.begin(output, augmented, output.joint_qd, dt, False)
+                    owner.begin(output, solver, output.joint_qd, dt, False)
                     np.testing.assert_array_equal(owner.data.generation.numpy(), before)
                     owner.invalidate(wp.array([True, False], dtype=wp.bool, device=device))
-                    owner.begin(output, augmented, output.joint_qd, dt, False)
+                    owner.begin(output, solver, output.joint_qd, dt, False)
                     np.testing.assert_array_equal(owner.data.generation.numpy(), np.add(before, [1, 0]))
                     held = operator.data.W.numpy().copy()
                     solver.mass_update_mask.zero_()
-                    operator.refresh(augmented)
+                    operator.refresh(solver)
                     np.testing.assert_array_equal(operator.data.W.numpy(), held)
 
     def test_physical_cache(self):

@@ -6,8 +6,8 @@
 Tree shapes, every held-tree scan configuration compiled as a stand-alone
 native on a held tree's scratch layout (to compare with a float64 reference or
 time with one launch), articulated models of the shapes, and the general
-route's passes on a solver's own arrays (:class:`GeneralRoute`), with the tape
-and central-difference gradients of each. It defines no tests.
+route's passes on a solver's own arrays (:class:`GeneralRoute`). It defines no
+tests.
 """
 
 import functools
@@ -408,7 +408,7 @@ def run(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, flag: int, 
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def articulated_model(shapes, worlds: int, device, seed: int = 0, requires_grad: bool = False):
+def articulated_model(shapes, worlds: int, device, seed: int = 0):
     """A model of the named tree shapes per world: free roots, revolute, prismatic and ball joints, random inertia."""
     import newton  # noqa: PLC0415
 
@@ -450,7 +450,7 @@ def articulated_model(shapes, worlds: int, device, seed: int = 0, requires_grad:
         scene.add_articulation(joints)
     builder = newton.ModelBuilder()
     builder.replicate(scene, worlds)
-    model = builder.finalize(device=device, requires_grad=requires_grad)
+    model = builder.finalize(device=device)
     q = model.joint_q.numpy()
     types, q_start = model.joint_type.numpy(), model.joint_q_start.numpy()
     for j in range(model.joint_count):
@@ -479,7 +479,7 @@ class GeneralRoute:
     state: object
     control: object
     aug: object
-    """The augmented state: the solver, or with gradients the output state (``_prepare_augmented_state``)."""
+    """The augmented state: the solver, which holds the step's state-derived dynamics."""
     size_groups: list
     """Per coordinate count: ``(size, group_to_art)``, the articulations of that size."""
     H: dict
@@ -495,7 +495,6 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
     with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
         solver = SolverFeatherPGS(model)
     state, control = model.state(), model.control()
-    aug = solver._prepare_augmented_state(state, model.state(), control)
     rng = np.random.default_rng(seed)
     if model.body_count:
         state.body_f.assign(rng.standard_normal((model.body_count, 6)).astype(np.float32))
@@ -511,7 +510,7 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
         ("_passive_joint_damping", 0.1, 0.5),
     ):
         values = np.where(axes, rng.uniform(low, high, dofs), 0.0).astype(np.float32)
-        setattr(solver, name, wp.array(values, dtype=float, device=device, requires_grad=model.requires_grad))
+        setattr(solver, name, wp.array(values, dtype=float, device=device))
     solver.mass_update_mask.fill_(1)
     starts = model.articulation_start.numpy()
     counts = np.diff(model.joint_qd_start.numpy()[starts])
@@ -521,14 +520,9 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
         solver,
         state,
         control,
-        aug,
+        solver,
         [(size, wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device)) for size in sizes],
-        {
-            size: wp.zeros(
-                (int(np.sum(counts == size)), size, size), dtype=float, device=device, requires_grad=model.requires_grad
-            )
-            for size in sizes
-        },
+        {size: wp.zeros((int(np.sum(counts == size)), size, size), dtype=float, device=device) for size in sizes},
     )
 
 
@@ -593,91 +587,3 @@ def joint_space_inertias(route: GeneralRoute) -> np.ndarray:
     for size, group_to_art in route.size_groups:
         H[group_to_art.numpy(), :size, :size] = route.H[size].numpy()
     return H
-
-
-GRADIENT_INPUTS = {
-    "fk_id": ("joint_q", "joint_qd", "body_mass", "body_inertia"),
-    "tau": ("joint_q", "joint_qd", "joint_f", "joint_S_s", "body_f_s", "body_f", "body_q"),
-    "composite_inertia": ("_body_inertia_terms",),
-    "crba": ("joint_S_s", "body_I_c"),
-}
-"""Each pass's inputs whose gradients the tests check: the state's, the control's, the augmented state's,
-the solver's or the model's arrays."""
-
-GRADIENT_OUTPUTS = {
-    "fk_id": ("body_q", "body_q_com", "joint_S_s", "_body_inertia_terms", "body_v_s", "body_f_s", "body_a_s"),
-    "tau": ("body_ft_s", "joint_tau"),
-    "composite_inertia": ("body_I_c",),
-    "crba": (),
-}
-"""Each pass's outputs, a random linear form of which the gradient tests differentiate (CRBA: its matrices)."""
-
-
-def owner_array(route: GeneralRoute, key: str) -> wp.array:
-    """The array ``key`` of the route's state, control, augmented state, solver or model, in that order."""
-    for owner in (route.state, route.control, route.aug, route.solver, route.model):
-        value = getattr(owner, key, None)
-        if isinstance(value, wp.array):
-            return value
-    raise KeyError(key)
-
-
-def _outputs(route: GeneralRoute, name: str) -> list:
-    if name == "crba":
-        return [route.H[size] for size, _ in route.size_groups]
-    return [owner_array(route, key) for key in GRADIENT_OUTPUTS[name]]
-
-
-def _form(model, name: str, seed: int):
-    """A route with ``name``'s inputs in place, and random weights of a linear form of its outputs."""
-    route = general_route(model)
-    run_inputs(route, name)
-    rng = np.random.default_rng(seed)
-    return route, [(array, rng.standard_normal(array.numpy().shape)) for array in _outputs(route, name)]
-
-
-def pass_gradients(model, name: str, seed: int = 5) -> dict:
-    """The gradients of a random linear form of pass ``name``'s outputs with respect to its inputs
-    (:data:`GRADIENT_INPUTS`), by Warp's tape (``model`` requires gradients)."""
-    route, weights = _form(model, name, seed)
-    inputs = {key: owner_array(route, key) for key in GRADIENT_INPUTS[name]}
-    tape = wp.Tape()
-    with tape:
-        run_pass(route, name, write_inertia_records=1)
-    for array in inputs.values():
-        array.grad.zero_()
-    tape.backward(
-        grads={array: wp.array(w.astype(np.float32), dtype=array.dtype, device=model.device) for array, w in weights}
-    )
-    gradients = {key: array.grad.numpy().astype(np.float64) for key, array in inputs.items()}
-    tape.zero()
-    return gradients
-
-
-def pass_difference(model, name: str, key: str, step: float, indices, seed: int = 5) -> np.ndarray:
-    """The same gradient with respect to input ``key`` by central differences, at the flat ``indices``
-    (``nan`` elsewhere)."""
-    route, weights = _form(model, name, seed)
-    target = owner_array(route, key)
-    base = target.numpy().copy()
-
-    def outputs(values):
-        target.assign(values.reshape(base.shape))
-        for array, _ in weights:
-            array.zero_()
-        run_pass(route, name, write_inertia_records=1)
-        return [array.numpy().astype(np.float64) for array, _ in weights]
-
-    flat = base.reshape(-1)
-    gradient = np.full(flat.size, np.nan)
-    for k in indices:
-        values = flat.copy()
-        values[k] += step
-        plus = outputs(values)
-        values[k] -= 2.0 * step
-        minus = outputs(values)
-        gradient[k] = sum(float(np.sum((a - b) * w)) for a, b, (_, w) in zip(plus, minus, weights, strict=True)) / (
-            2.0 * step
-        )
-    target.assign(base)
-    return gradient.reshape(base.shape)

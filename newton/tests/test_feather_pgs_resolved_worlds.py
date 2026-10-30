@@ -384,7 +384,7 @@ class TestResolvedWorlds(unittest.TestCase):
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
             _route_pins={},
-            laws=SimpleNamespace(set=plain_laws(gradients=True)),
+            laws=SimpleNamespace(set=plain_laws(warm_start=True)),
         )
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)
@@ -526,7 +526,7 @@ def _admissible_solver():
         _keyed_rows=None,
         _row_watermark=False,
         routes=SimpleNamespace(case="K6"),
-        model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
+        model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
         _route_pins={},
         forest=SimpleNamespace(
             max_world_dofs=29,
