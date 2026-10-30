@@ -786,7 +786,7 @@ def get_helpers(
     # finalization; the runtime free-rigid test skips tree bodies. A single
     # free-root tree of several bodies never takes this branch (it cost Cassie
     # flat and Humanoid 3-4% in the finish kernel).
-    free_rigid = (layout.bodies == 1 and layout.root_dofs == 6) or (layout.forest and layout.free_roots > 0)
+    free_rigid = (layout.bodies == 1 and layout.free_root) or (layout.forest and layout.free_root_count > 0)
 
     @wp.func
     def _body_terms(
@@ -952,8 +952,8 @@ def get_state_kernel(
     scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
     _storage, _store_motion, _load_motion, _store_bias = h._storage, h._store_motion, h._load_motion, h._store_bias
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
-    bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.root_dofs == 6
-    roots, free_roots, forest, own_bias = len(layout.roots), layout.free_roots, layout.forest, layout.own_bias
+    bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.free_root
+    roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
 
     @wp.func
     def admit(
@@ -1566,7 +1566,9 @@ def get_predictor_kernel(
         ),
         "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
         # Passive springs act on no root coordinate.
-        "SPRING_GUARD": f"i>={layout.root_dofs}" if not layout.forest else "plan.dof_passive.data[i]!=0",
+        "SPRING_GUARD": f"i>={layout.root_dofs if layout.free_root else 0}"
+        if not layout.forest
+        else "plan.dof_passive.data[i]!=0",
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "TRANSPORT_BLOCK": (

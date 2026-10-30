@@ -286,7 +286,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with assert_host_only():
             selected = solver.get_path_selection()
         self.assertIn("CUDA", selected["reasons"]["sparse_mass_matrix"])
-        self.assertIn("held groups", selected["reasons"]["cached_dynamics"])
+        self.assertIn("tree cache admitted", selected["reasons"]["cached_dynamics"])
         self.assertIn("CPU", selected["routes"]["stages"]["factor"]["1"]["reason"])
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
         json.dumps(selected, allow_nan=False)
@@ -317,10 +317,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["friction_anchor_beta"], {"applied": 0.0, "requested": 0.0, "default": None, "source": "argument"}
         )
-        # Split mode builds no matrix-free tier.
+        # The CPU builds no Jacobi tier.
         self.assertIsNone(selected["routes"]["sweep"]["tiers"])
         self.assertNotIn("grouped", {r["route"] for r in selected["routes"]["stages"]["response"].values()})
-        self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
+        self.assertEqual(selected["routes"]["publication"]["owner"], "cached")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
         solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
@@ -395,9 +395,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual((storage["metadata"], storage["mf_impulses"]), ("streamed", "resident"))
         self.assertEqual(routes["free_rigid_bodies"]["count"], 1)
         self.assertEqual(routes["free_rigid_bodies"]["owners"], ["matrix_free_rows"])
-        # The arm's revolute root is outside the held groups (fixed or free roots).
-        self.assertIsNone(routes["held_tree"]["owner"])
-        self.assertIn("held groups", routes["held_tree"]["reason"])
+        # The arm's revolute root is a joint root: the arm and the free box form one mixed held group.
+        self.assertEqual(routes["held_tree"]["owner"], "mixed")
         self.assertEqual(routes["contact_rows"]["producer"], "general")
         method = "masked_combined"
         self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
@@ -411,8 +410,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("CUDA", routes["local_solve"]["reason"])
         self.assertFalse(routes["resolved_worlds"]["enabled"])
         self.assertIn("matrix-free route", routes["resolved_worlds"]["reason"])
-        self.assertEqual(routes["publication"]["owner"], "ordinary")
-        self.assertEqual(routes["publication"]["fk_id_cache"], "off")
+        self.assertEqual(routes["publication"]["owner"], "cached")
+        self.assertEqual(routes["publication"]["fk_id_cache"], "in_place")
+        self.assertEqual([group["free_roots"] for group in routes["held_tree"]["groups"]], [[True], [False]])
         self.assertEqual(routes["velocity_limits"]["joint"], "off")
         self.assertFalse(routes["velocity_limits"]["free_body_rows"])
         self.assertEqual(routes["friction"]["law"], "patch")
@@ -978,8 +978,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(ordinary.get_path_selection()["sparse_mass_matrix"], "off")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
-    def test_cached_dynamics_generic_tree_is_default_and_unsupported_roots_reject(self):
-        """A fixed arm with a free body is cached by the generic tree owner by default; a revolute world root is rejected."""
+    def test_cached_dynamics_generic_tree_is_default_on_every_root(self):
+        """A fixed arm with a free body is cached by the generic tree owner by default, and so is a revolute world root."""
         world = newton.ModelBuilder()
         joints = []
         parent = -1
@@ -1004,7 +1004,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
             solver = _make_solver(model, False, friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
-        # Cached trees require a fixed or free root; a revolute joint at the world is rejected.
+        # A revolute joint at the world is a joint root: its coordinates are a descendant's.
         world = newton.ModelBuilder()
         joints, parent = [], -1
         for _ in range(3):
@@ -1018,8 +1018,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder.replicate(world, 2)
         model = builder.finalize(device="cuda:0")
         solver = _make_solver(model, False, friction_anchor_beta=0.0)
-        self.assertIsNone(solver.factor.held)
-        self.assertIn("Ordinary dynamics retained", solver.get_path_selection()["reasons"]["cached_dynamics"])
+        self.assertIsNotNone(solver.factor.held)
+        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_free_body_worlds_keep_the_dense_route_for_bothplain_laws(self):

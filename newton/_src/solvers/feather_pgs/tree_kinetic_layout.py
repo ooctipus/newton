@@ -23,13 +23,16 @@ class TreeLayout:
     # 0 selects one tree per block of the warps its bodies need.
     lanes: int = 0
     # A forest: local body index of every root (one tree: (0,)), each root's
-    # coordinate count (0 fixed, 6 free), its coordinate offset within the
-    # group, its factor family size (0 for a prescribed root) and whether the
-    # whole group is one articulation.
+    # coordinate count (0 fixed, 6 free, or a joint's), its coordinate offset
+    # within the group, its factor family size (0 for a prescribed root) and
+    # whether the whole group is one articulation.
     roots: tuple[int, ...] = (0,)
     root_coordinates: tuple[int, ...] = ()
     root_offsets: tuple[int, ...] = (0,)
     root_families: tuple[int, ...] = ()
+    # Per root, whether it stands on a free joint. Any other root's coordinates
+    # are a joint's, which the stages treat as a descendant's.
+    free_roots: tuple[bool, ...] = ()
     # A joint with its own bias acceleration: a D6 whose axes form a chain
     # (linear and angular axes, or several angular ones). The motion scan
     # then reads each joint's own bias instead of taking it as zero.
@@ -42,16 +45,27 @@ class TreeLayout:
             object.__setattr__(self, "root_coordinates", (self.root_dofs,))
         if not self.root_families:
             object.__setattr__(self, "root_families", (self.dofs,))
-        if not (len(self.roots) == len(self.root_coordinates) == len(self.root_offsets) == len(self.root_families)):
-            raise ValueError("Cached forest roots need one coordinate count, offset and family each")
-        if self.roots[0] != 0 or any(c not in (0, 6) for c in self.root_coordinates):
-            raise ValueError("Cached forest roots start at body 0 and are fixed or free")
+        if not self.free_roots:
+            object.__setattr__(self, "free_roots", tuple(c == 6 for c in self.root_coordinates))
+        if not (
+            len(self.roots)
+            == len(self.root_coordinates)
+            == len(self.root_offsets)
+            == len(self.root_families)
+            == len(self.free_roots)
+        ):
+            raise ValueError("Cached forest roots need one coordinate count, offset, family and kind each")
+        if self.roots[0] != 0 or any(
+            c != 6 if free else not 0 <= c <= self.dofs
+            for c, free in zip(self.root_coordinates, self.free_roots, strict=True)
+        ):
+            raise ValueError("Cached forest roots start at body 0 and are fixed, free or a joint's coordinates")
         if self.lanes == 0:
             object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
         if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies:
             raise ValueError("Cached tree lanes must be a power of two covering every body")
-        if self.root_dofs not in (0, 6) or self.root_dofs > self.dofs:
-            raise ValueError("Cached trees require a fixed or free root")
+        if self.root_dofs != self.root_coordinates[0] or self.root_dofs > self.dofs:
+            raise ValueError("Cached trees require their root's coordinate count")
         if sorted(self.permutation) != list(range(self.dofs)):
             raise ValueError("Cached trees require a complete factor-coordinate permutation")
         if not (self.dofs <= self.entries <= self.dofs * (self.dofs + 1) // 2):
@@ -86,8 +100,13 @@ class TreeLayout:
         return len(self.roots) > 1
 
     @property
-    def free_roots(self):
-        return sum(1 for c in self.root_coordinates if c == 6)
+    def free_root_count(self):
+        return sum(self.free_roots)
+
+    @property
+    def free_root(self):
+        """Whether the first root stands on a free joint."""
+        return self.free_roots[0]
 
     @property
     def pack(self):
@@ -141,10 +160,10 @@ class TreeLayout:
             "ORIGIN": self.origin_offset,
             "TOTAL": self.origin_offset + 6 * len(self.roots),
             "ROOT_COUNT": len(self.roots),
-            "FREE_ROOTS": self.free_roots,
+            "FREE_ROOTS": self.free_root_count,
             "WHITE": 6 * self.bodies + self.dofs,
             "PRED_SCRATCH": 6 * self.bodies + 2 * self.dofs,
-            "FREE_ROOT": int(self.root_dofs == 6),
+            "FREE_ROOT": int(self.free_root),
         }
 
     def render(self, source, **fragments):

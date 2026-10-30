@@ -433,7 +433,7 @@ def held_tree_calls():
                 kwargs = {**layout, "response": response, "twists": twists, **options}
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
-        coordinates = tree.dofs + tree.free_roots
+        coordinates = tree.dofs + tree.free_root_count
         schedules = _schedules(tree, chain)
         if "motion_velocity" not in repair_options:
             kwargs = {**layout, "body_velocity": True, "bank_coordinates": coordinates}

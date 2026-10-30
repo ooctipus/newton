@@ -67,7 +67,7 @@ def _kernels(layout):
     yield "repair_motion", state(False, schedules, layout=layout, motion_velocity=True)
     yield "repair_listed", state(False, schedules, layout=layout, listed=True)
     # A group's coordinate count: a free root's quaternion takes one more than its three rotation velocities.
-    yield "repair_banked", state(False, schedules, layout=layout, bank_coordinates=layout.dofs + layout.free_roots)
+    yield "repair_banked", state(False, schedules, layout=layout, bank_coordinates=layout.dofs + layout.free_root_count)
 
 
 def _input_uses(kernel, name="motion_qd"):
@@ -186,7 +186,7 @@ class TestTreeKineticStages(unittest.TestCase):
                         schedules,
                         layout=layout,
                         motion_velocity=True,
-                        bank_coordinates=layout.dofs + layout.free_roots,
+                        bank_coordinates=layout.dofs + layout.free_root_count,
                     )
 
     def test_only_listed_and_comparing_repairs_read_their_inputs(self):

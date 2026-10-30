@@ -639,15 +639,15 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "the CUDA trajectory requires CUDA")
     def test_cuda_ordinary_mass_pipeline_matches_cpu_trajectory(self):
-        """Run ordinary dynamics' drives and mass pipeline on CUDA as on the CPU (a revolute root keeps the held tree
-        out)."""
+        """Run ordinary dynamics' drives and mass pipeline on CUDA as on the CPU (both pinned to ordinary dynamics)."""
         model = _build_chain_model(num_links=3, num_worlds=2)
-        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-        reference = SolverFeatherPGS(
-            _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
-            enable_joint_limits=False,
-            dense_max_constraints=16,
-        )
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+            reference = SolverFeatherPGS(
+                _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
+                enable_joint_limits=False,
+                dense_max_constraints=16,
+            )
         self.assertIsNone(optimized.factor.held)
         self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
         # Both evaluate the drives with the joint forces in one pass and add K after the assembly.
@@ -718,10 +718,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual((solver._pgs_convergence_log, solver._pgs_ncp_residual_log), ([], []))
 
     def test_serial_passes_launch_at_the_serial_block_size(self):
-        """A step launches every one-articulation-per-thread pass (FK/ID, the joint forces and drives, the composite
-        inertia) in blocks of ``tree_passes.SERIAL_BLOCK_DIM`` threads."""
+        """A step of ordinary dynamics (pinned) launches every one-articulation-per-thread pass (FK/ID, the joint forces
+        and drives, the composite inertia) in blocks of ``tree_passes.SERIAL_BLOCK_DIM`` threads."""
         model = _build_chain_model()
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=1)
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=1)
         state_0, state_1, control = model.state(), model.state(), model.control()
         serial = {
             tree_passes.fk_id,

@@ -243,10 +243,10 @@ class TreeKineticState:
         dof_offset = np.arange(dofs) - tree.dof_start[dof_joint]
         for group, art in enumerate(group_to_art):
             start = int(starts[art])
-            if self.layout.root_dofs and start not in root_lookup:
+            if self.layout.free_root and start not in root_lookup:
                 raise ValueError("Tree kinetic state is missing a free-root transport slot")
             root_slot[group] = root_lookup.get(start, -1)
-            for dof in range(self.layout.root_dofs, dofs):
+            for dof in range(self.layout.root_dofs if self.layout.free_root else 0, dofs):
                 q_index[group, dof] = q_starts[start + dof_joint[dof]] + dof_offset[dof]
         # Each group's coordinates are one contiguous range, from its first joint's.
         first_joint = starts[group_to_art]
@@ -280,14 +280,14 @@ class TreeKineticState:
                 solver._predicted_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
                 solver._predicted_twist_arts_host = np.zeros(model.articulation_count, np.int32)
             solver._predicted_twist_arts_host[np.asarray(arts, np.int64).reshape(-1)] = 1
-        free = [r for r, c in enumerate(self.layout.root_coordinates) if c == 6]
+        free = [r for r, is_free in enumerate(self.layout.free_roots) if is_free]
         free_root_local = root_locals[free] if free else np.zeros(1, np.int32)
         free_root_dof = (
             np.asarray([self.layout.root_offsets[r] for r in free], np.int32) if free else np.zeros(1, np.int32)
         )
         dof_passive = np.ones(dofs, np.int32)
-        for r, c in enumerate(self.layout.root_coordinates):
-            dof_passive[self.layout.root_offsets[r] : self.layout.root_offsets[r] + c] = 0
+        for r in free:
+            dof_passive[self.layout.root_offsets[r] : self.layout.root_offsets[r] + 6] = 0
         if self.layout.forest:
             root_slot = np.full((self.group_count, max(1, len(free))), -1, np.int32)
             for group in range(self.group_count):

@@ -551,6 +551,8 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 state.joint_qd.assign(joint_qd)
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                 solver.qd_work.fill_(_UNWRITTEN)
+                # The held tree's repair reads the step's duration.
+                solver.factor.last_step_dt = 1.0 / 60.0
                 destinations = []
                 with _recording_copies(destinations):
                     stage3_qd = solver.factor.fk_id(state, following, solver._step, solver.qd_work)

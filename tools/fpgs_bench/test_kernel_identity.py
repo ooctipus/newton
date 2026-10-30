@@ -146,7 +146,7 @@ class TestKernelIdentity(unittest.TestCase):
                     }
                     self.assertIn((state, (finish, schedules), name, {**running, "body_velocity": True}), calls)
                 ordinary = not options.get("motion_velocity", False)
-                coordinates = tree.dofs + tree.free_roots
+                coordinates = tree.dofs + tree.free_root_count
                 for call in (
                     (state, (False, schedules), name, {"body_velocity": True, "bank_coordinates": coordinates}),
                     (classify, (), name, {}),

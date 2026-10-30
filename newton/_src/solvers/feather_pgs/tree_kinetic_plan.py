@@ -80,17 +80,11 @@ def make_plan(model, operator, *, complete=True):
     types = model.joint_type.numpy()[joints]
     if not np.all(types == types[0]):
         raise ValueError("Cached trees require one uniform parent-first topology")
-    root_coordinates = []
-    for root in root_locals:
-        locked_root = types[0, root] == int(JointType.D6) and np.all(counts[:, root] == 0)
-        if types[0, root] not in (int(JointType.FREE), int(JointType.FIXED)) and not locked_root:
-            raise ValueError("Cached trees require a free, fixed or zero-coordinate D6 root")
-        root_coordinates.append(int(counts[0, root]))
-    non_root = np.ones(bodies, bool)
-    non_root[list(root_locals)] = False
     # Descendants may carry one or several coordinates: the motion scan stores
-    # one axis per coordinate through jcalc_motion and the integrator handles
-    # every joint type; the mass plan takes per-body coordinate counts.
+    # one axis per coordinate through joint_motion and the integrator handles
+    # every joint type; the mass plan takes per-body coordinate counts. A root
+    # stands on a free joint, on no coordinates (fixed or a locked D6), or on
+    # a joint with coordinates that the stages treat as a descendant's.
     descendants = (
         int(JointType.FIXED),
         int(JointType.REVOLUTE),
@@ -98,6 +92,15 @@ def make_plan(model, operator, *, complete=True):
         int(JointType.D6),
         int(JointType.BALL),
     )
+    root_coordinates, free_roots = [], []
+    for root in root_locals:
+        kind = int(types[0, root])
+        if kind != int(JointType.FREE) and kind not in descendants:
+            raise ValueError("Cached trees require a free root or a root joint the per-node laws hold")
+        root_coordinates.append(int(counts[0, root]))
+        free_roots.append(kind == int(JointType.FREE))
+    non_root = np.ones(bodies, bool)
+    non_root[list(root_locals)] = False
     if not np.all(np.isin(types[:, non_root], descendants)):
         raise ValueError("Cached trees require fixed, scalar, D6 or ball descendant joints")
     linear, angular = model.joint_dof_dim.numpy()[joints[0]].T
@@ -147,6 +150,7 @@ def make_plan(model, operator, *, complete=True):
         root_coordinates=tuple(root_coordinates),
         root_offsets=offsets,
         root_families=tuple(int(v) for v in getattr(operator, "root_families", ())) or (dofs,),
+        free_roots=tuple(free_roots),
         own_bias=own_bias,
     )
     return layout, parent

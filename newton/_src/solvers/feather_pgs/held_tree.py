@@ -172,12 +172,10 @@ def _size_group(solver, size, *, diagonal):
     parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
     counts = np.diff(model.joint_qd_start.numpy())[first:end]
     root_type = model.joint_type.numpy()[first]
-    fixed_root = counts[0] == 0 and root_type in (int(JointType.FIXED), int(JointType.D6))
     # A free rigid body is a one-body tree on a free root: its six coordinates
-    # share the held Cholesky action and the generic free-root transport.
+    # share the held Cholesky action and the generic free-root transport. Any
+    # other root's coordinates (none, or a joint's) are a descendant's.
     free_root = counts[0] == 6 and root_type == int(JointType.FREE)
-    if not (fixed_root or free_root):
-        raise ValueError("Mixed held tree groups require fixed or free roots")
     mass = TreePlan.build(parents, counts).factor
     if mass.dof_count != size:
         raise ValueError("Mixed tree physical and factor dimensions differ")

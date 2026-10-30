@@ -237,6 +237,8 @@ def _tree_group(group) -> dict:
         "block_dim": int(group.block_dim),
         "roots": json_value(layout.roots),
         "root_coordinates": json_value(layout.root_coordinates),
+        # Per root, whether it stands on a free joint (a joint root's coordinates are a descendant's).
+        "free_roots": json_value(layout.free_roots),
         # Factor family per root: its coordinate count, negated for a diagonal-mass family, 0 when prescribed.
         "root_families": json_value(layout.root_families),
         # The scans' schedules, chosen from the tree's data with its lanes (tree_kinetic_state.held_schedules).
@@ -297,6 +299,7 @@ def _scalar_group(group) -> dict:
         "block_dim": None,
         "roots": [0],
         "root_coordinates": [0],
+        "free_roots": [False],
         # A diagonal-mass family, negated as for the tree groups.
         "root_families": [-size],
         "schedules": None,

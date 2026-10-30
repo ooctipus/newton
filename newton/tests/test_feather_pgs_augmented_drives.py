@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -51,26 +52,28 @@ def _mixed_target_model(coord_layout, device):
 
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
-    @unittest.skipUnless(wp.get_device().is_cuda, "Matrix-free solver dispatch requires CUDA")
     def test_mixed_joint_target_layout_trajectories(self):
-        """Match public solver trajectories across both target layouts and drive dispatches."""
-        for parallel_streams in (False, True):
-            with self.subTest(parallel_streams=parallel_streams):
+        """Match public solver trajectories across both target layouts, on the held tree and on ordinary dynamics."""
+        for parallel_streams, evaluator in itertools.product((False, True), ("held", "ordinary")):
+            with self.subTest(parallel_streams=parallel_streams, evaluator=evaluator):
+                pins = {"evaluator": "ordinary"} if evaluator == "ordinary" else {}
                 trajectories = []
                 for coord_layout in (False, True):
                     model, state, control, _joints, dofs, coords, targets = _mixed_target_model(
                         coord_layout, wp.get_device()
                     )
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model,
-                        enable_joint_limits=False,
-                        dense_max_constraints=16,
-                        mf_max_constraints=16,
-                        pgs_iterations=8,
-                    )
-                    # Ball roots keep the held tree out: ordinary dynamics evaluate the drives with the joint forces.
-                    self.assertIsNone(solver.factor.held)
-                    self.assertFalse(solver.factor.parallel_drives)
+                    with patch.dict(newton.solvers.SolverFeatherPGS._route_pins, pins):
+                        solver = newton.solvers.SolverFeatherPGS(
+                            model,
+                            enable_joint_limits=False,
+                            dense_max_constraints=16,
+                            mf_max_constraints=16,
+                            pgs_iterations=8,
+                        )
+                    self.assertEqual(solver.factor.held is not None, evaluator == "held")
+                    if evaluator == "ordinary":
+                        # Ordinary dynamics evaluate the drives with the joint forces.
+                        self.assertFalse(solver.factor.parallel_drives)
                     initial_qd = state.joint_qd.numpy()[dofs].copy()
                     position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
                     following = model.state()

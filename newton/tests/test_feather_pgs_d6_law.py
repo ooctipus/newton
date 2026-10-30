@@ -7,11 +7,13 @@ A D6 joint is the chain of its axes that its transform composes: the linear axes
 then each angular axis, carried through the rotations before it, turns about the joint origin the linear
 coordinates moved. A body in free flight on a D6 (no gravity, no contacts) therefore keeps its line, speed and spin
 as the same body on a free joint does, and a tumbling one converges to the free body as the step shrinks (its angle
-coordinates integrate at first order). Both evaluators run the law: a D6 root takes the ordinary passes, a D6 below a
-fixed root the held tree.
+coordinates integrate at first order). Both evaluators run the law: the held tree by the route's rules, the ordinary
+passes under their test pin.
 """
 
+import itertools
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -101,13 +103,16 @@ class TestFeatherPGSD6Law(unittest.TestCase):
     def test_floating_d6_keeps_its_line_and_spin(self):
         """Slide at 1 m/s along x while spinning at 20 rad/s about z on a D6, as on a free joint, for 0.3 s.
 
-        The body keeps its speed, spin, line and energy on the ordinary passes (a D6 root) and on the held tree (a D6
-        below a fixed root), with the yaw axis alone and with all three angular axes.
+        The body keeps its speed, spin, line and energy on the held tree and on the ordinary passes, on a D6 root and on
+        a D6 below a fixed root, with the yaw axis alone and with all three angular axes.
         """
         for device in _devices():
-            for kind, evaluator in (("root", "ordinary"), ("child", "held")):
-                for angular in ((2,), (0, 1, 2)):
-                    with self.subTest(device=device, kind=kind, angular=angular):
+            for evaluator, kind, angular in itertools.product(
+                ("held", "ordinary"), ("root", "child"), ((2,), (0, 1, 2))
+            ):
+                pins = {"evaluator": "ordinary"} if evaluator == "ordinary" else {}
+                with self.subTest(device=device, evaluator=evaluator, kind=kind, angular=angular):
+                    with mock.patch.object(SolverFeatherPGS, "_route_pins", pins):
                         model = _floating_model(device, kind, angular)
                         velocity = [1.0, 0.0, 0.0] + [0.0] * (len(angular) - 1) + [20.0]
                         twist, pose, before, after, ran = _fly(model, velocity, 1.0 / 240.0, 0.3)

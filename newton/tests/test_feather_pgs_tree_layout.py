@@ -73,7 +73,7 @@ class TestTreeLayoutRender(unittest.TestCase):
                     natives += tree_kinetic_state._thread_helpers.__wrapped__(layout)
                     # The bank comparison votes over the group's lanes (a free root's quaternion adds a coordinate).
                     natives.append(
-                        tree_kinetic_state._bank_binding.__wrapped__(layout.dofs + layout.free_roots, layout)
+                        tree_kinetic_state._bank_binding.__wrapped__(layout.dofs + layout.free_root_count, layout)
                     )
                     # The predictor's native: the held solve, the subtree reduction and the twist publication.
                     predictor = tree_kinetic_state.get_predictor_kernel.__wrapped__(
