@@ -783,8 +783,15 @@ class TestPairedFactorUnitSource(unittest.TestCase):
 
 class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "paired factor sweeps require CUDA")
-    def test_paired_factor_units_match_the_general_sweep_bitwise(self):
-        """Walk patch units with the general sweep's row order and arithmetic: identical bits out."""
+    def test_paired_factor_units_match_the_general_sweep(self):
+        """Walk patch units on the unit's Gram block: the general sweep's impulses and velocity to rounding.
+
+        A loaded unit reduces its three rows' velocity terms and the pair's couplings with the normal in one ladder
+        and moves the pair's residuals by the normal's change (``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``): in exact
+        arithmetic the general sweep's row order, so the two differ by rounding only. An unloaded unit visits its
+        rows with the general sweep's reductions, so a sweep from zero impulses, which reaches every unit unloaded,
+        reproduces the general sweep's bits.
+        """
         device = wp.get_device("cuda:0")
         for (capacity, primary, secondary), components, (
             iterations,
@@ -822,8 +829,30 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 self.assertFalse(np.array_equal(general[0], rows["impulses"]), "the sweep changed no impulse")
                 tangents = rows["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
-                np.testing.assert_array_equal(units[0].view(np.uint32), general[0].view(np.uint32))
-                np.testing.assert_array_equal(units[1].view(np.uint32), general[1].view(np.uint32))
+                for unit_values, general_values in zip(units, general, strict=True):
+                    scale = float(np.max(np.abs(general_values)))
+                    gap = float(np.max(np.abs(unit_values.astype(np.float64) - general_values)))
+                    self.assertLessEqual(gap, 1.0e-5 * scale, f"units differ from the general sweep by {gap:.3g}")
+            cold = dict(rows, impulses=np.zeros_like(rows["impulses"]))
+            general, units = (
+                _launch_paired_factor_solve(
+                    kernel,
+                    cold,
+                    device,
+                    primary=primary,
+                    components=components,
+                    iterations=1,
+                    omega=omega,
+                    friction_start=0,
+                    offset=0,
+                )
+                for kernel in kernels
+            )
+            with self.subTest("cold", capacity=capacity, components=components, omega=omega):
+                tangents = cold["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
+                self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
+                for unit_values, general_values in zip(units, general, strict=True):
+                    np.testing.assert_array_equal(unit_values.view(np.uint32), general_values.view(np.uint32))
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal GS requires CUDA")
     def test_sparse_diagonal_gs_matches_scalar_reference(self):

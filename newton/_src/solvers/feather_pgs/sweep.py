@@ -50,7 +50,7 @@ from .kernels import (
 )
 from .response_operator import Lanes, ResponseOperator
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
-from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, vote
+from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
 from .staging import Buffer
 
 CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
@@ -698,7 +698,22 @@ class UnitOperator:
     and ``unit_dt2``, which the placement applies once after the unit: in exact arithmetic the row-by-row sweep. The
     pair's coupling ``Z_t1 . Z_t2`` is the placement's (:meth:`coupling`), or none where its pair law reads a metric
     cached for the unit (:class:`CachedPairMetric`).
+
+    A row's vote reads its terms' magnitude through a lower bound (:meth:`terms`): the reduced term's own, or, where
+    the placement's ladder also reduced the magnitudes (:attr:`magnitudes`: ``unit_jv{k}_terms``, and ``C_t = sum_k
+    |Z_tk Z_nk|`` in ``gram_n{t}_terms``), the normal's ``S_n`` and a moved tangent's ``max(|Z_t^T u'|, S_t - |dn|
+    C_t)``, the row-by-row sweep's ``S_t`` itself when the normal did not move.
     """
+
+    magnitudes = False
+
+    def terms(self, out: str, rhs: str, *, whole: bool) -> str:
+        if not self.magnitudes:
+            return super().terms(out, rhs, whole=whole)
+        moved = terms_bound(out, rhs) if whole else f"fabsf({out})"
+        if out == "sibling_residual":
+            return f"fmaxf({moved}, unit_jv2_terms - fabsf(unit_dn) * gram_n2_terms)"
+        return f"(r == 0 ? unit_jv0_terms : fmaxf({moved}, unit_jv1_terms - fabsf(unit_dn) * gram_n1_terms))"
 
     def residual(self, out: str, indent: str) -> str:
         return f"{indent}float {out} = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;"

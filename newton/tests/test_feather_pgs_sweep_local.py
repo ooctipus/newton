@@ -157,13 +157,32 @@ class TestPairedFactorRoute(unittest.TestCase):
             with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
                 _PAIRED(*args, **kwargs)
 
-    def test_unit_schedules_reduce_a_pair_in_one_ladder(self):
-        """A pair solved as a unit reduces both residuals, their terms' magnitudes (the exit law's scale) and the
-        coupling in one ladder; a pair at its first tangent reduces its sibling's and the coupling."""
-        unit = "SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);"
+    def test_unit_schedules_run_contact_units_through_the_row_law(self):
+        """A loaded contact unit reduces its three rows' velocity terms, the pair's Gram couplings with the normal
+        and their terms' magnitudes (the exit law's scale) in one ladder, then runs its rows by the row law
+        (:func:`.sweep.contact_unit`): the pair's residuals moved by the normal's change, a moved tangent's terms
+        bounded below, the changes deferred to one apply. An unloaded unit reduces its normal alone and its pair on
+        the pair's own ladder; a pair at its first tangent in the general sweep reduces its sibling's and the
+        coupling."""
+        unit = (
+            "SUM(unit_jv0, unit_jv0_terms, unit_jv1, unit_jv1_terms, unit_jv2, unit_jv2_terms, gram_n1, gram_n1_terms, "
+            "gram_n2, gram_n2_terms, unit_cross);"
+        )
         for schedule in PAIRED_SCHEDULES[1:]:
             body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, **schedule)
-            self.assertIn(unit, body)
+            units = _block(body, "if (s_lam[head] != 0.0f || s_lam[head + 1] != 0.0f || s_lam[head + 2] != 0.0f) {")
+            self.assertIn(unit, units)
+            self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", units)
+            self.assertIn("fmaxf(fabsf(jv), unit_jv1_terms - fabsf(unit_dn) * gram_n1_terms)", units)
+            self.assertIn(
+                "factor_velocity += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;", units
+            )
+            rest = body[body.index(units) + len(units) :]
+            self.assertTrue(rest.startswith(" else {"))
+            unloaded = _block(rest, "else {")
+            self.assertIn("SUM(jv, jv_terms);", unloaded)
+            self.assertIn("SUM(residual, residual_terms, sibling_residual, sibling_residual_terms, cross);", unloaded)
+            self.assertNotIn("unit_jv", unloaded)
         body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6)
         self.assertIn("SUM(sibling_residual, sibling_residual_terms, cross);", body)
         self.assertNotIn(unit, body)

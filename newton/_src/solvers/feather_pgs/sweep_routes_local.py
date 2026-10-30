@@ -38,7 +38,9 @@ from .sweep import (
     JOINT_LIMIT,
     RowContext,
     RowLaws,
+    UnitOperator,
     admit_pair,
+    contact_unit,
     end_sweep,
     friction_gate,
     friction_radius,
@@ -522,9 +524,9 @@ def paired_factor_source(
     free body (:class:`.FactorRows`), a warp per world, the factor velocity ``u = L^T v`` in a register per lane.
 
     The schedule visits the rows in slot order: row by row; with ``contact_triples``, when the world's rows are a
-    prefix and then normal/tangent/tangent triples, the prefix row by row and each triple's normal then its tangent
-    pair; with ``contact_units``, each row and then the tangent pair it owns (patch contacts own one when they hold
-    an anchor). A pair solved as a unit reduces its sums in one ladder (:func:`.sweep.pair_update`). With
+    prefix and then normal/tangent/tangent triples, the prefix row by row and each triple as a contact unit; with
+    ``contact_units``, each row, and a row with the tangent pair it owns (patch contacts own one when they hold an
+    anchor) as a contact unit (:func:`_contact_unit`: a loaded unit on its Gram block, one ladder and one apply). With
     ``independent_components`` a world whose signed free-body row count is negative solves only its articulation's
     coordinates (its free body's rows run in the matrix-free sweep).
 
@@ -676,8 +678,81 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str, *, friction: bool = T
     return "\n".join(line for line in lines if line)
 
 
+@dataclasses.dataclass(frozen=True)
+class _UnitFactorRows(UnitOperator, FactorRows):
+    """A contact unit's factor rows (:class:`.sweep.UnitOperator`): the unit's ladder (:func:`_contact_unit`) also
+    reduces the pair's coupling and the rows' terms' magnitudes, so a moved tangent votes on a lower bound of its terms
+    that is the row-by-row sweep's own when the normal did not move."""
+
+    magnitudes = True
+
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        return f"{indent}const float {out} = unit_cross;"
+
+
+def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
+    """The contact unit headed by row ``head`` (of kind ``kind``, never friction) with its tangent pair ``(head + 1,
+    head + 2)`` (friction coefficient ``mu`` at the visited row ``i``), its three factor rows in registers, by the unit
+    law (:func:`.sweep.contact_unit`).
+
+    The unit's impulses choose its reductions, not its law. A loaded unit (a nonzero impulse among its rows) reduces its
+    rows' velocity terms, the pair's couplings with the normal and their terms' magnitudes in one ladder, runs its rows
+    on :class:`_UnitFactorRows` and applies their changes in one pass. An unloaded one visits its rows as the row-by-row
+    sweep does: the normal on its own ladder (:func:`_unit_row`), then its pair on the pair's own (:func:`_pair_unit`),
+    only on a nonzero disk, so a unit that stays inactive reduces the normal's terms alone. The second tangent is only
+    zeroed while friction is delayed.
+    """
+    op = ctx.operator
+    velocity = op.velocity
+    unit = _UnitFactorRows(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
+    channels = (
+        ("unit_jv0", "row_z", velocity),
+        ("unit_jv1", "tangent1_z", velocity),
+        ("unit_jv2", "tangent2_z", velocity),
+        ("gram_n1", "row_z", "tangent1_z"),
+        ("gram_n2", "row_z", "tangent2_z"),
+        ("unit_cross", "tangent1_z", "tangent2_z"),
+    )
+    rows = dataclasses.replace(ctx, kind="unit_type", mu=lambda row: mu, inline_velocity_limit=False)
+    declare = (
+        f"const int i = head + r;\nconst int unit_type = r == 0 ? {kind} : {FRICTION};\nconst float denom = s_diag[i];"
+    )
+
+    diagonal = lambda row: "denom" if row == "i" else f"s_diag[{row}]"  # noqa: E731
+    unit_rows = contact_unit(
+        dataclasses.replace(rows, operator=dataclasses.replace(unit, diagonal=diagonal)),
+        laws,
+        rows="3",
+        declare=declare,
+        parent="head",
+        check="denom",
+        pad="    ",
+    )
+
+    lines = [
+        f"const float row_z = {op.load('head')};",
+        f"const float tangent1_z = {op.load('head + 1')};",
+        f"const float tangent2_z = {op.load('head + 2')};",
+        "if (s_lam[head] != 0.0f || s_lam[head + 1] != 0.0f || s_lam[head + 2] != 0.0f) {",
+        "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one ladder.",
+        unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
+        unit_rows,
+        "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2.",
+        "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
+        f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
+        "} else {",
+        "    const int i = head, tangent1 = head + 1;",
+        indent(_unit_row(ctx, laws, kind, load=False), "    "),
+        indent(_pair_unit(ctx, laws, mu), "    "),
+        "}",
+        friction_gate(str(FRICTION), ctx.store("head + 2", "0.0f"), ctx.sync(), "", skip=False),
+    ]
+    return "\n".join(lines)
+
+
 def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str) -> str:
-    """The tangent pair ``(tangent1, tangent1 + 1)`` of the normal row ``i``, solved as a unit after it."""
+    """The tangent pair ``(tangent1, tangent1 + 1)`` of the normal row ``i`` (its rows in ``tangent1_z``,
+    ``tangent2_z``), solved as a unit after it on its own ladder (:func:`.sweep.pair_update`)."""
     op = ctx.operator
     pair = dataclasses.replace(
         ctx,
@@ -690,8 +765,6 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str) -> str:
         inline_velocity_limit=False,
     )
     lines = [
-        f"const float tangent1_z = {op.load('tangent1')};",
-        f"const float tangent2_z = {op.load('tangent1 + 1')};",
         friction_gate(
             str(FRICTION), ctx.lanes.first("{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; }"), ctx.sync(), ""
         ),
@@ -702,8 +775,9 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str) -> str:
     return "\n".join(lines)
 
 
-def _unit_row(ctx: RowContext, laws: RowLaws, kind: str) -> str:
-    """Row ``i`` of a unit (its kind ``kind`` is never friction) by the row law, when its diagonal is positive."""
+def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -> str:
+    """Row ``i`` of a unit (its kind ``kind`` is never friction) by the row law, when its diagonal is positive; its
+    factor row loaded here, or (without ``load``) already."""
     op = ctx.operator
     row = dataclasses.replace(
         ctx,
@@ -713,30 +787,28 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str) -> str:
         inline_velocity_limit=kind == "row_type",
     )
     lines = [
-        f"const float {op.current} = {op.load('i')};",
+        f"const float {op.current} = {op.load('i')};" if load else "",
         "if (s_diag[i] > 0.0f) {",
         op.residual("jv", "    "),
         row_update(row, laws, residual="jv", pad="    "),
         "}",
     ]
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line)
 
 
 def _paired_triples(ctx: RowContext, laws: RowLaws) -> str:
-    """The contact triples after the prefix: each normal row, then its tangent pair as a unit."""
+    """The contact triples after the prefix, each a contact unit (:func:`_contact_unit`)."""
     lines = [
         "for (int contact = 0; contact < contact_count; ++contact) {",
-        "    const int i = contact_start + contact * 3;",
-        "    const int tangent1 = i + 1;",
-        indent(_unit_row(ctx, laws, str(CONTACT)), "    "),
-        indent(_pair_unit(ctx, laws, "s_contact_mu[contact]"), "    "),
+        "    const int head = contact_start + contact * 3;",
+        indent(_contact_unit(ctx, laws, str(CONTACT), "s_contact_mu[contact]"), "    "),
         "}",
     ]
     return "\n".join(lines)
 
 
 def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
-    """Contact units in slot order: each row by the row law, then the tangent pair it owns as a unit.
+    """Contact units in slot order: a row by the row law, or, with the tangent pair it owns, a contact unit.
 
     A row owns the next two rows when they are tangent rows naming it as parent. A tangent row outside a unit is
     zeroed while friction is delayed, and otherwise left alone.
@@ -752,10 +824,13 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
         "    const int tangent1 = i + 1;",
         f"    const bool owns_tangents = i + 2 < m && static_cast<int>(s_type[tangent1]) == {FRICTION}",
         "        && world_row_parent.data[off + tangent1] == i;",
-        indent(_unit_row(ctx, laws, "row_type"), "    "),
-        "    if (!owns_tangents) continue;",
+        "    if (!owns_tangents) {",
+        indent(_unit_row(ctx, laws, "row_type"), "        "),
+        "        continue;",
+        "    }",
         "    step = 3;",
-        indent(_pair_unit(ctx, laws, "world_row_mu.data[off + tangent1]"), "    "),
+        "    const int head = i;",
+        indent(_contact_unit(ctx, laws, "row_type", "world_row_mu.data[off + tangent1]"), "    "),
         "}",
     ]
     return "\n".join(lines)

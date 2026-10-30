@@ -2081,14 +2081,14 @@ class FactorRows(ResponseOperator):
     def _product(self, out: str, a: str, b: str) -> str:
         return f"float {out} = {self.lanes.lane} < {self.dofs} ? {a} * {b} : 0.0f;"
 
-    def _sums(self, channels, indent: str) -> str:
-        """Reduce each channel ``(out, a, b)``'s products in one ladder; a velocity sum (``b`` the velocity) reduces
-        its terms' magnitude beside it, ``{out}_terms`` (:meth:`terms`)."""
+    def _sums(self, channels, indent: str, *, magnitudes: tuple[str, ...] = ()) -> str:
+        """Reduce each channel ``(out, a, b)``'s products in one ladder; a velocity sum (``b`` the velocity), and each
+        channel named in ``magnitudes``, reduces its terms' magnitude beside it, ``{out}_terms`` (:meth:`terms`)."""
         lines, names = [], []
         for out, a, b in channels:
             lines.append(f"{indent}{self._product(out, a, b)}")
             names.append(out)
-            if b == self.velocity:
+            if b == self.velocity or out in magnitudes:
                 lines.append(f"{indent}float {out}_terms = fabsf({out});")
                 names.append(f"{out}_terms")
         return "\n".join([*lines, f"{indent}{self.lanes.reduce(*names)}"])

@@ -75,7 +75,7 @@ _SCALED_VOTES = {
     ),
     "paired": (
         "fabsf(delta_impulse) * (s_diag[i])",
-        "fabsf(delta_impulse) * (s_diag[tangent1])",
+        "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (s_diag[sib])",
     ),
     "local": ("fabsf(delta_impulse) * (inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f)",),
