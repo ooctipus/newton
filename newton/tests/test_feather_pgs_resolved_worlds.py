@@ -475,7 +475,7 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertFalse(rw.supported(solver))
         solver.laws.set = plain_laws(contact="patch")
         self.assertTrue(rw.supported(solver))
-        solver._sparse_mass_matrix_size = 23
+        solver.routes.case = "K1"
         self.assertFalse(rw.supported(solver))
 
     def test_classify_bounds_patch_worlds_by_the_solver_capacities(self):
@@ -521,10 +521,11 @@ class TestResolvedWorlds(unittest.TestCase):
 
 def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
-    solver = SimpleNamespace(
+    return SimpleNamespace(
         _preelim_count=0,
-        _sparse_mass_matrix_size=None,
         _keyed_rows=None,
+        _row_watermark=False,
+        routes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
         _route_pins={},
         forest=SimpleNamespace(
@@ -537,14 +538,6 @@ def _admissible_solver():
         laws=SimpleNamespace(set=plain_laws(), mimic_count=0, connect_count=0, joint_limit_q_index=1),
         options=SimpleNamespace(enable_bilateral_preelimination=False),
     )
-    for name in (
-        "_fused_diagonal_joint_limits",
-        "_sparse_diagonal_contact_solve",
-        "_compact_contact_boundary",
-        "_row_watermark",
-    ):
-        setattr(solver, name, False)
-    return solver
 
 
 def _rollout(

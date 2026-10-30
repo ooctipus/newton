@@ -658,11 +658,12 @@ def decline(solver) -> str | None:
 
     The owner writes the solver's friction law: point rows, or persistent patch rows when friction
     anchors are on; the laws it implements are its capability (``route_table.CAPABILITIES``), and the local
-    owners' admission carries CUDA, the matrix-free plain sweep and no velocity limits. These are its fit.
+    owners' admission carries CUDA, the matrix-free plain sweep and no velocity limits. It produces the rows of the
+    local owners' class (case K3); the rest is its fit.
     """
     return first_failed(
         (
-            (solver._local_internal_fast_path, "Local packets serve the local owners' worlds; none is built."),
+            (solver.routes.case == "K3", "Local packets produce the rows of the local owners' class (case K3)."),
             (solver._hinv_jt_writes_world, "Local packets need the response written in world layout."),
             (
                 solver._packed_dense,
@@ -673,11 +674,6 @@ def decline(solver) -> str | None:
                 "dense_max_constraints is below the local residual owner's rows.",
             ),
             (
-                not (solver._sparse_diagonal_contact_solve or solver._fused_diagonal_joint_limits),
-                "The diagonal-mass contact owner and its fused limits own these worlds.",
-            ),
-            (not solver._paired_factor_coordinates, "The paired factor-coordinate sweep owns these worlds."),
-            (
                 all(
                     not solver._execution_plan.use_tiled_hinv_jt(size)
                     and not solver._execution_plan.use_diagonal_mass(size)
@@ -685,7 +681,6 @@ def decline(solver) -> str | None:
                 ),
                 "A size takes the tiled or diagonal response, which local packets do not write.",
             ),
-            (solver._ink_sizes is None, "The parallel tiers form these worlds' response in-kernel."),
         )
     )
 

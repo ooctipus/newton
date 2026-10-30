@@ -152,17 +152,18 @@ def _resting_arms_and_box(*links, device="cpu"):
     return builder.finalize(device=device)
 
 
-def _plan_stand_in(law, sizes=(108, 6), **attributes):
-    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted."""
+def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
+    """A host stand-in with the attributes contact_row_plan and the route record read; no owner is admitted unless
+    ``case`` and the attributes name one."""
     values = {
         "laws": SimpleNamespace(friction_anchors_enabled=law == "patch", set=plain_laws(contact=law)),
         "forest": SimpleNamespace(size_groups=list(sizes)),
+        "routes": SimpleNamespace(case=case),
         "_row_packets": None,
         "_keyed_rows": None,
         "_compact_contact_boundary": False,
         "_sparse_mass_matrix_size": None,
         "_sparse_prepare_contacts": False,
-        "_sparse_diagonal_contact_solve": False,
         "_sparse_diagonal_response_size": None,
         "_sparse_diagonal_contact_triples": False,
         "_sparse_diagonal_contact_units": False,
@@ -581,26 +582,26 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             point = law == "point"
             masked = ["contact_row_prelude", "populate_world_J_masked"]
             diagonal = {
-                "_sparse_diagonal_contact_solve": True,
+                "case": "K2",
                 "_sparse_diagonal_response_size": 108,
                 "_mark_independent_sparse_contact_candidates_kernel": marker,
             }
             schedule = {"_sparse_diagonal_contact_triples": point, "_sparse_diagonal_contact_units": not point}
-            sparse = {"_sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
+            sparse = {"case": "K1", "_sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
 
             def same(sizes, method, kernels):
                 return dict.fromkeys(sizes, (method, kernels))
 
             cases = (
-                # (attributes, sizes, producer, {size: (method, kernels)})
+                # (attributes, sizes, producer, {size: (method, kernels)}); the case is the attributes' "case"
                 (
-                    {"_row_packets": SimpleNamespace()},
+                    {"case": "K3", "_row_packets": SimpleNamespace()},
                     (18, 6),
                     "local_packets",
                     same((18, 6), "local_packets", ["produce_contacts", "materialize_fallback"]),
                 ),
                 (
-                    {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
+                    {"case": "K4", "_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
                     (16, 6),
                     "keyed_rows",
                     same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
@@ -720,31 +721,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # One combined masked launch for both sizes, then one per-contact launch per size.
         self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
         self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
-
-    def test_plan_refuses_sparse_factors_beside_the_sparse_diagonal_owner(self):
-        """Refuse a plan in which native sparse factors and the sparse-diagonal owner both own contact rows.
-
-        _setup_sparse_mass_matrix declines sparse factors where the sparse-diagonal owner owns the
-        response. The plan ranks sparse factors first and the row build launches the diagonal response
-        for the sparse-diagonal producer only, so both owners together would drop that response.
-        """
-        for law in ("point", "patch"):
-            with self.subTest(law=law):
-                both = _plan_stand_in(
-                    law,
-                    _sparse_mass_matrix_size=6,
-                    _sparse_diagonal_contact_solve=True,
-                    _sparse_diagonal_response_size=108,
-                )
-                with self.assertRaisesRegex(RuntimeError, "sparse-diagonal contact owner"):
-                    contact_row_plan(both)
-                # Either owner alone produces its own rows.
-                for producer, owner in (
-                    ("sparse_contact_response", {"_sparse_mass_matrix_size": 6}),
-                    ("sparse_diagonal", {"_sparse_diagonal_contact_solve": True}),
-                ):
-                    plan = contact_row_plan(_plan_stand_in(law, _sparse_diagonal_response_size=108, **owner))
-                    self.assertEqual(plan.producer, producer)
 
     def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""

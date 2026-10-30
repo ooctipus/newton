@@ -33,8 +33,9 @@ class ContactRowPlan:
     """The contact-row producer of one solver and the builder method of each DOF size."""
 
     producer: str
-    """The first admitted producer: ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``,
-    ``sparse_contact_response``, ``sparse_diagonal``, ``compact_jacobian`` or ``general``."""
+    """The producer the class's placement case names: ``local_packets``, ``keyed_rows``,
+    ``compact_contact_boundary``, ``sparse_contact_response``, ``sparse_diagonal``, ``compact_jacobian`` or
+    ``general``."""
     law: str
     """The friction law of the contact rows: ``"point"`` or ``"patch"``."""
     methods: dict[int, str]
@@ -52,11 +53,12 @@ class ContactRowPlan:
 def contact_row_plan(solver) -> ContactRowPlan:
     """Decide the contact-row producer and each DOF size's builder method.
 
-    The first admitted producer writes every contact row: local row packets, keyed rows, the
-    compact contact boundary, then the shared-metadata producers (native sparse factors' response,
-    the sparse-diagonal owner, the compact Jacobian) and last the general builder. Owners decided at
-    construction admit the producers, so the plan stays fixed for a solver; it is evaluated from the
-    solver's current attributes.
+    The class's placement case (``solver.routes.case``) names the producer that writes every contact row: local row
+    packets for the local owners (K3), keyed rows for the tiers (K4) and the compact contact boundary for the
+    sparse diagonal (K2), each where its own fit admitted it; then the shared-metadata producers (native sparse
+    factors' response for K1, the sparse-diagonal rows for K2, the compact Jacobian) and last the general builder.
+    Owners decided at construction admit the producers, so the plan stays fixed for a solver; it is evaluated from
+    the solver's current attributes.
 
     Builder methods by producer:
 
@@ -70,34 +72,25 @@ def contact_row_plan(solver) -> ContactRowPlan:
     """
     law = "patch" if solver.laws.friction_anchors_enabled else "point"
     sizes = solver.forest.size_groups
-    if solver._row_packets is not None:
-        return ContactRowPlan("local_packets", law, dict.fromkeys(sizes, "local_packets"))
-    if solver._keyed_rows is not None:
-        return ContactRowPlan("keyed_rows", law, dict.fromkeys(sizes, "keyed_rows"))
-    if solver._compact_contact_boundary:
-        return ContactRowPlan("compact_contact_boundary", law, dict.fromkeys(sizes, "compact_contact_boundary"))
-    sparse_size = solver._sparse_mass_matrix_size
-    diagonal = bool(solver._sparse_diagonal_contact_solve)
-    if sparse_size is not None and diagonal:
-        # _setup_sparse_mass_matrix declines native sparse factors where the sparse-diagonal owner owns the
-        # response, so one producer ranks first; the row build launches the diagonal response for that owner only.
-        raise RuntimeError("Native sparse factors and the sparse-diagonal contact owner cannot both own contact rows.")
-    if sparse_size is not None or diagonal or solver._compact_contact_jacobian:
+    case = solver.routes.case
+    owned = {
+        "K3": "local_packets" if solver._row_packets is not None else None,
+        "K4": "keyed_rows" if solver._keyed_rows is not None else None,
+        "K2": "compact_contact_boundary" if solver._compact_contact_boundary else None,
+    }.get(case)
+    if owned is not None:
+        return ContactRowPlan(owned, law, dict.fromkeys(sizes, owned))
+    if case in ("K1", "K2") or solver._compact_contact_jacobian:
         methods = {}
         for size in sizes:
-            if sparse_size is not None:
+            if case == "K1":
                 # Native sparse factors admit one articulated size and no free rigid bodies.
                 methods[size] = "sparse_response"
-            elif diagonal and size == solver._sparse_diagonal_response_size:
+            elif case == "K2" and size == solver._sparse_diagonal_response_size:
                 methods[size] = "sparse_diagonal"
             else:
                 methods[size] = "compact_jacobian"
-        if sparse_size is not None:
-            producer = "sparse_contact_response"
-        elif diagonal:
-            producer = "sparse_diagonal"
-        else:
-            producer = "compact_jacobian"
+        producer = {"K1": "sparse_contact_response", "K2": "sparse_diagonal"}.get(case, "compact_jacobian")
         return ContactRowPlan(producer, law, methods, metadata_launch=not solver._sparse_prepare_contacts)
     masked_sizes = tuple(size for size in sizes if size <= 32)
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()

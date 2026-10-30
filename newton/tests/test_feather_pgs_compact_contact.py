@@ -861,12 +861,11 @@ class TestCompactContact(unittest.TestCase):
         """Reject incomplete mode compositions before any contact ownership changes.
 
         The sparse-diagonal owner's own admission (its fused limits: augmented drives, no velocity-limit, mimic or
-        connect rows, no debug rows or pre-elimination) is the owner's, which ``_sparse_diagonal_contact_solve``
-        stands for here.
+        connect rows, no debug rows or pre-elimination) is the owner's, which its case (K2) stands for here.
         """
         valid = {
             "model": SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
-            "_sparse_diagonal_contact_solve": True,
+            "routes": SimpleNamespace(case="K2"),
             "_sparse_diagonal_dense_size": 6,
             "_sparse_diagonal_response_size": 108,
             "_sparse_diagonal_contact_triples": True,
@@ -880,7 +879,7 @@ class TestCompactContact(unittest.TestCase):
         units = {**valid, "_sparse_diagonal_contact_triples": False, "_sparse_diagonal_contact_units": True}
         self.assertTrue(compact.supported(SimpleNamespace(**units)))
         for name, value in (
-            ("_sparse_diagonal_contact_solve", False),
+            ("routes", SimpleNamespace(case="K6")),
             ("_sparse_diagonal_dense_size", 7),
             ("_sparse_diagonal_contact_triples", False),
             ("dense_max_constraints", 11),

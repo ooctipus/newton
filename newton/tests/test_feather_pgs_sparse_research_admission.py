@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.route_table import Laws
+from newton._src.solvers.feather_pgs.route_table import Laws, RouteTable
 from newton.solvers import SolverFeatherPGS
 
 
@@ -73,7 +73,7 @@ def _eligible_solver():
         _route_pins={},
         _parallel_augmented_drive_topology=True,
         _preelim_active=False,
-        _sparse_diagonal_contact_solve=False,
+        routes=RouteTable({}),
         forest=forest,
         options=options,
         laws=_LawsProbe(

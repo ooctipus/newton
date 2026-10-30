@@ -62,7 +62,7 @@ def decline(solver) -> str | None:
     components implement (``route_table.CAPABILITIES``), then their fit."""
     return capable("components", solver.laws.set) or first_failed(
         (
-            (solver._paired_factor_coordinates, "Components need the paired factor-coordinate sweep."),
+            (solver.routes.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
             (
                 solver._paired_response_secondary_size == FREE_BODY_DOFS
                 and 1 <= (solver._paired_response_primary_size or 0) <= 32,

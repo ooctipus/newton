@@ -42,6 +42,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prescale_joint_velocity_limits,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -1150,8 +1151,17 @@ class TestTierSweeps(unittest.TestCase):
         assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
 
 
+def _routes(case=None, **pins):
+    """A route table whose class ``case`` holds (``None``: no earlier case claims it)."""
+    routes = RouteTable(pins)
+    if case is not None:
+        routes.taken(case)
+        routes.claim(case)
+    return routes
+
+
 class TestTierRule(unittest.TestCase):
-    """Build the Jacobi tiers for case K4, a tree beside a free body, where no other placement claims the class."""
+    """Build the Jacobi tiers for case K4, a tree beside a free body, where no earlier case claims the class."""
 
     @staticmethod
     def _probe(**changes):
@@ -1161,8 +1171,7 @@ class TestTierRule(unittest.TestCase):
             _preelim_active=False,
             dense_max_constraints=192,
             _route_pins={},
-            _paired_factor_coordinates=False,
-            _local_internal_fast_path=False,
+            routes=_routes(),
             _parallel_contact_paths=True,
             _parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
             _build_inkernel_response_meta=lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
@@ -1187,12 +1196,12 @@ class TestTierRule(unittest.TestCase):
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
             ({"_mf_sweeps": False}, "No matrix-free sweep"),
             ({"_preelim_active": True}, "pre-elimination"),
-            ({"_local_internal_fast_path": True}, "case K3"),
-            ({"_paired_factor_coordinates": True}, "case K5"),
+            ({"routes": _routes("K3")}, "case K3"),
+            ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
             ({"_parallel_contact_paths": False, "_parallel_contact_paths_reason": regularized}, "regularization"),
-            ({"_route_pins": {"placement": "general"}}, "general placement"),
+            ({"routes": _routes(placement="general")}, "general placement"),
             ({"_route_pins": {"tiers": 0}}, "tiers=0"),
             (
                 {"_build_inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},

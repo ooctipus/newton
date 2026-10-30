@@ -1,18 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The route table's laws axis: the row laws a solver's worlds solve, and the laws each placement implements.
+"""The route table: the row laws a solver's worlds solve, the laws each placement implements, and the placement case.
 
 The row laws (:class:`Laws`) are read once from the physics options and the model, never from a route. Each
 placement and schedule declares once, in :data:`CAPABILITIES`, the laws it implements, and :func:`capable` is the one
-test of them that the owners' admissions read: an owner then tests only its own topology fit.
+test of them that the owners' admissions read: an owner then tests only its own topology fit. The placement axis
+(:class:`RouteTable`) gives the class to one case, decided once in the precedence :data:`CASES`: an owner reads the
+case instead of the other owners' decisions.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-__all__ = ["CAPABILITIES", "Laws", "capable"]
+__all__ = ["CAPABILITIES", "CASES", "Laws", "RouteTable", "capable"]
 
 
 @dataclass(frozen=True)
@@ -164,3 +166,51 @@ def capable(owner: str, laws: Laws) -> str | None:
         if not holds(laws):
             return f"{_LABELS[owner]} {phrase}."
     return None
+
+
+CASES = {
+    "K2": "the sparse diagonal of a tree beside a star",
+    "K3": "the local owners of a small tree beside a body",
+    "K1": "native sparse factors of a single tree",
+    "K5": "factor coordinates of a tree beside one free body",
+    "K4": "the Jacobi tiers of dense trees beside a free body",
+}
+"""The placement axis's specialized cases (placement and producer by class shape), in precedence order: the first
+whose owner fits the class claims it. A class no case claims keeps the general placement, case K6."""
+
+
+class RouteTable:
+    """The placement axis: the case of the solver's class, decided once in :data:`CASES` order.
+
+    Construction asks the owners in that order. Each tests only its own fit (topology, sizes, capability, the device's
+    budget) after :meth:`taken`, which says why an earlier case holds the class, and :meth:`claim` gives the class to
+    the first that fits. The producers and the runtime claims read :attr:`case`. The test pin
+    ``placement="general"`` keeps every class general.
+    """
+
+    def __init__(self, pins):
+        self.case = "K6"
+        """The case holding the class: a key of :data:`CASES`, or ``"K6"`` (general) while none claims it."""
+        self._general = pins.get("placement") == "general"
+        self._asked = -1
+
+    def taken(self, case: str) -> str | None:
+        """Why ``case`` may not claim the class (the general pin, or an earlier case holds it), or ``None``."""
+        order = list(CASES).index(case)
+        if order < self._asked:
+            raise RuntimeError(f"Case {case} is asked after a later case; owners are asked in CASES order.")
+        self._asked = order
+        if self._general:
+            return "A test pin keeps the general placement (placement='general')."
+        if self.case != "K6":
+            return f"The class is case {self.case}: {CASES[self.case]}."
+        return None
+
+    def claim(self, case: str, fits: bool = True) -> bool:
+        """Give the class to ``case`` (the case :meth:`taken` last asked about) when its own fit holds; return
+        whether it holds the class."""
+        if fits:
+            if list(CASES).index(case) != self._asked or self.case != "K6" or self._general:
+                raise RuntimeError(f"Case {case} claims a class it was not offered.")
+            self.case = case
+        return fits

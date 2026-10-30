@@ -71,9 +71,9 @@ def launched_kernels():
 def install_cpu_keyed_rows(solver):
     """Install keyed rows on a CPU solver, with stand-ins for the matrix-free world layout they read.
 
-    The CUDA admission (keyed_rows.create_owner) needs the in-kernel parallel sweep; these stand-ins
-    take one articulation per world and no matrix-free rows. A solver that shares another's friction
-    patches must take them before this call, since the owner binds the patch law here.
+    The CUDA admission (keyed_rows.create_owner) needs the in-kernel parallel sweep's class (case K4); these
+    stand-ins give the solver that case, one articulation per world and no matrix-free rows. A solver that
+    shares another's friction patches must take them before this call, since the owner binds the patch law here.
     """
     model = solver.model
     solver.forest = dataclasses.replace(
@@ -83,6 +83,7 @@ def install_cpu_keyed_rows(solver):
     )
     solver.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     solver._ink_rows = 4
+    solver.routes.case = "K4"
     solver._keyed_rows = keyed_rows.KeyedRows(solver)
 
 

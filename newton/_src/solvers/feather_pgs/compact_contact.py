@@ -29,7 +29,7 @@ def supported(solver) -> bool:
     """
     return bool(
         solver.model.device.is_cuda
-        and solver._sparse_diagonal_contact_solve
+        and solver.routes.case == "K2"
         and solver._sparse_diagonal_dense_size == 6
         and solver._sparse_diagonal_response_size > 6
         and (solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units)

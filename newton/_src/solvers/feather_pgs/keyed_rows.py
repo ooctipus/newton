@@ -471,13 +471,12 @@ class KeyedRows:
 
 
 def create_owner(solver):
-    """Admit one bounded complete numerical law where the in-kernel parallel tiers (``_ink_sizes``) take the rows: the
+    """Admit one bounded complete numerical law for the rows of the in-kernel parallel tiers' class (case K4): the
     laws keyed rows implement (``route_table.CAPABILITIES``), then their fit."""
     supported = (
-        capable("keyed_rows", solver.laws.set) is None
-        and solver._ink_sizes is not None
+        solver.routes.case == "K4"
+        and capable("keyed_rows", solver.laws.set) is None
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
-        and not solver._fused_diagonal_joint_limits
     )
     if not supported:
         return None

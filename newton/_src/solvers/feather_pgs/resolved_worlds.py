@@ -660,19 +660,8 @@ def decline(solver) -> str | None:
     velocity limits keep every world on the complete path.
     """
     laws = solver.laws.set
-    exact = {
-        "_preelim_count": 0,
-        "_sparse_mass_matrix_size": None,
-        "_keyed_rows": None,
-    }
     # No mimic or connect rows.
     laws_exact = {"mimic_count": 0, "connect_count": 0}
-    false = (
-        "_fused_diagonal_joint_limits",
-        "_sparse_diagonal_contact_solve",
-        "_compact_contact_boundary",
-        "_row_watermark",
-    )
     required = ("world_dof_indices", "world_dof_count", "body_response_dof_mask", "body_has_response_dofs")
     return first_failed(
         (
@@ -691,10 +680,11 @@ def decline(solver) -> str | None:
                 and laws.plain
                 and not laws.regularized
                 and not laws.velocity_limits
-                and all(getattr(solver, name, object()) == value for name, value in exact.items())
+                and solver.routes.case not in ("K1", "K2")
+                and solver._preelim_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False
-                and all(getattr(solver, name, None) is False for name in false)
+                and solver._row_watermark is False
                 and (solver.forest.max_world_dofs or 33) <= 32
                 and all(getattr(solver.forest, name) is not None for name in required)
                 and solver.laws.joint_limit_q_index is not None,
