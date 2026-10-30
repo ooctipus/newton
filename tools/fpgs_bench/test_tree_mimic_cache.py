@@ -3,7 +3,6 @@
 
 """Compose native mimic rows with cached dynamics without changing their law."""
 
-import os
 import unittest
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -14,7 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.tests import test_feather_pgs_sparse_split as split
+from newton.tests import feather_pgs_sparse_scene as split
 from tools.fpgs_bench import test_tree_prescaled_state as prescaled
 from tools.fpgs_bench.test_tree_locked_root import locked_roots
 
@@ -47,23 +46,20 @@ def mimic_trees(*, prismatic=False):
 def mimic_model(*, floating=False, prismatic=False, locked=False, device="cuda:0"):
     """Create the loaded branched fixture with one scalar mimic per world."""
     with mimic_trees(prismatic=prismatic), locked_roots() if locked else nullcontext():
-        model = split._model(floating=floating, branches=2, depth=2, device=device)
+        model = split.branched_model(floating=floating, branches=2, depth=2, device=device)
     assert model.constraint_mimic_count == model.world_count == 2
     return model
 
 
 def solver_for(model, cached, interval=2):
     """Change only cached dynamics while retaining native mimic and velocity rows."""
-    with patch.dict(
-        os.environ,
-        {
-            "FEATHER_PGS_TREE_KINETIC_STATE": str(int(cached)),
-            "FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1",
-        },
-    ):
-        return split._solver(
-            model, True, pgs_mode="matrix_free", enable_joint_velocity_limits=True, update_mass_matrix_interval=interval
-        )
+    return split.make_solver(
+        model,
+        True,
+        pins=None if cached else {"evaluator": "ordinary"},
+        enable_joint_velocity_limits=True,
+        update_mass_matrix_interval=interval,
+    )
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")

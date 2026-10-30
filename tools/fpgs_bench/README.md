@@ -9,13 +9,11 @@ Both arms then run FPGS with identical task recipes, capacities and seed zero;
 they are labeled baseline/candidate, not FPGS/MJWarp. It requires exactly two
 selected GPUs, starts them simultaneously for each arm, alternates AB/BA rounds,
 and reuses this directory's checked capture, source/idle guards and child-group
-cleanup. No unchecked route or arbitrary solver-attribute override is exposed.
-An arm that selects the parallel tiers (`pgs_mode=matrix_free` or an
-`mf_gs_parallel_*` attribute) must keep every tier at the `pgs_iterations`
-allowance. Linked (patch-friction) tiers sweep `mf_gs_parallel_linked_sweeps`,
-`"auto"` by default, so set `FEATHER_PGS_PATCH_PARALLEL_SWEEPS` to the iteration
-count on such an arm; otherwise both arms must build the same linked budget.
-Example reproducing the structural Keyboard experiment:
+cleanup. No unchecked route or solver-attribute override is exposed: the solver
+chooses its routes from the data, so the arms differ only by their checkouts and
+their `--baseline-env`/`--candidate-env` flags.
+Example reproducing the structural Keyboard experiment (its two flags exist only
+at those historical revisions; current Newton chooses these routes by rule):
 
 ```sh
 uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
@@ -89,14 +87,12 @@ uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
   --repeats 3 --num-envs 16384 --warmup-steps 200 \
   --steps 40 --profile-steps 40 \
   --check-overflow \
-  --fpgs-env 0:FEATHER_PGS_DENSE_ROW_BUDGETS=1 \
-  --fpgs-env 1:FEATHER_PGS_DENSE_ROW_BUDGETS=1 \
   --output-dir /path/outside/all/checkouts/backend-comparison
 ```
 
-The example explicitly enables the dense row budgets on both GPUs; use a Newton revision containing that flag and the FPGS sticky capacity-check API. Omit those two feature overrides to measure the selected revision's defaults. Add the separately calibrated `--capacity` settings described below; the example does not supply universal safe capacities. The two Newton paths may be the same checkout when comparing backends from one revision. Task names come from the selected Lab helper (currently `ant`, `humanoid`, `franka`, `anymald`, `allegro`, `g1`, `kuka`, and `cartpole`). Repeated `--task` options preserve order and remove duplicates. Both arms use seed zero. FPGS receives the existing FPGS recipe's solver attributes and environment settings; MJWarp receives its own existing backend defaults, with no FPGS attributes or solver flags inherited.
+The example measures the selected revision's defaults; use a Newton revision with the FPGS sticky capacity-check API. Add the separately calibrated `--capacity` settings described below; the example does not supply universal safe capacities. The two Newton paths may be the same checkout when comparing backends from one revision. Task names come from the selected Lab helper (currently `ant`, `humanoid`, `franka`, `anymald`, `allegro`, `g1`, `kuka`, and `cartpole`). Repeated `--task` options preserve order and remove duplicates. Both arms use seed zero. FPGS receives the existing FPGS recipe's solver attributes and environment settings; MJWarp receives its own existing backend defaults, with no FPGS attributes or solver flags inherited.
 
-Explicit per-device optimization flags can be added only on the FPGS side, for example `--fpgs-env 0:FEATHER_PGS_DENSE_ROW_BUDGETS=1`. The accepted prefixes are `FEATHER_PGS_` and `NEWTON_NARROW_PHASE_`. There are no generic solver/physics-attribute overrides; the driver does not judge whether a manually selected feature flag preserves numerical semantics. All inherited `FEATHER_`, `NEWTON_`, and `FPGS_PROBE_` flags are discarded before each child launch.
+Explicit per-device optimization flags can be added only on the FPGS side, for example `--fpgs-env 0:FEATHER_PGS_PATCH_FRAME_REUSE=0`. The accepted prefixes are `FEATHER_PGS_` and `NEWTON_NARROW_PHASE_`. There are no generic solver/physics-attribute overrides; the driver does not judge whether a manually selected feature flag preserves numerical semantics. All inherited `FEATHER_`, `NEWTON_`, and `FPGS_PROBE_` flags are discarded before each child launch.
 
 Calibrated buffer sizes can be passed explicitly with repeated
 `--capacity TASK:BACKEND:FIELD=VALUE` options. Each setting applies to both GPUs

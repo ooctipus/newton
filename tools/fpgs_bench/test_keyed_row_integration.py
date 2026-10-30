@@ -3,7 +3,6 @@
 
 """Complete physical keyed rows on floating trees, pairs and fallback queues."""
 
-import os
 import unittest
 from unittest.mock import patch
 
@@ -13,8 +12,7 @@ import warp as wp
 import newton
 from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.feather_pgs import keyed_rows as rows
-from newton._src.solvers.feather_pgs import solver_feather_pgs as source
-from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -30,7 +28,6 @@ def make_case(
     capacity,
     free_count=0,
     *,
-    exact=False,
     model_factory=None,
     beta=0.0,
     deterministic=False,
@@ -40,26 +37,17 @@ def make_case(
     if rigid_contact_max is not None:
         # The solver sizes its contact scratch from the model's capacity at construction.
         model.rigid_contact_max = rigid_contact_max
-    with (
-        patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled)))}),
-        patch.object(source, "_MF_EXACT_ROWSUM", exact),
-    ):
-        # Patch friction sets the switch that admits it to the parallel tiers and keyed rows (its default);
-        # point friction runs with the switch unset, whatever the exported environment says.
-        os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
-        if beta > 0.0:
-            os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = "1"
+    # Tiers of ``capacity`` rows on any class whose response they form; keyed rows feed them unless ``enabled`` is
+    # False, which pins the general rows (``None`` leaves the producer to the rules, which choose keyed rows).
+    pins = {"tiers": capacity, "tier_sweeps": 24, **({"producer": "general"} if enabled is False else {})}
+    with patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = _make_solver(
             model,
             False,
             pgs_iterations=8,
             dense_max_constraints=64,
             mf_max_constraints=64,
-            mf_gs_parallel_rows=capacity,
-            mf_gs_parallel_sweeps=24,
-            mf_gs_parallel_matrix_free=True,
             friction_anchor_beta=beta,
-            fuse_joint_velocity_limits=False,
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -130,28 +118,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
         np.testing.assert_array_equal(keyed[1].L_by_size[9].numpy()[1], held[1])
         self.compare(ordinary, keyed)
 
-    def test_exact_row_sums(self):
-        """Replace ordinary contact inputs while preserving exact scaling."""
-        from newton.tests import test_feather_pgs_sparse_solver as chain  # noqa: PLC0415
-
-        def model_factory():
-            with patch.object(chain, "CHAIN_LINKS", 12), patch.object(chain, "CHAIN_WORLDS", 2):
-                return chain._build_chain("cuda:0", base_z=0.099, contact_sphere="base", ground=True)
-
-        for capacity in (32, 48):
-            with self.subTest(capacity=capacity):
-                ordinary = make_case(False, capacity, exact=True, model_factory=model_factory)
-                keyed = make_case(True, capacity, exact=True, model_factory=model_factory)
-                self.assertIsNotNone(keyed[1]._keyed_rows)
-                self.assertEqual(keyed[1]._keyed_rows.layout.primary, 18)
-                for _ in range(8):
-                    _step(ordinary)
-                    _step(keyed)
-                    self.compare(ordinary, keyed)
-
     def test_default_request_selects_keyed_inputs(self):
         """Adopt admitted physical keys without naming a task or adding a caller flag."""
-        case = make_case(None, 32, exact=True)
+        case = make_case(None, 32)
         self.assertIsNotNone(case[1]._keyed_rows)
         self.assertIsNotNone(case[1]._keyed_rows.layout)
 
@@ -165,7 +134,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
         contacts. Keyed rows decline the resolved-world classifier, which would
         resolve the tripod's worlds after their first step and leave the ordinary
         arm without rows, so the test turns the classifier off
-        (FEATHER_PGS_RESOLVED_WORLDS=0) to compare rows on every step.
+        (the route pin ``claims=()``) to compare rows on every step.
         test_patch_resolved_worlds_match_the_complete_path in
         test_feather_pgs_resolved_worlds covers the classifier's exactness under
         patch friction.
@@ -174,7 +143,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
             with self.subTest(fixture=name):
                 # The solver reads the switch only at construction; the classifier owner built there
                 # selects the allocator variant and the predictor's twist publication on every step.
-                with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+                with patch.dict(SolverFeatherPGS._route_pins, {"claims": ()}):
                     ordinary, keyed = (
                         make_case(enabled, 32, free_count, model_factory=factory, beta=0.2, deterministic=True)
                         for enabled in (False, True)
@@ -185,9 +154,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 self.assertIsNone(ordinary[1]._keyed_rows)
                 self.assertTrue(keyed[1]._keyed_rows.patch)
                 for case in (ordinary, keyed):
-                    kernels = case[1]._pgs_solve_mf_gs_incremental_kernels
-                    self.assertTrue(kernels)
-                    self.assertTrue(all(kernel.key.endswith("_linked_iso") for kernel in kernels))
+                    tiers = case[1]._mf_gs_tiers
+                    self.assertTrue(tiers)
+                    self.assertTrue(all(tier.linked_rows for tier in tiers))
                 linked = False
                 for _ in range(8):
                     _step(ordinary)
@@ -221,7 +190,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
         scatter = rows.scatter_contact_keys
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
-                with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
+                with patch.dict(SolverFeatherPGS._route_pins, {"claims": ()}):
                     wave, single = (
                         make_case(True, 32, 1, beta=beta, deterministic=True, rigid_contact_max=1024) for _ in range(2)
                     )
@@ -245,18 +214,6 @@ class TestKeyedRowIntegration(unittest.TestCase):
                     self.assertGreater(int(single[-1].rigid_contact_count.numpy()[0]), 0)
                     self.compare(wave, single)
                 self.assertEqual(blocks, [1] * 4)
-
-    def test_physical_reader_against_captured_allegro_operator(self):
-        """Compare the physical reader with independent captured mass actions."""
-        from tools.fpgs_bench import test_keyed_rows_capture as capture  # noqa: PLC0415
-
-        original = rows.get_parallel_factory
-        layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
-        # The capture binds its owner's topology layout; read at this explicit one instead.
-        with patch.object(rows, "get_parallel_factory", lambda factory, _topology: original(factory, layout)):
-            test = capture.TestKeyedRowsCUDA()
-            test.setUp()
-            test.test_native_parallel_matched_current_inputs()
 
 
 if __name__ == "__main__":

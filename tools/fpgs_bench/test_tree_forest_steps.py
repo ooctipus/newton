@@ -3,7 +3,6 @@
 
 """Exercise cached forests inside the unchanged complete native contact solve."""
 
-import os
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +12,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as native
-from newton.tests.test_feather_pgs_sparse_split import _external_forces
+from newton.tests.feather_pgs_sparse_scene import _external_forces
 from tools.fpgs_bench.forest_row_order import RowOrder
 from tools.fpgs_bench.public_state_oracle import public_state
 
@@ -30,9 +29,7 @@ def make_case(enabled, *, permuted=False, motion=False):
             solver.art_group_idx.assign(np.argsort(order).astype(np.int32))
 
     with (
-        patch.dict(
-            os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled)), "FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}
-        ),
+        patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"evaluator": "ordinary"}),
         patch.object(SolverFeatherPGS, "_setup_size_grouping", grouping),
     ):
         model = native._build_model(robot_count=2)

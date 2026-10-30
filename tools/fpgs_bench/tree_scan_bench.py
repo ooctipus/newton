@@ -211,7 +211,7 @@ def _held_tree(shape, worlds, device, lanes=None, schedules=None):
                     tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains, reference=False: schedules
                 )
             )
-        solver = _make_solver(model, True, cached_dynamics="on")
+        solver = _make_solver(model, True)
     return model, solver
 
 

@@ -4,7 +4,8 @@
 """Compare two FPGS variants with checked, alternating paired-GPU captures.
 
 Both arms use the same existing Isaac Lab recipe, capacities and seed zero.
-Explicit per-arm solver representations may differ; numerical budgets may not.
+Only the per-arm environment flags differ; the solver chooses its routes from
+the data, and numerical budgets may not differ.
 Physics-graph and unprofiled environment wall times are reported separately.
 Neither clean warning flags nor timing gains establish physical equivalence.
 """
@@ -21,80 +22,6 @@ import traceback
 from pathlib import Path
 
 import compare_backends as owner
-
-RECIPE_TYPES = {
-    "pgs_mode": str,
-    "mf_gs_parallel_rows": int,
-    "mf_gs_parallel_matrix_free": bool,
-    "mf_gs_parallel_sweeps": int,
-}
-# Recorded with the recipe, never selected: the linked (patch-friction) tiers' budget request after its environment
-# override (None, "auto" or a count), and the largest budget the built linked tiers sweep (0 without them).
-LINKED_SWEEPS = "mf_gs_parallel_linked_sweeps"
-LINKED_SWEEPS_APPLIED = "mf_gs_parallel_linked_sweeps_applied"
-
-
-def linked_sweeps_recorded(recipe: dict) -> bool:
-    """Require both linked-budget fields: a request of None, "auto" or a count, and an applied count."""
-    request, applied = recipe.get(LINKED_SWEEPS), recipe.get(LINKED_SWEEPS_APPLIED)
-    valid_request = request is None or request == "auto" or (type(request) is int and request >= 1)
-    return LINKED_SWEEPS in recipe and valid_request and type(applied) is int and applied >= 0
-
-
-def recipe_attributes(entries: list[str]) -> dict:
-    """Parse only explicitly supported representation controls."""
-    result = {}
-    for entry in entries:
-        name, separator, raw = entry.partition("=")
-        if not separator or name not in RECIPE_TYPES or name in result:
-            raise ValueError(f"Unknown or duplicate solver recipe: {entry}")
-        kind = RECIPE_TYPES[name]
-        if kind is bool and raw.lower() in ("true", "false"):
-            value = raw.lower() == "true"
-        elif kind is str and raw in ("split", "matrix_free"):
-            value = raw
-        elif kind is int and raw.isdecimal() and (1 if name.endswith("sweeps") else 0) <= int(raw) <= 128:
-            value = int(raw)
-        else:
-            raise ValueError(f"Invalid solver recipe: {entry}")
-        result[name] = value
-    return result
-
-
-def checked_recipe(args, run: dict, checks: dict, iterations: int) -> tuple[dict, dict]:
-    """Verify actual per-arm settings and retain all nonselected invariants."""
-    recipes = [boundary.get("solver_recipe") for boundary in checks["boundaries"]]
-    if len(recipes) != 2 or any(
-        not isinstance(recipe, dict)
-        or any(type(recipe.get(name)) is not kind for name, kind in RECIPE_TYPES.items())
-        or not linked_sweeps_recorded(recipe)
-        for recipe in recipes
-    ):
-        raise RuntimeError("Missing or invalid actual solver recipe metadata")
-    actual = recipes[0]
-    if actual != recipes[1]:
-        raise RuntimeError("Actual solver recipe changed within the capture")
-    requested = args.solver_recipes[run["variant"]]
-    if any(actual[name] != value for name, value in requested.items()):
-        raise RuntimeError("Actual solver differs from the requested solver recipe")
-    # Linked tiers sweep their own budget ("auto" by default), so an explicit parallel arm holds it to the
-    # allowance too: set FEATHER_PGS_PATCH_PARALLEL_SWEEPS to pgs_iterations on such an arm.
-    if (
-        actual["pgs_mode"] == "matrix_free"
-        and actual["mf_gs_parallel_rows"] > 0
-        and (
-            requested.get("pgs_mode") == "matrix_free" or any(name.startswith("mf_gs_parallel_") for name in requested)
-        )
-        and (actual["mf_gs_parallel_sweeps"] != iterations or actual[LINKED_SWEEPS_APPLIED] not in (0, iterations))
-    ):
-        raise RuntimeError("Explicit parallel sweeps must match the unchanged pgs_iterations budget")
-    selected = set().union(*args.solver_recipes.values())
-    # The request is each revision's own default; the applied linked budget is the physics budget both arms share,
-    # unless an arm selects the parallel tiers and the check above holds its budget to the allowance.
-    excluded = selected | {LINKED_SWEEPS}
-    if any(name == "pgs_mode" or name.startswith("mf_gs_parallel_") for name in selected):
-        excluded.add(LINKED_SWEEPS_APPLIED)
-    return actual, {name: value for name, value in actual.items() if name not in excluded}
 
 
 def arm_order(rounds: int):
@@ -118,8 +45,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", required=True)
     parser.add_argument("--baseline-env", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--candidate-env", action="append", default=[], metavar="NAME=VALUE")
-    for label in ("baseline", "candidate"):
-        parser.add_argument(f"--{label}-solver-attr", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument(
         "--legacy-baseline-capacity",
         action="store_true",
@@ -149,9 +74,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("Both variants use FPGS; MJWarp capacity overrides are not applicable")
     args.check_overflow = True
     args.mjwarp_linesearch_fix = False
-    args.solver_recipes = {
-        label: recipe_attributes(getattr(args, label + "_solver_attr")) for label in ("baseline", "candidate")
-    }
     for label in ("baseline", "candidate"):
         variant_flags(args, label)
     return args
@@ -175,18 +97,6 @@ def make_variant_batch(capture, args, label, devices, *, repeat, drivers):
     )
     for run in batch:
         run.update(newton=label, variant=label, source_root=str(getattr(args, label)))
-        requested = args.solver_recipes[label]
-        run["requested_solver_recipe"] = requested
-        command, original, index = [], run["command"], 0
-        while index < len(original):
-            if original[index] == "--solver-attr" and original[index + 1].partition("=")[0] in requested:
-                index += 2
-            else:
-                command.append(original[index])
-                index += 1
-        for name, value in requested.items():
-            command.extend(["--solver-attr", f"{name}={value}"])
-        run["command"] = command
         run["environment"]["FPGS_NSYS_TRACE_MODE"] = args.trace_mode
         run["environment"]["REPEATS"] = "1"
         if label == "baseline" and args.legacy_baseline_capacity:
@@ -218,7 +128,6 @@ def read_checked_result(capture, args, run, drivers):
         "worlds",
         "num_substeps",
         "solver_dt",
-        "pgs_mode",
         "pgs_iterations",
         "bodies",
         "joints",
@@ -234,21 +143,15 @@ def read_checked_result(capture, args, run, drivers):
     if any(not math.isfinite(float(value)) or float(value) <= 0 for value in (before["solver_dt"], data["sim_dt"])):
         raise RuntimeError("Invalid actual simulation timestep")
     checks = run["overflow_check"]
-    actual_recipe, invariant_recipe = checked_recipe(args, run, checks, before["pgs_iterations"])
-    if actual_recipe["pgs_mode"] != before["pgs_mode"]:
-        raise RuntimeError("Solver recipe and Lab pgs_mode metadata disagree")
-    run["solver_recipe"] = actual_recipe
-    selected = set().union(*args.solver_recipes.values())
     capacities = checks["boundaries"][0]["capacities"]
     if capacities != checks["boundaries"][1]["capacities"]:
         raise RuntimeError("Actual row capacities changed within the capture")
     fingerprint = {
-        "model": {name: value for name, value in before.items() if name not in selected},
-        "solver_recipe": invariant_recipe,
+        "model": before,
         "row_capacities": capacities,
         "sim_dt": data["sim_dt"],
         "decimation": data["decimation"],
-        "solver_attr": [value for value in data["solver_attr"] if value.partition("=")[0] not in selected],
+        "solver_attr": data["solver_attr"],
     }
     if "collision_capacity" in checks:
         fingerprint["broad_capacity"] = [
@@ -316,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
         "settings": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "seed": 0,
         "same_capacity_overrides": args.capacity,
-        "requested_solver_recipes": args.solver_recipes,
         "runs": [],
         "physical_quality_accepted": False,
         "performance_accepted": False,
@@ -357,7 +259,6 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("Paired device enumeration did not match the selected indices")
         manifest["gpus"] = devices
         fingerprint = None
-        recipes = {}
         for repeat, label in arm_order(args.rounds):
             capture._require_idle(devices)
             owner.source_guard(capture, roots, sources, files)
@@ -370,12 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                 if fingerprint is not None and actual != fingerprint:
                     raise RuntimeError("Variants/devices/rounds changed actual capacities or recorded physics budgets")
                 fingerprint = actual
-                recipe = run.get("solver_recipe")
-                if label in recipes and recipes[label] != recipe:
-                    raise RuntimeError("Actual solver recipe changed across devices or rounds within one arm")
-                recipes[label] = recipe
             manifest["budget_fingerprint"] = fingerprint
-            manifest["actual_solver_recipes"] = recipes
             owner.source_guard(capture, roots, sources, files)
             capture._require_idle(devices)
             save()

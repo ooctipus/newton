@@ -4,7 +4,6 @@
 """Check complete cached publication with distinct group/articulation/world IDs."""
 
 import contextlib
-import os
 import unittest
 from unittest.mock import patch
 
@@ -52,9 +51,9 @@ def fixture(floating, device, *, permuted=True, motion=False):
     builder.replicate(scene, 3)
     model = builder.finalize(device=device)
     model.rigid_contact_max = 8
-    options = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "use_parallel_streams": False, "double_buffer": False}
-    with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
-        solver, reference = (SolverFeatherPGS(model, **options) for _ in range(2))
+    # Ordinary dynamics: the test installs the held owner itself.
+    with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary", "double_buffer": False}):
+        solver, reference = (SolverFeatherPGS(model, friction_anchor_beta=0.0) for _ in range(2))
     arts = model.articulation_count
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
@@ -311,8 +310,7 @@ class TestTreeForestCache(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_coupled_trees_select_cache(self):
         """Admit complete multi-articulation worlds without changing their row law."""
-        with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "1"}):
-            case = native._case(True, robot_count=2)
+        case = native._case(True, robot_count=2)
         self.assertIsNotNone(case[1]._tree_kinetic_state)
         self.assertEqual(case[1]._tree_kinetic_state.groups[0].data.bias.shape, (4, 9))
         native._step(case)

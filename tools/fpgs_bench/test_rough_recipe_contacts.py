@@ -62,8 +62,10 @@ def make_scene(device, kind, case):
 
 
 def make_pipeline(model, enabled, reduced):
-    """Isolate exactly the two recipe switches from unrelated ambient opt-ins."""
+    """Isolate exactly the two recipe switches from unrelated ambient opt-ins, on the terrain route they tune (the
+    terrain law is the default since d2530beca)."""
     flags = {
+        "NEWTON_TERRAIN_LAW": "none",
         "NEWTON_HEIGHTFIELD_CELL_REJECT": str(int(enabled)),
         "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS": str(int(enabled)),
         "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",

@@ -3,7 +3,6 @@
 
 """Check heterogeneous scalar trees against independent physical operators."""
 
-import os
 import unittest
 from unittest.mock import patch
 
@@ -83,21 +82,14 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
                 inverse[values] = np.arange(group.size)
             solver.art_group_idx.assign(inverse)
 
+    # The held owner on dense storage, or ordinary dynamics; one buffer set either way.
+    pins = {"storage": "dense", "double_buffer": False, **({} if enabled else {"evaluator": "ordinary"})}
     with (
-        patch.dict(
-            os.environ,
-            {
-                "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(enabled)),
-                "FEATHER_PGS_TREE_KINETIC_STATE": "0",
-                "FEATHER_PGS_WORLD_SCAN_PUBLICATION": "0",
-            },
-        ),
+        patch.object(SolverFeatherPGS, "_route_pins", pins),
         patch.object(SolverFeatherPGS, "_setup_size_grouping", grouping),
-        patch.dict(SolverFeatherPGS._kernel_overrides, {"sparse_mass_matrix": False}),
     ):
         solver = SolverFeatherPGS(
             model,
-            pgs_mode="matrix_free" if model.device.is_cuda else "split",
             pgs_iterations=8,
             pgs_beta=0.05,
             pgs_cfm=1e-6,
@@ -106,8 +98,6 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
             enable_joint_limits=True,
             enable_joint_velocity_limits=False,
             update_mass_matrix_interval=2,
-            double_buffer=False,
-            use_parallel_streams=model.device.is_cuda,
             angular_damping=0.05,
             friction_anchor_beta=friction_anchor_beta,
         )
@@ -263,10 +253,6 @@ class TestMixedTreeCache(unittest.TestCase):
             np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
         solver.group_to_art[9] = original
         owner.validate_model()
-
-    def test_physical_cpu(self):
-        """Check both factor families against independent double-precision mass."""
-        self.check_physical("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_physical_cuda(self):

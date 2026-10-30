@@ -16,7 +16,6 @@ No restitution is involved anywhere here: this is ordinary free fall with
 """
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -400,12 +399,11 @@ def test_multiworld_end_gap_uses_each_world_position_velocity(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     builder.replicate(template, 2)
     model = builder.finalize(device=device)
-    with mock.patch.dict("os.environ", {"IL_NEWTON_FPGS_MF_WARMSTART": "0"}):
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_velocity_iterations=4,
-        )
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        angular_damping=0.0,
+        pgs_velocity_iterations=4,
+    )
     state_0, state_1 = model.state(), model.state()
     joint_qd = state_0.joint_qd.numpy().reshape(2, 6)
     joint_qd[0, 2] = -0.5 * gap / SIM_DT

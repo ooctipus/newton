@@ -3,9 +3,7 @@
 
 """Check explicit motion velocity without conflating raw-state force operands."""
 
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -15,7 +13,7 @@ from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_state import HeldSchedules, get_classify_kernel, get_state_kernel
-from newton.tests import test_feather_pgs_sparse_split as split
+from newton.tests import feather_pgs_sparse_scene as split
 from newton.tests import test_feather_pgs_tree_stages as stages
 from tools.fpgs_bench.public_state_oracle import physical_mass
 from tools.fpgs_bench.test_tree_kinetic_state import fixture as tree_fixture
@@ -212,20 +210,11 @@ class TestPrescaledTreeContract(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_ordinary_dynamics_keep_no_cache(self):
-        """Ordinary dynamics (here by cached_dynamics='off') keep no FK/ID cache of their own."""
-        model = split._model(floating=False)
-        for parallel in (True, False):
-            with self.subTest(parallel=parallel):
-                solver = split._solver(
-                    model,
-                    True,
-                    pgs_mode="matrix_free",
-                    enable_joint_velocity_limits=True,
-                    use_parallel_streams=parallel,
-                    cached_dynamics="off",
-                )
-                self.assertIsNone(solver._tree_kinetic_state)
-                self.assertFalse(solver._fk_id_cache_enabled)
+        """Ordinary dynamics (here by the evaluator pin) keep no FK/ID cache of their own."""
+        model = split.branched_model(floating=False)
+        solver = split.make_solver(model, True, pins={"evaluator": "ordinary"}, enable_joint_velocity_limits=True)
+        self.assertIsNone(solver._tree_kinetic_state)
+        self.assertFalse(solver._fk_id_cache_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_loaded_steps_and_masked_reset(self):
@@ -233,26 +222,18 @@ class TestPrescaledTreeContract(unittest.TestCase):
         for floating in (False, True):
             for mass_interval in (1, 3):
                 with self.subTest(floating=floating, mass_interval=mass_interval):
-                    model = split._model(floating=floating, branches=2, depth=2)
+                    model = split.branched_model(floating=floating, branches=2, depth=2)
                     model.joint_velocity_limit.fill_(0.2)
-                    solvers = []
-                    for enabled in (False, True):
-                        with patch.dict(
-                            os.environ,
-                            {
-                                "FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled)),
-                                "FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1",
-                            },
-                        ):
-                            solvers.append(
-                                split._solver(
-                                    model,
-                                    True,
-                                    pgs_mode="matrix_free",
-                                    enable_joint_velocity_limits=True,
-                                    update_mass_matrix_interval=mass_interval,
-                                )
-                            )
+                    solvers = [
+                        split.make_solver(
+                            model,
+                            True,
+                            pins=None if enabled else {"evaluator": "ordinary"},
+                            enable_joint_velocity_limits=True,
+                            update_mass_matrix_interval=mass_interval,
+                        )
+                        for enabled in (False, True)
+                    ]
                     self.assertIsNone(solvers[0]._tree_kinetic_state)
                     self.assertIsNotNone(solvers[1]._tree_kinetic_state)
                     self.assertFalse(solvers[0]._fk_id_cache_enabled)
@@ -283,7 +264,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                             if step == 8:
                                 solver.notify_state_changed()
                             case = (model, solver, *pair, control, pipeline, contact)
-                            split._step(case)
+                            split.step(case)
                             solver.check_constraint_capacity()
                             observed_contact |= bool(contact.rigid_contact_count.numpy()[0])
                         for name in split.STATE_FIELDS:
@@ -303,24 +284,17 @@ class TestPrescaledTreeContract(unittest.TestCase):
         """Replay prescale, prediction, contact and publication across masked resets."""
         for floating in (False, True):
             with self.subTest(floating=floating):
-                model = split._model(floating=floating, branches=2, depth=2)
+                model = split.branched_model(floating=floating, branches=2, depth=2)
                 model.joint_velocity_limit.fill_(0.2)
                 cases, graphs = [], []
                 for enabled in (False, True):
-                    with patch.dict(
-                        os.environ,
-                        {
-                            "FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled)),
-                            "FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1",
-                        },
-                    ):
-                        solver = split._solver(
-                            model,
-                            True,
-                            pgs_mode="matrix_free",
-                            enable_joint_velocity_limits=True,
-                            update_mass_matrix_interval=2,
-                        )
+                    solver = split.make_solver(
+                        model,
+                        True,
+                        pins=None if enabled else {"evaluator": "ordinary"},
+                        enable_joint_velocity_limits=True,
+                        update_mass_matrix_interval=2,
+                    )
                     self.assertEqual(solver._tree_kinetic_state is not None, enabled)
                     first, second, control = model.state(), model.state(), model.control()
                     newton.eval_fk(model, first.joint_q, first.joint_qd, first)

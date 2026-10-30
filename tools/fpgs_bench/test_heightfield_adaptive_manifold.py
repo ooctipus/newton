@@ -409,10 +409,8 @@ class TestAdaptiveManifold(unittest.TestCase):
             for name in ("scalar_rebound", "rebound", "support", "tilted_foot", "sliding", "finite_border")
         ]
         support = next(case for case in q.CASES if case.name == "support")
-        sliding = next(case for case in q.CASES if case.name == "sliding")
         cases = [
             *base_cases,
-            replace(sliding, name="sliding_full_friction"),
             replace(support, name="yaw_support", steps=320),
             replace(support, name="step_support", steps=320),
         ]
@@ -427,10 +425,9 @@ class TestAdaptiveManifold(unittest.TestCase):
                 counts = []
                 tail = []
                 laws = []
-                anchor_limit = 0 if case.name == "sliding_full_friction" else 2
 
-                def solver(*args, selected_limit=anchor_limit, **kwargs):
-                    kwargs.update(contact_friction_anchor_limit=selected_limit, contact_friction_gap_threshold=0.02)
+                def solver(*args, **kwargs):
+                    kwargs.update(contact_friction_gap_threshold=0.02)
                     return original_solver(*args, **kwargs)
 
                 def heightfield(*args, selected_case=case, **kwargs):
@@ -440,7 +437,7 @@ class TestAdaptiveManifold(unittest.TestCase):
                         kwargs["data"] = data
                     return original_heightfield(*args, **kwargs)
 
-                def build(*args, selected_case=case, selected_enabled=enabled, selected_limit=anchor_limit, **kwargs):
+                def build(*args, selected_case=case, selected_enabled=enabled, **kwargs):
                     with (
                         patch.object(q.newton.solvers, "SolverFeatherPGS", solver),
                         patch.object(q.newton, "Heightfield", heightfield),
@@ -449,7 +446,6 @@ class TestAdaptiveManifold(unittest.TestCase):
                     self.assertEqual(
                         getattr(scene.pipeline.narrow_phase, self.loaded_feature_attribute), selected_enabled
                     )
-                    self.assertEqual(scene.solver.contact_friction_anchor_limit, selected_limit)
                     if selected_case.name == "yaw_support":
                         for state in scene.states:
                             qd = state.joint_qd.numpy()
@@ -516,7 +512,6 @@ class TestAdaptiveManifold(unittest.TestCase):
                         record = q.run_case(case, True, "cuda:0", reduce=True)
                     record["adaptive_manifold"] = enabled
                     record["row_counts"] = counts
-                    record["anchor_limit"] = anchor_limit
                     record["original_sampled_failures"] = list(record["failures"])
                     record["law_diagnostics"] = laws
                     if case.kind in ("support", "tilt"):

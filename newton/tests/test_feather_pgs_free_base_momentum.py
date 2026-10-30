@@ -209,8 +209,8 @@ class TestFeatherPgsFreeBaseMomentum(unittest.TestCase):
 
         Tumbling changes the angular velocity within each step, so the public-to-internal shift's
         reference-point error stops cancelling step to step: on the defective formulation this body
-        drifts at ~0.5 m/s within the run, versus ~1e-7 here, on every route and
-        ``articulated_contact_response``. This is the single-body case the fix corrects — every
+        drifts at ~0.5 m/s within the run, versus ~1e-7 here, on every route. This is the
+        single-body case the fix corrects — every
         real robot root link has an offset centre of mass; it fails without the fix.
         """
         model = _build_single_offset_com_tumbling(wp.get_device())

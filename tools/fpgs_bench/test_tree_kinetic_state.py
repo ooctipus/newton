@@ -4,7 +4,6 @@
 """Check generated state caches against physical trees outside the G1 layout."""
 
 import contextlib
-import os
 import unittest
 from unittest.mock import patch
 
@@ -20,7 +19,7 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests import test_feather_pgs_sparse_split as split
+from newton.tests import feather_pgs_sparse_scene as split
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 
 
@@ -80,9 +79,9 @@ def fixture(floating, device):
     builder.replicate(scene, 2)
     model = builder.finalize(device=device)
     model.rigid_contact_max = 8
-    options = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "use_parallel_streams": False, "double_buffer": False}
-    with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
-        solver, reference = (SolverFeatherPGS(model, **options) for _ in range(2))
+    # Ordinary dynamics: the test installs the held owner itself.
+    with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary", "double_buffer": False}):
+        solver, reference = (SolverFeatherPGS(model, friction_anchor_beta=0.0) for _ in range(2))
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver._sparse_mass_matrix_size = count
@@ -165,22 +164,17 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         """Select native trees, their launch from the tree's data and the prescaled-velocity contract."""
         if not wp.get_cuda_devices():
             self.skipTest("No leased CUDA device")
-        with patch.dict(os.environ):
-            os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
-            case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
-            self.assertIsNotNone(case[1]._tree_kinetic_state)
-            (owner,) = case[1]._tree_kinetic_state.groups
-            self.assertEqual(owner.layout.lanes, tree_kinetic_state.held_lanes(owner.tree, owner.group_count))
-            self.assertEqual(owner.block_dim, owner.layout.block)
-            ordinary = split._solver(
-                case[0], True, pgs_mode="matrix_free", pgs_kernel="auto", enable_joint_velocity_limits=True
-            )
-            self.assertIsNotNone(ordinary._tree_kinetic_state)
-            self.assertTrue(ordinary._tree_kinetic_state.groups[0].motion_velocity)
-            self.assertTrue(ordinary._fk_id_cache_enabled)
-            os.environ["FEATHER_PGS_TREE_KINETIC_STATE"] = "0"
-            explicit = split._solver(case[0], True)
-            self.assertIsNone(explicit._tree_kinetic_state)
+        case = split.make_case(True, floating=True, branches=3, depth=2, device="cuda:0")
+        self.assertIsNotNone(case[1]._tree_kinetic_state)
+        (owner,) = case[1]._tree_kinetic_state.groups
+        self.assertEqual(owner.layout.lanes, tree_kinetic_state.held_lanes(owner.tree, owner.group_count))
+        self.assertEqual(owner.block_dim, owner.layout.block)
+        limited = split.make_solver(case[0], True, enable_joint_velocity_limits=True)
+        self.assertIsNotNone(limited._tree_kinetic_state)
+        self.assertTrue(limited._tree_kinetic_state.groups[0].motion_velocity)
+        self.assertTrue(limited._fk_id_cache_enabled)
+        explicit = split.make_solver(case[0], True, pins={"evaluator": "ordinary"})
+        self.assertIsNone(explicit._tree_kinetic_state)
 
     def test_physical_cache(self):
         """Check non-G1 geometry and force actions on the explicitly leased GPU."""
@@ -196,19 +190,9 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         for floating in (False, True):
             cases = []
             for enabled in (False, True):
-                with (
-                    patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled))}),
-                    _heavy_chains(),
-                ):
-                    # This helper preserves the existing split contact law.
-
-                    original = split._solver
-
-                    def make_solver(model, sparse, _original=original, **overrides):
-                        return _original(model, sparse, use_parallel_streams=True, **overrides)
-
-                    with patch.object(split, "_solver", make_solver):
-                        case = split._case(True, floating=floating, branches=3, depth=2, device="cuda:0")
+                with _heavy_chains():
+                    pins = None if enabled else {"evaluator": "ordinary"}
+                    case = split.make_case(True, pins=pins, floating=floating, branches=3, depth=2, device="cuda:0")
                 self.assertIsNotNone(case[1]._sparse_mass_matrix_size)
                 self.assertEqual(case[1]._tree_kinetic_state is not None, enabled)
                 cases.append(case)
@@ -217,7 +201,7 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
                     if step in (4, 9):
                         mask = wp.array([True, False], dtype=wp.bool, device="cuda:0")
                         case[1].reset(case[2], world_mask=mask)
-                    split._step(case)
+                    split.step(case)
                     public_state(self, case[0], case[3])
                 for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
                     np.testing.assert_allclose(
@@ -226,8 +210,8 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
             graphs = []
             for case in cases:
                 with wp.ScopedCapture(device="cuda:0") as capture:
-                    split._step(case)
-                    split._step(case)
+                    split.step(case)
+                    split.step(case)
                 graphs.append(capture.graph)
             for _ in range(4):
                 for graph in graphs:

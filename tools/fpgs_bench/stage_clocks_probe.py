@@ -5,8 +5,6 @@ import sys
 import time
 
 os.environ.setdefault("FEATHER_PGS_STAGE_CLOCKS", "1")
-os.environ.setdefault("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "1")
-os.environ.setdefault("FEATHER_PGS_TREE_KINETIC_STATE", "0")
 
 import numpy as np
 import warp as wp
@@ -113,7 +111,6 @@ for kind in ("kuka", "franka"):
     model = build(kind)
     solver = SolverFeatherPGS(
         model,
-        pgs_mode="matrix_free",
         pgs_iterations=8,
         enable_joint_limits=True,
         dense_max_constraints=192,
@@ -127,7 +124,7 @@ for kind in ("kuka", "franka"):
     )
     if clocks is None:
         print("no stage clocks (owner not installed or instrumentation off); stepping for the profiler only")
-    groups = [g for g in getattr(owner, "groups", [])]
+    groups = list(getattr(owner, "groups", []))
     print(
         "groups:",
         [
@@ -186,7 +183,7 @@ for kind in ("kuka", "franka"):
         med = np.median(block, axis=0)
         total = med.sum()
         print(f"{name}: total {total:,.0f} cycles (median over groups)")
-        for label, value, p90 in zip(labels, med, np.percentile(block, 90, axis=0)):
+        for label, value, p90 in zip(labels, med, np.percentile(block, 90, axis=0), strict=True):
             print(f"   {label:16} {value:9,.0f}  {100 * value / max(total, 1):5.1f}%   p90 {p90:9,.0f}")
     print(
         "contacts",

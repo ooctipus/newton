@@ -35,8 +35,8 @@ prints its groups' widths. ``--scene`` records only the named scenes.
 read of an array no kernel wrote shows in both arms' records.
 
 Scalar-branch groups (``scalar_branches.py``) hold no tree layout and are not
-recorded: the mixed scenes build their solvers with
-``FEATHER_PGS_SCALAR_BRANCHES=0``, so every scene composes tree groups, and
+recorded: the mixed scenes build their solvers with the route pin
+``star="held"``, so every scene composes tree groups, and
 ``check_owner_launches`` of ``newton/tests/test_feather_pgs_scalar_branches.py``
 checks the launches of a scalar group and of the tree group beside it instead.
 
@@ -413,21 +413,19 @@ class Recorder:
                 continue
             self.poison_heap()
             model = _build(wp.get_device(self.device), worlds=self.worlds, **options)
-            # Every scene stays on tree groups: a scalar-branch group holds no tree layout or cache data.
-            with _environment(FEATHER_PGS_SCALAR_BRANCHES=0):
-                solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+            # Every scene stays on tree groups (a scalar-branch group holds no tree layout or cache data), and the
+            # solver builds no owner of its own: the scene builds it below.
+            with unittest.mock.patch.dict(SolverFeatherPGS._route_pins, {"star": "held", "evaluator": "ordinary"}):
+                solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
             solver.enable_joint_velocity_limits = owner_options.get("motion", False)
             admitted = held_tree.admitted
             if forest:
                 # Admission is CUDA-only; both arms lift it to build the forest group on any device.
                 held_tree.admitted = lambda solver: True
-            switches = {
-                "FEATHER_PGS_TREE_FOREST": int(forest),
-                "FEATHER_PGS_STAGE_CLOCKS": int(owner_options.get("clocked", False)),
-            }
+            solver._route_pins["grouping"] = "forest" if forest else "per_size"
             try:
-                with _environment(**switches):
+                with _environment(FEATHER_PGS_STAGE_CLOCKS=int(owner_options.get("clocked", False))):
                     owner = held_tree.HeldTree(solver)
             except ValueError as error:
                 print(f"skipped {tag}: {error}", flush=True)
@@ -461,20 +459,19 @@ def record(path, *, root=None, device="cpu", lanes=0, poison=0.0, worlds=2, scen
     unknown = sorted(set(scenes or ()) - set(single_scene_names()) - set(MIXED_SCENES))
     if unknown:
         raise SystemExit(f"Unknown scenes: {', '.join(unknown)}")
-    # The scenes build their own owners; the solvers build none.
-    with _environment(FEATHER_PGS_TREE_KINETIC_STATE=0):
-        _import_newton(root)
-        import numpy as np  # noqa: PLC0415
-        import warp as wp  # noqa: PLC0415
+    # The scenes build their own owners; the solvers build none (their fixtures pin ordinary dynamics).
+    _import_newton(root)
+    import numpy as np  # noqa: PLC0415
+    import warp as wp  # noqa: PLC0415
 
-        log_level, wp.config.log_level = wp.config.log_level, wp.LOG_WARNING
-        recorder = Recorder(device, poison, worlds=worlds, scenes=scenes)
-        try:
-            with recorder.hooks(), _fixed_lanes(lanes):
-                recorder.single_scenes()
-                recorder.mixed_scenes()
-        finally:
-            wp.config.log_level = log_level
+    log_level, wp.config.log_level = wp.config.log_level, wp.LOG_WARNING
+    recorder = Recorder(device, poison, worlds=worlds, scenes=scenes)
+    try:
+        with recorder.hooks(), _fixed_lanes(lanes):
+            recorder.single_scenes()
+            recorder.mixed_scenes()
+    finally:
+        wp.config.log_level = log_level
     np.savez_compressed(path, **recorder.records)
     print(f"Recorded {len(recorder.records)} arrays: {path}")
     return recorder.records

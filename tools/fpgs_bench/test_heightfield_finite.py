@@ -137,7 +137,13 @@ class TestHeightfieldFinite(unittest.TestCase):
         model = builder.finalize(device="cpu")
         state = model.state()
         for reduce in (False, True):
-            with patch.dict(os.environ, NEWTON_HEIGHTFIELD_CELL_REJECT="1", NEWTON_HEIGHTFIELD_FINITE_QUERY="1"):
+            # The terrain route's own markers: request that route, as the terrain law is the default (d2530beca).
+            with patch.dict(
+                os.environ,
+                NEWTON_HEIGHTFIELD_CELL_REJECT="1",
+                NEWTON_HEIGHTFIELD_FINITE_QUERY="1",
+                NEWTON_TERRAIN_LAW="none",
+            ):
                 pipeline = newton.CollisionPipeline(
                     model, reduce_contacts=reduce, rigid_contact_max=64, max_triangle_pairs=16
                 )

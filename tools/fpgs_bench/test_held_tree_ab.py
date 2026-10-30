@@ -174,7 +174,8 @@ class TestHeldTreeAB(unittest.TestCase):
                 )
 
     def test_mixed_scenes_request_no_scalar_branches(self):
-        """Build every mixed scene's solver with scalar branches off, so that its owner composes tree groups only.
+        """Build every mixed scene's solver with its diagonal-mass group pinned to the held tree (``star="held"``), so
+        that its owner composes tree groups only.
 
         A scalar-branch group holds no tree layout or cache data, so a record could not describe or
         drive it; ``check_owner_launches`` of the scalar-branch tests checks its launches instead.
@@ -190,7 +191,7 @@ class TestHeldTreeAB(unittest.TestCase):
             patch.object(scalar_branches, "plan_scalar_branches", plan),
         ):
             records = ab.record(Path(directory) / "record.npz", scenes=("cabinet", "forest-cabinet"))
-        self.assertEqual([call.kwargs for call in plan.call_args_list], [{"requested": False}] * 2)
+        self.assertEqual([call.args[0]._route_pins.get("star") for call in plan.call_args_list], ["held"] * 2)
         self.assertEqual({name.split("/")[0] for name in records}, {"mixed-cabinet", "mixed-forest-cabinet"})
 
     def test_worlds_set_the_mixed_scenes_world_count(self):
