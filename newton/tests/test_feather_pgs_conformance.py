@@ -1281,7 +1281,12 @@ def reference(physics: Physics, route: Route, device) -> Reference:
     indeterminate support lets the order pick one of many rigid solutions,
     which more iterations do not remove and one repeat cannot bound, so such
     a scene sorts its contacts (``deterministic_contacts``) and repeats
-    bitwise, as FeatherPGS then gives the rows the contacts' order.
+    bitwise, as FeatherPGS then gives the rows the contacts' order. Every
+    scene also takes its rounding sensitivity into the spread: another
+    route's float order moves a rounding-sensitive trajectory as far as one
+    ulp of the time step does (the legged scene under the relative
+    regularization: 0.011 m/s), which no repeat of the reference's own
+    float order measures.
     """
     high = REFERENCE_FACTOR * physics.iterations
     converged = run_physics(physics, route, device, high)
@@ -1291,13 +1296,12 @@ def reference(physics: Physics, route: Route, device) -> Reference:
     if wp.get_device(device).is_cuda:
         repeat = run_physics(physics, dataclasses.replace(route, name=f"{route.name}_repeat"), device)
         spread = np.maximum(spread, distance(repeat, budget).as_array())
-    if physics.scene.deterministic_contacts:
-        # The support's rounding sensitivity: the run at N with the time step one float32 ulp off either way.
-        for toward in (np.inf, -np.inf):
-            dt = float(np.nextafter(np.float32(physics.scene.dt), np.float32(toward)))
-            nudged = dataclasses.replace(physics, scene=dataclasses.replace(physics.scene, dt=dt))
-            rounding = run_physics(nudged, dataclasses.replace(route, name=f"{route.name}_dt{dt!r}"), device)
-            spread = np.maximum(spread, distance(rounding, budget).as_array())
+    # The trajectory's rounding sensitivity: the run at N with the time step one float32 ulp off either way.
+    for toward in (np.inf, -np.inf):
+        dt = float(np.nextafter(np.float32(physics.scene.dt), np.float32(toward)))
+        nudged = dataclasses.replace(physics, scene=dataclasses.replace(physics.scene, dt=dt))
+        rounding = run_physics(nudged, dataclasses.replace(route, name=f"{route.name}_dt{dt!r}"), device)
+        spread = np.maximum(spread, distance(rounding, budget).as_array())
     # A pose at rest under static friction is one of a continuum: a perturbation of the transient leaves an offset
     # of its own size, so the end pose is held to the transient's spread. A rest velocity is unique (zero).
     fields = Distance.FIELDS
