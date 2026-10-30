@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs import contact_input, response_builds_rows
 from newton.tests import test_feather_pgs_compact_contact as baseline
 from newton.tests.feather_pgs_patch_parity import point_row_law
 from newton.tests.test_feather_pgs_compact_contact import (
+    _FOREST_FIELDS,
     _LAUNCH_FIELDS,
     OUTPUTS,
     fixture,
@@ -186,10 +187,11 @@ class TestCoalescedContact(unittest.TestCase):
         data, aux = fixture()
         # Every solver attribute the producer's structs bind, from the fixture's fields.
         values = {name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()}
+        forest = {name: getattr(data, field) for name, field in _FOREST_FIELDS.items()}
         marker = object()
         solver = SimpleNamespace(
             **values,
-            world_count=2,
+            forest=SimpleNamespace(**forest, world_count=2),
             slot_counter=aux.counts,
             dense_phase_bounds=aux.bounds,
             constraint_count=wp.zeros(2, dtype=int, device="cpu"),

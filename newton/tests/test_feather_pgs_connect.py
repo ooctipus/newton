@@ -150,7 +150,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
 
         self.assertEqual(int(model.joint_articulation.numpy()[loop_joint]), -1)
         np.testing.assert_array_equal(
-            solver._model_plan.loop_joint_articulation,
+            solver.forest.loop_joint_articulation,
             np.array([-1, -1, -1, 0], dtype=np.int32),
         )
         np.testing.assert_array_equal(solver._connect_art.numpy(), np.array([0], dtype=np.int32))
@@ -173,10 +173,10 @@ class TestFeatherPGSConnect(unittest.TestCase):
         self.assertEqual(standalone_joint, 1)
 
         solver = newton.solvers.SolverFeatherPGS(model)
-        self.assertFalse(solver._has_loop_joints)
+        self.assertFalse(solver.forest.has_loop_joints)
         self.assertEqual(solver._connect_count, 0)
         np.testing.assert_array_equal(
-            solver._model_plan.loop_joint_articulation,
+            solver.forest.loop_joint_articulation,
             np.array([-1, -1], dtype=np.int32),
         )
 
@@ -354,7 +354,7 @@ class TestFeatherPGSPrescribedParentConnect(unittest.TestCase):
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.2)
         self.assertFalse([w for w in caught if "loop joint" in str(w.message)], [str(w.message) for w in caught])
-        articulation = wp.array([int(solver.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
+        articulation = wp.array([int(solver.forest.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         dt = 1.0 / 240.0

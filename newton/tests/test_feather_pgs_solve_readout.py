@@ -360,8 +360,8 @@ def _diagonal_route():
 
     def prepare(solver, state):
         joint_qd = state.joint_qd.numpy()
-        for art in np.flatnonzero(solver._model_plan.response_dof_count == 16):
-            start = int(solver._model_plan.articulation_dof_start[art])
+        for art in np.flatnonzero(solver.forest.response_dof_count == 16):
+            start = int(solver.forest.articulation_dof_start_host[art])
             joint_qd[start : start + 16] = -0.3
         state.joint_qd.assign(joint_qd)
 
@@ -389,8 +389,8 @@ def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
 
     def prepare(solver, state):
         joint_qd = state.joint_qd.numpy()
-        free = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
-        start = int(solver._model_plan.articulation_dof_start[free])
+        free = int(np.flatnonzero(solver.forest.is_free_rigid_host)[0])
+        start = int(solver.forest.articulation_dof_start_host[free])
         joint_qd[start], joint_qd[start + 2] = 2.0, -3.0
         state.joint_qd.assign(joint_qd)
 

@@ -74,11 +74,11 @@ def _jacobian(solver, route, world, count):
         return unpacked_rows(solver)[0][world, :count]
     # Split mode keeps each articulation's columns in its size group; the world's
     # articulations follow in index order (split construction maps no world offsets).
-    worlds = solver.art_to_world.numpy()
+    worlds = solver.forest.art_to_world.numpy()
     blocks = []
-    for size in solver.size_groups:
+    for size in solver.forest.size_groups:
         group_jacobian = solver.J_by_size[size].numpy()
-        for group, art in enumerate(solver.group_to_art[size].numpy()):
+        for group, art in enumerate(solver.forest.group_to_art[size].numpy()):
             if worlds[art] == world:
                 blocks.append((int(art), group_jacobian[group, :count]))
     return np.concatenate(
@@ -380,10 +380,10 @@ def _predicted_velocity(solver, world):
     """Return a world's predicted generalized velocity in the column order of its dense split row Jacobians."""
     v_hat = solver.v_hat.numpy().astype(np.float64)
     # The world's articulations in index order, as :func:`_jacobian` lays them out.
-    worlds, starts = solver.art_to_world.numpy(), solver.articulation_dof_start.numpy()
+    worlds, starts = solver.forest.art_to_world.numpy(), solver.forest.articulation_dof_start.numpy()
     blocks = []
-    for size in solver.size_groups:
-        for art in solver.group_to_art[size].numpy():
+    for size in solver.forest.size_groups:
+        for art in solver.forest.group_to_art[size].numpy():
             if worlds[art] == world:
                 blocks.append((int(art), v_hat[int(starts[art]) : int(starts[art]) + size]))
     return np.concatenate([block for _art, block in sorted(blocks, key=lambda item: item[0])] or [np.zeros(0)])
@@ -747,7 +747,7 @@ def assert_sparse_rows_consistent(solver):
 
     recover = TestFeatherPGSSparseSolver()._sparse_rows_physical
     impulses, incident = solver.impulses.numpy(), solver._sparse_row_incident.numpy()
-    delta, dofs = solver._sparse_factor_velocity_delta.numpy(), solver.world_dof_indices.numpy()
+    delta, dofs = solver._sparse_factor_velocity_delta.numpy(), solver.forest.world_dof_indices.numpy()
     v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
     checked = 0
     for world, live in enumerate(solver.constraint_count.numpy()):

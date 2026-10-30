@@ -474,22 +474,22 @@ def test_kinematic_free_base_prescribed_motion(
         )
         solver = solver_fn(model)
         if isinstance(solver, newton.solvers.SolverFeatherPGS) and solver._matrix_free:
-            body_to_articulation = solver.body_to_articulation.numpy()
+            body_to_articulation = solver.forest.body_to_articulation.numpy()
             kinematic_articulation = int(body_to_articulation[kinematic_body])
             probe_articulation = int(body_to_articulation[probe_body])
-            physical_dof_count = solver.articulation_H_rows.numpy()
-            response_dof_count = solver.articulation_response_dof_count.numpy()
+            physical_dof_count = solver.forest.articulation_dof_count.numpy()
+            response_dof_count = solver.forest.articulation_response_dof_count.numpy()
             test.assertEqual(int(physical_dof_count[kinematic_articulation]), 6)
             test.assertEqual(int(physical_dof_count[probe_articulation]), 6)
             test.assertEqual(int(response_dof_count[kinematic_articulation]), 0)
             test.assertEqual(int(response_dof_count[probe_articulation]), 6)
-            test.assertEqual(solver.max_world_dofs, 6)
-            test.assertEqual(solver._free_rigid_body_count, 1)
-            test.assertEqual(int(solver.free_rigid_body_indices.numpy()[0]), probe_body)
-            world = int(solver.art_to_world.numpy()[probe_articulation])
-            probe_start = int(solver.articulation_dof_start.numpy()[probe_articulation])
+            test.assertEqual(solver.forest.max_world_dofs, 6)
+            test.assertEqual(solver.forest.free_rigid_body_count, 1)
+            test.assertEqual(int(solver.forest.free_rigid_body_indices.numpy()[0]), probe_body)
+            world = int(solver.forest.art_to_world.numpy()[probe_articulation])
+            probe_start = int(solver.forest.articulation_dof_start.numpy()[probe_articulation])
             np.testing.assert_array_equal(
-                solver.world_dof_indices.numpy()[world], np.arange(probe_start, probe_start + 6)
+                solver.forest.world_dof_indices.numpy()[world], np.arange(probe_start, probe_start + 6)
             )
         collision_pipeline, contacts = _create_contacts(model, solver)
         state_0, state_1 = model.state(), model.state()
@@ -604,7 +604,7 @@ def test_kinematic_free_base_drives_dense_articulation(
         state_0, state_1 = state_1, state_0
         max_probe_velocity = max(max_probe_velocity, float(state_0.joint_qd.numpy()[probe_qd_start]))
 
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[0]), 0)
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[0]), 0)
     test.assertGreater(max_probe_velocity, 3.0e-2)
 
 
@@ -851,16 +851,16 @@ def test_kinematic_prescribed_response_lifetime(
 ):
     model, kinematic_body, probe_body, _kinematic_joint = _build_free_root_scene(device)
     solver = solver_fn(model)
-    body_to_articulation = solver.body_to_articulation.numpy()
+    body_to_articulation = solver.forest.body_to_articulation.numpy()
     kinematic_articulation = int(body_to_articulation[kinematic_body])
     probe_articulation = int(body_to_articulation[probe_body])
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[kinematic_articulation]), 0)
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[kinematic_articulation]), 0)
 
     flags = model.body_flags.numpy()
     flags[probe_body] = int(BodyFlags.KINEMATIC)
     model.body_flags.assign(flags)
     solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-    test.assertEqual(int(solver.articulation_response_dof_count.numpy()[probe_articulation]), 6)
+    test.assertEqual(int(solver.forest.articulation_response_dof_count.numpy()[probe_articulation]), 6)
 
     flags = model.body_flags.numpy()
     flags[kinematic_body] = int(BodyFlags.DYNAMIC)

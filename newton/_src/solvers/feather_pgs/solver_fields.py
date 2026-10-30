@@ -367,11 +367,11 @@ PGS_MF_DIAGNOSTICS = FieldGroup(Field("_diag_prev_mf_impulses", wp.float32, ("wo
 # ---------------------------------------------------------------------------------------------------------------------
 
 BODY_MAPS = FieldGroup(
-    Field("body_to_joint", wp.int32, ("body",), grad=False),
-    Field("body_to_articulation", wp.int32, ("body",), grad=False),
-    Field("body_has_response_dofs", wp.int32, ("body",), grad=False),
-    Field("body_response_dof_mask", wp.uint32, ("body",), grad=False),
-    Field("body_single_response_dof", wp.int32, ("body",), grad=False),
+    Field("body_to_joint", wp.int32, ("body",), grad=False, owner="forest"),
+    Field("body_to_articulation", wp.int32, ("body",), grad=False, owner="forest"),
+    Field("body_has_response_dofs", wp.int32, ("body",), grad=False, owner="forest"),
+    Field("body_response_dof_mask", wp.uint32, ("body",), grad=False, owner="forest"),
+    Field("body_single_response_dof", wp.int32, ("body",), grad=False, owner="forest"),
 )
 """Each body's tree joint, articulation, response presence, low-32 response support and single response DOF."""
 

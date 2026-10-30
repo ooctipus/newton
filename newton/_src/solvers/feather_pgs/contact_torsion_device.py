@@ -467,10 +467,10 @@ class DeviceTorsionPreparation:
         fields += [ContactField(name, wp.float32) for name in ("gap", "coefficient")]
         fields += [ContactField(name, wp.vec3) for name in ("normal", "point")]
         self._rows = pool.rows(fields, on_rows=self._on_rows)
-        shape = (solver.world_count, solver.dense_max_constraints)
+        shape = (solver.forest.world_count, solver.dense_max_constraints)
         w.row_contact = wp.full(shape, -1, dtype=int, device=device)
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
-        w.planned_count = wp.zeros(solver.world_count, dtype=int, device=device)
+        w.planned_count = wp.zeros(solver.forest.world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
         selected = solver._contact_torsion_shape_set
         self.selected = wp.array(
@@ -483,7 +483,7 @@ class DeviceTorsionPreparation:
         )
         self._dummy_stiffness = wp.zeros(1, dtype=float, device=device)
         self._dummy_owner = wp.full(1, -1, dtype=int, device=device)
-        self._dummy_mf_count = wp.zeros(solver.world_count, dtype=int, device=device)
+        self._dummy_mf_count = wp.zeros(solver.forest.world_count, dtype=int, device=device)
         self._saved_state = None
 
     def _on_rows(self, rows):
@@ -594,7 +594,7 @@ class DeviceTorsionPreparation:
                 contacts.rigid_contact_count,
                 self.capacity,
                 contacts.rigid_contact_max,
-                s.world_count,
+                s.forest.world_count,
                 s.contact_path,
                 s.contact_slot,
                 s.contact_world,
@@ -624,7 +624,7 @@ class DeviceTorsionPreparation:
         wp.utils.radix_sort_pairs(w.keys, w.indices, self.capacity)
         wp.launch(
             _group_world,
-            dim=s.world_count,
+            dim=s.forest.world_count,
             inputs=[
                 self.capacity,
                 s.dense_max_constraints,
@@ -645,8 +645,8 @@ class DeviceTorsionPreparation:
             inputs=[
                 w,
                 s.pgs_cfm,
-                s.body_to_articulation,
-                s._prescribed_articulation,
+                s.forest.body_to_articulation,
+                s.forest.prescribed_articulation,
                 augmented_state.body_v_s,
                 s.row_type,
                 s.row_parent,
@@ -662,18 +662,18 @@ class DeviceTorsionPreparation:
             device=device,
         )
         support = s._row_support()
-        for size in s.size_groups:
+        for size in s.forest.size_groups:
             wp.launch(
                 _jacobians,
-                dim=(s.n_arts_by_size[size], s.dense_max_constraints),
+                dim=(s.forest.n_arts_by_size[size], s.dense_max_constraints),
                 inputs=[
                     w,
-                    s.group_to_art[size],
-                    s.art_to_world,
-                    s.articulation_dof_start,
-                    s.body_to_articulation,
-                    s.body_to_joint,
-                    s._prescribed_articulation,
+                    s.forest.group_to_art[size],
+                    s.forest.art_to_world,
+                    s.forest.articulation_dof_start,
+                    s.forest.body_to_articulation,
+                    s.forest.body_to_joint,
+                    s.forest.prescribed_articulation,
                     s.model.joint_ancestor,
                     s.model.joint_qd_start,
                     augmented_state.joint_S_s,
@@ -685,7 +685,7 @@ class DeviceTorsionPreparation:
             )
         wp.launch(
             _apply_counts,
-            dim=s.world_count,
+            dim=s.forest.world_count,
             inputs=[w, s.constraint_count, s.slot_counter, getattr(s, "mf_constraint_count", self._dummy_mf_count)],
             device=device,
         )

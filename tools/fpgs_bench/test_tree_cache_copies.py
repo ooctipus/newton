@@ -78,7 +78,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             field = changed.joint_qd if changed_velocity else changed.joint_q
             values = field.numpy().copy()
             index = (
-                solver.articulation_dof_start.numpy()[art]
+                solver.forest.articulation_dof_start.numpy()[art]
                 if changed_velocity
                 else target.plan.q_index.numpy().reshape(target.group_count, -1)[group_index, 0]
             )
@@ -100,7 +100,7 @@ class TestTreeCacheCopies(unittest.TestCase):
         owner.begin(bank, augmented, bank.joint_qd, DT, True)
         for group, previous in zip(owner.groups, before, strict=True):
             arts = group.sparse.plan.group_to_art.numpy()
-            worlds = solver.art_to_world.numpy()[arts]
+            worlds = solver.forest.art_to_world.numpy()[arts]
             np.testing.assert_array_equal(group.data.generation.numpy(), previous + (worlds == 1))
 
         # Publication may omit next mass terms; an exact copy cannot manufacture them.
@@ -161,7 +161,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             checker.assert_pair(cases)
             for group, previous in zip(owner.groups, before, strict=True):
                 arts = group.sparse.plan.group_to_art.numpy()
-                reset = np.array(selected)[cases[1][1].art_to_world.numpy()[arts]]
+                reset = np.array(selected)[cases[1][1].forest.art_to_world.numpy()[arts]]
                 np.testing.assert_array_equal(group.data.generation.numpy(), previous + 4 + reset)
         wp.synchronize()  # Keep both graph fixtures alive through all asynchronous work.
 

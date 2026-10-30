@@ -344,7 +344,7 @@ def fused_contact_metadata(solver) -> dict:
     if active is not fusion:
         raise RuntimeError("Current fused contact owner differs from its configured owner")
     arrays = (fusion.owner, solver.constraint_count, fusion.fallback_counts)
-    if any(array.shape != (solver.world_count,) or array.device.is_capturing for array in arrays):
+    if any(array.shape != (solver.forest.world_count,) or array.device.is_capturing for array in arrays):
         raise RuntimeError("Fused ownership must have one value per world and be read outside capture")
     owners, counts, fallback = (array.numpy().tolist() for array in arrays)
     if (
@@ -358,7 +358,7 @@ def fused_contact_metadata(solver) -> dict:
     fallback_counts = [count for owner, count in zip(owners, counts, strict=True) if not owner]
     result.update(
         scope="Current solver call only; not whole-run admission or a physical-quality check",
-        worlds=solver.world_count,
+        worlds=solver.forest.world_count,
         fused_worlds=len(fused_counts),
         fallback_worlds=len(fallback_counts),
         fused_nonempty_worlds=sum(count > 0 for count in fused_counts),

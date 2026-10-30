@@ -213,12 +213,14 @@ def _law_probe(**changes):
         "pgs_schedule": "interleaved",
         "enable_joint_velocity_limits": True,
         "_has_rigid_body_velocity_limits": False,
-        "_free_rigid_body_count": 0,
+        "free_rigid_body_count": 0,
         "velocity_limit_activation_fraction": 0.0,
         "velocity_limit_law": "accumulated",
     }
     probe.update(changes)
-    return SimpleNamespace(**probe)
+    # The forest plan's fact, beside the solver's options.
+    forest = SimpleNamespace(free_rigid_body_count=probe.pop("free_rigid_body_count"))
+    return SimpleNamespace(**probe, forest=forest)
 
 
 class TestVelocityLimitLawOption(unittest.TestCase):
@@ -236,7 +238,7 @@ class TestVelocityLimitLawOption(unittest.TestCase):
                 {
                     "enable_joint_velocity_limits": False,
                     "_has_rigid_body_velocity_limits": True,
-                    "_free_rigid_body_count": 1,
+                    "free_rigid_body_count": 1,
                 },
                 "accumulated",
                 "velocity_limit_law=",

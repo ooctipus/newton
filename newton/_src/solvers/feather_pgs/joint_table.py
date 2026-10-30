@@ -34,8 +34,8 @@ JOINTS = (
     Field("joint_velocity_limit", wp.float32, ("dof",), attr="_joint_velocity_limit"),
     Field("joint_limit_lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
     Field("joint_limit_upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
-    Field("articulation_H_rows", wp.int32, ("articulation",)),
-    Field("art_to_world", wp.int32, ("articulation",)),
+    Field("articulation_H_rows", wp.int32, ("articulation",), owner="forest", attr="articulation_dof_count"),
+    Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
 )
 """The model's joint topology and effort limits, the drive gains and velocity and position limits the solver's rows
 read (the effective row data it publishes every step, :func:`publish_effective`: none on a prescribed coordinate), and
@@ -115,11 +115,11 @@ def effective(model, prescribed=None) -> dict[str, wp.array]:
 
 def bind(solver, data=None):
     """Bind the model's and the solver's joint table into a :data:`JointTable` (``data``: an instance to refill)."""
-    return field_group.bind(JointTable, data, model=solver.model, solver=solver)
+    return field_group.bind(JointTable, data, model=solver.model, solver=solver, forest=solver.forest)
 
 
 FREE_BODIES = (
-    Field("free_rigid_body_indices", wp.int32, ("free_body",)),
+    Field("free_rigid_body_indices", wp.int32, ("free_body",), owner="forest"),
     *FieldGroup(*DYNAMICS).select("body_to_articulation", "is_free_rigid"),
     FieldGroup(*JOINTS)["art_to_world"],
     Field("max_linear_velocity", wp.float32, ("body",), attr="rigid_body_max_linear_velocity"),
@@ -133,4 +133,4 @@ FreeBodies = field_group.struct("FreeBodies", FREE_BODIES, __name__)
 
 def bind_free_bodies(solver):
     """Bind the solver's free-body table into a :data:`FreeBodies`."""
-    return field_group.bind(FreeBodies, solver=solver)
+    return field_group.bind(FreeBodies, solver=solver, forest=solver.forest)

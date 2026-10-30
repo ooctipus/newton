@@ -29,11 +29,11 @@ def _held_tree_solver(law):
     return SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
         _laws=plain_laws(**_CONTACT_LAWS[law]),
-        size_groups=[9],
         _sparse_mass_matrix_size=None,
         _fk_id_cache_available=True,
         _parallel_augmented_drive_topology=True,
         _compact_diagonal_mass_size=None,
+        forest=SimpleNamespace(size_groups=[9]),
     )
 
 
@@ -43,13 +43,12 @@ def _sparse_tree_solver(**changes):
         model=SimpleNamespace(particle_count=0),
         _laws=plain_laws(),
         _sparse_mass_matrix_size=18,
-        _has_free_rigid_bodies=False,
         _mimic_count=0,
         _sparse_velocity_limits=False,
         _mimic_valid_np=None,
-        _has_prescribed_response=False,
         _fk_id_cache_available=True,
         _parallel_augmented_drive_topology=True,
+        forest=SimpleNamespace(has_free_rigid_bodies=False, has_prescribed_response=False),
     )
     for name, value in changes.items():
         setattr(solver, name, value)

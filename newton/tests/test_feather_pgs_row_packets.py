@@ -376,8 +376,6 @@ def _owner_solver(device, *, anchors, beta=0.0):
     }
     solver = SimpleNamespace(
         model=SimpleNamespace(device=wp.get_device(device), articulation_count=2 * worlds),
-        world_count=worlds,
-        size_groups=[PRIMARY, SECONDARY],
         _local_solve_max_rows=PACKETS // 2,
         _local_residual_max_rows=PACKETS,
         _local_residual_mf_max_rows=4,
@@ -386,11 +384,15 @@ def _owner_solver(device, *, anchors, beta=0.0):
         mf_body_a=ints(worlds, 4),
         mf_body_b=ints(worlds, 4),
         mf_row_type=ints(worlds, 4),
-        body_to_articulation=ints(3 * worlds),
         _local_general_world_count=ints(1),
-        world_response_group_art_start={size: ints(worlds + 1) for size in (PRIMARY, SECONDARY)},
-        world_response_group_to_art={size: ints(worlds) for size in (PRIMARY, SECONDARY)},
-        art_group_idx=ints(2 * worlds),
+        forest=SimpleNamespace(
+            world_count=worlds,
+            size_groups=[PRIMARY, SECONDARY],
+            body_to_articulation=ints(3 * worlds),
+            world_response_group_art_start={size: ints(worlds + 1) for size in (PRIMARY, SECONDARY)},
+            world_response_group_to_art={size: ints(worlds) for size in (PRIMARY, SECONDARY)},
+            art_group_idx=ints(2 * worlds),
+        ),
         J_by_size={size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)},
         _friction_anchors_enabled=anchors,
         _friction_patches=SimpleNamespace(view=view),

@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import forest_plan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as native
 from newton.tests.feather_pgs_sparse_scene import _external_forces
@@ -19,18 +20,18 @@ from tools.fpgs_bench.public_state_oracle import public_state
 
 def make_case(enabled, *, permuted=False, motion=False):
     """Build group maps before any operator, publication or row allocation."""
-    setup = SolverFeatherPGS._setup_size_grouping
+    size_groups = forest_plan._size_groups
 
-    def grouping(solver, model):
-        setup(solver, model)
+    def grouping(plan, model):
+        size_groups(plan, model)
         if permuted:
             order = np.array([2, 0, 3, 1], np.int32)
-            solver.group_to_art[9].assign(order)
-            solver.art_group_idx.assign(np.argsort(order).astype(np.int32))
+            plan.group_to_art[9].assign(order)
+            plan.art_group_idx.assign(np.argsort(order).astype(np.int32))
 
     with (
         patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"evaluator": "ordinary"}),
-        patch.object(SolverFeatherPGS, "_setup_size_grouping", grouping),
+        patch.object(forest_plan, "_size_groups", grouping),
     ):
         model = native._build_model(robot_count=2)
         model.joint_velocity_limit.fill_(0.08)
@@ -91,7 +92,7 @@ class TestTreeForestSteps(unittest.TestCase):
                     inspector.assert_sparse_state(cases[1])
                     np.testing.assert_array_equal(solver._tree_kinetic_state.groups[0].data.current_valid.numpy(), 1)
                     count = int(contacts.rigid_contact_count.numpy()[0])
-                    bodies, arts = model.shape_body.numpy(), solver.body_to_articulation.numpy()
+                    bodies, arts = model.shape_body.numpy(), solver.forest.body_to_articulation.numpy()
                     for a, b in zip(
                         contacts.rigid_contact_shape0.numpy()[:count],
                         contacts.rigid_contact_shape1.numpy()[:count],

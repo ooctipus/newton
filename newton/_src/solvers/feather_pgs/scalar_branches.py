@@ -530,13 +530,13 @@ def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBran
         return None, "Scalar branches exclude gradients and particles."
     if solver.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the diagonal-mass group on its ordinary dynamics."
-    if size not in solver._direct_diagonal_inertia_sizes:
+    if size not in solver.forest.direct_diagonal_inertia_sizes:
         return None, "The diagonal-mass group has coordinates that do not each move one body."
-    articulations = solver.group_to_art[size].numpy()
-    kinds, reason = branch_topology(model, articulations, solver.articulation_joint_end.numpy())
+    articulations = solver.forest.group_to_art[size].numpy()
+    kinds, reason = branch_topology(model, articulations, solver.forest.articulation_joint_end.numpy())
     if kinds is None:
         return None, reason
-    offsets = solver._crba_dof_joint_offset_by_size[size].numpy()
+    offsets = solver.forest.crba_dof_joint_offset_by_size[size].numpy()
     if kinds.shape[1] != size or not np.array_equal(offsets, np.arange(1, size + 1)):
         return None, "The diagonal-mass group's coordinates do not follow its leaves."
     if not solver._parallel_augmented_drive_topology:
@@ -589,8 +589,8 @@ class ScalarBranchState:
         self.sparse = self
         model, device = solver.model, solver.model.device
         self.group_count = plan.group_count
-        self.group_to_art = solver.group_to_art[plan.size]
-        self.dof_joint_offset = solver._crba_dof_joint_offset_by_size[plan.size]
+        self.group_to_art = solver.forest.group_to_art[plan.size]
+        self.dof_joint_offset = solver.forest.crba_dof_joint_offset_by_size[plan.size]
         self._cache_to_art = self.group_to_art.reshape((self.group_count, 1))
         # The family holds no geometry cache; invalidation clears this flag only.
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
@@ -608,7 +608,7 @@ class ScalarBranchState:
     def _dimensions(self):
         model = self.solver.model
         return (
-            self.solver.world_count,
+            self.solver.forest.world_count,
             model.articulation_count,
             model.body_count,
             model.joint_count,
@@ -643,10 +643,10 @@ class ScalarBranchState:
     def invalidate(self, world_mask=None):
         """Invalidate the cached state of every owned articulation in selected worlds."""
         cached_state_binding.invalidate(
-            self.solver.world_count,
+            self.solver.forest.world_count,
             world_mask,
             self._cache_to_art,
-            self.solver.art_to_world,
+            self.solver.forest.art_to_world,
             self.solver._fk_id_cache_valid,
             self._geometry_valid,
         )
@@ -683,7 +683,7 @@ class ScalarBranchState:
                 self.group_to_art,
                 self.dof_joint_offset,
                 model.articulation_start,
-                solver.articulation_dof_start,
+                solver.forest.articulation_dof_start,
                 solver._fk_id_cache_valid,
                 model.joint_child,
                 model.joint_q_start,
@@ -744,7 +744,7 @@ class ScalarBranchState:
             self.group_to_art,
             self.dof_joint_offset,
             model.articulation_start,
-            solver.articulation_dof_start,
+            solver.forest.articulation_dof_start,
         ]
         inputs += [
             model.joint_child,
@@ -795,7 +795,7 @@ class ScalarBranchState:
             self.group_to_art,
             self.dof_joint_offset,
             model.articulation_start,
-            solver.articulation_dof_start,
+            solver.forest.articulation_dof_start,
         ]
         inputs += [
             model.joint_child,

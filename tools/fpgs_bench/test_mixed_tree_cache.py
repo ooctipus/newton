@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import forest_plan
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
@@ -70,23 +71,23 @@ def model_fixture(device="cpu", *, worlds=3, reordered=False, primary_dofs=9):
 
 def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.0):
     """Retain original Cholesky and independent-branch diagonal representations."""
-    setup = SolverFeatherPGS._setup_size_grouping
+    size_groups = forest_plan._size_groups
 
-    def grouping(solver, source):
-        setup(solver, source)
+    def grouping(plan, source):
+        size_groups(plan, source)
         if permuted:
-            inverse = solver.art_group_idx.numpy().copy()
-            for size, group in solver.group_to_art.items():
+            inverse = plan.art_group_idx.numpy().copy()
+            for size, group in plan.group_to_art.items():
                 values = np.roll(group.numpy()[::-1], size % group.size)
                 group.assign(values)
                 inverse[values] = np.arange(group.size)
-            solver.art_group_idx.assign(inverse)
+            plan.art_group_idx.assign(inverse)
 
     # The held owner on dense storage, or ordinary dynamics; one buffer set either way.
     pins = {"storage": "dense", "double_buffer": False, **({} if enabled else {"evaluator": "ordinary"})}
     with (
         patch.object(SolverFeatherPGS, "_route_pins", pins),
-        patch.object(SolverFeatherPGS, "_setup_size_grouping", grouping),
+        patch.object(forest_plan, "_size_groups", grouping),
     ):
         solver = SolverFeatherPGS(
             model,
@@ -153,7 +154,7 @@ class TestMixedTreeCache(unittest.TestCase):
             np.testing.assert_allclose(solver.joint_S_s.numpy(), reference.joint_S_s.numpy(), atol=4e-6, rtol=3e-5)
             np.testing.assert_allclose(solver.body_v_s.numpy(), reference.body_v_s.numpy(), atol=4e-6, rtol=3e-5)
             expected = np.zeros(model.joint_dof_count)
-            starts = solver.articulation_dof_start.numpy()
+            starts = solver.forest.articulation_dof_start.numpy()
             for group in owner.groups:
                 operator, n = group.sparse, group.layout.dofs
                 mass = operator.mass
@@ -194,7 +195,7 @@ class TestMixedTreeCache(unittest.TestCase):
             for group, before in zip(owner.groups, generation, strict=False):
                 arts = group.sparse.plan.group_to_art.numpy()
                 np.testing.assert_array_equal(
-                    group.data.generation.numpy() - before, solver.art_to_world.numpy()[arts] == 1
+                    group.data.generation.numpy() - before, solver.forest.art_to_world.numpy()[arts] == 1
                 )
             requests = np.zeros(model.articulation_count, np.int32)
             requests[-1] = 1
@@ -232,7 +233,7 @@ class TestMixedTreeCache(unittest.TestCase):
                 for group, before in zip(owner.groups, generation, strict=False):
                     arts = group.sparse.plan.group_to_art.numpy()
                     np.testing.assert_array_equal(
-                        group.data.generation.numpy() - before, 3 * (solver.art_to_world.numpy()[arts] == 1)
+                        group.data.generation.numpy() - before, 3 * (solver.forest.art_to_world.numpy()[arts] == 1)
                     )
             np.testing.assert_array_equal(state.joint_qd.numpy(), raw)
             if model.device.is_cuda:
@@ -244,14 +245,14 @@ class TestMixedTreeCache(unittest.TestCase):
         solver = make_solver(model)
         owner = HeldTree(solver)
         solver._fk_id_cache_valid.fill_(1)
-        original = solver.group_to_art[9]
+        original = solver.forest.group_to_art[9]
         values = original.numpy()
         for changed in (values[::-1].copy(), np.full_like(values, values[0])):
-            solver.group_to_art[9] = wp.array(changed, dtype=int, device=model.device)
+            solver.forest.group_to_art[9] = wp.array(changed, dtype=int, device=model.device)
             with self.assertRaises((ValueError, RuntimeError)):
                 owner.validate_model()
             np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
-        solver.group_to_art[9] = original
+        solver.forest.group_to_art[9] = original
         owner.validate_model()
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")

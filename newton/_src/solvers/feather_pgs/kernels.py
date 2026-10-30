@@ -92,7 +92,7 @@ PGS_CONSTRAINT_TYPE_MIMIC = 5
 # Connect (loop-closure) row: one axis of the bilateral 3-DoF point-coincidence equality
 # ``p_anchor(parent) - p_anchor(child) = 0`` closing a kinematic loop between two links of
 # the same articulation (imported MJCF ``connect`` equalities become trailing BALL loop
-# joints; see ``_FeatherPGSModelPlan.build``). Three rows per closure, world-axis
+# joints; see ``forest_plan.ForestPlan.build``). Three rows per closure, world-axis
 # directions, unbounded lambda, Baumgarte drift correction.
 PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_TORSION = 7

@@ -34,7 +34,7 @@ from newton.tests.feather_pgs_patch_parity import (
     contact_rows,
 )
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
-from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
+from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _ForestProbe, _TopologyReached
 
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
@@ -64,8 +64,8 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for changes in (
             {"_route_pins": {"storage": "dense"}},
-            {"pgs_warmstart": True, "_has_free_rigid_bodies": True},
-            {"_has_free_rigid_bodies": True},
+            {"pgs_warmstart": True, "forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
+            {"forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
             {"drive_mode": "physx_pgs"},
             {"pgs_schedule": "contact_then_internal"},
             {"pgs_velocity_iterations": 1},
@@ -403,7 +403,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     rtol=3e-4,
                 )
             finite = np.isfinite(new.rhs.numpy()[world, :count])
-            dofs = new.world_dof_indices.numpy()[world]
+            dofs = new.forest.world_dof_indices.numpy()[world]
             residual = jacobian @ new.v_out.numpy()[dofs] + new.rhs.numpy()[world, :count]
             old_residual = old_j[world, :count] @ old.v_out.numpy()[dofs] + old.rhs.numpy()[world, :count]
             np.testing.assert_allclose(residual[finite], old_residual[finite], atol=5e-5, rtol=5e-4)

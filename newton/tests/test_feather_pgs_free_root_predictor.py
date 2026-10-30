@@ -309,7 +309,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
             solver = SolverFeatherPGS(model, angular_damping=0.0)
         self.assertIsNone(solver.get_path_selection()["cached_prediction"])
-        self.assertEqual(solver._free_root_joint_count, 1)
+        self.assertEqual(solver.forest.free_root_joint_count, 1)
         state_in, state_out = model.state(), model.state()
         state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
 
@@ -347,7 +347,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
 
         model = builder.finalize(device=wp.get_device())
         solver = SolverFeatherPGS(model)
-        np.testing.assert_array_equal(solver._free_root_joint_indices.numpy(), (joint_a, joint_b))
+        np.testing.assert_array_equal(solver.forest.free_root_joint_indices.numpy(), (joint_a, joint_b))
 
     def test_zero_transport_keeps_nonzero_gradient(self):
         """Differentiate both corrections through an exact-zero transport value."""

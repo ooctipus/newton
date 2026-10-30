@@ -107,7 +107,7 @@ class TestMixedTreeSteps(unittest.TestCase):
         """Check original held factors against public-twist mass and drive diagonals."""
         model, solver, *_ = case
         physical = physical_mass(model, state)
-        starts = solver.articulation_dof_start.numpy()
+        starts = solver.forest.articulation_dof_start.numpy()
         rows, coefficients = solver._augmented_drive_row_by_dof.numpy(), solver.aug_row_K.numpy()
         for group in solver._tree_kinetic_state.groups:
             operator, size = group.sparse, group.layout.dofs

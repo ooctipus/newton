@@ -12,7 +12,8 @@ import warp as wp
 
 from newton import JointType
 from newton._src.solvers.feather_pgs import kernels
-from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS, _FeatherPGSModelPlan
+from newton._src.solvers.feather_pgs.forest_plan import ForestPlan, joint_forest
+from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
 
 class TestFeatherPGSDenseRHS(unittest.TestCase):
@@ -41,15 +42,18 @@ class TestFeatherPGSDenseRHS(unittest.TestCase):
                 starts = np.concatenate(([0], np.cumsum(sizes))).astype(np.int32)
                 coord_sizes = [7 if art in free else size for art, size in enumerate(sizes)]
                 coord_starts = np.concatenate(([0], np.cumsum(coord_sizes))).astype(np.int32)
-                # Minimal CPU model metadata: one tree joint per articulation.
-                # The plan and both grouping methods run without mocking their logic.
+                # Minimal CPU model metadata: one tree joint and one body per articulation.
+                # The forest plan runs without mocking its logic.
                 model = SimpleNamespace(
                     articulation_count=count,
                     joint_count=count,
+                    body_count=count,
                     joint_dof_count=int(starts[-1]),
                     articulation_world=array(worlds),
                     articulation_start=array(range(count + 1)),
                     joint_parent=array([-1] * count),
+                    joint_ancestor=array([-1] * count),
+                    joint_articulation=array(range(count)),
                     joint_qd_start=array(starts),
                     joint_q_start=array(coord_starts),
                     joint_type=array(
@@ -62,22 +66,20 @@ class TestFeatherPGSDenseRHS(unittest.TestCase):
                     joint_dof_dim=array([[min(size, 3), max(size - 3, 0)] for size in sizes]),
                     device=device,
                     requires_grad=False,
+                    world_count=max(worlds, default=0) + 1,
                 )
                 mask = np.zeros(model.joint_dof_count, dtype=np.int32)
                 for art in kinematic:
                     mask[starts[art] : starts[art + 1]] = 1
-                plan = _FeatherPGSModelPlan.build(model, mask, enable_prescribed_response=True)
-                self.assertEqual(plan.response_dof_count.tolist(), list(response))
-                state = SimpleNamespace(_model_plan=plan)
-                SolverFeatherPGS._setup_size_grouping(state, model)
-                SolverFeatherPGS._setup_world_mapping(state, model)
-                self.assertEqual(state._is_one_solve_art_per_world, eligible)
+                forest = ForestPlan.build(model, joint_forest(model), mask, matrix_free=True)
+                self.assertEqual(forest.response_dof_count.tolist(), list(response))
+                self.assertEqual(forest.is_one_solve_art_per_world, eligible)
                 if count:
-                    self.assertEqual(state.art_to_world.numpy().tolist(), list(worlds))
+                    self.assertEqual(forest.art_to_world.numpy().tolist(), list(worlds))
                 grouped_arts = []
-                for size in state.size_groups:
-                    arts = state.group_to_art[size].numpy().tolist()
-                    self.assertEqual(len(arts), state.n_arts_by_size[size])
+                for size in forest.size_groups:
+                    arts = forest.group_to_art[size].numpy().tolist()
+                    self.assertEqual(len(arts), forest.n_arts_by_size[size])
                     self.assertTrue(all(response[art] == size for art in arts))
                     grouped_arts.extend(arts)
                 self.assertEqual(sorted(grouped_arts), np.flatnonzero(np.asarray(response) > 0).tolist())
@@ -86,31 +88,37 @@ class TestFeatherPGSDenseRHS(unittest.TestCase):
 
                 # Exercise the derived guard for every launched size group without
                 # acquiring CUDA: only the launch/device shell is replaced.
+                state = SimpleNamespace(forest=forest)
                 state.model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
                 state.dense_max_constraints = 8
-                state.J_by_size = dict.fromkeys(state.size_groups, object())
-                for attr in ("constraint_count", "articulation_dof_start", "v_hat", "rhs"):
+                state.J_by_size = dict.fromkeys(forest.size_groups, object())
+                for attr in ("constraint_count", "v_hat", "rhs"):
                     setattr(state, attr, object())
-                for size in state.size_groups:
+                for size in forest.size_groups:
                     with patch("newton._src.solvers.feather_pgs.solver_feather_pgs.wp.launch") as launch:
                         SolverFeatherPGS._stage4_accumulate_rhs_world(state, size)
                     expected = kernels.rhs_accum_world_par_row if eligible else kernels.rhs_accum_world_par_art
                     self.assertIs(launch.call_args.args[0], expected)
                     self.assertEqual(
-                        launch.call_args.kwargs["dim"], state.n_arts_by_size[size] * (8 if eligible else 1)
+                        launch.call_args.kwargs["dim"], forest.n_arts_by_size[size] * (8 if eligible else 1)
                     )
 
     def test_dispatch_preserves_ordering_domains(self):
         """Use row workers only for non-differentiable CUDA single-owner worlds."""
+        forest = SimpleNamespace(
+            is_one_solve_art_per_world=True,
+            n_arts_by_size={14: 17},
+            group_to_art={14: object()},
+            art_to_world=object(),
+            articulation_dof_start=object(),
+        )
         state = SimpleNamespace(
             model=SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False),
-            _is_one_solve_art_per_world=True,
-            n_arts_by_size={14: 17},
+            forest=forest,
             dense_max_constraints=64,
-            group_to_art={14: object()},
             J_by_size={14: object()},
         )
-        for name in ("constraint_count", "art_to_world", "articulation_dof_start", "v_hat", "rhs"):
+        for name in ("constraint_count", "v_hat", "rhs"):
             setattr(state, name, object())
         for cuda, gradients, single, expected_rows in (
             (True, False, True, True),
@@ -121,7 +129,7 @@ class TestFeatherPGSDenseRHS(unittest.TestCase):
             with self.subTest(cuda=cuda, gradients=gradients, single=single):
                 state.model.device.is_cuda = cuda
                 state.model.requires_grad = gradients
-                state._is_one_solve_art_per_world = single
+                forest.is_one_solve_art_per_world = single
                 velocity = object()
                 with patch("newton._src.solvers.feather_pgs.solver_feather_pgs.wp.launch") as launch:
                     SolverFeatherPGS._stage4_accumulate_rhs_world(state, 14, velocity)
@@ -133,10 +141,10 @@ class TestFeatherPGSDenseRHS(unittest.TestCase):
                     [
                         state.constraint_count,
                         64,
-                        state.art_to_world,
-                        state.articulation_dof_start,
+                        forest.art_to_world,
+                        forest.articulation_dof_start,
                         velocity,
-                        state.group_to_art[14],
+                        forest.group_to_art[14],
                         state.J_by_size[14],
                         14,
                     ],

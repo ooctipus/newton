@@ -64,7 +64,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     solver._sparse_mass_matrix_status = wp.zeros(arts, dtype=int, device=device)
     solver._sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
-    solver.group_to_art[count].assign(groups)
+    solver.forest.group_to_art[count].assign(groups)
     for item in (solver, reference):
         item.enable_joint_velocity_limits = motion
         item._fk_id_cache_enabled = False
@@ -218,7 +218,7 @@ class TestTreeForestCache(unittest.TestCase):
         for permuted in (False, True):
             model, solver, _, operator, owner, _ = fixture(False, "cpu", permuted=permuted)
             groups = operator.plan.group_to_art.numpy()
-            worlds = solver.art_to_world.numpy()
+            worlds = solver.forest.art_to_world.numpy()
             for values in (
                 [True, False, False],
                 [False, True, False],

@@ -31,22 +31,22 @@ LANES = 32
 
 
 RESOLVED_WORLD_INPUT = (
-    Field("world_dof_indices", wp.int32, ("world", "world_dof")),
-    Field("world_dof_count", wp.int32, ("world",)),
+    Field("world_dof_indices", wp.int32, ("world", "world_dof"), owner="forest"),
+    Field("world_dof_count", wp.int32, ("world",), owner="forest"),
     Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
     Field("lower", wp.float32, ("dof",), attr="_joint_limit_lower"),
     Field("upper", wp.float32, ("dof",), attr="_joint_limit_upper"),
     Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
     Field("v_hat", wp.float32, ("dof",)),
-    Field("body_to_articulation", wp.int32, ("body",)),
-    Field("art_to_world", wp.int32, ("articulation",)),
-    Field("articulation_dof_start", wp.int32, ("articulation",)),
-    Field("articulation_response_dof_count", wp.int32, ("articulation",)),
-    Field("prescribed_articulation", wp.int32, ("articulation",), attr="_prescribed_articulation"),
-    Field("is_free_rigid", wp.int32, ("articulation",)),
+    Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
+    Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
+    Field("articulation_dof_start", wp.int32, ("articulation",), owner="forest"),
+    Field("articulation_response_dof_count", wp.int32, ("articulation",), owner="forest"),
+    Field("prescribed_articulation", wp.int32, ("articulation",), owner="forest"),
+    Field("is_free_rigid", wp.int32, ("articulation",), owner="forest"),
     Field("body_flags", wp.int32, ("body",), owner="model"),
-    Field("body_has_response_dofs", wp.int32, ("body",)),
-    Field("body_response_dof_mask", wp.uint32, ("body",)),
+    Field("body_has_response_dofs", wp.int32, ("body",), owner="forest"),
+    Field("body_response_dof_mask", wp.uint32, ("body",), owner="forest"),
     Field("body_q", wp.transform, ("body",), owner="state_in"),
     Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("joint_S_s", wp.spatial_vector, ("dof",), owner="state_aug"),
@@ -673,13 +673,7 @@ def decline(solver) -> str | None:
         "_compact_contact_boundary",
         "_row_watermark",
     )
-    required = (
-        "world_dof_indices",
-        "world_dof_count",
-        "body_response_dof_mask",
-        "body_has_response_dofs",
-        "_joint_limit_q_index",
-    )
+    required = ("world_dof_indices", "world_dof_count", "body_response_dof_mask", "body_has_response_dofs")
     return first_failed(
         (
             (
@@ -699,8 +693,9 @@ def decline(solver) -> str | None:
                 and not laws.velocity_limits
                 and all(getattr(solver, name, object()) == value for name, value in exact.items())
                 and all(getattr(solver, name, None) is False for name in false)
-                and (getattr(solver, "max_world_dofs", 33) or 33) <= 32
-                and all(getattr(solver, name, None) is not None for name in required),
+                and (solver.forest.max_world_dofs or 33) <= 32
+                and all(getattr(solver.forest, name) is not None for name in required)
+                and getattr(solver, "_joint_limit_q_index", None) is not None,
                 "The rows are outside the classified law (route, bilateral or velocity rows, warm start, "
                 "regularization, device or world width).",
             ),
@@ -744,7 +739,7 @@ class ResolvedWorlds:
         if self.enabled and not solver._laws.point:
             self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
         device = solver.model.device
-        worlds = solver.world_count if self.enabled else 0
+        worlds = solver.forest.world_count if self.enabled else 0
         self.scratch = ResolvedWorldScratch()
         if not self.enabled:
             self.resolved = wp.zeros(0, dtype=wp.int32, device=device)
@@ -763,10 +758,10 @@ class ResolvedWorlds:
         self.twists = twists if twists is not None else wp.zeros(1, dtype=wp.spatial_vector, device=device)
         self.published = False
         if twists is not None and flags is not None:
-            responding = solver.articulation_response_dof_count.numpy() > 0
-            prescribed = solver._prescribed_articulation.numpy() != 0
+            responding = solver.forest.articulation_response_dof_count.numpy() > 0
+            prescribed = solver.forest.prescribed_articulation.numpy() != 0
             self.published = bool(np.all(flags[responding & ~prescribed] != 0))
-        free = solver.free_rigid_body_indices
+        free = solver.forest.free_rigid_body_indices
         self.free_bodies = free if free is not None else wp.zeros(0, dtype=wp.int32, device=device)
 
     def classify(self, state_in, state_aug, contacts, dt: float) -> None:
@@ -789,6 +784,7 @@ class ResolvedWorlds:
         data = field_group.bind(
             ResolvedWorldInput,
             solver=solver,
+            forest=solver.forest,
             model=solver.model,
             state_in=state_in,
             state_aug=state_aug,

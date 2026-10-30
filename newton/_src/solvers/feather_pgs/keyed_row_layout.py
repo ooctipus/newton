@@ -56,13 +56,13 @@ class KeyedLayout:
 def topology_plan(solver):
     """Derive uniform block offsets and supported velocity DOFs from the model: the layout, then each world's group
     index, first coordinate and articulation of each size."""
-    sizes = sorted((int(n) for n in solver.size_groups), reverse=True)
-    if not 1 <= len(sizes) <= 2 or sum(sizes) != solver.max_world_dofs:
+    sizes = sorted((int(n) for n in solver.forest.size_groups), reverse=True)
+    if not 1 <= len(sizes) <= 2 or sum(sizes) != solver.forest.max_world_dofs:
         raise ValueError("keyed rows require at most two complete uniform size groups")
-    worlds = solver.art_to_world.numpy()
-    offsets = solver.articulation_world_dof_offset.numpy()
-    starts = solver.articulation_dof_start.numpy()
-    groups = np.zeros((solver.world_count, 2), dtype=np.int32)
+    worlds = solver.forest.art_to_world.numpy()
+    offsets = solver.forest.articulation_world_dof_offset.numpy()
+    starts = solver.forest.articulation_dof_start.numpy()
+    groups = np.zeros((solver.forest.world_count, 2), dtype=np.int32)
     dof_starts = np.zeros_like(groups)
     arts_by_world = np.full_like(groups, -1)
     block_offsets = [0, 0]
@@ -73,8 +73,10 @@ def topology_plan(solver):
     velocity_mask, position_mask = 0, 0
     q_index = solver._joint_limit_q_index_host
     for column, size in enumerate(sizes):
-        arts = solver.group_to_art[size].numpy()
-        if len(arts) != solver.world_count or not np.array_equal(np.sort(worlds[arts]), np.arange(solver.world_count)):
+        arts = solver.forest.group_to_art[size].numpy()
+        if len(arts) != solver.forest.world_count or not np.array_equal(
+            np.sort(worlds[arts]), np.arange(solver.forest.world_count)
+        ):
             raise ValueError("keyed rows require exactly one articulation of each size per world")
         if np.any(offsets[arts] != offsets[arts[0]]):
             raise ValueError("keyed rows require uniform coordinate offsets")

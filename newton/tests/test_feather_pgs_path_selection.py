@@ -157,7 +157,7 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
     values = {
         "_friction_anchors_enabled": law == "patch",
         "_laws": plain_laws(contact=law),
-        "size_groups": list(sizes),
+        "forest": SimpleNamespace(size_groups=list(sizes)),
         "_row_packets": None,
         "_keyed_rows": None,
         "_compact_contact_boundary": False,

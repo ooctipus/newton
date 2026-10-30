@@ -138,8 +138,9 @@ def _permuted_slots(solver, contacts, shift):
         _matrix_free=solver._matrix_free,
         # The bodies' factors, which whitened the rows.
         L_by_size=solver.L_by_size,
-        body_to_articulation=solver.body_to_articulation,
-        art_group_idx=solver.art_group_idx,
+        forest=SimpleNamespace(
+            body_to_articulation=solver.forest.body_to_articulation, art_group_idx=solver.forest.art_group_idx
+        ),
     )
     return stand_in
 

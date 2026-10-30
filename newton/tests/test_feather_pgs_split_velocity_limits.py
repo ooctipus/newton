@@ -298,8 +298,8 @@ def _sweep(device, *, iterations, articulated=False, omega=1.0):
     _step(run)
     solver = run.solver
     # The sweep reads the response DOFs the free-body map assigns, not the joint coordinates.
-    articulation = solver.body_to_articulation.numpy()[run.bodies]
-    dofs = solver.articulation_dof_start.numpy()[articulation][:, None] + np.arange(6)
+    articulation = solver.forest.body_to_articulation.numpy()[run.bodies]
+    dofs = solver.forest.articulation_dof_start.numpy()[articulation][:, None] + np.arange(6)
     start = np.hstack([np.array(SWEEP_LINEAR), np.array(SWEEP_ANGULAR)]).astype(np.float32)
     velocity = solver.v_out.numpy()
     velocity[dofs] = start

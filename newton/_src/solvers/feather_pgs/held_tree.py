@@ -78,7 +78,7 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
         return "Particles are outside the held tree."
     if sparse is not None:
         velocity_limits = sparse
-        if solver._has_free_rigid_bodies:
+        if solver.forest.has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
         if solver._mimic_count and not (
             velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
@@ -88,9 +88,9 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
         # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the
         # solver pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body
         # twists every group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
-        if not solver.size_groups:
+        if not solver.forest.size_groups:
             return "No articulation has response coordinates."
-    if sparse is not None and solver._has_prescribed_response:
+    if sparse is not None and solver.forest.has_prescribed_response:
         return "The sparse factor's group holds no prescribed articulations."
     if not solver._fk_id_cache_available:
         return "The FK/ID cache is unavailable."
@@ -101,7 +101,7 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
     # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32
     # coordinates) into the solver's dense factor of the same shape, in place of the size's stage-2 factor; the
     # compact diagonal size keeps its compact inverse.
-    for size in solver.size_groups:
+    for size in solver.forest.size_groups:
         if size != compact and size > 32:
             return f"Size {size} has no held Cholesky family (1 to 32 coordinates)."
     return None
@@ -115,7 +115,7 @@ def admitted(solver) -> bool:
 
 def _prescribed_articulations(solver):
     """Articulations whose response the solver prescribes (kinematic free bodies)."""
-    return np.flatnonzero(solver._prescribed_articulation.numpy() != 0).astype(np.int32)
+    return np.flatnonzero(solver.forest.prescribed_articulation.numpy() != 0).astype(np.int32)
 
 
 def _coverage(solver, compact):
@@ -123,31 +123,33 @@ def _coverage(solver, compact):
     size the groups carry."""
     model = solver.model
     prescribed = _prescribed_articulations(solver)
-    if not solver.size_groups or model.joint_count != model.body_count:
+    if not solver.forest.size_groups or model.joint_count != model.body_count:
         raise ValueError("Mixed tree cache requires complete factor groups")
-    arts = np.concatenate([solver.group_to_art[size].numpy() for size in solver.size_groups] + [prescribed])
+    arts = np.concatenate(
+        [solver.forest.group_to_art[size].numpy() for size in solver.forest.size_groups] + [prescribed]
+    )
     if not np.array_equal(np.sort(arts), np.arange(model.articulation_count)):
         raise ValueError("Mixed tree factors must cover every articulation exactly once")
     starts = model.articulation_start.numpy()
     if starts[0] != 0 or starts[-1] != model.joint_count or np.any(np.diff(starts) <= 0):
         raise ValueError("Mixed tree cache requires contiguous nonempty articulations")
     qd = model.joint_qd_start.numpy()
-    ds = solver.articulation_dof_start.numpy()
+    ds = solver.forest.articulation_dof_start.numpy()
     if not np.array_equal(ds, qd[starts[:-1]]):
         raise ValueError("Mixed tree factor starts must preserve physical coordinate ownership")
-    for size in solver.size_groups:
-        group = solver.group_to_art[size].numpy()
+    for size in solver.forest.size_groups:
+        group = solver.forest.group_to_art[size].numpy()
         if np.any(qd[starts[group + 1]] - qd[starts[group]] != size):
             raise ValueError("Mixed tree factor size disagrees with its physical coordinates")
-        if solver.n_arts_by_size[size] != len(group):
+        if solver.forest.n_arts_by_size[size] != len(group):
             raise ValueError("Mixed tree factor count disagrees with its group map")
     if prescribed.size and np.any(qd[starts[prescribed + 1]] - qd[starts[prescribed]] != 6):
         raise ValueError("Prescribed cached roots must be six-coordinate free bodies")
     if not np.array_equal(np.sort(model.joint_child.numpy()), np.arange(model.body_count)):
         raise ValueError("Mixed tree cache must publish every body exactly once")
     return (
-        tuple(solver.size_groups),
-        tuple(sorted(solver.n_arts_by_size.items())),
+        tuple(solver.forest.size_groups),
+        tuple(sorted(solver.forest.n_arts_by_size.items())),
         compact,
         int(prescribed.size),
     )
@@ -164,7 +166,7 @@ def _size_group(solver, size, *, diagonal):
     """Size group ``size`` as a held group: whether its trees stand on free roots, their mass pattern, its metadata
     and its layout (:func:`.make_plan`). Raises ValueError where the trees do not fit a held group."""
     model = solver.model
-    first_art = int(solver.group_to_art[size].numpy()[0])
+    first_art = int(solver.forest.group_to_art[size].numpy()[0])
     starts = model.articulation_start.numpy()
     first, end = starts[first_art], starts[first_art + 1]
     parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
@@ -182,7 +184,9 @@ def _size_group(solver, size, *, diagonal):
     if diagonal and mass.nonzero_count != size:
         raise ValueError("Compact diagonal cache requires independent physical coordinates")
     host = operator_metadata(mass)
-    layout, _ = make_plan(model, _plan_view(solver.group_to_art[size], solver.art_to_world, host), complete=False)
+    layout, _ = make_plan(
+        model, _plan_view(solver.forest.group_to_art[size], solver.forest.art_to_world, host), complete=False
+    )
     return bool(free_root), mass, host, layout
 
 
@@ -190,7 +194,7 @@ def _prescribed_group(solver, group_to_art):
     """The prescribed free bodies as a held group: their mass pattern, metadata and layout (:func:`.make_plan`)."""
     mass = TreePlan.build([-1], [6]).factor
     host = operator_metadata(mass)
-    view = _plan_view(group_to_art, solver.art_to_world, host, prescribed=True)
+    view = _plan_view(group_to_art, solver.forest.art_to_world, host, prescribed=True)
     layout, _ = make_plan(solver.model, view, complete=False)
     return mass, host, layout
 
@@ -204,7 +208,7 @@ def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
     reason = options_decline(solver) or decline(solver, sparse=velocity_limits)
     if reason is not None:
         return reason
-    view = _plan_view(solver.group_to_art[size], solver.art_to_world, operator_metadata(plan))
+    view = _plan_view(solver.forest.group_to_art[size], solver.forest.art_to_world, operator_metadata(plan))
     try:
         make_plan(solver.model, view, complete=True)
     except ValueError as error:
@@ -224,7 +228,7 @@ def compact_decline(solver, size, *, scalar) -> str | None:
         return reason
     try:
         _coverage(solver, size)
-        for group_size in solver.size_groups:
+        for group_size in solver.forest.size_groups:
             if group_size != size or not scalar:
                 _size_group(solver, group_size, diagonal=group_size == size)
         prescribed = _prescribed_articulations(solver)
@@ -261,11 +265,11 @@ class TreeSparseOperator:
         s, n = self.solver, self.solver._sparse_mass_matrix_size
         wp.launch(
             self.refresh_kernel,
-            dim=s.n_arts_by_size[n] * 32,
+            dim=s.forest.n_arts_by_size[n] * 32,
             inputs=[
-                s.group_to_art[n],
+                s.forest.group_to_art[n],
                 s.mass_update_mask,
-                s.articulation_dof_start,
+                s.forest.articulation_dof_start,
                 self.kinetic_state.geometric,
                 s.R_by_size[n],
                 s._augmented_drive_row_by_dof,
@@ -288,7 +292,7 @@ class TreeHeldOperator:
         self.solver, self.size = solver, size
         self.requires_body_velocity = True
         device = solver.model.device
-        group = solver.group_to_art[size].numpy()
+        group = solver.forest.group_to_art[size].numpy()
         self.diagonal = size == solver._compact_diagonal_mass_size
         self.free_root, mass, self.host, self.layout = _size_group(solver, size, diagonal=self.diagonal)
         self.mass = mass
@@ -318,10 +322,10 @@ class TreeHeldOperator:
         if self.diagonal:
             wp.launch(
                 self.refresh_kernel,
-                dim=solver.n_arts_by_size[size] * size,
+                dim=solver.forest.n_arts_by_size[size] * size,
                 inputs=[
                     self.plan.group_to_art,
-                    solver.articulation_dof_start,
+                    solver.forest.articulation_dof_start,
                     solver.mass_update_mask,
                     self.geometry_index,
                     self.geometry_group,
@@ -337,10 +341,10 @@ class TreeHeldOperator:
         else:
             wp.launch(
                 self.refresh_kernel,
-                dim=solver.n_arts_by_size[size] * 32,
+                dim=solver.forest.n_arts_by_size[size] * 32,
                 inputs=[
-                    solver.n_arts_by_size[size],
-                    solver.articulation_dof_start,
+                    solver.forest.n_arts_by_size[size],
+                    solver.forest.articulation_dof_start,
                     solver.mass_update_mask,
                     self.plan.group_to_art,
                     solver.R_by_size[size],
@@ -429,10 +433,10 @@ def forest_families(solver):
         # Scalar branches own their size group outside any tree plan.
         return None
     model = solver.model
-    worlds = int(solver.world_count)
-    art_world = solver.art_to_world.numpy()
-    prescribed = solver._prescribed_articulation.numpy()
-    counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
+    worlds = int(solver.forest.world_count)
+    art_world = solver.forest.art_to_world.numpy()
+    prescribed = solver.forest.prescribed_articulation.numpy()
+    counts = np.diff([*solver.forest.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
     world_bounds, order = host_index.group_by(art_world, worlds)
     world_arts = np.diff(world_bounds)[:worlds]
     if not worlds or np.any(world_arts != world_arts[0]) or world_arts[0] == 0:
@@ -457,7 +461,7 @@ def forest_families(solver):
                 return None
         elif not 1 <= size <= 32 or solver._execution_plan.use_diagonal_mass(size):
             return None
-        group = solver.group_to_art[size].numpy()
+        group = solver.forest.group_to_art[size].numpy()
         if len(group) != worlds or not np.array_equal(art_world[group], np.arange(worlds)):
             return None
     return families
@@ -477,10 +481,10 @@ class ForestHeldOperator:
         self.free_root = True
         self.diagonal = False
         model, device = solver.model, solver.model.device
-        worlds = int(solver.world_count)
-        art_world = solver.art_to_world.numpy()
-        prescribed = solver._prescribed_articulation.numpy()
-        counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
+        worlds = int(solver.forest.world_count)
+        art_world = solver.forest.art_to_world.numpy()
+        prescribed = solver.forest.prescribed_articulation.numpy()
+        counts = np.diff([*solver.forest.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
         # Each world's articulations in ascending order, one row per world (forest_families admits equal counts).
         world_bounds, order = host_index.group_by(art_world, worlds)
         arts = order.reshape(worlds, int(world_bounds[1] - world_bounds[0])).astype(np.int32)
@@ -519,7 +523,7 @@ class ForestHeldOperator:
             offset = self.layout.root_offsets[r]
             if family < 0:
                 size = -family
-                group = solver.group_to_art[size].numpy()
+                group = solver.forest.group_to_art[size].numpy()
                 block = physical_index[offset : offset + size, offset : offset + size]
                 self.families.append(
                     (
@@ -532,7 +536,7 @@ class ForestHeldOperator:
                     )
                 )
                 continue
-            group = solver.group_to_art[family].numpy()
+            group = solver.forest.group_to_art[family].numpy()
             position = {int(a): g for g, a in enumerate(group)}
             factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
             index = leaf_index(physical_index[offset : offset + family, offset : offset + family])
@@ -569,10 +573,10 @@ class ForestHeldOperator:
                 size = -family
                 wp.launch(
                     kernel,
-                    dim=solver.n_arts_by_size[size] * size,
+                    dim=solver.forest.n_arts_by_size[size] * size,
                     inputs=[
-                        solver.group_to_art[size],
-                        solver.articulation_dof_start,
+                        solver.forest.group_to_art[size],
+                        solver.forest.articulation_dof_start,
                         solver.mass_update_mask,
                         geometry_index,
                         geometry_group,
@@ -588,12 +592,12 @@ class ForestHeldOperator:
                 continue
             wp.launch(
                 kernel,
-                dim=solver.n_arts_by_size[family] * 32,
+                dim=solver.forest.n_arts_by_size[family] * 32,
                 inputs=[
-                    solver.n_arts_by_size[family],
-                    solver.articulation_dof_start,
+                    solver.forest.n_arts_by_size[family],
+                    solver.forest.articulation_dof_start,
                     solver.mass_update_mask,
-                    solver.group_to_art[family],
+                    solver.forest.group_to_art[family],
                     solver.R_by_size[family],
                     schedule,
                     solver._augmented_drive_row_by_dof,
@@ -661,7 +665,9 @@ class HeldTree:
             )
         else:
             operators = [
-                TreeHeldOperator(solver, size) for size in solver.size_groups if scalar is None or size != scalar.size
+                TreeHeldOperator(solver, size)
+                for size in solver.forest.size_groups
+                if scalar is None or size != scalar.size
             ]
             if self.coverage[-1]:
                 operators.append(PrescribedRootOperator(solver))
@@ -713,13 +719,13 @@ class HeldTree:
 
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model
-        for size in solver.size_groups:
-            yield f"group_to_art[{size}]", solver.group_to_art[size]
+        for size in solver.forest.size_groups:
+            yield f"group_to_art[{size}]", solver.forest.group_to_art[size]
         yield "articulation_start", model.articulation_start
         yield "joint_qd_start", model.joint_qd_start
         yield "joint_child", model.joint_child
-        yield "articulation_dof_start", solver.articulation_dof_start
-        yield "prescribed_articulation", solver._prescribed_articulation
+        yield "articulation_dof_start", solver.forest.articulation_dof_start
+        yield "prescribed_articulation", solver.forest.prescribed_articulation
 
     def validate_model(self, flags=None):
         """Reject ownership changes before any cache or notification mutation.
@@ -736,8 +742,8 @@ class HeldTree:
         solver = self.solver
         if self.coverage is not None:
             sizes = (
-                tuple(solver.size_groups),
-                tuple(sorted(solver.n_arts_by_size.items())),
+                tuple(solver.forest.size_groups),
+                tuple(sorted(solver.forest.n_arts_by_size.items())),
                 solver._compact_diagonal_mass_size,
             )
             if (

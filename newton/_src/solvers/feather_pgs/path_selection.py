@@ -142,7 +142,7 @@ def route_selection(solver) -> dict:
     from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time flags
 
     return {
-        "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.n_arts_by_size.items()},
+        "articulations_by_dof": {str(int(size)): int(count) for size, count in solver.forest.n_arts_by_size.items()},
         # The test-only axis pins in force (SolverFeatherPGS._route_pins); empty in production.
         "pins": json_value(dict(solver._route_pins)),
         # The row laws every owner's admission reads (route_table.Laws).
@@ -507,7 +507,7 @@ def _sweep(solver) -> dict:
     if dense_split:
         dense = {"kernels": [_key(solver._pgs_solve_loop_kernel)]}
     free_body = None
-    if dense_split and solver._has_free_rigid_bodies:
+    if dense_split and solver.forest.has_free_rigid_bodies:
         free_body = _key(solver._pgs_solve_mf_loop_kernel)
     mf_meta_pack = None
     if solver._matrix_free:
@@ -799,18 +799,18 @@ def _velocity_limits(solver) -> dict:
         "rigid_body_limits": limits,
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
-        "free_body_rows": bool(limits and solver._free_rigid_body_count > 0),
+        "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
         # The law of split mode's free-body sweep (sweep.free_body_matrix_free) for these rows.
         "free_body_sweep_law": free_body_law,
         "free_body_sweep_law_reason": free_body_law_reason,
         # Split mode's clamp of the solved velocity of free roots (_stage6_clamp_rigid_velocity_limits).
-        "root_clamp": bool(limits and solver._has_root_free and not matrix_free),
+        "root_clamp": bool(limits and solver.forest.has_root_free and not matrix_free),
     }
 
 
 def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
     # Mirrors the free_body_matrix_free sweep of _sweep and the kernel selection of _init_tiled_kernels.
-    if solver._matrix_free or not solver._has_free_rigid_bodies:
+    if solver._matrix_free or not solver.forest.has_free_rigid_bodies:
         return None, "No split free-body sweep: CUDA solves the rows matrix-free, or there are no free rigid bodies."
     if solver._has_free_body_velocity_limit_rows:
         return "stateless", (
@@ -825,7 +825,7 @@ def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
 
 
 def _free_rigid_bodies(solver) -> dict:
-    count = int(solver._free_rigid_body_count)
+    count = int(solver.forest.free_rigid_body_count)
     owners = []
     if count:
         if not solver._matrix_free:
@@ -843,7 +843,7 @@ def _free_rigid_bodies(solver) -> dict:
             owners.append("matrix_free_rows")
     return {
         "count": count,
-        "mixed_worlds": bool(solver._has_mixed_contacts),
+        "mixed_worlds": bool(solver.forest.has_mixed_contacts),
         "owners": owners,
         "reason": "No free rigid bodies."
         if not count
@@ -910,7 +910,7 @@ def _friction(solver) -> dict:
 def _dynamics(solver) -> dict:
     return {
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
-        "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
+        "diagonal_mass_dofs": sorted(int(size) for size in solver.forest.diagonal_mass_sizes),
         # Response layout: whether J/Y are gathered per world or already world-indexed.
         "jy_world_aliased": bool(solver._jy_world_aliased),
         "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),
@@ -929,13 +929,13 @@ def _dynamics(solver) -> dict:
         # (routes.stages.unread_mass_dofs).
         "double_buffer_mass_matrix_clear_dofs": []
         if solver._memset_stream is None
-        else sorted(int(size) for size in solver.size_groups if size not in solver._plan.unread_mass_sizes),
+        else sorted(int(size) for size in solver.forest.size_groups if size not in solver._plan.unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
         "preelimination": bool(solver._preelim_active),
         "mimic_rows": int(solver._mimic_count or 0),
         "connect_rows": int(solver._connect_count or 0),
-        "loop_joints": bool(solver._has_loop_joints),
-        "prescribed_response": bool(solver._has_prescribed_response),
+        "loop_joints": bool(solver.forest.has_loop_joints),
+        "prescribed_response": bool(solver.forest.has_prescribed_response),
         "armature_floor": _armature_floor(solver),
     }
 

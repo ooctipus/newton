@@ -76,7 +76,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         H[:3, :3] = mass * np.eye(3)
         H[3:, 3:] = inertia
         H += armature * np.eye(6)
-        L = solver.L_by_size[6].numpy()[solver.art_group_idx.numpy()[0]].astype(np.float64)
+        L = solver.L_by_size[6].numpy()[solver.forest.art_group_idx.numpy()[0]].astype(np.float64)
         np.testing.assert_allclose((L @ L.T)[::-1, ::-1], H, rtol=1e-5, atol=1e-6)  # leaf-first: P H P^T = L L^T
         # The box is each row's one body (the ground has none): its side's Jacobian.
         J_a, J_b = (J[0, :rows] for J in free_body_jacobians(solver))

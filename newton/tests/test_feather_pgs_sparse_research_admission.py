@@ -20,12 +20,14 @@ class _TopologyReached(Exception):
     pass
 
 
-class _AdmissionProbe(SimpleNamespace):
+class _ForestProbe(SimpleNamespace):
     @property
-    def _model_plan(self):
+    def response_dof_count(self):
         # Stop after admission, before any factor planning or device allocation.
         raise _TopologyReached
 
+
+class _AdmissionProbe(SimpleNamespace):
     # The row laws, from the probe's fields as Laws.build reads a solver's (a CUDA model without gradients).
     @property
     def _laws(self):
@@ -44,7 +46,7 @@ class _AdmissionProbe(SimpleNamespace):
             preelimination=self._preelim_active,
             mimic=bool(self._mimic_count),
             connect=bool(self._connect_count),
-            loops=self._has_loop_joints,
+            loops=self.forest.has_loop_joints,
             iterations=self.pgs_iterations > 0,
             forward_cuda=True,
         )
@@ -74,9 +76,8 @@ def _eligible_solver():
         contact_compliance=False,
         _mimic_count=0,
         _connect_count=0,
-        _has_loop_joints=False,
         _sparse_diagonal_contact_solve=False,
-        _has_free_rigid_bodies=False,
+        forest=_ForestProbe(has_loop_joints=False, has_free_rigid_bodies=False),
     )
 
 
@@ -149,7 +150,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             with self.subTest(friction_anchors=anchors), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
                 solver._friction_anchors_enabled = anchors
-                solver._has_free_rigid_bodies = True
+                solver.forest.has_free_rigid_bodies = True
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertIn("free rigid bodies", solver._sparse_selection_reason)
@@ -180,7 +181,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
             solver._friction_anchors_enabled = True
-            solver._has_free_rigid_bodies = True
+            solver.forest.has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
             self.assertIsNone(solver._sparse_mass_matrix_size)
             self.assertIn("free rigid bodies", solver._sparse_selection_reason)

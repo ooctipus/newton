@@ -24,6 +24,7 @@ def publication(solver, state_in, state_aug, state_out, dt):
     return field_group.bind(
         PublicationData,
         solver=solver,
+        forest=solver.forest,
         model=solver.model,
         state_in=state_in,
         state_aug=state_aug,

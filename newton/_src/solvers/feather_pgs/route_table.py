@@ -106,7 +106,7 @@ class Laws:
             preelimination=bool(solver._preelim_active),
             mimic=bool(solver._mimic_count),
             connect=bool(solver._connect_count),
-            loops=bool(solver._has_loop_joints),
+            loops=bool(solver.forest.has_loop_joints),
             iterations=solver.pgs_iterations > 0,
             forward_cuda=bool(model.device.is_cuda and not model.requires_grad),
         )

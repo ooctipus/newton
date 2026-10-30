@@ -143,7 +143,7 @@ def _prepare_compliant_rows(self):
     dense_cfm = self.row_cfm.numpy()
     dense_target = self.target_velocity.numpy()
     # Without prescribed bodies Newton allocates only a (1, 1) placeholder.
-    mf_target = self.mf_target_velocity.numpy() if self._has_prescribed_response else None
+    mf_target = self.mf_target_velocity.numpy() if self.forest.has_prescribed_response else None
     active = 0
     skipped = 0
     seen_rows = set()

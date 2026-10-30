@@ -173,7 +173,7 @@ def _single_step(device, gap, approach_speed, velocity_iterations=4, mass=1.0):
     )
     dof_a = solver._debug_position_mf_dof_a.numpy()[0]
     dof_b = solver._debug_position_mf_dof_b.numpy()[0]
-    world_dofs = solver.world_dof_indices.numpy()[0]
+    world_dofs = solver.forest.world_dof_indices.numpy()[0]
     end_gaps = []
     for row in contact_rows:
         jv = 0.0

@@ -921,7 +921,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             pins = {"storage": "dense", **({"mf_storage": "streamed"} if request == "1" else {})}
             with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, pins):
                 solvers[request] = fpgs.SolverFeatherPGS(model, **options)
-        dofs = solvers["0"].max_world_dofs
+        dofs = solvers["0"].forest.max_world_dofs
         # The factor coordinates' bitmap (sweep_routes.FactorCoordinates): a word a 32 coordinates.
         bitmaps = (dofs + 31) // 32
         if 128 + 4 * (dofs + bitmaps + 320 + 12288) > device.max_shared_memory_per_block:

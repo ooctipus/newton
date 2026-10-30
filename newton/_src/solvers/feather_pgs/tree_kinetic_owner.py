@@ -232,7 +232,7 @@ class TreeKineticState:
         group_to_art = sparse_owner.plan.group_to_art.numpy()
         starts = model.articulation_start.numpy()
         q_starts = model.joint_q_start.numpy()
-        free_roots = solver._free_root_joint_indices
+        free_roots = solver.forest.free_root_joint_indices
         free_roots = free_roots.numpy() if free_roots is not None else []
         root_lookup = {int(joint): slot for slot, joint in enumerate(free_roots)}
         root_slot = np.empty(self.group_count, np.int32)
@@ -453,7 +453,7 @@ class TreeKineticState:
     def _dimensions(self):
         model = self.solver.model
         return (
-            self.solver.world_count,
+            self.solver.forest.world_count,
             model.world_count,
             model.articulation_count,
             model.body_count,
@@ -464,7 +464,7 @@ class TreeKineticState:
 
     def _mapping(self, name):
         return (
-            self.solver._free_root_joint_indices
+            self.solver.forest.free_root_joint_indices
             if name == "free_root_joint_indices"
             else getattr(self.sparse.plan, name)
         )
@@ -519,7 +519,7 @@ class TreeKineticState:
         """Invalidate current state for every owned articulation in selected worlds."""
         self.forget_continuity()
         cached_state_binding.invalidate(
-            self.solver.world_count,
+            self.solver.forest.world_count,
             world_mask,
             self._cache_to_art,
             self.sparse.plan.art_to_world,

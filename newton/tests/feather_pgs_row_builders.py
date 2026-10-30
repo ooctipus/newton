@@ -13,6 +13,7 @@ stand-in the record tests share. It defines no tests.
 
 import collections
 import contextlib
+import dataclasses
 from unittest import mock
 
 import warp as wp
@@ -75,9 +76,12 @@ def install_cpu_keyed_rows(solver):
     patches must take them before this call, since the owner binds the patch law here.
     """
     model = solver.model
-    solver.max_world_dofs = int(model.joint_dof_count) // solver.world_count
-    solver.articulation_world_dof_offset = wp.zeros(model.articulation_count, dtype=int, device=model.device)
-    solver.mf_constraint_count = wp.zeros(solver.world_count, dtype=int, device=model.device)
+    solver.forest = dataclasses.replace(
+        solver.forest,
+        max_world_dofs=int(model.joint_dof_count) // solver.forest.world_count,
+        articulation_world_dof_offset=wp.zeros(model.articulation_count, dtype=int, device=model.device),
+    )
+    solver.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     solver._ink_rows = 4
     solver._keyed_rows = keyed_rows.KeyedRows(solver)
 

@@ -373,7 +373,7 @@ class KeyedRows:
         self.keyed_rows = True
         self.layout, groups, starts, arts = direct_topology_plan(solver)
         self.prefix_layout = self.layout
-        dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
+        dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.dense_max_constraints
         self.data, self.prefix = KineticRows(), PrefixInput()
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
         self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
@@ -407,7 +407,7 @@ class KeyedRows:
         self.contact_input = None
         self.data.maps, self.data.prefix = m, p
         prefix = prefix_kernel(self.prefix_layout, PrefixInput, KineticRows)
-        wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
+        wp.launch_tiled(prefix, dim=[s.forest.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
     def produce_contacts(self, contact_input):
         """Bind the step's contact input; :meth:`finish_rows` writes the rows once the counts are final."""
@@ -436,7 +436,7 @@ class KeyedRows:
             )
         wp.launch_tiled(
             materialize_general_rows,
-            dim=[s.world_count],
+            dim=[s.forest.world_count],
             inputs=[
                 self.data,
                 self.data.contact,

@@ -724,8 +724,8 @@ def whitened_rows(jacobian, L) -> np.ndarray:
 def packed_coordinates(solver) -> np.ndarray:
     """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
     rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side)."""
-    sides, sizes = solver._row_sides.numpy(), solver.articulation_response_dof_count.numpy()
-    offsets = solver.articulation_world_dof_offset.numpy()
+    sides, sizes = solver._row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    offsets = solver.forest.articulation_world_dof_offset.numpy()
     dof = np.full((*sides.shape[:2], solver._packed_Z.shape[2]), -1, dtype=np.int32)
     for world, count in enumerate(solver.constraint_count.numpy()):
         for row in range(min(int(count), sides.shape[1])):
@@ -746,10 +746,10 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     side, the side's entries found by their coordinates)."""
     dof = packed_coordinates(solver)
     J, Z = solver._packed_J.numpy().astype(np.float64), solver._packed_Z.numpy().astype(np.float64)
-    sides, sizes = solver._row_sides.numpy(), solver.articulation_response_dof_count.numpy()
-    groups, offsets = solver.art_group_idx.numpy(), solver.articulation_world_dof_offset.numpy()
+    sides, sizes = solver._row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
     factors = {}
-    shape = (*dof.shape[:2], solver.max_world_dofs)
+    shape = (*dof.shape[:2], solver.forest.max_world_dofs)
     jacobian, response = np.zeros(shape), np.zeros(shape)
     for world, count in enumerate(solver.constraint_count.numpy()):
         for row in range(min(int(count), dof.shape[1])):

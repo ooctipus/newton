@@ -384,6 +384,14 @@ class TreePlan:
         return int(self.dof_start[-1])
 
     @property
+    def nonzero_count(self) -> int:
+        """Entries of the fill-free factor pattern's lower triangle (:meth:`factor`), at any size: a coordinate's
+        row holds itself, the coordinates before it on its node and every ancestor's. ``dof_count`` exactly when the
+        pattern is diagonal (a star)."""
+        above = self.scan_down(self.dofs) - self.dofs
+        return int(np.sum(self.dofs * above + self.dofs * (self.dofs + 1) // 2))
+
+    @property
     def max_depth(self) -> int:
         """Edges on the longest root-to-leaf path."""
         return int(self.depth.max()) if self.count else 0

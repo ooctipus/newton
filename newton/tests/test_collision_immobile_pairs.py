@@ -549,12 +549,12 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
             solver = newton.solvers.SolverFeatherPGS(model)
             shape_body = model.shape_body.numpy()
             body = np.maximum(shape_body, 0)
-            articulation = solver.body_to_articulation.numpy()[body]
+            articulation = solver.forest.body_to_articulation.numpy()[body]
             responds = (
                 (shape_body >= 0)
                 & (articulation >= 0)
-                & (solver.articulation_response_dof_count.numpy()[np.maximum(articulation, 0)] > 0)
-                & (solver.body_has_response_dofs.numpy()[body] != 0)
+                & (solver.forest.articulation_response_dof_count.numpy()[np.maximum(articulation, 0)] > 0)
+                & (solver.forest.body_has_response_dofs.numpy()[body] != 0)
                 & ((model.body_flags.numpy()[body] & int(BodyFlags.KINEMATIC)) == 0)
             )
             state = model.state()

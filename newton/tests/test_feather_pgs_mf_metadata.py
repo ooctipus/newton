@@ -3,6 +3,7 @@
 
 """Exercise MF metadata: parent indices beyond the signed-16-bit boundary and the pack launch policy."""
 
+import dataclasses
 import inspect
 import re
 import unittest
@@ -89,9 +90,8 @@ def _pack_state(has_free_rigid_bodies):
     state = SimpleNamespace(
         _pack_mf_meta_kernel=object(),
         _colored_units=None,
-        _has_free_rigid_bodies=has_free_rigid_bodies,
-        world_count=7,
         model=SimpleNamespace(device="mock-device"),
+        forest=SimpleNamespace(has_free_rigid_bodies=has_free_rigid_bodies, world_count=7),
     )
     for name in (
         "mf_constraint_count",
@@ -377,7 +377,7 @@ def _launch_pack_unconditionally(solver):
 
     def unconditional(mf_rhs):
         # The production launch, with the skip's only gate held open for the call.
-        with patch.object(solver, "_has_free_rigid_bodies", True):
+        with patch.object(solver, "forest", dataclasses.replace(solver.forest, has_free_rigid_bodies=True)):
             pack(solver, mf_rhs)
 
     solver._pack_mf_meta = unconditional
@@ -421,7 +421,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
                 runs = []
                 for unconditional in (False, True):
                     solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=velocity_iterations)
-                    self.assertFalse(solver._has_free_rigid_bodies)
+                    self.assertFalse(solver.forest.has_free_rigid_bodies)
                     # The pack kernel is built only where it launches.
                     self.assertIsNone(solver._pack_mf_meta_kernel)
                     if unconditional:
@@ -456,7 +456,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize(device=wp.get_device("cuda:0"))
         solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=2)
-        self.assertTrue(solver._has_free_rigid_bodies)
+        self.assertTrue(solver.forest.has_free_rigid_bodies)
         steps = 4
         packed, values = _step_matrix_free(model, solver, steps=steps)
         self.assertGreater(int(values["mf_constraint_count"].max()), 0)

@@ -69,7 +69,13 @@ def check_physics(test, device):
     wp.launch(
         update_body_qd_from_featherstone,
         model.body_count,
-        inputs=[aug.body_v_s, state.body_q, model.body_com, solver.body_to_articulation, solver.articulation_origin],
+        inputs=[
+            aug.body_v_s,
+            state.body_q,
+            model.body_com,
+            solver.forest.body_to_articulation,
+            solver.articulation_origin,
+        ],
         outputs=[state.body_qd],
         device=device,
     )
@@ -186,7 +192,7 @@ class _Stages:
     def mass_matrices(self) -> list:
         self.solver._stage1_fk_id(self.state, self.aug, self.out)
         self.solver._stage1_crba(self.aug, None)
-        return [self.solver.H_by_size[size] for size in self.solver.size_groups]
+        return [self.solver.H_by_size[size] for size in self.solver.forest.size_groups]
 
 
 def check_stage_mass_gradient(test, device):

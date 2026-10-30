@@ -177,7 +177,7 @@ def _solver_snapshot(solver):
         "joint_armature_effective": solver._joint_armature_effective,
         "fk_id_cache_valid": solver._fk_id_cache_valid,
         "mass_update_requested": solver._mass_update_requested,
-        **{f"R_by_size[{size}]": solver.R_by_size[size] for size in solver.size_groups},
+        **{f"R_by_size[{size}]": solver.R_by_size[size] for size in solver.forest.size_groups},
     }
     owner = solver._tree_kinetic_state
     for index, group in enumerate(getattr(owner, "groups", ())):
@@ -411,7 +411,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     for cached in ("off", "auto"):
                         model, box, probe = _pair_scene()
                         solver = _solver(model, beta, cached)
-                        self.assertTrue(solver._has_prescribed_response)
+                        self.assertTrue(solver.forest.has_prescribed_response)
                         if cached == "auto":
                             groups = solver._tree_kinetic_state.groups
                             if forest == "1":

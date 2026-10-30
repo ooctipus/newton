@@ -78,10 +78,10 @@ class PairedComponents:
     def __init__(self, solver):
         self.primary_size = int(solver._paired_response_primary_size)
         self.secondary_size = int(solver._paired_response_secondary_size)
-        self.world_count = solver.world_count
+        self.world_count = solver.forest.world_count
         self.data = PairedComponentData()
-        self.data.selector = wp.zeros(solver.world_count, dtype=wp.int32, device=solver.model.device)
-        self.workers = min(solver.world_count, 512)
+        self.data.selector = wp.zeros(solver.forest.world_count, dtype=wp.int32, device=solver.model.device)
+        self.workers = min(solver.forest.world_count, 512)
         from .response_builds_rows import paired_components_kernel  # noqa: PLC0415 - the build reads this module
 
         self.kernel = paired_components_kernel(self.primary_size, self.secondary_size)

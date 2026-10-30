@@ -174,14 +174,14 @@ class TestColoredSweep(unittest.TestCase):
         solver = solvers[-1]
         self.assertIsNotNone(solver._colored_units, "the tray's worlds take the colored mapping")
         host = {name: array.numpy() for name, array in solver._colored_units.units.items()}
-        metas = solver.mf_meta_packed.numpy().reshape(solver.world_count, solver.mf_max_constraints, 4)
+        metas = solver.mf_meta_packed.numpy().reshape(solver.forest.world_count, solver.mf_max_constraints, 4)
         return solver, host, metas
 
     def test_units_follow_the_host_rules(self):
         """Units, row-order levels and the slot records by color equal the host reference's."""
         solver, host, metas = self._built()
         counts, ends = solver.mf_constraint_count.numpy(), solver.mf_contact_rows_end.numpy()
-        for world in range(solver.world_count):
+        for world in range(solver.forest.world_count):
             want = reference_units(metas[world], int(counts[world]), int(ends[world]))
             slot = int(host["world_slot"][world])
             units = int(host["unit_count"][world])
@@ -193,7 +193,7 @@ class TestColoredSweep(unittest.TestCase):
             np.testing.assert_array_equal(host["color_offset"][slot, : colors + 1], want["color_offset"])
             np.testing.assert_array_equal(host["color_slot"][slot, :units], want["color_slot"])
         stats = solver._colored_units.stats()
-        self.assertEqual(len(stats), solver.world_count)
+        self.assertEqual(len(stats), solver.forest.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))
         self.assertFalse(solver._colored_units.capacity_status())
 
@@ -202,7 +202,7 @@ class TestColoredSweep(unittest.TestCase):
         solver, _, _ = self._built()
         record = solver.get_path_selection()["routes"]["sweep"]["mf_colored"]
         units = solver._colored_units
-        self.assertEqual(record["capable_worlds"], solver.world_count)
+        self.assertEqual(record["capable_worlds"], solver.forest.world_count)
         self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
         arrays = (*units.units.values(), *units.slots.values(), units.slot_world, units.status)
         self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
@@ -215,7 +215,7 @@ class TestColoredSweep(unittest.TestCase):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
         solver, host, metas = self._built()
         parents = metas[:, :, 3] >> 16
-        for world in range(solver.world_count):
+        for world in range(solver.forest.world_count):
             slot = int(host["world_slot"][world])
             offsets = host["color_offset"][slot]
             for color in range(int(host["color_count"][world])):
@@ -232,7 +232,7 @@ class TestColoredSweep(unittest.TestCase):
     def test_colors_keep_the_row_order(self):
         """Units that share a body run in row order: the earlier one takes the lower color."""
         solver, host, _ = self._built()
-        for world in range(solver.world_count):
+        for world in range(solver.forest.world_count):
             slot, last = int(host["world_slot"][world]), {}
             for unit in range(int(host["unit_count"][world])):
                 color = int(host["unit_color"][slot, unit])

@@ -4,6 +4,7 @@
 """CPU tests for the predictor-resolved world classifier."""
 
 import ast
+import dataclasses
 import inspect
 import itertools
 import os
@@ -494,8 +495,11 @@ class TestResolvedWorlds(unittest.TestCase):
                 )
                 # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
                 # which the mocked decision launch never reads.
-                solver.world_dof_indices = wp.zeros((model.world_count, 1), dtype=int, device="cpu")
-                solver.world_dof_count = wp.zeros(model.world_count, dtype=int, device="cpu")
+                solver.forest = dataclasses.replace(
+                    solver.forest,
+                    world_dof_indices=wp.zeros((model.world_count, 1), dtype=int, device="cpu"),
+                    world_dof_count=wp.zeros(model.world_count, dtype=int, device="cpu"),
+                )
                 with patch.object(rw, "decline", return_value=None):
                     owner = rw.ResolvedWorlds(solver)
                 with patch.object(rw, "launch") as launch:
@@ -524,13 +528,15 @@ def _admissible_solver():
         _keyed_rows=None,
         drive_slot=None,
         model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
-        max_world_dofs=29,
-        world_dof_indices=1,
-        world_dof_count=1,
-        body_response_dof_mask=1,
-        body_has_response_dofs=1,
         _joint_limit_q_index=1,
         _route_pins={},
+        forest=SimpleNamespace(
+            max_world_dofs=29,
+            world_dof_indices=1,
+            world_dof_count=1,
+            body_response_dof_mask=1,
+            body_has_response_dofs=1,
+        ),
     )
     for name in (
         "enable_bilateral_preelimination",

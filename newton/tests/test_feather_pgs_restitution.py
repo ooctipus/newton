@@ -814,8 +814,8 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
     test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
     test.assertFalse(solver._debug_buffers_enabled)
     test.assertIsNone(solver._debug_position_v_out)
-    test.assertEqual(solver.row_restitution.shape, (solver.world_count, solver.dense_max_constraints))
-    test.assertEqual(solver.mf_row_restitution.shape, (solver.world_count, solver.mf_max_constraints))
+    test.assertEqual(solver.row_restitution.shape, (solver.forest.world_count, solver.dense_max_constraints))
+    test.assertEqual(solver.mf_row_restitution.shape, (solver.forest.world_count, solver.mf_max_constraints))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):

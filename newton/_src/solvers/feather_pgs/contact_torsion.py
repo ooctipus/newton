@@ -357,7 +357,7 @@ def prepare_torsion_velocity_pass(solver, dt):
     """
     wp.launch(
         _prepare_velocity_torsion_rows,
-        dim=solver.world_count * solver.dense_max_constraints,
+        dim=solver.forest.world_count * solver.dense_max_constraints,
         inputs=[
             solver.constraint_count,
             solver.dense_max_constraints,
@@ -366,7 +366,7 @@ def prepare_torsion_velocity_pass(solver, dt):
             solver.phi,
             solver.target_velocity,
             solver.v_out_snap,
-            solver.world_dof_indices,
+            solver.forest.world_dof_indices,
             solver._row_support(),
             solver._packed_J,
             dt,
@@ -411,16 +411,16 @@ def prepare_torsion_rows(solver, state, augmented_state, contacts):
     # The rows' Jacobians: the packed rows (packed_rows, by world) or each size group's.
     packed = solver._mf_sweeps
     jacobians = {0: solver._packed_J.numpy()} if packed else {size: a.numpy() for size, a in solver.J_by_size.items()}
-    art_offset = solver.articulation_world_dof_offset.numpy() if packed else None
-    body_joint = solver.body_to_joint.numpy()
-    body_art = solver.body_to_articulation.numpy()
+    art_offset = solver.forest.articulation_world_dof_offset.numpy() if packed else None
+    body_joint = solver.forest.body_to_joint.numpy()
+    body_art = solver.forest.body_to_articulation.numpy()
     ancestor = solver.model.joint_ancestor.numpy()
     qd_start = solver.model.joint_qd_start.numpy()
-    art_start = solver.articulation_dof_start.numpy()
-    art_size = solver.articulation_response_dof_count.numpy()
-    art_group = solver.art_group_idx.numpy()
+    art_start = solver.forest.articulation_dof_start.numpy()
+    art_size = solver.forest.articulation_response_dof_count.numpy()
+    art_group = solver.forest.art_group_idx.numpy()
     motions = augmented_state.joint_S_s.numpy()
-    prescribed = solver._prescribed_articulation.numpy()
+    prescribed = solver.forest.prescribed_articulation.numpy()
     body_velocities = augmented_state.body_v_s.numpy()
     for group in groups:
         world = group[0].world

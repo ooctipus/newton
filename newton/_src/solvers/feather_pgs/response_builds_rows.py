@@ -556,8 +556,8 @@ FREE_BODY_Z = FreeBodyZBuild(
 
 
 COMPACT_BOUNDARY = (
-    Field("body_single_dof", wp.int32, ("body",), attr="body_single_response_dof"),
-    Field("dof_offset", wp.int32, ("articulation",), attr="articulation_world_dof_offset"),
+    Field("body_single_dof", wp.int32, ("body",), owner="forest", attr="body_single_response_dof"),
+    Field("dof_offset", wp.int32, ("articulation",), owner="forest", attr="articulation_world_dof_offset"),
     Field("inverse_mass", wp.float32, ("dof",), attr="_diagonal_inverse_mass"),
     Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
     Field("factor", wp.float32, ("group", 6, 6), owner="six"),

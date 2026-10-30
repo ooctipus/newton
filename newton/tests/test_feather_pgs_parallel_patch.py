@@ -409,12 +409,12 @@ def split_world_case(solver, world=0):
     )
     if unmodelled:
         raise ValueError(f"split_world_case models contact, friction and limit rows only, not row types {unmodelled}")
-    worlds, starts = solver.art_to_world.numpy(), solver.articulation_dof_start.numpy()
+    worlds, starts = solver.forest.art_to_world.numpy(), solver.forest.articulation_dof_start.numpy()
     predicted = solver.v_hat.numpy().astype(np.float64)
     blocks = []
-    for size in solver.size_groups:
+    for size in solver.forest.size_groups:
         jacobian, response = solver.J_by_size[size].numpy(), solver.Y_by_size[size].numpy()
-        for group, art in enumerate(solver.group_to_art[size].numpy()):
+        for group, art in enumerate(solver.forest.group_to_art[size].numpy()):
             if worlds[art] == world:
                 start = int(starts[art])
                 blocks.append(
@@ -782,7 +782,7 @@ class TestParallelPatchReference(unittest.TestCase):
         with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.2)
         _rollout(model, solver, 1)
-        (size,) = solver.size_groups
+        (size,) = solver.forest.size_groups
         mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
         case = with_velocity_limit_rows(split_world_case(solver)[0], mass_matrix, limits, solver.pgs_cfm)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
@@ -827,7 +827,7 @@ def _linked_rows(solver, state, contacts, dt):
         finalize(self, step_contacts)
         if self is solver:
             rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
-            rows["J"] = {size: self.J_by_size[size].numpy().copy() for size in self.size_groups}
+            rows["J"] = {size: self.J_by_size[size].numpy().copy() for size in self.forest.size_groups}
             raise _RowsBuilt
 
     with patch.object(SolverFeatherPGS, "_finalize_constraint_status", capture):
@@ -1209,11 +1209,10 @@ class TestTierRule(unittest.TestCase):
             fuse_joint_velocity_limits=False,
             _paired_factor_coordinates=False,
             _local_internal_fast_path=False,
-            _has_free_rigid_bodies=True,
-            _has_non_free_articulations=True,
             _parallel_contact_paths=True,
             _parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
             _build_inkernel_response_meta=lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
+            forest=SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=True),
         )
         for name, value in changes.items():
             setattr(probe, name, value)
@@ -1236,8 +1235,8 @@ class TestTierRule(unittest.TestCase):
             ({"_preelim_active": True}, "pre-elimination"),
             ({"_local_internal_fast_path": True}, "case K3"),
             ({"_paired_factor_coordinates": True}, "case K5"),
-            ({"_has_free_rigid_bodies": False}, "case K4"),
-            ({"_has_non_free_articulations": False}, "case K4"),
+            ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
+            ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
             ({"fuse_joint_velocity_limits": True}, "fused velocity clamp"),
             ({"_parallel_contact_paths": False, "_parallel_contact_paths_reason": regularized}, "regularization"),
             ({"_route_pins": {"placement": "general"}}, "general placement"),

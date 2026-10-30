@@ -138,10 +138,10 @@ class StepPlan:
             response=MappingProxyType(response),
             delassus=MappingProxyType(_delassus(solver, solve)),
             solve=solve,
-            unread_mass_sizes=tuple(solver.size_groups) if held else (),
+            unread_mass_sizes=tuple(solver.forest.size_groups) if held else (),
             jacobian_clear_sizes=()
             if solver._row_packets is not None or solver._keyed_rows is not None
-            else tuple(size for size in solver.size_groups if solver._memset_clears_jacobian(size)),
+            else tuple(size for size in solver.forest.size_groups if solver._memset_clears_jacobian(size)),
         )
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:
@@ -176,7 +176,7 @@ def _factor(solver) -> dict[int, Route]:
     plan = solver._execution_plan
     held = solver._tree_kinetic_state is not None
     routes = {}
-    for size in solver.size_groups:
+    for size in solver.forest.size_groups:
         if size == solver._compact_diagonal_mass_size:
             route = "none", "The compact diagonal size stores its inverse mass directly; no dense factor."
         elif size == solver._sparse_mass_matrix_size:
@@ -198,7 +198,7 @@ def _trisolve(solver) -> dict[int, Route]:
     choice = solver.trisolve_kernel
     threshold = f"Automatic DOF threshold {solver.small_dof_threshold}."
     routes = {}
-    for size in solver.size_groups:
+    for size in solver.forest.size_groups:
         if size == solver._sparse_mass_matrix_size:
             route = "sparse", "Native sparse factors solve in factor coordinates."
         elif size == solver._compact_diagonal_mass_size:
@@ -215,7 +215,7 @@ def _trisolve(solver) -> dict[int, Route]:
 
 def _response(solver, solve: SolveRoute) -> dict[int, Route]:
     plan = solver._execution_plan
-    sizes = solver.size_groups
+    sizes = solver.forest.size_groups
     owner = solver._compact_contact_boundary or solver._sparse_mass_matrix_size is not None
     routes = {}
     for size in sizes:
@@ -268,7 +268,7 @@ def _delassus(solver, solve: SolveRoute) -> dict[int, Route]:
     if not solve.assembles_delassus:
         return {}
     return dict.fromkeys(
-        solver.size_groups, Route("entries", "The CPU assembles each Delassus entry on its own thread.")
+        solver.forest.size_groups, Route("entries", "The CPU assembles each Delassus entry on its own thread.")
     )
 
 
@@ -277,7 +277,7 @@ def _solve(solver) -> SolveRoute:
     dense_split = not matrix_free
     if matrix_free:
         family = "matrix_free"
-    elif solver._has_mixed_contacts:
+    elif solver.forest.has_mixed_contacts:
         family = "split_interleaved"
     else:
         family = "dense_split"
@@ -307,7 +307,11 @@ def _solve(solver) -> SolveRoute:
         driver = Route(
             "dense_split",
             "One dense dispatch sweeps all iterations"
-            + ("; one matrix-free dispatch then sweeps the free-body rows." if solver._has_free_rigid_bodies else "."),
+            + (
+                "; one matrix-free dispatch then sweeps the free-body rows."
+                if solver.forest.has_free_rigid_bodies
+                else "."
+            ),
         )
     elif solver.pgs_debug:
         driver = Route(

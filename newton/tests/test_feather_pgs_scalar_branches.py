@@ -288,7 +288,7 @@ def ordinary_inverse_mass(solver, size):
     """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its leaf-first diagonal
     factor (``L_jj = sqrt(H_ii + R_i)``, ``i = n - 1 - j``), for every coordinate (zero outside the group)."""
     factor = solver.L_by_size[size].numpy().astype(np.float64)
-    starts = solver.articulation_dof_start.numpy()[solver.group_to_art[size].numpy()]
+    starts = solver.forest.articulation_dof_start.numpy()[solver.forest.group_to_art[size].numpy()]
     inverse = np.zeros(solver.model.joint_dof_count)
     for group, start in enumerate(starts):
         inverse[start : start + size] = 1.0 / np.diagonal(factor[group])[::-1] ** 2
@@ -356,9 +356,9 @@ def _linear_state_plan(solver):
     """Shorten each branch articulation's joint pass to its root and map every leaf body to its joint."""
     model = solver.model
     starts = model.articulation_start.numpy()
-    ends = solver.articulation_joint_end.numpy().copy()
+    ends = solver.forest.articulation_joint_end.numpy().copy()
     body_joint = np.full(model.body_count, -1, dtype=np.int32)
-    for art in solver.group_to_art[solver._compact_diagonal_mass_size].numpy():
+    for art in solver.forest.group_to_art[solver._compact_diagonal_mass_size].numpy():
         joints = np.arange(starts[art] + 1, ends[art], dtype=np.int32)
         body_joint[model.joint_child.numpy()[joints]] = joints
         ends[art] = starts[art] + 1
@@ -667,8 +667,8 @@ class _PrismaticRoute:
         self.solver, model = solver, solver.model
         self.model, self.device = model, model.device
         self.size = solver._compact_diagonal_mass_size
-        self.group = solver.group_to_art[self.size]
-        self.offsets = solver._crba_dof_joint_offset_by_size[self.size]
+        self.group = solver.forest.group_to_art[self.size]
+        self.offsets = solver.forest.crba_dof_joint_offset_by_size[self.size]
         self.joint_end, self.body_joint = _linear_state_plan(solver)
         self.previous = wp.zeros(model.articulation_count, dtype=int, device=self.device)
         self.inverse_mass = _linear_inverse_mass_kernel(self.size)
@@ -697,7 +697,7 @@ class _PrismaticRoute:
                 model.joint_X_c,
                 s.body_X_com,
                 model.joint_axis,
-                s.body_to_articulation,
+                s.forest.body_to_articulation,
                 model.body_mass,
                 s.articulation_origin,
                 model.gravity,
@@ -739,7 +739,7 @@ class _PrismaticRoute:
             dim=count,
             inputs=[
                 model.articulation_start,
-                s.articulation_dof_start,
+                s.forest.articulation_dof_start,
                 s.mass_update_mask,
                 model.joint_child,
                 s.joint_S_s,
@@ -757,7 +757,7 @@ class _PrismaticRoute:
         wp.launch(
             _apply_inverse_mass,
             dim=count,
-            inputs=[s._diagonal_inverse_mass, self.group, s.articulation_dof_start, size, s.joint_tau],
+            inputs=[s._diagonal_inverse_mass, self.group, s.forest.articulation_dof_start, size, s.joint_tau],
             outputs=[s.joint_qdd],
             device=self.device,
         )
@@ -821,7 +821,7 @@ class _PrismaticRoute:
                 s.body_X_com,
                 model.joint_axis,
                 s.joint_S_s,
-                s.body_to_articulation,
+                s.forest.body_to_articulation,
                 state_out.body_q,
                 s.body_q_com,
                 model.body_mass,
@@ -856,7 +856,7 @@ class _Pair:
             for name in DROPPED_FIELDS:
                 getattr(self.mine, name).fill_(float("nan"))
         starts = model.articulation_start.numpy()
-        self.arts = self.mine.group_to_art[size].numpy()
+        self.arts = self.mine.forest.group_to_art[size].numpy()
         self.bodies = np.concatenate([model.joint_child.numpy()[starts[a] : starts[a + 1]] for a in self.arts])
         self.coordinates = np.concatenate(
             [model.joint_q_start.numpy()[starts[a] + 1] + np.arange(size) for a in self.arts]
@@ -1050,7 +1050,10 @@ class TestScalarBranchRule(unittest.TestCase):
                 self.assertIn("run as scalar branches", reason)
                 starts = model.articulation_start.numpy()
                 expected = np.concatenate(
-                    [model.joint_qd_start.numpy()[starts[a] + 1] + np.arange(7) for a in solver.group_to_art[7].numpy()]
+                    [
+                        model.joint_qd_start.numpy()[starts[a] + 1] + np.arange(7)
+                        for a in solver.forest.group_to_art[7].numpy()
+                    ]
                 )
                 np.testing.assert_array_equal(plan.dofs, np.sort(expected))
                 # A plan holds an array, so it compares and hashes by identity.
@@ -1073,12 +1076,12 @@ class TestScalarBranchRule(unittest.TestCase):
             with self.subTest(leaves=leaves):
                 model = build_branch_model(worlds=2, leaves=leaves, shapes=True)
                 solver = SolverFeatherPGS(model, enable_joint_limits=True)
-                self.assertEqual(sorted(solver.size_groups), sorted((leaves, ARM_DOFS)))
-                self.assertEqual(set(solver._diagonal_mass_sizes), {leaves})
+                self.assertEqual(sorted(solver.forest.size_groups), sorted((leaves, ARM_DOFS)))
+                self.assertEqual(set(solver.forest.diagonal_mass_sizes), {leaves})
         # An arm-sized star joins the arm's group: no diagonal-mass size is left to admit.
         model = build_branch_model(worlds=2, leaves=ARM_DOFS, shapes=True)
         solver = SolverFeatherPGS(model, enable_joint_limits=True)
-        self.assertEqual((solver.size_groups, set(solver._diagonal_mass_sizes)), ([ARM_DOFS], set()))
+        self.assertEqual((solver.forest.size_groups, set(solver.forest.diagonal_mass_sizes)), ([ARM_DOFS], set()))
 
     def test_other_topologies_are_declined(self):
         """Decline chains, multi-coordinate leaves, welded descendants and roots that move."""
@@ -1116,16 +1119,36 @@ class TestScalarBranchRule(unittest.TestCase):
         q_index = solver._augmented_drive_q_index_by_dof.numpy()
         q_index[plan.dofs[0]] += 1
         q_index = wp.array(q_index, dtype=int, device=model.device)
-        offsets = dict(solver._crba_dof_joint_offset_by_size)
+        offsets = dict(solver.forest.crba_dof_joint_offset_by_size)
         offsets[7] = wp.array(np.roll(np.arange(1, 8), 1), dtype=int, device=model.device)
-        for attribute, value, words in (
-            ("enable_joint_velocity_limits", True, "velocity limits"),
-            ("_direct_diagonal_inertia_sizes", frozenset(), "do not each move one body"),
-            ("_crba_dof_joint_offset_by_size", offsets, "do not follow its leaves"),
-            ("_parallel_augmented_drive_topology", False, "owned drive-row topology"),
-            ("_augmented_drive_q_index_by_dof", q_index, "do not read its leaf coordinates"),
+        for label, attribute, value, words in (
+            ("enable_joint_velocity_limits", "enable_joint_velocity_limits", True, "velocity limits"),
+            (
+                "forest.direct_diagonal_inertia_sizes",
+                "forest",
+                dataclasses.replace(solver.forest, direct_diagonal_inertia_sizes=frozenset()),
+                "do not each move one body",
+            ),
+            (
+                "forest.crba_dof_joint_offset_by_size",
+                "forest",
+                dataclasses.replace(solver.forest, crba_dof_joint_offset_by_size=offsets),
+                "do not follow its leaves",
+            ),
+            (
+                "_parallel_augmented_drive_topology",
+                "_parallel_augmented_drive_topology",
+                False,
+                "owned drive-row topology",
+            ),
+            (
+                "_augmented_drive_q_index_by_dof",
+                "_augmented_drive_q_index_by_dof",
+                q_index,
+                "do not read its leaf coordinates",
+            ),
         ):
-            with self.subTest(attribute=attribute), mock.patch.object(solver, attribute, value):
+            with self.subTest(attribute=label), mock.patch.object(solver, attribute, value):
                 plan, reason = sb.plan_scalar_branches(solver)
                 self.assertIsNone(plan)
                 self.assertIn(words, reason)
@@ -1322,7 +1345,7 @@ class TestScalarBranchKernels(unittest.TestCase):
                     q[pair.coordinates[: pair.plan.size]] -= 0.001
                     current.joint_q.assign(q)
                 pair.head._fk_id_cache_valid.assign(
-                    np.where(pair.head.art_to_world.numpy() == 0, 0, 1).astype(np.int32)
+                    np.where(pair.head.forest.art_to_world.numpy() == 0, 0, 1).astype(np.int32)
                 )
                 pair.state.invalidate(mask)
                 np.testing.assert_array_equal(pair.mine._fk_id_cache_valid.numpy()[pair.arts], [0] + [1] * (worlds - 1))

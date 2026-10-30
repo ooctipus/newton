@@ -118,7 +118,7 @@ class RowOrder:
         device = solver.model.device
         wp.launch(
             _order,
-            dim=solver.world_count,
+            dim=solver.forest.world_count,
             inputs=[
                 solver.constraint_count,
                 solver.row_type,

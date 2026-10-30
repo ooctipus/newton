@@ -57,7 +57,7 @@ def _generations(owner):
 
 def _group_worlds(solver, owner):
     """The world of every cache group, aligned with :func:`_generations`."""
-    art_to_world = solver.art_to_world.numpy()
+    art_to_world = solver.forest.art_to_world.numpy()
     return [art_to_world[group.sparse.plan.group_to_art.numpy()] for group in _groups(owner)]
 
 
@@ -1761,7 +1761,6 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             return {size: object() for size in sizes}
 
         solver = SimpleNamespace(
-            size_groups=list(sizes),
             _compact_diagonal_mass_size=2,
             _sparse_mass_matrix_size=None,
             _tree_kinetic_state=None,
@@ -1776,13 +1775,14 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             _paired_response_primary_size=None,
             _paired_factor_coordinates=False,
             model=SimpleNamespace(device="cpu"),
-            n_arts_by_size=dict.fromkeys(sizes, 3),
             tile_threads=64,
             mass_update_mask=object(),
             H_by_size=opaque(),
             R_by_size=opaque(),
             L_by_size=opaque(),
-            group_to_art=opaque(),
+            forest=SimpleNamespace(
+                size_groups=list(sizes), n_arts_by_size=dict.fromkeys(sizes, 3), group_to_art=opaque()
+            ),
         )
         solver._tree_kinetic_state = object()
         held = step_plan._factor(solver)
@@ -1824,7 +1824,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         factor = SolverFeatherPGS._stage2_factor
         with patch.object(SolverFeatherPGS, "_stage2_factor", autospec=True, side_effect=factor) as recorded:
             solver.step(state_in, state_out, model.control(), None, DT)
-        self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.size_groups))
+        self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.forest.size_groups))
         self.assertTrue(all(call.args[0] is solver for call in recorded.call_args_list))
 
     def test_owner_stage1_writes_no_mass_matrix(self):
@@ -1890,7 +1890,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 self.assertEqual(solver._tree_kinetic_state is not None, owner)
                 self.assertIsNotNone(solver._memset_stream)
                 record = solver.get_path_selection()["routes"]["dynamics"]["double_buffer_mass_matrix_clear_dofs"]
-                self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.size_groups))
+                self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.forest.size_groups))
                 matrices = _mass_matrices(solver)
                 rollout = _Rollout(model, solver)
                 zeroed, zero = [], wp.array.zero_
@@ -1904,7 +1904,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                         rollout.step()
                 cleared = {(slot, size) for slot, size, array in matrices if any(array is z for z in zeroed)}
                 # With update_mass_matrix_interval=2 the refresh steps use slot 0 alone.
-                expected = set() if owner else {(0, int(size)) for size in solver.size_groups}
+                expected = set() if owner else {(0, int(size)) for size in solver.forest.size_groups}
                 self.assertEqual(cleared, expected)
 
     @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")

@@ -53,7 +53,7 @@ _ROW_ARRAYS = (
 def _arrays(solver):
     """Host copies of the whole row arrays and Jacobian blocks, the slots past each world's row count included."""
     arrays = {name: getattr(solver, name).numpy().copy() for name in _ROW_ARRAYS}
-    arrays.update({f"J_by_size[{size}]": solver.J_by_size[size].numpy().copy() for size in solver.size_groups})
+    arrays.update({f"J_by_size[{size}]": solver.J_by_size[size].numpy().copy() for size in solver.forest.size_groups})
     # The matrix-free sweeps' producers write the packed rows (a placeholder otherwise).
     arrays["_packed_J"] = solver._packed_J.numpy().copy()
     return arrays
@@ -72,8 +72,8 @@ def _rows(solver, contacts):
     count = len(solver.contact_slot.numpy())
     slot, needed = solver.contact_slot.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
     arts = (solver.contact_art_a.numpy()[:count], solver.contact_art_b.numpy()[:count])
-    dofs, groups = solver.articulation_response_dof_count.numpy(), solver.art_group_idx.numpy()
-    jacobians = {size: solver.J_by_size[size].numpy() for size in solver.size_groups}
+    dofs, groups = solver.forest.articulation_response_dof_count.numpy(), solver.forest.art_group_idx.numpy()
+    jacobians = {size: solver.J_by_size[size].numpy() for size in solver.forest.size_groups}
     for c, record in records.items():
         rows = slice(int(slot[c]), int(slot[c]) + int(needed[c]))
         record["jacobian"] = np.concatenate(
@@ -335,7 +335,7 @@ class TestMaskedPatchRows(unittest.TestCase):
         _, general, general_methods = _rollout(model, masked=False, steps=1, pins=dense, **options)
         self.assertEqual(methods, {"masked_combined"})
         self.assertEqual(general_methods, {"per_contact"})
-        self.assertTrue(solver._has_prescribed_response)
+        self.assertTrue(solver.forest.has_prescribed_response)
         self.assertFalse(solver._compact_contact_jacobian)
         (rows, _, _), (expected, _, _) = masked[0], general[0]
         assert_rows_close(rows, expected, atol=_CUDA_ROW_TOLERANCE, rtol=_CUDA_ROW_TOLERANCE)

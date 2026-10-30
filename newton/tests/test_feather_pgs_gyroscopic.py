@@ -275,8 +275,8 @@ class TestFeatherPGSGyroscopic(unittest.TestCase):
         solver.v_hat.assign(explicit)
         wp.launch(
             kernels.apply_free_root_transport_to_predictor,
-            dim=solver._free_root_joint_count,
-            inputs=[solver._free_root_joint_indices, model.joint_qd_start, solver._kinematic_joint_mask, qd, dt],
+            dim=solver.forest.free_root_joint_count,
+            inputs=[solver.forest.free_root_joint_indices, model.joint_qd_start, solver._kinematic_joint_mask, qd, dt],
             outputs=[solver.v_hat],
             device=model.device,
         )

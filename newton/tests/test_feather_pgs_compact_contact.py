@@ -315,8 +315,9 @@ def run_candidate(data, aux, law=None):
     )
 
 
-# Solver attributes that launch_contacts binds, by the struct field they fill.
+# Solver and forest-plan attributes that launch_contacts binds, by the struct field they fill.
 _LAUNCH_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "solver"}
+_FOREST_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "forest"}
 
 
 def launch_solver(data, aux, *, anchors, beta=0.0):
@@ -327,7 +328,7 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
     """
     return SimpleNamespace(
         **{name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()},
-        world_count=2,
+        forest=SimpleNamespace(**{name: getattr(data, field) for name, field in _FOREST_FIELDS.items()}, world_count=2),
         slot_counter=aux.counts,
         dense_phase_bounds=aux.bounds,
         model=SimpleNamespace(device=aux.device, shape_body=data.shape_body),

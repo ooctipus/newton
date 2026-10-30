@@ -675,7 +675,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({}, False, False, True, 32, True, True, "full ordered sweep"),
             ({}, False, False, True, 16, True, False, "16-lane"),
             ({}, False, True, True, 32, True, False, "Velocity-limit"),
-            ({"_has_free_rigid_bodies": True}, False, False, True, 32, True, False, "free-body"),
+            ({"forest": SimpleNamespace(has_free_rigid_bodies=True)}, False, False, True, 32, True, False, "free-body"),
             ({}, True, False, False, 32, True, False, "support table"),
             ({}, True, False, True, 32, False, False, "room for contact units"),
             ({"_route_pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
@@ -684,7 +684,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({"_friction_anchors_enabled": False}, True, False, True, 32, True, True, "point contacts fuse"),
         )
         for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
-            probe = SimpleNamespace(_friction_anchors_enabled=True, _has_free_rigid_bodies=False, _route_pins={})
+            probe = SimpleNamespace(
+                _friction_anchors_enabled=True, _route_pins={}, forest=SimpleNamespace(has_free_rigid_bodies=False)
+            )
             for name, value in changes.items():
                 setattr(probe, name, value)
             with self.subTest(changes=changes, active=active, velocity=velocity, table=table, lanes=lanes, fits=fits):

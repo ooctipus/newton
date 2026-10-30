@@ -130,7 +130,6 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
     )
     solver = SimpleNamespace(
         model=model,
-        world_count=worlds,
         dense_max_constraints=dense,
         _max_contacts_alloc=capacity,
         _contact_torsion_shape_set=None,
@@ -150,19 +149,24 @@ def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cp
         _contact_torsion_group=full((worlds, dense), -1),
         pgs_cfm=0.003,
         contact_torsion_radius=0.01,
-        body_to_joint=arr(np.arange(worlds * 2, dtype=np.int32), int),
-        body_to_articulation=arr(np.arange(worlds * 2, dtype=np.int32), int),
-        articulation_dof_start=arr(starts[:-1], int),
-        articulation_response_dof_count=arr(response_sizes, int),
-        art_group_idx=arr(np.repeat(np.arange(worlds, dtype=np.int32), 2), int),
-        art_to_world=arr(np.repeat(np.arange(worlds, dtype=np.int32), 2), int),
-        _prescribed_articulation=arr(prescribed, int),
-        group_to_art={size: arr(np.flatnonzero(response_sizes == size).astype(np.int32), int) for size in (3, 6)},
         J_by_size={size: zero((worlds, dense, size)) for size in (3, 6)},
+        forest=SimpleNamespace(
+            world_count=worlds,
+            body_to_joint=arr(np.arange(worlds * 2, dtype=np.int32), int),
+            body_to_articulation=arr(np.arange(worlds * 2, dtype=np.int32), int),
+            articulation_dof_start=arr(starts[:-1], int),
+            articulation_response_dof_count=arr(response_sizes, int),
+            art_group_idx=arr(np.repeat(np.arange(worlds, dtype=np.int32), 2), int),
+            art_to_world=arr(np.repeat(np.arange(worlds, dtype=np.int32), 2), int),
+            prescribed_articulation=arr(prescribed, int),
+            group_to_art={size: arr(np.flatnonzero(response_sizes == size).astype(np.int32), int) for size in (3, 6)},
+        ),
     )
     # A size-group solver: the producers write each size group's rows (dense_rows.jacobian_row).
-    solver.size_groups = [3, 6]
-    solver.n_arts_by_size = {size: solver.group_to_art[size].shape[0] for size in solver.size_groups}
+    solver.forest.size_groups = [3, 6]
+    solver.forest.n_arts_by_size = {
+        size: solver.forest.group_to_art[size].shape[0] for size in solver.forest.size_groups
+    }
     solver._mf_sweeps = False
 
     def row_support():
@@ -406,7 +410,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
         device.prepare(state, augmented, contacts)
         membership = solver._contact_torsion_group.numpy()
         actual = set()
-        for world in range(solver.world_count):
+        for world in range(solver.forest.world_count):
             for spin in np.unique(membership[world]):
                 if spin >= 0:
                     actual.add((world, tuple(np.flatnonzero(membership[world] == spin))))

@@ -62,8 +62,8 @@ PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
 
 PREFIX = (
     Field("group_to_art", wp.int32, ("art",), owner="step"),
-    Field("art_to_world", wp.int32, ("articulation",)),
-    Field("dof_start", wp.int32, ("articulation",), attr="articulation_dof_start"),
+    Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
+    Field("dof_start", wp.int32, ("articulation",), owner="forest", attr="articulation_dof_start"),
     Field("mimic_start", wp.int32, ("articulation_bound",), owner="mimics", attr="_mimic_art_start"),
     Field("mimic_list", wp.int32, ("mimic",), owner="mimics", attr="_mimic_art_list"),
     Field("mimic_valid", wp.int32, ("mimic",), owner="mimics", attr="_mimic_valid"),
@@ -107,7 +107,7 @@ QUEUE = (
     Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a"),
     Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b"),
     Field("mf_row_type", wp.int32, ("world", "mf_row")),
-    Field("body_art", wp.int32, ("body",), attr="body_to_articulation"),
+    Field("body_art", wp.int32, ("body",), owner="forest", attr="body_to_articulation"),
     Field("count", wp.int32, ("world",), attr="constraint_count"),
     Field("owner", wp.int32, ("world",), attr="_local_solve_owner"),
     Field("status", wp.int32, (2,), attr="_constraint_capacity_status"),
@@ -460,14 +460,14 @@ def plan(solver):
     world has exactly one of it. A second size, if present, is the world's
     secondary articulation. Mimic rows belong to the primary alone.
     """
-    sizes = sorted(int(size) for size in solver.size_groups)
+    sizes = sorted(int(size) for size in solver.forest.size_groups)
     if not 1 <= len(sizes) <= 2 or len(solver._joint_limit_sizes) != 1:
         return None
     primary = int(next(iter(solver._joint_limit_sizes)))
-    if primary not in sizes or solver.n_arts_by_size[primary] != solver.world_count:
+    if primary not in sizes or solver.forest.n_arts_by_size[primary] != solver.forest.world_count:
         return None
     secondary = next((size for size in sizes if size != primary), 0)
-    if secondary and solver.n_arts_by_size[secondary] != solver.world_count:
+    if secondary and solver.forest.n_arts_by_size[secondary] != solver.forest.world_count:
         return None
     if solver._mimic_sizes - {primary} or solver._connect_count:
         return None
@@ -491,9 +491,9 @@ def topology_supported(solver, primary, mimics):
     if solver._mimic_art_start is None or solver._mimic_art_list is None:
         return mimics == 0
     return validate_prefix_topology(
-        solver.group_to_art[primary].numpy(),
-        solver.art_to_world.numpy(),
-        solver.articulation_dof_start.numpy(),
+        solver.forest.group_to_art[primary].numpy(),
+        solver.forest.art_to_world.numpy(),
+        solver.forest.articulation_dof_start.numpy(),
         solver._mimic_art_start.numpy(),
         solver._mimic_art_list.numpy(),
         solver._mimic_dof0.numpy(),
@@ -512,7 +512,7 @@ class LocalRowPackets:
         self.primary, self.secondary, self.mimics = int(primary), int(secondary), int(mimics)
         self.packets = int(solver._local_residual_max_rows)
         device = solver.model.device
-        worlds = solver.world_count
+        worlds = solver.forest.world_count
         self.workers = max(1, min(worlds, int(device.sm_count) * 4))
         self.prefix = PrefixData()
         arrays = SolverArrays(None, device)
@@ -536,7 +536,7 @@ class LocalRowPackets:
             residual=solver._local_residual_active_candidates[self.primary],
             residual_pair=solver._local_residual_active_secondaries[self.primary],
         )
-        self.queue = field_group.bind(QueueData, solver=solver, size=size, status=None)
+        self.queue = field_group.bind(QueueData, solver=solver, forest=solver.forest, size=size, status=None)
         self.contact_input = None
         self.law = None
         self._topology = TopologyPin.read(solver.model, TOPOLOGY)
@@ -560,12 +560,13 @@ class LocalRowPackets:
             PrefixData,
             self.prefix,
             solver=solver,
+            forest=solver.forest,
             model=solver.model,
             mimics=solver,
             mimic_model=solver.model,
             state_in=state_in,
             packets=self._packets,
-            group_to_art=solver.group_to_art[self.primary],
+            group_to_art=solver.forest.group_to_art[self.primary],
             dt=dt,
             **({} if self.mimics else self._absent_mimics),
         )
@@ -573,7 +574,7 @@ class LocalRowPackets:
         self.law = None
         wp.launch_tiled(
             self._prefix_kernel,
-            dim=[(solver.n_arts_by_size[self.primary] + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK],
+            dim=[(solver.forest.n_arts_by_size[self.primary] + WARPS_PER_BLOCK - 1) // WARPS_PER_BLOCK],
             inputs=[data],
             block_dim=32 * WARPS_PER_BLOCK,
             device=solver.model.device,
@@ -604,7 +605,7 @@ class LocalRowPackets:
         queue.residual_count.zero_()
         wp.launch(
             finalize_and_queue,
-            dim=solver.world_count,
+            dim=solver.forest.world_count,
             inputs=[
                 self.prefix,
                 queue,
@@ -616,7 +617,7 @@ class LocalRowPackets:
             device=solver.model.device,
         )
         support = solver._row_support()
-        for size in solver.size_groups:
+        for size in solver.forest.size_groups:
             wp.launch_tiled(
                 materialize_general_prefix,
                 dim=[self.workers],
@@ -624,9 +625,9 @@ class LocalRowPackets:
                     self.workers,
                     self.prefix,
                     queue,
-                    solver.world_response_group_art_start[size],
-                    solver.world_response_group_to_art[size],
-                    solver.art_group_idx,
+                    solver.forest.world_response_group_art_start[size],
+                    solver.forest.world_response_group_to_art[size],
+                    solver.forest.art_group_idx,
                     size,
                     support,
                     solver._jacobian_rows(size),
@@ -641,7 +642,7 @@ class LocalRowPackets:
                 dim=self.workers * 32,
                 inputs=[self.workers * 32, self.contact_input, self.law, queue.owner, self.primary, size_b],
                 outputs=[
-                    solver.art_group_idx,
+                    solver.forest.art_group_idx,
                     support,
                     solver._jacobian_rows(self.primary),
                     solver._jacobian_rows(size_b),
@@ -678,7 +679,7 @@ def decline(solver) -> str | None:
                 all(
                     not solver._execution_plan.use_tiled_hinv_jt(size)
                     and not solver._execution_plan.use_diagonal_mass(size)
-                    for size in solver.size_groups
+                    for size in solver.forest.size_groups
                 ),
                 "A size takes the tiled or diagonal response, which local packets do not write.",
             ),

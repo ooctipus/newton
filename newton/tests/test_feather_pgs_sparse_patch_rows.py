@@ -30,8 +30,8 @@ def _admission_probe(**changes):
     probe = SimpleNamespace(
         _route_pins={},
         _friction_anchors_enabled=False,
-        max_world_dofs=18,
         dense_max_constraints=256,
+        forest=SimpleNamespace(max_world_dofs=18),
     )
     for name, value in changes.items():
         setattr(probe, name, value)
@@ -93,7 +93,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                probe = _admission_probe(max_world_dofs=dofs, dense_max_constraints=rows)
+                probe = _admission_probe(forest=SimpleNamespace(max_world_dofs=dofs), dense_max_constraints=rows)
                 staging = functools.partial(sweep_routes_sparse.sparse_staging, rows, dofs, dofs)
                 # A world past 16 DOFs or 64 rows never packs; its budget is moot.
                 packable = dofs <= 16 and rows <= 64

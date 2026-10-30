@@ -109,7 +109,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, scene.dt)
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
-        size = solver.size_groups[0]
+        size = solver.forest.size_groups[0]
         self.assertTrue(np.isfinite(solver.L_by_size[size].numpy()).all())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")

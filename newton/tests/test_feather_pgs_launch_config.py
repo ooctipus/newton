@@ -353,14 +353,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_fixed_base_sibling_branches_detect_diagonal_mass_topology(self):
         """Detect independent fixed-base branches on every supported device."""
         solver = SolverFeatherPGS(_build_fixed_base_star_model(), enable_joint_limits=False, dense_max_constraints=16)
-        self.assertEqual(solver._diagonal_mass_sizes, frozenset((16,)))
+        self.assertEqual(solver.forest.diagonal_mass_sizes, frozenset((16,)))
 
     @unittest.skipUnless(wp.is_cuda_available(), "diagonal mass execution-path parity requires CUDA")
     def test_fixed_base_sibling_branches_use_diagonal_mass_path(self):
         """Match the dense reference while selecting independent branch solves."""
         model = _build_fixed_base_star_model()
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-        self.assertEqual(optimized._diagonal_mass_sizes, frozenset((16,)))
+        self.assertEqual(optimized.forest.diagonal_mass_sizes, frozenset((16,)))
         self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
         self.assertIsNone(optimized._cholesky_kernels_by_size[16])
         self.assertIsNone(optimized._triangular_solve_kernels_by_size[16])
@@ -420,7 +420,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(optimized._sparse_diagonal_contact_solve)
         self.assertTrue(optimized._sparse_diagonal_contact_triples)
         self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
-        self.assertEqual(optimized._direct_diagonal_inertia_sizes, frozenset((16,)))
+        self.assertEqual(optimized.forest.direct_diagonal_inertia_sizes, frozenset((16,)))
         self.assertEqual(optimized._sparse_diagonal_response_size, 16)
         self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
@@ -499,8 +499,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         def run(solver):
             state_in, state_out = model.state(), model.state()
             joint_qd = state_in.joint_qd.numpy()
-            for art in np.flatnonzero(solver._model_plan.response_dof_count == 16):
-                start = int(solver._model_plan.articulation_dof_start[art])
+            for art in np.flatnonzero(solver.forest.response_dof_count == 16):
+                start = int(solver.forest.articulation_dof_start_host[art])
                 joint_qd[start : start + 16] = -0.3
             state_in.joint_qd.assign(joint_qd)
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -598,7 +598,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
         # Star branch joints and their child links (skip the fixed root joint of each star).
         articulation_start = model.articulation_start.numpy()
-        star_articulations = np.flatnonzero(solver._model_plan.response_dof_count == 16)
+        star_articulations = np.flatnonzero(solver.forest.response_dof_count == 16)
         branch_joints = np.concatenate(
             [np.arange(articulation_start[art] + 1, articulation_start[art + 1]) for art in star_articulations]
         )

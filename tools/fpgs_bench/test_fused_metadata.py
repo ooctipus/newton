@@ -15,7 +15,7 @@ from test_checked_capture import FlagArray, collision_pipeline, fpgs
 def fixture():
     """Expose current owners with mixed empty/admitted/fallback worlds."""
     solver = fpgs()
-    solver.world_count = 4
+    solver.forest = SimpleNamespace(world_count=4)
     solver.constraint_count = FlagArray([0, 3, 384, 402])
     fusion = SimpleNamespace(owner=FlagArray([1, 1, 1, 0]), fallback_counts=FlagArray([0, 0, 0, 402]))
     solver._fused_contact_solve = fusion

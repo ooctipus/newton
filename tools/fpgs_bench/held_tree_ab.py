@@ -374,7 +374,7 @@ class Recorder:
             state.joint_q.assign(coordinates)
             owner.begin(state, augmented, scaled if motion else state.joint_qd, DT, False, state_out=output)
             self.snapshot(f"{tag}/{form}/begin", groups, extra())
-        world_mask = wp.array([True] + [False] * (solver.world_count - 1), dtype=wp.bool, device=self.device)
+        world_mask = wp.array([True] + [False] * (solver.forest.world_count - 1), dtype=wp.bool, device=self.device)
         owner.invalidate(world_mask)
         owner.begin(state, augmented, scaled if motion else state.joint_qd, DT, False)
         self.snapshot(f"{tag}/reset/begin", groups, extra())

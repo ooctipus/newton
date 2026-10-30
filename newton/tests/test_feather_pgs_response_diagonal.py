@@ -169,8 +169,8 @@ def _run_mixed_response(
         )
     state_in, state_out = model.state(), model.state()
     joint_qd = state_in.joint_qd.numpy()
-    free_articulation = int(np.flatnonzero(solver._model_plan.is_free_rigid)[0])
-    free_dof_start = int(solver._model_plan.articulation_dof_start[free_articulation])
+    free_articulation = int(np.flatnonzero(solver.forest.is_free_rigid_host)[0])
+    free_dof_start = int(solver.forest.articulation_dof_start_host[free_articulation])
     joint_qd[free_dof_start] = tangential_velocity
     joint_qd[free_dof_start + 2] = -3.0
     state_in.joint_qd.assign(joint_qd)
@@ -1351,30 +1351,30 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
     def test_mixed_world_diagonal_map_includes_free_rigid_response(self):
         """Include free rigid articulations in every forced-tiled diagonal group."""
         solver = SolverFeatherPGS(_build_mixed_response_model("cpu", world_count=2), dense_max_constraints=32)
-        self.assertEqual(set(solver.size_groups), {6, 13})
+        self.assertEqual(set(solver.forest.size_groups), {6, 13})
 
-        response_dof_count = solver._model_plan.response_dof_count
-        articulation_world = solver._model_plan.articulation_world
-        free_mask = solver._model_plan.is_free_rigid != 0
-        for size in solver.size_groups:
+        response_dof_count = solver.forest.response_dof_count
+        articulation_world = solver.forest.articulation_world
+        free_mask = solver.forest.is_free_rigid_host != 0
+        for size in solver.forest.size_groups:
             size_arts = np.flatnonzero(response_dof_count == size)
             response_order = np.asarray(
                 sorted(size_arts, key=lambda art: (int(articulation_world[art]), int(art))), dtype=np.int32
             )
-            response_counts = np.bincount(articulation_world[response_order], minlength=solver.world_count)
+            response_counts = np.bincount(articulation_world[response_order], minlength=solver.forest.world_count)
             response_starts = np.pad(np.cumsum(response_counts), (1, 0)).astype(np.int32)
 
-            np.testing.assert_array_equal(solver.world_response_group_art_start[size].numpy(), response_starts)
-            np.testing.assert_array_equal(solver.world_response_group_to_art[size].numpy(), response_order)
+            np.testing.assert_array_equal(solver.forest.world_response_group_art_start[size].numpy(), response_starts)
+            np.testing.assert_array_equal(solver.forest.world_response_group_to_art[size].numpy(), response_order)
 
         free_articulations = np.flatnonzero(free_mask).astype(np.int32)
         np.testing.assert_array_equal(
-            solver.world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
+            solver.forest.world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
         )
-        np.testing.assert_array_equal(solver.world_response_group_to_art[6].numpy(), free_articulations)
+        np.testing.assert_array_equal(solver.forest.world_response_group_to_art[6].numpy(), free_articulations)
 
         forced_tiled = _FeatherPGSExecutionPlan.build(
-            solver.size_groups,
+            solver.forest.size_groups,
             max_constraints=solver.dense_max_constraints,
             max_shared_memory=101376,
             cholesky_kernel="auto",
@@ -1569,8 +1569,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "mixed contact never selected the paired local owner",
         )
 
-        free_articulation = int(np.flatnonzero(general_solver._model_plan.is_free_rigid)[0])
-        free_dof_start = int(general_solver._model_plan.articulation_dof_start[free_articulation])
+        free_articulation = int(np.flatnonzero(general_solver.forest.is_free_rigid_host)[0])
+        free_dof_start = int(general_solver.forest.articulation_dof_start_host[free_articulation])
         self.assertGreater(
             abs(float(general[0][4][free_dof_start + 2]) + 3.0),
             1.0e-4,
@@ -1749,8 +1749,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
-        free_articulation = int(np.flatnonzero(local_solver._model_plan.is_free_rigid)[0])
-        self.assertEqual(int(local_solver._model_plan.articulation_dof_start[free_articulation]), 0)
+        free_articulation = int(np.flatnonzero(local_solver.forest.is_free_rigid_host)[0])
+        self.assertEqual(int(local_solver.forest.articulation_dof_start_host[free_articulation]), 0)
         self.assertFalse(general_solver._local_internal_fast_path)
         self.assertTrue(local_solver._local_internal_fast_path)
         np.testing.assert_array_equal(local_solver._local_residual_pair_articulation.numpy(), [-1])

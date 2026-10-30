@@ -40,8 +40,8 @@ SPARSE_PLAN = (
     Field("physical", wp.int32, ("i",), owner="host"),
     Field("sparse", wp.int32, ("i",), owner="host"),
     Field("group_to_art", wp.int32, ("art",), owner="step"),
-    Field("art_to_world", wp.int32, ("articulation",)),
-    Field("art_dof_start", wp.int32, ("articulation",), attr="articulation_dof_start"),
+    Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
+    Field("art_dof_start", wp.int32, ("articulation",), owner="forest", attr="articulation_dof_start"),
     Field("art_joint_start", wp.int32, ("articulation_bound",), owner="model", attr="articulation_start"),
     Field("joint_child", wp.int32, ("joint",), owner="model"),
 )
@@ -93,9 +93,9 @@ def bind_operator_plan(solver, size, host, *, group_to_art=None):
         SparsePlan,
         model.device,
         **host,
-        group_to_art=solver.group_to_art[size] if group_to_art is None else group_to_art,
-        art_to_world=solver.art_to_world,
-        art_dof_start=solver.articulation_dof_start,
+        group_to_art=solver.forest.group_to_art[size] if group_to_art is None else group_to_art,
+        art_to_world=solver.forest.art_to_world,
+        art_dof_start=solver.forest.articulation_dof_start,
         art_joint_start=model.articulation_start,
         joint_child=model.joint_child,
     )
