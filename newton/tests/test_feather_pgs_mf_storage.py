@@ -752,6 +752,94 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     for output in outputs:
                         np.testing.assert_array_equal(_bits(_host(bank[output])), _bits(expected[output]), output)
 
+    def test_rows_without_a_friction_pair_read_no_sibling_diagonal(self):
+        """Vote a row without a friction pair on its own change: NaN diagonals outside the worlds' rows change no bit.
+
+        Each world holds one contact on a zero response whose warm impulse takes a nonzero step below its bound, so
+        the first sweep is quiet and ends the solve. Every diagonal outside the worlds' rows is NaN, the one before
+        the first world's included. The fused pair vote names the second tangent ``sib`` = -1 at such a row: reading
+        its diagonal reads the row before the world's first (before the array for the first world, an illegal
+        access when that address is unmapped), votes loud on NaN and keeps the worlds sweeping.
+        """
+        device = wp.get_device()
+        if not device.is_cuda:
+            self.skipTest("Select a CUDA device for native MF-GS execution")
+        worlds, capacity, mf_capacity, dofs = 4, 8, 4, 12
+        host = _patch_ring_rows(
+            0,
+            worlds=worlds,
+            dense_capacity=capacity,
+            mf_capacity=mf_capacity,
+            dofs=dofs,
+            velocity_limits=False,
+            rings=(1, 2),
+        )
+        host["world_constraint_count"][:] = 1
+        host["dense_phase_bounds"][:] = 0
+        host["world_row_type"][:] = PGS_CONSTRAINT_TYPE_CONTACT
+        host["world_row_parent"][:] = -1
+        host["packed_Z"][:] = 0.0
+        host["rhs_bias"][:] = 0.0
+        host["rhs_bias"][:, 0] = 1.0e-6
+        host["world_impulses"][:] = 0.0
+        host["world_impulses"][:, 0] = 4.0
+        host["mf_constraint_count"][:] = 0
+        host["mf_contact_rows_end"][:] = 0
+        values = _bind_rows(host, device)
+        # One step from the warm impulse: |dlambda| A = 2^-20 against the bound 2^-20 (|b| + A |lambda|) > 2^-18.
+        step = np.float32(4.0) + np.float32(-1.0e-6)
+        self.assertNotEqual(step, np.float32(4.0))
+
+        def diagonal(outside):
+            """The worlds' diagonals with ``outside`` past each world's row and before the first world's."""
+            padded = np.full(host["world_diag"].size + 1, outside, np.float32)
+            padded[1::capacity] = 1.0
+            storage = wp.array(padded, dtype=wp.float32, device=device)
+            return storage, wp.array(
+                ptr=storage.ptr + 4, shape=host["world_diag"].shape, dtype=wp.float32, device=device
+            )
+
+        guarded, finite = diagonal(np.nan), diagonal(1.0)
+        outputs = ("v_out", "world_impulses", "mf_impulses")
+        # Streamed and resident row metadata read the diagonal from global memory; staged metadata from shared memory.
+        streamed = {"shared_metadata": False}
+        for metadata in (streamed, {**streamed, "resident_row_metadata": True}, {"shared_metadata": True}):
+            kernel = sweep_routes.mf_gs_kernel(
+                capacity,
+                mf_capacity,
+                dofs,
+                str(device.arch),
+                has_dense_velocity_limit_rows=False,
+                **metadata,
+            )
+            for grid in (worlds, 2):
+                launch = {
+                    "row_phase": 0,
+                    "general_world_grid_stride": grid,
+                    "use_general_world_queue": int(grid < worlds),
+                    "iterations": 8,
+                    "omega": 1.0,
+                    "friction_start_iteration": 0,
+                    "iteration_offset": 0,
+                    "regularize": 0,
+                }
+                results = []
+                for _storage, world_diag in (guarded, finite):
+                    bank = {output: wp.clone(values[output]) for output in outputs}
+                    bound = {**values, **bank, **launch, "world_diag": world_diag}
+                    wp.launch_tiled(
+                        kernel,
+                        dim=[grid],
+                        block_dim=32,
+                        device=device,
+                        inputs=[bound[parameter] for parameter in inspect.signature(kernel.func).parameters],
+                    )
+                    results.append({output: _host(bank[output]) for output in outputs})
+                with self.subTest(**metadata, grid=grid):
+                    np.testing.assert_array_equal(results[0]["world_impulses"][:, 0], np.full(worlds, step))
+                    for output in outputs:
+                        np.testing.assert_array_equal(_bits(results[0][output]), _bits(results[1][output]), output)
+
     def _replay_solver_launches(self, model, options):
         """Build a solver and replay every MF-GS launch of four steps through its streamed twin.
 
