@@ -40,6 +40,7 @@ from .sweep import (
     jacobi_limit_pass,
     jacobi_scale,
     jacobi_sweeps,
+    material_arguments,
 )
 from .sweep_routes import MF_GS_ABI
 
@@ -130,6 +131,8 @@ def parallel_source(
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row.
@@ -140,7 +143,9 @@ def parallel_source(
     (:class:`.TransposedResponse`: ``Z`` in registers and staged transposed, its step scale bounded by the column
     sums). It runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected
     on their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
-    ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses.
+    ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses. With
+    ``weighted`` contact rows step by their weights (the relative regularization's; ``material``: a material
+    contact's ``d / (d + eps)`` from the diagonal the tier forms).
 
     Returns the body and its staging.
     """
@@ -156,8 +161,8 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(regularize=False, policy=solve_policy)
-    store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces)
+    laws = RowLaws(regularize=bool(weighted), material=bool(material), policy=solve_policy)
+    store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted))
     whitened = WhitenedRows(
         NA,
         NB,
@@ -247,6 +252,8 @@ def parallel_kernel(
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 
@@ -254,7 +261,10 @@ def parallel_kernel(
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
     rows. Its worlds' packed rows (:mod:`.packed_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
+    With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance.
     """
+    if material and not weighted:
+        raise ValueError("material contacts step by their weights: their tiers are weighted")
     options = {
         "rows": rows,
         "min_rows": min_rows,
@@ -269,6 +279,8 @@ def parallel_kernel(
         linked_rows=linked_rows,
         velocity_limit_pass=velocity_limit_pass,
         solve_policy=solve_policy,
+        weighted=weighted,
+        material=material,
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
@@ -279,6 +291,8 @@ def parallel_kernel(
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
+        + ("_weighted" if weighted else "")
+        + ("_material" if material else "")
         + solve_policy.suffix
     )
     kernel = KernelTemplate.from_abi(
@@ -286,7 +300,11 @@ def parallel_kernel(
         PARALLEL_ABI,
         snippet,
         kernel_template.WORLD_QUEUE,
-        extra=(*(operands.arguments if operands is not None else ()), *solve_policy.arguments),
+        extra=(
+            *(operands.arguments if operands is not None else ()),
+            *material_arguments(material),
+            *solve_policy.arguments,
+        ),
         composed=True,
         native_name="sweep_parallel_native",
     ).kernel()

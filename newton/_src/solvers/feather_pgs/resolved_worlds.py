@@ -673,7 +673,8 @@ def decline(solver) -> str | None:
                 solver.model.device.is_cuda,
                 "The classifier evaluates the CUDA matrix-free route only.",
             ),
-            (laws.agnostic, "Contact torsion and compliance rows are outside the contact laws it classifies."),
+            (laws.agnostic, "Contact torsion rows are outside the contact laws it classifies."),
+            (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
                 laws.plain

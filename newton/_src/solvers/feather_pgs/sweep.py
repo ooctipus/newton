@@ -39,6 +39,8 @@ import dataclasses
 from collections.abc import Callable
 from typing import ClassVar
 
+import warp as wp
+
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -47,6 +49,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
 )
 from .response_operator import Lanes, ResponseOperator
+from .row_inputs import RowArgument
 from .row_metadata import _DENSE_META_ROW_TYPE_BITS, _DENSE_META_ROW_TYPE_MASK, _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit, terms_bound, vote
 from .staging import Buffer
@@ -115,6 +118,9 @@ class WorldRows:
 
     def weight(self, row: str) -> str:
         return f"world_row_w.data[off_dense + {row}]"
+
+    def eps(self, row: str) -> str:
+        return f"world_row_eps.data[off_dense + {row}]"
 
     def kind(self, row: str, *, scan: bool = False) -> str:
         if self.shared_metadata or (self.packed_types and not scan):
@@ -224,6 +230,9 @@ class FreeBodyRows:
     def weight(self, row: str) -> str:
         return f"mf_row_w.data[off_mf + {row}]"
 
+    def eps(self, row: str) -> str:
+        return f"mf_row_eps.data[off_mf + {row}]"
+
     def buffers(self) -> tuple[Buffer, ...]:
         return () if self.stream else (Buffer("s_lam_mf", "float", self.capacity),)
 
@@ -250,13 +259,41 @@ class RowLaws:
 
     Args:
         regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
+        material: Material contacts exist: a contact row of compliance ``eps > 0`` takes the weight ``d / (d + eps)``
+            from the diagonal the placement forms (:func:`row_weight`), its stored one otherwise.
         torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
         policy: The solve policy: the readout beside the exit law.
     """
 
     regularize: bool = True
+    material: bool = False
     torsion: bool = False
     policy: SolvePolicy = DEFAULT_POLICY
+
+
+def row_weight(weight: str, eps: str, diagonal: str) -> str:
+    """A contact row's regularization weight: ``d / (d + eps)`` for a material row of compliance ``eps > 0`` and
+    diagonal ``d``, else its stored ``weight`` (the relative option's ``1 / (1 + g)``, or 1).
+
+    The regularized step (:func:`.projection_laws.regularized_delta`) with ``d / (d + eps)`` is the material row's
+    exact Gauss-Seidel step, ``-(r + eps lambda) / (d + eps)``, whichever diagonal the placement forms. Emitted only
+    where the laws have material contacts, so no other sweep's text changes.
+    """
+    return f"({eps} > 0.0f ? ({diagonal}) / (({diagonal}) + {eps}) : {weight})"
+
+
+def weight_arguments(weighted: bool) -> tuple[RowArgument, ...]:
+    """The operands a sweep whose ABI holds no row weights takes once its laws are weighted: the dense rows' weights
+    and the run-time switch ``regularize``."""
+    return (RowArgument("world_row_w", wp.array2d[float]), RowArgument("regularize", int)) if weighted else ()
+
+
+def material_arguments(material: bool) -> tuple[RowArgument, ...]:
+    """The operands of a sweep with material contacts: the dense and free-body rows' compliance, zero but on a
+    material contact's normal."""
+    if not material:
+        return ()
+    return (RowArgument("world_row_eps", wp.array2d[float]), RowArgument("mf_row_eps", wp.array2d[float]))
 
 
 def change_vote(laws: RowLaws, changes: tuple[Change, ...], pad: str) -> str:
@@ -287,6 +324,8 @@ class RowContext:
     """The pooled normal load of the patch ring of normal row ``parent``: ``ring_load(parent)`` from the row's stored
     impulse, ``ring_load(parent, load)`` from ``load`` (a contact unit's normal in a register, :func:`contact_unit`)."""
     lanes: Lanes
+    eps: Callable[[str], str] | None = None
+    """A row's compliance, where the laws have material contacts (:attr:`RowLaws.material`)."""
     contact_kinds: tuple[int, ...] = (CONTACT, JOINT_LIMIT)
     inline_velocity_limit: bool = False
     """Velocity-limit rows the row loop visits take the velocity-limit law in place (a velocity-limit row phase)."""
@@ -347,10 +386,13 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     ]
     step = op.step("residual", row)
     if laws.regularize:
+        weight = ctx.weight(row)
+        if laws.material:
+            weight = row_weight(weight, ctx.eps(row), op.value(row))
         lines += [
             f"float delta = {step};",
             f"if ({kind} == {CONTACT} && regularize)",
-            f"    delta = ProjectionLaw::regularized_delta(delta, {ctx.weight(row)}, old_impulse);",
+            f"    delta = ProjectionLaw::regularized_delta(delta, {weight}, old_impulse);",
             "float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);",
         ]
     else:
@@ -891,6 +933,7 @@ def dense_rows_block(
         parent="parent",
         ring_load=rows.ring_load,
         lanes=rows.lanes,
+        eps=rows.eps,
     )
     residual = op.residual("jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
     body = [
@@ -940,6 +983,7 @@ def free_body_rows_block(
         lanes=rows.lanes,
         contact_kinds=(CONTACT,),
         owned=False,
+        eps=rows.eps,
     )
     body = [
         op.consume("i", end, inner),
@@ -1138,7 +1182,9 @@ class JacobiRows:
     lane's ``frozen``). The lane keeps its row's diagonal in a register
     (``row_diag``), which the exit law scales the row's impulse by; with
     ``types`` each row's constraint type is staged (``s_type``), which the
-    trace names its change by.
+    trace names its change by. With ``weighted`` the lane also keeps whether
+    its row is a contact (``row_contact``), whose weight the weighted Jacobi
+    law reads (:func:`jacobi_sweeps`).
     """
 
     capacity: int
@@ -1146,6 +1192,7 @@ class JacobiRows:
     limits: bool = False
     rows: str = "n_rows"
     types: bool = False
+    weighted: bool = False
 
     def buffers(self) -> tuple[Buffer, ...]:
         """The rows' state and metadata."""
@@ -1186,9 +1233,12 @@ class JacobiRows:
             "    s_kind[i] = kind;",
             "    s_step[i] = 1.0f;",
             "    s_type[i] = row_type;" if self.types else "",
+            f"    row_contact = row_type == {CONTACT};" if self.weighted else "",
             "}",
         ]
         lines.insert(0, "int frozen = 0;")
+        if self.weighted:
+            lines.insert(0, "int row_contact = 0;")
         # The lane's own row's diagonal (a row each: the loop runs at most once per lane).
         lines.insert(0, "float row_diag = 0.0f;")
         return indent("\n".join(line for line in lines if line), pad)
@@ -1274,10 +1324,19 @@ def isotropic_pair_step(rows: JacobiRows, pad: str = "    ") -> str:
     return indent("\n".join(lines), pad)
 
 
-def _jacobi_step(rows: JacobiRows, op, pad: str) -> str:
-    """Row ``i``'s update ``x_new`` from the extrapolated impulses (``x_old``: its impulse), on its lane."""
+def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
+    """Row ``i``'s update ``x_new`` from the extrapolated impulses (``x_old``: its impulse), on its lane.
+
+    Weighted laws step a row by its regularized step (:func:`.projection_laws.regularized_delta`) relaxed by its
+    share ``s = omega w_i`` of a Gauss-Seidel step: ``y + s ((-r / d) w - (1 - w) y)``, with the delta and the impulse
+    both scaled by ``s`` (the law is linear in them). For a material row of weight ``d / (d + eps)`` that is
+    ``y - s (r + eps y) / (d + eps)``, whose fixed point is the row's ``r + eps lambda = 0`` whatever ``s``.
+    """
+    step = "value = s_y[i] - s_step[i] * r;"
+    if laws.regularize:
+        step = "value = s_y[i] + ProjectionLaw::regularized_delta(-row_step * r, row_w, row_share * s_y[i]);"
     update = [
-        "value = s_y[i] - s_step[i] * r;",
+        step,
         f"if (s_kind[i] == {JACOBI_UNILATERAL}) value = ProjectionLaw::unilateral(value);",
         f"if (s_kind[i] == {JACOBI_FRICTION} && global_iter < friction_start_iteration) value = 0.0f;",
     ]
@@ -1416,6 +1475,16 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     policy = laws.policy
     if policy.traces and not rows.types:
         raise ValueError("the trace names the Jacobi rows' changes by their staged types")
+    if laws.regularize and not rows.weighted:
+        raise ValueError("the weighted Jacobi law reads the weights of the contact rows its store marks")
+    weight = ""
+    if laws.regularize:
+        # The lane's row's weight, fixed through the sweeps: a contact's stored one, or a material contact's from the
+        # diagonal the tier formed (row_weight); 1 for every other row.
+        stored = "world_row_w.data[off_dense + lane]"
+        if laws.material:
+            stored = row_weight(stored, "world_row_eps.data[off_dense + lane]", "row_diag")
+        weight = f"{pad}const float row_w = (row_contact && regularize) ? {stored} : 1.0f;"
     inner = pad + "    "
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
     block = rows.threads > 32
@@ -1428,11 +1497,12 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{pad}const float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
         # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
         f"{pad}const float row_share = row_diag * row_step;",
+        weight,
         f"{pad}float t_k = 1.0f;",
         f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
         f"{inner}const int global_iter = iteration_offset + sweep;",
         op.gather(inner),
-        _jacobi_step(rows, op, inner),
+        _jacobi_step(rows, op, laws, inner),
         f"{inner}int iteration_changed = 0;",
         _jacobi_projection(rows, pooled=pooled, pad=inner),
         _jacobi_momentum(rows, pad=inner),

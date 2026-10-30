@@ -58,9 +58,11 @@ from .sweep import (
     contact_unit,
     end_sweep,
     indent,
+    material_arguments,
     row_visit,
     unit_held_loads,
     velocity_limit_pass,
+    weight_arguments,
 )
 
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -138,6 +140,8 @@ class SparseSweep:
     local: bool
     warm_start: bool
     policy: SolvePolicy
+    weighted: bool = False
+    material: bool = False
 
     @property
     def groups(self) -> int:
@@ -155,6 +159,8 @@ class SparseSweep:
         suffix += f"_lanes{self.lanes}" if self.lanes != 32 else ""
         suffix += "_local_factors" if self.local else ""
         suffix += "_warm_start" if self.warm_start else ""
+        suffix += "_weighted" if self.weighted else ""
+        suffix += "_material" if self.material else ""
         return f"sweep_sparse_{self.rows}_{self.dofs}_{self.support}{suffix}{self.policy.suffix}"
 
 
@@ -174,6 +180,8 @@ def _resolve(
     warm_start: bool = False,
     linked_rows: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> SparseSweep:
     """Validate the factory's options and resolve the sweep they configure."""
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
@@ -208,6 +216,8 @@ def _resolve(
         local=bool(local_factors),
         warm_start=bool(warm_start),
         policy=solve_policy,
+        weighted=bool(weighted),
+        material=bool(material),
     )
 
 
@@ -249,6 +259,12 @@ class SparseRows:
 
     def mu(self, row: str) -> str:
         return f"world_row_mu.data[offset + {row}]"
+
+    def weight(self, row: str) -> str:
+        return f"world_row_w.data[offset + {row}]"
+
+    def eps(self, row: str) -> str:
+        return f"world_row_eps.data[offset + {row}]"
 
     def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``, from ``load`` (its impulse)."""
@@ -451,8 +467,8 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
         store=rows.store,
         rhs=rows.rhs_of,
         mu=rows.mu,
-        # No contact regularization: the laws read no weight.
-        weight=lambda row: "1.0f",
+        weight=rows.weight,
+        eps=rows.eps,
         parent="parent",
         ring_load=rows.ring_load,
         lanes=lanes,
@@ -607,8 +623,8 @@ if (index >= 0) {{
         store=rows.store,
         rhs=rows.rhs_of,
         mu=lambda row: "mu",
-        # No contact regularization: the laws read no weight.
-        weight=lambda row: "1.0f",
+        weight=rows.weight,
+        eps=rows.eps,
         parent="parent",
         ring_load=ring_load,
         lanes=rows.lanes,
@@ -693,7 +709,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     lanes = Lanes(L)
     rows = SparseRows(M, lanes)
     op = factor_operator(sweep)
-    laws = RowLaws(regularize=False, policy=sweep.policy)
+    laws = RowLaws(regularize=sweep.weighted, material=sweep.material, policy=sweep.policy)
     staging = _staging(sweep, rows, op)
 
     setup = []
@@ -781,6 +797,8 @@ def sparse_source(
     warm_start: bool = False,
     linked_rows: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the sparse sweep and its staging."""
     return _source(
@@ -799,6 +817,8 @@ def sparse_source(
             warm_start=warm_start,
             linked_rows=linked_rows,
             solve_policy=solve_policy,
+            weighted=weighted,
+            material=material,
         )
     )
 
@@ -821,6 +841,8 @@ def sparse_kernel(
     linked_rows: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     device_arch=None,
+    weighted: bool = False,
+    material: bool = False,
 ) -> wp.Kernel:
     """The sparse sweep kernel.
 
@@ -843,10 +865,12 @@ def sparse_kernel(
         warm_start=warm_start,
         linked_rows=linked_rows,
         solve_policy=solve_policy,
+        weighted=weighted,
+        material=material,
     )
     snippet, staging = _source(sweep)
     staging.check("the sparse sweep", arch_budget(device_arch))
-    extra = sweep.policy.arguments
+    extra = (*weight_arguments(sweep.weighted), *material_arguments(sweep.material), *sweep.policy.arguments)
     if sweep.triplets:
         extra = (RowArgument("contact_records", wp.array3d[float], after="iteration_offset"), *extra)
     return KernelTemplate.from_abi(

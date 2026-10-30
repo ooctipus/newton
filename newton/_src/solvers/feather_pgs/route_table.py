@@ -59,15 +59,15 @@ class Laws:
 
     @property
     def weighted(self) -> bool:
-        """Contact rows step by per-row weights: the relative regularization's or material contacts' (a sweep that
-        reads no row weight solves another law)."""
+        """Contact rows step by their weights: the relative regularization's, or a material contact's from its
+        compliance (every placement's sweep reads them)."""
         return self.regularized or self.compliance
 
     @property
     def agnostic(self) -> bool:
         """The contact rows follow the point or the patch row law, which every row writer implements (no torsion
-        row, no compliant normal)."""
-        return not (self.torsion or self.compliance)
+        row; a material normal is the row law's, with its compliance)."""
+        return not self.torsion
 
     @property
     def point(self) -> bool:
@@ -109,15 +109,10 @@ class Laws:
 _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
     "plain": (lambda laws: laws.plain, Laws.PLAIN),
-    "agnostic": (lambda laws: laws.agnostic, "the point or patch row law (no torsion, no compliance)"),
-    "unweighted": (lambda laws: not laws.weighted, "contact rows without weights (no regularization, no compliance)"),
+    "agnostic": (lambda laws: laws.agnostic, "the point or patch row law (no torsion)"),
     "limits": (lambda laws: laws.limits, "joint-limit rows (enable_joint_limits)"),
     "no_velocity_limits": (lambda laws: not laws.velocity_limits, "no joint velocity-limit rows"),
     "no_torsion": (lambda laws: not laws.torsion, "no torsion row"),
-    "no_compliance": (
-        lambda laws: not laws.compliance,
-        "no material contacts (their weight d / (d + eps) needs the diagonal before the sweep)",
-    ),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
     "no_connect": (lambda laws: not laws.connect, "no connect rows"),
     "no_loops": (lambda laws: not laws.loops, "no loop-closing joints"),
@@ -134,21 +129,19 @@ CAPABILITIES = {
         "cuda",
         "iterations",
         "no_debug_rows",
-        "unweighted",
         "no_preelimination",
         "no_torsion",
         "no_connect",
         "no_loops",
     ),
     # On-chip blocks of a world's rows (local owners), claimed per world at run time.
-    # It forms its rows' diagonals in the kernel.
-    "local": ("cuda", "plain", "no_velocity_limits", "no_torsion", "no_compliance"),
+    "local": ("cuda", "plain", "no_velocity_limits", "no_torsion"),
     # The local owners' row producer: limit prefix and contact packets built in place.
-    "row_packets": ("agnostic", "limits", "unweighted"),
+    "row_packets": ("agnostic", "limits"),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "plain", "unweighted", "iterations", "no_velocity_limits", "no_torsion"),
+    "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits", "no_torsion"),
     # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("cuda", "plain", "unweighted", "no_mimic", "no_connect"),
+    "components": ("cuda", "plain", "no_mimic", "no_connect"),
     # The Jacobi tiers of dense trees beside a free body (case K4).
     "tiers": ("cuda",),
     # The keyed in-kernel row producer of the tiers.

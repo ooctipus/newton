@@ -192,8 +192,6 @@ class RowLaws:
         # change w are the exact hard update and stay on the zero-cost path.
         laws.contact_w = float(np.float32(1.0 / (1.0 + options.pgs_contact_regularization)))
         laws.regularization_enabled = laws.contact_w < 1.0
-        # A weighted row law: contact rows step by their weights (the relative option's, or material contacts').
-        laws.weighted = laws.regularization_enabled or bool(options.contact_compliance)
         laws.effective_restitution_velocity_threshold = (
             options.restitution_velocity_threshold if options.enable_restitution else np.finfo(np.float32).max
         )

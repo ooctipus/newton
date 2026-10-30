@@ -81,7 +81,14 @@ from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import BILATERAL_PIVOT, PROJECTION_LAW
 from .response_builds_dense import _indent, _Vec6, whiten_six
 from .response_operator import FreeBodyZ
-from .row_laws import ROW_LAW, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, row_rhs
+from .row_laws import (
+    ROW_LAW,
+    contact_depenetration_cap,
+    contact_material_rhs,
+    contact_restitution_rhs,
+    contact_rhs,
+    row_rhs,
+)
 from .row_metadata import _validate_mf_metadata_encoding
 from .solver_fields import Preelim
 from .sparse_mass_matrix import _SparseMassMatrixIndices, _SparseRowSupport
@@ -281,8 +288,8 @@ def free_body_rows_kernel(
     """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
 
     One thread per row slot (``world * mf_max_constraints + row``). A restitutive contact first stores its incident
-    velocity ``J v_hat`` from the writers' ``J``. ``weighted`` rows take a weight: the relative regularization's, or a
-    material contact's (``material``: its writer stored its rhs and compliance ``eps``) ``d / (d + eps)``.
+    velocity ``J v_hat`` from the writers' ``J``. ``weighted`` rows store their relative regularization weight; a
+    material contact (``material``: its writer stored its rhs and compliance ``eps``) keeps its rhs.
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
@@ -309,10 +316,7 @@ def free_body_rows_kernel(
         mf.incident[world, i] = incident
     mf_eff_mass_inv[world, i] = free_body_response(mf.Z_a, mf.Z_b, world, i, body_a, body_b, row_type, factors, pgs_cfm)
     if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        eps = mf.eps[world, i]
-        if eps > 0.0:
-            # d / (d + eps) with the inverse diagonal 1 / d the response stores.
-            mf_row_w[world, i] = 1.0 / (1.0 + eps * mf_eff_mass_inv[world, i])
+        if mf.eps[world, i] > 0.0:
             return
     target = float(0.0)
     if has_target_velocity != 0:
@@ -2008,8 +2012,12 @@ def factor_contact_rows_kernel(
                     row_type = PGS_CONSTRAINT_TYPE_CONTACT
                     parent = int(-1)
                     restitution = float(0.0)
+                    stiffness = float(0.0)
+                    if data.material != 0:
+                        stiffness = data.stiffness[c]
                     if lane == 0:
-                        restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
+                        if stiffness <= 0.0:
+                            restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
                     else:
                         beta = law.beta
                         # Selected, not indexed by the lane, which would place the pair in local memory.
@@ -2018,12 +2026,22 @@ def factor_contact_rows_kernel(
                         if lane == 2:
                             phi = anchor_phi[1]
                         mu *= data.friction_scale
+                        if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+                            mu *= data.friction_weight[c]
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION
                         parent = data.slot[c]
-                    # The position pass's row law (bias scale and contact weight 1).
-                    rhs, _row_w = row_rhs(
-                        row_type, phi, beta, target, 1.0 / data.dt, 1.0, data.speculative_scale, 0.0, 1.0
+                    # The position pass's row law (bias scale 1) and its regularization weight; a material normal's
+                    # own law.
+                    rhs, row_w = row_rhs(
+                        row_type, phi, beta, target, 1.0 / data.dt, 1.0, data.speculative_scale, 0.0, data.contact_w
                     )
+                    if data.contact_w < 1.0:
+                        data.row_w[world, slot] = row_w
+                    if data.material != 0:
+                        eps = float(0.0)
+                        if lane == 0 and stiffness > 0.0:
+                            rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
+                        data.row_eps[world, slot] = eps
                     data.row_type[world, slot] = row_type
                     data.row_parent[world, slot] = parent
                     data.row_mu[world, slot] = mu
@@ -2114,6 +2132,9 @@ def factor_contact_rows_kernel(
                         )
                         if fires:
                             data.rhs[world, slot] = bounce
+                            # An impact is impulsive, not a spring: keep the rebound exact.
+                            if data.contact_w < 1.0:
+                                data.row_w[world, slot] = 1.0
 
     name = f"factor_contact_rows_{n}_{lanes}_{warps}"
     if prepare_rows:

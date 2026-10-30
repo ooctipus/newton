@@ -150,7 +150,7 @@ class TestJacobiLaw(unittest.TestCase):
         Gauss-Seidel step, ``A_ii s_i``)."""
         rows = JacobiRows(32, 32)
         op = _operator()
-        text = jacobi_sweeps(rows, op, RowLaws(), sweeps=1, pooled=False)
+        text = jacobi_sweeps(rows, op, RowLaws(regularize=False), sweeps=1, pooled=False)
         self.assertNotIn("if (x_new != x_old) {", text)
         self.assertIn("const float row_share = row_diag * row_step;", text)
         self.assertIn(
@@ -160,7 +160,7 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn("if (x_new != x_from) {", text)
         self.assertIn("(!(fabsf(x_new - x_from) <= row_bound))", text)
         typed = JacobiRows(32, 32, types=True)
-        traced = RowLaws(policy=SolvePolicy(readout="trace"))
+        traced = RowLaws(regularize=False, policy=SolvePolicy(readout="trace"))
         text = jacobi_sweeps(typed, op, traced, sweeps=7, pooled=False)
         self.assertIn("solve_trace_change(fabsf(x_new - x_from) * (row_inv_step), s_type[i]);", text)
         self.assertIn("sweep + 1 == 7", text)
@@ -174,8 +174,12 @@ class TestJacobiLaw(unittest.TestCase):
         rows = JacobiRows(32, 32)
         op = _operator()
         with self.assertRaisesRegex(ValueError, "staged types"):
-            jacobi_sweeps(rows, op, RowLaws(policy=SolvePolicy(readout="trace")), sweeps=1, pooled=False)
-        counted = jacobi_sweeps(rows, op, RowLaws(policy=SolvePolicy(readout="sweeps")), sweeps=3, pooled=False)
+            jacobi_sweeps(
+                rows, op, RowLaws(regularize=False, policy=SolvePolicy(readout="trace")), sweeps=1, pooled=False
+            )
+        counted = jacobi_sweeps(
+            rows, op, RowLaws(regularize=False, policy=SolvePolicy(readout="sweeps")), sweeps=3, pooled=False
+        )
         self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 
     def test_a_pooled_pair_reads_its_ring_from_the_staged_impulses(self):

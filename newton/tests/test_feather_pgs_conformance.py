@@ -1689,10 +1689,14 @@ def cuda_groups() -> list:
     for scene in COMPLIANT_SCENES():
         routes = (MF_COMPLIANCE, MF_GENERAL.but("mf_general_compliance", expect={"friction.compliance": True}))
         groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, routes))
-    # Material contacts compose with warm start (the cold reference) and patch friction.
-    for scene in (scenes.compliant_plate(contact_matching="latest"), scenes.compliant_stack(contact_matching="latest")):
+    # Material contacts compose with warm start (the cold reference) and patch friction. The stack's corner split
+    # converges at 64 sweeps; at 32 its last step's split sits at the solve's noise floor (the bound's 1e-4).
+    for scene, iterations in (
+        (scenes.compliant_plate(contact_matching="latest"), 32),
+        (scenes.compliant_stack(contact_matching="latest"), 64),
+    ):
         warm = MF_COMPLIANCE.but("mf_compliance_warm_start", options=_WARM)
-        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, (warm,)))
+        groups.append(Group(_physics(scene, "point", iterations, "compliance", contact_compliance=True), ref, (warm,)))
     groups.append(
         Group(
             _physics(scenes.compliant_stack(), "patch", 32, "compliance", contact_compliance=True),
@@ -1700,6 +1704,22 @@ def cuda_groups() -> list:
             (MF_COMPLIANCE,),
         )
     )
+    # Every placement takes a contact row by its weight: the articulated scenes on stiff material contacts, and on
+    # rigid contacts under the relative regularization, through the routes that serve their topologies (the
+    # specialized placements' row laws against the reference's).
+    for scene, iterations, routes in (
+        (scenes.legged(), 32, (SPARSE, SPARSE_TRIPLETS, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
+        (scenes.gripper(), 32, (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY)),
+        (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY)),
+        (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
+    ):
+        material = _material(scene)
+        groups.append(
+            Group(_physics(material, "point", iterations, "compliance", contact_compliance=True), ref, routes)
+        )
+        groups.append(
+            Group(_physics(scene, "point", iterations, "regularized", pgs_contact_regularization=0.1), ref, routes)
+        )
     return groups
 
 
@@ -1715,6 +1735,17 @@ def cpu_groups() -> list:
         route = CPU.but(f"{CPU.name}_{group.tag}" if group.tag else CPU.name, options=options)
         groups.append(dataclasses.replace(group, reference=REFERENCE_CPU, routes=(route,), findings=()))
     return groups
+
+
+def _material(scene: scenes.Scene, stiffness: float = 2.0e4, damping: float = 100.0) -> scenes.Scene:
+    """``scene`` on material contacts of ``stiffness`` [N/m] and ``damping`` [N s/m] in every world."""
+    worlds = len(scene.params["mu"])
+    return dataclasses.replace(
+        scene,
+        name=f"{scene.name}_material",
+        contact_stiffness=(stiffness,) * worlds,
+        contact_damping=(damping,) * worlds,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------

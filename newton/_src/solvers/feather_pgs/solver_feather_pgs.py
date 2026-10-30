@@ -775,7 +775,8 @@ class SolverFeatherPGS(SolverBase):
                 the contact's ``rigid_contact_friction`` scale (zero meaning one). Zero stiffness keeps the rigid
                 law. The law is the row law's compliance ``eps = 1 / (dt (dt k + c))``: a material normal takes
                 neither restitution nor ``pgs_contact_regularization``. The contacts must carry the three
-                per-contact arrays. Placements whose sweeps read no row weights decline it. Defaults to False.
+                per-contact arrays. Every placement takes it: each sweep steps a material normal by the weight
+                ``d / (d + eps)`` of the diagonal it forms. Defaults to False.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
@@ -1378,6 +1379,7 @@ class SolverFeatherPGS(SolverBase):
         # regularization is disabled.
         self._contact_row_w_dummy = self._arrays.placeholder(wp.float32, (1, 1), 1.0)
         self._contact_row_eps_dummy = self._arrays.placeholder(wp.float32, (1, 1))
+        self.row_eps = self.mf_row_eps = self._contact_row_eps_dummy
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
@@ -1547,12 +1549,8 @@ class SolverFeatherPGS(SolverBase):
                 else "The local packet law does not admit this topology."
             )
         self._keyed_rows = None
-        if self.laws.regularization_enabled:
+        if not self._parallel_contact_paths:
             self._keyed_rows_reason = self._parallel_contact_paths_reason
-        elif not self._parallel_contact_paths:
-            self._keyed_rows_reason = (
-                "Keyed rows write the point and patch row laws; torsion and compliance keep ordinary rows."
-            )
         elif self._route_pins.get("producer") not in (None, "keyed_rows"):
             self._keyed_rows_reason = "A test pin selects another contact-row producer."
         else:
@@ -2340,7 +2338,6 @@ class SolverFeatherPGS(SolverBase):
             and not self._preelim_active
             and not self.forest.has_free_rigid_bodies
             and not self._debug_buffers_enabled
-            and not self.laws.weighted
             and self.laws.mimic_count == 0
             and self.laws.connect_count == 0
         )
@@ -2728,6 +2725,7 @@ class SolverFeatherPGS(SolverBase):
             warm_start=self.options.pgs_warmstart,
             linked_rows=self.laws.friction_anchors_enabled,
             device_arch=model.device.arch,
+            weighted=self.laws.set.weighted,
         )
 
     def _sweep_kernel(self, route: str, factory, *args, readout_budget: int | None = None, **kwargs):
@@ -2743,7 +2741,7 @@ class SolverFeatherPGS(SolverBase):
             **kwargs: Keyword arguments of the factory.
         """
         policy = self._solve_policy
-        built = factory(*args, solve_policy=policy, **kwargs)
+        built = factory(*args, solve_policy=policy, material=bool(self.options.contact_compliance), **kwargs)
         kernel = built.kernel if isinstance(built, SweepTier) else built
         budget = int(self.options.pgs_iterations if readout_budget is None else readout_budget)
         self._solve_readout.register(
@@ -2755,6 +2753,16 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
         return built
+
+    def _weight_operands(self) -> list:
+        """The row weights and the run-time switch that a sweep without them takes once the laws are weighted
+        (:func:`.sweep.weight_arguments`)."""
+        return [self.row_w, 1] if self.laws.set.weighted else []
+
+    def _material_operands(self) -> list:
+        """The material contacts' compliance per row, which every sweep built with them takes after its own operands
+        (:func:`.sweep.material_arguments`)."""
+        return [self.row_eps, self.mf_row_eps] if self.options.contact_compliance else []
 
     def _sparse_small_world_lanes(self, staging, budget: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
@@ -3231,7 +3239,7 @@ class SolverFeatherPGS(SolverBase):
         arrays.allocate(FUSED_DIAGONAL_LIMITS, **(sizes if fused else {"world": 1, "world_dof": 1}))
         # Per-row weights exist only for a weighted row law (relative regularization or material contacts), and
         # per-row compliance only for material contacts.
-        if self.laws.weighted:
+        if self.laws.set.weighted:
             arrays.allocate(DENSE_ROW_WEIGHTS, **sizes)
         else:
             self.row_w = self._contact_row_w_dummy
@@ -3257,7 +3265,7 @@ class SolverFeatherPGS(SolverBase):
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
         arrays.allocate(MF_COUNTERS, world=worlds)
         arrays.allocate(MF_ROWS, world=worlds, mf_row=rows, mf_meta=4 * rows)
-        if self.laws.weighted and self.forest.has_free_rigid_bodies:
+        if self.laws.set.weighted and self.forest.has_free_rigid_bodies:
             arrays.allocate(MF_ROW_WEIGHTS, world=worlds, mf_row=rows)
         else:
             self.mf_row_w = self._contact_row_w_dummy
@@ -3370,6 +3378,7 @@ class SolverFeatherPGS(SolverBase):
                     contact_triples=self._factor_coordinate_contact_triples,
                     independent_components=self._paired_components is not None,
                     contact_units=self._factor_coordinate_contact_units,
+                    weighted=self.laws.set.weighted,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -3482,6 +3491,7 @@ class SolverFeatherPGS(SolverBase):
                 contact_triples=self._sparse_diagonal_contact_triples,
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
                 contact_units=self._sparse_diagonal_contact_units,
+                weighted=self.laws.set.weighted,
             )
             if self._sparse_diagonal_contact_solve
             else None
@@ -3611,6 +3621,7 @@ class SolverFeatherPGS(SolverBase):
                         inkernel_response=self._ink_sizes,
                         linked_rows=self.laws.friction_anchors_enabled,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
+                        weighted=self.laws.set.weighted,
                     )
                     self._mf_gs_tiers.append(dataclasses.replace(tier, tier=tier_index))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
@@ -3800,7 +3811,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_Z_b,
                 self.mf_row_mu,
                 self.mf_row_w,
-                int(self.laws.weighted),
+                int(self.laws.set.weighted),
             )
 
     def _launch_local_internal_solve(
@@ -3861,7 +3872,7 @@ class SolverFeatherPGS(SolverBase):
                     self.mf_Z_a,
                     self.mf_Z_b,
                     self.mf_row_mu,
-                    int(self.laws.weighted),
+                    int(self.laws.set.weighted),
                     self.row_w,
                     self.mf_row_w,
                     iterations,
@@ -3873,7 +3884,7 @@ class SolverFeatherPGS(SolverBase):
             outputs = [self.diag, self.impulses, self.v_out]
             if self._row_packets is not None:
                 outputs.extend([self._row_packets.prefix, self._row_packets.packet])
-            outputs.extend(self._solve_readout.operands(kernel))
+            outputs.extend([*self._material_operands(), *self._solve_readout.operands(kernel)])
             wp.launch_tiled(
                 kernel,
                 dim=[count // worlds_per_block],
@@ -3977,6 +3988,8 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[
                     self._sparse_factor_velocity_delta,
                     self._sparse_row_support,
+                    *self._weight_operands(),
+                    *self._material_operands(),
                     *self._solve_readout.operands(self._pgs_solve_sparse_kernel),
                 ],
                 block_dim=64,
@@ -4044,6 +4057,8 @@ class SolverFeatherPGS(SolverBase):
                     self._fused_diagonal_limit_lower_lambda,
                     self._fused_diagonal_limit_upper_lambda,
                     self.v_out,
+                    *self._weight_operands(),
+                    *self._material_operands(),
                     *self._solve_readout.operands(kernel),
                 ],
                 block_dim=32,
@@ -4137,7 +4152,12 @@ class SolverFeatherPGS(SolverBase):
                             int(friction_start_iteration),
                             int(iteration_offset),
                         ],
-                        outputs=[self.v_out, *self._solve_readout.operands(factor_kernel)],
+                        outputs=[
+                            self.v_out,
+                            *self._weight_operands(),
+                            *self._material_operands(),
+                            *self._solve_readout.operands(factor_kernel),
+                        ],
                         block_dim=64,
                         device=self.model.device,
                         stream=factor_stream,
@@ -4180,7 +4200,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_row_w,
                 iterations,
                 omega,
-                int(self.laws.weighted),
+                int(self.laws.set.weighted),
                 int(friction_start_iteration),
                 int(iteration_offset),
             ]
@@ -4229,7 +4249,7 @@ class SolverFeatherPGS(SolverBase):
                     sweep.kernel,
                     dim=[dim],
                     inputs=inputs,
-                    outputs=[self.v_out, *self._solve_readout.operands(sweep.kernel)],
+                    outputs=[self.v_out, *self._material_operands(), *self._solve_readout.operands(sweep.kernel)],
                     block_dim=sweep.block_dim,
                     device=self.model.device,
                 )
@@ -4239,7 +4259,7 @@ class SolverFeatherPGS(SolverBase):
                     colored_kernel,
                     dim=[general_block_count],
                     inputs=[*mf_gs_inputs, *self._colored_units.operands()],
-                    outputs=[self.v_out, *self._solve_readout.operands(colored_kernel)],
+                    outputs=[self.v_out, *self._material_operands(), *self._solve_readout.operands(colored_kernel)],
                     block_dim=sweep_routes.COLORED_THREADS,
                     device=self.model.device,
                 )
@@ -7068,21 +7088,15 @@ class SolverFeatherPGS(SolverBase):
         converged point tiers sat 3.9 times the serial sweep's p90 error away from its
         fixed point on anymal-D's 33-48-row worlds. Both project joint velocity-limit
         rows by one unilateral law, so the tiers share the serial sweep's fixed point
-        there too. Torsion and compliance keep ordinary rows. So does contact
-        regularization, under either law: the tiers
-        solve the unregularized law, so the worlds they own would drop
-        ``pgs_contact_regularization`` while the serial sweeps apply it.
+        there too, and weighted contact rows (the relative regularization, material
+        contacts) by their weights, the serial sweeps' row law. Torsion keeps ordinary
+        rows.
         """
         laws = self.laws.set
-        if laws.regularized:
-            return False, (
-                "Contact regularization keeps serial sweeps and ordinary rows: the parallel tiers, which keyed rows "
-                "feed, solve the unregularized law, and the serial sweeps apply pgs_contact_regularization."
-            )
         if laws.point:
             return True, "Point friction: parallel tiers and keyed rows serve it."
         if not laws.agnostic:
-            return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
+            return False, "Contact torsion keeps serial sweeps and ordinary rows."
         return True, (
             "Patch friction: parallel tiers and keyed rows serve it. In the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
@@ -7305,7 +7319,7 @@ class SolverFeatherPGS(SolverBase):
                 dt,
                 self.options.contact_speculative_scale,
                 self.laws.contact_w,
-                int(self.laws.weighted),
+                int(self.laws.set.weighted),
                 int(self.options.contact_compliance),
             ],
             device=self.model.device,
@@ -7341,7 +7355,7 @@ class SolverFeatherPGS(SolverBase):
                 self._diagonal_inverse_mass,
                 dt,
                 self.laws.effective_restitution_velocity_threshold,
-                int(self.laws.weighted),
+                int(self.laws.set.weighted),
             ],
             device=self.model.device,
         )
@@ -7436,7 +7450,7 @@ class SolverFeatherPGS(SolverBase):
                 self.options.contact_speculative_scale,
                 self.laws.effective_restitution_velocity_threshold,
                 self.mf_max_constraints,
-                int(self.laws.weighted),
+                int(self.laws.set.weighted),
                 int(self.options.contact_compliance),
             ],
             outputs=[self.mf_eff_mass_inv, self.mf_row_w],

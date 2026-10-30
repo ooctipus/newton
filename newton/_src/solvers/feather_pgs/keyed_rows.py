@@ -78,7 +78,8 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
 
     Under persistent patch friction also the type, parent and undivided coefficient of each row: the patch
     link runs after this launch and before any row is read, links each normal row into its patch ring and
-    divides the tangent coefficient among the anchors that received rows.
+    divides the tangent coefficient among the anchors that received rows. A material contact's tangents take its
+    friction scale (:func:`.row_build.write_contact_row`).
     """
     contact = wp.tid()
     if contact < data.count[0]:
@@ -89,6 +90,10 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                 z.rowkeys[world, slot + direction] = contact * 4 + direction
             if law.patches.enabled != 0:
                 mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
+                friction = mu * data.friction_scale
+                if data.material != 0:
+                    if data.stiffness[contact] > 0.0 and data.friction_weight[contact] > 0.0:
+                        friction *= data.friction_weight[contact]
                 for direction in range(data.slots_needed[contact]):
                     row = slot + direction
                     if direction == 0:
@@ -98,14 +103,14 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                     else:
                         data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
                         data.row_parent[world, row] = slot
-                        data.row_mu[world, row] = mu * data.friction_scale
+                        data.row_mu[world, row] = friction
 
 
 ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
 """Device preludes of the row source: the contact and row laws it calls (``ContactLaw::...``, ``RowLaw::...``)."""
 
 
-def _row_source(*, layout, patch=False):
+def _row_source(*, layout, patch=False, weighted=False):
     """Decode a dense row from its key into the parallel tiers' row ``Zi`` and its records.
 
     A prefix row's key ``~(2 d + side)`` gives a unit coefficient. A contact row takes its geometry, frame, target,
@@ -113,6 +118,10 @@ def _row_source(*, layout, patch=False):
     ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
     Jacobian and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
     every row's type, parent and coefficient stay as :func:`scatter_contact_keys` and the patch link left them.
+    ``weighted`` writes each row's weight (the relative regularization's, 1 for a firing rebound) and, under
+    ``contact_compliance``, a material contact's law as :func:`.row_build.write_contact_row` does: its normal's rhs
+    and compliance (:func:`.row_laws.contact_material_rhs`, zero on every other row), no restitution and its
+    tangents' friction scale; the tiers form its weight from that compliance.
     """
     dofs, output = layout.dofs, "Zi[q * ZS]"
     prefix = substitute(
@@ -174,6 +183,32 @@ def _row_source(*, layout, patch=False):
             "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
             "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n"
         )
+    materials = """        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
+        const float friction = mu * c.friction_scale;"""
+    rhs = """        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
+                                    c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;"""
+    bounce, weight = "if (bounce.v0) rhs = bounce.v1;", ""
+    if weighted:
+        materials = """        const auto [mu, rigid_restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu,
+                                                                           c.material_restitution);
+        const float stiffness = c.material != 0 ? c.stiffness.data[contact] : 0.0f;
+        const float restitution = stiffness > 0.0f ? 0.0f : rigid_restitution;
+        const float friction = mu * c.friction_scale
+            * (stiffness > 0.0f && c.friction_weight.data[contact] > 0.0f ? c.friction_weight.data[contact] : 1.0f);"""
+        rhs = """        const auto row_law = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target,
+                                             1.0f / c.dt, c.bias_scale, c.speculative_scale, 0.0f, c.contact_w);
+        float rhs = row_law.v0, weight = row_law.v1;"""
+        bounce = "if (bounce.v0) { rhs = bounce.v1; weight = 1.0f; }"
+        weight = """        float eps = 0.0f;
+        if (r == 0 && stiffness > 0.0f) {
+            const auto spring = RowLaw::contact_material_rhs(phi, target, stiffness, c.damping.data[contact], c.dt);
+            rhs = spring.v0;
+            eps = spring.v1;
+        }
+        c.row_w.data[at] = weight;
+        if (c.material != 0) c.row_eps.data[at] = eps;
+"""
+    rhs = rhs.replace("${TANGENT_BETA}", tangent_beta)
     if patch:
         metadata = "built_rhs = rhs;"
     else:
@@ -204,21 +239,19 @@ ${PREFIX}
         ${FRICTION_LOCATION}
         const auto [direction, p0, p1] = ContactLaw::contact_row_frame(r, c.shared_anchor, normal, t0, t1, pa, pb, fa, fb);
         const float target = ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v);
-        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
-        const float friction = mu * c.friction_scale;
+${MATERIALS}
 ${PROJECTION}
         const float phi = r == 0 ? separation : ${TANGENT_PHI};
-        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
-                                    c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;
+${RHS}
         if (r == 0 && restitution > 0.0f) {
             float relative = -target;
             #pragma unroll
             for (int q = 0; q < ${DOFS}; ++q) { ${INCIDENT} }
             const auto bounce = RowLaw::contact_restitution_rhs(phi, relative, target, restitution, c.dt,
                                                                 c.restitution_threshold);
-            if (bounce.v0) rhs = bounce.v1;
+            ${BOUNCE}
         }
-${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
+${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
         c.phi.data[at] = phi; c.target.data[at] = target;
         c.restitution.data[at] = r == 0 ? restitution : 0.0f;
         c.rhs.data[at] = rhs; c.diag.data[at] = c.cfm;
@@ -226,11 +259,14 @@ ${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
     }
 """,
         PREFIX=prefix,
+        MATERIALS=materials,
+        RHS=rhs,
+        BOUNCE=bounce,
+        WEIGHT=weight,
         FRICTION_LOCATION=friction_location,
         PROJECTION=projection,
         INCIDENT=incident,
         TANGENT_PHI=tangent_phi,
-        TANGENT_BETA=tangent_beta,
         ROW_LAW=row_law,
         PRIVATE_METADATA=metadata,
         DOFS=dofs,
@@ -298,12 +334,12 @@ def materialize_general_rows(
             J_b[at[0], row, at[1] + local] = value
 
 
-def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
+def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False, weighted=False):
     """Decode physical endpoints in the ordinary factor stage.
 
     ``patch`` writes the persistent patch row law and reads every row's parent and
     coefficient as the scatter and the patch link left them; point friction builds
-    them with the row.
+    them with the row. ``weighted`` writes the rows' weights and material contacts' law (:func:`_row_source`).
     """
     if (na, nb, oa, ob, dofs) != (
         layout.primary,
@@ -329,7 +365,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
             const auto& z = kinetic_rows;
             {built}
     """
-        + _row_source(layout=layout, patch=patch)
+        + _row_source(layout=layout, patch=patch, weighted=weighted)
         + f"""
             if ({key} >= 0) {publish}
     """
@@ -354,9 +390,9 @@ def get_parallel_factory(original, layout):
     ring-pooled friction projection together.
     """
 
-    def factory(*args, linked_rows=False, **kwargs):
-        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows)
-        return original(*args, row_inputs=inputs, linked_rows=linked_rows, **kwargs)
+    def factory(*args, linked_rows=False, weighted=False, **kwargs):
+        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows, weighted=weighted)
+        return original(*args, row_inputs=inputs, linked_rows=linked_rows, weighted=weighted, **kwargs)
 
     return factory
 

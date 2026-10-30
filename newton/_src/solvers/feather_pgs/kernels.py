@@ -2676,9 +2676,9 @@ def compute_world_contact_bias(
     The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
     ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS.
 
-    ``weighted`` rows take a weight: the relative regularization's, or a material contact's (``material``: a contact
-    whose writer stored a compliance ``eps`` and its rhs) ``d / (d + eps)`` from its final diagonal ``d``, in which the
-    regularized step (:func:`.projection_laws.regularized_delta`) is the material law's exact Gauss-Seidel step.
+    ``weighted`` rows store their relative regularization weight. A material contact (``material``: its writer stored
+    its rhs and compliance ``eps``, from which the sweeps form its weight, :func:`.sweep.row_weight`) keeps
+    its rhs.
 
     One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
@@ -2690,10 +2690,7 @@ def compute_world_contact_bias(
         return
     kind = rows.row_type[world, i]
     if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        eps = rows.row_eps[world, i]
-        if eps > 0.0:
-            diagonal = rows.diag[world, i]
-            rows.row_w[world, i] = diagonal / (diagonal + eps)
+        if rows.row_eps[world, i] > 0.0:
             return
     inv_dt = 1.0 / dt
     phi = rows.phi[world, i]

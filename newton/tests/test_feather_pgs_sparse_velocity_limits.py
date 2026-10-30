@@ -47,18 +47,19 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         """Admit the unchanged augmented matrix-free recipe under either friction law before planning its factor.
 
         Warm starting is admitted without free rigid bodies: the sparse sweep
-        seeds its factor delta with the carried impulses' response.
+        seeds its factor delta with the carried impulses' response. Material
+        contacts are admitted: the sparse sweeps step them by their weights.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
-        warm_starts = ({}, {"pgs_warmstart": True})
-        for patches, warm_start in itertools.product((False, True), warm_starts):
+        recipes = ({}, {"pgs_warmstart": True}, {"contact_compliance": True})
+        for patches, recipe in itertools.product((False, True), recipes):
             solver = _eligible_solver()
             solver.options.enable_joint_velocity_limits = True
             solver.laws.friction_anchors_enabled = patches
-            for key, value in warm_start.items():
+            for key, value in recipe.items():
                 _change(solver, key, value)
             with (
-                self.subTest(patches=patches, warm_start=warm_start),
+                self.subTest(patches=patches, recipe=recipe),
                 mock.patch.dict(os.environ, {}, clear=True),
                 self.assertRaises(_TopologyReached),
             ):
@@ -71,7 +72,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
             {"_route_pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
             {"forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
-            {"contact_compliance": True},
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()

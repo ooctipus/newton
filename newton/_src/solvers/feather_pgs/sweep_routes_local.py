@@ -46,11 +46,13 @@ from .sweep import (
     friction_gate,
     friction_radius,
     indent,
+    material_arguments,
     pair_radius,
     pair_update,
     row_update,
     row_visit,
     unit_held_loads,
+    weight_arguments,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -172,6 +174,7 @@ def local_owned_source(
     local_mf_max_constraints: int = 0,
     row_inputs=None,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel.
@@ -190,7 +193,7 @@ def local_owned_source(
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
     lanes = Lanes(L)
     free = FreeBodyZ(lanes) if MFR else None
-    laws = RowLaws(regularize=contact_capable, policy=solve_policy)
+    laws = RowLaws(regularize=contact_capable, material=material and contact_capable, policy=solve_policy)
     factors = (CholeskySolve(P, "s_L", reciprocal=True, ascending=True),)
     if S:
         factors += (CholeskySolve(S, "s_L_secondary", reciprocal=True, ascending=True),)
@@ -341,6 +344,7 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
         rhs=lambda row: f"s_rhs[{row}]",
         mu=lambda row: f"s_mu[{row}]",
         weight=lambda row: f"world_row_w.data[world_row_base + {row}]",
+        eps=lambda row: f"world_row_eps.data[world_row_base + {row}]",
         parent="parent",
         ring_load=lambda parent: (
             f"RING_LOAD(s_lam[{parent}], {parent}, {R},\n"
@@ -384,6 +388,7 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             store=lambda row, value: lanes.first(f"s_mf_lam[{row}] = {value};"),
             mu=lambda row: f"mf_row_mu.data[off_mf + {row}]",
             weight=lambda row: f"mf_row_w.data[off_mf + {row}]",
+            eps=lambda row: f"mf_row_eps.data[off_mf + {row}]",
             ring_load=lambda parent: (
                 f"RING_LOAD(s_mf_lam[{parent}], {parent}, {MFR},\n"
                 f"    [&](int patch_row) {{ return {meta_parent}; }},\n"
@@ -434,6 +439,7 @@ def local_owned_kernel(
     local_mf_max_constraints: int = 0,
     row_inputs=None,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    material: bool = False,
 ) -> wp.Kernel:
     """A local owner's sweep kernel.
 
@@ -452,6 +458,7 @@ def local_owned_kernel(
         local_mf_max_constraints=local_mf_max_constraints,
         row_inputs=row_inputs,
         solve_policy=solve_policy,
+        material=material,
     )
     staging.check("the local owner's sweep", arch_budget(device_arch))
     family = "sweep_local" if row_inputs is None else "sweep_local_packet"
@@ -462,10 +469,11 @@ def local_owned_kernel(
         + ("" if contact_capable else "_contact0")
         + (f"_mf{local_mf_max_constraints}" if local_mf_max_constraints else "")
         + ("_queue" if persistent_queue else "")
+        + ("_material" if material else "")
         + solve_policy.suffix
     )
     queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
-    arguments = () if row_inputs is None else row_inputs.arguments
+    arguments = (*(() if row_inputs is None else row_inputs.arguments), *material_arguments(material))
     return KernelTemplate.from_abi(
         name,
         LOCAL_ABI,
@@ -521,6 +529,8 @@ def paired_factor_source(
     *,
     contact_units: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the factor velocity ``u = L^T v`` in a register per lane.
@@ -542,7 +552,7 @@ def paired_factor_source(
     if contact_triples and contact_units:
         raise ValueError("contact triples and contact units are exclusive paired factor schedules")
     lanes = Lanes(32)
-    laws = RowLaws(regularize=False, policy=solve_policy)
+    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy)
     op = FactorRows(
         D,
         (
@@ -572,7 +582,8 @@ def paired_factor_source(
         store=lambda row, value: lanes.first(f"s_lam[{row}] = {value};"),
         rhs=lambda row: f"s_rhs[{row}]",
         mu=lambda row: f"world_row_mu.data[off + {row}]",
-        weight=lambda row: "1.0f",  # The paired route runs without regularization.
+        weight=lambda row: f"world_row_w.data[off + {row}]",
+        eps=lambda row: f"world_row_eps.data[off + {row}]",
         parent="parent",
         ring_load=lambda parent, load=None: (
             f"RING_LOAD({load or f's_lam[{parent}]'}, {parent}, m, ring_parent, ring_impulse)"
@@ -852,8 +863,11 @@ def paired_factor_kernel(
     *,
     contact_units: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> wp.Kernel:
-    """The paired factor sweep kernel; a readout's operand follows ``v_out``."""
+    """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
+    :func:`.sweep.material_arguments`) and a readout's operand follow ``v_out``."""
     snippet, staging = paired_factor_source(
         max_constraints,
         max_world_dofs,
@@ -863,6 +877,8 @@ def paired_factor_kernel(
         independent_components,
         contact_units=contact_units,
         solve_policy=solve_policy,
+        weighted=weighted,
+        material=material,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
@@ -870,6 +886,8 @@ def paired_factor_kernel(
         + ("_contact3" if contact_triples else "")
         + ("_units" if contact_units else "")
         + ("_components" if independent_components else "")
+        + ("_weighted" if weighted else "")
+        + ("_material" if material else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(
@@ -877,7 +895,7 @@ def paired_factor_kernel(
         PAIRED_FACTOR_ABI,
         snippet,
         kernel_template.tiles(_PAIRED_WORLDS_PER_BLOCK, 32),
-        extra=solve_policy.arguments,
+        extra=(*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments),
         composed=True,
         native_name="sweep_paired_factor_native",
     ).kernel()

@@ -43,6 +43,7 @@ from .sweep import (
     end_sweep,
     free_body_rows_block,
     indent,
+    material_arguments,
     speed_rows_pass,
     velocity_limit_pass,
 )
@@ -328,6 +329,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
         rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3 + 1])",
         mu=lambda row: f"E[{sweep_units.SLOT_MU}]",
         weight=lambda row: f"E[{sweep_units.SLOT_WEIGHT}]",
+        eps=unit_rows.eps,
         parent="parent",
         ring_load=ring_load,
         lanes=Lanes(1),
@@ -527,6 +529,7 @@ def mf_gs_source(
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     lanes: int = 32,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -560,7 +563,7 @@ def mf_gs_source(
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     row_lanes = Lanes(lanes)
-    laws = RowLaws(regularize=True, torsion=contact_torsion, policy=solve_policy)
+    laws = RowLaws(regularize=True, material=material, torsion=contact_torsion, policy=solve_policy)
     dense = WorldRows(
         M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=row_lanes
     )
@@ -752,6 +755,7 @@ def mf_gs_kernel(
     skip_tier_rows: int = 0,
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    material: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -776,6 +780,7 @@ def mf_gs_kernel(
         independent_components=independent_components,
         solve_policy=solve_policy,
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
+        material=material,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -792,6 +797,7 @@ def mf_gs_kernel(
         + (f"_skiptier{int(skip_tier_rows)}" if skip_tier_rows > 0 else "")
         + ("_components" if independent_components else "")
         + ("_cw" if colored_worlds and not colored else "")
+        + ("_material" if material else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(
@@ -799,7 +805,7 @@ def mf_gs_kernel(
         COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
         kernel_template.WORLD_QUEUE,
-        extra=solve_policy.arguments,
+        extra=(*material_arguments(material), *solve_policy.arguments),
         composed=True,
         native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",
         launch_bounds=(COLORED_THREADS, 1) if colored else None,

@@ -41,7 +41,9 @@ from .sweep import (
     end_sweep,
     friction_gate,
     indent,
+    material_arguments,
     row_visit,
+    weight_arguments,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -205,6 +207,8 @@ def sparse_diagonal_source(
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
@@ -239,7 +243,7 @@ def sparse_diagonal_source(
     scheduled = contact_triples or contact_units
 
     warp = Lanes(32)
-    laws = RowLaws(regularize=False, policy=solve_policy)
+    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy)
     rows = WorldRows(M, lanes=warp)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
 
@@ -256,6 +260,7 @@ def sparse_diagonal_source(
             rhs=rows.rhs_of,
             mu=rows.mu,
             weight=rows.weight,
+            eps=rows.eps,
             parent="parent",
             ring_load=rows.ring_load,
             lanes=lanes,
@@ -595,8 +600,11 @@ def sparse_diagonal_kernel(
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    weighted: bool = False,
+    material: bool = False,
 ) -> wp.Kernel:
-    """The sparse-diagonal sweep kernel."""
+    """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
+    (:func:`.sweep.material_arguments`) add their operands."""
     snippet, staging = sparse_diagonal_source(
         max_constraints,
         max_world_dofs,
@@ -605,6 +613,8 @@ def sparse_diagonal_kernel(
         speculative_contact_batches=speculative_contact_batches,
         contact_units=contact_units,
         solve_policy=solve_policy,
+        weighted=weighted,
+        material=material,
     )
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
@@ -612,11 +622,14 @@ def sparse_diagonal_kernel(
         + ("_contact_groups" if contact_triples else "")
         + ("_speculative_batches" if speculative_contact_batches else "")
         + ("_units" if contact_units else "")
+        + ("_weighted" if weighted else "")
+        + ("_material" if material else "")
         + solve_policy.suffix
     )
+    extra = (*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments)
     return KernelTemplate(
         name,
-        kernel_template.operands(SPARSE_DIAGONAL_ABI, solve_policy.arguments),
+        kernel_template.operands(SPARSE_DIAGONAL_ABI, extra),
         snippet,
         kernel_template.WORLDS,
         composed=True,

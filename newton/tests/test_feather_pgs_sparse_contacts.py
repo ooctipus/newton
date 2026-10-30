@@ -64,6 +64,8 @@ def _contact_input(f, device="cpu", **fields):
         "shape_body": f["shape_body"],
         "body_q": f["body_q"],
         "incident": f["velocity"],
+        # The rigid law's contact weight: no regularization, so the producers write no row weight.
+        "contact_w": 1.0,
     }
     values.update(fields)
     if "row_type" in values and "sides" not in values:
