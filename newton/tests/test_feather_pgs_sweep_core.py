@@ -192,6 +192,12 @@ class TestRowTail(unittest.TestCase):
         self.assertIn("apply_pair(sib_delta, delta_impulse);", update)
         self.assertNotIn("Y(sib)", update)
 
+    def test_a_fused_vote_reads_the_sibling_only_where_the_row_has_one(self):
+        """A row without a pair (``sib < 0``) has no sibling whose diagonal the vote could read: its zero change is
+        quiet without reading ``A[-1]`` (another row's or buffer's slot, possibly not a finite number)."""
+        update = self._update(_FusedRows(diagonal=lambda row: f"A[{row}]"))
+        self.assertIn("(sib >= 0 && !(fabsf(sib_delta) * (A[sib]) <= sib_bound))", update)
+
     def test_rows_without_friction_pairs_store_and_apply_the_row_only(self):
         update = self._update(_FusedRows(diagonal=lambda row: f"A[{row}]"), friction=False)
         self.assertNotIn("sib", update)

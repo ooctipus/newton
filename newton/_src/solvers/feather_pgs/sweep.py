@@ -437,6 +437,8 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
     row_change = op.change("delta_impulse", "row_bound", kind, row)
     sib_change = _sibling_change(ctx)
     if ctx.friction and op.fused_pair_apply:
+        # Both changes vote together, the sibling's only where the row has a pair (sib < 0: no sibling row to read).
+        sib_change = dataclasses.replace(sib_change, exists="sib >= 0")
         lines += [
             "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
             change_vote(laws, (row_change, sib_change), "    "),

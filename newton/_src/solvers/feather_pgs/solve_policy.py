@@ -228,6 +228,9 @@ class Change:
     """Converts the impulse change into the row's velocity change: ``A_ii``, or a Jacobi step's inverse size."""
     scaled: bool = False
     """Whether the bound is in velocity units (a row that keeps its diagonal), so the vote reads ``phi``."""
+    exists: str | None = None
+    """Where the row may not exist (a friction sibling of a row without a pair), the condition that it does: a
+    missing row's change is quiet and reads none of the row's data."""
 
     @property
     def phi(self) -> str:
@@ -238,7 +241,8 @@ class Change:
     def loud(self) -> str:
         """Whether the change exceeds its bound."""
         change = self.phi if self.scaled else f"fabsf({self.delta})"
-        return f"!({change} <= {self.bound})"
+        loud = f"!({change} <= {self.bound})"
+        return f"{self.exists} && {loud}" if self.exists else loud
 
 
 def terms_bound(residual: str, rhs: str) -> str:
