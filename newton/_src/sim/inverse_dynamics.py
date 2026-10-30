@@ -461,8 +461,8 @@ def eval_inverse_dynamics_passive(
     )
 
     if mass_matrix is not None:
-        # eval_jacobian clears the scratch.J blocks of the selected
-        # articulations, the only ones eval_mass_matrix reads;
+        # eval_jacobian writes the Jacobians of the selected articulations
+        # in scratch.J, the only entries eval_mass_matrix reads;
         # jcalc_motion_subspace overwrites every selected DOF of
         # scratch.joint_S_s; compute_body_spatial_inertia fully overwrites
         # every body's scratch.body_I_s; eval_mass_matrix zeros mass_matrix

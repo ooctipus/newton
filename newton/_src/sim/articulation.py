@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import threading
-
 import warp as wp
 
 from ..math import quat_decompose, transform_twist, velocity_at_point
@@ -1095,9 +1093,9 @@ def jcalc_motion_subspace(
 
 @wp.kernel
 def eval_articulation_jacobian(
+    joint_articulation: wp.array[int],
     articulation_start: wp.array[int],
     articulation_end: wp.array[int],
-    articulation_count: int,
     articulation_mask: wp.array[bool],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
@@ -1115,14 +1113,19 @@ def eval_articulation_jacobian(
     J: wp.array3d[float],
     joint_S_s: wp.array[wp.spatial_vector],
 ):
-    """Compute spatial Jacobian for articulations.
+    """Write one joint's columns of its articulation's spatial Jacobian.
 
-    The Jacobian J maps joint velocities to spatial velocities of each link.
-    Output shape: (articulation_count, max_links*6, max_dofs)
+    Row block ``i`` of ``J[a]`` (rows ``6 * i`` to ``6 * i + 5``) is the COM twist of the
+    child link of articulation ``a``'s ``i``-th joint, and column ``c`` belongs to its
+    ``c``-th DOF. The column of a DOF of joint ``j`` is the DOF's motion subspace, shifted
+    to each link's COM, on the links whose path to the root passes through ``j``, and
+    zero on every other link. One thread per joint writes its DOFs' columns down every
+    link row, so the selected articulations' Jacobians, links by DOFs, are written in
+    full and nothing else in ``J`` is.
     """
-    art_idx = wp.tid()
-
-    if art_idx >= articulation_count:
+    j = wp.tid()
+    art_idx = joint_articulation[j]
+    if art_idx < 0:
         return
 
     if articulation_mask:
@@ -1131,254 +1134,56 @@ def eval_articulation_jacobian(
 
     joint_start = articulation_start[art_idx]
     joint_end = articulation_end[art_idx]
-    joint_count = joint_end - joint_start
-
-    articulation_dof_start = joint_qd_start[joint_start]
-
-    # First pass: compute body transforms and motion subspaces
-    for i in range(joint_count):
-        j = joint_start + i
-        parent = joint_parent[j]
-        type = joint_type[j]
-
-        X_pj = joint_X_p[j]
-
-        # parent anchor frame in world space
-        X_wpj = X_pj
-        if parent >= 0:
-            X_wp = body_q[parent]
-            X_wpj = X_wp * X_pj
-
-        q_start = joint_q_start[j]
-        qd_start = joint_qd_start[j]
-        lin_axis_count = joint_dof_dim[j, 0]
-        ang_axis_count = joint_dof_dim[j, 1]
-
-        jcalc_motion_subspace(
-            type,
-            joint_axis,
-            joint_q,
-            lin_axis_count,
-            ang_axis_count,
-            X_wpj,
-            body_q[joint_child[j]],
-            body_com[joint_child[j]],
-            q_start,
-            qd_start,
-            joint_S_s,
-        )
-
-    # Second pass: build Jacobian by walking kinematic chain
-    for i in range(joint_count):
-        row_start = i * 6
-
-        j = joint_start + i
-        child = joint_child[j]
-        x_com_world = wp.transform_point(body_q[child], body_com[child])
-        while j != -1:
-            joint_dof_start = joint_qd_start[j]
-            joint_dof_end = joint_qd_start[j + 1]
-            joint_dof_count = joint_dof_end - joint_dof_start
-
-            # Fill out each row of the Jacobian walking up the tree
-            for dof in range(joint_dof_count):
-                col = (joint_dof_start - articulation_dof_start) + dof
-                S = joint_S_s[joint_dof_start + dof]
-                S_com = wp.spatial_vector(velocity_at_point(S, x_com_world), wp.spatial_bottom(S))
-
-                for k in range(6):
-                    J[art_idx, row_start + k, col] = S_com[k]
-
-            j = joint_ancestor[j]
-
-
-@wp.kernel(enable_backward=False)
-def _zero_selected_articulation_blocks(
-    articulation_mask: wp.array[bool],
-    lane_count: int,
-    # outputs
-    blocks: wp.array3d[float],
-):
-    """Zero the whole block ``blocks[i]`` of every articulation ``i`` selected by the mask.
-
-    ``lane_count`` threads share one articulation and walk its block in row-major
-    order with stride ``lane_count``, so consecutive lanes store consecutive entries.
-    Like the memset it stands in for, the clear has no adjoint.
-    """
-    art_idx, lane = wp.tid()
-    if not articulation_mask[art_idx]:
+    # Loop-closing joints past the tree joints have no columns.
+    if j >= joint_end:
         return
 
-    cols = blocks.shape[2]
-    row = lane // cols
-    col = lane - row * cols
-    row_step = lane_count // cols
-    col_step = lane_count - row_step * cols
-    while row < blocks.shape[1]:
-        blocks[art_idx, row, col] = 0.0
-        row += row_step
-        col += col_step
-        if col >= cols:
-            col -= cols
-            row += 1
-
-
-_MASKED_CLEAR_MIN_BLOCK_ENTRIES: dict[str, int | None] = {"cuda": 1024, "cpu": None}
-"""Block size, in entries, from which a masked :func:`eval_jacobian` zeroes only the selected blocks, per device kind.
-
-Smaller blocks, and every block on a device kind mapped to ``None``, are zeroed with
-the rest of the Jacobian by ``J.zero_()``, one memset when ``J`` is contiguous.
-Measured against that memset on an RTX PRO 6000 (Blackwell), the only GPU measured,
-the per-block kernel took 1.9 to 8.9 times as long on blocks of 6 to 252 entries with
-every block selected, and 1.05 to 1.12 times on 594-entry blocks (0.86 times with
-every other block selected). From 1026 entries on it took at most 1.03 times as long
-with every block selected and 0.50 to 0.65 times with every other block selected. No
-size between 594 and 1026 entries was measured. On the CPU the per-block kernel's
-threads run serially: it took 8.5 ms against the memset's 0.45 ms on a
-128 x 654 x 108 Jacobian with half of the blocks selected. A NumPy fill of the
-selected blocks, the other CPU candidate, took 1.2 to 5.1 times as long as the memset
-with every block selected, and 1.0 to 3.2 times with every other block selected on
-Jacobians of 0.5 to 67 MB (0.59 times on 289 MB), for blocks of 1024 to 70632
-entries.
-"""
-
-_CLEAR_REPLAY_CAPACITY = 16
-"""Number of recorded clear launches kept for replay; the oldest is dropped first."""
-
-_clear_replays: dict[tuple, wp.Launch] = {}
-"""Recorded clear launches, keyed by every value the clear kernel reads.
-
-The key holds the launch device, the articulation count, and each array's address,
-shape, strides, data type and device. The recorded views carry no gradient arrays,
-which the kernel never reads.
-"""
-
-_clear_replays_lock = threading.Lock()
-"""Serializes changes to :data:`_clear_replays`; lookups read it without the lock."""
-
-_warp_config = vars(wp.config)
-"""Warp's live configuration values.
-
-Reading them here skips the Python attribute hook of :mod:`warp.config`, which costs
-about 0.1 us per read. A replayed clear reads four of them; on an RTX PRO 6000 the
-replayed clear of a small model (4096 blocks of 24 entries) took 3.3 us per call, to
-which the hook would add about 11%.
-"""
-
-
-def _unowned_view(array: wp.array) -> wp.array:
-    """Return a view of ``array``'s memory, with its shape and strides, that does not keep the memory alive."""
-    return wp.array(ptr=array.ptr, dtype=array.dtype, shape=array.shape, strides=array.strides, device=array.device)
-
-
-def _clear_launch_arguments(
-    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, *, owned: bool = True
-) -> tuple[wp.Kernel, tuple[int, int], list, list]:
-    """Return the kernel, launch dimensions, inputs and outputs that clear the selected blocks.
-
-    Args:
-        blocks: Per-articulation blocks, shape [articulation_count or more, rows, columns].
-        mask: Articulation mask.
-        articulation_count: Number of leading blocks that the mask covers.
-        owned: Whether array arguments may keep their memory alive. A recorded launch
-            gets views that do not, so that it never extends a buffer's lifetime.
-    """
-    block_size = blocks.shape[1] * blocks.shape[2]
-    # A whole number of warps per articulation, at most one 256-thread block.
-    lane_count = min(256, 32 * ((block_size + 31) // 32))
-    if not owned:
-        blocks, mask = _unowned_view(blocks), _unowned_view(mask)
-    return _zero_selected_articulation_blocks, (articulation_count, lane_count), [mask, lane_count], [blocks]
-
-
-def _launch_zero_selected_blocks(
-    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, device: wp.Device
-) -> None:
-    """Zero the blocks that ``mask`` selects among the first ``articulation_count`` and leave the others untouched.
-
-    The clear is a launch of :func:`_zero_selected_articulation_blocks`. A call with
-    Warp arrays replays the launch recorded for the same arrays and
-    articulation count, which reads the values that a :func:`warp.launch` of them
-    would. Packing a launch costs more host time than the clear takes on a small
-    model, where it would make the clear slower than the whole-buffer memset it
-    replaces. Other masks, graph captures and Warp's debugging aids take
-    :func:`warp.launch` instead: a capture records its own launches, printed launches
-    and CUDA error checks happen in :func:`warp.launch`, and a recorded launch keeps
-    the module build it was recorded with, so a replay would skip the checks of a
-    debug or floating-point-checking build.
-
-    No launch is recorded on a :class:`warp.Tape`, so a backward pass sees the clear
-    as it saw the ``J.zero_()`` it replaces: not at all.
-    """
-    block_size = blocks.shape[1] * blocks.shape[2]
-    if block_size == 0 or articulation_count == 0:
-        return
-    if (
-        not (isinstance(blocks, wp.array) and isinstance(mask, wp.array))
-        or device.is_capturing
-        or _warp_config["mode"] == "debug"
-        or _warp_config["verify_fp"]
-        or _warp_config["print_launches"]
-        or _warp_config["verify_cuda"]
-    ):
-        kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, articulation_count)
-        wp.launch(kernel, dim=dim, inputs=inputs, outputs=outputs, device=device, record_tape=False)
+    dof_start = joint_qd_start[j]
+    dof_count = joint_qd_start[j + 1] - dof_start
+    if dof_count == 0:
         return
 
-    key = (
-        device.alias,
-        articulation_count,
-        blocks.ptr,
-        blocks.shape,
-        blocks.strides,
-        blocks.dtype,
-        blocks.device.alias,
-        mask.ptr,
-        mask.shape,
-        mask.strides,
-        mask.dtype,
-        mask.device.alias,
+    # Motion subspace of this joint's DOFs
+    X_wpj = joint_X_p[j]
+    parent = joint_parent[j]
+    if parent >= 0:
+        X_wpj = body_q[parent] * X_wpj
+    child = joint_child[j]
+    jcalc_motion_subspace(
+        joint_type[j],
+        joint_axis,
+        joint_q,
+        joint_dof_dim[j, 0],
+        joint_dof_dim[j, 1],
+        X_wpj,
+        body_q[child],
+        body_com[child],
+        joint_q_start[j],
+        dof_start,
+        joint_S_s,
     )
-    launch = _clear_replays.get(key)
-    if launch is None:
-        kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, articulation_count, owned=False)
-        launch = wp.launch(
-            kernel, dim=dim, inputs=inputs, outputs=outputs, device=device, record_tape=False, record_cmd=True
-        )
-        if launch is None:
-            return  # warp.launch launches nothing either
-        with _clear_replays_lock:
-            if key not in _clear_replays:
-                while len(_clear_replays) >= _CLEAR_REPLAY_CAPACITY:
-                    del _clear_replays[next(iter(_clear_replays))]
-            _clear_replays[key] = launch
-    launch.launch()
 
+    # The joint's columns down every link row: the motion subspace at the link's COM
+    # where the link's path to the root passes through the joint, zero elsewhere.
+    col_start = dof_start - joint_qd_start[joint_start]
+    for i in range(joint_end - joint_start):
+        row_start = i * 6
+        ancestor = joint_start + i
+        while ancestor != j and ancestor != -1:
+            ancestor = joint_ancestor[ancestor]
 
-def _clear_jacobian(
-    J: wp.array3d[float], mask: wp.array[bool] | None, articulation_count: int, device: wp.Device
-) -> None:
-    """Zero what :func:`eval_jacobian` needs zeroed in a supplied ``J``: every block that ``mask`` selects.
-
-    Without a mask, with no entry for the device kind in
-    :data:`_MASKED_CLEAR_MIN_BLOCK_ENTRIES`, or with blocks under that entry,
-    ``J.zero_()`` clears the whole of ``J`` (one memset when ``J`` is contiguous).
-    Otherwise only the selected blocks are zeroed, so the cost follows the selection
-    and the other blocks keep the caller's values. A graph capture of a masked call
-    zeroes only the selected blocks of a non-contiguous ``J`` too, whatever their
-    size: ``J.zero_()`` is then Warp's strided fill, which its APIC capture (every CPU
-    capture, and a CUDA capture with ``apic=True``) cannot record. The choice depends
-    on the device, the shape and layout of ``J`` and whether a capture is on: it never
-    reads the mask, and a graph capture records the same clear for every mask.
-    """
-    if mask is not None:
-        min_entries = _MASKED_CLEAR_MIN_BLOCK_ENTRIES["cuda" if device.is_cuda else "cpu"]
-        if (min_entries is not None and J.shape[1] * J.shape[2] >= min_entries) or (
-            not J.is_contiguous and device.is_capturing
-        ):
-            _launch_zero_selected_blocks(J, mask, articulation_count, device)
-            return
-    J.zero_()
+        if ancestor == j:
+            link = joint_child[joint_start + i]
+            x_com_world = wp.transform_point(body_q[link], body_com[link])
+            for dof in range(dof_count):
+                S = joint_S_s[dof_start + dof]
+                S_com = wp.spatial_vector(velocity_at_point(S, x_com_world), wp.spatial_bottom(S))
+                for k in range(6):
+                    J[art_idx, row_start + k, col_start + dof] = S_com[k]
+        else:
+            for dof in range(dof_count):
+                for k in range(6):
+                    J[art_idx, row_start + k, col_start + dof] = 0.0
 
 
 def eval_jacobian(
@@ -1395,6 +1200,15 @@ def eval_jacobian(
     each articulation in the model and satisfies ``J_link @ joint_qd ==
     state.body_qd[link]`` under Newton's public COM/world body-twist convention.
 
+    The Jacobian of articulation ``i``, with ``n`` tree joints and ``d`` DOFs, is
+    ``J[i, :6 * n, :d]``. Row block ``k`` maps the articulation's joint velocities to
+    the twist of the child link of its ``k``-th joint; the columns of DOFs whose joint
+    is not on that link's path to the root are zero there. Each selected
+    articulation's Jacobian is overwritten in full, and nothing else in ``J`` is
+    written: the rows and columns past an articulation's links and DOFs, and the
+    blocks of unselected articulations, keep their values (zero in an array that this
+    function allocates).
+
     Args:
         model: The model containing articulation definitions.
         state: The state containing body transforms (body_q).
@@ -1405,12 +1219,6 @@ def eval_jacobian(
                    If None, allocates internally.
         mask: Optional boolean mask to select which articulations to compute.
               Shape [articulation_count]. If None, computes for all articulations.
-              The block ``J[i]`` of each selected articulation is overwritten in
-              full, with zeros in the rows past its links and the columns past its
-              DOFs. Blocks of unselected articulations are either zeroed or left
-              unchanged, and which is unspecified (it may depend on the device, on
-              the shape and memory layout of ``J`` and on whether a graph capture
-              records the call); zero ``J`` first if code reads them.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.
@@ -1426,8 +1234,6 @@ def eval_jacobian(
             dtype=float,
             device=model.device,
         )
-    else:
-        _clear_jacobian(J, mask, model.articulation_count, model.device)
 
     # Allocate temp if not provided
     if joint_S_s is None:
@@ -1439,11 +1245,11 @@ def eval_jacobian(
 
     wp.launch(
         kernel=eval_articulation_jacobian,
-        dim=model.articulation_count,
+        dim=model.joint_count,
         inputs=[
+            model.joint_articulation,
             model.articulation_start,
             model.articulation_end,
-            model.articulation_count,
             mask,
             model.joint_type,
             model.joint_parent,
@@ -1829,9 +1635,9 @@ def eval_mass_matrix(
         H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs).
            If None, allocates internally.
         J: Optional pre-computed Jacobian. If None, computes internally.
-           Shape (articulation_count, max_links*6, max_dofs). Only the blocks of
-           selected articulations are read, so :func:`~newton.eval_jacobian` with the
-           same mask provides enough.
+           Shape (articulation_count, max_links*6, max_dofs). Only the Jacobians of
+           selected articulations, rows of their links by columns of their DOFs, are
+           read, so :func:`~newton.eval_jacobian` with the same mask provides enough.
         body_I_s: Optional pre-allocated temp array for spatial inertias,
                   shape (body_count,), dtype wp.spatial_matrix. If None, allocates internally.
         joint_S_s: Optional pre-allocated temp array for motion subspaces (only used if J is None),
@@ -1880,8 +1686,8 @@ def eval_mass_matrix(
         device=model.device,
     )
 
-    # Compute Jacobian if not provided. eval_jacobian clears every block that the
-    # mass-matrix kernel reads, so the scratch needs no clear of its own.
+    # Compute Jacobian if not provided. eval_jacobian writes every entry that the
+    # mass-matrix kernel reads, so the scratch needs no clear.
     if J is None:
         max_links = model.max_joints_per_articulation
         max_dofs = model.max_dofs_per_articulation

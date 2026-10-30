@@ -2017,8 +2017,8 @@ class ArticulationView:
                If None, allocates a zero-initialized array.
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
-                Blocks of articulations outside this view, or outside ``mask``, are either
-                zeroed or left unchanged, as in :func:`~newton.eval_jacobian`.
+                Blocks of articulations outside this view, or outside ``mask``, are left
+                unchanged, as in :func:`~newton.eval_jacobian`.
 
         Returns:
             The Jacobian array J, or None if the model has no articulations.
