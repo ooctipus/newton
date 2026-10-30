@@ -89,9 +89,9 @@ class TestWarmStartPublication(unittest.TestCase):
         cold = self._balance(route, device, warm=False, context=context)
         self.assertLessEqual(cold, bound, f"cold momentum balance {cold:.3e} over {bound:.0e} of m g dt")
 
-    def test_cpu_split(self):
-        """The CPU's free-body loop sweep."""
-        self._check(conf.CPU_SPLIT, wp.get_device("cpu"))
+    def test_cpu(self):
+        """The CPU's matrix-free sweep, one thread per world."""
+        self._check(conf.CPU, wp.get_device("cpu"))
 
     def test_cuda_warp_mapping(self):
         """The matrix-free sweep's one-warp mapping."""

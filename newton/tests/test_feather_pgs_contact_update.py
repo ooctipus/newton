@@ -24,7 +24,6 @@ disk of its ring's load, in velocity units.
 
 import os
 import unittest
-import warnings
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
@@ -973,26 +972,6 @@ def _step(solver, model, steps):
 class TestContactUpdateSolver(unittest.TestCase):
     """The ``contact_update`` option, its route record and launches."""
 
-    def test_sequential_is_the_unchanged_law(self):
-        """Run the unchanged sequential kernels for the default and an explicit "sequential" law."""
-        states = []
-        with _without_solver_environment():
-            for options in ({}, {"contact_update": "sequential"}):
-                model = _free_box_model()
-                solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
-                sweep = solver.get_path_selection()["routes"]["sweep"]
-                self.assertEqual(sweep["dense"], {"kernels": ["sweep_loop"]})
-                self.assertEqual(sweep["free_body_matrix_free"], "sweep_mf_loop")
-                self.assertEqual(sweep["contact_update"]["law"], "sequential")
-                with launched_kernels() as keys:
-                    states.append(_step(solver, model, 20))
-                self.assertIn("sweep_loop", keys)
-                self.assertNotIn("sweep_loop_unit", keys)
-                self.assertNotIn("sweep_mf_loop_unit", keys)
-        for state in states[1:]:
-            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
-                np.testing.assert_array_equal(getattr(state, name).numpy(), getattr(states[0], name).numpy())
-
     def test_sequential_dispatch_runs_the_unchanged_kernel_on_stored_systems(self):
         """Dispatch "sequential" to the loop sweep, bitwise, and "unit" to the unit loop sweep on stored systems."""
         systems = replica_systems("point") + replica_systems("patch")
@@ -1033,43 +1012,6 @@ class TestContactUpdateSolver(unittest.TestCase):
                 with self.subTest(update=update, system=k):
                     np.testing.assert_array_equal(out[k, : len(lam)].astype(np.float64), lam)
 
-    def test_unit_option_runs_the_unit_loop_sweeps(self):
-        """Run both CPU loop sweeps' unit variants for contact_update="unit"."""
-        with _without_solver_environment():
-            for options in ({"contact_update": "unit"},):
-                with self.subTest(options=options):
-                    model = _free_box_model()
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("error")
-                        solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
-                    selected = solver.get_path_selection()
-                    sweep = selected["routes"]["sweep"]
-                    self.assertEqual(sweep["dense"], {"kernels": ["sweep_loop_unit"]})
-                    self.assertEqual(sweep["free_body_matrix_free"], "sweep_mf_loop_unit")
-                    self.assertEqual(
-                        sweep["contact_update"],
-                        {
-                            "requested": "unit",
-                            "law": "unit",
-                            "unit": ["sweep_loop_unit", "sweep_mf_loop_unit"],
-                            "sequential": [],
-                            "patch_units": "ring",
-                            "reason": sweep["contact_update"]["reason"],
-                        },
-                    )
-                    option = selected["options"]["contact_update"]
-                    self.assertEqual(option["applied"], "unit")
-                    self.assertEqual(option["source"], "argument")
-                    with launched_kernels() as keys:
-                        state = _step(solver, model, 20)
-                    # The arm and the box share a world: one-iteration dense and free-body launches interleave.
-                    self.assertEqual(keys.count("sweep_loop_unit"), 20 * 8)
-                    self.assertEqual(keys.count("sweep_mf_loop_unit"), 20 * 8)
-                    self.assertNotIn("sweep_loop", keys)
-                    self.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
-                    # The box rests on the ground.
-                    self.assertAlmostEqual(float(state.body_q.numpy()[1, 2]), 0.1, delta=2.0e-3)
-
     def test_invalid_contact_update_raises(self):
         """Reject a contact update other than "sequential" or "unit"."""
         with _without_solver_environment():
@@ -1095,26 +1037,6 @@ class TestContactUpdateSolver(unittest.TestCase):
         self.assertEqual(path_selection.contact_update_warnings(sweep), [])
         sweep["contact_update"].update(requested="sequential", sequential=["pgs_solve_mf_cuda"])
         self.assertEqual(path_selection.contact_update_warnings(sweep), [])
-
-    def test_patch_unit_switch_selects_anchor_units(self):
-        """Launch the anchor-unit form of patch regions when the internal switch says so."""
-        with _without_solver_environment():
-            model = _free_box_model()
-            solver = SolverFeatherPGS(model, pgs_iterations=8, contact_update="unit")
-        solver._contact_unit_patch = "anchor"
-        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["contact_update"]["patch_units"], "anchor")
-        launches = []
-        launch = wp.launch
-
-        def record(kernel, *args, **kwargs):
-            if getattr(kernel, "key", None) in ("sweep_loop_unit", "sweep_mf_loop_unit"):
-                launches.append(kwargs["inputs"][-4])
-            return launch(kernel, *args, **kwargs)
-
-        with mock.patch.object(wp, "launch", record):
-            _step(solver, model, 2)
-        self.assertTrue(launches)
-        self.assertEqual(set(launches), {0})
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
@@ -1175,26 +1097,22 @@ class TestContactUpdateCuda(unittest.TestCase):
                         self.assertAlmostEqual(lam[normals].sum(), load, delta=1.0e-4)
                         self.assertGreaterEqual(residuals(system, lam)[1][normals].min(), -1.0e-5)
 
-    def test_cuda_routes_without_units_keep_the_sequential_law(self):
-        """Keep the sequential law on CUDA sweeps, record them and warn; the CPU's loop sweep runs units."""
+    def test_matrix_free_routes_keep_the_sequential_law(self):
+        """Keep the sequential law on the matrix-free sweeps of both devices, record them and warn."""
         with _without_solver_environment():
             builder = newton.ModelBuilder()
             body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
             builder.add_articulation([builder.add_joint_revolute(-1, body)])
             builder.add_shape_sphere(body, radius=0.1)
             builder.add_ground_plane()
-            with self.assertWarnsRegex(UserWarning, "contact_update='unit' applies only to some sweeps"):
-                cuda = SolverFeatherPGS(builder.finalize(device="cuda:0"), contact_update="unit")
-            update = cuda.get_path_selection()["routes"]["sweep"]["contact_update"]
-            self.assertEqual(update["law"], "sequential")
-            self.assertTrue(update["sequential"])
-            with warnings.catch_warnings(record=True) as recorded:
-                warnings.simplefilter("always")
-                loop = SolverFeatherPGS(builder.finalize(device="cpu"), contact_update="unit")
-            self.assertFalse([w for w in recorded if "contact_update" in str(w.message)])
-            update = loop.get_path_selection()["routes"]["sweep"]["contact_update"]
-            self.assertEqual(update["unit"], ["sweep_loop_unit"])
-            self.assertEqual(update["sequential"], [])
+            for device in ("cuda:0", "cpu"):
+                with self.subTest(device=device):
+                    with self.assertWarnsRegex(UserWarning, "contact_update='unit' applies only to some sweeps"):
+                        solver = SolverFeatherPGS(builder.finalize(device=device), contact_update="unit")
+                    update = solver.get_path_selection()["routes"]["sweep"]["contact_update"]
+                    self.assertEqual(update["law"], "sequential")
+                    self.assertEqual(update["unit"], [])
+                    self.assertTrue(update["sequential"])
 
 
 if __name__ == "__main__":

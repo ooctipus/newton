@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -62,9 +63,10 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_warmstart_clear_does_not_change_fk_cache_source(self):
         """Keep cache-source bookkeeping in reset, independent of impulse clearing."""
         model = _build_two_world_free_model("cpu")
-        solver = _make_solver(model, warmstart=True)
+        # The ordinary evaluator's cache-source bookkeeping (the held tree compares its state banks instead).
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            solver = _make_solver(model, warmstart=True)
         state = model.state()
-        # Exercise the host cache bookkeeping even when CUDA execution is unavailable.
         solver._fk_id_cache_enabled = True
         solver._fk_id_cache_source_state = state
         solver._fk_id_cache_valid = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)

@@ -349,14 +349,23 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             seen.update(rows[w, : counts[w]].tolist())
         self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
 
-    def test_unsupported_mode_warns_and_falls_back(self):
-        """The CPU formulation (no matrix-free sweeps) warns and keeps the iterative rows."""
+
+class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
+    def test_cpu_pre_eliminates_the_closure(self):
+        """Pre-eliminate the four-bar's closure on the CPU, whose matrix-free sweeps carry it as CUDA's do.
+
+        Nothing warns, and at two sweeps the anchors stay within 1e-5 m over a second, against about 5e-4 m with
+        the closure's iterative rows.
+        """
         model = _build_four_bar().finalize(device="cpu")
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, enable_bilateral_preelimination=True)
-        self.assertFalse(solver._preelim_active)
-        self.assertTrue(any("requires CUDA" in str(w.message) for w in caught))
+        self.assertTrue(solver._preelim_active)
+        self.assertFalse([w for w in caught if "requires CUDA" in str(w.message)])
+        with wp.ScopedDevice("cpu"):
+            _, _, _, gap = _run_four_bar(steps=240, enable_bilateral_preelimination=True)
+        self.assertLess(gap, 1.0e-5)
 
 
 if __name__ == "__main__":

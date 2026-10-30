@@ -10,7 +10,7 @@ projected into the disk of radius ``mu * (sum of its ring's normal impulses)``
 with one isotropic step, so a sliding pair converges to the serial pair solve's
 maximal dissipation. The reference below repeats the kernel's sweep in float64
 so the CUDA kernels can be checked row by row; on CPU it also sweeps the rows a
-split solver builds, against that solver's serial solution. Keyed rows write the
+CPU solver builds, against that solver's serial solution. Keyed rows write the
 patch row law themselves; the CPU fallback checks it against the general
 producer and the patch link.
 """
@@ -45,6 +45,7 @@ from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     assert_loaded_anchors,
@@ -385,16 +386,16 @@ def sliding_stance(device):
     return standing_model(device=device, worlds=1, **SLIDING_FEET)
 
 
-def split_world_case(solver, world=0):
-    """One world's rows of a CPU split solver's last step as a reference case, and the velocity of its own solve.
+def world_case(solver, world=0):
+    """One world's rows of a CPU solver's last step as a reference case, and the velocity of its own solve.
 
-    Split mode keeps each articulation's columns in its size group (the world's
-    articulations in index order) and adds the predicted velocity's ``J v_hat``
-    into the right-hand side; the case keeps the bias apart, ``v_hat`` as its
-    velocity and cold impulses. Contact and limit rows clamp at zero and
-    friction rows pair; a world with any other row, such as a drive, mimic or
-    connect row, raises ``ValueError``. Returns the case and ``v_hat + Y^T lambda``
-    of the impulses the split sweep solved.
+    The rows are the matrix-free sweep's: each row's Jacobian ``J`` and response
+    ``Y = H^-1 J^T`` over the world's coordinates, from the packed rows
+    (:func:`.feather_pgs_law_harness.unpacked_rows`), and the bias in the
+    right-hand side; the case takes ``v_hat`` as its velocity and cold impulses.
+    Contact and limit rows clamp at zero and friction rows pair; a world with any
+    other row, such as a drive, mimic or connect row, raises ``ValueError``.
+    Returns the case and ``v_hat + Y^T lambda`` of the impulses the sweep solved.
     """
     count = int(solver.constraint_count.numpy()[world])
     types = solver.row_type.numpy()[world, :count]
@@ -408,22 +409,15 @@ def split_world_case(solver, world=0):
         }
     )
     if unmodelled:
-        raise ValueError(f"split_world_case models contact, friction and limit rows only, not row types {unmodelled}")
-    worlds, starts = solver.forest.art_to_world.numpy(), solver.forest.articulation_dof_start.numpy()
-    predicted = solver.v_hat.numpy().astype(np.float64)
-    blocks = []
-    for size in solver.forest.size_groups:
-        jacobian, response = solver.J_by_size[size].numpy(), solver.Y_by_size[size].numpy()
-        for group, art in enumerate(solver.forest.group_to_art[size].numpy()):
-            if worlds[art] == world:
-                start = int(starts[art])
-                blocks.append(
-                    (int(art), jacobian[group, :count], response[group, :count], predicted[start : start + size])
-                )
-    blocks.sort(key=lambda block: block[0])
-    J = np.concatenate([block[1] for block in blocks], axis=1).astype(np.float64)
-    Y = np.concatenate([block[2] for block in blocks], axis=1).astype(np.float64)
-    velocity = np.concatenate([block[3] for block in blocks])
+        raise ValueError(f"world_case models contact, friction and limit rows only, not row types {unmodelled}")
+    jacobian, response = unpacked_rows(solver)
+    J, Y = jacobian[world, :count], response[world, :count]
+    forest = solver.forest
+    starts, offsets = forest.articulation_dof_start.numpy(), forest.articulation_world_dof_offset.numpy()
+    predicted, velocity = solver.v_hat.numpy().astype(np.float64), np.zeros(J.shape[1])
+    for art, n in enumerate(forest.articulation_response_dof_count.numpy()):
+        if forest.art_to_world.numpy()[art] == world:
+            velocity[offsets[art] : offsets[art] + n] = predicted[starts[art] : starts[art] + n]
     cfm = solver.row_cfm.numpy()[world, :count].astype(np.float64)
     case = {
         "J": J,
@@ -436,7 +430,7 @@ def split_world_case(solver, world=0):
         "types": types,
         "parents": solver.row_parent.numpy()[world, :count].astype(np.int32),
         "mu": solver.row_mu.numpy()[world, :count].astype(np.float64),
-        "rhs": solver.rhs.numpy()[world, :count].astype(np.float64) - J @ velocity,
+        "rhs": solver.rhs.numpy()[world, :count].astype(np.float64),
         "impulses": np.zeros(count),
         "velocity": velocity,
     }
@@ -449,8 +443,8 @@ def prescaled_joint_velocity(model):
     With ``enable_joint_velocity_limits`` the solver scales each articulation's
     velocity by one ratio, the smallest ``limit / |qd|`` over its DOFs (PhysX's
     ``maxJointVelocity`` ratio), and predicts the step's velocity from the
-    result. Split mode, which builds this module's CPU rows, has no velocity
-    limits and predicts from the unscaled velocity. The launch takes the
+    result. A solver without them, which builds this module's CPU rows, predicts
+    from the unscaled velocity. The launch takes the
     solver.s lanes and thread count (``rows.velocity_prescale_launch``).
     """
     lanes, threads = velocity_prescale_launch(
@@ -767,10 +761,10 @@ class TestParallelPatchReference(unittest.TestCase):
     def test_last_word_holds_a_pushed_sphere_at_its_limit(self):
         """Hold a sphere the step pushes past its limit: two sweeps hold it only with the last word, 2000 either way.
 
-        The rows are the first step of :func:`_pushed_sphere` as a CPU split solver
-        builds them, started from the prescaled velocity the matrix-free route
-        predicts from, with every DOF's velocity-limit rows added as the matrix-free
-        builder writes them (split mode has neither). Two sweeps of the matrix-free
+        The rows are the first step of :func:`_pushed_sphere` as a CPU solver
+        without velocity limits builds them, started from the prescaled velocity
+        the route with them predicts from, with every DOF's velocity-limit rows added
+        as the matrix-free builder writes them. Two sweeps of the matrix-free
         linked tier (the float64 reference) leave the sphere 43 % past its limit;
         the pass holds it to 1e-5 (1.7e-6 past: the regularized diagonal's share).
         A sphere that starts past its limit cannot show this: the prescale puts it
@@ -785,7 +779,7 @@ class TestParallelPatchReference(unittest.TestCase):
         _rollout(model, solver, 1)
         (size,) = solver.forest.size_groups
         mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
-        case = with_velocity_limit_rows(split_world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
+        case = with_velocity_limit_rows(world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         speeds = {}
         for sweeps, last_word in itertools.product((2, 2000), (False, True)):
@@ -828,7 +822,7 @@ def _linked_rows(solver, state, contacts, dt):
         finalize(self, step_contacts)
         if self is solver:
             rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
-            rows["J"] = {size: self.J_by_size[size].numpy().copy() for size in self.forest.size_groups}
+            rows["J"] = {size: self._jacobian_rows(size).numpy().copy() for size in self.forest.size_groups}
             raise _RowsBuilt
 
     with patch.object(SolverFeatherPGS, "_finalize_constraint_status", capture):
@@ -1127,7 +1121,7 @@ class TestTierSweeps(unittest.TestCase):
     def test_budget_carries_a_truncated_tier_to_the_serial_fixed_point(self):
         """Leave a two-sweep linked tier short of a sliding stance's serial fixed point, and reach it within budget.
 
-        The rows are the first step of :func:`sliding_stance` as a CPU split solver
+        The rows are the first step of :func:`sliding_stance` as a CPU solver
         builds them, and that solver's serial sweep (2000 iterations) gives the
         fixed point. The matrix-free linked tier (the float64 reference) stops
         3.4e-2 of the velocity scale short of it after two sweeps and lands within
@@ -1138,7 +1132,7 @@ class TestTierSweeps(unittest.TestCase):
         with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=2000)
         _rollout(model, solver, 1)
-        case, serial = split_world_case(solver)
+        case, serial = world_case(solver)
         # Sixteen contact rows: two patch rings of four normals, each ring with two anchors.
         rings = {
             tuple(sorted(ring_rows(case["parents"], int(normal))))
@@ -1923,7 +1917,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         sweeps (a test pin, ``tier_sweeps``) must stay short of the serial
         sweep's velocity (2000 iterations), and a budget of 2000 sweeps must
         carry it there (:func:`assert_budget_reaches_the_fixed_point`; the float64
-        reference on the CPU split rows: 3.4e-2 of the scale after two sweeps, 1.1e-7
+        reference on the CPU solver's rows: 3.4e-2 of the scale after two sweeps, 1.1e-7
         after 2000). A single sliding contact cannot show what a budget carries: two
         sweeps converge it (4.2e-6 of the scale in the reference). One step keeps the
         comparison on the solve, as later steps add the float32 drift of the feet's

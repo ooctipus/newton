@@ -257,15 +257,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         solver = SolverFeatherPGS(model)
         self.assertEqual(solver.tile_threads, 64)
 
-    def test_joint_limit_solver_compatibility_validation(self):
-        model = _build_chain_model(num_links=2, num_worlds=1, device="cpu")
-
-        with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-            SolverFeatherPGS(
-                model,
-                enable_joint_velocity_limits=True,
-            )
-
     def test_hinv_chunk_selection_accounts_for_tile_threads(self):
         """Include tile scratch space when selecting response chunks."""
         self.assertEqual(_select_hinv_jt_chunk_size(50, 384, 30000, 64), 32)

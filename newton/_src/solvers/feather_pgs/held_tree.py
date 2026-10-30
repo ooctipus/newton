@@ -791,14 +791,11 @@ class HeldTree:
 
 
 def options_decline(solver) -> str | None:
-    """Why the formulation or a test pin keeps ordinary dynamics, or ``None``.
+    """Why a test pin keeps ordinary dynamics, or ``None``.
 
-    The CPU's split formulation keeps the serial passes, and so does the test pin ``evaluator='ordinary'``. Only the
-    held tree evaluates the native sparse factor and the compact diagonal, so their admissions read this before
-    :func:`install` does.
+    The test pin ``evaluator='ordinary'`` keeps the serial passes. Only the held tree evaluates the native sparse
+    factor and the compact diagonal, so their admissions read this before :func:`install` does.
     """
-    if not solver._matrix_free:
-        return "The split formulation (the CPU's) keeps ordinary dynamics."
     if solver._route_pins.get("evaluator") == "ordinary":
         return "A test pin keeps ordinary dynamics (evaluator='ordinary')."
     return None

@@ -77,8 +77,6 @@ def validate_configuration(model, settings):
             raise ValueError(f"contact_compliance requires {key}={expected!r}; got {settings[key]!r}")
     if settings["pgs_iterations"] <= 0:
         raise ValueError("contact_compliance requires positive pgs_iterations")
-    if not model.device.is_cuda:
-        raise ValueError("contact_compliance currently requires CUDA")
 
 
 def validate_step(solver):

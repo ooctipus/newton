@@ -631,7 +631,6 @@ class SolverFeatherPGS(SolverBase):
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
     #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel: a dense kernel (CUDA).
-    #   formulation "matrix_free": the CPU solves the rows matrix-free, with the held tree, as CUDA does.
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -1092,15 +1091,10 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_mf_row_parent = None
         self._ws_prev_slot_sorted = None
 
-        # CUDA solves the rows matrix-free, from their whitened placements; the CPU assembles the Delassus rows
-        # and sweeps them with its loop kernels, unless the test pin formulation="matrix_free" runs CUDA's there.
-        self._matrix_free = bool(model.device.is_cuda or self._route_pins.get("formulation") == "matrix_free")
+        # Both devices solve the rows matrix-free, from their whitened placements.
+        self._matrix_free = True
         self.mf_max_constraints = options.mf_max_constraints
-        if self._matrix_free:
-            _validate_mf_metadata_encoding(self.mf_max_constraints)
-        elif self.options.enable_joint_velocity_limits:
-            # Only the CUDA sweeps implement them.
-            raise NotImplementedError("enable_joint_velocity_limits=True requires CUDA")
+        _validate_mf_metadata_encoding(self.mf_max_constraints)
         self._grouped_response = False
 
         # Double-buffered mass matrices on CUDA (the sparse factor's producers overwrite every value and take none).
@@ -1701,11 +1695,9 @@ class SolverFeatherPGS(SolverBase):
 
         self._init_double_buffer_stream()
 
-        # Contact torsion's preparation is device-resident on CUDA and on the host on the CPU (the host preparation is
-        # the test pin torsion_preparation='host' on CUDA).
-        self.contact_torsion_device = bool(
-            model.device.is_cuda and self._route_pins.get("torsion_preparation") != "host"
-        )
+        # Contact torsion's preparation is device-resident on both devices (the host preparation is the test pin
+        # torsion_preparation='host').
+        self.contact_torsion_device = self._route_pins.get("torsion_preparation") != "host"
         if self.laws.contact_torsion_enabled and self.contact_torsion_device:
             from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
 
@@ -2311,13 +2303,6 @@ class SolverFeatherPGS(SolverBase):
         self._preelim_active = False
         self._elimination = None
         if not self.options.enable_bilateral_preelimination or not (self.laws.connect_count or self.laws.mimic_count):
-            return
-        if not self._matrix_free:
-            warnings.warn(
-                "SolverFeatherPGS: enable_bilateral_preelimination requires CUDA; falling back to "
-                "iterative mimic/connect rows.",
-                stacklevel=2,
-            )
             return
         # Per-articulation block rows (upper bound: every valid constraint).
         counts = np.zeros(model.articulation_count, dtype=np.int64)

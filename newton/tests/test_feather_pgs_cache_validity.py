@@ -187,10 +187,8 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        owner = HeldTree(solver)
-        # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
-        solver._tree_kinetic_state = owner
-        solver._fk_id_cache_enabled = True
+        owner = solver._tree_kinetic_state
+        self.assertIsInstance(owner, HeldTree)
         validity_arrays = [solver._fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
         invalidators = [cached_state_binding._invalidate_kernel(group._cache_to_art.shape[1]) for group in owner.groups]
 
@@ -260,7 +258,8 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         self.assertEqual(validity(), valid)
         model.joint_axis.assign(axes)
         self.assertEqual(invalidating_launches(JOINT), [])
-        ordinary = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary"}):
+            ordinary = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         ordinary._fk_id_cache_enabled = True
         ordinary._fk_id_cache_valid.fill_(1)
         ordinary.notify_model_changed(JOINT)
@@ -276,10 +275,8 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        owner = HeldTree(solver)
-        # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
-        solver._tree_kinetic_state = owner
-        solver._fk_id_cache_enabled = True
+        owner = solver._tree_kinetic_state
+        self.assertIsInstance(owner, HeldTree)
         validity_arrays = [solver._fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
 
         def refuse(flags):

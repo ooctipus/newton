@@ -381,55 +381,6 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
         test.assertEqual(float(row_w.numpy()[0, 0]), 0.5)
 
 
-def test_assembled_dense_regularization_fixed_point(test: unittest.TestCase, device):
-    """An articulated dense contact of the assembled split route converges to the regularized fixed point.
-
-    The split sweep keeps the assembled Delassus system unregularized and steps a contact
-    row with its weight ``w = 1 / (1 + g)`` (``projection_laws.regularized_delta``), so a
-    converged loaded row's residual ``r = rhs + (C lambda)_i`` is ``-g d_i lambda_i``.
-    """
-    g = 0.5
-    with wp.ScopedDevice(device):
-        model = _build_scissor_model(device)
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_iterations=400,
-            pgs_contact_regularization=g,
-            enable_contact_friction=False,
-            dense_max_constraints=64,
-            mf_max_constraints=16,
-        )
-        state_in = model.state()
-        state_out = model.state()
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        contacts = model.contacts()
-        state_in.clear_forces()
-        model.collide(state_in, contacts)
-        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
-        wp.synchronize()
-        rows = _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0]))
-        test.assertGreater(len(rows), 0)
-        m = int(solver.constraint_count.numpy()[0])
-        diag = solver.diag.numpy()[0].astype(np.float64)
-        delassus = solver.C.numpy()[0][:m, :m].astype(np.float64)
-        rhs = solver.rhs.numpy()[0][:m].astype(np.float64)
-        impulses = solver.impulses.numpy()[0][:m].astype(np.float64)
-        weights = solver.row_w.numpy()[0]
-        loaded = 0
-        for slot in rows.values():
-            test.assertAlmostEqual(float(weights[slot]), 1.0 / (1.0 + g), places=6)
-            # The assembled diagonal stays the Delassus diagonal plus CFM: the weight is not folded into it.
-            test.assertGreaterEqual(diag[slot], delassus[slot, slot])
-            test.assertLess(diag[slot] - delassus[slot, slot], 1.0e-5)
-            if impulses[slot] > 0.0:
-                loaded += 1
-                residual = rhs[slot] + delassus[slot] @ impulses
-                test.assertAlmostEqual(
-                    residual, -g * diag[slot] * impulses[slot], delta=1.0e-3 * diag[slot] * impulses[slot]
-                )
-        test.assertGreater(loaded, 0)
-
-
 def test_compliance_parameters_removed(test: unittest.TestCase, device):
     """The no-op dense compliance knobs are gone; passing them fails loudly."""
     names = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
@@ -577,12 +528,6 @@ add_function_test(
     "test_exact_surface_contact_is_regularized",
     test_exact_surface_contact_is_regularized,
     devices=get_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_assembled_dense_regularization_fixed_point",
-    test_assembled_dense_regularization_fixed_point,
-    devices=["cpu"],
 )
 add_function_test(
     TestFeatherPGSRegularization,

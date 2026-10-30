@@ -21,7 +21,8 @@ Routes
     (with contact triplets), the matrix-free Gauss-Seidel sweep with its
     parallel and keyed-parallel tiers, local owners (row packets and owned rows), the paired factor sweep
     and the sparse-diagonal sweep (sparse-diagonal rows and the compact contact
-    boundary); on CPU, split mode. Dynamics owners: ``TreeSparseOperator``,
+    boundary); on CPU, the general row of the matrix-free sweep, one thread per
+    world. Dynamics owners: ``TreeSparseOperator``,
     ``TreeHeldOperator``, ``ForestHeldOperator``, scalar branches and ordinary
     dynamics. Contact-row producers: sparse response, compact Jacobian, general
     (per contact and masked), keyed rows, local packets, sparse diagonal and
@@ -41,8 +42,8 @@ Scenes and features
     twist threshold, a soft-finger pinch) and contact compliance (a drop, a
     plate's elastic split, a stack, a compliant pinch). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: warm
-    start, contact compliance, contact torsion, ``contact_update="unit"``,
-    restitution, bilateral pre-elimination, joint and rigid-body velocity limits.
+    start, contact compliance, contact torsion, restitution, bilateral
+    pre-elimination, joint and rigid-body velocity limits.
 
 Metrics
     Computed on the host from the model, the states before and after each
@@ -82,8 +83,8 @@ Metrics
 Reference and tolerances
     Per scene, friction law and variant, the reference route runs at the gate
     budget ``N`` and at ``8 N`` and ``8 N + 1`` iterations: the plain
-    matrix-free Gauss-Seidel sweep over ordinary dynamics on CUDA, split mode on
-    CPU. ``8 N`` is the converged reference. Its spread, the larger distance of
+    matrix-free Gauss-Seidel sweep over ordinary dynamics, on either device.
+    ``8 N`` is the converged reference. Its spread, the larger distance of
     the runs at ``N`` and ``8 N + 1`` (sequential Gauss-Seidel can cycle with
     period two) from it and, on CUDA, of a repeat of the run at ``N`` (atomic
     allocation varies the row order; scenes whose support is statically
@@ -113,8 +114,10 @@ Findings
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
-    cache, the whole module takes about five minutes on one GPU, the CPU class
-    about one. A cold cache adds the compilation of every route's kernels.
+    cache, the whole module takes about five minutes on one GPU. The CPU class
+    (:mod:`newton.tests.test_feather_pgs_conformance_cpu`, the same problems)
+    takes about three. A cold cache adds the compilation of every route's
+    kernels.
 """
 
 from __future__ import annotations
@@ -1320,15 +1323,6 @@ REFERENCE_CUDA = Route(
         "resolved_worlds.enabled": False,
     },
 )
-CPU_SPLIT = Route(
-    "cpu_split",
-    "cpu",
-    options={},
-    expect={"sweep.route": "dense_loop", "held_tree.owner": None, "contact_rows.producer": "general"},
-)
-CPU_SPLIT_UNIT = CPU_SPLIT.but(
-    "cpu_split_unit", options={"contact_update": "unit"}, expect={"sweep.contact_update.law": "unit"}
-)
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 MF_TORSION = MF_DEFAULT.but("mf_torsion", expect={"friction.torsion": True})
 MF_COMPLIANCE = MF_DEFAULT.but("mf_compliance", expect={"sweep.driver": "contact_compliance"})
@@ -1471,20 +1465,16 @@ PAIRED_FOREST = Route(
 )
 
 
-# The CPU's matrix-free formulation, under the test pin formulation="matrix_free" until it is the CPU's own: the held
-# tree and the general row (case K6) at the CPU's lane width, against the CUDA reference's route on the CPU (whose
-# dense kernels are the CPU's own).
-_CPU_MATRIX_FREE = {"formulation": "matrix_free"}
+# The CPU's route: the held tree and the general row (case K6) at the CPU's lane width, against the CUDA reference's
+# route on the CPU (whose dense kernels are the CPU's own).
 REFERENCE_CPU = Route(
     "reference_cpu",
     "cpu",
     options=_MF,
-    pins={**_ORDINARY, "placement": "general", "claims": (), **_CPU_MATRIX_FREE},
+    pins={**_ORDINARY, "placement": "general", "claims": ()},
     expect={"sweep.route": "matrix_free_gs", "held_tree.owner": None},
 )
-CPU_MATRIX_FREE = Route(
-    "cpu_matrix_free", "cpu", options=_MF, pins=_CPU_MATRIX_FREE, expect={"sweep.route": "matrix_free_gs"}
-)
+CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 
 
 def _unsupported(solver) -> bool:
@@ -1567,43 +1557,6 @@ def _laws(*laws):
 
 
 _WARM = {"pgs_warmstart": True}
-
-
-def cpu_groups() -> list:
-    """Problems of the CPU subset: split mode, its unit contact update and warm start."""
-    groups = []
-    for law in _laws():
-        groups += [
-            Group(_physics(scenes.box_drop(), law, 32), CPU_SPLIT, (CPU_SPLIT, CPU_SPLIT_UNIT)),
-            Group(_physics(scenes.box_stack(), law, 32), CPU_SPLIT, (CPU_SPLIT,)),
-            Group(_physics(scenes.incline(), law, 32), CPU_SPLIT, (CPU_SPLIT, CPU_SPLIT_UNIT)),
-            Group(_physics(scenes.heightfield(), law, 32), CPU_SPLIT, (CPU_SPLIT,)),
-            Group(_physics(scenes.legged(), law, 32), CPU_SPLIT, (CPU_SPLIT,)),
-            Group(_physics(scenes.gripper(), law, 16), CPU_SPLIT, (CPU_SPLIT, CPU_SPLIT_UNIT)),
-            Group(_physics(scenes.gripper(table=True), law, 16), CPU_SPLIT, (CPU_SPLIT,)),
-        ]
-    groups += [
-        Group(
-            _physics(scenes.box_stack(contact_matching="latest"), "point", 32),
-            CPU_SPLIT,
-            (CPU_SPLIT.but("cpu_split_warm_start", options=_WARM),),
-        ),
-        Group(_physics(scenes.ball_drop(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.box_push(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.keyboard(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.hand(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.sprawl(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.long_chain(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.long_chain(armature=0.0), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
-    ]
-    for scene, iterations in (
-        (scenes.chain(), 16),
-        (scenes.four_bar(), 16),
-        (scenes.mimic_pair(), 16),
-        (scenes.spring_hinge(), 8),
-    ):
-        groups.append(Group(_physics(scene, None, iterations), CPU_SPLIT, (CPU_SPLIT,)))
-    return groups
 
 
 def cuda_groups() -> list:
@@ -1717,19 +1670,16 @@ def cuda_groups() -> list:
     return groups
 
 
-def cpu_matrix_free_groups() -> list:
-    """The CUDA matrix's problems on the CPU's matrix-free formulation: the default rules, with the options of the
-    problem's routes (warm start, pre-elimination), against the CPU reference. The CPU refuses contact torsion and
-    compliance until they are row laws (CT)."""
+def cpu_groups() -> list:
+    """The CUDA matrix's problems on the CPU: the default rules, with the options of the problem's routes (warm start,
+    pre-elimination), against the CPU reference."""
     groups, seen = [], set()
     for group in cuda_groups():
-        variant = dict(group.physics.variant)
-        if group.name in seen or "contact_torsion_radius" in variant or "contact_compliance" in variant:
+        if group.name in seen:
             continue
         seen.add(group.name)
         options = {name: value for route in group.routes for name, value in route.options.items()}
-        name = f"{CPU_MATRIX_FREE.name}_{group.tag}" if group.tag else CPU_MATRIX_FREE.name
-        route = CPU_MATRIX_FREE.but(name, options=options)
+        route = CPU.but(f"{CPU.name}_{group.tag}" if group.tag else CPU.name, options=options)
         groups.append(dataclasses.replace(group, reference=REFERENCE_CPU, routes=(route,), findings=()))
     return groups
 
@@ -1929,19 +1879,12 @@ def _add_group_tests(cls, groups: list) -> None:
             setattr(cls, f"test_{group.name}_routes_agree", agreement)
 
 
-class TestFeatherPGSConformanceCPU(_ConformanceCase):
-    """Split mode on CPU against its converged reference."""
-
-    device = wp.get_device("cpu")
-
-
 class TestFeatherPGSConformanceCUDA(_ConformanceCase):
     """Every CUDA route against the converged CUDA reference, which must match the CPU reference."""
 
     device = _cuda_device()
 
 
-_add_group_tests(TestFeatherPGSConformanceCPU, cpu_groups())
 _add_group_tests(TestFeatherPGSConformanceCUDA, cuda_groups())
 
 
@@ -2017,25 +1960,23 @@ def _add_reference_tests() -> None:
 _add_reference_tests()
 
 
-def _add_incline_budget_tests() -> None:
+def add_incline_budget_tests(cls, route: Route) -> None:
+    """Add to ``cls`` the incline's steady slide through ``route`` at every budget of :data:`INCLINE_BUDGETS`."""
     for law in _laws():
         physics = _physics(scenes.incline(), law, 32)
 
         def test(self, physics=physics):
             rows = []
             for budget in INCLINE_BUDGETS:
-                run = run_physics(physics, CPU_SPLIT, self.device, budget)
+                run = run_physics(physics, route, self.device, budget)
                 rows += [
                     (f"{budget} sweeps: {name}", value, bound) for name, value, bound in incline_steady_slide_laws(run)
                 ]
             failures = _failures(rows)
-            self.assertFalse(failures, f"{physics.name} through {CPU_SPLIT.name}:\n{_message(failures)}")
+            self.assertFalse(failures, f"{physics.name} through {route.name}:\n{_message(failures)}")
 
-        test.__doc__ = f"Check that {physics.name} slides steadily through {CPU_SPLIT.name} at every budget."
-        setattr(TestFeatherPGSConformanceCPU, f"test_{physics.name}_slides_steadily_at_every_budget", test)
-
-
-_add_incline_budget_tests()
+        test.__doc__ = f"Check that {physics.name} slides steadily through {route.name} at every budget."
+        setattr(cls, f"test_{physics.name}_slides_steadily_at_every_budget", test)
 
 
 if __name__ == "__main__":

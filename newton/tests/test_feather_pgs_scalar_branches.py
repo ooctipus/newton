@@ -227,13 +227,14 @@ def branch_articulations(model):
 
 
 def cpu_solver(model, size):
-    """A CPU solver that carries the CUDA route's drive-row topology and compact diagonal size.
+    """A CPU solver over ordinary dynamics that carries the CUDA route's drive-row topology and compact diagonal size.
 
-    CPU keeps ordinary split dynamics, so it builds neither the asynchronous
+    The test pin keeps ordinary dynamics, which build neither the asynchronous
     drive rows nor the sparse-diagonal response; give it both so that the
     scalar kernels and the head kernels bind the arrays the CUDA route binds.
     """
-    solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+        solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
     solver._setup_parallel_augmented_drive_topology(model, True)
     solver._compact_diagonal_mass_size = size
     solver._fk_id_cache_enabled = True

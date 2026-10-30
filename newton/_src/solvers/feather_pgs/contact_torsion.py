@@ -103,15 +103,14 @@ def _validate_torsion_mode(laws):
     """Reject unsupported construction and runtime mode combinations (of the row laws' options)."""
     options = laws.options
     if (
-        not laws.model.device.is_cuda
-        or laws.model.requires_grad
+        laws.model.requires_grad
         or options.pgs_warmstart
         or options.pgs_debug
         or options.contact_compliance
         or not options.enable_contact_friction
     ):
         raise ValueError(
-            "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
+            "Contact torsion requires non-differentiable matrix_free/immediate/current/"
             "interleaved, without warmstart, compliance, or debug"
         )
 

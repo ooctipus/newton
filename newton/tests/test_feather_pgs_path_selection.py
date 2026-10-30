@@ -286,7 +286,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with assert_host_only():
             selected = solver.get_path_selection()
         self.assertIn("CUDA", selected["reasons"]["sparse_mass_matrix"])
-        self.assertIn("CPU", selected["reasons"]["cached_dynamics"])
+        self.assertIn("held groups", selected["reasons"]["cached_dynamics"])
         self.assertIn("CPU", selected["routes"]["stages"]["factor"]["1"]["reason"])
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
         json.dumps(selected, allow_nan=False)
@@ -379,23 +379,25 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(messages, dict.fromkeys(("Passing", "Patch"), os.path.basename(__file__)))
 
     def test_cpu_route_record_reports_known_selections(self):
-        """Report the CPU loop sweep, the split free-body rows and the declined owners with their reasons."""
+        """Report the CPU's matrix-free sweep, its free-body rows and the declined owners with their reasons."""
         selected = SolverFeatherPGS(_cpu_free_body_model()).get_path_selection()
         routes = selected["routes"]
         self.assertEqual(routes["articulations_by_dof"], {"6": 1, "1": 1})
-        self.assertEqual(routes["sweep"]["route"], "dense_loop")
-        # The arm and the free box share a world: split mode interleaves the dense and free-body sweeps.
+        self.assertEqual(routes["sweep"]["route"], "matrix_free_gs")
+        # The arm and the free box share a world, which one sweep of the general row solves.
         self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
-        self.assertEqual(routes["sweep"]["driver"], "split_interleaved")
-        self.assertEqual(routes["sweep"]["dense"], {"kernels": ["sweep_loop"]})
-        self.assertEqual(routes["sweep"]["free_body_matrix_free"], "sweep_mf_loop")
-        # Only the matrix-free step packs row metadata, and only its GS kernel chooses a storage.
-        self.assertIsNone(routes["sweep"]["mf_meta_pack"])
-        self.assertIsNone(routes["sweep"]["mf_gs_storage"])
+        self.assertEqual(routes["sweep"]["driver"], "direct")
+        self.assertIsNone(routes["sweep"]["dense"])
+        self.assertIsNone(routes["sweep"]["free_body_matrix_free"])
+        self.assertEqual(routes["sweep"]["mf_meta_pack"]["kernel"], "free_body_meta_512")
+        # The CPU's one thread keeps the impulses and streams the metadata: no shared memory to stage them in.
+        storage = routes["sweep"]["mf_gs_storage"]
+        self.assertEqual((storage["metadata"], storage["mf_impulses"]), ("streamed", "resident"))
         self.assertEqual(routes["free_rigid_bodies"]["count"], 1)
-        self.assertEqual(routes["free_rigid_bodies"]["owners"], ["split_matrix_free_rows"])
+        self.assertEqual(routes["free_rigid_bodies"]["owners"], ["matrix_free_rows"])
+        # The arm's revolute root is outside the held groups (fixed or free roots).
         self.assertIsNone(routes["held_tree"]["owner"])
-        self.assertIn("CPU", routes["held_tree"]["reason"])
+        self.assertIn("held groups", routes["held_tree"]["reason"])
         self.assertEqual(routes["contact_rows"]["producer"], "general")
         method = "masked_combined"
         self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
@@ -423,12 +425,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIsNone(routes["sparse_mass_matrix"]["size"])
         self.assertFalse(routes["sparse_mass_matrix"]["active_rows"])
         self.assertIn("CUDA", routes["sparse_mass_matrix"]["reason"])
-        self.assertEqual({entry["route"] for entry in routes["stages"]["response"].values()}, {"rows"})
+        self.assertEqual({entry["route"] for entry in routes["stages"]["response"].values()}, {"packed"})
         self.assertEqual(selected["measurements"], {})
         separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
         self.assertFalse(separate["free_rigid_bodies"]["mixed_worlds"])
-        self.assertEqual(separate["sweep"]["driver"], "dense_split")
-        self.assertIn("free-body rows", separate["sweep"]["driver_reason"])
+        self.assertEqual(separate["sweep"]["driver"], "direct")
+        self.assertIn("one dispatch", separate["sweep"]["driver_reason"])
         debug = SolverFeatherPGS(_cpu_model(), pgs_debug=True).get_path_selection()["routes"]
         self.assertEqual(debug["sweep"]["driver"], "debug_loop")
 
@@ -475,11 +477,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Label the sizes the grouped response serves from the data, with their reasons, from the step plan's table:
         every size up to 32 coordinates whose worlds' in-kernel tier rows it skips, and no other."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
-        # A stand-in for the CUDA-only grouped response: the plan reads host state only, and the record its table.
+        # A stand-in for the CUDA-only grouped response of a row that builds responses (no packed rows): the plan
+        # reads host state only, and the record its table.
         solver._grouped_response = True
         for skip, route in ((0, "rows"), (8, "grouped")):
             with self.subTest(skip_rows=skip):
-                solver._plan = StepPlan.build(dataclasses.replace(solver.routes.row, tier_rows=skip), solver)
+                row = dataclasses.replace(solver.routes.row, tier_rows=skip, packed=False)
+                solver._plan = StepPlan.build(row, solver)
                 selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
                 response = selected["routes"]["stages"]["response"]
@@ -488,7 +492,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertTrue(all(reason in entry["reason"] for entry in response.values()), response)
 
     def test_cpu_route_record_matches_launched_kernels(self):
-        """Tie the record's sweep driver, row builders and root clamp to the kernels one CPU step launches."""
+        """Tie the record's sweep, row builders and root clamp to the kernels one CPU step launches."""
         for name, model in (
             ("mixed", _cpu_free_body_model()),
             ("mixed_velocity_limits", _cpu_free_body_model(velocity_limit=1.0)),
@@ -500,14 +504,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 routes = solver.get_path_selection()["routes"]
                 sweep = routes["sweep"]
                 keys = _launched_kernel_keys(model, solver)
-                dense, free_body = sweep["dense"]["kernels"][0], sweep["free_body_matrix_free"]
-                sweeps = [key for key in keys if key in (dense, free_body)]
-                if sweep["driver"] == "split_interleaved":
-                    # One one-iteration dense sweep, then one free-body sweep, per iteration.
-                    self.assertEqual(sweeps, [dense, free_body] * solver.options.pgs_iterations)
-                else:
-                    self.assertEqual(sweep["driver"], "dense_split")
-                    self.assertEqual(sweeps, [dense] if free_body is None else [dense, free_body])
+                # The general row sweeps every iteration of a world's dense and free-body rows in one launch.
+                self.assertEqual(sweep["driver"], "direct")
+                self.assertEqual([key for key in keys if key.startswith("sweep_")], [sweep["mf_gs"]])
                 methods = routes["contact_rows"]["general_method_by_dof"]
                 self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))
                 assert_row_builders_named(self, routes["contact_rows"], keys)
@@ -722,15 +721,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
         self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
 
-    def test_cpu_split_route_reports_free_body_velocity_limit_rows(self):
-        """Report free-body velocity-limit rows in split mode, where the row builder allocates them as well."""
+    def test_cpu_route_reports_free_body_velocity_limit_rows(self):
+        """Report free-body velocity-limit rows on the CPU, where the row builder allocates them as well."""
         solver = SolverFeatherPGS(_cpu_free_body_model(velocity_limit=1.0))
         limits = solver.get_path_selection()["routes"]["velocity_limits"]
         self.assertTrue(limits["rigid_body_limits"])
         self.assertIsNotNone(solver.rigid_velocity_limit_slot)
         self.assertTrue(limits["free_body_rows"])
-        # Split mode keeps the direct root clamp of the free box beside the rows.
-        self.assertTrue(limits["root_clamp"])
+        # The matrix-free sweep bounds free rigid bodies with speed rows alone.
+        self.assertFalse(limits["root_clamp"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_route_record_reports_sparse_rows_and_tree_owner(self):

@@ -706,7 +706,7 @@ class TestSolverReadoutOption(unittest.TestCase):
         self.assertEqual((law["law"], law["quiet_units"], law["unit_roundoff"]), ("rounding_floor", 16, 2.0**-24))
 
     def test_records_name_the_readout_and_its_kernels(self):
-        """Record the requested readout, the loop sweep's counters and, after a step, its counted solve."""
+        """Record the requested readout, the matrix-free sweep's counters and, after a step, its counted solve."""
         model = self._model()
         for requested in ("off", "sweeps", "trace"):
             with self.subTest(requested=requested):
@@ -717,7 +717,7 @@ class TestSolverReadoutOption(unittest.TestCase):
                 self.assertEqual((option["requested"], option["applied"]), (requested, requested))
                 readout = selection["routes"]["sweep"]["readout"]
                 self.assertEqual(readout["mode"], requested)
-                self.assertEqual(list(readout["counted"].values()), [] if requested == "off" else ["dense_loop"])
+                self.assertEqual(list(readout["counted"].values()), [] if requested == "off" else ["mf_gs"])
                 self.assertEqual(selection["routes"]["sweep"]["exit_law"]["law"], "rounding_floor")
                 state_0, state_1, control = model.state(), model.state(), model.control()
                 solver.step(state_0, state_1, control, None, 1.0 / 60.0)
