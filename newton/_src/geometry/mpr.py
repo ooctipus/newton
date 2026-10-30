@@ -40,6 +40,10 @@ from .support_function import (
     create_shape_support_function,
 )
 
+PORTAL_HEIGHT_RTOL = wp.constant(1.0e-6)
+"""A portal's height below this fraction of its longest edge (plus the inflate on either side) marks it a sliver: the
+float32 rounding of its support points (:func:`create_solve_mpr`)."""
+
 
 @wp.struct
 class Vert:
@@ -332,8 +336,16 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
             break
 
-        # Phase Two: Refine the portal
+        # Phase Two: Refine the portal. A portal whose height (twice its area over its longest edge) is within the
+        # support points' own spread, the inflate on either side and float32 rounding, is a sliver: its vertices lie
+        # on one edge of the Minkowski difference, which they do not orient. The refinement never ends on one; it
+        # returns its last well-formed portal instead, which still holds the origin's ray.
         v4 = Vert()
+        good1 = v1
+        good2 = v2
+        good3 = v3
+        good_penetration = float(0.0)
+        have_good = bool(False)
         while True:
             phase2 += 1
 
@@ -347,6 +359,10 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             # Can this happen??? Can it be handled more cleanly?
             if normal_sq < NUMERIC_EPSILON * NUMERIC_EPSILON:
                 return False, point_a, point_b, normal, penetration
+
+            longest_sq = wp.max(wp.length_sq(temp1), wp.max(wp.length_sq(temp2), wp.length_sq(v3.BtoA - v2.BtoA)))
+            height = 2.0 * extend + PORTAL_HEIGHT_RTOL * wp.sqrt(longest_sq)
+            sliver = normal_sq < height * height * longest_sq
 
             if not hit:
                 # Compute distance from origin to wedge face
@@ -366,6 +382,15 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                 or penetration <= 0.0
                 or phase2 > MAX_ITER
             ):
+                if sliver and have_good:
+                    v1 = good1
+                    v2 = good2
+                    v3 = good3
+                    temp1 = v2.BtoA - v1.BtoA
+                    temp2 = v3.BtoA - v1.BtoA
+                    normal = wp.cross(temp1, temp2)
+                    normal_sq = wp.length_sq(normal)
+                    penetration = good_penetration
                 if hit:
                     inv_normal = 1.0 / wp.sqrt(normal_sq)
                     penetration *= inv_normal
@@ -382,6 +407,13 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     point_b = alpha * v1.B + beta * v2.B + gamma * v3.B
 
                 return hit, point_a, point_b, normal, penetration
+
+            if hit and not sliver:
+                good1 = v1
+                good2 = v2
+                good3 = v3
+                good_penetration = penetration
+                have_good = True
 
             # Determine what region of the wedge the origin is in
             temp1 = wp.cross(v4.BtoA, v0.BtoA)

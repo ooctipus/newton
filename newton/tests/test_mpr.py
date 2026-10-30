@@ -83,23 +83,25 @@ def _triangle_mpr_kernel(
 def _box_mpr_kernel(
     shape_b_position: wp.array[wp.vec3],
     shape_b_orientation: wp.array[wp.quat],
+    half_extent: float,
+    extend: float,
     collision_out: wp.array[int],
     point_a_out: wp.array[wp.vec3],
     point_b_out: wp.array[wp.vec3],
     normal_out: wp.array[wp.vec3],
     penetration_out: wp.array[float],
 ):
-    """Run MPR directly for two unit boxes."""
+    """Run MPR directly for two cubes of ``half_extent``, inflated by ``extend`` as the narrow phase does."""
     i = wp.tid()
 
     shape_a = GenericShapeData()
     shape_a.shape_type = int(GeoType.BOX)
-    shape_a.scale = wp.vec3(0.5)
+    shape_a.scale = wp.vec3(half_extent)
     shape_a.auxiliary = wp.vec3(0.0)
 
     shape_b = GenericShapeData()
     shape_b.shape_type = int(GeoType.BOX)
-    shape_b.scale = wp.vec3(0.5)
+    shape_b.scale = wp.vec3(half_extent)
     shape_b.auxiliary = wp.vec3(0.0)
 
     data_provider = SupportMapDataProvider()
@@ -108,7 +110,7 @@ def _box_mpr_kernel(
         shape_b,
         shape_b_orientation[i],
         shape_b_position[i],
-        0.0,
+        extend,
         data_provider,
     )
 
@@ -170,7 +172,7 @@ def _run_triangle_mpr(
     )
 
 
-def _run_box_mpr(shape_positions, shape_orientations):
+def _run_box_mpr(shape_positions, shape_orientations, half_extent=0.5, extend=0.0):
     """Run direct box-vs-box MPR cases on CPU and return NumPy outputs."""
     device = "cpu"
     count = len(shape_positions)
@@ -186,12 +188,23 @@ def _run_box_mpr(shape_positions, shape_orientations):
     wp.launch(
         _box_mpr_kernel,
         dim=count,
-        inputs=[shape_positions_wp, shape_orientations_wp],
+        inputs=[shape_positions_wp, shape_orientations_wp, float(half_extent), float(extend)],
         outputs=[collision, point_a, point_b, normal, penetration],
         device=device,
     )
 
     return collision.numpy(), point_a.numpy(), point_b.numpy(), normal.numpy(), penetration.numpy()
+
+
+@wp.kernel
+def _relative_pose_kernel(
+    poses: wp.array[wp.transform], position_out: wp.array[wp.vec3], orientation_out: wp.array[wp.quat]
+):
+    """Shape B's pose in shape A's frame, as the narrow phase forms it (float32)."""
+    pa, qa = wp.transform_get_translation(poses[0]), wp.transform_get_rotation(poses[0])
+    pb, qb = wp.transform_get_translation(poses[1]), wp.transform_get_rotation(poses[1])
+    orientation_out[0] = wp.quat_inverse(qa) * qb
+    position_out[0] = wp.quat_rotate_inv(qa, pb - pa)
 
 
 class TestMPRBoxSupportTie(unittest.TestCase):
@@ -215,6 +228,42 @@ class TestMPRBoxSupportTie(unittest.TestCase):
         np.testing.assert_allclose(normals, np.tile([0.0, 1.0, 0.0], (len(angles), 1)), atol=1.0e-5)
         np.testing.assert_allclose(penetrations, expected_penetrations, atol=2.0e-5)
         np.testing.assert_allclose(witness_separations, -penetrations, atol=1.0e-6)
+
+
+class TestMPRPortalSliver(unittest.TestCase):
+    """The refinement never returns a sliver portal, whose vertices lie on one edge of the Minkowski difference."""
+
+    def test_stacked_cubes_keep_their_face_normal(self):
+        """Two 0.1 m cubes stacked face to face, 1.1e-4 m into each other and turned by about 1e-5 rad (a compliant
+        stack's settling pose), inflated by the narrow phase's 1e-4 m: the support points of the top face's corners
+        from different directions differ by the inflate, the region test meets a tie on the face diagonal and the
+        portal collapses onto one edge of the face, whose plane its next support point also lies in. The sliver's
+        normal tilted 18 degrees with a 0.031 m penetration (one contact, which threw the stack apart); the face
+        normal and the 2.1e-4 m inflated overlap hold."""
+        poses = np.array(
+            [
+                [-3.9629060e-07, 5.2373551e-08, 0.14960562, -1.3033934e-06, -4.4859153e-06, 2.6716860e-08, 1.0],
+                [-1.4703926e-06, 3.6858987e-07, 0.24949512, -2.6275686e-06, -5.5330815e-06, -1.8647762e-07, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        position = wp.zeros(1, dtype=wp.vec3, device="cpu")
+        orientation = wp.zeros(1, dtype=wp.quat, device="cpu")
+        wp.launch(
+            _relative_pose_kernel,
+            dim=1,
+            inputs=[wp.array(poses, dtype=wp.transform, device="cpu")],
+            outputs=[position, orientation],
+            device="cpu",
+        )
+
+        collision, _points_a, _points_b, normals, penetrations = _run_box_mpr(
+            position.numpy(), orientation.numpy(), half_extent=0.05, extend=1.0e-4
+        )
+
+        self.assertEqual(int(collision[0]), 1)
+        self.assertGreater(float(normals[0, 2]), 1.0 - 1.0e-6, f"normal {normals[0]}")
+        self.assertAlmostEqual(float(penetrations[0]), 2.1e-4, delta=5.0e-5)
 
 
 class TestMPRTriangleInitialization(unittest.TestCase):
