@@ -313,15 +313,6 @@ effective mass, rhs, type and parent)."""
 
 MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0, grad=False))
 
-MF_BODY_MAP = FieldGroup(
-    Field("mf_body_list", wp.int32, ("world", "mf_body")),
-    Field("mf_body_dof_start", wp.int32, ("world", "mf_body")),
-    Field("mf_body_count", wp.int32, ("world",)),
-    Field("mf_local_body_a", wp.int32, ("world", "mf_row")),
-    Field("mf_local_body_b", wp.int32, ("world", "mf_row")),
-)
-"""Body maps of the free-body warm start's publication."""
-
 MF_WARMSTART = FieldGroup(
     Field("_ws_prev_mf_impulses", wp.float32, ("world", "mf_row")),
     Field("_ws_prev_mf_row_type", wp.int32, ("world", "mf_row"), fill=-1, grad=False),

@@ -81,7 +81,7 @@ from .contact_torsion import (
     validate_torsion_step,
 )
 from .contact_unit import CONTACT_UNIT_STATE_FIELDS, RING_BLOCK_SIZE
-from .dense_rows import RowSupport, bind_mf_body_map
+from .dense_rows import RowSupport
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import lane_group
@@ -195,7 +195,6 @@ from .solver_fields import (
     DOF_WORK,
     FUSED_DIAGONAL_LIMITS,
     JOINT_FOREST,
-    MF_BODY_MAP,
     MF_CONTACT_UNITS,
     MF_COUNTERS,
     MF_ROW_WEIGHTS,
@@ -3612,9 +3611,8 @@ class SolverFeatherPGS(SolverBase):
         ``finalize_constraint_counts_with_status`` write it only when MF is
         active), so every access sits inside a loop bounded by
         ``m_mf == 0`` and no element is ever read or written; :meth:`_pack_mf_meta`
-        skips its launch. The rows then hold one slot per world, the per-world
-        counts keep their real width, and the free-body body maps
-        (``mf_body_list`` et al.) are not allocated.
+        skips its launch. The rows then hold one slot per world and the per-world
+        counts keep their real width.
         """
         if not self.forest.has_free_rigid_bodies and not self._matrix_free:
             return
@@ -3669,10 +3667,6 @@ class SolverFeatherPGS(SolverBase):
             )
         else:
             self.rigid_velocity_limit_slot = None
-
-        # Body map buffers for tiled MF PGS kernel
-        self.max_mf_bodies = 64
-        arrays.allocate(MF_BODY_MAP, world=worlds, mf_row=rows, body=model.body_count, mf_body=self.max_mf_bodies)
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -5211,13 +5205,8 @@ class SolverFeatherPGS(SolverBase):
         elif solve.family == "split_interleaved":
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
             self._mf_pgs_setup(state_aug, dt)
-            self._build_mf_body_map()
             self.v_mf_accum.zero_()
-            self._apply_mf_warmstart_velocity(
-                self.v_mf_accum,
-                set_output_to_delta=True,
-                body_map_ready=True,
-            )
+            self._apply_mf_warmstart_velocity(self.v_mf_accum, set_output_to_delta=True)
             if self.options.pgs_warmstart:
                 # Split stores dense constraints in impulse space, so its RHS
                 # must include the velocity represented by the cached MF
@@ -5250,7 +5239,6 @@ class SolverFeatherPGS(SolverBase):
                     iterations=1,
                     friction_start_iteration=self._contact_friction_start_iteration(self.options.pgs_iterations),
                     iteration_offset=_pgs_iter,
-                    body_map_ready=True,
                 )
 
                 # v_mf_accum += (v_out - v_out_snap); v_out_snap = delta
@@ -8294,46 +8282,25 @@ class SolverFeatherPGS(SolverBase):
     def _stage6_prepare_world_velocity(self):
         wp.copy(self.v_out, self.v_hat)
 
-    def _build_mf_body_map(self) -> None:
-        """Build the per-world free-body map shared by MF warm start and PGS."""
-        wp.launch(
-            response_builds_rows.free_body_map_kernel,
-            dim=self.forest.world_count,
-            inputs=[
-                bind_mf_rows(self),
-                bind_mf_body_map(self),
-                self.mf_constraint_count,
-                self.forest.body_to_articulation,
-                self.forest.articulation_dof_start,
-                self.max_mf_bodies,
-            ],
-            device=self.model.device,
-        )
-
-    def _apply_mf_warmstart_velocity(
-        self,
-        velocity: wp.array,
-        *,
-        set_output_to_delta: bool,
-        body_map_ready: bool = False,
-    ) -> None:
-        """Install cached MF impulse response into a live velocity state."""
+    def _apply_mf_warmstart_velocity(self, velocity: wp.array, *, set_output_to_delta: bool) -> None:
+        """Install the carried free-body impulses' velocity into a live velocity state, on every free rigid body the
+        rows hold (:func:`.response_builds_rows.free_body_publish_kernel`, one thread per free rigid body)."""
         if not self.options.pgs_warmstart or not self.forest.has_free_rigid_bodies:
             return
-        if not body_map_ready:
-            self._build_mf_body_map()
         wp.launch(
             response_builds_rows.free_body_publish_kernel,
-            dim=self.forest.world_count * self.max_mf_bodies,
+            dim=self.forest.free_rigid_body_count,
             inputs=[
-                bind_mf_body_map(self),
+                self.forest.free_rigid_body_indices,
+                self.forest.free_rigid_body_world,
+                self.mf_body_a,
+                self.mf_body_b,
                 self.mf_constraint_count,
                 self.mf_Z_a,
                 self.mf_Z_b,
                 self.mf_row_type,
                 self.mf_impulses,
                 self._body_factors(),
-                self.max_mf_bodies,
                 int(set_output_to_delta),
             ],
             outputs=[velocity],
@@ -8420,16 +8387,10 @@ class SolverFeatherPGS(SolverBase):
     def _stage6b_mf_pgs(self, state_aug: State, dt: float):
         """Run matrix-free PGS for free rigid body contacts."""
         self._mf_pgs_setup(state_aug, dt)
-        self._build_mf_body_map()
-        self._apply_mf_warmstart_velocity(
-            self.v_out,
-            set_output_to_delta=False,
-            body_map_ready=True,
-        )
+        self._apply_mf_warmstart_velocity(self.v_out, set_output_to_delta=False)
         self._mf_pgs_solve(
             self.options.pgs_iterations,
             friction_start_iteration=self._contact_friction_start_iteration(self.options.pgs_iterations),
-            body_map_ready=True,
         )
 
     def _mf_pgs_setup(self, state_aug: State, dt: float):
@@ -8546,15 +8507,11 @@ class SolverFeatherPGS(SolverBase):
         iterations: int,
         friction_start_iteration: int | None = None,
         iteration_offset: int = 0,
-        body_map_ready: bool = False,
     ):
         """MF PGS solve with given iteration count."""
         model = self.model
         if friction_start_iteration is None:
             friction_start_iteration = self._contact_friction_start_iteration(iterations)
-
-        if not body_map_ready:
-            self._build_mf_body_map()
 
         # The CPU's free-body rows: the loop sweep, whose unit variant also reads the patch form and unit storage.
         units = []

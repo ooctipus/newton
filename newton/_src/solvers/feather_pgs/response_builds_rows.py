@@ -57,7 +57,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .dense_rows import DenseRows, MfBodyMap, MfRows
+from .dense_rows import DenseRows, MfRows
 from .device_preludes import cuda_native, dual_native, lane_group
 from .field_group import Field
 from .friction_patches import PatchRowLaw
@@ -98,8 +98,8 @@ from .sparse_row_projection import _sparse_contact_projection_source
 # armature included: :class:`.kernels.BodyFactors`), and its rows are whitened: the writers store each side's ``J``
 # and the build replaces it with ``Z = L^-1 J^T``, so ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and the sweeps hold the
 # bodies' velocities in factor coordinates ``u = L^T v``. A body's six velocity coordinates start at its
-# articulation's first coordinate, in the addressing the mapping reads: global (``articulation_dof_start``), world
-# (``articulation_world_dof_offset``) or the world's local body slot (:func:`free_body_slot`).
+# articulation's first coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
+# (``articulation_world_dof_offset``).
 
 
 @wp.func
@@ -225,61 +225,38 @@ def free_body_row_rhs(
 
 
 @wp.func
-def free_body_slot(
-    world: int,
-    body: int,
-    count: int,
-    capacity: int,
-    body_to_articulation: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    body_list: wp.array2d[int],
-    body_dof_start: wp.array2d[int],
-):
-    """``body``'s slot in its world's local body list and the list's new length.
-
-    A body not yet listed is appended (with its first global coordinate) while the list holds fewer than
-    ``capacity`` bodies; past it the body gets slot -1, as does no body (a negative one).
-    """
-    slot = int(-1)
-    if body >= 0:
-        for b in range(count):
-            if body_list[world, b] == body:
-                slot = b
-                break
-        if slot < 0 and count < capacity:
-            slot = count
-            body_list[world, count] = body
-            body_dof_start[world, count] = body_coordinate(body, body_to_articulation, articulation_dof_start)
-            count += 1
-    return slot, count
-
-
-@wp.func
 def free_body_publish(
     world: int,
     body: int,
     count: int,
-    local_body_a: wp.array2d[int],
-    local_body_b: wp.array2d[int],
+    body_a: wp.array2d[int],
+    body_b: wp.array2d[int],
     Z_a: wp.array3d[float],
     Z_b: wp.array3d[float],
     row_type: wp.array2d[int],
     impulses: wp.array2d[float],
-) -> wp.spatial_vector:
-    """``sum_i Z_i lambda_i`` on the world's local body ``body``, in factor coordinates: the rows in order, each nonzero
-    impulse times the row's entries on that body (side ``a``, then ``b``), from zero. Speed rows carry no ``Z``."""
+):
+    """``sum_i Z_i lambda_i`` on ``body`` in factor coordinates, and whether any of the world's rows holds the body: the
+    rows in order, each nonzero impulse times the row's entries on that body (side ``a``, then ``b``), from zero. Speed
+    rows carry no ``Z``."""
     delta = wp.spatial_vector()
+    held = bool(False)
     for i in range(count):
+        on_a = body_a[world, i] == body
+        on_b = body_b[world, i] == body
+        if not (on_a or on_b):
+            continue
+        held = True
         impulse = impulses[world, i]
         if impulse == 0.0 or row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             continue
-        if local_body_a[world, i] == body:
+        if on_a:
             for k in range(6):
                 delta[k] += Z_a[world, i, k] * impulse
-        if local_body_b[world, i] == body:
+        if on_b:
             for k in range(6):
                 delta[k] += Z_b[world, i, k] * impulse
-    return delta
+    return delta, held
 
 
 @wp.kernel(enable_backward=False)
@@ -355,48 +332,6 @@ def free_body_rows_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def free_body_map_kernel(
-    mf: MfRows,
-    bodies: MfBodyMap,
-    mf_constraint_count: wp.array[int],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    max_mf_bodies: int,
-):
-    """List each world's bodies in row order and give every row its bodies' local slots (:func:`free_body_slot`).
-
-    One thread per world. A world with more than ``max_mf_bodies`` bodies gives the later bodies slot -1, which
-    the sweeps that read slots treat as no body.
-    """
-    world = wp.tid()
-    count = int(0)
-    for i in range(mf_constraint_count[world]):
-        slot_a, count = free_body_slot(
-            world,
-            mf.body_a[world, i],
-            count,
-            max_mf_bodies,
-            body_to_articulation,
-            art_dof_start,
-            bodies.body_list,
-            bodies.body_dof_start,
-        )
-        bodies.local_body_a[world, i] = slot_a
-        slot_b, count = free_body_slot(
-            world,
-            mf.body_b[world, i],
-            count,
-            max_mf_bodies,
-            body_to_articulation,
-            art_dof_start,
-            bodies.body_list,
-            bodies.body_dof_start,
-        )
-        bodies.local_body_b[world, i] = slot_b
-    bodies.body_count[world] = count
-
-
-@wp.kernel(enable_backward=False)
 def free_body_coordinates_kernel(
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
@@ -420,14 +355,16 @@ def free_body_coordinates_kernel(
 
 @wp.kernel(enable_backward=False)
 def free_body_publish_kernel(
-    bodies: MfBodyMap,
+    publish_body: wp.array[int],
+    publish_world: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
     mf_constraint_count: wp.array[int],
     mf_Z_a: wp.array3d[float],
     mf_Z_b: wp.array3d[float],
     mf_row_type: wp.array2d[int],
     mf_impulses: wp.array2d[float],
     factors: BodyFactors,
-    max_mf_bodies: int,
     set_output_to_delta: int,
     # in/out
     velocity: wp.array[float],
@@ -435,31 +372,31 @@ def free_body_publish_kernel(
     """Publish the velocity change of a world's impulses onto ``velocity``: ``v += L^-T sum_i Z_i lambda_i`` per body
     (:func:`free_body_publish`, then the body's factor).
 
-    One thread per (world, local body). The change replaces the velocity (``set_output_to_delta``) or is added to
-    it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
+    One thread per free rigid body of the model (``publish_body``, in its world ``publish_world``), so every body a
+    world's rows hold is published, however many there are. The change replaces the velocity (``set_output_to_delta``)
+    or is added to it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
+    A body no row holds is left untouched.
     """
     tid = wp.tid()
-    local_body = tid % max_mf_bodies
-    world = tid // max_mf_bodies
-    if local_body >= bodies.body_count[world]:
+    body = publish_body[tid]
+    world = publish_world[tid]
+    if world < 0:
         return
-    first = bodies.body_dof_start[world, local_body]
-    factor = free_body_factor(bodies.body_list[world, local_body], factors)
-    delta = factor_leave(
-        factors.L,
-        factor,
-        free_body_publish(
-            world,
-            local_body,
-            mf_constraint_count[world],
-            bodies.local_body_a,
-            bodies.local_body_b,
-            mf_Z_a,
-            mf_Z_b,
-            mf_row_type,
-            mf_impulses,
-        ),
+    sums, held = free_body_publish(
+        world,
+        body,
+        mf_constraint_count[world],
+        mf_body_a,
+        mf_body_b,
+        mf_Z_a,
+        mf_Z_b,
+        mf_row_type,
+        mf_impulses,
     )
+    if not held:
+        return
+    first = body_coordinate(body, factors.body_to_articulation, factors.dof_start)
+    delta = factor_leave(factors.L, free_body_factor(body, factors), sums)
     for k in range(6):
         if set_output_to_delta != 0:
             velocity[first + k] = delta[k]
@@ -520,14 +457,12 @@ class FreeBodyZBuild:
     Attributes:
         rows: Each row's whitened entries, stored inverse diagonal, incident velocity and ``rhs``
             (:func:`free_body_rows_kernel`).
-        body_map: Each world's local body list and each row's body slots (:func:`free_body_map_kernel`).
         coordinates: Each row's bodies' first world coordinates (:func:`free_body_coordinates_kernel`).
         meta: The factory of the row-word pack (:func:`free_body_meta_kernel`).
         publish: The velocity change of a world's impulses (:func:`free_body_publish_kernel`).
     """
 
     rows: wp.Kernel
-    body_map: wp.Kernel
     coordinates: wp.Kernel
     meta: Callable[[int, str], wp.Kernel]
     publish: wp.Kernel
@@ -535,7 +470,6 @@ class FreeBodyZBuild:
 
 FREE_BODY_Z = FreeBodyZBuild(
     rows=free_body_rows_kernel,
-    body_map=free_body_map_kernel,
     coordinates=free_body_coordinates_kernel,
     meta=free_body_meta_kernel,
     publish=free_body_publish_kernel,

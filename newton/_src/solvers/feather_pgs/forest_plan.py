@@ -92,6 +92,8 @@ class ForestPlan:
     articulation_response_dof_count: wp.array
     is_free_rigid: wp.array | None
     free_rigid_body_indices: wp.array | None
+    free_rigid_body_world: wp.array | None
+    """Each free rigid body's world, in the order of ``free_rigid_body_indices`` (the warm start's publication)."""
 
     # Roots.
     free_root_joint_count: int
@@ -479,6 +481,7 @@ def _free_bodies(plan, model):
         plan.has_non_free_articulations = False
         plan.is_free_rigid = None
         plan.free_rigid_body_indices = None
+        plan.free_rigid_body_world = None
         plan.free_rigid_body_count = 0
         return
 
@@ -501,6 +504,9 @@ def _free_bodies(plan, model):
     plan.free_rigid_per_world = np.bincount(free_world, minlength=plan.free_rigid_per_world.size)
     plan.is_free_rigid = wp.array(is_free_rigid, dtype=wp.int32, device=model.device)
     plan.free_rigid_body_indices = wp.array(plan.response_free_rigid_body_indices, dtype=wp.int32, device=model.device)
+    plan.free_rigid_body_world = wp.array(
+        articulation_world[solve_mask & free_mask], dtype=wp.int32, device=model.device
+    )
 
 
 def _mass_schedules(plan, model):
