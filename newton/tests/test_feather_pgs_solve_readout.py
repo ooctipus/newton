@@ -736,7 +736,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             (solver,) = self._solvers(
-                route, [{"pgs_solve_readout": "trace", "contact_torsion_radius": 0.01, "dense_max_constraints": 256}]
+                route, [{"pgs_solve_readout": "trace", "contact_torsion": True, "dense_max_constraints": 256}]
             )
         key = solver._pgs_solve_mf_gs_kernel.key
         self.assertIn("_torsion", key)

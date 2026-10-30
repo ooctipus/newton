@@ -601,6 +601,17 @@ class ResponseOperator:
         ]
         return "\n".join(line for line in lines if line != "")
 
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """Declare a friction triple's spin terms (contact torsion), after :meth:`pair_terms`: ``spin_residual``
+        (``J_p v + rhs_p`` of the spin row ``spin``) and its couplings with the tangents, ``spin_cross``
+        (``J_i Y_p``) and ``spin_cross_sibling`` (``J_s Y_p``)."""
+        lines = (
+            self.sibling_residual("spin_residual", spin, indent, rhs(spin)),
+            self.coupling("spin_cross", row, spin, indent),
+            self.coupling("spin_cross_sibling", sibling, spin, indent),
+        )
+        return "\n".join(line for line in lines if line != "")
+
     def apply(self, delta: str, indent: str) -> str:
         """``v += Y_i delta`` of the visited row."""
         raise self._lacks("apply")
@@ -992,6 +1003,16 @@ class ResidualBlock(ResponseOperator):
         setup, index = self.entry(self.block_row(sibling), self.block_row(row))
         lead = f"{indent}{setup}\n" if setup else ""
         return f"{lead}{indent}float {out} = s_A[{index}];"
+
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """The spin row's maintained residual and its couplings with the tangents (``A[p][i]``, ``A[p][s]``), each
+        entry read in a scope of its own: a layout's setup declares its indices."""
+        lines = [self.sibling_residual("spin_residual", spin, indent, rhs(spin))]
+        for out, source in (("spin_cross", row), ("spin_cross_sibling", sibling)):
+            setup, index = self.entry(self.block_row(spin), self.block_row(source))
+            read = f"{out} = s_A[{index}];"
+            lines.append(f"{indent}float {out};\n{indent}{{ {setup} {read} }}" if setup else f"{indent}float {read}")
+        return "\n".join(lines)
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
         lane, width = self.lanes.lane, self.lanes.width
@@ -1924,9 +1945,10 @@ class FactorRows(ResponseOperator):
     term is ``J_i v = Z_i u`` and its response ``u += Z_i delta``: one row array
     (``rows``, row ``i`` from ``base + i * dofs``) is both. Lane ``l`` holds
     coordinate ``l`` of ``u`` in the register ``velocity``, and of the rows it
-    acts on in registers: the current row's (``current``) and its friction
-    sibling's (``sibling``), which the schedule loads (:meth:`load`, or the
-    pipeline :meth:`prefetch` and :meth:`consume`). A sum is one product per
+    acts on in registers: the current row's (``current``), its friction
+    sibling's (``sibling``) and, under contact torsion, its contact's spin
+    row's (``spin``), which the schedule loads (:meth:`load`, or the pipeline
+    :meth:`prefetch` and :meth:`consume`). A sum is one product per
     lane (zero past ``dofs``) reduced with ``SUM``; a pair's sums reduce in one
     ladder (:meth:`pair_terms`). The builder stores ``A_ii``; the step divides
     by it. ``components``, the diagonal blocks of ``L``, map the velocity into
@@ -1941,6 +1963,7 @@ class FactorRows(ResponseOperator):
     velocity: str = "factor_velocity"
     current: str = "row_z"
     sibling: str = "sibling_z"
+    spin: str = "spin_z"
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
     name = "factor_rows"
@@ -2014,13 +2037,25 @@ class FactorRows(ResponseOperator):
         lines.append(f"{indent}sibling_residual += {rhs(sibling)};")
         return "\n".join(lines)
 
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """The spin row's sums in one ladder (its entries in the ``spin`` register): its residual, then its couplings
+        with the current row and the sibling."""
+        channels = (
+            ("spin_residual", self.spin, self.velocity),
+            ("spin_cross", self.current, self.spin),
+            ("spin_cross_sibling", self.sibling, self.spin),
+        )
+        return f"{self._sums(channels, indent)}\n{indent}spin_residual += {rhs(spin)};"
+
     def apply(self, delta: str, indent: str) -> str:
         """``u += Z_i delta`` of the current row (lanes past ``dofs`` add zero)."""
         return f"\n{indent}{self.velocity} += {self.current} * {delta};"
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """``u += Z_s delta`` of the friction sibling ``row`` (its entries in the ``sibling`` register)."""
-        return f"\n{indent}{self.velocity} += {self.sibling} * {delta};"
+        """``u += Z_s delta`` of the friction sibling ``row`` (its entries in the ``sibling`` register), or of the spin
+        row (``spin``, in the ``spin`` register)."""
+        register = self.spin if row == "spin" else self.sibling
+        return f"\n{indent}{self.velocity} += {register} * {delta};"
 
     def _factor_product(self, source: str, out: str, indent: str, *, transposed: bool, declare: bool) -> str:
         """``out = L source`` or ``L^T source`` per component in leaf-first positions (factor coordinate ``i`` on
@@ -2181,12 +2216,14 @@ class SparseFactor(ResponseOperator):
         row: str = "i",
         sibling: str | None = None,
         paired: str = "false",
+        spin: str | None = None,
     ) -> str:
         """``float out = Z_row . delta`` (every lane holds it), the row's entries kept for :meth:`apply`.
 
         With ``sibling``, a ``paired`` row (a first tangent) also reduces ``sibling_jv = Z_sibling . delta`` and
         ``pair_coupling = Z_row . Z_sibling`` in the same ``SUM`` and keeps the sibling's entries for
-        :meth:`apply_pair`.
+        :meth:`apply_pair`; with its contact's ``spin`` row (contact torsion, on the same support) also ``spin_jv``,
+        ``spin_coupling = Z_row . Z_spin`` and ``spin_coupling_sibling = Z_sibling . Z_spin`` (:meth:`spin_terms`).
         """
         count = self.entries
         lines = [f"int indices[{count}];", f"float responses[{count}];"]
@@ -2205,9 +2242,16 @@ class SparseFactor(ResponseOperator):
         else:
             lines += [f"float sibling_responses[{count}];", f"float {out} = 0.0f;"]
             lines += ["float sibling_jv = 0.0f;", "float pair_coupling = 0.0f;"]
+            if spin is not None:
+                lines.append("float spin_jv = 0.0f, spin_coupling = 0.0f, spin_coupling_sibling = 0.0f;")
             body += [
                 f"const float sibling_value = {paired} && index >= 0",
                 f"    ? {self.element(sibling)} : 0.0f;",
+                *(
+                    (f"const float spin_value = {paired} && index >= 0", f"    ? {self.element(spin)} : 0.0f;")
+                    if spin is not None
+                    else ()
+                ),
                 "indices[q] = index;",
                 "responses[q] = value;",
                 "sibling_responses[q] = sibling_value;",
@@ -2216,9 +2260,19 @@ class SparseFactor(ResponseOperator):
                 f"    {out} += value * velocity;",
                 "    sibling_jv += sibling_value * velocity;",
                 "    pair_coupling += value * sibling_value;",
+                *(
+                    (
+                        "    spin_jv += spin_value * velocity;",
+                        "    spin_coupling += value * spin_value;",
+                        "    spin_coupling_sibling += sibling_value * spin_value;",
+                    )
+                    if spin is not None
+                    else ()
+                ),
                 "}",
             ]
-            reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling")
+            sums = ("spin_jv", "spin_coupling", "spin_coupling_sibling") if spin is not None else ()
+            reduce = self.lanes.reduce(out, "sibling_jv", "pair_coupling", *sums)
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
         return text + "".join(f"\n{indent}{line}" for line in reduce.split("\n") if line)
 
@@ -2229,6 +2283,13 @@ class SparseFactor(ResponseOperator):
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
         """``float out = Z_t . Z_s``: the pair's off-diagonal entry, which :meth:`residual` reduced."""
         return f"{indent}float {out} = pair_coupling;"
+
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """The spin row's residual and couplings, which :meth:`residual` reduced with the pair's."""
+        return (
+            f"{indent}float spin_residual = spin_jv;\n{indent}spin_residual += {rhs(spin)};\n"
+            f"{indent}float spin_cross = spin_coupling;\n{indent}float spin_cross_sibling = spin_coupling_sibling;"
+        )
 
     def apply(self, delta: str, indent: str) -> str:
         """``delta_v += Z_row delta`` from the entries :meth:`residual` (or :meth:`row_velocity`) kept."""

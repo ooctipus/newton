@@ -66,17 +66,12 @@ from . import (
 )
 from . import route_table as _route_table
 from . import row_metadata as _row_metadata
-from .capture_joins import capturing
 from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
-from .contact_torsion import (
-    prepare_torsion_rows,
-    validate_torsion_step,
-)
 from .dense_rows import RowSupport
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
@@ -607,7 +602,6 @@ class SolverFeatherPGS(SolverBase):
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
     #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
-    #   torsion_preparation "host": the host reference of the torsion rows.
     #   double_buffer False: one set of mass matrices and Jacobians, whose rows stay readable after a step.
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
@@ -665,21 +659,6 @@ class SolverFeatherPGS(SolverBase):
             )
         )
 
-    @property
-    def contact_torsion_radius(self) -> float:
-        """Experimental construction-only effective spin radius [m]."""
-        return self.laws.contact_torsion_radius
-
-    @property
-    def contact_torsion_shape_indices(self) -> tuple[int, ...] | None:
-        """Experimental construction-only global shape selection."""
-        return self.laws.contact_torsion_shape_indices
-
-    @property
-    def contact_torsion_shape_patterns(self) -> tuple[str, ...] | None:
-        """Experimental construction-only shape-label regular expressions."""
-        return self.laws.contact_torsion_shape_patterns
-
     @deprecate_nonkeyword_arguments(last_positional="friction_anchor_beta")
     def __init__(
         self,
@@ -720,9 +699,7 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
-        contact_torsion_radius: float = 0.0,
-        contact_torsion_shape_indices: tuple[int, ...] | None = None,
-        contact_torsion_shape_patterns: tuple[str, ...] | None = None,
+        contact_torsion: bool = False,
         contact_compliance: bool = False,
     ):
         """Create the solver for ``model``.
@@ -736,39 +713,14 @@ class SolverFeatherPGS(SolverBase):
 
         Args:
             model (Model): the model to be simulated.
-            contact_torsion_radius: Experimental effective spin radius [m], zero disables.
-                Explicit material/footprint assumption: for uniform pressure on a disk
-                of radius R, the effective radius is 2*R/3. Does not consume the generic
-                material torsion default. Sliding and spin share one Coulomb budget.
-                Currently supports dense articulated contacts in CUDA matrix-free,
-                immediate/current/interleaved mode without warmstarting,
-                hydroelastic contact, contact compliance,
-                or debug mode. Final normal load always bounds the friction budget.
-                Radius and selectors are
-                construction-only; recreate the solver to change them. With point
-                friction, one spin row bounds each coplanar exact-shape-pair group. With
-                persistent friction patches (the default ``friction_anchor_beta``), one
-                spin row bounds each patch region by the region's pooled normal load
-                times the undivided friction coefficient, less the tangent impulses of
-                its anchor rows; normal rows stay independent. Contact regularization
-                softens the position solve's normal rows; velocity cleanup is
-                unregularized. Spin uses the final solved normal load without
-                applying a second regularization factor. Capacity
-                exhaustion raises even when optional overflow diagnostics are off. Host
-                grouping is diagnostic, not optimized for throughput. This experimental
-                parameter may change without the normal deprecation policy.
-            contact_torsion_shape_indices: Optional global shape indices selecting
-                contacts with at least one selected collider. Supported geometry is
-                sphere, box, capsule, cylinder, cone, ellipsoid, plane, and convex mesh.
-                Explicitly selecting unsupported geometry raises; without selectors,
-                contacts involving unsupported geometry are skipped. None selects all shapes;
-                an empty tuple selects none. Mutually exclusive with shape patterns.
-                Experimental, with the same compatibility limitations as the radius.
-            contact_torsion_shape_patterns: Optional regex patterns, full-matched against
-                finalized model.shape_label at construction. For substring matching use
-                an explicit pattern such as ".*fingertip.*". Empty tuple selects none;
-                unmatched nonempty patterns raise ValueError. Experimental, with the
-                same compatibility limitations as the radius.
+            contact_torsion: Resist spin about each contact's normal: a friction contact takes a spin row beside its
+                friction pair, and the pair and the spin row share the elliptic cone
+                ``|(t1 / mu, t2 / mu, s / mu_t)| <= lambda_n`` (the soft-finger contact). ``mu_t`` [m] is the
+                contact's torsional coefficient, the mean of its shapes' ``Model.shape_material_mu_torsional``
+                (as ``mu`` is the mean of their ``shape_material_mu``); a zero coefficient pins the spin. Under
+                persistent friction patches each anchor's spin row shares the region's capacity as its pair shares
+                the region's friction. Point contacts (spheres, fingertips) are its use: a flat contact's several
+                points already resist spin through their friction's lever arms. Off by default.
             contact_compliance: Contacts of positive ``Contacts.rigid_contact_stiffness`` [N/m] are material
                 contacts: each pushes with ``F = max(0, -k phi - c u)`` at the step's end (backward Euler), with the
                 contact's ``rigid_contact_damping`` [N s/m] (no dashpot across an open gap), and its tangents take
@@ -819,7 +771,7 @@ class SolverFeatherPGS(SolverBase):
                 normal impulse equally between those anchors. Normal contacts are preserved.
                 Twisting resistance comes only from the separation between the anchors;
                 a single-anchor region has no independent torsional stiction constraint
-                unless ``contact_torsion_radius`` adds one bounded spin row per region.
+                unless ``contact_torsion`` gives each anchor a spin row.
                 For uniform pad-friction randomization, sample one coefficient per pad
                 and assign it to all constituent convex shapes. Different coefficients
                 define separate regions and are not pooled across material boundaries.
@@ -1417,14 +1369,6 @@ class SolverFeatherPGS(SolverBase):
         self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
         self._allocate_buffers(model)
         self._allocate_world_buffers(model)
-        # CONTACT row_parent belongs to ordinary friction/patch load linkage.
-        # Torsion must never reinterpret it, including when patch PRs are merged.
-        self._contact_torsion_group = wp.full(
-            self.row_parent.shape if self.laws.contact_torsion_enabled else (1, 1),
-            -1,
-            dtype=wp.int32,
-            device=model.device,
-        )
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self._hinv_jt_writes_world = (
@@ -1454,10 +1398,12 @@ class SolverFeatherPGS(SolverBase):
             and self.options.contact_friction_gap_threshold == math.inf
             and not self.laws.friction_anchors_enabled
         )
-        # Patch contacts are units of one row, or three when they own an anchor;
+        # Patch contacts are units of one row, or three (four with a spin row) when they own an anchor;
         # the factor sweep walks them with the generic path's row order and
         # arithmetic, solving each tangent pair once.
-        self._factor_coordinate_contact_units = bool(self._paired_factor_coordinates and laws.patch)
+        self._factor_coordinate_contact_units = bool(
+            self._paired_factor_coordinates and laws.contact == "patch" and not laws.compliance
+        )
         self._paired_factor_primary_groups_by_world = None
         self._paired_factor_secondary_groups_by_world = None
         self._paired_factor_primary_offsets_by_world = None
@@ -1551,6 +1497,8 @@ class SolverFeatherPGS(SolverBase):
         self._keyed_rows = None
         if not self._parallel_contact_paths:
             self._keyed_rows_reason = self._parallel_contact_paths_reason
+        elif (declined := capable("keyed_rows", self.laws.set)) is not None:
+            self._keyed_rows_reason = declined
         elif self._route_pins.get("producer") not in (None, "keyed_rows"):
             self._keyed_rows_reason = "A test pin selects another contact-row producer."
         else:
@@ -1590,9 +1538,7 @@ class SolverFeatherPGS(SolverBase):
         # capture. The warning path tracks only current-step dropped rows and a
         # one-shot flag per row family; row_watermark additionally accumulates
         # whole-run high-water telemetry for explicit readback.
-        self._track_row_capacity = (
-            self._row_watermark or self.options.warn_constraint_overflow or self.laws.contact_torsion_enabled
-        )
+        self._track_row_capacity = self._row_watermark or self.options.warn_constraint_overflow
         # Dropped-row accounting is unconditional (see _row_dropped_all above);
         # _track_row_capacity now gates only the optional warning/watermark readbacks.
         if self.options.warn_constraint_overflow:
@@ -1607,14 +1553,6 @@ class SolverFeatherPGS(SolverBase):
             self._arrays.release(ROW_WATERMARKS)
 
         self._init_double_buffer_stream()
-
-        # Contact torsion's preparation is device-resident on both devices (the host preparation is the test pin
-        # torsion_preparation='host').
-        self.contact_torsion_device = self._route_pins.get("torsion_preparation") != "host"
-        if self.laws.contact_torsion_enabled and self.contact_torsion_device:
-            from .contact_torsion_device import enable_device_torsion  # noqa: PLC0415
-
-            enable_device_torsion(self)
 
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
@@ -1738,40 +1676,6 @@ class SolverFeatherPGS(SolverBase):
         selection["options"] = options_selection(self)
         selection["environment"] = copy.deepcopy(self._environment_record)
         return selection
-
-    def prepare_contact_torsion_capture(self, state_in: State, state_out: State) -> None:
-        """Prepare experimental torsion rollback buffers before CUDA graph capture.
-
-        Torsion's preparation is device-resident on CUDA. Call
-        outside capture with the state layouts used by the graph. Subsequent
-        graph replay requires :meth:`validate_contact_torsion` at every batch
-        boundary before results are consumed. Eager steps continue to validate
-        automatically. This method does not advance physics.
-        """
-        if not self.laws.contact_torsion_enabled:
-            return
-        preparation = getattr(self, "_device_torsion", None)
-        if preparation is None:
-            raise RuntimeError("Contact torsion graph capture requires the device-resident torsion preparation")
-        if capturing(self.model.device):
-            raise RuntimeError("Prepare contact torsion buffers outside CUDA graph capture")
-        preparation.validate()
-        preparation.deferred_errors = True
-        preparation.begin_step(state_in, state_out)
-
-    def validate_contact_torsion(self) -> None:
-        """Raise latched torsion errors after every experimental graph replay batch.
-
-        This synchronous status check must run before consuming captured results.
-        Invalid input suppresses incomplete contact solving and restores published
-        dynamic state, but internal caches are not rolled back: recreate the solver
-        after correcting invalid input. No-op without device torsion preparation.
-        """
-        preparation = getattr(self, "_device_torsion", None)
-        if preparation is not None:
-            if capturing(self.model.device):
-                raise RuntimeError("Validate contact torsion outside CUDA graph capture")
-            preparation.validate()
 
     def _kinematic_state(self, forest: TreePlan) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
         """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
@@ -3379,6 +3283,7 @@ class SolverFeatherPGS(SolverBase):
                     independent_components=self._paired_components is not None,
                     contact_units=self._factor_coordinate_contact_units,
                     weighted=self.laws.set.weighted,
+                    torsion=self.laws.contact_torsion_enabled,
                 )
                 if self._paired_factor_coordinates
                 else None
@@ -3402,6 +3307,8 @@ class SolverFeatherPGS(SolverBase):
         local_factory = sweep_routes_local.local_owned_kernel
         if self._row_packets is not None:
             local_factory = self._row_packets.local_factory()
+        # The contact owners solve contact torsion's spin rows with their pairs.
+        local_torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
         if self._local_internal_fast_path:
             for size, count in self._local_internal_art_counts.items():
                 if count > 0:
@@ -3441,6 +3348,7 @@ class SolverFeatherPGS(SolverBase):
                         paired_dof_count=6,
                         persistent_queue=True,
                         warps_per_block=warps_per_block,
+                        **local_torsion,
                     )
             for size, count in self._local_residual_art_counts.items():
                 if count > 0:
@@ -3457,6 +3365,7 @@ class SolverFeatherPGS(SolverBase):
                         warps_per_block=warps_per_block,
                         mf_max_constraints=self.mf_max_constraints,
                         local_mf_max_constraints=self._local_residual_mf_max_rows,
+                        **local_torsion,
                     )
 
         sparse_contact_schedule = self._sparse_diagonal_contact_triples or self._sparse_diagonal_contact_units
@@ -3622,6 +3531,7 @@ class SolverFeatherPGS(SolverBase):
                         linked_rows=self.laws.friction_anchors_enabled,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         weighted=self.laws.set.weighted,
+                        **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     self._mf_gs_tiers.append(dataclasses.replace(tier, tier=tier_index))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
@@ -4187,8 +4097,6 @@ class SolverFeatherPGS(SolverBase):
                 self.row_type,
                 self.row_parent,
                 self.row_mu,
-                self._contact_torsion_group,
-                self.laws.contact_torsion_radius,
                 self.mf_constraint_count,
                 self.mf_contact_rows_end,
                 mf_meta,
@@ -4387,13 +4295,9 @@ class SolverFeatherPGS(SolverBase):
         dt: float,
         collide_done_event=None,
     ):
-        if self.laws.contact_torsion_enabled:
-            validate_torsion_step(self)
         # The configuration's checks come first; then the states', before any of them is read.
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
-        if self.laws.contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
-            self._device_torsion.begin_step(state_in, state_out)
         self._bind_contact_material(contacts)
         if contacts is not None:
             self._follow_contacts(contacts)
@@ -4497,8 +4401,6 @@ class SolverFeatherPGS(SolverBase):
             if self._resolved_worlds_owner is not None:
                 self._resolved_worlds_owner.classify(state_in, state_aug, contacts, dt)
             self._stage4_build_rows(state_in, state_aug, control, contacts, dt)
-            if self.laws.contact_torsion_enabled:
-                prepare_torsion_rows(self, state_in, state_aug, contacts)
 
         # The response Y = H^-1 J^T of each size that builds one, the diagonals (from J Y, or the packed rows'
         # |Z|^2) and the bias (the sweeps compute J v each iteration).
@@ -4863,10 +4765,6 @@ class SolverFeatherPGS(SolverBase):
                     device=contact_counts.device,
                 )
 
-        if self.laws.contact_torsion_enabled and getattr(self, "_device_torsion", None) is not None:
-            self._device_torsion.end_step(state_out)
-            if self._device_torsion.deferred_errors and not capturing(self.model.device):
-                self.validate_contact_torsion()
         self._step += 1
         return state_out
 
@@ -7089,14 +6987,13 @@ class SolverFeatherPGS(SolverBase):
         fixed point on anymal-D's 33-48-row worlds. Both project joint velocity-limit
         rows by one unilateral law, so the tiers share the serial sweep's fixed point
         there too, and weighted contact rows (the relative regularization, material
-        contacts) by their weights, the serial sweeps' row law. Torsion keeps ordinary
-        rows.
+        contacts) by their weights, the serial sweeps' row law. Contact torsion's spin
+        rows project with their pairs onto their cone (keyed rows write none: the tiers
+        then take the general producer's rows).
         """
         laws = self.laws.set
-        if laws.point:
+        if laws.contact == "point":
             return True, "Point friction: parallel tiers and keyed rows serve it."
-        if not laws.agnostic:
-            return False, "Contact torsion keeps serial sweeps and ordinary rows."
         return True, (
             "Patch friction: parallel tiers and keyed rows serve it. In the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "

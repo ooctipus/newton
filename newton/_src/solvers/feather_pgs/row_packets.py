@@ -31,6 +31,7 @@ from ...sim import ModelFlags
 from . import field_group, sweep_routes_local
 from .contact_input import ContactInput
 from .contact_laws import (
+    CONTACT_SPIN_ROW,
     contact_bodies,
     contact_friction_points,
     contact_points,
@@ -412,8 +413,8 @@ def produce_contacts(
                 direction, p0, p1 = contact_row_frame(
                     row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
                 )
-                value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
-                value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
+                value = endpoint_projection(data, body0, art0, size, dof, row, p0, direction)
+                value -= endpoint_projection(data, body1, art1, size, dof, row, p1, direction)
                 packet.jacobian[world, output_row, coordinate] = value
         warp_sync()
         # A lane per row writes its records and rhs with the row law the owners share.
@@ -445,7 +446,8 @@ def materialize_fallback(
         if data.path[c] != 0 or data.slot[c] < 0 or owner[data.world[c]] != 0:
             continue
         a_in, b_in = _contact_in_sizes(data, c, size_a, size_b)
-        flags = 1 | wp.where(data.slots_needed[c] == 3, 2, 0) | wp.where(a_in, 4, 0) | wp.where(b_in, 8, 0)
+        flags = 1 | wp.where(data.slots_needed[c] >= 3, 2, 0) | wp.where(a_in, 4, 0) | wp.where(b_in, 8, 0)
+        flags |= wp.where(data.slots_needed[c] > CONTACT_SPIN_ROW, 16, 0)
         populate_contact_J(c, tid % lanes, data, size_a, groups, law, flags, support, J_a, J_b)
 
 

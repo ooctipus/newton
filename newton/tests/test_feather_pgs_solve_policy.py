@@ -484,20 +484,21 @@ class TestExitLaw(unittest.TestCase):
                 self.assertEqual(body.count("solve_trace_sweep("), 1)
 
     def test_torsion_votes_under_every_policy(self):
-        """Vote the torsion pass's changes under the exit law and the trace, each scaled by its row's diagonal."""
-        torsion, friction = int(kernels.PGS_CONSTRAINT_TYPE_TORSION), int(kernels.PGS_CONSTRAINT_TYPE_FRICTION)
+        """Vote a spin row's change (contact torsion) under the exit law and the trace, scaled by its row's diagonal,
+        with its friction pair's."""
+        torsion = int(kernels.PGS_CONSTRAINT_TYPE_TORSION)
         options = {"contact_torsion": True}
         traced = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=TRACE, **options)
         snippet = _policy_snippet(self, traced, "solve_trace_sweep(")
-        self.assertIn(f"if (delta != 0.0f) solve_trace_change(fabsf(delta) * (diagonal), {torsion});", snippet)
         self.assertIn(
-            f"if (delta2 != 0.0f) solve_trace_change(fabsf(delta2) * (world_diag.data[off_dense + n + 2]), {friction});",
+            f"if (spin_delta != 0.0f) solve_trace_change(fabsf(spin_delta) * (s_diag_dense[spin]), {torsion});",
             snippet,
         )
         plain = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", **options)
-        snippet = _policy_snippet(self, plain, "fabsf(delta) * (diagonal) <=")
-        torsion_bound = bound("rhs_bias.data[off_dense + spin]", "fabsf(dot)", "old", diagonal="diagonal")
-        self.assertIn(f"(!(fabsf(delta) * (diagonal) <= {torsion_bound}))", snippet)
+        snippet = _policy_snippet(self, plain, "fabsf(spin_delta) * (s_diag_dense[spin]) <=")
+        self.assertIn("(!(fabsf(spin_delta) * (s_diag_dense[spin]) <= spin_bound))", snippet)
+        self.assertIn("ProjectionLaw::friction_ball(", snippet)
+        self.assertIn("ConeLaw::ball(", snippet)
         kernel = sweep_routes.mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
         self.assertIs(kernel.adj.args[-1].type, SolveReadout)
 

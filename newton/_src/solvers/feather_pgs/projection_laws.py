@@ -9,8 +9,10 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   regularization of a row's step, :func:`regularized_delta` (the w-form), its
   diagonal for block solves, :func:`regularized_diagonal`, and
   :func:`friction_gate` (friction rows wait for ``friction_start_iteration``);
-* sets: :func:`unilateral` (``lambda >= 0``), :func:`box` (``|lambda| <= b``) and
-  :func:`disk` (``|lambda_t| <= r``);
+* sets: :func:`unilateral` (``lambda >= 0``), :func:`box` (``|lambda| <= b``),
+  :func:`disk` (``|lambda_t| <= r``) and, for a contact with a spin row,
+  :func:`ball`, its elliptic cone (the family :data:`CONE_LAW`, which only sweeps
+  of contacts with spin rows declare);
 * friction at a fixed normal load: :func:`friction_pair`, the bounded solve of a
   tangent pair on its disk, composed of :func:`friction_pair_metric` and
   :func:`friction_pair_from_metric` for sweeps that keep a pair's block across
@@ -36,6 +38,10 @@ on the rows kept before it (a planar loop's out-of-plane axis, a mimic a closure
 
 PROJECTION_LAW = LawFamily("ProjectionLaw")
 """The projection laws' family; native code calls ``ProjectionLaw::friction_pair(...)``."""
+
+CONE_LAW = LawFamily("ConeLaw", requires=(PROJECTION_LAW,))
+"""The friction cone of a contact with a spin row (contact torsion), which only the sweeps of such contacts declare;
+native code calls ``ConeLaw::ball(...)``."""
 
 
 @PROJECTION_LAW.law
@@ -98,6 +104,22 @@ def disk(pair: wp.vec2, radius: float) -> wp.vec2:
     if magnitude > radius:
         return pair * (radius / magnitude)
     return pair
+
+
+@CONE_LAW.law
+def ball(triple: wp.vec3, mu: float, mu_t: float, load: float) -> wp.vec3:
+    """Scale a friction triple ``(t1, t2, s)`` back onto its elliptic cone ``|(t1 / mu, t2 / mu, s / mu_t)| <= load``
+    when it lies outside, as :func:`disk` does a pair; a zero coefficient pins its component. Without spin
+    (``mu_t = 0``) the pair is projected by :func:`disk` on ``mu load`` bit for bit, as :func:`friction_ball` solves
+    it by :func:`friction_pair`."""
+    if mu_t <= 0.0:
+        pair = disk(wp.vec2(triple[0], triple[1]), mu * load)
+        return wp.vec3(pair[0], pair[1], 0.0)
+    reciprocal = wp.where(mu > 0.0, 1.0 / mu, 0.0)
+    scaled = wp.cw_mul(triple, wp.vec3(reciprocal, reciprocal, 1.0 / mu_t))
+    magnitude = wp.length(scaled)
+    pinned = wp.where(mu > 0.0, 1.0, 0.0)
+    return wp.cw_mul(triple, wp.vec3(pinned, pinned, 1.0)) * wp.where(magnitude > load, load / magnitude, 1.0)
 
 
 @PROJECTION_LAW.law

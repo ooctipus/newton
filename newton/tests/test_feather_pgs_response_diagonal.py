@@ -1539,19 +1539,20 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "paired response ownership requires CUDA")
     def test_paired_factor_coordinates_follow_patch_friction_and_torsion(self):
-        """Keep factor coordinates with default patch friction and yield them to the general owner for torsion."""
+        """Keep factor coordinates with default patch friction, and with contact torsion: the factor sweep's units
+        hold the spin rows."""
         model = _build_mixed_response_model("cuda:0", dof_count=23, friction=0.7)
         solvers = {}
         with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "auto"}):
-            for radius in (0.0, 0.01):
-                solvers[radius] = SolverFeatherPGS(
+            for torsion in (False, True):
+                solvers[torsion] = SolverFeatherPGS(
                     model,
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     pgs_iterations=8,
                     dense_max_constraints=96,
                     mf_max_constraints=32,
-                    contact_torsion_radius=radius,
+                    contact_torsion=torsion,
                 )
             point = SolverFeatherPGS(
                 model,
@@ -1562,22 +1563,23 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 mf_max_constraints=32,
                 friction_anchor_beta=0.0,
             )
-        self.assertTrue(solvers[0.0].laws.friction_anchors_enabled)
-        self.assertTrue(solvers[0.0]._paired_factor_coordinates)
+        self.assertTrue(solvers[False].laws.friction_anchors_enabled)
+        self.assertTrue(solvers[False]._paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
-        self.assertFalse(solvers[0.0]._factor_coordinate_contact_triples)
-        self.assertTrue(solvers[0.0]._factor_coordinate_contact_units)
-        self.assertIn("_units", solvers[0.0]._paired_factor_solve_kernel.key)
-        self.assertTrue(solvers[0.0].get_path_selection()["routes"]["paired_response"]["contact_units"])
+        self.assertFalse(solvers[False]._factor_coordinate_contact_triples)
+        self.assertTrue(solvers[False]._factor_coordinate_contact_units)
+        self.assertIn("_units", solvers[False]._paired_factor_solve_kernel.key)
+        self.assertTrue(solvers[False].get_path_selection()["routes"]["paired_response"]["contact_units"])
         self.assertFalse(point.laws.friction_anchors_enabled)
         self.assertTrue(point._paired_factor_coordinates)
         self.assertTrue(point._factor_coordinate_contact_triples)
         self.assertFalse(point._factor_coordinate_contact_units)
-        self.assertTrue(solvers[0.01].laws.contact_torsion_enabled)
-        self.assertIsNotNone(solvers[0.01]._paired_response_primary_size)
-        self.assertFalse(solvers[0.01]._paired_factor_coordinates)
-        self.assertFalse(solvers[0.01]._factor_coordinate_contact_triples)
-        self.assertFalse(solvers[0.01]._factor_coordinate_contact_units)
+        self.assertTrue(solvers[True].laws.contact_torsion_enabled)
+        self.assertIsNotNone(solvers[True]._paired_response_primary_size)
+        self.assertTrue(solvers[True]._paired_factor_coordinates)
+        self.assertFalse(solvers[True]._factor_coordinate_contact_triples)
+        self.assertTrue(solvers[True]._factor_coordinate_contact_units)
+        self.assertIn("_torsion", solvers[True]._paired_factor_solve_kernel.key)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_internal_mixed_world_matches_general_response(self):
@@ -1791,24 +1793,30 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         _assert_owner_parity(self, general, local)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
-    def test_local_owners_stay_general_with_contact_torsion(self):
-        """Keep torsion-eligible worlds on the general owner, which solves the appended torsion row."""
+    def test_local_owners_take_contact_torsion(self):
+        """Keep the local owners for a model with contact torsion: their sweeps solve its spin rows."""
         model = _build_mixed_response_model("cuda:0", friction=0.7)
         solvers = {}
         with mock.patch.object(SolverFeatherPGS, "_route_pins", {"hinv_jt_kernel": "par_row"}):
-            for radius in (0.0, 0.01):
-                solvers[radius] = SolverFeatherPGS(
+            for torsion in (False, True):
+                solvers[torsion] = SolverFeatherPGS(
                     model,
                     enable_joint_limits=True,
                     joint_limit_activation_gap=0.0,
                     pgs_iterations=8,
                     dense_max_constraints=32,
                     mf_max_constraints=32,
-                    contact_torsion_radius=radius,
+                    contact_torsion=torsion,
                 )
-        self.assertTrue(solvers[0.0]._local_internal_fast_path)
-        self.assertTrue(solvers[0.01].laws.contact_torsion_enabled)
-        self.assertFalse(solvers[0.01]._local_internal_fast_path)
+        self.assertTrue(solvers[False]._local_internal_fast_path)
+        self.assertTrue(solvers[True].laws.contact_torsion_enabled)
+        self.assertTrue(solvers[True]._local_internal_fast_path)
+        kernels = (
+            *solvers[True]._pgs_solve_local_pair_kernels.values(),
+            *solvers[True]._pgs_solve_local_residual_kernels.values(),
+        )
+        self.assertTrue(kernels)
+        self.assertTrue(all("_torsion" in kernel.key for kernel in kernels))
 
     @unittest.skipUnless(wp.is_cuda_available(), "tiled H-inverse response requires CUDA")
     def test_tiled_response_diagonal_matches_dense_reference(self):

@@ -38,9 +38,10 @@ Scenes and features
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
     free cube, two articulations above the held-tree owner's caps (a
     66-coordinate humanoid-like tree, a 100-link snake with and without joint
-    armature), and the CT benchmark of contact torsion (a decaying spin, a
-    twist threshold, a soft-finger pinch) and contact compliance (a drop, a
-    plate's elastic split, a stack, a compliant pinch). Articulated contact
+    armature), and the CT benchmark of contact torsion (a decaying spin,
+    articulated and free, a twist threshold, a soft-finger pinch, a sliding
+    and spinning sphere) and contact compliance (a drop, a plate's elastic
+    split, a stack, a compliant pinch). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: warm
     start, contact compliance, contact torsion, restitution, bilateral
     pre-elimination, joint and rigid-body velocity limits.
@@ -72,9 +73,10 @@ Metrics
       limits, the spring hinge's discrete oscillator, the lifted box following
       the gripper, the exported force on a pressed key balancing its drive,
       and the CT benchmark's references (:mod:`newton.tests.feather_pgs_references`):
-      torsional decay, stiction and spin-up, the soft-finger pinch's hold, a
-      compliant drop against its material law's recurrence, the plate's
-      elastic split, the stack's compressions and the pads' compression.
+      torsional decay, stiction and spin-up, the soft-finger pinch's hold on the
+      elliptic cone, sliding and spinning against a uniform patch's limit
+      surface, a compliant drop against its material law's recurrence, the
+      plate's elastic split, the stack's compressions and the pads' compression.
 
     Individual contact forces are not compared between routes: a statically
     indeterminate distribution (a box's four corners, the lateral friction of
@@ -1011,6 +1013,43 @@ def pinch_laws(run: Run) -> list:
     return laws
 
 
+def _stop_time(t: np.ndarray, value: np.ndarray, tolerance: float) -> float:
+    """The first time ``|value|`` is within ``tolerance`` (the run's end if never)."""
+    below = np.flatnonzero(np.abs(value) <= tolerance)
+    return float(t[below[0]]) if below.size else float(t[-1])
+
+
+def slide_spin_laws(run: Run) -> list:
+    """T4: a sliding and spinning contact follows the exact limit surface of a uniform patch of equal spin capacity
+    (the elliptic cone's maximal dissipation): speed and spin within 0.008 m/s and 4.5% of the start spin (rms), the
+    spin stopping (1% of its start) within 5% of the patch's time."""
+    params, dt = run.scene.params, run.scene.dt
+    body = params["body"]
+    inertia = 0.4 * params["mass"] * params["radius"] ** 2
+    t = np.arange(run.body_qd.shape[0]) * dt
+    speed = np.hypot(run.body_qd[:, body, 0], run.body_qd[:, body, 1])
+    spin = run.body_qd[:, body, 5]
+    reference = refs.slide_spin(
+        params["speed"],
+        params["omega"],
+        params["mu"][0],
+        params["mass"],
+        inertia,
+        params["spin_radius"],
+        "patch",
+        t_end=float(t[-1]) + dt,
+    )
+    speed_ref = np.interp(t, reference["t"], reference["v"])
+    spin_ref = np.interp(t, reference["t"], reference["w"])
+    stop = _stop_time(t, spin, 0.01 * params["omega"])
+    stop_ref = _stop_time(reference["t"], reference["w"], 0.01 * params["omega"])
+    return [
+        ("speed rms error [m/s]", float(np.sqrt(np.mean((speed - speed_ref) ** 2))), 8.0e-3),
+        ("spin rms error [omega0]", float(np.sqrt(np.mean((spin - spin_ref) ** 2))) / params["omega"], 4.5e-2),
+        ("spin stop error [1]", abs(stop / stop_ref - 1.0), 5.0e-2),
+    ]
+
+
 def compliant_drop_laws(run: Run) -> list:
     """C1: each drop follows its material law's backward-Euler recurrence: the gap over the run, and the rebound,
     the peak penetration and the rest within 1%."""
@@ -1145,8 +1184,10 @@ SCENE_LAWS = {
     "pushed_arm": joint_speed_limit_laws,
     "spring_hinge": spring_laws,
     "spin_decay": spin_decay_laws,
+    "spin_decay_free": spin_decay_laws,
     "twist_threshold": twist_laws,
     "pinch_twist": pinch_laws,
+    "slide_spin": slide_spin_laws,
     "compliant_drop": compliant_drop_laws,
     "compliant_plate": plate_laws,
     "compliant_plate_latest": plate_laws,
@@ -1266,8 +1307,10 @@ class Reference:
 
 def _torque_balance(physics: Physics) -> bool:
     """Whether the free bodies' angular balance applies: under point friction, whose rows act at the exported
-    witness points, and without torsion, whose spin torque the export does not carry."""
-    return physics.law == "point" and "torsion" not in physics.scene.tags
+    witness points, and without torsion (a torsion scene, or contact torsion on any scene), whose spin torque the
+    export does not carry."""
+    torsion = "torsion" in physics.scene.tags or dict(physics.variant).get("contact_torsion", False)
+    return physics.law == "point" and not torsion
 
 
 def reference(physics: Physics, route: Route, device) -> Reference:
@@ -1590,11 +1633,15 @@ def COMPLIANT_SCENES() -> tuple:
     return (scenes.compliant_drop(), scenes.compliant_plate(), scenes.compliant_stack(), scenes.compliant_pinch())
 
 
+def _torsion_scenes() -> tuple:
+    """The CT benchmark's torsion scenes after T2: T1 articulated and free, T3 and T4."""
+    return (scenes.spin_decay(), scenes.spin_decay(free=True), scenes.pinch_twist(), scenes.slide_spin())
+
+
 def cuda_groups() -> list:
     """Problems of the CUDA matrix: every route each scene admits, against the CUDA reference."""
     ref = REFERENCE_CUDA
     vlimits = {"enable_joint_velocity_limits": True}
-    twist = scenes.twist_threshold()
     groups = []
     for law in _laws():
         # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
@@ -1612,6 +1659,13 @@ def cuda_groups() -> list:
             Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL)),
             Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
+            # The Jacobi tiers' radial projection of the friction triple (keyed rows write no spin row: the general
+            # producer feeds the tiers), against the general route's sequential sweep.
+            Group(
+                _physics(scenes.legged(), law, 32, "torsion", contact_torsion=True),
+                ref,
+                (MF_PARALLEL.but("mf_parallel_torsion", expect={"friction.torsion": True}),),
+            ),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
             Group(
                 _physics(scenes.gripper(), law, 32),
@@ -1619,12 +1673,27 @@ def cuda_groups() -> list:
                 (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY),
             ),
             Group(_physics(scenes.gripper(table=True), law, 32), ref, (LOCAL_KINEMATIC,)),
+            # The local owners' rows with spin rows (the grasp: soft fingers), against the general route's.
+            Group(
+                _physics(scenes.gripper(), law, 32, "torsion", contact_torsion=True),
+                ref,
+                tuple(
+                    route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
+                    for route in (LOCAL_PACKETS, LOCAL_OWNED)
+                ),
+            ),
             Group(
                 _physics(scenes.keyboard(), law, 16),
                 ref,
                 (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY),
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
+            # The paired factor sweep's contact units and quads with spin rows, against the general route's.
+            Group(
+                _physics(scenes.hand(), law, 16, "torsion", contact_torsion=True),
+                ref,
+                (PAIRED.but("paired_torsion", expect={"friction.torsion": True}),),
+            ),
             # The tiers form the response in-kernel, which bounds an articulation at 32 coordinates: the sprawl (66)
             # and the snake (106) take no tier, even pinned.
             Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT,)),
@@ -1632,11 +1701,7 @@ def cuda_groups() -> list:
             # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
             # armature it needs near the head, the same on every route.
             Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT,)),
-            Group(
-                _physics(twist, law, 32, "torsion", contact_torsion_radius=twist.params["spin_radius"]),
-                ref,
-                (MF_TORSION.but("mf_torsion_host", pins={"torsion_preparation": "host"}), MF_TORSION),
-            ),
+            Group(_physics(scenes.twist_threshold(), law, 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)),
         ]
     groups += [
         # Warm start solves the cold problem from another first iterate: compare it with the cold reference.
@@ -1685,11 +1750,10 @@ def cuda_groups() -> list:
             ),
         ),
     ]
-    # The CT benchmark's checks that today's torsion and compliance pass. T1 on a free body, T3 at 7 mm (where the
-    # elliptic cone holds and the pair-first law slips) and T4 join with the ball law.
-    for scene in (scenes.spin_decay(), scenes.pinch_twist(offsets=(0.004, 0.011, 0.02))):
-        torsion = {"contact_torsion_radius": scene.params["spin_radius"]}
-        groups.append(Group(_physics(scene, "point", 32, "torsion", **torsion), ref, (MF_TORSION,)))
+    # The CT benchmark's torsion checks: T1 articulated and free, T3 at every offset (7 mm, where the elliptic cone
+    # holds and a pair-first law slips, included) and T4 against the patch's limit surface.
+    for scene in _torsion_scenes():
+        groups.append(Group(_physics(scene, "point", 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)))
     for scene in COMPLIANT_SCENES():
         routes = (MF_COMPLIANCE, MF_GENERAL.but("mf_general_compliance", expect={"friction.compliance": True}))
         groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, routes))

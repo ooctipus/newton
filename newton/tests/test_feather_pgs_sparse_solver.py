@@ -523,7 +523,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assertIsNone(_make_solver(chain, True)._sparse_mass_matrix_size)
         model = _build_model()
         for options in (
-            {"contact_torsion_radius": 0.01},
+            {"contact_torsion": True},
             {"dense_max_constraints": _over_budget_rows(model)},
         ):
             with self.subTest(options=options):

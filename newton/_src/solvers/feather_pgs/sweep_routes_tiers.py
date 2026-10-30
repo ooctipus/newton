@@ -25,7 +25,7 @@ from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
@@ -130,12 +130,13 @@ def parallel_source(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
-    Jacobi law, a thread per row.
+    Jacobi law, a thread per row; under ``torsion`` a contact's spin row projects with its pair.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then whitens the rows in the kernel
     (:class:`.WhitenedRows`, ``inkernel_response = (NA, NB, OA, OB)``), from the group Jacobians or the keyed rows'
@@ -161,7 +162,9 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(regularize=bool(weighted), material=bool(material), policy=solve_policy)
+    if torsion and row_inputs is not None:
+        raise ValueError("keyed rows write no spin row (contact torsion)")
+    laws = RowLaws(regularize=bool(weighted), material=bool(material), torsion=torsion, policy=solve_policy)
     store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted))
     whitened = WhitenedRows(
         NA,
@@ -196,6 +199,7 @@ def parallel_source(
     loads = store.loads(
         **metadata,
         unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT),
+        **({"torsion": True} if torsion else {}),
     )
 
     def scale(aii, bound, pad):
@@ -232,7 +236,7 @@ def parallel_source(
         SHARED_STORAGE,
         *((RING,) if linked_rows else ()),
         *row_preludes,
-        *law_preludes(PROJECTION_LAW),
+        *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
     return cuda_native(body, preludes=(*preludes, *solve_policy.preludes)), staging
 
@@ -251,6 +255,7 @@ def parallel_kernel(
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -278,6 +283,7 @@ def parallel_kernel(
         sweeps=sweeps,
         linked_rows=linked_rows,
         velocity_limit_pass=velocity_limit_pass,
+        torsion=torsion,
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
@@ -293,6 +299,7 @@ def parallel_kernel(
         + ("_lw" if velocity_limit_pass else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
+        + ("_torsion" if torsion else "")
         + solve_policy.suffix
     )
     kernel = KernelTemplate.from_abi(

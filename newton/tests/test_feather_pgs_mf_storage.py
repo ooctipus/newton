@@ -583,7 +583,7 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocit
 
 
 def _bind_rows(host, device):
-    """Bind the operands as the MF-GS launch takes them, with neutral queue, owner and torsion inputs."""
+    """Bind the operands as the MF-GS launch takes them, with neutral queue and owner inputs."""
 
     def array(value):
         dtype = wp.int32 if value.dtype == np.int32 else wp.float32
@@ -601,8 +601,6 @@ def _bind_rows(host, device):
         general_world_count=array(np.array([worlds], np.int32)),
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
-        world_torsion_group=array(np.full((1, 1), -1, np.int32)),
-        contact_torsion_radius=0.0,
         factors=_body_factors(host, device),
     )
     return values

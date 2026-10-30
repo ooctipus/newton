@@ -6,7 +6,7 @@
 :meth:`RowLaws.build` resolves the laws from the options (:class:`.configuration.Options`) and the model:
 
 - the contact law: the friction law (patch friction with ``friction_anchor_beta > 0``, else point friction), the
-  regularization weight, the restitution threshold, the shape materials and the contact torsion selection;
+  regularization weight, the restitution threshold, the shape materials and contact torsion;
 - the rigid bodies' speed limits;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
 - the mimic and connect plans (the bilateral rows' tables);
@@ -31,7 +31,6 @@ from ...sim import Model
 from ...sim.enums import BodyFlags, JointType
 from . import host_index, prefix_rows
 from .configuration import Options
-from .contact_torsion import configure_contact_torsion
 from .dense_rows import RowSupport
 from .device_preludes import lane_group
 from .field_group import SolverArrays
@@ -160,7 +159,8 @@ class RowLaws:
             options: The solver's options.
 
         Raises:
-            ValueError: For a negative or non-finite ``friction_anchor_beta`` or an invalid contact torsion selection.
+            ValueError: For a negative or non-finite ``friction_anchor_beta`` or contact torsion with an option it does
+                not compose with.
         """
         laws = cls()
         laws.model = model
@@ -216,13 +216,7 @@ class RowLaws:
         # counts their rows (see _estimate_dense_internal_rows_per_world).
         laws._mimic_plan(model)
         laws._connect_plan(model)
-        # Contact torsion is decided with the other options, before the owners that exclude its appended row.
-        configure_contact_torsion(
-            laws,
-            options.contact_torsion_radius,
-            options.contact_torsion_shape_indices,
-            options.contact_torsion_shape_patterns,
-        )
+        laws._contact_torsion(model, options)
 
         # Shape materials.
         if model.shape_material_mu is not None:
@@ -244,6 +238,22 @@ class RowLaws:
         laws.patch_frame_reuse, laws.patch_frame_reuse_reason = laws._patch_frame_reuse()
         laws.friction_patches = None
         return laws
+
+    def _contact_torsion(self, model, options) -> None:
+        """Contact torsion: every friction contact's fourth row, its spin about the normal, on the elliptic cone with
+        its friction pair. Its coefficient is the shapes' torsional friction (``Model.shape_material_mu_torsional``,
+        a length), combined per contact as the friction coefficient is (:func:`.contact_laws.contact_friction`)."""
+        self.contact_torsion_enabled = bool(options.contact_torsion)
+        self.torsion_rows = int(self.contact_torsion_enabled)
+        if self.contact_torsion_enabled:
+            if not options.enable_contact_friction:
+                raise ValueError(
+                    "contact_torsion resists spin with the friction rows: it needs enable_contact_friction"
+                )
+        mu_torsional = model.shape_material_mu_torsional if model.shape_count else None
+        if mu_torsional is None:
+            mu_torsional = wp.zeros((1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
+        self.shape_material_mu_torsional = mu_torsional
 
     def decide(self, *, preelimination: bool) -> None:
         """Read the route table's laws axis (:attr:`set`) once the bilateral pre-elimination is decided."""

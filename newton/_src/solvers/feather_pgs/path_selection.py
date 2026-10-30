@@ -35,7 +35,7 @@ _APPLIED_ATTRIBUTES = {
 
 def _applied(solver, name, requested):
     """An option's applied value: the row laws' resolved friction beta, the solver's attribute where it keeps one
-    (:data:`_APPLIED_ATTRIBUTES`, capacities, the torsion selection), else the options record's value."""
+    (:data:`_APPLIED_ATTRIBUTES`, capacities), else the options record's value."""
     if name == "friction_anchor_beta":
         return solver.laws.friction_anchor_beta
     attribute = _APPLIED_ATTRIBUTES.get(name, name)
@@ -768,8 +768,8 @@ def _friction(solver) -> dict:
         owners = []
         if not solver._parallel_contact_paths:
             owners.append("keyed rows and parallel matrix-free tiers")
-        # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
-        if not solver.laws.set.patch:
+        # Patch friction reaches the resolved-world classifier on the dense paths only, not under compliance.
+        if solver.laws.set.compliance:
             owners.append("the resolved-world classifier")
         if owners:
             reason += f" Point-contact owners ({', '.join(owners)}) need point friction."

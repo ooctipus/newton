@@ -27,7 +27,7 @@ from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
@@ -36,6 +36,7 @@ from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    TORSION,
     UNIT_HELD,
     RowContext,
     RowLaws,
@@ -173,11 +174,13 @@ def local_owned_source(
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
     row_inputs=None,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of a local owner's sweep: an articulation's rows (and a paired free body's coordinates and,
-    for the residual owner, its free-body rows) over the response block the lane group builds in the kernel.
+    for the residual owner, its free-body rows) over the response block the lane group builds in the kernel. Under
+    ``torsion`` a friction pair solves with its contact's spin row (the friction triple).
 
     The group stages the factors, the rows' impulses, right-hand sides and metadata and the velocity, which enters
     factor coordinates; whitens each row, ``Z = L^-1 P J^T``, from its Jacobian (``row_inputs``' packets, or the
@@ -193,7 +196,11 @@ def local_owned_source(
     _check_local_options(warps_per_block, L, contact_capable, T, S, MFS, MFR)
     lanes = Lanes(L)
     free = FreeBodyZ(lanes) if MFR else None
-    laws = RowLaws(regularize=contact_capable, material=material and contact_capable, policy=solve_policy)
+    if torsion and not contact_capable:
+        raise ValueError("spin rows (contact torsion) are contact rows")
+    laws = RowLaws(
+        regularize=contact_capable, material=material and contact_capable, torsion=torsion, policy=solve_policy
+    )
     factors = (CholeskySolve(P, "s_L", reciprocal=True, ascending=True),)
     if S:
         factors += (CholeskySolve(S, "s_L_secondary", reciprocal=True, ascending=True),)
@@ -327,7 +334,7 @@ def local_owned_source(
         SHARED_STORAGE,
         *((RING,) if contact_capable else ()),
         PACKED_SIDES,
-        *law_preludes(PROJECTION_LAW),
+        *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
         *solve_policy.preludes,
     )
     return cuda_native(body, preludes=preludes), staging
@@ -355,15 +362,18 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
         record=lambda row, delta: lanes.first(f"s_app[{row}] += {delta};"),
         friction=contacts,
     )
+    torsion = laws.torsion
+    spin = {"load_spin": "s_lam[i + 2]"} if torsion else {}
     dense = [
         "for (int i = 0; i < row_count; ++i) {",
         "    if (s_active[i] == 0) continue;",
         "    const int row_type = s_type[i];",
+        f"    if (row_type == {TORSION}) continue;" if torsion else "",
         friction_gate("row_type", ctx.store("i", "0.0f"), ctx.sync(), "    ") if contacts else "",
         "    const float inverse_diagonal = s_inv_diag[i];",
         "    if (inverse_diagonal <= 0.0f) continue;",
-        admit_pair("row_type", "s_parent[i]", "    ") if contacts else "",
-        friction_radius("row_type", ctx.ring_load("parent"), "s_mu[i]", "s_lam[i]", "s_lam[i + 1]", "    ")
+        admit_pair("row_type", "s_parent[i]", "    ", torsion=torsion) if contacts else "",
+        friction_radius("row_type", ctx.ring_load("parent"), "s_mu[i]", "s_lam[i]", "s_lam[i + 1]", "    ", **spin)
         if contacts
         else "",
         op.residual("jv", "    "),
@@ -403,11 +413,18 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             "    const float mf_inverse = __int_as_float(meta.y);",
             "    const int packed_tp = meta.w;",
             "    const int mf_rt = packed_tp & 0xFFFF;",
+            f"    if (mf_rt == {TORSION}) continue;" if torsion else "",
             friction_gate("mf_rt", free_ctx.store("i", "0.0f"), free_ctx.sync(), "    "),
             "    if (mf_inverse <= 0.0f) continue;",
-            admit_pair("mf_rt", _mf_parent_expression("packed_tp", MFS), "    "),
+            admit_pair("mf_rt", _mf_parent_expression("packed_tp", MFS), "    ", torsion=torsion),
             friction_radius(
-                "mf_rt", free_ctx.ring_load("parent"), free_ctx.mu("i"), "s_mf_lam[i]", "s_mf_lam[i + 1]", "    "
+                "mf_rt",
+                free_ctx.ring_load("parent"),
+                free_ctx.mu("i"),
+                "s_mf_lam[i]",
+                "s_mf_lam[i + 1]",
+                "    ",
+                **({"load_spin": "s_mf_lam[i + 2]"} if torsion else {}),
             ),
             free_op.residual("jv", "    "),
             row_update(free_ctx, laws, residual="jv", pad="    "),
@@ -438,6 +455,7 @@ def local_owned_kernel(
     mf_max_constraints: int = 0,
     local_mf_max_constraints: int = 0,
     row_inputs=None,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
 ) -> wp.Kernel:
@@ -457,6 +475,7 @@ def local_owned_kernel(
         mf_max_constraints=mf_max_constraints,
         local_mf_max_constraints=local_mf_max_constraints,
         row_inputs=row_inputs,
+        torsion=torsion,
         solve_policy=solve_policy,
         material=material,
     )
@@ -470,6 +489,7 @@ def local_owned_kernel(
         + (f"_mf{local_mf_max_constraints}" if local_mf_max_constraints else "")
         + ("_queue" if persistent_queue else "")
         + ("_material" if material else "")
+        + ("_torsion" if torsion else "")
         + solve_policy.suffix
     )
     queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
@@ -528,12 +548,15 @@ def paired_factor_source(
     independent_components: bool = False,
     *,
     contact_units: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the factor velocity ``u = L^T v`` in a register per lane.
+    Under ``torsion`` every friction pair has its contact's spin row after it: a contact is four rows, and its unit
+    solves the pair and the spin row as the friction triple.
 
     The schedule visits the rows in slot order: row by row; with ``contact_triples``, when the world's rows are a
     prefix and then normal/tangent/tangent triples, the prefix row by row and each triple as a contact unit; with
@@ -552,7 +575,8 @@ def paired_factor_source(
     if contact_triples and contact_units:
         raise ValueError("contact triples and contact units are exclusive paired factor schedules")
     lanes = Lanes(32)
-    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy)
+    laws = RowLaws(regularize=weighted, material=material, torsion=torsion, policy=solve_policy)
+    stride = 3 + int(torsion)
     op = FactorRows(
         D,
         (
@@ -568,7 +592,7 @@ def paired_factor_source(
             Buffer("s_rhs", "float", M),
             Buffer("s_diag", "float", M),
             Buffer("s_type", "unsigned char", M),
-            *((Buffer("s_contact_mu", "float", (M + 2) // 3),) if contact_triples else ()),
+            *((Buffer("s_contact_mu", "float", (M + stride - 1) // stride),) if contact_triples else ()),
         ),
         groups=_PAIRED_WORLDS_PER_BLOCK,
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
@@ -593,7 +617,7 @@ def paired_factor_source(
     )
     general = _paired_rows(ctx, laws, "m")
     if contact_triples:
-        triples = _paired_rows(ctx, laws, "contact_start", friction=False) + "\n" + _paired_triples(ctx, laws)
+        triples = _paired_rows(ctx, laws, "contact_start", friction=False) + "\n" + _paired_triples(ctx, laws, stride)
         schedule = f"if (triple_layout) {{\n{indent(triples, '    ')}\n}} else {{\n{indent(general, '    ')}\n}}"
     elif contact_units:
         schedule = _paired_units(ctx, laws)
@@ -611,16 +635,17 @@ def paired_factor_source(
         write += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
     layout = mu_load = ""
     if contact_triples:
-        layout = """
+        rows = "normal/tangent/tangent/spin quads" if torsion else "normal/tangent/tangent triples"
+        layout = f"""
     int contact_start = dense_phase_bounds.data[world * 2 + 1];
     if (contact_start < 0) contact_start = 0;
     if (contact_start > m) contact_start = m;
-    // A prefix, then contacts that own exact normal/tangent/tangent triples.
-    const bool triple_layout = dense_phase_bounds.data[world * 2] == contact_start && (m - contact_start) % 3 == 0;
-    const int contact_count = (m - contact_start) / 3;"""
-        mu_load = """
+    // A prefix, then contacts that own exact {rows}.
+    const bool triple_layout = dense_phase_bounds.data[world * 2] == contact_start && (m - contact_start) % {stride} == 0;
+    const int contact_count = (m - contact_start) / {stride};"""
+        mu_load = f"""
     for (int contact = lane; contact < contact_count; contact += 32)
-        s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * 3 + 1];"""
+        s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * {stride} + 1];"""
     body = f"""{staging.declarations("    ")}
     const int lane = LANE;
     int m = world_constraint_count.data[world];
@@ -665,7 +690,8 @@ def paired_factor_source(
 {staging.undefine()}
 #endif
 """
-    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    cone = (CONE_LAW,) if torsion else ()
+    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -675,11 +701,15 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str, *, friction: bool = T
     triple layout's prefix)."""
     op = ctx.operator
     sibling = f"const float {op.sibling} = row_type == {FRICTION} ? ({op.load('parent + 2')}) : 0.0f;\n"
+    if laws.torsion:
+        # The pair's contact's spin row, solved with it (the friction triple).
+        sibling += f"const float {op.spin} = row_type == {FRICTION} ? ({op.load('parent + 3')}) : 0.0f;\n"
     lines = [
         op.prefetch("0", ""),
         f"for (int i = 0; i < {end}; ++i) {{",
         op.consume("i", end, "    "),
         "    const int row_type = static_cast<int>(s_type[i]);",
+        f"    if (row_type == {TORSION}) continue;" if laws.torsion and friction else "",
         row_visit(
             dataclasses.replace(ctx, friction=friction),
             laws,
@@ -708,7 +738,7 @@ class _UnitFactorRows(UnitOperator, FactorRows):
 def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     """The contact unit headed by row ``head`` (of kind ``kind``, never friction) with its tangent pair ``(head + 1,
     head + 2)`` (friction coefficient ``mu`` at the visited row ``i``), its three factor rows in registers, by the unit
-    law (:func:`.sweep.contact_unit`).
+    law (:func:`.sweep.contact_unit`); under torsion with its spin row ``head + 3`` too, its fourth.
 
     The unit's impulses choose its reductions, not its law. A loaded unit (a nonzero impulse among its rows) reduces its
     rows' velocity terms, the pair's couplings with the normal and their terms' magnitudes in one ladder, runs its rows
@@ -720,6 +750,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     """
     op = ctx.operator
     velocity = op.velocity
+    torsion = laws.torsion
     unit = _UnitFactorRows(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
     channels = (
         ("unit_jv0", "row_z", velocity),
@@ -729,7 +760,17 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         ("gram_n2", "row_z", "tangent2_z"),
         ("unit_cross", "tangent1_z", "tangent2_z"),
     )
-    rows = dataclasses.replace(ctx, kind="unit_type", mu=lambda row: mu, inline_velocity_limit=False)
+    if torsion:
+        channels += (
+            ("unit_jv3", op.spin, velocity),
+            ("gram_n3", "row_z", op.spin),
+            ("unit_cross13", "tangent1_z", op.spin),
+            ("unit_cross23", "tangent2_z", op.spin),
+        )
+    spin_mu = ctx.mu("head + 3")
+    rows = dataclasses.replace(
+        ctx, kind="unit_type", mu=lambda row: spin_mu if row == "spin" else mu, inline_velocity_limit=False
+    )
     declare = (
         f"const int i = head + r;\nconst int unit_type = r == 0 ? {kind} : {FRICTION};\nconst float denom = s_diag[i];"
     )
@@ -741,33 +782,58 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     )
 
     impulses, *staged = UNIT_HELD
-    lines = [
-        f"const float row_z = {op.load('head')};",
-        f"const float tangent1_z = {op.load('head + 1')};",
-        f"const float tangent2_z = {op.load('head + 2')};",
-        unit_held_loads(unit_ctx, impulses, "head", ""),
-        "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {",
-        *(unit_held_loads(unit_ctx, name, "head", "    ") for name in staged),
-        "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one ladder.",
-        unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
-        unit_rows,
-        "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
-        "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
-        f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
+    if torsion:
+        lines = [
+            f"const float row_z = {op.load('head')};",
+            f"const float tangent1_z = {op.load('head + 1')};",
+            f"const float tangent2_z = {op.load('head + 2')};",
+            f"const float {op.spin} = {op.load('head + 3')};",
+            unit_held_loads(unit_ctx, impulses, "head", "", torsion=True),
+            "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f || unit_lam3 != 0.0f) {",
+            *(unit_held_loads(unit_ctx, name, "head", "    ", torsion=True) for name in staged),
+            "    // The unit's velocity terms, its rows' Gram couplings and their magnitudes, in one ladder.",
+            unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2", "gram_n3")),
+            unit_rows,
+            "    // The unit's changes in one pass; then its stores are every lane's.",
+            "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f || unit_ds != 0.0f)",
+            f"        {velocity} += ((row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2)"
+            f" + {op.spin} * unit_ds;",
+        ]
+    else:
+        lines = [
+            f"const float row_z = {op.load('head')};",
+            f"const float tangent1_z = {op.load('head + 1')};",
+            f"const float tangent2_z = {op.load('head + 2')};",
+            unit_held_loads(unit_ctx, impulses, "head", ""),
+            "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {",
+            *(unit_held_loads(unit_ctx, name, "head", "    ") for name in staged),
+            "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one "
+            "ladder.",
+            unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
+            unit_rows,
+            "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
+            "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
+            f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
+        ]
+    gate = ctx.store("head + 2", "0.0f")
+    if torsion:
+        gate = ctx.lanes.first("{ s_lam[head + 2] = 0.0f; s_lam[head + 3] = 0.0f; }")
+    lines += [
         f"    {ctx.lanes.sync()}",
         "} else {",
         "    const int i = head, tangent1 = head + 1;",
         indent(_unit_row(ctx, laws, kind, load=False), "    "),
-        indent(_pair_unit(ctx, laws, mu), "    "),
+        indent(_pair_unit(ctx, laws, mu, spin_mu), "    "),
         "}",
-        friction_gate(str(FRICTION), ctx.store("head + 2", "0.0f"), ctx.sync(), "", skip=False),
+        friction_gate(str(FRICTION), gate, ctx.sync(), "", skip=False),
     ]
     return "\n".join(lines)
 
 
-def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str) -> str:
+def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, spin_mu: str) -> str:
     """The tangent pair ``(tangent1, tangent1 + 1)`` of the normal row ``i`` (its rows in ``tangent1_z``,
-    ``tangent2_z``), solved as a unit after it on its own ladder (:func:`.sweep.pair_update`)."""
+    ``tangent2_z``), solved as a unit after it on its own ladder (:func:`.sweep.pair_update`); under torsion with its
+    spin row (``tangent1 + 2``, coefficient ``spin_mu``), the friction triple."""
     op = ctx.operator
     pair = dataclasses.replace(
         ctx,
@@ -776,15 +842,19 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str) -> str:
         operator=dataclasses.replace(
             op, diagonal=lambda row: f"s_diag[{row}]", current="tangent1_z", sibling="tangent2_z"
         ),
+        mu=lambda row: spin_mu if row == "spin" else mu,
         parent="i",
         inline_velocity_limit=False,
     )
+    zero = "{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; }"
+    spin = {}
+    if laws.torsion:
+        zero = "{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; s_lam[tangent1 + 2] = 0.0f; }"
+        spin = {"load_spin": "s_lam[tangent1 + 2]"}
     lines = [
-        friction_gate(
-            str(FRICTION), ctx.lanes.first("{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; }"), ctx.sync(), ""
-        ),
-        "float radius = 0.0f;",
-        pair_radius(ctx.ring_load("i"), mu, "s_lam[tangent1]", "s_lam[tangent1 + 1]", ""),
+        friction_gate(str(FRICTION), ctx.lanes.first(zero), ctx.sync(), ""),
+        "float radius = 0.0f, load = 0.0f;" if laws.torsion else "float radius = 0.0f;",
+        pair_radius(ctx.ring_load("i"), mu, "s_lam[tangent1]", "s_lam[tangent1 + 1]", "", **spin),
         pair_update(pair, laws, pad=""),
     ]
     return "\n".join(lines)
@@ -811,11 +881,12 @@ def _unit_row(ctx: RowContext, laws: RowLaws, kind: str, *, load: bool = True) -
     return "\n".join(line for line in lines if line)
 
 
-def _paired_triples(ctx: RowContext, laws: RowLaws) -> str:
-    """The contact triples after the prefix, each a contact unit (:func:`_contact_unit`)."""
+def _paired_triples(ctx: RowContext, laws: RowLaws, stride: int) -> str:
+    """The contact triples (quads under torsion: ``stride`` rows) after the prefix, each a contact unit
+    (:func:`_contact_unit`)."""
     lines = [
         "for (int contact = 0; contact < contact_count; ++contact) {",
-        "    const int head = contact_start + contact * 3;",
+        f"    const int head = contact_start + contact * {stride};",
         indent(_contact_unit(ctx, laws, str(CONTACT), "s_contact_mu[contact]"), "    "),
         "}",
     ]
@@ -825,13 +896,14 @@ def _paired_triples(ctx: RowContext, laws: RowLaws) -> str:
 def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
     """Contact units in slot order: a row by the row law, or, with the tangent pair it owns, a contact unit.
 
-    A row owns the next two rows when they are tangent rows naming it as parent. A tangent row outside a unit is
-    zeroed while friction is delayed, and otherwise left alone.
+    A row owns the next two rows when they are tangent rows naming it as parent (and, under torsion, the spin row
+    after them). A tangent row outside a unit is zeroed while friction is delayed, and otherwise left alone.
     """
     lines = [
         "for (int i = 0, step = 1; i < m; i += step) {",
         "    const int row_type = static_cast<int>(s_type[i]);",
         "    step = 1;",
+        *((f"    if (row_type == {TORSION}) continue;",) if laws.torsion else ()),
         f"    if (row_type == {FRICTION}) {{",
         friction_gate("row_type", ctx.store("i", "0.0f"), ctx.sync(), "        ", skip=False),
         "        continue;",
@@ -843,7 +915,7 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
         indent(_unit_row(ctx, laws, "row_type"), "        "),
         "        continue;",
         "    }",
-        "    step = 3;",
+        f"    step = {4 if laws.torsion else 3};",
         "    const int head = i;",
         indent(_contact_unit(ctx, laws, "row_type", "world_row_mu.data[off + tangent1]"), "    "),
         "}",
@@ -862,6 +934,7 @@ def paired_factor_kernel(
     independent_components: bool = False,
     *,
     contact_units: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -876,6 +949,7 @@ def paired_factor_kernel(
         contact_triples,
         independent_components,
         contact_units=contact_units,
+        torsion=torsion,
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
@@ -888,6 +962,7 @@ def paired_factor_kernel(
         + ("_components" if independent_components else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
+        + ("_torsion" if torsion else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(

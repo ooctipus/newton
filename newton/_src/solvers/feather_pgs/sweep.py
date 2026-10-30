@@ -261,7 +261,9 @@ class RowLaws:
         regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
         material: Material contacts exist: a contact row of compliance ``eps > 0`` takes the weight ``d / (d + eps)``
             from the diagonal the placement forms (:func:`row_weight`), its stored one otherwise.
-        torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
+        torsion: Every friction pair has its contact's spin row after it (contact torsion): the row loops skip the
+            spin rows, and the pair's visit solves the friction triple, the pair and the spin row on their elliptic
+            cone (:func:`friction_pair`).
         policy: The solve policy: the readout beside the exit law.
     """
 
@@ -400,6 +402,8 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
     lines.append("float delta_impulse = 0.0f;")
     if ctx.friction:
         lines += ["int sib = -1;", "float sib_new = 0.0f, sib_delta = 0.0f, sib_bound = 0.0f;"]
+        if laws.torsion:
+            lines += ["int spin = -1;", "float spin_new = 0.0f, spin_delta = 0.0f, spin_bound = 0.0f;"]
     branches = []
     if ctx.inline_velocity_limit:
         branches.append(
@@ -418,18 +422,22 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
         )
     )
     if ctx.friction:
-        pair = friction_pair(ctx, own=ctx.pair_residual)
+        pair = friction_pair(ctx, laws, own=ctx.pair_residual)
         if _sibling_in_pair(ctx):
-            # Impulses that need no barrier: the pair stores, votes and applies its second tangent in its branch, so
-            # the rows without a pair carry no sibling test.
+            # Impulses that need no barrier: the pair stores, votes and applies its second tangent (and spin row) in
+            # its branch, so the rows without a pair carry no sibling test.
+            siblings = [("sib", "sib_new", "sib_delta", _sibling_change(ctx))]
+            if laws.torsion:
+                siblings.append(("spin", "spin_new", "spin_delta", _spin_change(ctx)))
             pair += "\n" + "\n".join(
                 line
+                for sibling, new, delta, change in siblings
                 for line in (
-                    ctx.store("sib", "sib_new"),
-                    ctx.record("sib", "sib_delta") if ctx.record is not None else "",
-                    "if (sib_delta != 0.0f) {",
-                    change_vote(laws, (_sibling_change(ctx),), "    "),
-                    indent(op.apply_row("sib", "sib_delta", "").lstrip("\n"), "    "),
+                    ctx.store(sibling, new),
+                    ctx.record(sibling, delta) if ctx.record is not None else "",
+                    f"if ({delta} != 0.0f) {{",
+                    change_vote(laws, (change,), "    "),
+                    indent(op.apply_row(sibling, delta, "").lstrip("\n"), "    "),
                     "}",
                 )
                 if line
@@ -460,6 +468,11 @@ def _sibling_change(ctx: RowContext) -> Change:
     return ctx.operator.change("sib_delta", "sib_bound", str(FRICTION), "sib")
 
 
+def _spin_change(ctx: RowContext) -> Change:
+    """The spin row's change as the exit law reads it (``spin_bound``: :func:`friction_pair` under torsion)."""
+    return ctx.operator.change("spin_delta", "spin_bound", str(TORSION), "spin")
+
+
 def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
     """Store the row's (and its sibling's) impulse, record and vote the changes, apply the sibling's then the row's.
 
@@ -476,9 +489,19 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             "if (sib >= 0) {",
             "    " + ctx.store("sib", "sib_new"),
             ("    " + ctx.record("sib", "sib_delta")) if ctx.record is not None else "",
+            ("    " + ctx.store("spin", "spin_new")) if laws.torsion else "",
+            ("    " + ctx.record("spin", "spin_delta")) if laws.torsion and ctx.record is not None else "",
             "}",
         ]
     lines.append(ctx.lanes.sync() if ctx.owned and ctx.fenced else "")
+    if ctx.friction and laws.torsion and not _sibling_in_pair(ctx):
+        # The spin row's change, ahead of the pair's (its own apply: the triple's rows apply one at a time).
+        lines += [
+            "if (spin_delta != 0.0f) {",
+            change_vote(laws, (_spin_change(ctx),), "    "),
+            indent(op.apply_row("spin", "spin_delta", "").lstrip("\n"), "    "),
+            "}",
+        ]
     row_change = op.change("delta_impulse", "row_bound", kind, row)
     sib_change = _sibling_change(ctx)
     if ctx.friction and op.fused_pair_apply:
@@ -523,7 +546,8 @@ def pair_update(ctx: RowContext, laws: RowLaws, *, pad: str) -> str:
         "float delta_impulse = 0.0f;",
         "int sib = -1;",
         "float sib_new = 0.0f, sib_delta = 0.0f, row_bound = 0.0f, sib_bound = 0.0f;",
-        friction_pair(ctx, own=True),
+        *(("int spin = -1;", "float spin_new = 0.0f, spin_delta = 0.0f, spin_bound = 0.0f;") if laws.torsion else ()),
+        friction_pair(ctx, laws, own=True),
         "delta_impulse = new_impulse - old_impulse;",
         *_row_tail(ctx, laws),
     ]
@@ -536,12 +560,24 @@ def _sibling_bound(ctx: RowContext) -> str:
     return op.bound(rhs, op.terms("sibling_residual", rhs, whole=True), "sibling_impulse", "sib")
 
 
-def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
+def _spin_bound(ctx: RowContext) -> str:
+    """The spin row's bound from its residual (``spin_residual``), at its old impulse."""
+    op, rhs = ctx.operator, ctx.rhs("spin")
+    return op.bound(rhs, op.terms("spin_residual", rhs, whole=True), "spin_impulse", "spin")
+
+
+def friction_pair(ctx: RowContext, laws: RowLaws, *, own: bool = False) -> str:
     """The friction pair at its first tangent: both tangents on the disk of ``radius`` (``sib_new``, ``sib_delta``).
 
-    With ``own`` the first tangent's residual is reduced with the pair's terms (a pair solved as a unit).
+    With ``own`` the first tangent's residual is reduced with the pair's terms (a pair solved as a unit). Under
+    torsion (``laws.torsion``) the pair solves with its contact's spin row (``spin``, after the pair) as the friction
+    triple on its elliptic cone of the pooled normal ``load`` (:func:`.projection_laws.friction_ball`, then
+    :func:`.projection_laws.ball`): the spin row's coefficient is its ``mu`` field, its terms the operator's
+    (:meth:`.ResponseOperator.spin_terms`).
     """
     op = ctx.operator
+    if laws.torsion:
+        return _friction_triple(ctx, own=own)
     lines = [
         f"sib = {ctx.parent} + 2;",
         f"const float sibling_impulse = {ctx.load('sib')};",
@@ -559,6 +595,43 @@ def friction_pair(ctx: RowContext, *, own: bool = False) -> str:
         "new_impulse = pair[0];",
         "sib_new = pair[1];",
         "sib_delta = sib_new - sibling_impulse;",
+    ]
+    return "\n".join(line for line in lines if line != "")
+
+
+def _friction_triple(ctx: RowContext, *, own: bool) -> str:
+    """:func:`friction_pair` under torsion: the pair and the spin row on their elliptic cone."""
+    op = ctx.operator
+    mu, spin_mu = ctx.mu(ctx.row), "spin_mu"
+    block = (
+        f"wp::mat33({op.value(ctx.row)}, cross, spin_cross, cross, {op.value('sib')}, spin_cross_sibling,\n"
+        f"              spin_cross, spin_cross_sibling, {op.value('spin')})"
+    )
+    lines = [
+        f"sib = {ctx.parent} + 2;",
+        f"spin = {ctx.parent} + 3;",
+        f"const float sibling_impulse = {ctx.load('sib')};",
+        f"const float spin_impulse = {ctx.load('spin')};",
+        f"const float spin_mu = {ctx.mu('spin')};",
+        op.pair_entries("sib", ""),
+        "wp::vec3 triple(0.0f);",
+        "// Zero load gives a zero cone; avoid unused reductions.",
+        "if (load > 0.0f) {",
+        op.pair_terms(ctx.row, "sib", ctx.rhs, "    ", own=own),
+        op.spin_terms(ctx.row, "sib", "spin", ctx.rhs, "    "),
+        f"    row_bound = {_row_bound(ctx, op.terms('residual', ctx.rhs(ctx.row), whole=True))};" if own else "",
+        f"    sib_bound = {_sibling_bound(ctx)};",
+        f"    spin_bound = {_spin_bound(ctx)};",
+        f"    triple = ProjectionLaw::friction_ball({block},",
+        "        wp::vec3(residual, sibling_residual, spin_residual), wp::vec3(old_impulse, sibling_impulse, spin_impulse),",
+        f"        {mu}, {spin_mu}, load, omega);",
+        "}",
+        f"triple = ConeLaw::ball(triple, {mu}, {spin_mu}, load);",
+        "new_impulse = triple[0];",
+        "sib_new = triple[1];",
+        "sib_delta = sib_new - sibling_impulse;",
+        "spin_new = triple[2];",
+        "spin_delta = spin_new - spin_impulse;",
     ]
     return "\n".join(line for line in lines if line != "")
 
@@ -584,16 +657,16 @@ def friction_gate(kind: str, store: str, sync: str, pad: str, *, skip: bool = Tr
     return indent("\n".join(line for line in lines if line), pad)
 
 
-def admit_pair(kind: str, parent: str, pad: str, *, disk: str = "") -> str:
+def admit_pair(kind: str, parent: str, pad: str, *, disk: str = "", torsion: bool = False) -> str:
     """Friction rows of the row loop over ``i``: visit the first tangent only.
 
-    Declares ``parent`` (the contact's normal row ``parent`` for a friction row, -1 for other kinds) and ``radius``,
-    which :func:`friction_radius` sets, or ``disk`` (:func:`pair_radius`'s statements, indented one level) in the
-    same block.
+    Declares ``parent`` (the contact's normal row ``parent`` for a friction row, -1 for other kinds) and ``radius``
+    (with ``torsion`` also the pooled normal ``load``), which :func:`friction_radius` sets, or ``disk``
+    (:func:`pair_radius`'s statements, indented one level) in the same block.
     """
     lines = [
         "int parent = -1;",
-        "float radius = 0.0f;",
+        "float radius = 0.0f, load = 0.0f;" if torsion else "float radius = 0.0f;",
         f"if ({kind} == {FRICTION}) {{",
         f"    parent = {parent};",
         "    if (i != parent + 1) continue;",
@@ -604,27 +677,48 @@ def admit_pair(kind: str, parent: str, pad: str, *, disk: str = "") -> str:
 
 
 def pair_radius(
-    ring_load: str, mu: str, load_row: str, load_next: str, pad: str, *, keep_next: str | None = None
+    ring_load: str,
+    mu: str,
+    load_row: str,
+    load_next: str,
+    pad: str,
+    *,
+    keep_next: str | None = None,
+    load_spin: str | None = None,
 ) -> str:
     """Set ``radius``: ``mu`` times the pooled normal load of the contact's patch ring, and skip a zero pair.
 
     A zero disk with no carried tangent impulse (``load_row``, ``load_next``) cannot change the velocity, so the
     pair is skipped before its residuals are reduced. ``keep_next`` names a declared register that keeps the second
-    tangent's impulse for the pair's update.
+    tangent's impulse for the pair's update. With the spin row's impulse ``load_spin`` (torsion) the pooled ``load``
+    is set too, and a zero cone with no carried impulse is skipped: the spin's capacity holds with a zero ``mu``.
     """
     lines = [f"const float lambda_n = {ring_load};", f"radius = fmaxf({mu} * lambda_n, 0.0f);"]
+    if load_spin is not None:
+        lines.append("load = fmaxf(lambda_n, 0.0f);")
     if keep_next is not None:
         lines.append(f"{keep_next} = {load_next};")
         load_next = keep_next
-    lines.append(f"if (radius == 0.0f && {load_row} == 0.0f && {load_next} == 0.0f) continue;")
+    if load_spin is not None:
+        lines.append(f"if (load == 0.0f && {load_row} == 0.0f && {load_next} == 0.0f && {load_spin} == 0.0f) continue;")
+    else:
+        lines.append(f"if (radius == 0.0f && {load_row} == 0.0f && {load_next} == 0.0f) continue;")
     return indent("\n".join(lines), pad)
 
 
 def friction_radius(
-    kind: str, ring_load: str, mu: str, load_row: str, load_next: str, pad: str, *, keep_next: str | None = None
+    kind: str,
+    ring_load: str,
+    mu: str,
+    load_row: str,
+    load_next: str,
+    pad: str,
+    *,
+    keep_next: str | None = None,
+    load_spin: str | None = None,
 ) -> str:
     """:func:`pair_radius` for a friction row of the row loop (one of kind ``kind``)."""
-    radius = pair_radius(ring_load, mu, load_row, load_next, pad + "    ", keep_next=keep_next)
+    radius = pair_radius(ring_load, mu, load_row, load_next, pad + "    ", keep_next=keep_next, load_spin=load_spin)
     return f"{pad}if ({kind} == {FRICTION}) {{\n{radius}\n{pad}}}"
 
 
@@ -662,13 +756,16 @@ def row_visit(
     between.append(indent(hold, pad) if hold else "")
     lines = [friction_gate(kind, ctx.store(row, "0.0f"), ctx.sync(), pad) if pairs else ""]
     disk = (ctx.ring_load("parent"), ctx.mu(row), ctx.load(row), ctx.load(f"{row} + 1"))
+    # Under torsion the spin row follows the pair (the first tangent's row plus two).
+    spin = {"load_spin": ctx.load(f"{row} + 2")} if laws.torsion else {}
     if pairs and not any(between):
-        lines.append(admit_pair(kind, parent, pad, disk=pair_radius(*disk, "    ", keep_next=keep_next)))
+        disk_lines = pair_radius(*disk, "    ", keep_next=keep_next, **spin)
+        lines.append(admit_pair(kind, parent, pad, disk=disk_lines, torsion=laws.torsion))
     else:
         lines += [
-            admit_pair(kind, parent, pad) if pairs else "",
+            admit_pair(kind, parent, pad, torsion=laws.torsion) if pairs else "",
             *between,
-            friction_radius(kind, *disk, pad, keep_next=keep_next) if pairs else "",
+            friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
     lines += [
         indent(entries, pad) if entries else "",
@@ -710,6 +807,8 @@ class UnitOperator:
         moved = terms_bound(out, rhs) if whole else f"fabsf({out})"
         if out == "sibling_residual":
             return f"fmaxf({moved}, unit_jv2_terms - fabsf(unit_dn) * gram_n2_terms)"
+        if out == "spin_residual":
+            return f"fmaxf({moved}, unit_jv3_terms - fabsf(unit_dn) * gram_n3_terms)"
         return f"(r == 0 ? unit_jv0_terms : fmaxf({moved}, unit_jv1_terms - fabsf(unit_dn) * gram_n1_terms))"
 
     def residual(self, out: str, indent: str) -> str:
@@ -730,11 +829,19 @@ class UnitOperator:
         )
         return "\n".join(line for line in lines if line != "")
 
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """The spin row's moved residual ``Z_s^T u + G_sn dn`` and its couplings with the pair (``unit_cross13``,
+        ``unit_cross23``: the placement's, reduced with the unit's terms), under contact torsion."""
+        return (
+            f"{indent}float spin_residual = (unit_jv3 + gram_n3 * unit_dn) + {rhs(spin)};\n"
+            f"{indent}const float spin_cross = unit_cross13;\n{indent}const float spin_cross_sibling = unit_cross23;"
+        )
+
     def apply(self, delta: str, indent: str) -> str:
         return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
-        return f"\n{indent}unit_dt2 += {delta};"
+        return f"\n{indent}{'unit_ds' if row == 'spin' else 'unit_dt2'} += {delta};"
 
     def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
         return f"\n{indent}unit_dt2 += {sibling_delta};" + self.apply(delta, indent)
@@ -764,14 +871,16 @@ def cached_pair_law(name: str, scale: str, low: str, high: str, axis: tuple[str,
 
 UNIT_HELD = ("unit_lam", "unit_rhs", "unit_diag")
 """The registers in which a contact unit's placement holds its rows' staged values (:func:`contact_unit`), numbered by
-the unit's row (0 the normal, 1 and 2 its pair): the impulses, right-hand sides and diagonals."""
+the unit's row (0 the normal, 1 and 2 its pair, 3 its spin row under contact torsion): the impulses, right-hand sides
+and diagonals."""
 
 
-def unit_held_loads(ctx: RowContext, name: str, head: str, pad: str) -> str:
+def unit_held_loads(ctx: RowContext, name: str, head: str, pad: str, *, torsion: bool = False) -> str:
     """Declare the held registers ``name`` (one of :data:`UNIT_HELD`) of the contact unit headed by row ``head``, read
-    from the row store of ``ctx``: a placement's loads with the unit's rows, ahead of its reduction."""
+    from the row store of ``ctx``: a placement's loads with the unit's rows, ahead of its reduction; under ``torsion``
+    the spin row's fourth."""
     read = dict(zip(UNIT_HELD, (ctx.load, ctx.rhs, ctx.operator.diagonal), strict=True))[name]
-    rows = (head, f"{head} + 1", f"{head} + 2")
+    rows = (head, f"{head} + 1", f"{head} + 2", *((f"{head} + 3",) if torsion else ()))
     return f"{pad}const float " + ", ".join(f"{name}{k} = {read(row)}" for k, row in enumerate(rows)) + ";"
 
 
@@ -805,21 +914,30 @@ def contact_unit(
     values after such a barrier, which orders the reads after it (a memory fence): the pair's right-hand sides and
     diagonals would load after the normal's stores, on the unit's critical chain. Rows that every lane stores alike, or
     one thread's, pass no barrier and read their own stores.
+
+    Under contact torsion (``laws.torsion``) the unit has a fourth row, its spin row after the pair, which the pair's
+    visit solves with it (the friction triple, :func:`friction_pair`): ``held`` holds its staged values fourth, its
+    change defers into ``unit_ds``, and the placement reduces its terms (``unit_jv3``, ``gram_n3``, ``unit_cross13``,
+    ``unit_cross23``: :meth:`UnitOperator.spin_terms`) and applies it with the unit's.
     """
     if (ctx.owned and ctx.lanes.parallel) != held:
         raise ValueError(
             "a contact unit holds its staged values in registers exactly where its first lane owns the stores"
         )
     unit = dataclasses.replace(ctx, fenced=False, synced=False, first_store="r == 0" if check is None else None)
-    declarations = [f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;"]
+    spin = ", unit_ds = 0.0f" if laws.torsion else ""
+    declarations = [f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f{spin};"]
     if held:
         if ctx.operator.diagonal is None:
             raise ValueError("a held contact unit reads its rows' diagonals")
         impulse, rhs, diagonal = UNIT_HELD
 
         def held_row(name: str, row: str) -> str | None:
-            # The visited row (the normal, then the first tangent), the row after it and the pair's second tangent.
+            # The visited row (the normal, then the first tangent), the row after it and the pair's second tangent;
+            # under torsion the row two after the visited one and the spin row.
             index = {ctx.row: (0, 1), f"{ctx.row} + 1": (1, 2), "sib": (2, 2)}
+            if laws.torsion:
+                index.update({f"{ctx.row} + 2": (2, 3), "spin": (3, 3)})
             if row not in index:
                 return None
             normal, pair = index[row]
@@ -935,7 +1053,8 @@ def dense_rows_block(
         lanes=rows.lanes,
         eps=rows.eps,
     )
-    residual = op.residual("jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}")
+    spin = {"spin": "parent + 3"} if laws.torsion else {}
+    residual = op.residual("jv", inner, sibling="parent + 2", paired=f"row_type == {FRICTION}", **spin)
     body = [
         f"{inner}int row_type = {rows.kind('i')};",
         indent(torsion_skip, inner) if torsion_skip else "",
@@ -987,6 +1106,8 @@ def free_body_rows_block(
     )
     body = [
         op.consume("i", end, inner),
+        # A spin row is solved with its friction pair (torsion).
+        f"{inner}if (mf_rt == {TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
         row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", pad=inner),
     ]
@@ -1210,14 +1331,16 @@ class JacobiRows:
         parent: str,
         mu: str,
         unilateral: tuple[int, ...],
+        torsion: bool = False,
         pad: str = "    ",
     ) -> str:
         """Stage each row, lane-strided: its impulses at their warm start, its metadata (native expressions at row
         ``i``) and its kind, its diagonal formed later (:func:`jacobi_scale`). ``unilateral`` lists the row types that
-        clamp at zero."""
+        clamp at zero; with ``torsion`` a contact's spin row is of its friction pair's kind (projected with it)."""
+        friction = f"row_type == {FRICTION} || row_type == {TORSION}" if torsion else f"row_type == {FRICTION}"
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
-            f"else if (row_type == {FRICTION}) kind = {JACOBI_FRICTION};",
+            f"else if ({friction}) kind = {JACOBI_FRICTION};",
         ]
         lines = [
             f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{",
@@ -1362,14 +1485,18 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
+def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str, torsion: bool = False) -> str:
     """Project each friction row's update radially onto its pair's disk of radius ``mu`` times the normal load.
 
     The load is the pair's normal's fresh impulse (``pooled``: the sum over its patch ring of normals, in ring order
     from its own). One warp exchanges the fresh updates by shuffle (a pooled load reads the ring's staged ones, and
     the warp synchronizes before the impulses are stored again); several warps stage them in ``s_x``. The pair's
-    tangents project together, each on its own lane.
+    tangents project together, each on its own lane. Under ``torsion`` the pair and its contact's spin row (its
+    normal's row plus three) project together, radially onto their elliptic cone in the scaled impulse
+    (:func:`.projection_laws.ball`).
     """
+    if torsion:
+        return _jacobi_triple_projection(rows, pooled=pooled, pad=pad)
     F, n = JACOBI_FRICTION, rows.rows
     disk = "radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2({first}, {second}), radius)[0]"
     if rows.threads == 32:
@@ -1421,6 +1548,56 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
         *ring,
         f"        const float radius = fmaxf(s_mu[i] * {load}, 0.0f);",
         f"        x_new = {disk.format(first='s_x[i]', second='s_x[sib]')};",
+        "    }",
+        "}",
+        "SYNC();",
+    ]
+    return indent("\n".join(lines), pad)
+
+
+def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
+    """:func:`_jacobi_projection` of contacts with spin rows: each friction-kind lane (a tangent or the spin row of
+    normal ``p``) projects the triple ``(p + 1, p + 2, p + 3)`` onto its cone and keeps its own component."""
+    F, n = JACOBI_FRICTION, rows.rows
+    project = [
+        "        const float radius_load = fmaxf({load}, 0.0f);",
+        "        const wp::vec3 triple = ConeLaw::ball(wp::vec3({t1}, {t2}, {s}), s_mu[p + 1], s_mu[p + 3], radius_load);",
+        "        x_new = triple[i - p - 1];",
+    ]
+    if rows.threads == 32:
+        lines = [
+            "{",
+            "    const int i = lane;",
+            f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
+            "    const int p = fr ? s_parent[i] : i;",
+            "    const float x1 = READ(x_new, (fr ? p + 1 : i) & 31);",
+            "    const float x2 = READ(x_new, (fr ? p + 2 : i) & 31);",
+            "    const float x3 = READ(x_new, (fr ? p + 3 : i) & 31);",
+        ]
+        load = "xp"
+        if pooled:
+            lines += [f"    if (i < {n}) s_x[i] = x_new;", "    WARP_SYNC();", "    if (fr) {"]
+            lines.append(indent(f"const float load = {rows.ring_load('p')};", "        "))
+            load = "load"
+        else:
+            lines += ["    const float xp = READ(x_new, p & 31);", "    if (fr) {"]
+        lines += [line.format(load=load, t1="x1", t2="x2", s="x3") for line in project]
+        lines += ["    }", "    WARP_SYNC();" if pooled else "", "}"]
+        return indent("\n".join(line for line in lines if line), pad)
+    ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")] if pooled else []
+    lines = [
+        "SYNC();",
+        f"if (lane < {n}) s_x[lane] = x_new;",
+        "SYNC();",
+        "{",
+        "    const int i = lane;",
+        f"    if (i < {n} && s_kind[i] == {F}) {{",
+        "        const int p = s_parent[i];",
+        *ring,
+        *(
+            line.format(load="load" if pooled else "s_x[p]", t1="s_x[p + 1]", t2="s_x[p + 2]", s="s_x[p + 3]")
+            for line in project
+        ),
         "    }",
         "}",
         "SYNC();",
@@ -1504,7 +1681,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         op.gather(inner),
         _jacobi_step(rows, op, laws, inner),
         f"{inner}int iteration_changed = 0;",
-        _jacobi_projection(rows, pooled=pooled, pad=inner),
+        _jacobi_projection(rows, pooled=pooled, pad=inner, torsion=laws.torsion),
         _jacobi_momentum(rows, pad=inner),
         f"{inner}{{",
         f"{inner}    const int i = lane;",

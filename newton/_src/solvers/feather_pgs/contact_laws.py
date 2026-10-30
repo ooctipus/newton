@@ -10,22 +10,22 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 * geometry: :func:`contact_geometry` reads a contact from the collision arrays;
   :func:`contact_points` gives the normal from body B to body A, the
   world contact points offset by the shapes' margins along it, and the gap
-  ``phi = n . (p_a - p_b)``. Two arithmetic contracts are kept as explicit
-  modes: :func:`contact_points_endpoint_relative` subtracts body translations
-  apart from the rotated offsets (the resolved-world classifier's rounding), and
-  :func:`contact_points_oracle` reproduces the retained host oracle of contact
-  torsion (its callers compile with ``fuse_fp`` off; Warp only);
+  ``phi = n . (p_a - p_b)``. A second arithmetic contract is kept as an explicit
+  mode: :func:`contact_points_endpoint_relative` subtracts body translations
+  apart from the rotated offsets (the resolved-world classifier's rounding);
 * materials: :func:`contact_materials`, the friction coefficient
-  (:func:`contact_friction`) and the restitution (:func:`contact_restitution`)
-  averaged over the present shapes;
+  (:func:`contact_friction`, also the torsional one's combination) and the
+  restitution (:func:`contact_restitution`) averaged over the present shapes;
 * row frame: :func:`contact_tangent_basis`, :func:`contact_friction_points` (the
   point law's friction location) and :func:`contact_row_frame`, each row's
   direction and endpoints under the point or patch law (``patch_row_frame``);
 * :func:`prescribed_target`, the row target that prescribed bodies' motion
-  imposes;
+  imposes, and the spin row's, :func:`prescribed_spin_target`;
 * :func:`jacobian_entry`, ``J = d . (S_lin + S_ang x (p - o))`` for one motion
   subspace column ``S`` of a body whose twists are taken about ``o``, and its
-  closed form for a free body's six unit columns, :func:`free_body_jacobian`.
+  closed form for a free body's six unit columns, :func:`free_body_jacobian`;
+  the spin row's (contact torsion, :data:`CONTACT_SPIN_ROW`), ``J = n . S_ang``,
+  :func:`spin_entry` and :func:`free_body_spin_jacobian`.
 """
 
 import warp as wp
@@ -36,6 +36,9 @@ from .spatial_laws import SPATIAL, point_velocity
 
 CONTACT_LAW = LawFamily("ContactLaw", requires=(SPATIAL,))
 """The contact front end's family; native code calls ``ContactLaw::contact_points(...)``."""
+
+CONTACT_SPIN_ROW = wp.constant(3)
+"""A contact's spin row under contact torsion: its fourth row, after the normal (0) and the friction pair (1, 2)."""
 
 CONTACT_WORLDS_DIFFER = wp.constant(-2)
 """World of a contact whose endpoints belong to different worlds (:func:`contact_endpoints`)."""
@@ -198,54 +201,6 @@ def contact_points_endpoint_relative(
     return normal, translation_a, offset_a, translation_b, offset_b, separation, phi
 
 
-@CONTACT_LAW.law(cuda=False)
-def oracle_transform_point(pose: wp.transform, point: wp.vec3) -> wp.vec3:
-    """Rotate and translate ``point`` with the host oracle's cross-product expression of a quaternion rotation."""
-    q = wp.transform_get_rotation(pose)
-    v = wp.vec3(q[0], q[1], q[2])
-    cross = 2.0 * wp.cross(v, point)
-    return point + q[3] * cross + wp.cross(v, cross) + wp.transform_get_translation(pose)
-
-
-@CONTACT_LAW.law(cuda=False)
-def oracle_dot3(a: wp.vec3, b: wp.vec3) -> float:
-    """Dot product with the host oracle's contract: float32 products summed in float64."""
-    x = wp.float64(a[0] * b[0])
-    y = wp.float64(a[1] * b[1])
-    z = wp.float64(a[2] * b[2])
-    return float(x + y + z)
-
-
-@CONTACT_LAW.law(cuda=False)
-def contact_points_oracle(
-    normal_ab: wp.vec3,
-    point0: wp.vec3,
-    point1: wp.vec3,
-    margin0: float,
-    margin1: float,
-    body_a: int,
-    body_b: int,
-    body_q: wp.array[wp.transform],
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
-    """Return :func:`contact_points` under the contact-torsion host oracle's arithmetic contract.
-
-    The rotation is the oracle's cross-product form and the gap sums float32
-    products in float64. Callers compile with ``fuse_fp`` off, as the oracle's
-    rounding at touching and grouping thresholds requires; there is no CUDA form.
-    """
-    normal = -normal_ab
-    point_a = point0
-    point_b = point1
-    if body_a >= 0:
-        point_a = oracle_transform_point(body_q[body_a], point_a)
-    if body_b >= 0:
-        point_b = oracle_transform_point(body_q[body_b], point_b)
-    point_a = point_a - margin0 * normal
-    point_b = point_b + margin1 * normal
-    phi = oracle_dot3(normal, point_a - point_b)
-    return normal, point_a, point_b, phi
-
-
 @CONTACT_LAW.law
 def contact_friction(shape_a: int, shape_b: int, shape_mu: wp.array[float]) -> float:
     """Return a contact's friction coefficient: the plain mean over its present shapes."""
@@ -335,7 +290,8 @@ def contact_row_frame(
     The normal row (row 0) acts at the contact points, or at their midpoint with
     ``shared_anchor``. Tangent rows 1 and 2 act along ``tangent0`` and ``tangent1``
     at the friction location: :func:`contact_friction_points` under the point law,
-    the patch's friction location under the patch law.
+    the patch's friction location under the patch law. The spin row
+    (:data:`CONTACT_SPIN_ROW`) turns about the normal, wherever its bodies are.
     """
     direction = normal
     p0 = point_a
@@ -344,7 +300,7 @@ def contact_row_frame(
         if shared_anchor != 0:
             p0 = 0.5 * (point_a + point_b)
             p1 = p0
-    else:
+    elif row != CONTACT_SPIN_ROW:
         direction = tangent0
         if row == 2:
             direction = tangent1
@@ -368,6 +324,19 @@ def jacobian_entry(motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3
 def free_body_jacobian(direction: wp.vec3, point: wp.vec3, origin: wp.vec3) -> wp.spatial_vector:
     """Return a free body's Jacobian row ``[d, (p - o) x d]``: :func:`jacobian_entry` over its six unit columns."""
     return wp.spatial_vector(direction, wp.cross(point - origin, direction))
+
+
+@CONTACT_LAW.law
+def spin_entry(motion: wp.spatial_vector, normal: wp.vec3) -> float:
+    """Return one entry of a contact's spin row, ``J = n . S_ang``: the spin about the normal that a unit rate of
+    the motion subspace column (or body twist) ``motion`` produces, wherever its twist is taken about."""
+    return wp.dot(normal, wp.spatial_bottom(motion))
+
+
+@CONTACT_LAW.law
+def free_body_spin_jacobian(normal: wp.vec3) -> wp.spatial_vector:
+    """Return a free body's spin row ``[0, n]``: :func:`spin_entry` over its six unit columns."""
+    return wp.spatial_vector(wp.vec3(0.0), normal)
 
 
 @CONTACT_LAW.law
@@ -396,4 +365,26 @@ def prescribed_target(
     if body_b >= 0 and art_b >= 0:
         if prescribed_articulation[art_b] != 0:
             known -= jacobian_entry(body_v_s[body_b], direction, point_b, articulation_origin[art_b])
+    return -known
+
+
+@CONTACT_LAW.law
+def prescribed_spin_target(
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+    normal: wp.vec3,
+    prescribed_articulation: wp.array[int],
+    body_v_s: wp.array[wp.spatial_vector],
+) -> float:
+    """Return the spin row's target that prescribed endpoints impose: minus their relative spin about the normal
+    (:func:`prescribed_target` with :func:`spin_entry`)."""
+    known = float(0.0)
+    if body_a >= 0 and art_a >= 0:
+        if prescribed_articulation[art_a] != 0:
+            known = spin_entry(body_v_s[body_a], normal)
+    if body_b >= 0 and art_b >= 0:
+        if prescribed_articulation[art_b] != 0:
+            known -= spin_entry(body_v_s[body_b], normal)
     return -known

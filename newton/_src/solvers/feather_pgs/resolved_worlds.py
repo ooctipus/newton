@@ -673,7 +673,8 @@ def decline(solver) -> str | None:
                 solver.model.device.is_cuda,
                 "The classifier evaluates the CUDA matrix-free route only.",
             ),
-            (laws.agnostic, "Contact torsion rows are outside the contact laws it classifies."),
+            # A separating contact carries no load, so its friction and spin rows (contact torsion) carry nothing either:
+            # the classifier's normal law decides a world with spin rows as one without.
             (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
@@ -711,7 +712,7 @@ class ResolvedWorlds:
         self.solver = solver
         declined = decline(solver)
         self.enabled = declined is None
-        if self.enabled and not solver.laws.set.point:
+        if self.enabled and solver.laws.set.contact == "patch":
             self.reason = (
                 "Admitted: interleaved matrix-free patch-friction rows whose kinds are all unilateral; a world "
                 "resolves only if its checked rows fit every contact route."
@@ -728,7 +729,7 @@ class ResolvedWorlds:
         # matrix-free capacities (finalize_resolved_worlds_bounded); point friction
         # keeps no such bound.
         self.row_bound = None
-        if self.enabled and not solver.laws.set.point:
+        if self.enabled and solver.laws.set.contact == "patch":
             self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
         device = solver.model.device
         worlds = solver.forest.world_count if self.enabled else 0

@@ -1731,19 +1731,20 @@ def _link_contact(
         parents[world[c], slot[c]] = slot[c]
         return
     next_slot = slot[c]
-    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] == 3)
+    anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
     while row != c:
         if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
             if next_slot == slot[c]:
                 next_slot = slot[row]
-            if patches.weight[row] > 0.0 and slots_needed[row] == 3:
+            if patches.weight[row] > 0.0 and slots_needed[row] >= 3:
                 anchors += 1
             if patches.weight[c] == 0.0:
                 break
         row = patches.next_contact[row]
     parents[world[c], slot[c]] = next_slot
-    if patches.weight[c] > 0.0 and slots_needed[c] == 3 and anchors > 0:
-        for t in range(1, 3):
+    if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
+        # The pair's and, with contact torsion, the spin row's coefficients: the region's capacity is shared once.
+        for t in range(1, slots_needed[c]):
             mu[world[c], slot[c] + t] /= float(anchors)
 
 
@@ -1831,7 +1832,7 @@ def seed_patch_routes(
     thread = wp.tid()
     for c in range(thread, extent[1], threads):
         route = _contact_route(routes, slot, path, c)
-        if route >= 0 and slots_needed[c] == 3:
+        if route >= 0 and slots_needed[c] >= 3:
             parents = _route_parents(routes, route)
             mu = _route_mu(routes, route)
             impulses = _route_impulses(routes, route)
@@ -1877,7 +1878,7 @@ def _finish_contact(
         # and apply that error when it later lands (common on curved meshes).
         frame.valid[c] = 0
         return
-    if slots_needed[c] != 3:
+    if slots_needed[c] < 3:
         # Friction was filtered, but its normal rows still prove support.
         return
     n = frame.normal[c]

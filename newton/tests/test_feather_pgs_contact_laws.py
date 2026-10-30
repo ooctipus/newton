@@ -797,6 +797,7 @@ def _kernel_ancestor_rows(
         point[row],
         origin[row],
         direction[row],
+        False,
         body_to_joint,
         joint_ancestor,
         joint_qd_start,

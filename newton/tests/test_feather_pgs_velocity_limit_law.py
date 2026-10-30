@@ -191,8 +191,6 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "world_row_type": array(row_type, wp.int32),
         "world_row_parent": array(np.full((1, capacity), -1, np.int32), wp.int32),
         "world_row_mu": array(np.zeros((1, capacity), np.float32)),
-        "world_torsion_group": array([[-1]], wp.int32),
-        "contact_torsion_radius": 0.0,
         "mf_constraint_count": zero_int,
         "mf_contact_rows_end": zero_int,
         "mf_meta": array([[0]], wp.int32),

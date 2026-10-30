@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.solver_fields import Mimics
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW)
+FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.CONE_LAW)
 PACKAGE = Path(kernels.__file__).parent
 
 
@@ -358,7 +358,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         return {"point_a": vec(), "point_b": vec(), "shared_anchor": flags(), "friction_shared_anchor": flags()}
     if name == "contact_row_frame":
         return {
-            "row": ints(0, 3),
+            "row": ints(0, 4),
             "shared_anchor": flags(),
             "normal": unit_vectors(rng, n),
             "tangent0": unit_vectors(rng, n),
@@ -377,6 +377,17 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         }
     if name == "free_body_jacobian":
         return {"direction": unit_vectors(rng, n), "point": vec(3.0), "origin": vec(3.0)}
+    if name == "spin_entry":
+        return {"motion": rng.normal(size=(n, 6)).astype(np.float32), "normal": unit_vectors(rng, n)}
+    if name == "free_body_spin_jacobian":
+        return {"normal": unit_vectors(rng, n)}
+    if name == "prescribed_spin_target":
+        return {
+            **common,
+            "normal": unit_vectors(rng, n),
+            "prescribed_articulation": np.array([1, 0, 1, 1], dtype=np.int32),
+            "body_v_s": rng.normal(size=(8, 6)).astype(np.float32),
+        }
     if name == "prescribed_target":
         return {
             **common,
@@ -419,6 +430,11 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "axis": axis.astype(np.float32),
             **pair,
         }
+    if name == "ball":
+        # The cone's projection: zero coefficients and loads among them (a zero mu_t is the disk's branch).
+        mu, mu_t, load = (rng.uniform(0.0, 1.5, n).astype(np.float32) for _ in range(3))
+        mu[::7], mu_t[::5], load[::11] = 0.0, 0.0, 0.0
+        return {"triple": rng.normal(size=(n, 3)).astype(np.float32), "mu": mu, "mu_t": mu_t, "load": load}
     if name.startswith(("friction_ball", "jacobi_rotation")):
         block = spd3(rng, n).astype(np.float64)
         mu = rng.uniform(0.0, 2.0, n)

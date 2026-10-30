@@ -22,6 +22,7 @@ from ...sim import BodyFlags, JointType
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .contact_input import ContactInput, ContactRoutes, contact_frame
 from .contact_laws import (
+    CONTACT_SPIN_ROW,
     contact_endpoints,
     contact_friction_points,
     contact_geometry,
@@ -31,8 +32,11 @@ from .contact_laws import (
     contact_row_frame,
     contact_tangent_basis,
     free_body_jacobian,
+    free_body_spin_jacobian,
     jacobian_entry,
+    prescribed_spin_target,
     prescribed_target,
+    spin_entry,
 )
 from .dense_rows import DenseRows, MfRows, RowSupport, clear_side, jacobian_row, row_sides
 from .device_preludes import (
@@ -57,7 +61,7 @@ from .joint_table import FreeBodies, JointTable
 from .projection_laws import (
     disk,
 )
-from .row_build import write_contact_row
+from .row_build import contact_torsion_mu, write_contact_row
 from .row_laws import (
     contact_material_rhs,
     contact_restitution_rhs,
@@ -1419,6 +1423,7 @@ def populate_connect_J_for_size(
                     p_a,
                     origin,
                     e,
+                    False,
                     body_to_joint,
                     joint_ancestor,
                     joints.joint_qd_start,
@@ -1435,6 +1440,7 @@ def populate_connect_J_for_size(
                 p_b,
                 origin,
                 e,
+                False,
                 body_to_joint,
                 joint_ancestor,
                 joints.joint_qd_start,
@@ -1798,7 +1804,7 @@ def allocate_world_contact_slots(
 
     A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
     friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
-    rows. Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
+    rows, and with contact torsion (``data.torsion``) a third for its spin row. Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
     dense rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
     zero disables the gate.
 
@@ -1882,7 +1888,7 @@ def allocate_world_contact_slots(
         if friction_patches.enabled != 0:
             add_friction = add_friction and friction_patches.weight[c] > 0.0
         if add_friction:
-            slots_needed = 3
+            slots_needed = 3 + data.torsion
         data.slots_needed[c] = slots_needed
 
         # The matrix-free or the dense family's counter.
@@ -2123,6 +2129,7 @@ def accumulate_jacobian_row_world(
     point_world: wp.vec3,
     origin: wp.vec3,
     direction: wp.vec3,
+    spin: bool,
     body_to_joint: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
@@ -2134,7 +2141,8 @@ def accumulate_jacobian_row_world(
     J_group: wp.array3d[float],
 ):
     """Accumulate Jacobian contributions by walking up the kinematic tree, into the side at ``at``
-    (:func:`.dense_rows.jacobian_row`) of row ``row``."""
+    (:func:`.dense_rows.jacobian_row`) of row ``row``: :func:`.contact_laws.jacobian_entry` along ``direction`` at
+    ``point_world``, or a contact's spin row (``spin``) about ``direction`` (:func:`.contact_laws.spin_entry`)."""
     if body_index < 0:
         return
 
@@ -2143,7 +2151,11 @@ def accumulate_jacobian_row_world(
         for global_dof in range(joint_qd_start[curr_joint], joint_qd_start[curr_joint + 1]):
             local_dof = global_dof - art_dof_start
             if local_dof >= 0 and local_dof < n_dofs:
-                entry = jacobian_entry(joint_S_s[global_dof], direction, point_world, origin)
+                entry = float(0.0)
+                if spin:
+                    entry = spin_entry(joint_S_s[global_dof], direction)
+                else:
+                    entry = jacobian_entry(joint_S_s[global_dof], direction, point_world, origin)
                 J_group[at[0], row, at[1] + local_dof] += sign * entry
         curr_joint = joint_ancestor[curr_joint]
 
@@ -2159,7 +2171,7 @@ def prepare_world_contact_rows(data: ContactInput, total_num_threads: int, law: 
         # floating-point threshold and overwrite the following contact.
         rows = 1
         if data.slots_needed[c] >= 3:
-            rows = 3
+            rows = data.slots_needed[c]
         for row in range(rows):
             write_contact_row(data, law, c, row, False)
 
@@ -2176,7 +2188,7 @@ def populate_world_J_for_compact_size(
     J_group: wp.array3d[float],
 ):
     """Project one dense contact row/DOF per lane for compact articulations: every coordinate of each side of the
-    size, zeros included."""
+    size, zeros included. A normal's lanes also write its spin row (contact torsion), which shares its direction."""
     worker, lane = wp.tid()
     total_contacts = data.count[0]
     row = lane // target_size
@@ -2219,17 +2231,24 @@ def populate_world_J_for_compact_size(
         group_b = -1
         value_a = float(0.0)
         value_b = float(0.0)
+        spin_a = float(0.0)
+        spin_b = float(0.0)
+        spin = row == 0 and data.slots_needed[c] > CONTACT_SPIN_ROW
         bit = wp.uint32(1) << wp.uint32(local_dof)
         if art_a >= 0 and data.response_dofs[art_a] == target_size:
             group_a = art_group_idx[art_a]
             if body_a >= 0 and (data.body_mask[body_a] & bit) != wp.uint32(0):
                 motion_a = data.motion[data.dof_start[art_a] + local_dof]
                 value_a = jacobian_entry(motion_a, direction, p0, data.origin[art_a])
+                if spin:
+                    spin_a = spin_entry(motion_a, normal)
         if art_b >= 0 and data.response_dofs[art_b] == target_size:
             group_b = art_group_idx[art_b]
             if body_b >= 0 and (data.body_mask[body_b] & bit) != wp.uint32(0):
                 motion_b = data.motion[data.dof_start[art_b] + local_dof]
                 value_b = -jacobian_entry(motion_b, direction, p1, data.origin[art_b])
+                if spin:
+                    spin_b = -spin_entry(motion_b, normal)
 
         slot = data.slot[c] + row
         sides = row_sides(art_a, art_b)
@@ -2237,11 +2256,17 @@ def populate_world_J_for_compact_size(
             at = jacobian_row(support, group_a, art_a, sides)
             if group_b == group_a:
                 J_group[at[0], slot, at[1] + local_dof] = value_a + value_b
+                if spin:
+                    J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_a + spin_b
             else:
                 J_group[at[0], slot, at[1] + local_dof] = value_a
+                if spin:
+                    J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_a
         if group_b >= 0 and group_b != group_a:
             at = jacobian_row(support, group_b, art_b, sides)
             J_group[at[0], slot, at[1] + local_dof] = value_b
+            if spin:
+                J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_b
 
 
 @wp.kernel
@@ -2492,7 +2517,7 @@ def populate_world_J_for_size(
         # floating-point threshold and overwrite the following contact.
         rows = 1
         if data.slots_needed[c] >= 3:
-            rows = 3
+            rows = data.slots_needed[c]
         sides = row_sides(art_a, art_b)
         at_a = wp.vec2i(0, 0)
         at_b = wp.vec2i(0, 0)
@@ -2514,6 +2539,7 @@ def populate_world_J_for_size(
                     p0,
                     data.origin[art_a],
                     direction,
+                    row == CONTACT_SPIN_ROW,
                     body_to_joint,
                     joint_ancestor,
                     joint_qd_start,
@@ -2531,6 +2557,7 @@ def populate_world_J_for_size(
                     p1,
                     data.origin[art_b],
                     direction,
+                    row == CONTACT_SPIN_ROW,
                     body_to_joint,
                     joint_ancestor,
                     joint_qd_start,
@@ -2901,20 +2928,25 @@ def build_mf_contact_rows(
         # floating-point threshold and overwrite the following contact.
         rows = 1
         if data.slots_needed[c] >= 3:
-            rows = 3
+            rows = data.slots_needed[c]
         for row in range(rows):
             row_idx = slot + row
             direction, p0, p1 = contact_row_frame(
                 row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
             )
-            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B. The rows' build
-            # whitens it in place (Z = L^-1 J^T).
+            spin = row == CONTACT_SPIN_ROW
+            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B; a spin row's
+            # [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
             if response_body_a >= 0:
                 J_a = free_body_jacobian(direction, p0, data.origin[art_a])
+                if spin:
+                    J_a = free_body_spin_jacobian(normal)
                 for k in range(6):
                     mf.Z_a[world, row_idx, k] = J_a[k]
             if response_body_b >= 0:
                 J_b = free_body_jacobian(direction, p1, data.origin[art_b])
+                if spin:
+                    J_b = free_body_spin_jacobian(normal)
                 for k in range(6):
                     mf.Z_b[world, row_idx, k] = -J_b[k]
             mf.body_a[world, row_idx] = response_body_a
@@ -2925,6 +2957,12 @@ def build_mf_contact_rows(
                 mf.row_mu[world, row_idx] = mu
                 mf.phi[world, row_idx] = phi
                 mf.restitution[world, row_idx] = restitution
+            elif spin:
+                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
+                mf.row_parent[world, row_idx] = slot
+                mf.row_mu[world, row_idx] = contact_torsion_mu(data, c)
+                mf.phi[world, row_idx] = 0.0
+                mf.restitution[world, row_idx] = 0.0
             else:
                 tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
                 if stiffness > 0.0 and data.friction_weight[c] > 0.0:
@@ -2939,6 +2977,8 @@ def build_mf_contact_rows(
                 target = prescribed_target(
                     body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
                 )
+                if spin:
+                    target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
                 mf.target[world, row_idx] = target
             if data.material != 0:
                 eps = float(0.0)

@@ -26,7 +26,7 @@ class Laws:
     regularized: bool
     """Contact rows step toward the hard law with a float32 weight below one (``pgs_contact_regularization``)."""
     torsion: bool
-    """Contact torsion appends a spin row per touching group."""
+    """Contact torsion gives every friction contact a spin row after its pair (``contact_torsion``)."""
     compliance: bool
     """Material contacts take the row law's compliance (``contact_compliance``)."""
     limits: bool
@@ -135,21 +135,21 @@ CAPABILITIES = {
         "no_loops",
     ),
     # On-chip blocks of a world's rows (local owners), claimed per world at run time.
-    "local": ("cuda", "plain", "no_velocity_limits", "no_torsion"),
+    "local": ("cuda", "plain", "no_velocity_limits"),
     # The local owners' row producer: limit prefix and contact packets built in place.
-    "row_packets": ("agnostic", "limits"),
+    "row_packets": ("limits",),
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
-    "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits", "no_torsion"),
+    "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits"),
     # Its runtime claim: independent articulation and free-body components per world.
     "components": ("cuda", "plain", "no_mimic", "no_connect"),
     # The Jacobi tiers of dense trees beside a free body (case K4).
     "tiers": ("cuda",),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
+    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect", "no_torsion"),
     # The compact boundary's row producer of a star beside a six-coordinate arm.
     "compact": ("agnostic",),
     # The colored mapping of the free-body rows' contact units.
-    "colored": ("cuda",),
+    "colored": ("cuda", "no_torsion"),
 }
 """The laws each placement or schedule implements, by owner: what its admission reads through :func:`capable`."""
 

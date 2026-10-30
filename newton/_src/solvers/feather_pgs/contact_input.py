@@ -47,6 +47,7 @@ CONTACT_INPUT = (
     Field("prescribed", wp.int32, ("articulation",), owner="forest", attr="prescribed_articulation"),
     Field("material_mu", wp.float32, ("shape",), owner="laws", attr="shape_material_mu"),
     Field("material_restitution", wp.float32, ("shape",), owner="laws", attr="shape_material_restitution"),
+    Field("material_mu_torsional", wp.float32, ("shape",), owner="laws", attr="shape_material_mu_torsional"),
     Field("incident", wp.float32, ("dof",), attr="v_hat"),
     # The row law.
     Field("shared_anchor", wp.int32, owner="options", attr="contact_shared_anchor"),
@@ -65,6 +66,8 @@ CONTACT_INPUT = (
     Field("stiffness", wp.float32, ("contact",), attr="contact_stiffness"),
     Field("damping", wp.float32, ("contact",), attr="contact_damping"),
     Field("friction_weight", wp.float32, ("contact",), attr="contact_friction_weight"),
+    # Contact torsion: 1 gives every friction contact its spin row (a fourth row), 0 none.
+    Field("torsion", wp.int32, owner="laws", attr="torsion_rows"),
     # The dense row records the producers write.
     *dense_rows.RECORDS,
 )

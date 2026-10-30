@@ -15,14 +15,13 @@ from functools import cache
 import warp as wp
 
 from . import kernel_template, sweep_units
-from .contact_torsion import torque_sweep_source
 from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
 from .launch import device_lanes
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax, sweep_exit
@@ -70,8 +69,6 @@ MF_GS_ABI = kernel_template.params(
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
-    ("world_torsion_group", wp.array2d[int]),
-    ("contact_torsion_radius", float),
     ("mf_constraint_count", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
@@ -559,6 +556,8 @@ def mf_gs_source(
         raise ValueError("Independent components require the paired factor-coordinate solve")
     if lanes not in (1, 32) or (colored and lanes != 32):
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
+    if contact_torsion and (colored or colored_worlds):
+        raise ValueError("The colored units solve no spin rows (contact torsion)")
     _validate_dense_metadata_encoding(max_constraints)
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
@@ -615,8 +614,6 @@ def mf_gs_source(
     if has_dense_velocity_limit_rows:
         passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
     passes.append(speed_rows_pass(free, free_op, laws, pad="        "))
-    if contact_torsion:
-        passes.append(torque_sweep_source(dense_op, solve_policy))
 
     if colored:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
@@ -726,7 +723,7 @@ def mf_gs_source(
         SHARED_STORAGE,
         RING,
         PACKED_SIDES,
-        *law_preludes(PROJECTION_LAW),
+        *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
         *solve_policy.preludes,
     )
     if lanes == 1:

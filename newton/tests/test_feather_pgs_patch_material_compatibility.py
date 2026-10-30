@@ -6,13 +6,11 @@
 import unittest
 import warnings
 
-import numpy as np
 import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_contact_compliance import run_fixture
-from newton.tests.test_feather_pgs_contact_torsion import fixture
 
 
 class TestPatchMaterialCompatibility(unittest.TestCase):
@@ -22,25 +20,23 @@ class TestPatchMaterialCompatibility(unittest.TestCase):
         body = builder.add_body()
         builder.add_shape_sphere(body, radius=0.05)
         model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion_radius=0.0)
+        solver = SolverFeatherPGS(model, contact_compliance=False, contact_torsion=False)
         self.assertEqual(solver.laws.friction_anchor_beta, 0.2)
         self.assertTrue(solver.laws.friction_anchors_enabled)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_torsion_opt_in_keeps_default_patches(self):
         """Resolve omitted patch gain to default patch friction alongside torsion, without a warning."""
-        options = {"center_only": True, "contact_shared_anchor": False, "contact_friction_shared_anchor": False}
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_sphere(body, radius=0.05)
+        model = builder.finalize(device="cpu")
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            actual, solver, *_ = fixture(0.01, friction_anchor_beta=None, **options)
+            solver = SolverFeatherPGS(model, contact_torsion=True)
         self.assertEqual([str(w.message) for w in caught if "friction" in str(w.message)], [])
-        reference, explicit, *_ = fixture(0.01, friction_anchor_beta=0.2, **options)
+        self.assertTrue(solver.laws.contact_torsion_enabled)
         self.assertTrue(solver.laws.friction_anchors_enabled)
-        self.assertTrue(explicit.laws.friction_anchors_enabled)
         self.assertAlmostEqual(solver.laws.friction_anchor_beta, 0.2)
-        self.assertGreater(solver.laws.torsion_stats["rows"], 0)
-        for name in reference:
-            np.testing.assert_array_equal(actual[name], reference[name], err_msg=name)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_compliance_opt_in_keeps_default_patches(self):

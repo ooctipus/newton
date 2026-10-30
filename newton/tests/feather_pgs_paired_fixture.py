@@ -148,8 +148,6 @@ def solve_fixture(device):
         "local_solve_owner": array(np.zeros(5, np.int32)),
         "world_dof_indices": array(np.arange(145, dtype=np.int32).reshape(5, 29)),
         "world_impulses": array(np.full((5, 8), 0.01, np.float32)),
-        "world_torsion_group": array(np.full((1, 1), -1, np.int32)),
-        "contact_torsion_radius": 0.0,
         "mf_impulses": array(np.full((5, 6), 0.02, np.float32)),
         "world_row_w": array(np.ones((5, 8), np.float32)),
         "mf_row_w": array(np.ones((5, 6), np.float32)),

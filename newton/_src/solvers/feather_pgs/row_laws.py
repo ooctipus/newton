@@ -39,6 +39,7 @@ ROW_JOINT_LIMIT = wp.constant(3)
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
 ROW_MIMIC = wp.constant(5)
 ROW_CONNECT = wp.constant(6)
+ROW_TORSION = wp.constant(7)
 
 CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 """Gap within which a contact counts as reached: absorbs float32 residuals of rows that land exactly at contact."""
@@ -172,7 +173,7 @@ def row_rhs(
     * friction (the anchor's tangential displacement), mimic and connect
       (bilateral equalities): Baumgarte from both sides, ``bias_scale * beta * phi / dt``;
     * joint limit: :func:`limit_rhs`;
-    * velocity limit and other rows: ``-target`` only.
+    * velocity limit, a contact's spin row (torsion) and other rows: ``-target`` only.
     """
     rhs = -target
     row_w = float(1.0)

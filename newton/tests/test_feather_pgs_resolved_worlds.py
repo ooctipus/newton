@@ -468,10 +468,13 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch, row_bound=(100, 2)), 0)
 
     def test_patch_friction_admission(self):
-        """Admit persistent patch friction on the dense route, not under torsion or compliance."""
+        """Admit persistent patch friction on the dense route and contact torsion (a separating contact carries no
+        spin either), not compliance."""
         solver = _admissible_solver()
         self.assertTrue(rw.supported(solver))
         solver.laws.set = plain_laws(torsion=True)
+        self.assertTrue(rw.supported(solver))
+        solver.laws.set = plain_laws(compliance=True)
         self.assertFalse(rw.supported(solver))
         solver.laws.set = plain_laws(contact="patch")
         self.assertTrue(rw.supported(solver))

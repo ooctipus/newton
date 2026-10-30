@@ -15,7 +15,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_laws, kernels, law_source, projection_laws, row_laws
+from newton._src.solvers.feather_pgs import contact_laws, kernels, law_source, projection_laws, row_laws, spatial_laws
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native
 from newton.tests.feather_pgs_law_harness import (
     FAMILIES,
@@ -49,7 +49,7 @@ class TestLawSource(unittest.TestCase):
                 sig = law_source.law_signature(LAWS.get(name) or getattr(contact_laws, name))
                 rendered = f" {name}(" in source
                 self.assertEqual(rendered, sig.cuda, name)
-        self.assertFalse(law_source.law_signature(contact_laws.contact_points_oracle).cuda)
+        self.assertFalse(law_source.law_signature(spatial_laws.inertia_matrix).cuda)
         self.assertEqual(
             [prelude.name for prelude in law_source.law_preludes(row_laws.ROW_LAW, row_laws.ROW_LAW)], ["RowLaw"]
         )
@@ -88,11 +88,11 @@ class TestLawSource(unittest.TestCase):
 
     def test_constants_are_the_replaced_codes(self):
         """Keep the row kinds of the kernels' row types."""
-        for name in ("CONTACT", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "CONNECT"):
+        for name in ("CONTACT", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "CONNECT", "TORSION"):
             self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
 
     def test_cuda_renderings_compile(self):
-        """Compile the three families' CUDA renderings through NVRTC, without a device (sm_80)."""
+        """Compile the families' CUDA renderings through NVRTC, without a device (sm_80)."""
         import tempfile  # noqa: PLC0415
 
         body = "    return 0;\n#endif\n"

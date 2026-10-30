@@ -993,7 +993,8 @@ def _cpu_arm():
 
 class TestPatchParallelAdmission(unittest.TestCase):
     def test_both_laws_are_admitted_and_the_record_says_why(self):
-        """Admit point and patch friction to the parallel rows, record why, and keep torsion out."""
+        """Admit point and patch friction to the parallel rows, record why, and admit contact torsion (the tiers solve
+        the friction triple) and weighted contact rows."""
         model = _cpu_arm()
         for beta in (0.0, 0.2):
             with self.subTest(beta=beta):
@@ -1010,14 +1011,10 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertNotIn("need point friction", friction["reason"])
                 self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                 self.assertNotIn("point contacts", keyed["reason"])
-        # Torsion (a CUDA-only law here) keeps ordinary rows; weighted contact rows take the weighted tiers.
-        other_law = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(torsion=True)))
-        admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
-        self.assertFalse(admitted)
-        self.assertIn("torsion", reason)
-        for weighted in ({"regularized": True}, {"compliance": True}):
-            weighted_law = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(**weighted)))
-            self.assertTrue(SolverFeatherPGS._admit_parallel_contact_paths(weighted_law)[0], weighted)
+        # Torsion takes the tiers, and so do weighted contact rows (the weighted tiers).
+        for law in ({"torsion": True}, {"regularized": True}, {"compliance": True}):
+            other = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(**law)))
+            self.assertTrue(SolverFeatherPGS._admit_parallel_contact_paths(other)[0], law)
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""

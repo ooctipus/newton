@@ -321,8 +321,8 @@ def materialize_general_rows(
             direction, p0, p1 = contact_row_frame(
                 r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
             )
-            value = endpoint_projection(data, body_a, data.art0[c], size, local, p0, direction)
-            value -= endpoint_projection(data, body_b, data.art1[c], size, local, p1, direction)
+            value = endpoint_projection(data, body_a, data.art0[c], size, local, r, p0, direction)
+            value -= endpoint_projection(data, body_b, data.art1[c], size, local, r, p1, direction)
             if q == 0:
                 write_contact_row(data, law, c, r, True)
         side = wp.where(size == primary, 0, 1)

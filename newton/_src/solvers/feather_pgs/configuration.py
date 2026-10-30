@@ -61,6 +61,7 @@ _BOOLEANS = (
     "warn_constraint_overflow",
     "pgs_warmstart",
     "row_watermark",
+    "contact_torsion",
     "contact_compliance",
 )
 
@@ -109,9 +110,7 @@ class Options:
     warn_constraint_overflow: bool
     friction_anchor_beta: Any
     pgs_solve_readout: str
-    contact_torsion_radius: Any
-    contact_torsion_shape_indices: Any
-    contact_torsion_shape_patterns: Any
+    contact_torsion: bool
     contact_compliance: bool
 
 

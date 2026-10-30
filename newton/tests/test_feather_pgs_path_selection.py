@@ -436,8 +436,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Name the owners patch friction cannot use, and route the masked rows and the classifier to the patch law.
 
         Which owner claims a world is recorded where it is decided (routes.stages, each owner's reason); the
-        friction record names only the owners that need point friction. Contact torsion takes none of the patch
-        routes whatever the flags say.
+        friction record names only the owners that need point friction. Contact torsion keeps the tiers' admission
+        (the keyed rows, which write no spin row, decline it) whatever the flags say.
         """
         model = _cpu_free_body_model()
         routes = SolverFeatherPGS(model).get_path_selection()["routes"]
@@ -452,19 +452,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder = {"method": method, "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Contact torsion keeps ordinary factors and serial sweeps; its rows take the masked builder, as the
-        # zero-radius solver's do.
+        # solver's without torsion do.
         for flags in ({},):
-            with (
-                self.subTest(torsion=True, **flags),
-                patch.dict(os.environ, flags),
-                # Construct on the CPU, as TestTorsionNeutralRoute does; nothing is stepped.
-                patch("newton._src.solvers.feather_pgs.contact_torsion._validate_torsion_mode"),
-            ):
-                routes = SolverFeatherPGS(model, contact_torsion_radius=0.01).get_path_selection()["routes"]
+            with self.subTest(torsion=True, **flags), patch.dict(os.environ, flags):
+                routes = SolverFeatherPGS(model, contact_torsion=True).get_path_selection()["routes"]
                 friction = routes["friction"]
                 self.assertEqual((friction["law"], friction["torsion"]), ("patch", True))
-                self.assertIn("need point friction", friction["reason"])
-                self.assertFalse(friction["parallel_rows"]["admitted"])
+                self.assertNotIn("need point friction", friction["reason"])
+                self.assertTrue(friction["parallel_rows"]["admitted"])
                 self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Point friction's record names no patch route.
         point = SolverFeatherPGS(model, friction_anchor_beta=0.0).get_path_selection()
