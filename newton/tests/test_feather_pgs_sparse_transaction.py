@@ -7,6 +7,7 @@ A contact unit solves a normal and its friction pair on their Gram block, in exa
 row-by-row updates, so its CUDA twins match the ordinary sweep and the physical reference to rounding, not bitwise.
 """
 
+import re
 import unittest
 from itertools import product
 from unittest import mock
@@ -330,6 +331,14 @@ class TestContactUnits(unittest.TestCase):
                 self.assertLess(unit.index("unit_lam1 = s_impulse[tangent]"), reduction)
                 self.assertLess(unit.index("unit_lam0 = s_impulse[i]"), reduction)
                 self.assertLess(unit.index("SYNC();"), unit.index("if (lane == 0) s_impulse[i] = new_impulse;"))
+                # The rows read those registers and pool the ring from the normal's new impulse in a register, so
+                # they read no store of the unit: only the normal's stores wait for the lanes (beside the gate's own
+                # barrier), and the unit synchronizes once, after its apply.
+                rows = unit[unit.index("for (int r = 0; r < 2; ++r) {") : unit.index("if (unit_dn != 0.0f ||")]
+                self.assertEqual(re.findall(r"s_impulse\[[^\]]*\](?! = )", rows), [])
+                self.assertIn("if (r == 0) SYNC();", rows)
+                self.assertEqual(rows.count("SYNC();"), 2)
+                self.assertRegex(snippet[start:], r"consumed_tangent = tangent;\s+SYNC\(\);")
 
     def test_route_record_names_no_transaction_cpu(self):
         """Record the sparse route without a transaction field or switch: contact units are the one law."""

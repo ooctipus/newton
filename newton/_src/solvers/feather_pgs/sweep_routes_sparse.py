@@ -576,7 +576,12 @@ if (index >= 0) {{
         "            ",
         entry=False,
     )
-    ring_load, ring = rows.load, ""
+
+    def ring_load(parent: str, load: str) -> str:
+        # A point contact's pool is its normal's load.
+        return load
+
+    ring = ""
     if sweep.linked:
         # The ring pools as the pair update walks it, from the normal's new load on.
         ring = f"""
@@ -588,17 +593,15 @@ if (index >= 0) {{
             return load;
         }};"""
 
-        def ring_load(parent):
-            return f"unit_ring_load({rows.load(parent)})"
+        def ring_load(parent: str, load: str) -> str:
+            return f"unit_ring_load({load})"
 
     unit_op = _UnitFactor(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
-    # The visited row's and its sibling's impulses as the unit loaded them; the ring's pool reads the stores.
-    held = {"i": "(r == 0 ? unit_lam0 : unit_lam1)", "sib": "unit_lam2"}
     ctx = RowContext(
         row="i",
         kind="row_type",
         operator=dataclasses.replace(unit_op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row)),
-        load=lambda row: held.get(row) or rows.load(row),
+        load=rows.load,
         store=rows.store,
         rhs=rows.rhs_of,
         mu=lambda row: "mu",
@@ -613,7 +616,17 @@ if (index >= 0) {{
     declare = f"""const int i = head + r;
 const int row_type = r == 0 ? {CONTACT} : {FRICTION};
 const float denom = s_diag[i];"""
-    rows_text = contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check="denom", pad="        ")
+    # The guards admitted the normal (a positive diagonal); the rows read the unit's impulses as it loaded them.
+    rows_text = contact_unit(
+        ctx,
+        laws,
+        rows="3",
+        declare=declare,
+        parent="head",
+        check=None,
+        held=("unit_lam0", "unit_lam1", "unit_lam2"),
+        pad="        ",
+    )
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration

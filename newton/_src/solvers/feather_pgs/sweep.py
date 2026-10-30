@@ -295,7 +295,9 @@ class RowContext:
     mu: Callable[[str], str]
     weight: Callable[[str], str]
     parent: str
-    ring_load: Callable[[str], str]
+    ring_load: Callable[..., str]
+    """The pooled normal load of the patch ring of normal row ``parent``: ``ring_load(parent)`` from the row's stored
+    impulse, ``ring_load(parent, load)`` from ``load`` (a contact unit's normal in a register, :func:`contact_unit`)."""
     lanes: Lanes
     contact_kinds: tuple[int, ...] = (CONTACT, JOINT_LIMIT)
     inline_velocity_limit: bool = False
@@ -310,10 +312,17 @@ class RowContext:
     arguments after leading ones of its own (a cache of the pair's metric)."""
     owned: bool = True
     """The row's first lane owns the stored impulses: the lanes synchronize before the stores (every lane has read
-    the impulses the first lane overwrites) and, with :attr:`fenced`, after them. Otherwise every lane stores what it
-    computed, as every other lane does, and reads only its own stores."""
+    the impulses the first lane overwrites; :attr:`first_store`) and, with :attr:`fenced`, after them. Otherwise every
+    lane stores what it computed, as every other lane does, and reads only its own stores."""
     fenced: bool = True
     """The lanes also synchronize between the first lane's stores and the applies, which read no impulse."""
+    first_store: str | None = None
+    """For rows that read their impulses from registers loaded before them (a contact unit's, :func:`contact_unit`),
+    the condition under which a row's stores are the first since those loads: only these wait for the lanes. ``None``:
+    every row's stores wait."""
+    synced: bool = True
+    """The lanes synchronize after a row's stores and apply (:meth:`sync`). A contact unit's rows defer their applies
+    and read no store of the unit, so its placement synchronizes once, after the unit's apply."""
     pair_residual: bool = False
     """A friction pair reduces its first tangent's residual again with the pair's terms
     (:meth:`.ResponseOperator.pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
@@ -323,6 +332,12 @@ class RowContext:
         """The barrier after a row's stores and apply: needed when the lanes share them (the first lane's impulses, or
         an apply to the velocity or a maintained residual); nothing for one thread."""
         return self.lanes.sync() if self.owned or self.operator.applies else ""
+
+    def store_barrier(self) -> str:
+        """The barrier before a row's stores where its first lane owns them: every lane has read the impulses it
+        overwrites (:attr:`first_store`); nothing otherwise."""
+        barrier = self.lanes.sync() if self.owned else ""
+        return f"if ({self.first_store}) {barrier}" if barrier and self.first_store else barrier
 
 
 def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> str:
@@ -422,7 +437,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
     sibling's and then the row's change to each of its entries, written back once.
     """
     op, row, kind = ctx.operator, ctx.row, ctx.kind
-    lines = [ctx.lanes.sync() if ctx.owned else ""]
+    lines = [ctx.store_barrier()]
     lines.append(ctx.store(row, "new_impulse"))
     if ctx.record is not None:
         lines.append(ctx.record(row, "delta_impulse"))
@@ -459,7 +474,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             indent(op.apply("delta_impulse", "").lstrip("\n"), "    "),
             "}",
         ]
-    lines.append(ctx.sync())
+    lines.append(ctx.sync() if ctx.synced else "")
     return lines
 
 
@@ -531,7 +546,7 @@ def friction_gate(kind: str, store: str, sync: str, pad: str, *, skip: bool = Tr
     """
     lines = [
         f"if (ProjectionLaw::friction_gate({kind}, global_iter, friction_start_iteration)) {{",
-        f"    {store}",
+        indent(store, "    "),
         f"    {sync}" if sync else "",
         "    continue;" if skip else "",
         "}",
@@ -717,18 +732,56 @@ def cached_pair_law(name: str, scale: str, low: str, high: str, axis: tuple[str,
     return "\n".join(pad + line for line in lines)
 
 
-def contact_unit(ctx: RowContext, laws: RowLaws, *, rows: str, declare: str, parent: str, check: str, pad: str) -> str:
+def contact_unit(
+    ctx: RowContext,
+    laws: RowLaws,
+    *,
+    rows: str,
+    declare: str,
+    parent: str,
+    check: str | None,
+    held: tuple[str, str, str] | None = None,
+    pad: str,
+) -> str:
     """The rows of a contact unit by the row law (BACKBONE §1 step 5), after the placement's one reduction of the
     unit's terms and before its one apply of the unit's changes (both the placement's).
 
     Row ``r`` of the unit (the normal, then its pair at the first tangent; ``rows`` is the unit's row count, one for a
     normal without a pair, else three) declares its index ``i``, kind and response (``declare``, which ``check`` reads:
-    the row law runs when it is positive) and runs :func:`row_visit` with the unit's operator (:class:`UnitOperator`),
-    the pair at the normal ``parent``. A visit that skips its row leaves it (a one-pass loop), not the unit.
+    the row law runs when it is positive; ``None`` where the placement admitted the unit's normal) and runs
+    :func:`row_visit` with the unit's operator (:class:`UnitOperator`), the pair at the normal ``parent``. A visit that
+    skips its row leaves it (a one-pass loop), not the unit.
+
+    The rows defer their applies, so none synchronizes the lanes after it: the placement does once, after the unit's
+    apply. Where the rows' first lane owns the stores, the placement holds the unit's three impulses in registers
+    (``held``: the normal's and the two tangents', loaded before its reduction), which the rows read, and the pair
+    pools its ring from the normal's new impulse in a register (``unit_normal``, what the normal stores). The rows then
+    read no store of the unit, so only the unit's first stores wait for every lane's reads: the normal's where the
+    placement admitted it, else each row's (a skipped normal leaves the pair's stores first). Rows that every lane
+    stores alike, or one thread's, read only their own stores.
     """
-    visit = row_visit(ctx, laws, parent=parent, check=check, pad=pad + "    ")
+    if (ctx.owned and ctx.lanes.parallel) != (held is not None):
+        raise ValueError("a contact unit holds its impulses in registers exactly where its first lane owns the stores")
+    unit = dataclasses.replace(ctx, fenced=False, synced=False, first_store="r == 0" if check is None else None)
+    declarations = [f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;"]
+    if held is not None:
+        normal, tangent, sibling = held
+        loads = {ctx.row: f"(r == 0 ? {normal} : {tangent})", f"{ctx.row} + 1": sibling, "sib": sibling}
+
+        def store(row: str, value: str) -> str:
+            stored = ctx.store(row, value)
+            return f"{stored}\nif (r == 0) unit_normal = {value};" if row == ctx.row else stored
+
+        unit = dataclasses.replace(
+            unit,
+            load=lambda row: loads.get(row) or ctx.load(row),
+            store=store,
+            ring_load=lambda row: ctx.ring_load(row, "unit_normal"),
+        )
+        declarations.append(f"{pad}float unit_normal = {normal};")
+    visit = row_visit(unit, laws, parent=parent, check=check, pad=pad + "    ")
     lines = [
-        f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;",
+        *declarations,
         "#pragma unroll",
         f"{pad}for (int r = 0; r < 2; ++r) {{",
         f"{pad}    if (r >= {rows}) break;",

@@ -7,6 +7,7 @@ No GPU is needed: the checks read the native statements the core emits for small
 """
 
 import dataclasses
+import re
 import unittest
 
 from newton._src.solvers.feather_pgs.response_operator import Lanes, ResidualBlock, ResponseOperator, SparseFactor
@@ -15,7 +16,9 @@ from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
     RowContext,
     RowLaws,
+    UnitOperator,
     change_vote,
+    contact_unit,
     friction_gate,
     friction_radius,
     row_update,
@@ -70,6 +73,11 @@ class _FusedRows(_Rows):
 
     def apply_pair(self, sibling_delta, delta, indent):
         return f"\n{indent}apply_pair({sibling_delta}, {delta});"
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnitRows(UnitOperator, _Rows):
+    """The same operator's rows in a contact unit."""
 
 
 def _rhs(row):
@@ -172,6 +180,58 @@ class TestRowVisit(unittest.TestCase):
         gate = friction_gate("k", "lam[i] = 0.0f;", "SYNC();", "")
         self.assertTrue(gate.endswith("    SYNC();\n    continue;\n}"))
         self.assertNotIn("continue", friction_gate("k", "lam[i] = 0.0f;", "", "", skip=False))
+
+
+class TestContactUnit(unittest.TestCase):
+    """A contact unit's rows by the row law (:func:`.sweep.contact_unit`): where the lanes synchronize."""
+
+    def _unit(self, lanes=None, check=None, held=("lam0", "lam1", "lam2"), **options):
+        ctx = dataclasses.replace(
+            _context(_UnitRows(diagonal=lambda row: f"A[{row}]"), lanes, **options),
+            ring_load=lambda parent, load=None: f"RING_LOAD({load or f'lam[{parent}]'})",
+        )
+        declare = "const int i = head + r;\nconst int row_type = r == 0 ? 0 : 2;\nconst float denom = A[i];"
+        laws = RowLaws(regularize=False)
+        return contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check=check, held=held, pad="")
+
+    def test_held_rows_synchronize_only_before_the_normal_stores(self):
+        """The rows read the unit's impulses from the registers the placement loaded and pool the ring from the
+        normal's new impulse in a register, so only the normal's stores wait for every lane's reads (besides the
+        delayed-friction gate's own barrier) and no row synchronizes after its stores: the placement does after the
+        unit's apply."""
+        unit = self._unit()
+        self.assertEqual(re.findall(r"lam\[[^\]]*\](?! = )", unit), [])
+        self.assertIn("float unit_normal = lam0;", unit)
+        self.assertIn("RING_LOAD(unit_normal)", unit)
+        self.assertRegex(
+            unit,
+            r"if \(r == 0\) SYNC\(\);\s+if \(lane == 0\) lam\[i\] = new_impulse;\s+if \(r == 0\) unit_normal = new_impulse;",
+        )
+        self.assertEqual(unit.count("SYNC();"), 2)
+        self.assertNotIn("if (denom <= 0.0f", unit)
+
+    def test_a_normal_the_visit_may_skip_leaves_every_rows_stores_waiting(self):
+        """Where the placement did not admit the normal, a skipped normal leaves the pair's stores first."""
+        unit = self._unit(check="denom")
+        self.assertIn("if (denom <= 0.0f && row_type != 2) continue;", unit)
+        self.assertNotIn("if (r == 0) SYNC();", unit)
+        self.assertRegex(unit, r"SYNC\(\);\s+if \(lane == 0\) lam\[i\] = new_impulse;")
+        self.assertEqual(unit.count("SYNC();"), 2)
+
+    def test_rows_every_lane_stores_read_their_own_stores(self):
+        """Rows that every lane stores alike, or one thread's, hold nothing and synchronize only at the gate."""
+        for lanes, owned in ((Lanes(32), False), (Lanes(1), True)):
+            with self.subTest(width=lanes.width):
+                unit = self._unit(lanes, check="denom", held=None, owned=owned)
+                self.assertNotIn("unit_normal", unit)
+                self.assertIn("RING_LOAD(lam[parent])", unit)
+                self.assertEqual(unit.count("SYNC();"), int(lanes.parallel))
+
+    def test_owned_rows_hold_their_impulses_exactly_where_the_lanes_share_the_stores(self):
+        with self.assertRaises(ValueError):
+            self._unit(held=None)
+        with self.assertRaises(ValueError):
+            self._unit(Lanes(1))
 
 
 class TestRowTail(unittest.TestCase):

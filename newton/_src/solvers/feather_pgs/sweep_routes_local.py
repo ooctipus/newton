@@ -572,7 +572,9 @@ def paired_factor_source(
         mu=lambda row: f"world_row_mu.data[off + {row}]",
         weight=lambda row: "1.0f",  # The paired route runs without regularization.
         parent="parent",
-        ring_load=lambda parent: f"RING_LOAD(s_lam[{parent}], {parent}, m, ring_parent, ring_impulse)",
+        ring_load=lambda parent, load=None: (
+            f"RING_LOAD({load or f's_lam[{parent}]'}, {parent}, m, ring_parent, ring_impulse)"
+        ),
         lanes=lanes,
         inline_velocity_limit=True,
     )
@@ -697,7 +699,8 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
 
     The unit's impulses choose its reductions, not its law. A loaded unit (a nonzero impulse among its rows) reduces its
     rows' velocity terms, the pair's couplings with the normal and their terms' magnitudes in one ladder, runs its rows
-    on :class:`_UnitFactorRows` and applies their changes in one pass. An unloaded one visits its rows as the row-by-row
+    on :class:`_UnitFactorRows` on the impulses its test loaded and applies their changes in one pass, after which the
+    lanes synchronize once (:func:`.sweep.contact_unit`). An unloaded one visits its rows as the row-by-row
     sweep does: the normal on its own ladder (:func:`_unit_row`), then its pair on the pair's own (:func:`_pair_unit`),
     only on a nonzero disk, so a unit that stays inactive reduces the normal's terms alone. The second tangent is only
     zeroed while friction is delayed.
@@ -726,6 +729,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         declare=declare,
         parent="head",
         check="denom",
+        held=("unit_lam0", "unit_lam1", "unit_lam2"),
         pad="    ",
     )
 
@@ -733,13 +737,15 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         f"const float row_z = {op.load('head')};",
         f"const float tangent1_z = {op.load('head + 1')};",
         f"const float tangent2_z = {op.load('head + 2')};",
-        "if (s_lam[head] != 0.0f || s_lam[head + 1] != 0.0f || s_lam[head + 2] != 0.0f) {",
+        "const float unit_lam0 = s_lam[head], unit_lam1 = s_lam[head + 1], unit_lam2 = s_lam[head + 2];",
+        "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {",
         "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one ladder.",
         unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
         unit_rows,
-        "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2.",
+        "    // The unit's changes in one pass: u += Z_n dn + Z_t1 dt1 + Z_t2 dt2; then its stores are every lane's.",
         "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
         f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
+        f"    {ctx.lanes.sync()}",
         "} else {",
         "    const int i = head, tangent1 = head + 1;",
         indent(_unit_row(ctx, laws, kind, load=False), "    "),
