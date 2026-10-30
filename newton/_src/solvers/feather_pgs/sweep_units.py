@@ -174,11 +174,17 @@ def stage_slots(
     mf_Z_b: wp.array3d[float],
     mf_row_mu: wp.array2d[float],
     mf_row_w: wp.array2d[float],
+    regularize: int,
     slot_data: wp.array3d[float],
     slot_words: wp.array3d[wp.int32],
 ):
     """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per slot and
-    unit)."""
+    unit).
+
+    A unit stages only what its rows hold: its friction coefficient when it has a friction pair, and its normal row's
+    weight from ``mf_row_w`` only when ``regularize`` is set (the sweeps' run-time switch); otherwise the solver binds
+    a one-element stand-in for the weights, and the row's weight is 1.
+    """
     slot, p = wp.tid()
     world = slot_world[slot]
     if world_colored[world] == 0 or p >= unit_count[world]:
@@ -193,8 +199,14 @@ def stage_slots(
             slot_words[slot, r * 3, p] = mf_meta[world, (row + r) * 4 + 1]
             slot_words[slot, r * 3 + 1, p] = mf_meta[world, (row + r) * 4 + 2]
             slot_words[slot, r * 3 + 2, p] = mf_meta[world, (row + r) * 4 + 3]
-    slot_data[slot, _SLOT_MU, p] = wp.where(rows == 3, mf_row_mu[world, row + 1], 0.0)
-    slot_data[slot, _SLOT_WEIGHT, p] = mf_row_w[world, row]
+    mu = float(0.0)
+    if rows == 3:
+        mu = mf_row_mu[world, row + 1]
+    slot_data[slot, _SLOT_MU, p] = mu
+    weight = float(1.0)
+    if regularize != 0:
+        weight = mf_row_w[world, row]
+    slot_data[slot, _SLOT_WEIGHT, p] = weight
     if rows == 3:
         # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
         words = wp.vec4i(-1, -1, -1, -1)
@@ -581,8 +593,10 @@ class ColoredUnits:
         mf_Z_b,
         mf_row_mu,
         mf_row_w,
+        regularize: int,
     ) -> None:
-        """Build every capable world's units and colors and stage the colored worlds' rows by color slot."""
+        """Build every capable world's units and colors and stage the colored worlds' rows by color slot (the row
+        weights ``mf_row_w`` only under the sweeps' run-time switch ``regularize``: :func:`stage_slots`)."""
         units = self.units
         wp.launch_tiled(
             self.build_kernel,
@@ -605,6 +619,7 @@ class ColoredUnits:
                 mf_Z_b,
                 mf_row_mu,
                 mf_row_w,
+                int(regularize),
             ],
             outputs=[self.slots["slot_data"], self.slots["slot_words"]],
             device=self.device,

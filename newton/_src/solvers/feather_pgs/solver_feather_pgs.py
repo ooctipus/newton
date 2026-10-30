@@ -3836,6 +3836,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_Z_b,
                 self.mf_row_mu,
                 self.mf_row_w,
+                int(self.laws.regularization_enabled),
             )
 
     def _launch_local_internal_solve(
