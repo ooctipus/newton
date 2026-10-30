@@ -491,7 +491,7 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
         cap = contact_depenetration_cap(
             wp.where(responds_a, body_a, -1), wp.where(responds_b, body_b, -1), data.max_depenetration_velocity
         )
-    bias, _row_w = contact_rhs(phi, data.beta, 0.0, 1.0 / data.dt, 1.0, data.speculative_scale, 1.0, cap, 0.0)
+    bias, _row_w = contact_rhs(phi, data.beta, 0.0, 1.0 / data.dt, 1.0, data.speculative_scale, 1.0, cap)
     restitution = contact_restitution(shape_a, shape_b, raw.shape_restitution)
     if restitution > 0.0:
         fires, bounce = contact_restitution_rhs(phi, incident, 0.0, restitution, data.dt, data.restitution_threshold)
@@ -656,7 +656,7 @@ def decline(solver) -> str | None:
     predictor residual: contacts, their friction and joint position limits.
     A patch tangent pair projects on its ring's pooled normal load, which is
     zero in a world whose normals all separate. Bilateral rows (mimic,
-    connect, drives, pre-elimination), warm starts, regularization and
+    connect, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
     laws = solver.laws.set
@@ -665,10 +665,9 @@ def decline(solver) -> str | None:
         "_sparse_mass_matrix_size": None,
         "_keyed_rows": None,
     }
-    # No mimic, connect or drive rows.
-    laws_exact = {"mimic_count": 0, "connect_count": 0, "drive_slot": None}
+    # No mimic or connect rows.
+    laws_exact = {"mimic_count": 0, "connect_count": 0}
     false = (
-        "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
         "_compact_contact_boundary",

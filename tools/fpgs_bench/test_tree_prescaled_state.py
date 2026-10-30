@@ -90,19 +90,13 @@ class TestPrescaledTreeContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ordinary motion"):
             get_state_kernel(False, _SCHEDULES, layout=layout, motion_velocity=True, listed=True)
 
-    def check_current_motion(self, device, exclude_driven=False):
+    def check_current_motion(self, device):
         for floating in (False, True):
             with self.subTest(device=device, floating=floating):
                 model, solver, reference, operator, owner, mass = fixture(floating, device)
                 self.assertNotEqual(tuple(mass.permutation), tuple(range(mass.dof_count - 1, -1, -1)))
                 state, output, control = model.state(), model.state(), model.control()
                 count, dt = mass.dof_count, split.DT
-                excluded = np.array([owner.layout.root_dofs, count + owner.layout.root_dofs])
-                if exclude_driven:
-                    slots = np.full(model.joint_dof_count, -1, dtype=np.int32)
-                    slots[excluded] = 0
-                    reference.laws.vel_limit_drive_slot_arg = wp.array(slots, dtype=int, device=device)
-                    reference.laws.vel_limit_skip_driven = 1
                 rng = np.random.default_rng(413)
                 raw = rng.uniform(-0.8, 0.8, model.joint_dof_count).astype(np.float32)
                 raw[count:] *= 0.03
@@ -132,8 +126,6 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         np.testing.assert_array_equal(actual_motion[count:], raw[count:])
                         if floating:
                             np.testing.assert_array_equal(actual_motion[:6], raw[:6])
-                        if exclude_driven:
-                            np.testing.assert_array_equal(actual_motion[excluded], raw[excluded])
                     else:
                         np.testing.assert_array_equal(actual_motion, raw)
                     augmented.joint_tau.zero_()
@@ -199,15 +191,10 @@ class TestPrescaledTreeContract(unittest.TestCase):
         """Match raw passive forces and prescaled bias across mutable working epochs."""
         self.check_current_motion("cpu")
 
-    def test_excluded_motion_coordinates_cpu(self):
-        """Preserve unscaled coordinates when the working-vector producer excludes drives."""
-        self.check_current_motion("cpu", exclude_driven=True)
-
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_current_motion_cuda(self):
         """Keep per-world repair and return-to-raw transitions correct under replay."""
         self.check_current_motion("cuda:0")
-        self.check_current_motion("cuda:0", exclude_driven=True)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_ordinary_dynamics_keep_no_cache(self):

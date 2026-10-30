@@ -35,7 +35,6 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_ROW_TYPE_MASK
 from newton._src.solvers.feather_pgs.solve_policy import (
-    SOLVE_PASSES,
     TRACE_GRID,
     TRACE_KINDS,
     TRACE_REASONS,
@@ -271,9 +270,9 @@ def _rowless(solver):
     return int(np.count_nonzero((dense == 0) & (free == 0)))
 
 
-def _skipped(summary, solve_pass="position"):
-    """Skipped world-solves of a readout summary in one solve pass."""
-    return sum(entry["solves"] for entry in summary["skipped"] if entry["pass"] == solve_pass)
+def _skipped(summary):
+    """Skipped world-solves of a readout summary."""
+    return summary["skipped"]["solves"] if summary["skipped"] else 0
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
@@ -611,9 +610,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual(counts["counted"], counted._solve_readout.kernels)
         summary = record["measurements"]["solve_readout"]
         self.assertEqual(summary["readout"], readout)
-        # The route record names the passes whose skipped solves the summary holds.
-        self.assertEqual(counts["skipped_passes"], [] if route.get("enters_rowless_worlds") else ["position"])
-        self.assertEqual([entry["pass"] for entry in summary["skipped"]], counts["skipped_passes"])
+        # The route record says whether the summary holds skipped solves.
+        self.assertEqual(counts["counts_skipped"], not route.get("enters_rowless_worlds"))
+        self.assertEqual(summary["skipped"] is not None, counts["counts_skipped"])
         # A parallel tier counts against its own compiled budget, every other sweep against the solver's.
         budgets = {tier.kernel.key: tier.sweeps for tier in counted._mf_gs_tiers if tier.sweeps}
         for slot in summary["slots"]:
@@ -639,11 +638,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual(skipped, 0 if route.get("enters_rowless_worlds") else rowless)
         for owners in route["owners"]:
             with self.subTest(owners=sorted(owners)):
-                solves = sum(
-                    slot["solves"]
-                    for slot in summary["slots"]
-                    if slot["route"] in owners and slot["pass"] == "position"
-                )
+                solves = sum(slot["solves"] for slot in summary["slots"] if slot["route"] in owners)
                 self.assertEqual(solves + skipped, steps * world_count)
         for label in route["solving"]:
             with self.subTest(solving=label):
@@ -694,8 +689,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """
         solver, summary, model = self._lockstep(_dense_route())
         self.assertTrue(solver.get_path_selection()["routes"]["resolved_worlds"]["enabled"])
-        (skipped,) = summary["skipped"]
-        self.assertEqual(skipped["pass"], "position")
+        skipped = summary["skipped"]
         self.assertGreater(skipped["solves"], 0)
         self.assertLessEqual(skipped["worlds"], model.world_count)
 
@@ -762,30 +756,6 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertIn("trace", slot)
         self.assertGreater(slot["solves"], 0)
         self.assertEqual(sum(slot["trace"]["reasons"].values()), slot["solves"])
-
-    def test_velocity_pass_counts_in_its_own_slots(self):
-        """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
-        route, steps = _dense_route(), 4
-        (solver,) = self._solvers(route, [{"pgs_solve_readout": "sweeps", "pgs_velocity_iterations": 2}])
-        rowless = 0
-        for _ in self._steps(route, [solver], steps):
-            rowless += _rowless(solver)
-        summary = solver.get_path_selection()["measurements"]["solve_readout"]
-        slots = {(slot["route"], slot["pass"]): slot for slot in summary["slots"]}
-        # Every counted kernel holds one slot per pass, and the route one skip counter per pass.
-        self.assertEqual(
-            sorted((slot["kernel"], slot["pass"]) for slot in summary["slots"]),
-            sorted((kernel, solve_pass) for kernel in solver._solve_readout.kernels for solve_pass in SOLVE_PASSES),
-        )
-        self.assertEqual([entry["pass"] for entry in summary["skipped"]], list(SOLVE_PASSES))
-        for solve_pass, budget in (("position", BUDGET), ("velocity", 2)):
-            with self.subTest(solve_pass=solve_pass):
-                slot = slots[("mf_gs", solve_pass)]
-                self.assertEqual(slot["budget"], budget)
-                # Both passes sweep the same rows: a world without rows skips both.
-                self.assertEqual(_skipped(summary, solve_pass), rowless)
-                self.assertEqual(slot["solves"] + rowless, steps * route["model"].world_count)
-                self.assertEqual(len(slot["sweeps"]), budget + 1)
 
     def test_trace_changes_no_result_and_records_every_solve(self):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""

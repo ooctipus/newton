@@ -90,8 +90,8 @@ class SolveRoute:
     """The rows the sweep solves: ``dense_loop`` (the CPU), ``sparse_pgs``, ``sparse_diagonal`` or
     ``matrix_free_gs``."""
     driver: Route
-    """What drives the route's sweep each solve: ``direct``, ``split_interleaved``, ``dense_split``, ``debug_loop``,
-    ``contact_compliance``, ``contact_then_internal`` or ``physx_grasp``."""
+    """What drives the route's sweep each solve: ``direct``, ``split_interleaved``, ``dense_split``, ``debug_loop`` or
+    ``contact_compliance``."""
 
     @property
     def assembles_delassus(self) -> bool:
@@ -321,15 +321,6 @@ def _solve(solver) -> SolveRoute:
         driver = Route(
             "contact_compliance",
             "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
-        )
-    elif route.name == "matrix_free_gs" and solver.options.pgs_schedule == "contact_then_internal":
-        driver = Route(
-            "contact_then_internal",
-            "Contact rows sweep all iterations in one dispatch, then internal rows in a second.",
-        )
-    elif route.name == "matrix_free_gs" and solver.options.pgs_schedule == "physx_grasp":
-        driver = Route(
-            "physx_grasp", "Each iteration launches the drive and limit, contact and velocity-limit row phases in turn."
         )
     else:
         driver = Route("direct", "The route sweeps all iterations in one dispatch.")

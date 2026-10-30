@@ -159,15 +159,13 @@ def _scalar_laws(
     out[i, 5] = accumulated_delta
     out[i, 6] = stateless_new
     out[i, 7] = stateless_delta
-    out[i, 8] = laws.velocity_clamp_impulse(residual[i], bound[i], diagonal[i])
-    out[i, 9] = laws.physx_drive(old[i], residual[i], w[i], 0.5, 0.25, bound[i])
-    out[i, 10] = float(laws.friction_gate(kind[i], iteration[i], 3))
+    out[i, 8] = float(laws.friction_gate(kind[i], iteration[i], 3))
     row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0, 0)
-    out[i, 11] = row[2]
+    out[i, 9] = row[2]
 
 
 def test_scalar_laws(test, device):
-    """Hold each scalar law's definition: steps, sets, velocity limits, the drive and the friction gate.
+    """Hold each scalar law's definition: steps, sets, velocity limits and the friction gate.
 
     The regularized step's fixed point, residual ``-(1 / w - 1) d lambda``, is the exact solve against
     :func:`~.projection_laws.regularized_diagonal`.
@@ -192,7 +190,7 @@ def test_scalar_laws(test, device):
         bound=bound,
         kind=kind,
         iteration=iteration,
-        out=np.zeros((n, 12), np.float32),
+        out=np.zeros((n, 10), np.float32),
     )["out"].numpy()
     o, r, d, w64, b = (v.astype(np.float64) for v in (old, residual, diagonal, w, bound))
     np.testing.assert_allclose(out[:, 0], o + 0.7 * (w64 * (-r / d) - (1.0 - w64) * o), rtol=1e-5, atol=1e-6)
@@ -204,15 +202,12 @@ def test_scalar_laws(test, device):
     stateless = np.where(r < 0.0, -r / d, 0.0)
     np.testing.assert_allclose(out[:, 6], stateless, rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(out[:, 7], stateless, rtol=1e-6, atol=1e-7)
-    # The clamp impulse moves the coordinate's velocity into [-limit, limit].
-    np.testing.assert_allclose(r + d * out[:, 8], np.clip(r, -b, b), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(out[:, 9], np.clip(o * w64 + 0.5 * r + 0.25, -b, b), rtol=1e-5, atol=1e-6)
-    np.testing.assert_array_equal(out[:, 10], (kind == ROW_FRICTION) & (iteration < 3))
+    np.testing.assert_array_equal(out[:, 8], (kind == ROW_FRICTION) & (iteration < 3))
     # A free body over its speed limit keeps its direction and ends on the limit.
     speed = np.abs(r) * 3.0
     over = speed > b
-    np.testing.assert_allclose(speed[over] * (1.0 + out[over, 11]), b[over], rtol=1e-5)
-    np.testing.assert_array_equal(out[~over, 11], 0.0)
+    np.testing.assert_allclose(speed[over] * (1.0 + out[over, 9]), b[over], rtol=1e-5)
+    np.testing.assert_array_equal(out[~over, 9], 0.0)
     # The regularized step's fixed point solves the row against the regularized diagonal.
     b_free = r
     fixed = -b_free * w64 / d

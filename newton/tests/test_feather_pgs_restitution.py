@@ -111,7 +111,6 @@ def _make_solver(
     model,
     *,
     enable_restitution=None,
-    velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
     pgs_warmstart=False,
@@ -121,7 +120,6 @@ def _make_solver(
         "angular_damping": 0.0,
         "enable_contact_friction": False,
         "pgs_iterations": pgs_iterations,
-        "pgs_velocity_iterations": velocity_iterations,
         "pgs_cfm": 0.0,
         "pgs_omega": 1.0,
         "pgs_warmstart": pgs_warmstart,
@@ -156,7 +154,6 @@ def _step_plane(
     initial_vertical_velocity=None,
     scene="free",
     enable_restitution=None,
-    velocity_iterations=0,
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
 ):
@@ -172,7 +169,6 @@ def _step_plane(
     )
     solver = _make_solver(
         model,
-        velocity_iterations=velocity_iterations,
         enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
         pgs_iterations=pgs_iterations,
@@ -314,7 +310,6 @@ def test_penetrating_impact_replaces_baumgarte_with_restitution(test, device):
                 separation=-penetration,
                 speed=speed,
                 restitution=restitution,
-                velocity_iterations=0,
                 pgs_iterations=8,
             )
             test.assertEqual(result["contact_count"], 1, f"{label}: expected exactly one contact")
@@ -681,7 +676,6 @@ def test_every_contact_response_route_enforces_restitution(test, device):
                 speed=speed,
                 restitution=restitution,
                 scene=scene,
-                velocity_iterations=0,
                 pgs_iterations=16,
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, scene)
@@ -689,7 +683,7 @@ def test_every_contact_response_route_enforces_restitution(test, device):
             _assert_velocity(test, result["after"], restitution * speed, speed, scene, rtol=5.0e-3)
 
 
-def test_dense_and_free_body_rows_enforce_restitution_without_velocity_iterations(test, device):
+def test_dense_and_free_body_rows_enforce_restitution(test, device):
     """Apply restitution in dense and free-body rows with explicit zero refinement."""
     restitution = 0.65
     speed = 3.0
@@ -706,7 +700,6 @@ def test_dense_and_free_body_rows_enforce_restitution_without_velocity_iteration
                 speed=speed,
                 restitution=restitution,
                 scene=scene,
-                velocity_iterations=0,
                 pgs_iterations=16,
             )
             _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
@@ -803,17 +796,14 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
 
 
 def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device):
-    """Keep velocity iterations explicit while provisioning live restitution rows."""
+    """Provision live restitution rows and validate the restitution threshold."""
     positive_model, _ = _build_plane_model(
         device,
         separation=1.0e-3,
         restitution=0.6,
     )
-    solver = _make_solver(positive_model, velocity_iterations=0)
-    test.assertEqual(solver.options.pgs_velocity_iterations, 0)
-    test.assertFalse(hasattr(solver, "_velocity_post_iterations"), "zero iterations were silently overridden")
+    solver = _make_solver(positive_model)
     test.assertFalse(solver._debug_buffers_enabled)
-    test.assertIsNone(solver._debug_position_v_out)
     test.assertEqual(solver.row_restitution.shape, (solver.forest.world_count, solver.dense_max_constraints))
     test.assertEqual(solver.mf_row_restitution.shape, (solver.forest.world_count, solver.mf_max_constraints))
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
@@ -826,13 +816,12 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
         separation=1.0e-3,
         restitution=0.0,
     )
-    zero_solver = _make_solver(zero_model, velocity_iterations=0)
-    test.assertEqual(zero_solver.options.pgs_velocity_iterations, 0)
+    zero_solver = _make_solver(zero_model)
 
     zero_model.shape_material_restitution.fill_(0.6)
     zero_solver.notify_model_changed(newton.ModelFlags.SHAPE_PROPERTIES)
 
-    default_solver = _make_solver(positive_model, velocity_iterations=0, restitution_velocity_threshold=None)
+    default_solver = _make_solver(positive_model, restitution_velocity_threshold=None)
     test.assertAlmostEqual(default_solver.options.restitution_velocity_threshold, 0.5)
 
 
@@ -864,24 +853,6 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
             _assert_velocity(test, result["after"], -IMPACT_FRACTION * speed, speed, scene)
 
 
-def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
-    """Keep restitution correct while optional velocity iterations refine the row."""
-    restitution = 0.7
-    speed = 2.0
-    separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    for iterations in (0, 1, 4, 12):
-        with test.subTest(velocity_iterations=iterations):
-            result = _step_plane(
-                device,
-                separation=separation,
-                speed=speed,
-                restitution=restitution,
-                velocity_iterations=iterations,
-            )
-            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, f"iterations={iterations}")
-            _assert_velocity(test, result["after"], restitution * speed, speed, f"iterations={iterations}")
-
-
 def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
     """Use the current incident velocity once under dense and identity warm starting."""
     restitution = 0.6
@@ -901,7 +872,6 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
             )
             solver = _make_solver(
                 model,
-                velocity_iterations=0,
                 pgs_warmstart=True,
             )
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
@@ -957,7 +927,7 @@ def test_redundant_box_contacts_do_not_multiply_restitution_energy(test, device)
     builder.add_shape_box(body, hx=hx, hy=hy, hz=hz, cfg=cfg)
     builder.add_ground_plane(cfg=cfg)
     model = builder.finalize(device=device)
-    solver = _make_solver(model, velocity_iterations=32, pgs_iterations=32)
+    solver = _make_solver(model, pgs_iterations=32)
     state_in, state_out = model.state(), model.state()
     _reset_state(model, state_in, -speed)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
@@ -1030,7 +1000,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
                 )
             builder.add_ground_plane(cfg=cfg)
             model = builder.finalize(device=device)
-            solver = _make_solver(model, velocity_iterations=0, pgs_iterations=16)
+            solver = _make_solver(model, pgs_iterations=16)
             state_in, state_out = model.state(), model.state()
             _reset_state(model, state_in, -speed)
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
@@ -1059,7 +1029,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
             separation=separation,
             restitution=0.0,
         )
-        solver = _make_solver(model, velocity_iterations=0)
+        solver = _make_solver(model)
         state_in, state_out = model.state(), model.state()
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts = pipeline.contacts()
@@ -1128,11 +1098,10 @@ for _fn in (
     test_two_body_impact_conserves_momentum_and_reverses_relative_speed,
     test_restitution_is_relative_to_a_moving_kinematic_surface,
     test_every_contact_response_route_enforces_restitution,
-    test_dense_and_free_body_rows_enforce_restitution_without_velocity_iterations,
+    test_dense_and_free_body_rows_enforce_restitution,
     test_multiworld_restitution_keeps_case_data_isolated,
     test_restitution_uses_ordinary_rows_and_validates_configuration,
     test_restitution_can_be_disabled_without_changing_materials,
-    test_velocity_iteration_counts_reach_the_same_single_row_solution,
     test_warm_start_history_does_not_change_or_repeat_restitution,
     test_redundant_box_contacts_do_not_multiply_restitution_energy,
     test_articulated_redundant_manifold_preserves_symmetric_rebound,

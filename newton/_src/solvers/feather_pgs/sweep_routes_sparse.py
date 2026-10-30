@@ -695,7 +695,6 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     rows = SparseRows(M, lanes)
     op = factor_operator(sweep)
     laws = RowLaws(
-        drive=False,
         velocity_limit_law="accumulated" if sweep.accumulated else "stateless",
         regularize=False,
         policy=sweep.policy,

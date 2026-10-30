@@ -50,12 +50,7 @@ _NUMBER_RULES = (
     ("dense_max_constraints", int, lambda value: value >= 1, "must be positive", False),
 )
 # Each option with a fixed set of values.
-_CHOICE_RULES = (
-    ("pgs_solve_readout", SOLVE_READOUTS),
-    ("pgs_velocity_drive_mode", ("active", "freeze")),
-    ("pgs_schedule", ("interleaved", "contact_then_internal", "physx_grasp")),
-    ("drive_mode", ("augmented", "physx_pgs")),
-)
+_CHOICE_RULES = (("pgs_solve_readout", SOLVE_READOUTS),)
 
 
 # The switches the solver applies as booleans.
@@ -77,8 +72,8 @@ _BOOLEANS = (
 class Options:
     """Every option of :class:`.SolverFeatherPGS`, as the solver applies it (:func:`check_options`).
 
-    Numbers are coerced and checked by the rule tables, choices checked, the switches of :data:`_BOOLEANS` made
-    booleans and ``pgs_velocity_iterations`` clamped at zero; every other option is as given.
+    Numbers are coerced and checked by the rule tables, choices checked and the switches of :data:`_BOOLEANS` made
+    booleans; every other option is as given.
     ``friction_anchor_beta`` is the request (``None`` for the default): the row laws resolve it.
     """
 
@@ -96,19 +91,15 @@ class Options:
     enable_joint_velocity_limits: Any
     velocity_limit_activation_fraction: float
     pgs_iterations: Any
-    pgs_velocity_iterations: int
     pgs_beta: Any
     pgs_cfm: Any
     pgs_omega: Any
     pgs_contact_regularization: float
-    pgs_velocity_drive_mode: str
     dense_max_constraints: int
     pgs_warmstart: bool
-    pgs_schedule: str
     mf_max_constraints: int
     nvtx: Any
     pgs_debug: Any
-    drive_mode: str
     row_watermark: bool
     restitution_velocity_threshold: float
     contact_speculative_scale: float
@@ -159,7 +150,6 @@ def check_options(options: Mapping[str, Any]) -> Options:
             "larger values are not numerically useful in the float32 solve"
         )
     checked.update({name: bool(options[name]) for name in _BOOLEANS})
-    checked["pgs_velocity_iterations"] = max(int(options["pgs_velocity_iterations"]), 0)
     checked["mf_max_constraints"] = int(options["mf_max_constraints"])
     checked["velocity_limit_law"] = check_velocity_limit_law(options["velocity_limit_law"])
     checked["contact_update"] = check_contact_update(options["contact_update"])

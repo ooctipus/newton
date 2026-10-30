@@ -329,16 +329,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 38 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 39th
+        declaration order, so a positional call over the 34 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 35th
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:39]}
-        self.assertEqual((parameters[1].name, parameters[38].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:35]}
+        self.assertEqual((parameters[1].name, parameters[34].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -364,9 +364,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[39].name, "pgs_solve_readout")
-        with self.assertRaisesRegex(TypeError, r"takes at most 40 positional arguments but 41 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[39].default)
+        self.assertEqual(parameters[35].name, "pgs_solve_readout")
+        with self.assertRaisesRegex(TypeError, r"takes at most 36 positional arguments but 37 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[35].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
@@ -846,7 +846,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"enable_joint_velocity_limits": True}, {}),
             # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers.
             patch_parallel,
-            ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # 320 dense rows stream the row metadata (5120 bytes); the two-world grid keeps row types and parents
             # resident, under either friction law.
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
@@ -914,8 +913,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     for tier in tiers["tiers"]:
                         expected = sweep_routes_tiers.tier_sweeps(tier["rows"], applied["pgs_iterations"])
                         self.assertEqual(tier["sweeps"], expected)
-                if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
-                    self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # The grouped kernel serves only sizes whose worlds' in-kernel tier rows it skips.
                 if solver._ink_skip_rows() == 0:
                     self.assertNotIn("grouped", {entry["route"] for entry in routes["stages"]["response"].values()})

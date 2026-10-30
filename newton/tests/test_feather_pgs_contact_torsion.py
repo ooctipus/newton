@@ -100,7 +100,6 @@ def fixture(
         # whether the optional spin radius is zero or positive.
         "friction_anchor_beta": 0.0,
         "pgs_iterations": 128,
-        "pgs_velocity_iterations": 0,
         "pgs_beta": 0.05,
         "pgs_cfm": 0,
         "pgs_contact_regularization": 0,
@@ -218,7 +217,6 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
             model,
             contact_torsion_radius=radius,
             pgs_iterations=64,
-            pgs_velocity_iterations=0,
             pgs_beta=0.05,
             pgs_cfm=0,
             pgs_contact_regularization=0,
@@ -543,7 +541,6 @@ class TestContactTorsion(unittest.TestCase):
             {"contact_torsion_shape_patterns": ("missing-label",)},
             {"contact_torsion_shape_indices": (), "contact_torsion_shape_patterns": ()},
             {"pgs_warmstart": True},
-            {"pgs_velocity_iterations": 1, "enable_bilateral_preelimination": True},
             {"pgs_debug": True},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):

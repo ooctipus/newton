@@ -39,34 +39,33 @@ from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_r
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, accumulated sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
 # its free-body form speed_row, whose last argument selects the accumulated total).
-_DENSE_PHASE = "ProjectionLaw::velocity_limit_update(old_impulse, residual, residual / denom, 1)"
 _DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, residual_vlim / denom, 1)"
 _SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim, 1)"
 _GENERATORS = {
     "mf_gs": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"has_drive_rows": True},
-        # Dense rows of a velocity-limit row phase, the end-of-iteration dense pass and free-body speed pass.
-        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
+        {},
+        # The end-of-iteration dense pass and free-body speed pass.
+        (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_without_dense_limits": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"has_drive_rows": False, "has_dense_velocity_limit_rows": False},
-        (_DENSE_PHASE, _SPEED_PASS),
+        {"has_dense_velocity_limit_rows": False},
+        (_SPEED_PASS,),
     ),
     "mf_gs_streamed": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"has_drive_rows": True, "stream_mf_impulses": True},
-        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
+        {"stream_mf_impulses": True},
+        (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_global_metadata": (
         sweep_routes.mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
-        {"has_drive_rows": True, "shared_metadata": False, "fuse_vel_limits": True},
-        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
+        {"shared_metadata": False},
+        (_DENSE_PASS, _SPEED_PASS),
     ),
     "sparse_limits": (
         sparse_kernel.__wrapped__,
@@ -210,7 +209,6 @@ def _cpu_arm():
 def _law_probe(**changes):
     """A stand-in for the row laws the sweep-law decision reads: a matrix-free solver's, with joint limits."""
     options = {
-        "pgs_schedule": "interleaved",
         "enable_joint_velocity_limits": True,
         "velocity_limit_activation_fraction": 0.0,
         "velocity_limit_law": "accumulated",
@@ -223,14 +221,12 @@ def _law_probe(**changes):
 
 
 class TestVelocityLimitLawOption(unittest.TestCase):
-    def test_sweep_law_follows_the_schedule_and_the_rows(self):
-        """Build the requested law where velocity-limit rows exist, except under PhysX's grasp schedule."""
+    def test_sweep_law_follows_the_rows(self):
+        """Build the requested law where velocity-limit rows exist."""
         decide = RowLaws.velocity_limit_sweep_law
         for changes, law, words in (
             ({}, "accumulated", "velocity_limit_law='accumulated'"),
             ({"velocity_limit_law": "stateless"}, "stateless", "velocity_limit_law='stateless'"),
-            ({"pgs_schedule": "contact_then_internal"}, "accumulated", "velocity_limit_law="),
-            ({"pgs_schedule": "physx_grasp"}, "stateless", "physx_grasp"),
             ({"enable_joint_velocity_limits": False}, "stateless", "No velocity-limit rows"),
             # Free-body velocity limits are rows of their own.
             (
@@ -326,7 +322,7 @@ class TestVelocityLimitLawReference(unittest.TestCase):
         np.testing.assert_allclose(results["stateless", (1, 0)], _CHAIN_SOLUTION, atol=1.0e-12)
 
 
-def _dense_row_values(device, *, order, row_phase, iterations, first_row=0, mass=_CHAIN_MASS):
+def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MASS):
     """Inputs of a matrix-free sweep kernel holding the chain's two velocity-limit rows in ``order``.
 
     The rows are packed (:mod:`.packed_rows`): whitened by the chain's leaf-first factor of ``mass``, at their
@@ -357,7 +353,7 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0, mass
         "general_world_grid_stride": 1,
         "use_general_world_queue": 0,
         "world_constraint_count": array([count], wp.int32),
-        # Every row is in the velocity-limit segment of a phase-5 launch.
+        # Every row is in the velocity-limit segment.
         "dense_phase_bounds": array([[0, count]], wp.int32),
         "local_solve_owner": zero_int,
         "world_dof_indices": array([[0, 1]], wp.int32),
@@ -387,14 +383,10 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0, mass
         "iterations": iterations,
         "omega": 1.0,
         "regularize": 0,
-        "row_phase": row_phase,
         "friction_start_iteration": 0,
         "iteration_offset": 0,
-        "freeze_drive_rows": 0,
         "v_out": array(_CHAIN_VELOCITY.astype(np.float32)),
     }
-    for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
-        values[f"world_drive_{name}"] = zero_float
     return values
 
 
@@ -428,29 +420,25 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
                 self.assertGreater(move, 0.05)
 
     def test_serial_sweeps_follow_the_reference_in_either_row_order(self):
-        """Run the chain's rows through the serial sweeps in both orders and both row phases.
+        """Run the chain's rows through the serial sweep in both orders.
 
-        Phase 0 visits velocity-limit rows in the end-of-iteration pass, phase 5 in
-        the main row loop (the velocity-limit phase of the PhysX-grasp
-        schedule). Reversing the row order moves the accumulated
-        result by at most 1e-6; the stateless law's move documents the
-        order-dependent over-braking the accumulated law removes.
+        The sweep visits velocity-limit rows in the end-of-iteration pass. Reversing the row
+        order moves the accumulated result by at most 1e-6; the stateless law's move documents
+        the order-dependent over-braking the accumulated law removes.
         """
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
         factories = {
-            "mf_gs": lambda law: sweep_routes.mf_gs_kernel(4, 1, 2, arch, has_drive_rows=False, velocity_limit_law=law),
+            "mf_gs": lambda law: sweep_routes.mf_gs_kernel(4, 1, 2, arch, velocity_limit_law=law),
         }
-        for (name, factory), law, row_phase in itertools.product(
-            factories.items(), ("stateless", "accumulated"), (0, 5)
-        ):
+        for (name, factory), law in itertools.product(factories.items(), ("stateless", "accumulated")):
             kernel = factory(law)
             velocities = {}
             for order in ((0, 1), (1, 0)):
-                values = _dense_row_values(device, order=order, row_phase=row_phase, iterations=64)
+                values = _dense_row_values(device, order=order, iterations=64)
                 wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
-                self._check_chain(values, velocities, order=order, law=law, kernel=name, row_phase=row_phase)
-            self._check_order_move(velocities, law=law, kernel=name, row_phase=row_phase)
+                self._check_chain(values, velocities, order=order, law=law, kernel=name)
+            self._check_order_move(velocities, law=law, kernel=name)
 
 
 def _pushed_arm(device, limit):

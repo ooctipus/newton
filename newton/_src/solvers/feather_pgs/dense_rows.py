@@ -119,14 +119,11 @@ by the rows' build), and the dense records' kind, friction parent, coefficient, 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 
 
-def bind_mf(solver, **records):
-    """Bind the solver's matrix-free row records into an :data:`MfRows` (``records`` replace records by name)."""
-    return field_group.bind(MfRows, solver=solver, **records)
+def bind_mf(solver):
+    """Bind the solver's matrix-free row records into an :data:`MfRows`."""
+    return field_group.bind(MfRows, solver=solver)
 
 
-def bind(solver, data=None, **records):
-    """Bind the solver's dense row records into a :data:`DenseRows` (``data``: an instance to refill).
-
-    ``records`` replace records by field name, such as another ``rhs`` for the velocity pass.
-    """
-    return field_group.bind(DenseRows, data, solver=solver, **records)
+def bind(solver, data=None):
+    """Bind the solver's dense row records into a :data:`DenseRows` (``data``: an instance to refill)."""
+    return field_group.bind(DenseRows, data, solver=solver)

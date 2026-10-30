@@ -36,8 +36,6 @@ def _serial_prescale(
     joint_dof_dim: wp.array2d[int],
     joint_velocity_limit: wp.array[float],
     body_flags: wp.array[wp.int32],
-    drive_slot: wp.array[int],
-    skip_driven: int,
     # in/out
     joint_qd: wp.array[float],
 ):
@@ -60,9 +58,6 @@ def _serial_prescale(
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
             limit = joint_velocity_limit[dof]
             qd_abs = wp.abs(joint_qd[dof])
             if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
@@ -87,9 +82,6 @@ def _serial_prescale(
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
             joint_qd[dof] = joint_qd[dof] * ratio
 
 
@@ -114,7 +106,6 @@ _ARRAYS = (
     "joint_dof_dim",
     "joint_velocity_limit",
     "body_flags",
-    "drive_slot",
 )
 # Random layouts: seed, articulation count, joints ahead of the first articulation and the
 # interval of articulations longer than a warp (0: none).
@@ -195,40 +186,38 @@ def _layout(seed: int, articulations: int, *, leading_joints: int = 0, long_ever
         "joint_dof_dim": dof_dim,
         "joint_velocity_limit": limit.astype(np.float32),
         "body_flags": np.where(kinematic, int(BodyFlags.KINEMATIC), int(BodyFlags.DYNAMIC)).astype(np.int32),
-        "drive_slot": np.where(rng.random(max(dof_count, 1)) < 0.3, 1, -1).astype(np.int32),
         "joint_qd": qd,
     }
 
 
-def _serial(layout: dict, skip_driven: int, device) -> np.ndarray:
+def _serial(layout: dict, device) -> np.ndarray:
     """Scale a copy of the velocities in place with the serial reference."""
     arrays = [wp.array(layout[name], device=device) for name in _ARRAYS]
     reference = wp.array(layout["joint_qd"], device=device)
     wp.launch(
         _serial_prescale,
         dim=len(layout["articulation_start"]) - 1,
-        inputs=[*arrays, skip_driven],
+        inputs=arrays,
         outputs=[reference],
         device=device,
     )
     return reference.numpy()
 
 
-def _lanes(layout: dict, skip_driven: int, device, lanes: int) -> tuple[np.ndarray, np.ndarray]:
+def _lanes(layout: dict, device, lanes: int) -> tuple[np.ndarray, np.ndarray]:
     """Return the lane kernel's output, every DOF prefilled as unwritten, and its input afterwards.
 
     The launch covers complete warps. CPU threads cannot exchange ratios, so with more than one lane
     a CPU launch scales each lane's joints by that lane's own ratio.
     """
     count = len(layout["articulation_start"]) - 1
-    joints = field_group.upload(JointTable, device, **{name: layout[name] for name in _ARRAYS[:-1]})
-    drive_slot = wp.array(layout["drive_slot"], device=device)
+    joints = field_group.upload(JointTable, device, **{name: layout[name] for name in _ARRAYS})
     joint_qd = wp.array(layout["joint_qd"], device=device)
     output = wp.full(len(layout["joint_qd"]), _UNWRITTEN, dtype=float, device=device)
     wp.launch(
         prescale_joint_velocity_limits,
         dim=(count * lanes + 31) // 32 * 32,
-        inputs=[joints, count, lanes, drive_slot, skip_driven, joint_qd],
+        inputs=[joints, count, lanes, joint_qd],
         outputs=[output],
         device=device,
     )
@@ -244,9 +233,7 @@ def _emulated_axis_count(layout: dict, joint: int) -> int:
     return int(layout["joint_dof_dim"][joint].sum())
 
 
-def _emulate_lanes(
-    layout: dict, skip_driven: int, lanes: int, *, combine: bool
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _emulate_lanes(layout: dict, lanes: int, *, combine: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Replay in NumPy, in thread order, every thread of a complete-warp lane launch.
 
     Thread ``tid`` is lane ``tid % lanes`` of articulation ``tid // lanes``; threads past the last
@@ -259,16 +246,13 @@ def _emulate_lanes(
         DOF and the ratio of each thread.
     """
     start, qd_start = layout["articulation_start"], layout["joint_qd_start"]
-    qd, limit, drive = layout["joint_qd"], layout["joint_velocity_limit"], layout["drive_slot"]
+    qd, limit = layout["joint_qd"], layout["joint_velocity_limit"]
     count = len(start) - 1
     threads = (count * lanes + 31) // 32 * 32
     joints = [
         (int(start[tid // lanes]), int(start[tid // lanes + 1])) if tid // lanes < count else (0, 0)
         for tid in range(threads)
     ]
-
-    def skipped(dof: int) -> bool:
-        return skip_driven != 0 and drive[dof] >= 0
 
     ratios = np.ones(threads, dtype=np.float32)
     # A tiny speed under a huge limit overflows to an infinite quotient, as in the kernel.
@@ -278,7 +262,7 @@ def _emulate_lanes(
                 begin = int(qd_start[joint])
                 for dof in range(begin, begin + _emulated_axis_count(layout, joint)):
                     speed = np.abs(qd[dof])
-                    if not skipped(dof) and limit[dof] > 0.0 and np.isfinite(limit[dof]) and speed > 0.0:
+                    if limit[dof] > 0.0 and np.isfinite(limit[dof]) and speed > 0.0:
                         scale = limit[dof] / speed
                         if scale < ratios[tid]:
                             ratios[tid] = scale
@@ -306,9 +290,7 @@ def _emulate_lanes(
                 for joint in range(first + lane, end, lanes):
                     begin = int(qd_start[joint])
                     scaled_end = begin + _emulated_axis_count(layout, joint)
-                    dofs += [
-                        (dof, dof < scaled_end and not skipped(dof)) for dof in range(begin, int(qd_start[joint + 1]))
-                    ]
+                    dofs += [(dof, dof < scaled_end) for dof in range(begin, int(qd_start[joint + 1]))]
             else:
                 dofs += [(dof, False) for dof in range(int(qd_start[first]) + lane, int(qd_start[end]), lanes)]
             for dof, scaled in dofs:
@@ -371,9 +353,8 @@ def _solver_model(device) -> newton.Model:
     return model
 
 
-def _model_layout(model: newton.Model, joint_qd: np.ndarray, drive_slot: np.ndarray) -> dict:
-    layout = {name: getattr(model, name).numpy() for name in _ARRAYS if name != "drive_slot"}
-    layout["drive_slot"] = drive_slot
+def _model_layout(model: newton.Model, joint_qd: np.ndarray) -> dict:
+    layout = {name: getattr(model, name).numpy() for name in _ARRAYS}
     layout["joint_qd"] = joint_qd
     return layout
 
@@ -404,22 +385,21 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         for seed, articulations, leading, long_every in _CASES:
             layout = _layout(seed, articulations, leading_joints=leading, long_every=long_every)
             dof_ranges = list(itertools.pairwise(layout["joint_qd_start"][layout["articulation_start"]].tolist()))
-            for skip_driven in (0, 1):
-                expected = _serial(layout, skip_driven, device)
-                changed = expected.view(np.uint32) != layout["joint_qd"].view(np.uint32)
-                scaled += int(np.count_nonzero(changed))
-                unscaled += int(np.count_nonzero(~changed))
-                for first, end in dof_ranges:
-                    if end > first:
-                        if changed[first:end].any():
-                            scaled_articulations += 1
-                        else:
-                            copied_articulations += 1
-                for lanes in lane_widths:
-                    actual, source = _lanes(layout, skip_driven, device, lanes)
-                    message = f"seed={seed} skip_driven={skip_driven} lanes={lanes}"
-                    _assert_bits_equal(actual, expected, message)
-                    _assert_bits_equal(source, layout["joint_qd"], message)
+            expected = _serial(layout, device)
+            changed = expected.view(np.uint32) != layout["joint_qd"].view(np.uint32)
+            scaled += int(np.count_nonzero(changed))
+            unscaled += int(np.count_nonzero(~changed))
+            for first, end in dof_ranges:
+                if end > first:
+                    if changed[first:end].any():
+                        scaled_articulations += 1
+                    else:
+                        copied_articulations += 1
+            for lanes in lane_widths:
+                actual, source = _lanes(layout, device, lanes)
+                message = f"seed={seed} lanes={lanes}"
+                _assert_bits_equal(actual, expected, message)
+                _assert_bits_equal(source, layout["joint_qd"], message)
         # Both the scaling and the copying branches ran.
         self.assertGreater(scaled, 100)
         self.assertGreater(unscaled, 100)
@@ -452,26 +432,25 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         for seed, articulations, leading, long_every in _CASES:
             layout = _layout(seed, articulations, leading_joints=leading, long_every=long_every)
             count = len(layout["articulation_start"]) - 1
-            for skip_driven in (0, 1):
-                expected = _serial(layout, skip_driven, "cpu")
-                for lanes in _LANE_WIDTHS:
-                    message = f"seed={seed} skip_driven={skip_driven} lanes={lanes}"
-                    combined, writes, ratios = _emulate_lanes(layout, skip_driven, lanes, combine=True)
-                    _assert_bits_equal(combined, expected, message)
-                    np.testing.assert_array_equal(writes, 1, err_msg=message)
-                    group_bits = ratios[: count * lanes].view(np.uint32).reshape(count, lanes)
-                    np.testing.assert_array_equal(
-                        group_bits, np.broadcast_to(group_bits[:, :1], group_bits.shape), err_msg=message
-                    )
+            expected = _serial(layout, "cpu")
+            for lanes in _LANE_WIDTHS:
+                message = f"seed={seed} lanes={lanes}"
+                combined, writes, ratios = _emulate_lanes(layout, lanes, combine=True)
+                _assert_bits_equal(combined, expected, message)
+                np.testing.assert_array_equal(writes, 1, err_msg=message)
+                group_bits = ratios[: count * lanes].view(np.uint32).reshape(count, lanes)
+                np.testing.assert_array_equal(
+                    group_bits, np.broadcast_to(group_bits[:, :1], group_bits.shape), err_msg=message
+                )
 
-                    uncombined, writes, _ = _emulate_lanes(layout, skip_driven, lanes, combine=False)
-                    actual, source = _lanes(layout, skip_driven, "cpu", lanes)
-                    single = writes <= 1
-                    _assert_bits_equal(actual[single], uncombined[single], message)
-                    _assert_bits_equal(source, layout["joint_qd"], message)
-                    if lanes > 1:
-                        errors = uncombined.view(np.uint32) != expected.view(np.uint32)
-                        uncombined_errors[lanes] += int(np.count_nonzero(errors))
+                uncombined, writes, _ = _emulate_lanes(layout, lanes, combine=False)
+                actual, source = _lanes(layout, "cpu", lanes)
+                single = writes <= 1
+                _assert_bits_equal(actual[single], uncombined[single], message)
+                _assert_bits_equal(source, layout["joint_qd"], message)
+                if lanes > 1:
+                    errors = uncombined.view(np.uint32) != expected.view(np.uint32)
+                    uncombined_errors[lanes] += int(np.count_nonzero(errors))
         for lanes, errors in uncombined_errors.items():
             self.assertGreater(errors, 100, f"lanes={lanes}")
 
@@ -483,15 +462,15 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 layout["joint_dof_dim"][:] = 0
                 layout["joint_qd_start"][:] = 0
                 layout["joint_qd"] = np.zeros(0, dtype=np.float32)
-                actual, _ = _lanes(layout, 0, device, _lane_width(device))
+                actual, _ = _lanes(layout, device, _lane_width(device))
                 self.assertEqual(actual.shape, (0,))
 
                 # Every joint precedes the only articulation, which is empty.
                 layout = _layout(1, 0, leading_joints=5)
                 layout["articulation_start"] = np.array([5, 5], dtype=np.int32)
                 layout["joint_velocity_limit"][:] = 1.0e-3
-                actual, _ = _lanes(layout, 0, device, _lane_width(device))
-                _assert_bits_equal(actual, _serial(layout, 0, device))
+                actual, _ = _lanes(layout, device, _lane_width(device))
+                _assert_bits_equal(actual, _serial(layout, device))
                 _assert_bits_equal(actual, layout["joint_qd"])
 
     def test_launch_covers_complete_warps(self):
@@ -544,10 +523,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 with _recording_copies(destinations):
                     solver._launch_velocity_prescale(state.joint_qd, solver.qd_work)
                 self.assertEqual(destinations, [])
-                drive_slot = solver.laws.vel_limit_drive_slot_arg.numpy()
-                expected = _serial(
-                    _model_layout(model, joint_qd, drive_slot), solver.laws.vel_limit_skip_driven, device
-                )
+                expected = _serial(_model_layout(model, joint_qd), device)
                 self.assertFalse(np.array_equal(expected, joint_qd))
                 _assert_bits_equal(solver.qd_work.numpy(), expected)
                 _assert_bits_equal(state.joint_qd.numpy(), joint_qd)
@@ -556,49 +532,35 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
     def test_stage1_prescales_without_a_separate_copy_cuda(self):
         """Write the stage-1 velocity in the prescale launch alone and record the lane width."""
         for device in wp.get_cuda_devices():
-            for drive_mode in ("augmented", "physx_pgs"):
-                with self.subTest(device=str(device), drive_mode=drive_mode):
-                    model = _solver_model(device)
-                    solver = SolverFeatherPGS(
-                        model,
-                        enable_joint_velocity_limits=True,
-                        drive_mode=drive_mode,
-                    )
-                    # The fused clamp skips driven DOFs; only physx_pgs drives allocate drive rows.
-                    self.assertEqual(solver.laws.vel_limit_skip_driven, int(drive_mode == "physx_pgs"))
-                    lanes, threads = velocity_prescale_launch(
-                        model.articulation_start.numpy(), joint_count=model.joint_count, cuda=True
-                    )
-                    self.assertEqual(
-                        (solver.laws.velocity_prescale_lanes, solver.laws.velocity_prescale_threads), (lanes, threads)
-                    )
-                    self.assertEqual(threads % 32, 0)
-                    routes = solver.get_path_selection()["routes"]
-                    self.assertEqual(routes["velocity_limits"]["prescale_lanes"], lanes)
+            with self.subTest(device=str(device)):
+                model = _solver_model(device)
+                solver = SolverFeatherPGS(model, enable_joint_velocity_limits=True)
+                lanes, threads = velocity_prescale_launch(
+                    model.articulation_start.numpy(), joint_count=model.joint_count, cuda=True
+                )
+                self.assertEqual(
+                    (solver.laws.velocity_prescale_lanes, solver.laws.velocity_prescale_threads), (lanes, threads)
+                )
+                self.assertEqual(threads % 32, 0)
+                routes = solver.get_path_selection()["routes"]
+                self.assertEqual(routes["velocity_limits"]["prescale_lanes"], lanes)
 
-                    dofs = model.joint_dof_count
-                    joint_qd = (np.random.default_rng(7).normal(size=dofs) * 3.0).astype(np.float32)
-                    drive_slot = np.full(dofs, -1, dtype=np.int32)
-                    if solver.laws.vel_limit_skip_driven:
-                        # A previous step allocated drive rows for every other DOF.
-                        drive_slot[::2] = np.arange((dofs + 1) // 2, dtype=np.int32)
-                        solver.laws.drive_slot.assign(drive_slot)
-                    state, following = model.state(), model.state()
-                    state.joint_qd.assign(joint_qd)
-                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                    solver._prepare_augmented_state(state, following, model.control())
-                    solver.qd_work.fill_(_UNWRITTEN)
-                    destinations = []
-                    with _recording_copies(destinations):
-                        stage3_qd = solver._stage1_fk_id(state, solver, following)
-                    self.assertIs(stage3_qd, solver.qd_work)
-                    self.assertFalse(any(destination is solver.qd_work for destination in destinations))
-                    expected = _serial(
-                        _model_layout(model, joint_qd, drive_slot), solver.laws.vel_limit_skip_driven, device
-                    )
-                    self.assertFalse(np.array_equal(expected, joint_qd))
-                    _assert_bits_equal(solver.qd_work.numpy(), expected)
-                    _assert_bits_equal(state.joint_qd.numpy(), joint_qd)
+                dofs = model.joint_dof_count
+                joint_qd = (np.random.default_rng(7).normal(size=dofs) * 3.0).astype(np.float32)
+                state, following = model.state(), model.state()
+                state.joint_qd.assign(joint_qd)
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                solver._prepare_augmented_state(state, following, model.control())
+                solver.qd_work.fill_(_UNWRITTEN)
+                destinations = []
+                with _recording_copies(destinations):
+                    stage3_qd = solver._stage1_fk_id(state, solver, following)
+                self.assertIs(stage3_qd, solver.qd_work)
+                self.assertFalse(any(destination is solver.qd_work for destination in destinations))
+                expected = _serial(_model_layout(model, joint_qd), device)
+                self.assertFalse(np.array_equal(expected, joint_qd))
+                _assert_bits_equal(solver.qd_work.numpy(), expected)
+                _assert_bits_equal(state.joint_qd.numpy(), joint_qd)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Joint velocity limits require the CUDA matrix-free mode")
     def test_captured_owner_route_prescales_bitwise_cuda(self):
@@ -619,7 +581,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         with patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
             solver = SolverFeatherPGS(
                 model,
-                drive_mode="augmented",
                 enable_joint_limits=True,
                 enable_joint_velocity_limits=True,
                 friction_anchor_beta=friction_anchor_beta,
@@ -683,7 +644,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         self.assertEqual(len(predicted), 2)
         self.assertTrue(all(prescaled is solver.qd_work for prescaled in launches))
 
-        drive_slot = solver.laws.vel_limit_drive_slot_arg.numpy()
         scaled = 0
         for replay in range(3):
             # An episode reset between env steps, as a training loop does.
@@ -692,7 +652,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             wp.capture_launch(capture.graph)
             for substep in range(2):
                 source = inputs[substep].numpy()
-                expected = _serial(_model_layout(model, source, drive_slot), solver.laws.vel_limit_skip_driven, device)
+                expected = _serial(_model_layout(model, source), device)
                 _assert_bits_equal(consumed[substep].numpy(), expected, f"replay={replay} substep={substep}")
                 scaled += int(np.count_nonzero(expected != source))
         self.assertGreater(scaled, 0)

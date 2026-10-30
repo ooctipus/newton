@@ -45,10 +45,6 @@ RADIUS = 0.1
 # the contact normal; spin parallel to the slide cannot excite the term.
 OMEGA_Y = 20.0
 SLIDE_VX = 2.0
-# pgs_velocity_iterations of each run: the velocity post-pass (CUDA only) converts velocity to acceleration at two
-# more patched sites
-SLIDER_CONFIGS = [0]
-SLIDER_CONFIGS_CUDA = [2]
 
 
 @wp.kernel
@@ -82,7 +78,7 @@ def _build_slider(device):
     return builder.finalize(device=device)
 
 
-def _slide_heights(model, omega_y, velocity_iterations=0):
+def _slide_heights(model, omega_y):
     """Slide the sphere at ``SLIDE_VX`` while spinning at ``omega_y``.
 
     Returns per-step COM heights [m] and the peak live contact count, so the
@@ -96,11 +92,7 @@ def _slide_heights(model, omega_y, velocity_iterations=0):
     state_0.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
 
-    solver = SolverFeatherPGS(
-        model,
-        angular_damping=0.0,
-        pgs_velocity_iterations=velocity_iterations,
-    )
+    solver = SolverFeatherPGS(model, angular_damping=0.0)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     control = model.control()
@@ -154,21 +146,16 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         agreeing the trajectories match to solver precision.
         """
         device = wp.get_device()
-        configs = list(SLIDER_CONFIGS)
-        if device.is_cuda:
-            configs += SLIDER_CONFIGS_CUDA
-        for vel_iters in configs:
-            with self.subTest(velocity_iterations=vel_iters):
-                model = _build_slider(device)
-                still, contacts_still = _slide_heights(model, 0.0, vel_iters)
-                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, vel_iters)
-                # the comparison is vacuous unless both runs really ride on
-                # active contact rows at the rest height
-                self.assertGreater(min(contacts_still, contacts_spin), 0, "no contacts were generated")
-                for label, h in (("still", still), ("spinning", spinning)):
-                    self.assertLess(float(np.abs(h - RADIUS).max()), 2e-3, f"{label} run left the ground support band")
-                divergence = float(np.abs(spinning - still).max())
-                self.assertLess(divergence, 1e-4, f"spin changed a frictionless slide by {divergence} m")
+        model = _build_slider(device)
+        still, contacts_still = _slide_heights(model, 0.0)
+        spinning, contacts_spin = _slide_heights(model, OMEGA_Y)
+        # the comparison is vacuous unless both runs really ride on
+        # active contact rows at the rest height
+        self.assertGreater(min(contacts_still, contacts_spin), 0, "no contacts were generated")
+        for label, h in (("still", still), ("spinning", spinning)):
+            self.assertLess(float(np.abs(h - RADIUS).max()), 2e-3, f"{label} run left the ground support band")
+        divergence = float(np.abs(spinning - still).max())
+        self.assertLess(divergence, 1e-4, f"spin changed a frictionless slide by {divergence} m")
 
     def _anchored_spinner_drift(self, child_xform, com, omega=(0.0, 0.0, 10.0)):
         """Max world COM drift [m] of a force-free spinner with an offset joint anchor."""
@@ -388,25 +375,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         expected_conversion_grad[0] = -3.0
         np.testing.assert_array_equal(qdd.numpy(), np.zeros(6, dtype=np.float32))
         np.testing.assert_allclose(qd_conversion.grad.numpy(), expected_conversion_grad, rtol=1e-6, atol=1e-7)
-
-    def test_final_velocity_conversion_stores_transport_adjusted_qdd(self):
-        """Keep the final velocity-postpass conversion observable and wired."""
-        device = wp.get_device()
-        model = _build_slider(device)
-        solver = SolverFeatherPGS(model, angular_damping=0.0)
-        state_in, state_out = model.state(), model.state()
-        state_aug = solver._prepare_augmented_state(state_in, state_out, model.control())
-
-        qd_np = np.array((2.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
-        target_np = np.array((1.8, 0.1, -0.15, 0.05, 19.5, 0.25), dtype=np.float32)
-        state_in.joint_qd.assign(qd_np)
-        solver.v_out.assign(target_np)
-        solver._stage6_write_final_velocity(state_in, state_aug, state_out, DT)
-
-        expected_qdd = (target_np - qd_np) / DT
-        expected_qdd[0:3] -= np.cross(qd_np[3:6], qd_np[0:3])
-        np.testing.assert_allclose(state_aug.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
-        np.testing.assert_allclose(state_out.joint_qd.numpy(), target_np, rtol=1e-6, atol=1e-7)
 
     def test_captured_step_matches_uncaptured(self):
         """Replaying a captured collide+step reproduces the uncaptured trajectory.

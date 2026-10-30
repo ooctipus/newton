@@ -28,7 +28,7 @@ ROW_SLOT_UNBOUNDED = 2**31 - 1
 
 DOF_WORK = FieldGroup(
     Field("v_hat", wp.float32, ("dof",)),
-    Field("v_out", wp.float32, ("dof",), mirror=True),
+    Field("v_out", wp.float32, ("dof",)),
     Field("qd_work", wp.float32, ("dof",)),
     Field("v_mf_accum", wp.float32, ("dof",)),
     Field("v_out_snap", wp.float32, ("dof",)),
@@ -121,43 +121,31 @@ the packed rows instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) pla
 # ---------------------------------------------------------------------------------------------------------------------
 
 DENSE_ROWS = FieldGroup(
-    Field("rhs", wp.float32, ("world", "row"), mirror=True),
-    Field("rhs_unbiased", wp.float32, ("world", "row")),
-    Field("impulses", wp.float32, ("world", "row"), mirror=True),
-    Field("diag", wp.float32, ("world", "row"), mirror=True),
-    Field("row_type", wp.int32, ("world", "row"), mirror=True),
-    Field("row_parent", wp.int32, ("world", "row"), fill=-1, mirror=True),
-    Field("row_mu", wp.float32, ("world", "row"), mirror=True),
+    Field("rhs", wp.float32, ("world", "row")),
+    Field("impulses", wp.float32, ("world", "row")),
+    Field("diag", wp.float32, ("world", "row")),
+    Field("row_type", wp.int32, ("world", "row")),
+    Field("row_parent", wp.int32, ("world", "row"), fill=-1),
+    Field("row_mu", wp.float32, ("world", "row")),
     Field("row_restitution", wp.float32, ("world", "row")),
     Field("row_beta", wp.float32, ("world", "row")),
     Field("row_cfm", wp.float32, ("world", "row")),
-    Field("phi", wp.float32, ("world", "row"), mirror=True),
-    Field("target_velocity", wp.float32, ("world", "row"), mirror=True),
-    Field("drive_stiffness", wp.float32, ("world", "row")),
-    Field("drive_damping", wp.float32, ("world", "row")),
-    Field("drive_geom_error", wp.float32, ("world", "row")),
-    Field("drive_max_force", wp.float32, ("world", "row")),
-    Field("drive_target_vel_bias", wp.float32, ("world", "row"), mirror=True),
-    Field("drive_vel_multiplier", wp.float32, ("world", "row"), mirror=True),
-    Field("drive_impulse_multiplier", wp.float32, ("world", "row"), mirror=True),
-    Field("drive_max_impulse", wp.float32, ("world", "row"), mirror=True),
-    Field("constraint_count", wp.int32, ("world",), mirror=True),
+    Field("phi", wp.float32, ("world", "row")),
+    Field("target_velocity", wp.float32, ("world", "row")),
+    Field("constraint_count", wp.int32, ("world",)),
     Field("_row_sides", wp.vec2i, ("world", "row"), grad=False),
 )
-"""Every world's dense rows: the system, the row records (with each row's sides) and the PhysX drive coefficients."""
+"""Every world's dense rows: the system and the row records (with each row's sides)."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, grad=False))
 """Per-row regularization weights (speculative and restitution rows keep the rigid law)."""
-
-DENSE_DRIVE_LIMITS = FieldGroup(Field("drive_vel_limit", wp.float32, ("world", "row")))
-"""Per-row joint velocity limits of the fused drive-row clamp."""
 
 DENSE_DELASSUS = FieldGroup(Field("C", wp.float32, ("world", "row", "row")))
 """The assembled Delassus matrices of the CPU's split mode."""
 
 WORLD_RESPONSE = FieldGroup(
-    Field("J_world", wp.float32, ("world", "row", "world_dof"), mirror=True),
-    Field("Y_world", wp.float32, ("world", "row", "world_dof"), mirror=True),
+    Field("J_world", wp.float32, ("world", "row", "world_dof")),
+    Field("Y_world", wp.float32, ("world", "row", "world_dof")),
 )
 """World-indexed Jacobian and response of the CUDA (matrix-free) route."""
 
@@ -181,9 +169,8 @@ WORLD_ROW_STATE = FieldGroup(
     Field("slot_counter", wp.int32, ("world",)),
     Field("_dense_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, grad=False),
     # Per-world dense row-family boundaries, snapshotted from slot_counter each step. The dense slot layout is
-    # [drive][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the drive and position-limit
-    # prefix (row_phase 3), [world, 1] the velocity-limit segment (row_phase 5), and contacts/friction occupy
-    # [bounds[world, 1], m_dense) (row_phase 4).
+    # [mimic][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the mimic and position-limit
+    # prefix, [world, 1] the velocity-limit segment, and contacts/friction occupy [bounds[world, 1], m_dense).
     Field("dense_phase_bounds", wp.int32, ("world", 2), grad=False),
     # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
     Field("mf_contact_rows_end", wp.int32, ("world",), grad=False),
@@ -202,9 +189,6 @@ VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_sign", wp.float32, ("limit_row",), owner="laws"),
 )
 """Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
-
-DRIVE_SLOTS = FieldGroup(Field("drive_slot", wp.int32, ("dof",), fill=-1, owner="laws"))
-"""Each DOF's PhysX drive row slot."""
 
 DENSE_CONTACT_UNITS = FieldGroup(
     Field("_dense_unit_state", wp.float32, ("world", "row", "unit_fields"), grad=False),
@@ -281,29 +265,28 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
 # ---------------------------------------------------------------------------------------------------------------------
 
 MF_COUNTERS = FieldGroup(
-    Field("mf_constraint_count", wp.int32, ("world",), mirror=True),
+    Field("mf_constraint_count", wp.int32, ("world",)),
     Field("mf_slot_counter", wp.int32, ("world",)),
     Field("_mf_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, grad=False),
 )
 """Per-world matrix-free row counts, reservation counter and first rejected slot."""
 
 MF_ROWS = FieldGroup(
-    Field("mf_body_a", wp.int32, ("world", "mf_row"), mirror=True),
-    Field("mf_body_b", wp.int32, ("world", "mf_row"), mirror=True),
-    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), mirror=True),
-    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), mirror=True),
-    Field("mf_rhs", wp.float32, ("world", "mf_row"), mirror=True),
-    Field("mf_rhs_unbiased", wp.float32, ("world", "mf_row")),
-    Field("mf_impulses", wp.float32, ("world", "mf_row"), mirror=True),
-    Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row"), mirror=True),
-    Field("mf_row_type", wp.int32, ("world", "mf_row"), mirror=True),
-    Field("mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1, mirror=True),
-    Field("mf_row_mu", wp.float32, ("world", "mf_row"), mirror=True),
-    Field("mf_phi", wp.float32, ("world", "mf_row"), mirror=True),
+    Field("mf_body_a", wp.int32, ("world", "mf_row")),
+    Field("mf_body_b", wp.int32, ("world", "mf_row")),
+    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_rhs", wp.float32, ("world", "mf_row")),
+    Field("mf_impulses", wp.float32, ("world", "mf_row")),
+    Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row")),
+    Field("mf_row_type", wp.int32, ("world", "mf_row")),
+    Field("mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1),
+    Field("mf_row_mu", wp.float32, ("world", "mf_row")),
+    Field("mf_phi", wp.float32, ("world", "mf_row")),
     Field("mf_row_restitution", wp.float32, ("world", "mf_row")),
     Field("mf_row_incident", wp.float32, ("world", "mf_row")),
-    Field("mf_dof_a", wp.int32, ("world", "mf_row"), mirror=True),
-    Field("mf_dof_b", wp.int32, ("world", "mf_row"), mirror=True),
+    Field("mf_dof_a", wp.int32, ("world", "mf_row")),
+    Field("mf_dof_b", wp.int32, ("world", "mf_row")),
     Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), grad=False),
 )
 """Every world's matrix-free (free-body) rows. Each side's six entries hold the row's Jacobian ``J`` as the writers

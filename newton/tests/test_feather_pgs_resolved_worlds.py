@@ -534,11 +534,10 @@ def _admissible_solver():
             body_response_dof_mask=1,
             body_has_response_dofs=1,
         ),
-        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, connect_count=0, drive_slot=None, joint_limit_q_index=1),
+        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, connect_count=0, joint_limit_q_index=1),
         options=SimpleNamespace(enable_bilateral_preelimination=False),
     )
     for name in (
-        "fuse_joint_velocity_limits",
         "_fused_diagonal_joint_limits",
         "_sparse_diagonal_contact_solve",
         "_compact_contact_boundary",

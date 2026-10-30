@@ -41,7 +41,7 @@ from .sweep import (
     jacobi_scale,
     jacobi_sweeps,
 )
-from .sweep_routes import _PHASE_DENSE_KINDS, MF_GS_ABI
+from .sweep_routes import MF_GS_ABI
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -91,21 +91,12 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     return max(1, min(raw, TIER_SWEEPS_CAP))
 
 
-def _phase_admission() -> str:
-    """Clear ``admit`` for a row its row phase does not visit (velocity-limit rows stay in every phase but 3 and 4)."""
-    return "\n".join(
-        f"if (row_phase == {phase} && " + " && ".join(f"row_type != {kind}" for kind in kinds) + ") admit = 0;"
-        for phase, kinds in _PHASE_DENSE_KINDS.items()
-    )
-
-
 def _operands(
     max_constraints: int,
     max_world_dofs: int,
     *,
     rows: int,
     min_rows: int,
-    has_drive_rows: bool,
     inkernel_response: tuple[int, int, int, int],
     row_inputs,
 ):
@@ -124,8 +115,6 @@ def _operands(
     if int(min_rows) < 0 or int(min_rows) >= AM:
         raise ValueError("min_rows must be in [0, rows)")
     operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
-    if operands is not None and has_drive_rows:
-        raise ValueError("generated factor rows require the parallel law without drive rows")
     return groups, operands
 
 
@@ -137,7 +126,6 @@ def parallel_source(
     sweeps: int,
     inkernel_response: tuple[int, int, int, int],
     min_rows: int = 0,
-    has_drive_rows: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -161,7 +149,6 @@ def parallel_source(
         max_world_dofs,
         rows=rows,
         min_rows=min_rows,
-        has_drive_rows=has_drive_rows,
         inkernel_response=inkernel_response,
         row_inputs=row_inputs,
     )
@@ -169,8 +156,8 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(drive=has_drive_rows, velocity_limit_law="accumulated", regularize=False, policy=solve_policy)
-    store = JacobiRows(AM, NT, drive=has_drive_rows, limits=velocity_limit_pass, types=solve_policy.traces)
+    laws = RowLaws(velocity_limit_law="accumulated", regularize=False, policy=solve_policy)
+    store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces)
     whitened = WhitenedRows(
         NA,
         NB,
@@ -190,7 +177,7 @@ def parallel_source(
     if solve_policy.traces and NT > 32:
         trace_reduction, trace = block_argmax(NT // 32, warp="WARP", lane="(int)(threadIdx.x & 31)")
     staging = Staging(
-        (Buffer("s_v", "float", D), *store.buffers(), *op.buffers(AM), *dot, *store.drive_buffers(), *trace),
+        (Buffer("s_v", "float", D), *store.buffers(), *op.buffers(AM), *dot, *trace),
         threads=NT,
     )
     metadata = {
@@ -204,7 +191,6 @@ def parallel_source(
     loads = store.loads(
         **metadata,
         unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT) if laws.accumulated else (CONTACT, JOINT_LIMIT),
-        admission=_phase_admission(),
     )
 
     def scale(aii, bound, pad):
@@ -257,7 +243,6 @@ def parallel_kernel(
     sweeps: int,
     inkernel_response: tuple[int, int, int, int],
     min_rows: int = 0,
-    has_drive_rows: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
     velocity_limit_pass: bool = False,
@@ -274,7 +259,6 @@ def parallel_kernel(
     options = {
         "rows": rows,
         "min_rows": min_rows,
-        "has_drive_rows": has_drive_rows,
         "inkernel_response": inkernel_response,
         "row_inputs": row_inputs,
     }
@@ -294,7 +278,6 @@ def parallel_kernel(
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
-        f"_hd{int(bool(has_drive_rows))}"
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
         + solve_policy.suffix

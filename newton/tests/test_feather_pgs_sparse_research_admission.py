@@ -41,9 +41,6 @@ class _LawsProbe(SimpleNamespace):
             compliance=options.contact_compliance,
             limits=True,
             velocity_limits=options.enable_joint_velocity_limits,
-            drives=options.drive_mode,
-            schedule=options.pgs_schedule,
-            velocity_pass=options.pgs_velocity_iterations != 0,
             warm_start=options.pgs_warmstart,
             debug_rows=options.pgs_debug,
             preelimination=False,
@@ -66,10 +63,7 @@ def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
     forest = _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=False)
     options = SimpleNamespace(
-        pgs_schedule="interleaved",
-        drive_mode="augmented",
         pgs_iterations=8,
-        pgs_velocity_iterations=0,
         enable_joint_velocity_limits=False,
         pgs_warmstart=False,
         pgs_debug=False,
@@ -217,7 +211,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 model = _branched_model(branches, depth, "cuda:0")
                 solver = SolverFeatherPGS(
                     model,
-                    drive_mode="augmented",
                     friction_anchor_beta=0.0,
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,

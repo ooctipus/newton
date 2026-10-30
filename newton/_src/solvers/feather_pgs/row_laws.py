@@ -11,11 +11,9 @@ target and its stabilization. Every row builder and sweep that forms a row's
   form of :func:`.kernels.compute_world_contact_bias`: ``x * inv_dt`` with
   ``inv_dt = 1 / dt``, the bias scaled by ``bias_scale``, a contact row's
   regularization weight ``contact_w`` on Baumgarte rows only;
-* :func:`contact_rhs` is a contact normal row's law in both passes: Baumgarte
-  correction of a penetrating row, capped by its bodies' depenetration speed
-  where the route applies the cap, and the speculative bias of a separated row,
-  which the velocity pass keeps while the position solve's linearized end gap
-  stays open;
+* :func:`contact_rhs` is a contact normal row's law: Baumgarte correction of a
+  penetrating row, capped by its bodies' depenetration speed where the route
+  applies the cap, and the speculative bias of a separated row;
 * :func:`contact_restitution_rhs` replaces a closing row's bias by the
   restitution target ``-target + e u`` where :func:`contact_restitution_fires`;
 * :func:`joint_limit_side`, :func:`velocity_limit_active` and :func:`mimic_phi`
@@ -34,7 +32,6 @@ ROW_LAW = LawFamily("RowLaw")
 
 # Row kinds (the solver's constraint types).
 ROW_CONTACT = wp.constant(0)
-ROW_JOINT_TARGET = wp.constant(1)
 ROW_FRICTION = wp.constant(2)
 ROW_JOINT_LIMIT = wp.constant(3)
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
@@ -84,7 +81,6 @@ def contact_rhs(
     speculative_scale: float,
     contact_w: float,
     max_depenetration: float,
-    end_gap: float,
 ) -> tuple[float, float]:
     """Return a contact normal row's ``rhs`` and its regularization weight.
 
@@ -92,10 +88,7 @@ def contact_rhs(
     ``bias_scale * beta * phi / dt``, never below ``-max_depenetration`` when
     that is positive and finite (0 applies no cap), and the weight ``contact_w``.
     A separated row may close its gap during the step: it takes
-    ``speculative_scale * phi / dt``, or ``phi / dt`` while ``end_gap``, the
-    position solve's linearized gap at the end of the step, is still open
-    (the velocity pass; the position pass gives ``end_gap = 0``). Separated rows
-    stay rigid.
+    ``speculative_scale * phi / dt``. Separated rows stay rigid.
     """
     rhs = -target
     row_w = float(1.0)
@@ -105,8 +98,6 @@ def contact_rhs(
         else:
             rhs += bias_scale * beta * phi * inv_dt
         row_w = contact_w
-    elif end_gap > CONTACT_END_GAP_SLOP:
-        rhs += phi * inv_dt
     else:
         rhs += speculative_scale * phi * inv_dt
     return rhs, row_w
@@ -166,19 +157,16 @@ def row_rhs(
     * friction (the anchor's tangential displacement), mimic and connect
       (bilateral equalities): Baumgarte from both sides, ``bias_scale * beta * phi / dt``;
     * joint limit: :func:`limit_rhs`;
-    * PhysX drive: 0 (the sweep's drive law forms the row's update);
     * velocity limit and other rows: ``-target`` only.
     """
     rhs = -target
     row_w = float(1.0)
     if kind == ROW_CONTACT:
-        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, bias_scale, contact_speculative_scale, contact_w, 0.0, 0.0)
+        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, bias_scale, contact_speculative_scale, contact_w, 0.0)
     elif kind == ROW_FRICTION or kind == ROW_MIMIC or kind == ROW_CONNECT:
         rhs += bias_scale * beta * phi * inv_dt
     elif kind == ROW_JOINT_LIMIT:
         rhs = limit_rhs(phi, beta, target, inv_dt, bias_scale, limit_speculative_scale)
-    elif kind == ROW_JOINT_TARGET:
-        rhs = 0.0
     return rhs, row_w
 
 

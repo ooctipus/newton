@@ -113,7 +113,6 @@ def solve_kernels(enabled, arch="120", *, contact_triples=False):
         29,
         arch,
         factor_coordinates=True,
-        has_drive_rows=False,
         has_dense_velocity_limit_rows=False,
         independent_components=enabled,
     )
@@ -188,8 +187,6 @@ def solve_fixture(device):
     factors.L = arrays["secondary_L"]
     arrays["factors"] = factors
     _packed_rows(host, arrays, device)
-    for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):
-        arrays[f"world_drive_{name}"] = array(np.zeros((1, 1), np.float32))
     return data, arrays
 
 
@@ -263,10 +260,8 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8, friction_s
         iterations=iterations,
         omega=1.0,
         regularize=0,
-        row_phase=0,
         friction_start_iteration=friction_start,
         iteration_offset=0,
-        freeze_drive_rows=0,
     )
     if enabled:
         values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector

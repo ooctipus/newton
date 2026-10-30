@@ -21,7 +21,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_COUNT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     BodyFactors,
 )
@@ -30,22 +29,18 @@ from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixtur
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
-# A large streamed-metadata shape without drive or velocity-limit rows: 2304 dense and matrix-free rows
-# over 75 coordinates.
+# A large streamed-metadata shape without velocity-limit rows: 2304 dense and matrix-free rows over 75 coordinates.
 _LARGE_STREAMED_SHAPE = {
     "max_constraints": 2304,
     "mf_max_constraints": 2304,
     "max_world_dofs": 75,
-    "has_drive_rows": False,
     "has_dense_velocity_limit_rows": False,
     "skip_tier_rows": 32,
 }
 # Streamed-metadata option sets the resident row metadata must leave otherwise unchanged.
 _STREAMED_OPTIONS = (
     {},
-    {"has_drive_rows": True, "has_dense_velocity_limit_rows": True},
-    {"has_drive_rows": True, "fuse_vel_limits": True},
-    {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True},
+    {"has_dense_velocity_limit_rows": True},
     {"skip_tier_rows": 0, "contact_torsion": True},
     {"stream_mf_impulses": True},
     {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
@@ -57,7 +52,7 @@ _STREAMED_OPTIONS = (
     },
     {"max_constraints": 1024, "mf_max_constraints": 4096, "max_world_dofs": 604},
     # The accumulated velocity-limit law, in the dense limit pass and in streamed free-body totals.
-    {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
+    {"has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
     {"stream_mf_impulses": True, "velocity_limit_law": "accumulated"},
 )
 
@@ -208,11 +203,9 @@ def _replay_rewrite(source: wp.array[float], velocity: wp.array[float]):
     velocity[i] = velocity[i] - 3.0
 
 
-def _storage(shape, budget, *, block_count=16384, sm_count=188, has_drive_rows=False, fuse_vel_limits=False, **request):
+def _storage(shape, budget, *, block_count=16384, sm_count=188, **request):
     """The storage selection of a sweep of ``shape`` (rows, free-body rows, coordinates) under a static ``budget``."""
-    staging = functools.partial(
-        sweep_routes.mf_gs_staging, *shape, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits
-    )
+    staging = functools.partial(sweep_routes.mf_gs_staging, *shape)
     return execution_plan._select_mfgs_storage(staging, budget, block_count=block_count, sm_count=sm_count, **request)
 
 
@@ -235,7 +228,6 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
     def test_metadata_reasons_report_the_footprint_they_compared(self):
         """Report the metadata and block bytes the residency decision compared, for each outcome."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False}
         cases = (
             ((192, 64, 29), 100352, True, "Row metadata is resident: {metadata} bytes fit the 4096-byte budget."),
             ((1024, 4096, 604), 100352, False, "Row metadata streams: {metadata} bytes exceed the 4096-byte budget."),
@@ -248,8 +240,8 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         )
         for shape, budget, resident, text in cases:
             with self.subTest(shape=shape, budget=budget):
-                total = sweep_routes.mf_gs_staging(*shape, **options).bytes
-                metadata = total - sweep_routes.mf_gs_staging(*shape, shared_metadata=False, **options).bytes
+                total = sweep_routes.mf_gs_staging(*shape).bytes
+                metadata = total - sweep_routes.mf_gs_staging(*shape, shared_metadata=False).bytes
                 storage = _storage(shape, budget)
                 self.assertEqual(storage.shared_metadata, resident)
                 self.assertIn(text.format(metadata=metadata, total=total), storage.reason)
@@ -366,11 +358,11 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         """Name the resident variant apart from the streamed kernel, whose name stays as it was."""
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         shape = (2304, 2304, 75, "120")
-        options = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
+        options = {"has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
         streamed = factory(*shape, shared_metadata=False, **options)
         resident = factory(*shape, shared_metadata=False, resident_row_metadata=True, **options)
-        self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_skiptier32")
-        self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_s75_drive0_densevlim0_gmeta_smeta_skiptier32")
+        self.assertEqual(streamed.key, "sweep_mf_gs_2304_2304_75_s75_densevlim0_gmeta_skiptier32")
+        self.assertEqual(resident.key, "sweep_mf_gs_2304_2304_75_s75_densevlim0_gmeta_smeta_skiptier32")
         self.assertEqual(max(_native_snippets(resident), key=len).count("SHARED int s_meta_dense[2304];"), 1)
         self.assertEqual(
             list(inspect.signature(resident.func).parameters), list(inspect.signature(streamed.func).parameters)
@@ -439,7 +431,6 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     256,
                     15984,
                     3135,
-                    has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
                     stream_mf_impulses=stream,
                 )
@@ -456,27 +447,11 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 self.assertIn("if (lane == 0) s_lam_dense[sib] = sib_new;", stores)
                 self.assertTrue(stores.rstrip().endswith("SYNC();"))
 
-    def test_limit_only_phase_does_not_stage_contact_prefix(self):
-        """Keep contacts untouched and retain work for empty-segment fused clamps."""
-        for fused in (False, True):
-            kernel = sweep_routes.mf_gs_kernel(16, 4096, 128, "cpu", fuse_vel_limits=fused)
-            source = max(_native_snippets(kernel), key=len)
-            self.assertIn("int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;", source)
-            # The impulses' staging and store, and the flags of the bodies in factor coordinates.
-            self.assertEqual(source.count("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"), 3)
-            guard = "if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"
-            if fused:
-                self.assertNotIn(guard, source)
-            else:
-                self.assertIn(guard, source)
-                # The guard returns before the world stages its free-body rows.
-                self.assertLess(source.index(guard), source.index("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"))
 
-
-def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives, velocity_limits, rings):
+def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocity_limits, rings):
     """Build MF-GS operands whose dense contacts form patch rings, as ``link_patch_routes`` leaves them.
 
-    Each world holds a prefix of drive rows (with ``drives``) and position-limit rows, then
+    Each world holds a prefix of position-limit rows, then
     velocity-limit rows (with ``velocity_limits``), recorded in its phase bounds, then contacts in a
     random allocation order. A contact is a normal row, followed by two tangent rows naming it as
     parent when it owns an anchor (at most two per ring). The normals of a ring link circularly
@@ -509,11 +484,6 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
             ],
             axis=-1,
         ),
-        "world_drive_target_vel_bias": np.zeros((w_count, capacity), np.float32),
-        "world_drive_vel_multiplier": np.zeros((w_count, capacity), np.float32),
-        "world_drive_impulse_multiplier": np.zeros((w_count, capacity), np.float32),
-        "world_drive_max_impulse": np.zeros((w_count, capacity), np.float32),
-        "world_drive_vel_limit": np.zeros((w_count, capacity), np.float32),
         "mf_constraint_count": np.zeros(w_count, np.int32),
         "mf_meta": np.zeros((w_count, 4 * mf_capacity), np.int32),
         "mf_impulses": np.zeros((w_count, mf_capacity), np.float32),
@@ -545,15 +515,6 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
     for w in range(w_count):
         types, parents = host["world_row_type"][w], host["world_row_parent"][w]
         row = 0
-        if drives:
-            count = int(rng.integers(1, 4))
-            types[:count] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
-            host["world_drive_target_vel_bias"][w, :count] = rng.uniform(-0.2, 0.2, count)
-            host["world_drive_vel_multiplier"][w, :count] = rng.uniform(-0.8, -0.2, count)
-            host["world_drive_impulse_multiplier"][w, :count] = rng.uniform(0.8, 1.0, count)
-            host["world_drive_max_impulse"][w, :count] = rng.uniform(0.2, 1.0, count)
-            host["world_drive_vel_limit"][w, :count] = rng.uniform(0.05, 0.3, count)
-            row = count
         count = int(rng.integers(0, 4))
         types[row : row + count] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
         row += count
@@ -691,31 +652,29 @@ _FACTOR_STORAGE = []
 @unittest.skipUnless(wp.is_cuda_available(), "MF-GS native solve requires CUDA")
 class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
     def test_resident_row_metadata_matches_streamed_on_patch_rings(self):
-        """Solve dense patch rings with resident row types and parents: identical bits out in every row phase.
+        """Solve dense patch rings with resident row types and parents: identical bits out.
 
-        Random patch layouts at a small and at a large dense capacity run every row
-        phase, from warm and signed-zero impulses, with delayed friction, iteration offsets
-        and regularization, both one world per block and through a two-block
-        queue whose blocks reuse their shared memory across worlds, then once more from a captured
-        graph. The drive and limit cases run the end-of-iteration limit scans (row phases 0, 2 and
-        5), which read row types from global memory in both kernels, under either velocity-limit law.
+        Random patch layouts at a small and at a large dense capacity run from warm and signed-zero
+        impulses, with delayed friction, iteration offsets and regularization, both one world per block
+        and through a two-block queue whose blocks reuse their shared memory across worlds, then once
+        more from a captured graph. The limit cases run the end-of-iteration limit scans, which read row
+        types from global memory in both kernels, under either velocity-limit law.
         """
         device = wp.get_device()
         if not device.is_cuda:
             self.skipTest("Select a CUDA device for native MF-GS execution")
-        contacts = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
-        limits = {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "fuse_vel_limits": True}
+        contacts = {"has_dense_velocity_limit_rows": False, "skip_tier_rows": 32}
         cases = (
             ("large_capacity", (2304, 48, 75), contacts, (220, 300)),
             ("small_capacity", (48, 12, 29), contacts, (5, 9)),
-            ("drives_and_limits", (48, 12, 29), limits, (5, 9)),
+            ("limits", (48, 12, 29), {"has_dense_velocity_limit_rows": True}, (5, 9)),
             (
                 "accumulated_limits",
                 (48, 12, 29),
-                {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
+                {"has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
                 (5, 9),
             ),
-            ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True, "has_drive_rows": False}, (5, 9)),
+            ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True}, (5, 9)),
         )
         settings = (
             {"iterations": 8, "omega": 1.0, "friction_start_iteration": 0, "iteration_offset": 0},
@@ -725,7 +684,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 "friction_start_iteration": 3,
                 "iteration_offset": 1,
                 "regularize": 1,
-                "freeze_drive_rows": 1,
             },
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
@@ -736,7 +694,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 dense_capacity=dense_capacity,
                 mf_capacity=mf_capacity,
                 dofs=dofs,
-                drives=options.get("has_drive_rows", True),
                 velocity_limits=options.get("has_dense_velocity_limit_rows", True),
                 rings=rings,
             )
@@ -771,14 +728,12 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
 
             launches = [
                 {
-                    "row_phase": phase,
                     "general_world_grid_stride": grid,
                     "use_general_world_queue": int(grid < 5),
                     "regularize": 0,
-                    "freeze_drive_rows": 0,
                     **setting,
                 }
-                for phase, grid, setting in itertools.product(range(7), (5, 2), settings)
+                for grid, setting in itertools.product((5, 2), settings)
             ]
             for launch in launches:
                 run(launch)
@@ -846,9 +801,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         A dense row capacity of 320 streams the row metadata of a two-world patch scene (a standing
         robot, an arm resting its tip on the ground and a free box). Every MF-GS launch of four steps
         is replayed from its operands through the streamed kernel and compared bit for bit as it
-        runs: the interleaved schedule's full sweeps (row phase 0) and the split schedule's limit,
-        contact and velocity-limit passes (row phases 3, 4 and 5), whose contact pass stages only the
-        contact rows. With fewer SMs than worlds the solver keeps the streamed kernel.
+        runs. With fewer SMs than worlds the solver keeps the streamed kernel.
         """
         device = wp.get_device("cuda:0")
         model = _three_size_model(device)
@@ -858,42 +811,35 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             "dense_max_constraints": 320,
             "mf_max_constraints": 32,
         }
-        for schedule, phases in (("interleaved", {0}), ("physx_grasp", {3, 4, 5})):
-            with (
-                self.subTest(schedule=schedule),
-                mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, {"storage": "dense"}),
-            ):
-                solver, records = self._replay_solver_launches(model, {**options, "pgs_schedule": schedule})
-                sweep = solver.get_path_selection()["routes"]["sweep"]
-                self.assertEqual(sweep["mf_gs"], solver._pgs_solve_mf_gs_kernel.key)
-                storage = sweep["mf_gs_storage"]
-                self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
-                self.assertIn("2-block grid fits one block per SM", storage["reason"])
-                # The selection judged the grid the launches use.
-                self.assertEqual(solver._mf_gs_block_count, 2)
-                self.assertEqual(
-                    {(*record["dim"], record["scalars"]["general_world_grid_stride"]) for record in records}, {(2, 2)}
-                )
-                self.assertEqual({record["scalars"]["row_phase"] for record in records}, phases)
-                for index, record in enumerate(records):
-                    self.assertEqual(
-                        record["differ"], [], f"launch {index}, row phase {record['scalars']['row_phase']}"
-                    )
-                # The launches solve patch rings: some move dense impulses, and dense normal rows link rings.
-                solved = sum(
-                    not np.array_equal(record["before"]["world_impulses"], record["after"]["world_impulses"])
-                    for record in records
-                )
-                self.assertGreater(solved, 0, "no replayed launch changed a dense impulse")
-                rings = 0
-                for record in records:
-                    before = record["before"]
-                    types, parents = before["world_row_type"], before["world_row_parent"]
-                    for world, count in enumerate(before["world_constraint_count"]):
-                        normal = types[world, :count] == PGS_CONSTRAINT_TYPE_CONTACT
-                        linked = (parents[world, :count] >= 0) & (parents[world, :count] != np.arange(count))
-                        rings += int(np.count_nonzero(normal & linked))
-                self.assertGreater(rings, 0, "no dense normal row linked a patch ring")
+        with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, {"storage": "dense"}):
+            solver, records = self._replay_solver_launches(model, options)
+            sweep = solver.get_path_selection()["routes"]["sweep"]
+            self.assertEqual(sweep["mf_gs"], solver._pgs_solve_mf_gs_kernel.key)
+            storage = sweep["mf_gs_storage"]
+            self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
+            self.assertIn("2-block grid fits one block per SM", storage["reason"])
+            # The selection judged the grid the launches use.
+            self.assertEqual(solver._mf_gs_block_count, 2)
+            self.assertEqual(
+                {(*record["dim"], record["scalars"]["general_world_grid_stride"]) for record in records}, {(2, 2)}
+            )
+            for index, record in enumerate(records):
+                self.assertEqual(record["differ"], [], f"launch {index}")
+            # The launches solve patch rings: some move dense impulses, and dense normal rows link rings.
+            solved = sum(
+                not np.array_equal(record["before"]["world_impulses"], record["after"]["world_impulses"])
+                for record in records
+            )
+            self.assertGreater(solved, 0, "no replayed launch changed a dense impulse")
+            rings = 0
+            for record in records:
+                before = record["before"]
+                types, parents = before["world_row_type"], before["world_row_parent"]
+                for world, count in enumerate(before["world_constraint_count"]):
+                    normal = types[world, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+                    linked = (parents[world, :count] >= 0) & (parents[world, :count] != np.arange(count))
+                    rings += int(np.count_nonzero(normal & linked))
+            self.assertGreater(rings, 0, "no dense normal row linked a patch ring")
         with mock.patch.object(device, "sm_count", 1):
             declined = fpgs.SolverFeatherPGS(model, **options)
         storage = declined.get_path_selection()["routes"]["sweep"]["mf_gs_storage"]
@@ -958,10 +904,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             iterations=8,
             omega=1.0,
             regularize=0,
-            row_phase=0,
             friction_start_iteration=2,
             iteration_offset=0,
-            freeze_drive_rows=0,
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
         for shared_metadata in (False, True):
@@ -973,7 +917,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                         6,
                         29,
                         str(device.arch),
-                        has_drive_rows=False,
                         has_dense_velocity_limit_rows=False,
                         shared_metadata=shared_metadata,
                         stream_mf_impulses=stream,
@@ -994,16 +937,10 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                             inputs=[bound[name] for name in inspect.signature(kernel.func).parameters],
                         )
 
-                for phase in (0, 1, 2, 3, 4, 5):
-                    for _, bound in variants:
-                        bound["row_phase"] = phase
-                    run()
-                    for name in outputs:
-                        np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
-                    if phase == 0:
-                        eager = [{name: _host(bound[name]) for name in outputs} for _, bound in variants]
-                for _, bound in variants:
-                    bound["row_phase"] = 0
+                run()
+                for name in outputs:
+                    np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
+                eager = [{name: _host(bound[name]) for name in outputs} for _, bound in variants]
                 with wp.ScopedCapture(device=device) as capture:
                     run()
                 # NaN in both variants: a graph that replayed nothing cannot give the eager bits.

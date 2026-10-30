@@ -10,16 +10,12 @@ import warp as wp
 import newton
 from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
-from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau_and_augmented_drives,
-    populate_physx_drive_J_for_size,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import group_rows
 
 
 def _mixed_target_model(coord_layout, device):
@@ -58,8 +54,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
     @unittest.skipUnless(wp.get_device().is_cuda, "Matrix-free solver dispatch requires CUDA")
     def test_mixed_joint_target_layout_trajectories(self):
         """Match public solver trajectories across both target layouts and drive dispatches."""
-        for drive_mode, parallel_streams in (("augmented", False), ("augmented", True), ("physx_pgs", False)):
-            with self.subTest(drive_mode=drive_mode, parallel_streams=parallel_streams):
+        for parallel_streams in (False, True):
+            with self.subTest(parallel_streams=parallel_streams):
                 trajectories = []
                 for coord_layout in (False, True):
                     model, state, control, _joints, dofs, coords, targets = _mixed_target_model(
@@ -67,7 +63,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     )
                     solver = newton.solvers.SolverFeatherPGS(
                         model,
-                        drive_mode=drive_mode,
                         enable_joint_limits=False,
                         dense_max_constraints=16,
                         mf_max_constraints=16,
@@ -186,59 +181,6 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                             device=device,
                         )
                     np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
-
-    def test_physx_drive_position_target_layouts(self):
-        """Read position coordinates and DOF velocities independently in drive rows."""
-        device = wp.get_device()
-        for coord_layout in (False, True):
-            with self.subTest(coord_layout=coord_layout):
-                model, state, control, joints, dofs, coords, targets = _mixed_target_model(coord_layout, device)
-                slots = np.full(model.joint_dof_count, -1, dtype=np.int32)
-                slots[dofs] = [0, 1, 0, 1]
-                fields = [wp.zeros((2, 2), dtype=int if i < 2 else float, device=device) for i in range(12)]
-                wp.launch(
-                    populate_physx_drive_J_for_size,
-                    dim=len(joints),
-                    inputs=[
-                        field_group.upload(
-                            JointTable,
-                            device,
-                            model,
-                            articulation_dof_start=model.joint_qd_start.numpy()[:-1],
-                            art_to_world=np.repeat([0, 1], 4),
-                        ),
-                        state.joint_q,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        0,
-                        wp.array(slots, dtype=int, device=device),
-                        wp.array(joints, dtype=int, device=device),
-                        group_rows(device),
-                    ],
-                    outputs=[
-                        wp.zeros((4, 2, 1), dtype=float, device=device),
-                        field_group.upload(
-                            DenseRows,
-                            device,
-                            **dict(
-                                zip(
-                                    ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target"),
-                                    fields[:7],
-                                    strict=True,
-                                )
-                            ),
-                            sides=wp.zeros((2, 2), dtype=wp.vec2i, device=device),
-                        ),
-                        *fields[7:],
-                    ],
-                    device=device,
-                )
-                np.testing.assert_allclose(
-                    fields[9].numpy().ravel(),
-                    control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords],
-                    atol=1e-7,
-                )
-                np.testing.assert_array_equal(fields[6].numpy().ravel(), control.joint_target_qd.numpy()[dofs])
 
     def test_per_coordinate_drives_match_combined_kernel(self):
         """Match the held tree's per-coordinate drives plus the joint forces to the combined kernel; clear drives

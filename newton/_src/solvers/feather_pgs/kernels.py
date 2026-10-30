@@ -57,7 +57,6 @@ from .projection_laws import (
 )
 from .row_build import write_contact_row
 from .row_laws import (
-    contact_depenetration_cap,
     contact_restitution_fires,
     contact_restitution_rhs,
     contact_rhs,
@@ -75,7 +74,7 @@ from .tree_passes import (
 )
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
-PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
+# Type 1 was the PhysX drive row; drives fold into the mass matrix.
 PGS_CONSTRAINT_TYPE_FRICTION = 2
 PGS_CONSTRAINT_TYPE_JOINT_LIMIT = 3
 # Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp (see
@@ -195,8 +194,6 @@ def prescale_joint_velocity_limits(
     joints: JointTable,
     articulation_count: int,
     lanes: int,
-    drive_slot: wp.array[int],
-    skip_driven: int,
     joint_qd: wp.array[float],
     # out
     prescaled_joint_qd: wp.array[float],
@@ -206,16 +203,6 @@ def prescale_joint_velocity_limits(
     PhysX computes a single ratio per articulation from maxJointVelocity and
     applies that ratio to all articulation DOFs before building link velocities.
     This is separate from the velocity-limit constraint rows solved later.
-
-    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) excludes
-    DOFs with a PhysX drive row (``drive_slot[dof] >= 0``) from both the
-    ratio computation and the scaling: those DOFs are clamped in-solve by the
-    fused end-of-iteration velocity clamp instead. ``drive_slot`` holds the previous
-    step's allocation at this point in the step (it is initialized to -1, so
-    the very first step prescales exactly as before); the driven-DOF set is
-    derived from ``joint_target_ke/kd > 0`` and is stable across steps.
-    When ``skip_driven == 0``, ``drive_slot`` is never read (a 1-element
-    dummy is safe).
 
     An aligned group of ``lanes`` threads owns each articulation, the joints
     from ``articulation_start[art]`` up to the next articulation's start. Lane
@@ -243,9 +230,6 @@ def prescale_joint_velocity_limits(
         qd_start = joints.joint_qd_start[j]
         for axis in range(_prescaled_axis_count(j, joints)):
             dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
             limit = joints.joint_velocity_limit[dof]
             qd_abs = wp.abs(joint_qd[dof])
             if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
@@ -266,10 +250,7 @@ def prescale_joint_velocity_limits(
             for dof in range(qd_start, joints.joint_qd_start[j + 1]):
                 qd = joint_qd[dof]
                 if dof < scaled_end:
-                    if skip_driven == 0:
-                        qd = qd * ratio
-                    elif drive_slot[dof] < 0:
-                        qd = qd * ratio
+                    qd = qd * ratio
                 prescaled_joint_qd[dof] = qd
     else:
         for dof in range(joints.joint_qd_start[joint_start] + lane, joints.joint_qd_start[joint_end], lanes):
@@ -1183,47 +1164,6 @@ def eval_rigid_tau_and_augmented_drives(
 
 
 @wp.kernel
-def allocate_physx_drive_slots(
-    joints: JointTable,
-    max_constraints: int,
-    # outputs
-    drive_slot: wp.array[int],
-    world_slot_counter: wp.array[int],
-    first_rejected_slot: wp.array[int],
-):
-    """Allocate one dense PhysX-style drive row for each driven scalar DOF."""
-    art = wp.tid()
-    world = joints.art_to_world[art]
-
-    dof_base = joints.articulation_dof_start[art]
-    dof_count = joints.articulation_H_rows[art]
-    for d in range(dof_count):
-        drive_slot[dof_base + d] = -1
-
-    joint_start = joints.articulation_start[art]
-    joint_end = joints.articulation_start[art + 1]
-
-    for j in range(joint_start, joint_end):
-        jtype = joints.joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joints.joint_dof_dim[j, 0]
-        ang_count = joints.joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joints.joint_qd_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            stiffness = joints.joint_target_ke[dof]
-            damping = joints.joint_target_kd[dof]
-            if (stiffness <= 0.0 and damping <= 0.0) or joints.prescribed[dof] != 0:
-                continue
-
-            drive_slot[dof] = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
-
-
-@wp.kernel
 def clear_grouped_jacobian_active_rows(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
@@ -1253,159 +1193,6 @@ def clear_grouped_jacobian_active_rows(
         row = element // dof_count
         dof = element - row * dof_count
         J_group[group_idx, row, dof] = 0.0
-
-
-@wp.kernel
-def populate_physx_drive_J_for_size(
-    joints: JointTable,
-    joint_q: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    fuse_vel_limits: int,
-    drive_slot: wp.array[int],
-    group_to_art: wp.array[int],
-    support: RowSupport,
-    # outputs
-    J_group: wp.array3d[float],
-    rows: DenseRows,
-    world_drive_stiffness: wp.array2d[float],
-    world_drive_damping: wp.array2d[float],
-    world_drive_geom_error: wp.array2d[float],
-    world_drive_max_force: wp.array2d[float],
-    world_drive_vel_limit: wp.array2d[float],
-):
-    """Populate PhysX-style drive rows and row data for one articulation size group.
-
-    ``fuse_vel_limits != 0`` (the ``fuse_joint_velocity_limits`` path)
-    additionally records the DOF's joint velocity limit per drive row in
-    ``world_drive_vel_limit`` so the solve kernels can apply the PhysX-style
-    stateless velocity clamp at the end of each iteration in place of
-    dedicated velocity-limit rows. Non-positive / non-finite limits are stored as
-    ``+inf`` so the fused clamp is a no-op for unlimited DOFs. When
-    ``fuse_vel_limits == 0`` neither ``joint_velocity_limit`` nor
-    ``world_drive_vel_limit`` is touched (1-element dummies are safe).
-    """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
-    world = joints.art_to_world[art]
-    dof_start = joints.articulation_dof_start[art]
-
-    joint_start = joints.articulation_start[art]
-    joint_end = joints.articulation_start[art + 1]
-
-    for j in range(joint_start, joint_end):
-        jtype = joints.joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joints.joint_dof_dim[j, 0]
-        ang_count = joints.joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joints.joint_qd_start[j]
-        q_start = joints.joint_q_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            slot = drive_slot[dof]
-            if slot < 0:
-                continue
-
-            local_dof = dof - dof_start
-            at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-            clear_side(support, J_group, at, slot, art)
-            J_group[at[0], slot, at[1] + local_dof] = 1.0
-
-            stiffness = joints.joint_target_ke[dof]
-            damping = joints.joint_target_kd[dof]
-            target_pos = joint_target_pos[joints.joint_target_q_start[j] + axis]
-            target_vel = joint_target_vel[dof]
-            q = joint_q[q_start + axis]
-
-            rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_TARGET
-            rows.sides[world, slot] = wp.vec2i(art, -1)
-            rows.row_parent[world, slot] = -1
-            rows.row_mu[world, slot] = 0.0
-            rows.row_beta[world, slot] = 0.0
-            rows.row_cfm[world, slot] = 0.0
-            rows.phi[world, slot] = 0.0
-            rows.target[world, slot] = target_vel
-            world_drive_stiffness[world, slot] = stiffness
-            world_drive_damping[world, slot] = damping
-            world_drive_geom_error[world, slot] = target_pos - q
-            world_drive_max_force[world, slot] = joints.joint_effort_limit[dof]
-            if fuse_vel_limits != 0:
-                qdot_max = joints.joint_velocity_limit[dof]
-                if qdot_max <= 0.0 or not wp.isfinite(qdot_max):
-                    qdot_max = float(wp.inf)
-                world_drive_vel_limit[world, slot] = qdot_max
-
-
-@wp.kernel
-def compute_physx_pgs_drive_desc(
-    rows: DenseRows,
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    world_dof_indices: wp.array2d[int],
-    row_support: RowSupport,
-    packed_J: wp.array3d[float],
-    position_delta_velocity: wp.array[float],
-    world_drive_stiffness: wp.array2d[float],
-    world_drive_damping: wp.array2d[float],
-    world_drive_geom_error: wp.array2d[float],
-    world_drive_max_force: wp.array2d[float],
-    dt: float,
-    position_bias_scale: float,
-    position_delta_scale: float,
-    # outputs
-    world_drive_target_vel_bias: wp.array2d[float],
-    world_drive_vel_multiplier: wp.array2d[float],
-    world_drive_impulse_multiplier: wp.array2d[float],
-    world_drive_max_impulse: wp.array2d[float],
-):
-    """Build PhysX PGS force-drive descriptor fields for dense joint target rows."""
-    world = wp.tid()
-    m = world_constraint_count[world]
-
-    for i in range(m):
-        if rows.row_type[world, i] != PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-            world_drive_target_vel_bias[world, i] = 0.0
-            world_drive_vel_multiplier[world, i] = 0.0
-            world_drive_impulse_multiplier[world, i] = 0.0
-            world_drive_max_impulse[world, i] = 0.0
-            continue
-
-        stiffness = world_drive_stiffness[world, i]
-        damping = world_drive_damping[world, i]
-        target_vel = rows.target[world, i]
-        geom_error = world_drive_geom_error[world, i]
-        unit_response = rows.diag[world, i]
-
-        a = dt * (dt * stiffness + damping)
-        b = dt * (damping * target_vel)
-        x = float(0.0)
-        if unit_response > 0.0:
-            x = 1.0 / (1.0 + a * unit_response)
-
-        drive_bias_coeff = stiffness * x * dt
-        position_delta = float(0.0)
-        if position_delta_scale != 0.0:
-            position_delta = world_contact_row_dot(
-                world_dof_indices, row_support, packed_J, position_delta_velocity, world, i
-            )
-            position_delta = position_delta_scale * dt * position_delta
-
-        world_drive_target_vel_bias[world, i] = x * b + drive_bias_coeff * (
-            position_bias_scale * geom_error - position_delta
-        )
-        world_drive_vel_multiplier[world, i] = -x * a
-        # PGS path: PhysX uses 1 - x. TGS would use 1 and additional position bias.
-        world_drive_impulse_multiplier[world, i] = 1.0 - x
-
-        max_force = world_drive_max_force[world, i]
-        max_impulse = float(1.0e20)
-        if max_force > 0.0 and wp.isfinite(max_force):
-            max_impulse = max_force * dt
-        world_drive_max_impulse[world, i] = max_impulse
 
 
 @wp.kernel
@@ -1831,8 +1618,6 @@ def allocate_joint_velocity_limit_slots(
     joints: JointTable,
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
-    drive_slot: wp.array[int],
-    skip_driven: int,
     max_constraints: int,
     # outputs
     velocity_limit_slot: wp.array[int],
@@ -1864,14 +1649,6 @@ def allocate_joint_velocity_limit_slots(
     the gate: every limited DOF takes its pair. Because the gate samples the pre-solve
     velocity, a DOF that crosses the threshold during a step is clamped one
     step late.
-
-    ``skip_driven != 0`` (the ``fuse_joint_velocity_limits`` path) skips DOFs
-    with a PhysX drive row (``drive_slot[dof] >= 0``): their velocity limit is
-    enforced as a stateless clamp at the end of each solver iteration
-    instead of a dedicated row pair (PhysX ``PxClamp`` math, run after the
-    contact phases like the rows it replaces). DOFs with a velocity limit but no drive row keep their
-    dedicated rows. When ``skip_driven == 0``, ``drive_slot`` is never read
-    (a 1-element dummy is safe).
 
     Outputs two entries per DOF in ``velocity_limit_slot`` (world-constraint
     row, or -1) and ``velocity_limit_sign`` (+1 / -1).
@@ -1912,11 +1689,6 @@ def allocate_joint_velocity_limit_slots(
                 joints.joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction
             ):
                 continue
-
-            # Fused path: driven DOFs are clamped at the end of each iteration.
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
 
             # Mark eligible; slots are reserved below with a single atomic per articulation (the
             # per-DOF pair of atomics was a 2*dofs-long serial chain per thread).
@@ -1966,9 +1738,8 @@ def populate_joint_velocity_limit_J_for_size(
     with the sign flip on ``J``, this encodes the bilateral projection as
     two unilateral ``J*v >= target_vel`` rows with ``lambda >= 0``.
 
-    DOFs skipped by :func:`allocate_joint_velocity_limit_slots` (activation
-    gate, or driven DOFs under ``fuse_joint_velocity_limits``) carry
-    ``velocity_limit_slot == -1`` and are skipped here through the same
+    DOFs skipped by :func:`allocate_joint_velocity_limit_slots` (the activation
+    gate, a prescribed coordinate) carry ``velocity_limit_slot == -1`` and are skipped here through the same
     per-row slot check; this kernel needs no separate skip flag.
     """
     tid = wp.tid()
@@ -2959,25 +2730,13 @@ def compute_world_contact_bias(
     world_constraint_count: wp.array[int],
     max_constraints: int,
     dt: float,
-    bias_scale: float,
     contact_speculative_scale: float,
-    joint_limit_speculative_scale: float,
     contact_w: float,
-    velocity_pass: int,
-    world_dof_indices: wp.array2d[int],
-    row_support: RowSupport,
-    packed_J: wp.array3d[float],
-    world_position_velocity: wp.array[float],
-    world_incident_velocity: wp.array[float],
-    restitution_velocity_threshold: float,
 ):
     """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
 
     The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
-    ``bias_scale * beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS. In the
-    ``velocity_pass`` (the velocity iterations, bias scales 0) a closing contact rebounds by restitution
-    (:func:`.row_laws.contact_restitution_rhs`, its incident velocity from its world-layout row), and a separated one
-    keeps its speculative bias while the position solution's end gap stays open.
+    ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS.
 
     One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
@@ -2991,39 +2750,8 @@ def compute_world_contact_bias(
     kind = rows.row_type[world, i]
     phi = rows.phi[world, i]
     target = rows.target[world, i]
-    if velocity_pass != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        fires = bool(False)
-        bounce = float(0.0)
-        restitution = rows.restitution[world, i]
-        if restitution > 0.0:
-            relative_incident = (
-                world_contact_row_dot(world_dof_indices, row_support, packed_J, world_incident_velocity, world, i)
-                - target
-            )
-            fires, bounce = contact_restitution_rhs(
-                phi, relative_incident, target, restitution, dt, restitution_velocity_threshold
-            )
-        rhs = bounce
-        if not fires:
-            end_gap = float(0.0)
-            if phi > 0.0:
-                jv_position = world_contact_row_dot(
-                    world_dof_indices, row_support, packed_J, world_position_velocity, world, i
-                )
-                end_gap = phi + dt * (jv_position - target)
-            rhs, _row_w = contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
-        rows.rhs[world, i] = rhs
-        return
     rhs, row_w = row_rhs(
-        kind,
-        phi,
-        rows.row_beta[world, i],
-        target,
-        inv_dt,
-        bias_scale,
-        contact_speculative_scale,
-        joint_limit_speculative_scale,
-        contact_w,
+        kind, phi, rows.row_beta[world, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
     )
     rows.rhs[world, i] = rhs
     if contact_w < 1.0:
@@ -3123,7 +2851,7 @@ def apply_world_contact_restitution_accumulated(
     phi = rows.phi[world, i]
     # The geometric bias the position pass added (bias scale 1): the contact law without a target.
     geometric_bias, _row_w = contact_rhs(
-        phi, rows.row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0, 0.0
+        phi, rows.row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0
     )
     relative_incident = rows.rhs[world, i] - geometric_bias
     if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
@@ -3743,84 +3471,6 @@ def populate_rigid_velocity_limit_rows(
 
 
 @wp.kernel
-def compute_mf_rhs_bias(
-    rows: MfRows,
-    mf_constraint_count: wp.array[int],
-    factors: BodyFactors,
-    has_target_velocity: int,
-    rigid_body_max_depenetration_velocity: wp.array[float],
-    pgs_beta: float,
-    dt: float,
-    bias_scale: float,
-    speculative_scale: float,
-    position_velocity: wp.array[float],
-    preserve_unreached_speculative: int,
-    apply_restitution: int,
-    restitution_velocity_threshold: float,
-    mf_max_constraints: int,
-):
-    """Compute only the MF contact RHS bias (``rows.rhs``) for a previously-built contact set.
-
-    A restitutive contact rebounds from the incident velocity ``J v_hat`` its rows' build stored (``rows.incident``);
-    the end gap reads the position solution's ``J v = Z^T (L^T v)`` through each body's held factor ``L``.
-    """
-    tid = wp.tid()
-    world = tid // mf_max_constraints
-    i = tid % mf_max_constraints
-    if i >= mf_constraint_count[world]:
-        return
-
-    target = float(0.0)
-    if has_target_velocity != 0:
-        target = rows.target[world, i]
-    inv_dt = 1.0 / dt
-    rhs = -target
-    row_type = rows.row_type[world, i]
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi_val = rows.phi[world, i]
-        fires = bool(False)
-        bounce = float(0.0)
-        restitution = float(0.0)
-        if apply_restitution != 0:
-            restitution = rows.restitution[world, i]
-        if restitution > 0.0:
-            relative_incident = rows.incident[world, i] - target
-            fires, bounce = contact_restitution_rhs(
-                phi_val, relative_incident, target, restitution, dt, restitution_velocity_threshold
-            )
-        if fires:
-            rhs = bounce
-        else:
-            # The velocity pass keeps a separated row's bias while the position solve's linearized end gap,
-            # evaluated with its realized velocity, stays open.
-            end_gap = float(0.0)
-            if preserve_unreached_speculative != 0 and phi_val > 0.0:
-                jv_position = free_body_row_velocity(
-                    rows.Z_a,
-                    rows.Z_b,
-                    world,
-                    i,
-                    rows.body_a[world, i],
-                    rows.body_b[world, i],
-                    factors,
-                    position_velocity,
-                )
-                end_gap = phi_val + dt * (jv_position - target)
-            cap = contact_depenetration_cap(
-                rows.body_a[world, i], rows.body_b[world, i], rigid_body_max_depenetration_velocity
-            )
-            rhs, _row_w = contact_rhs(
-                phi_val, pgs_beta, target, inv_dt, bias_scale, speculative_scale, 1.0, cap, end_gap
-            )
-    elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-        # The row builder pre-multiplies the anchor gain into phi.
-        rhs, _w = row_rhs(row_type, rows.phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
-    elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        rhs = rows.phi[world, i] - target
-    rows.rhs[world, i] = rhs
-
-
-@wp.kernel
 def classify_parallel_sweep_tiers(
     world_constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],
@@ -4271,8 +3921,7 @@ def pgs_ncp_residuals_diagnostic_velocity(
     * Only rows of type ``PGS_CONSTRAINT_TYPE_CONTACT`` drive a contact
       iteration (both in the dense articulated buffer and the
       matrix-free free-rigid buffer).
-    * Joint-limit rows (``PGS_CONSTRAINT_TYPE_JOINT_LIMIT``) and
-      joint-target rows (``PGS_CONSTRAINT_TYPE_JOINT_TARGET``) are
+    * Joint-limit rows (``PGS_CONSTRAINT_TYPE_JOINT_LIMIT``) are
       **skipped** — friction, cone, and MDP residuals do not apply to
       them. ``r_gap`` is also skipped for these rows (the gap concept is
       specific to contact normals).

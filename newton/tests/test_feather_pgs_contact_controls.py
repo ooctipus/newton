@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, position_pass
+from newton.tests.feather_pgs_law_harness import group_rows
 from newton.tests.feather_pgs_patch_parity import row_law
 
 PATH_DENSE = 0
@@ -216,7 +216,7 @@ def _dense_speculative_rhs(scale: float) -> float:
     wp.launch(
         compute_world_contact_bias,
         dim=1,
-        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 0.5, 1.0, scale, 1.0, 1.0, *position_pass("cpu")],
+        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 0.5, scale, 1.0],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])

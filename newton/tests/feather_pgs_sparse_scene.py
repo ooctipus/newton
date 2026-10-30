@@ -82,11 +82,8 @@ def branched_model(*, floating=True, branches=3, depth=1, foot="sphere", device=
 def make_solver(model, enabled, pins=None, **overrides):
     """Change only representation admission between the paired solvers; ``pins`` are more test-only route pins."""
     options = {
-        "pgs_schedule": "interleaved",
-        "drive_mode": "augmented",
         "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,
-        "pgs_velocity_iterations": 0,
         "pgs_warmstart": False,
         "enable_joint_limits": True,
         "enable_joint_velocity_limits": False,

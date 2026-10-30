@@ -38,7 +38,6 @@ value.
 """
 
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
 import numpy as np
@@ -53,17 +52,15 @@ from .staging import Buffer
 SOLVE_READOUTS = ("off", "sweeps", "trace")
 """Accepted readouts: no counter, executed sweeps, or executed sweeps with the exit-law trace."""
 
-SOLVE_PASSES = ("position", "velocity")
-"""Solve passes a readout counts apart: the position solve and the velocity pass (``pgs_velocity_iterations``)."""
-
 TRACE_GRID = tuple(10.0 ** (-7.0 + 0.5 * point) for point in range(13))
 """Velocity tolerances [m/s or rad/s] at which the trace records where each solve would stop: 1e-7 to 1e-1."""
 
 TRACE_REASONS = ("stationary", "tolerance", "budget")
 """Exit reasons of a traced solve: no change, changes within the exit law's floor, or the sweep budget ran out."""
 
-TRACE_KINDS = ("contact", "drive", "friction", "joint_limit", "velocity_limit", "mimic", "connect", "torsion", "none")
-"""Row kinds of the trace's final-sweep change, indexed by constraint type; ``"none"`` when no row changed."""
+TRACE_KINDS = ("contact", "unused", "friction", "joint_limit", "velocity_limit", "mimic", "connect", "torsion", "none")
+"""Row kinds of the trace's final-sweep change, indexed by constraint type (type 1, the retired PhysX drive row, never
+occurs); ``"none"`` when no row changed."""
 
 TRACE_BINS = 26
 """Magnitude bins of the final-sweep change: 0 for exactly zero, then half decades from 1e-9 to 1e3."""
@@ -439,7 +436,6 @@ def block_argmax(warps: int, *, warp: str, lane: str) -> tuple[str, tuple[Buffer
 @dataclass
 class _ReadoutSlot:
     label: str
-    solve_pass: str
     operand: object
     arrays: dict
 
@@ -447,14 +443,10 @@ class _ReadoutSlot:
 class SolveReadoutRecord:
     """Host owner of the readout counters of a solver's sweep kernels.
 
-    Each readout kernel gets one slot of counters per solve pass it runs in
-    (:data:`SOLVE_PASSES`), allocated at registration (outside graph capture)
-    and passed as the kernel's last argument: the position solve's slot, and
-    a velocity-pass slot when the solver runs that pass, so that its short
-    budgets do not fill the position solve's histogram. Launches inside
-    :meth:`velocity_pass` take the velocity-pass slot. The counters accumulate
-    over every launch, captured graph replays included, so a window is the
-    difference of two summaries.
+    Each readout kernel gets one slot of counters, allocated at registration
+    (outside graph capture) and passed as the kernel's last argument. The
+    counters accumulate over every launch, captured graph replays included,
+    so a window is the difference of two summaries.
 
     A sweep that returns before its first sweep for a world records nothing
     for it. The matrix-free sweeps do so for every world without dense or
@@ -469,10 +461,9 @@ class SolveReadoutRecord:
 
     def __init__(self, policy: SolvePolicy):
         self.policy = policy
-        self._slots: dict[tuple[str, str], _ReadoutSlot] = {}
+        self._slots: dict[str, _ReadoutSlot] = {}
         self._labels: dict[str, str] = {}
-        self._skipped: dict[str, wp.array] = {}
-        self._pass = "position"
+        self._skipped: wp.array | None = None
 
     def register(
         self,
@@ -483,7 +474,6 @@ class SolveReadoutRecord:
         world_count: int,
         budget: int,
         device,
-        velocity_budget: int = 0,
     ) -> None:
         """Allocate the counters of a readout kernel; kernels built without a readout are ignored.
 
@@ -493,28 +483,22 @@ class SolveReadoutRecord:
             readout: The readout of the policy the kernel was built under (``"sweeps"`` or ``"trace"``), or
                 ``None`` for a kernel without a readout operand.
             world_count: Number of worlds the kernel can solve.
-            budget: Largest sweep budget a position-solve launch of the kernel passes.
+            budget: Largest sweep budget a launch of the kernel passes.
             device: Device of the counters.
-            velocity_budget: Sweep budget of the velocity pass, or 0 when the solver runs none.
         """
         if kernel is None or not readout or kernel.key in self._labels:
             return
         self._labels[kernel.key] = label
-        budgets = {"position": budget, "velocity": velocity_budget}
-        worlds = max(int(world_count), 1)
-        for solve_pass in SOLVE_PASSES:
-            if solve_pass != "position" and int(budgets[solve_pass]) <= 0:
-                continue
-            rows = max(int(budgets[solve_pass]), 1) + 1
-            trace = readout == "trace"
-            operand = SolveTrace() if trace else SolveReadout()
-            counters = SolverArrays(operand, device)
-            arrays = counters.allocate(READOUT_COUNTERS, budget_row=rows, world=worlds)
-            if trace:
-                arrays.update(counters.allocate(TRACE_COUNTERS, stop=rows + 1))
-            self._slots[(kernel.key, solve_pass)] = _ReadoutSlot(label, solve_pass, operand, arrays)
+        rows = max(int(budget), 1) + 1
+        trace = readout == "trace"
+        operand = SolveTrace() if trace else SolveReadout()
+        counters = SolverArrays(operand, device)
+        arrays = counters.allocate(READOUT_COUNTERS, budget_row=rows, world=max(int(world_count), 1))
+        if trace:
+            arrays.update(counters.allocate(TRACE_COUNTERS, stop=rows + 1))
+        self._slots[kernel.key] = _ReadoutSlot(label, operand, arrays)
 
-    def register_skipped(self, *, world_count: int, device, velocity_budget: int = 0) -> None:
+    def register_skipped(self, *, world_count: int, device) -> None:
         """Allocate per-world counters of the solves that enter no sweep because the world has no rows.
 
         Ignored without a readout, or when already registered.
@@ -522,17 +506,13 @@ class SolveReadoutRecord:
         Args:
             world_count: Number of worlds the route's launches cover.
             device: Device of the counters.
-            velocity_budget: Sweep budget of the velocity pass, or 0 when the solver runs none.
         """
-        if not self.policy.counts or self._skipped or int(world_count) <= 0:
+        if not self.policy.counts or self._skipped is not None or int(world_count) <= 0:
             return
-        budgets = {"position": 1, "velocity": int(velocity_budget)}
-        for solve_pass in SOLVE_PASSES:
-            if budgets[solve_pass] > 0:
-                self._skipped[solve_pass] = wp.zeros(int(world_count), dtype=wp.int32, device=device)
+        self._skipped = wp.zeros(int(world_count), dtype=wp.int32, device=device)
 
     def count_skipped(self, world_constraint_count: wp.array, mf_constraint_count: wp.array) -> None:
-        """Count, in the current pass, one skipped solve of every world without dense or matrix-free rows.
+        """Count one skipped solve of every world without dense or matrix-free rows.
 
         A launch of its own, made only under a registered readout; capturable.
 
@@ -540,7 +520,7 @@ class SolveReadoutRecord:
             world_constraint_count: Dense rows per world.
             mf_constraint_count: Matrix-free rows per world.
         """
-        skipped = self._skipped.get(self._pass)
+        skipped = self._skipped
         if skipped is None:
             return
         wp.launch(
@@ -551,19 +531,10 @@ class SolveReadoutRecord:
             device=skipped.device,
         )
 
-    @contextmanager
-    def velocity_pass(self):
-        """Count the launches made inside the context in the velocity-pass slots."""
-        previous, self._pass = self._pass, "velocity"
-        try:
-            yield
-        finally:
-            self._pass = previous
-
     def operands(self, kernel) -> list:
-        """Return the readout operand to append to a launch of ``kernel`` in the current pass, or nothing."""
+        """Return the readout operand to append to a launch of ``kernel``, or nothing."""
         key = getattr(kernel, "key", None) if kernel is not None else None
-        slot = self._slots.get((key, self._pass))
+        slot = self._slots.get(key)
         return [] if slot is None else [slot.operand]
 
     @property
@@ -572,14 +543,14 @@ class SolveReadoutRecord:
         return dict(self._labels)
 
     @property
-    def skipped_passes(self) -> tuple[str, ...]:
-        """Solve passes that count the solves of worlds without rows as skipped (:meth:`register_skipped`)."""
-        return tuple(self._skipped)
+    def counts_skipped(self) -> bool:
+        """Whether the solves of worlds without rows count as skipped (:meth:`register_skipped`)."""
+        return self._skipped is not None
 
     def summary(self) -> dict:
         """Read the counters and summarize every slot; this synchronizes with the device.
 
-        A slot is one kernel in one solve pass (``pass``). ``sweeps[k]`` counts
+        A slot is one kernel. ``sweeps[k]`` counts
         the solves that executed ``k`` sweeps (the last entry also holds longer
         solves), ``exhausted`` the solves that ran their whole budget without
         stopping. A traced slot adds ``trace``. Counts are cumulative since
@@ -592,20 +563,15 @@ class SolveReadoutRecord:
         full-budget fraction among the solves of worlds with rows lies between
         ``full_budget_fraction`` and ``past_first_sweep["full_budget_fraction"]``.
 
-        ``skipped`` holds, per solve pass of a route that registered skip
-        counters, the ``solves`` of worlds without dense or matrix-free rows,
-        which entered no sweep, and the number of ``worlds``
-        they came from: the matrix-free sweeps return before their first sweep
-        for such a world, so no slot counts it. Under the direct driver
-        (``routes.sweep.driver``) each solve of a world that a counted sweep
-        owns is counted once, by a slot or here, and under the
-        contact-then-internal driver once per launch. Drivers that launch one
-        row phase at a time count per launch, and a launch whose phase holds
-        none of a world's rows can return before its first sweep, which counts
-        that world nowhere.
+        ``skipped`` holds, for a route that registered skip counters, the
+        ``solves`` of worlds without dense or matrix-free rows, which entered
+        no sweep, and the number of ``worlds`` they came from (else ``None``):
+        the matrix-free sweeps return before their first sweep for such a
+        world, so no slot counts it. Each solve of a world that a counted sweep
+        owns is counted once, by a slot or here.
         """
         slots = []
-        for (key, _), slot in self._slots.items():
+        for key, slot in self._slots.items():
             sweeps = slot.arrays["sweeps"].numpy().astype(np.int64)
             exhausted = int(slot.arrays["exhausted"].numpy().astype(np.int64).sum())
             histogram = sweeps.sum(axis=1)
@@ -617,7 +583,6 @@ class SolveReadoutRecord:
             world_mean = (executed[:, None] * sweeps).sum(axis=0)[active] / per_world[active]
             record = {
                 "kernel": key,
-                "pass": slot.solve_pass,
                 "route": slot.label,
                 "budget": budget,
                 "solves": solves,
@@ -635,10 +600,10 @@ class SolveReadoutRecord:
             if "stops" in slot.arrays:
                 record["trace"] = _trace_summary(slot.arrays)
             slots.append(record)
-        skipped = []
-        for solve_pass, array in self._skipped.items():
-            counts = array.numpy().astype(np.int64)
-            skipped.append({"pass": solve_pass, "solves": int(counts.sum()), "worlds": int(np.count_nonzero(counts))})
+        skipped = None
+        if self._skipped is not None:
+            counts = self._skipped.numpy().astype(np.int64)
+            skipped = {"solves": int(counts.sum()), "worlds": int(np.count_nonzero(counts))}
         return {"readout": self.policy.readout, "slots": slots, "skipped": skipped}
 
 

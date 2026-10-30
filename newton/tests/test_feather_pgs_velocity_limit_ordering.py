@@ -1,28 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ordering of the fused joint velocity-limit clamp vs. contact rows.
+"""Ordering of the joint velocity-limit rows vs. contact rows.
 
 A joint velocity limit must get the last word of every solver iteration:
 PhysX solves joint max-velocity after link contacts (see
 PxSceneFlag::eSOLVE_ARTICULATION_CONTACT_LAST and the
 eAFTER_STATIC_CONSTRAINTS path in DyFeatherstoneArticulation.cpp), and the
-dedicated velocity-limit rows run in the final phase of each FPGS iteration
-for the same reason. If the fused clamp instead runs inside the drive-row
-visit (before contacts), a contact impulse landing later in the iteration
-re-accelerates the driven DOF past its limit and nothing re-clamps it.
+dedicated velocity-limit rows run in the final pass of each FPGS iteration
+for the same reason: a contact impulse landing earlier in the iteration
+cannot re-accelerate the limited DOF past its limit.
 
 The scene makes that failure concrete: a stiff PD-driven horizontal arm with
 a low joint velocity limit, and a heavy free box slamming into the arm's tip.
 The impact pushes the arm's joint speed far past the limit; the limit must
-still hold at the end of every step, exactly as it does with the dedicated
-velocity-limit rows the fused clamp replaces.
+still hold at the end of every step.
 """
 
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -71,10 +68,9 @@ def _build_arm_and_box_model(device) -> newton.Model:
     return builder.finalize(device=device)
 
 
-class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
+class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
     def _max_arm_speed_over_impact(
         self,
-        fuse: bool,
         velocity_limit_law: str = "stateless",
         routes: list | None = None,
         velocity_limits: bool = True,
@@ -92,24 +88,19 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         model.joint_target_kd.assign(target_kd)
         model.joint_velocity_limit.assign(vel_limit)
 
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
-            solver = SolverFeatherPGS(
-                model,
-                drive_mode="physx_pgs",
-                enable_joint_velocity_limits=velocity_limits,
-                enable_contact_friction=False,
-                # Deliberately under-converged (franka-class training configs run
-                # 8): ordering only matters when the sweep does NOT converge — at
-                # convergence the last contact visits apply ~zero delta and any
-                # clamp placement passes. A drive-visit clamp lets this impact
-                # reach 1.53x the limit at 8 iterations (7.1x at 1); dedicated
-                # rows and the end-of-iteration clamp hold the limit exactly at
-                # every iteration count.
-                pgs_iterations=8,
-                dense_max_constraints=32,
-                mf_max_constraints=32,
-                velocity_limit_law=velocity_limit_law,
-            )
+        solver = SolverFeatherPGS(
+            model,
+            enable_joint_velocity_limits=velocity_limits,
+            enable_contact_friction=False,
+            # Deliberately under-converged (franka-class training configs run
+            # 8): ordering only matters when the sweep does NOT converge — at
+            # convergence the last contact visits apply ~zero delta and any
+            # limit placement passes.
+            pgs_iterations=8,
+            dense_max_constraints=32,
+            mf_max_constraints=32,
+            velocity_limit_law=velocity_limit_law,
+        )
         if routes is not None:
             routes.append(solver.get_path_selection()["routes"])
 
@@ -136,18 +127,16 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         """Drive the arm at least twice past the limit when no velocity limit acts.
 
         Every other test here holds the limit through the impact, which an impact
-        that never reached the limit would pass vacuously. A CPU split solver
-        (augmented drives, 8 iterations) carries the unlimited arm to 6.3 times the
-        limit.
+        that never reached the limit would pass vacuously.
         """
-        speed = self._max_arm_speed_over_impact(fuse=False, velocity_limits=False)
+        speed = self._max_arm_speed_over_impact(velocity_limits=False)
         self.assertGreater(speed, 2.0 * QDOT_MAX)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_dedicated_rows_hold_limit_through_impact(self):
         # Reference behavior: dedicated velocity-limit rows run in the final
         # phase of every iteration and hold the limit through the impact.
-        speed = self._max_arm_speed_over_impact(fuse=False)
+        speed = self._max_arm_speed_over_impact()
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
@@ -158,18 +147,10 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         the matrix-free sweep.
         """
         routes = []
-        speed = self._max_arm_speed_over_impact(fuse=False, velocity_limit_law="accumulated", routes=routes)
+        speed = self._max_arm_speed_over_impact(velocity_limit_law="accumulated", routes=routes)
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
         self.assertEqual(routes[0]["velocity_limits"]["law"], "accumulated")
         self.assertIn("_vacc", routes[0]["sweep"]["mf_gs"])
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
-    def test_fused_clamp_holds_limit_through_impact(self):
-        # The fused clamp must match the dedicated rows it replaces: the
-        # contact impulse lands mid-iteration, so the clamp has to run after
-        # contacts to keep the limit at the end of the step.
-        speed = self._max_arm_speed_over_impact(fuse=True)
-        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
 
 if __name__ == "__main__":

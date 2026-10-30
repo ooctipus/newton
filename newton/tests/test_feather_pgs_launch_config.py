@@ -702,7 +702,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         """Keep resident metadata only when its complete working set fits."""
 
         def storage(shape, budget):
-            staging = functools.partial(sweep_routes.mf_gs_staging, *shape, has_drive_rows=False, fuse_vel_limits=False)
+            staging = functools.partial(sweep_routes.mf_gs_staging, *shape)
             return execution_plan._select_mfgs_storage(staging, budget, block_count=16384, sm_count=188)
 
         compact = storage((192, 64, 29), 100352).shared_metadata
@@ -745,127 +745,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             solver.step(state_0, state_1, control, None, 1.0 / 240.0)
         self.assertIn(tree_passes.fk_id.key, blocks)
         self.assertEqual(set().union(*blocks.values()), {tree_passes.SERIAL_BLOCK_DIM}, blocks)
-
-    def test_fused_velocity_limit_clamp_rule(self):
-        # The fused clamp engages exactly in the matrix_free + physx_pgs + velocity-limits formulation; anywhere
-        # else the velocity limits keep their dedicated rows.
-        model = _build_chain_model(num_links=2, num_worlds=1)
-        for kwargs in (
-            {},  # neither matrix_free nor velocity limits nor physx drive
-            {"drive_mode": "physx_pgs"},  # no velocity limits
-        ):
-            with self.subTest(kwargs=kwargs):
-                if kwargs.get("drive_mode") == "physx_pgs" and model.device.is_cpu:
-                    with self.assertRaisesRegex(NotImplementedError, "requires CUDA"):
-                        SolverFeatherPGS(model, **kwargs)
-                    continue
-                solver = SolverFeatherPGS(model, **kwargs)
-                self.assertFalse(solver.fuse_joint_velocity_limits)
-        if wp.is_cuda_available():
-            # drive_mode='augmented' with velocity limits enabled is inert too
-            # (matrix_free construction requires CUDA).
-            solver = SolverFeatherPGS(
-                model,
-                enable_joint_velocity_limits=True,
-                drive_mode="augmented",
-            )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
-            # The applicable combination engages, and the test pin velocity_limit_clamp=False keeps the rows.
-            solver = SolverFeatherPGS(
-                model,
-                enable_joint_velocity_limits=True,
-                drive_mode="physx_pgs",
-            )
-            self.assertTrue(solver.fuse_joint_velocity_limits)
-            with mock.patch.dict(SolverFeatherPGS._route_pins, {"velocity_limit_clamp": False}):
-                solver = SolverFeatherPGS(
-                    model,
-                    enable_joint_velocity_limits=True,
-                    drive_mode="physx_pgs",
-                )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
-            # velocity_limit_activation_fraction=inf is the explicit
-            # never-activate kill-switch for velocity limits; the fused clamp
-            # rides the drive-row visit (which the inf gate does not cover),
-            # so it must stay inert rather than re-enforce limits the fraction
-            # disabled.
-            solver = SolverFeatherPGS(
-                model,
-                enable_joint_velocity_limits=True,
-                drive_mode="physx_pgs",
-                velocity_limit_activation_fraction=float("inf"),
-            )
-            self.assertFalse(solver.fuse_joint_velocity_limits)
-            # The clamp pass runs at the end of each iteration, independent of
-            # the drive-row visit, so frozen drive rows during velocity
-            # iterations no longer disable fusion: the clamp keeps enforcing
-            # the limit there, exactly like the dedicated rows it replaces.
-            for velocity_drive_mode in ("freeze", "active"):
-                solver = SolverFeatherPGS(
-                    model,
-                    enable_joint_velocity_limits=True,
-                    drive_mode="physx_pgs",
-                    pgs_velocity_iterations=2,
-                    pgs_velocity_drive_mode=velocity_drive_mode,
-                )
-                self.assertTrue(solver.fuse_joint_velocity_limits)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "fused velocity-limit clamp requires CUDA")
-    def test_fuse_joint_velocity_limits_clamps_driven_dofs_without_rows(self):
-        # A strongly driven chain with a low joint velocity limit: with
-        # the fused clamp the driven DOFs must (a) stay within
-        # the limit plus a small GS-convergence tolerance and (b) use fewer
-        # dense rows than the dedicated-row formulation (the two vel-limit
-        # rows per driven DOF are replaced by a stateless end-of-iteration
-        # clamp).
-        num_links = 3
-        qdot_max = 1.0
-
-        def run(fuse):
-            model = _build_chain_model(num_links=num_links, num_worlds=1)
-            n = model.joint_dof_count
-            model.joint_target_ke.assign(np.full(n, 200.0, dtype=np.float32))
-            model.joint_target_kd.assign(np.full(n, 5.0, dtype=np.float32))
-            model.joint_velocity_limit.assign(np.full(n, qdot_max, dtype=np.float32))
-            with mock.patch.dict(SolverFeatherPGS._route_pins, {} if fuse else {"velocity_limit_clamp": False}):
-                solver = SolverFeatherPGS(
-                    model,
-                    drive_mode="physx_pgs",
-                    enable_joint_velocity_limits=True,
-                    pgs_iterations=64,
-                    dense_max_constraints=16,
-                    mf_max_constraints=16,
-                )
-            state_0, state_1 = model.state(), model.state()
-            control = model.control()
-            control.joint_target_q.assign(np.full(n, 3.0, dtype=np.float32))
-            newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-            max_speed = 0.0
-            for _ in range(60):
-                state_0.clear_forces()
-                solver.step(state_0, state_1, control, None, 1.0 / 60.0)
-                state_0, state_1 = state_1, state_0
-                max_speed = max(max_speed, float(np.max(np.abs(state_0.joint_qd.numpy()))))
-            wp.synchronize()
-            return max_speed, int(solver.constraint_count.numpy()[0])
-
-        fused_speed, fused_rows = run(True)
-        dedicated_speed, dedicated_rows = run(False)
-
-        # (a) the fused clamp reproduces the dedicated-row behavior it
-        # replaces. Both are stateless passes at the end of each iteration,
-        # and on a coupled chain both leave the same small GS residual above
-        # the limit (clamping DOF i perturbs DOF j through the tree response,
-        # and the sweep visits each DOF once per iteration) — dedicated rows
-        # measure ~1.12x the limit here. Assert against that reference, not
-        # an exact limit no last-word formulation achieves on this scene.
-        self.assertLessEqual(fused_speed, dedicated_speed * 1.05)
-        self.assertLessEqual(fused_speed, qdot_max * 1.25)
-        # (b) the fused solve drops the two dedicated vel-limit rows per
-        # driven DOF: 3 drive rows vs 3 drive + 6 vel-limit rows.
-        self.assertGreater(fused_rows, 0)
-        self.assertLess(fused_rows, dedicated_rows)
-        self.assertEqual(dedicated_rows - fused_rows, 2 * num_links)
 
 
 if __name__ == "__main__":

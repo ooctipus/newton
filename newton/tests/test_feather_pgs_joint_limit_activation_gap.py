@@ -91,7 +91,6 @@ def _make_phase_layout_run(
     device,
     *,
     pgs_iterations=0,
-    pgs_schedule="interleaved",
     enable_joint_velocity_limits=True,
 ):
     """Build a deterministic scene containing every phase-bounded row family."""
@@ -131,7 +130,6 @@ def _make_phase_layout_run(
     model.joint_velocity_limit.assign(velocity_limits)
     solver = SolverFeatherPGS(
         model,
-        pgs_schedule=pgs_schedule,
         enable_joint_limits=True,
         enable_joint_velocity_limits=enable_joint_velocity_limits,
         velocity_limit_activation_fraction=0.5,
@@ -209,12 +207,8 @@ def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherP
 
 
 def _run_joint_limit_trajectory(use_warp_builder: bool):
-    """Run a short PhysX-grasp trajectory with one row builder."""
-    model, solver, state_in, state_out, control, contacts = _make_phase_layout_run(
-        "cuda:0",
-        pgs_iterations=8,
-        pgs_schedule="physx_grasp",
-    )
+    """Run a short trajectory with one row builder."""
+    model, solver, state_in, state_out, control, contacts = _make_phase_layout_run("cuda:0", pgs_iterations=8)
     if not use_warp_builder:
         solver.laws.joint_limit_warp_kernels.clear()
 
@@ -262,14 +256,13 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
         _assert_mf_phase_layout(self, solver)
 
     @unittest.skipUnless(wp.is_cuda_available(), "joint-limit trajectory parity requires CUDA")
-    def test_warp_builder_matches_physx_grasp_trajectory(self):
-        """Match scalar joint-limit assembly under the PhysX-grasp schedule."""
+    def test_warp_builder_matches_scalar_trajectory(self):
+        """Match scalar joint-limit assembly over a trajectory."""
         reference_solver, reference = _run_joint_limit_trajectory(use_warp_builder=False)
         warp_solver, actual = _run_joint_limit_trajectory(use_warp_builder=True)
 
         self.assertFalse(reference_solver.laws.joint_limit_warp_kernels)
         self.assertTrue(any(kernel is not None for kernel in warp_solver.laws.joint_limit_warp_kernels.values()))
-        self.assertEqual(reference_solver.options.pgs_schedule, "physx_grasp")
         self.assertEqual(len(reference), len(actual))
         for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
             self.assertEqual(observed["counts"], expected["counts"], f"row counts differed at step {step}")

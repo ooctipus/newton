@@ -28,9 +28,7 @@ from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
-    DRIVE,
     FRICTION,
-    JOINT_LIMIT,
     VELOCITY_LIMIT,
     CachedPairMetric,
     FreeBodyRows,
@@ -43,40 +41,15 @@ from .sweep import (
     dense_rows_block,
     end_sweep,
     free_body_rows_block,
-    fused_clamp_pass,
     indent,
     speed_rows_pass,
     velocity_limit_pass,
 )
 from .velocity_limit_law import check_velocity_limit_law, velocity_limit_law_suffix
 
-# Dense row types each row phase visits (MF-GS ``row_phase``): 0 interleaved (every row; velocity limits in the end
-# pass), 1/2 contact-then-internal, 3/4/5 the PhysX grasp schedule (internal, contacts, velocity limits), 6 dense
-# rows only.
-_MIMIC, _CONNECT = 5, 6
-_PHASE_DENSE_KINDS = {
-    1: (CONTACT, FRICTION),
-    2: (DRIVE, JOINT_LIMIT, VELOCITY_LIMIT, _MIMIC, _CONNECT),
-    3: (DRIVE, JOINT_LIMIT, _MIMIC, _CONNECT),
-    4: (CONTACT, FRICTION),
-    5: (VELOCITY_LIMIT,),
-}
-
-
-def _phase_admission() -> str:
-    lines = []
-    for phase, kinds in _PHASE_DENSE_KINDS.items():
-        test = " && ".join(f"row_type != {kind}" for kind in kinds)
-        lines.append(f"if (row_phase == {phase} && {test}) continue;")
-    lines.append(f"if ((row_phase == 0 || row_phase == 2 || row_phase == 6) && row_type == {VELOCITY_LIMIT}) continue;")
-    lines.append(f"if (freeze_drive_rows != 0 && row_type == {DRIVE}) continue;")
-    return "\n".join(lines)
-
-
-_MF_PHASE_ADMISSION = (
-    f"if ((row_phase == 1 || row_phase == 4) && mf_rt != {CONTACT} && mf_rt != {FRICTION}) continue;\n"
-    f"if (row_phase == 0 && mf_rt == {VELOCITY_LIMIT}) continue;"
-)
+# The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
+_DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
+_MF_ADMISSION = f"if (mf_rt == {VELOCITY_LIMIT}) continue;"
 
 MF_GS_ABI = kernel_template.params(
     ("world", int),
@@ -98,11 +71,6 @@ MF_GS_ABI = kernel_template.params(
     ("world_row_mu", wp.array2d[float]),
     ("world_torsion_group", wp.array2d[int]),
     ("contact_torsion_radius", float),
-    ("world_drive_target_vel_bias", wp.array2d[float]),
-    ("world_drive_vel_multiplier", wp.array2d[float]),
-    ("world_drive_impulse_multiplier", wp.array2d[float]),
-    ("world_drive_max_impulse", wp.array2d[float]),
-    ("world_drive_vel_limit", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
@@ -115,10 +83,8 @@ MF_GS_ABI = kernel_template.params(
     ("iterations", int),
     ("omega", float),
     ("regularize", int),
-    ("row_phase", int),
     ("friction_start_iteration", int),
     ("iteration_offset", int),
-    ("freeze_drive_rows", int),
     ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
@@ -515,19 +481,13 @@ def mf_gs_staging(
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
-    has_drive_rows: bool = True,
-    fuse_vel_limits: bool = False,
     traces: bool = False,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free-body impulses unless they stream, and the colored
     mapping's color offsets (and its trace's warp maxima)."""
     dense = WorldRows(
-        max_constraints,
-        shared_metadata=shared_metadata,
-        packed_types=shared_metadata or resident_row_metadata,
-        drive=has_drive_rows,
-        fused_limits=fuse_vel_limits,
+        max_constraints, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata
     )
     free = FreeBodyRows(mf_max_constraints, stream=stream_mf_impulses)
     colored = ()
@@ -559,9 +519,7 @@ def mf_gs_source(
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
-    has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
-    fuse_vel_limits: bool = False,
     skip_local_internal_worlds: bool = False,
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
@@ -589,12 +547,8 @@ def mf_gs_source(
     colored = mapping == "colored"
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
-    if fuse_vel_limits and not has_drive_rows:
-        raise ValueError("fuse_vel_limits requires has_drive_rows")
-    if factor_coordinates and (
-        has_drive_rows or has_dense_velocity_limit_rows or fuse_vel_limits or skip_local_internal_worlds
-    ):
-        raise ValueError("factor coordinates require the paired augmented-drive contact solve")
+    if factor_coordinates and (has_dense_velocity_limit_rows or skip_local_internal_worlds):
+        raise ValueError("factor coordinates require the paired contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
     _validate_dense_metadata_encoding(max_constraints)
@@ -603,19 +557,13 @@ def mf_gs_source(
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     lanes = Lanes(32)
     laws = RowLaws(
-        drive=has_drive_rows,
         velocity_limit_law="accumulated" if accumulated else "stateless",
         regularize=True,
         torsion=contact_torsion,
         policy=solve_policy,
     )
     dense = WorldRows(
-        M_D,
-        shared_metadata=shared_metadata,
-        packed_types=shared_metadata or resident_row_metadata,
-        drive=has_drive_rows,
-        fused_limits=fuse_vel_limits,
-        lanes=lanes,
+        M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=lanes
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
     dense_op = packed_operator(max_row_dofs, lanes)
@@ -629,8 +577,6 @@ def mf_gs_source(
         shared_metadata=shared_metadata,
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
-        has_drive_rows=has_drive_rows,
-        fuse_vel_limits=fuse_vel_limits,
         traces=solve_policy.traces,
     )
 
@@ -659,32 +605,14 @@ def mf_gs_source(
     if colored or colored_worlds:
         # The worlds of the other mapping, as the unit builder assigned them at the pack.
         mapped = f"\n    if (world_colored.data[world] {'==' if colored else '!='} 0) return;"
-    load_lo = "    int load_lo = (row_phase == 5) ? 0 : dense_lo;" if fuse_vel_limits else ""
-    empty_limit_phase = (
-        "" if fuse_vel_limits else "    if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"
-    )
     dense_loads = indent(dense.loads("i"), "        ")
     mf_load = free.load_line("i")
     mf_store = free.store_line("i")
 
     passes = []
     if has_dense_velocity_limit_rows:
-        passes.append(
-            "        if (row_phase == 0 || row_phase == 2) {\n"
-            + velocity_limit_pass(dense, dense_op, laws, pad="            ")
-            + "\n        }"
-        )
-    if fuse_vel_limits:
-        passes.append(
-            "        if (row_phase == 0 || row_phase == 2 || row_phase == 5) {\n"
-            + fused_clamp_pass(dense, dense_op, laws, pad="            ")
-            + "\n        }"
-        )
-    passes.append(
-        "        if (row_phase == 0 || row_phase == 2 || row_phase == 5) {\n"
-        + speed_rows_pass(free, free_op, laws, pad="            ")
-        + "\n        }"
-    )
+        passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
+    passes.append(speed_rows_pass(free, free_op, laws, pad="        "))
     if contact_torsion:
         passes.append(torque_sweep_source(dense_op, solve_policy))
 
@@ -717,7 +645,7 @@ def mf_gs_source(
         head = "    const int lane = LANE;"
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
-        free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_PHASE_ADMISSION, pad="        ")
+        free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_ADMISSION, pad="    ")
         offsets = trace_reduction = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "32")
@@ -739,38 +667,21 @@ def mf_gs_source(
     int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;{mapped}
 
-    // Row phases own contiguous dense ranges: 3 [0, bounds[0]), 5 [bounds[0], bounds[1]), 4 [bounds[1], m).
-    int dense_lo = 0;
-    int dense_hi = m_dense;
-    if (row_phase == 3) {{
-        dense_hi = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
-    }} else if (row_phase == 5) {{
-        dense_lo = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
-        dense_hi = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-    }} else if (row_phase == 4) {{
-        dense_lo = min(dense_phase_bounds.data[world * 2 + 1], m_dense);
-    }}
-{load_lo}
-{empty_limit_phase}
-
     int dof_map_base = world * {D};
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;{component}
     const size_t packed_base = (size_t)world * {M_D * int(max_row_dofs)};
-    int mf6_base = world * {M_MF} * 6;
-    int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;{offsets}
+    int mf6_base = world * {M_MF} * 6;{offsets}
 
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}
 
-{first_warp}    for (int i = {"load_lo" if fuse_vel_limits else "dense_lo"} + lane; i < dense_hi; i += 32) {{
+{first_warp}    for (int i = lane; i < m_dense; i += 32) {{
 {dense_loads}
     }}
-    if (row_phase != 3 && row_phase != 6) {{
-        for (int i = mf_load_lo + lane; i < m_mf; i += 32) {{
-            {mf_load}
-        }}
+    for (int i = lane; i < m_mf; i += 32) {{
+        {mf_load}
     }}
     for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
@@ -779,9 +690,7 @@ def mf_gs_source(
 {indent(bodies.clear(D, "lane"), "    ")}
 {end_first_warp}    {barrier}
     // The articulations this launch's rows touch: the bodies of its free-body rows, the sides of every dense row.
-    if (row_phase != 3 && row_phase != 6) {{
-{indent(bodies.mark("mf_load_lo", "m_mf", thread, threads), "        ")}
-    }}
+{indent(bodies.mark("0", "m_mf", thread, threads), "    ")}
 {indent(bodies.mark_sides("m_dense", thread, threads), "    ")}
     {barrier}
 {prologue}
@@ -790,11 +699,9 @@ def mf_gs_source(
         int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 
-{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_phase_admission(), inline_velocity_limit=True, pad="        ")}
+{first_warp}{dense_rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, pad="        ")}
 {end_first_warp}{"        __syncthreads();" + chr(10) if colored else ""}
-        if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
-{free_phase}
-        }}
+{indent(free_phase, "    ")}
 
 {first_warp}{chr(10).join(passes)}
 {end_first_warp}{sweep_end}    }}
@@ -805,13 +712,11 @@ def mf_gs_source(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];
     }}
-    for (int i = dense_lo + lane; i < dense_hi; i += 32) {{
+    for (int i = lane; i < m_dense; i += 32) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
-    if (row_phase != 3 && row_phase != 6) {{
-        for (int i = mf_load_lo + lane; i < m_mf; i += 32) {{
-            {mf_store}
-        }}
+    for (int i = lane; i < m_mf; i += 32) {{
+        {mf_store}
     }}
 {end_first_warp}#endif
 """
@@ -839,9 +744,7 @@ def mf_gs_kernel(
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
-    has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
-    fuse_vel_limits: bool = False,
     skip_local_internal_worlds: bool = False,
     local_internal_max_constraints: int = 0,
     contact_torsion: bool = False,
@@ -865,9 +768,7 @@ def mf_gs_kernel(
         shared_metadata=shared_metadata,
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
-        has_drive_rows=has_drive_rows,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
-        fuse_vel_limits=fuse_vel_limits,
         skip_local_internal_worlds=skip_local_internal_worlds,
         contact_torsion=contact_torsion,
         factor_coordinates=factor_coordinates,
@@ -881,9 +782,8 @@ def mf_gs_kernel(
     name = (
         f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
         f"_s{max_row_dofs}"
-        f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
+        f"_densevlim{int(has_dense_velocity_limit_rows)}"
         + velocity_limit_law_suffix(velocity_limit_law)
-        + ("_fvl" if fuse_vel_limits else "")
         + ("" if shared_metadata else "_gmeta")
         + ("_smeta" if resident_row_metadata else "")
         + ("_glambda" if stream_mf_impulses else "")

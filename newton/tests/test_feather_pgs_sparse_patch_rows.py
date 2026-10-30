@@ -177,7 +177,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         active = staging(low, active_rows=True)
         self.assertFalse(active.fits(budget))
         options = {
-            "drive_mode": "augmented",
             "enable_joint_velocity_limits": False,
             "dense_max_constraints": low,
         }

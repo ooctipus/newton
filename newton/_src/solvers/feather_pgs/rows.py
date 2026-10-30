@@ -40,7 +40,7 @@ from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .kernel_template import KernelTemplate, params
 from .route_table import Laws
 from .row_laws import ROW_LAW
-from .solver_fields import CONNECT_PLAN, CONNECT_SLOTS, DRIVE_SLOTS, MIMIC_PLAN, MIMIC_SLOTS, VELOCITY_LIMIT_SLOTS
+from .solver_fields import CONNECT_PLAN, CONNECT_SLOTS, MIMIC_PLAN, MIMIC_SLOTS, VELOCITY_LIMIT_SLOTS
 
 __all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_prescale_launch"]
 
@@ -153,7 +153,6 @@ class RowLaws:
         options: Options,
         *,
         matrix_free: bool,
-        mirrors: bool = False,
     ) -> RowLaws:
         """Resolve the row laws and build their tables.
 
@@ -162,7 +161,6 @@ class RowLaws:
             forest: The forest plan.
             options: The solver's options.
             matrix_free: The matrix-free formulation (CUDA).
-            mirrors: Keep debug mirrors of the mirrored fields.
 
         Raises:
             ValueError: For a negative or non-finite ``friction_anchor_beta``, patch friction with compliant contacts
@@ -173,7 +171,7 @@ class RowLaws:
         laws.forest = forest
         laws.options = options
         laws.matrix_free = bool(matrix_free)
-        laws._arrays = SolverArrays(laws, model.device, requires_grad=model.requires_grad, mirrors=mirrors)
+        laws._arrays = SolverArrays(laws, model.device, requires_grad=model.requires_grad)
 
         # The friction law. How friction_anchor_beta was resolved, for get_path_selection().
         friction_anchor_beta = options.friction_anchor_beta
@@ -544,15 +542,13 @@ class RowLaws:
         return self.connect_anchor_p_np[index].copy(), self.connect_anchor_c_np[index].copy()
 
     # --- the slots and the friction patches, allocated with the rows ----------------------------------------------
-    def allocate(self, model, pool, phi, *, fuse_joint_velocity_limits: bool, placeholder) -> None:
-        """Allocate the velocity-limit and drive slots, the fused clamp's operands and the friction patch state.
+    def allocate(self, model, pool, phi) -> None:
+        """Allocate the velocity-limit slots and the friction patch state.
 
         Args:
             model: The model.
             pool: The contact pool (its rows hold the patch state's per-contact fields).
             phi: The contact rows' patch phi view (a contact pool field).
-            fuse_joint_velocity_limits: Driven coordinates clamp their velocity limits in the drive rows.
-            placeholder: The solver's placeholder of a feature that is off (:meth:`.SolverArrays.placeholder`).
         """
         options = self.options
         arrays = self._arrays
@@ -574,23 +570,6 @@ class RowLaws:
             arrays.allocate(VELOCITY_LIMIT_SLOTS, limit_row=2 * model.joint_dof_count)
         else:
             arrays.release(VELOCITY_LIMIT_SLOTS)
-
-        if options.drive_mode == "physx_pgs" and model.joint_dof_count > 0:
-            arrays.allocate(DRIVE_SLOTS, dof=model.joint_dof_count)
-        else:
-            arrays.release(DRIVE_SLOTS)
-
-        # Velocity-limit kernels take a drive_slot input for the fused-clamp
-        # skip; when fusion is off (or there are no drive slots) they receive
-        # this persistent 1-element dummy and never read it (skip_driven == 0).
-        self.vel_limit_skip_driven = 1 if (fuse_joint_velocity_limits and self.drive_slot is not None) else 0
-        if self.vel_limit_skip_driven:
-            self.vel_limit_drive_slot_arg = self.drive_slot
-        else:
-            self.vel_limit_drive_slot_arg = placeholder(wp.int32, (1,), -1)
-        # The drive-row populate kernel reads joint_velocity_limit only when the fused clamp is enabled.
-        if fuse_joint_velocity_limits and model.joint_velocity_limit is None:
-            raise ValueError("fuse_joint_velocity_limits=True requires model.joint_velocity_limit to be allocated")
 
     def _patch_frame_reuse(self) -> tuple[bool, str]:
         """Return whether captured patch builds keep the sorted pairs of a reused contact frame, with the reason.
@@ -634,8 +613,7 @@ class RowLaws:
         so it applies neither law (``None``); ``routes.velocity_limits.free_body_sweep_law``
         records the law of its free-body sweep, stateless where free-body velocity-limit
         rows can exist and ``None`` where none can (no free rigid bodies, native sparse
-        split rows, unregistered speed attributes or an infinite activation fraction). The
-        ``physx_grasp`` schedule keeps PhysX's stateless clamp. Without velocity-limit rows
+        split rows, unregistered speed attributes or an infinite activation fraction). Without velocity-limit rows
         the kernels keep their stateless build, so a model without limits runs the same
         kernels under either law.
         """
@@ -648,8 +626,6 @@ class RowLaws:
                 "stateless where free-body velocity-limit rows can exist, and the post-solve root clamp, where it "
                 "runs (routes.velocity_limits.root_clamp), keeps its own."
             )
-        if options.pgs_schedule == "physx_grasp":
-            return "stateless", "pgs_schedule='physx_grasp' keeps PhysX's stateless velocity clamp."
         rows = options.enable_joint_velocity_limits or (
             self.has_rigid_body_velocity_limits and self.forest.free_rigid_body_count > 0
         )

@@ -71,9 +71,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
             {"_route_pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
             {"forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
-            {"drive_mode": "physx_pgs"},
-            {"pgs_schedule": "contact_then_internal"},
-            {"pgs_velocity_iterations": 1},
             {"contact_compliance": True},
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
@@ -333,13 +330,11 @@ def _case(
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
-            drive_mode="augmented",
             friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             velocity_limit_activation_fraction=activation_fraction,
             pgs_iterations=8,
-            pgs_velocity_iterations=0,
             pgs_warmstart=False,
             dense_max_constraints=32,
             mf_max_constraints=32,

@@ -16,10 +16,8 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   :func:`friction_pair_from_metric` for sweeps that keep a pair's block across
   iterations;
 * velocity limits: :func:`velocity_limit_update` (the stateless PhysX clamp or
-  the accumulated unilateral law, :mod:`.velocity_limit_law`), its free-body
-  speed form :func:`speed_row`, and PhysX's velocity clamp of a driven
-  coordinate, :func:`velocity_clamp_impulse`;
-* :func:`physx_drive`, the PhysX drive row's impulse update.
+  the accumulated unilateral law, :mod:`.velocity_limit_law`) and its free-body
+  speed form :func:`speed_row`.
 """
 
 import warp as wp
@@ -274,21 +272,3 @@ def speed_row(speed: float, limit: float, effective_mass: float, old: float, acc
     if delta != 0.0 and speed > 0.0:
         scale = -(delta / effective_mass) / speed
     return wp.vec3(new, delta, scale)
-
-
-@PROJECTION_LAW.law
-def velocity_clamp_impulse(jv: float, limit: float, diagonal: float) -> float:
-    """Return the impulse that clamps a coordinate's velocity ``jv`` into ``[-limit, limit]`` (PhysX's PxClamp)."""
-    return (wp.min(wp.max(jv, -limit), limit) - jv) / diagonal
-
-
-@PROJECTION_LAW.law
-def physx_drive(
-    old: float, jv: float, impulse_multiplier: float, velocity_multiplier: float, target: float, max_impulse: float
-) -> float:
-    """Return a PhysX drive row's new impulse: its descriptor's affine update, clamped to ``+-max_impulse``.
-
-    The descriptor (``compute_physx_pgs_drive_desc``) folds stiffness, damping and the
-    drive target into the multipliers and ``target``; ``jv`` is the row's velocity.
-    """
-    return box(old * impulse_multiplier + jv * velocity_multiplier + target, -max_impulse, max_impulse)

@@ -44,7 +44,6 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import position_pass
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     assert_loaded_anchors,
@@ -464,8 +463,6 @@ def prescaled_joint_velocity(model):
             field_group.upload(JointTable, model.device, model),
             model.articulation_count,
             lanes,
-            wp.full(1, -1, dtype=wp.int32, device=model.device),  # drive slots: unread without the fused clamp
-            0,
             model.joint_qd,
         ],
         outputs=[qd],
@@ -866,11 +863,8 @@ def _general_bias(solver, rows, dt):
             count,
             rhs.shape[1],
             dt,
-            1.0,
             solver.options.contact_speculative_scale,
             1.0,
-            1.0,
-            *position_pass(device),
         ],
         device=device,
     )
@@ -1036,21 +1030,19 @@ class TestPatchParallelAdmission(unittest.TestCase):
         worlds the tiers decline keep the serial sweep, and under which law. The
         switch is unset: patch friction is admitted by default.
         """
-        for limits, fraction, law, schedule, shared in (
-            (False, 0.0, "stateless", "interleaved", True),
-            (True, float("inf"), "stateless", "interleaved", True),  # the limits never activate
-            (True, 0.0, "accumulated", "interleaved", True),
-            (True, 0.0, "stateless", "interleaved", False),
-            (True, 0.0, "accumulated", "physx_grasp", False),  # the grasp schedule keeps PhysX's clamp
+        for limits, fraction, law, shared in (
+            (False, 0.0, "stateless", True),
+            (True, float("inf"), "stateless", True),  # the limits never activate
+            (True, 0.0, "accumulated", True),
+            (True, 0.0, "stateless", False),
         ):
             options = SimpleNamespace(
-                pgs_schedule=schedule,
                 enable_joint_velocity_limits=limits,
                 velocity_limit_activation_fraction=fraction,
                 velocity_limit_law=law,
             )
             laws = SimpleNamespace(
-                set=plain_laws(contact="patch", velocity_limits=limits, schedule=schedule),
+                set=plain_laws(contact="patch", velocity_limits=limits),
                 matrix_free=True,
                 has_rigid_body_velocity_limits=False,
                 options=options,
@@ -1061,7 +1053,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
             probe._parallel_velocity_limit_agreement = MethodType(
                 SolverFeatherPGS._parallel_velocity_limit_agreement, probe
             )
-            with self.subTest(limits=limits, fraction=fraction, law=law, schedule=schedule):
+            with self.subTest(limits=limits, fraction=fraction, law=law):
                 admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
                 self.assertTrue(admitted)
                 self.assertIn("one isotropic step per pair", reason)
@@ -1224,7 +1216,6 @@ class TestTierRule(unittest.TestCase):
             _preelim_active=False,
             dense_max_constraints=192,
             _route_pins={},
-            fuse_joint_velocity_limits=False,
             _paired_factor_coordinates=False,
             _local_internal_fast_path=False,
             _parallel_contact_paths=True,
@@ -1255,7 +1246,6 @@ class TestTierRule(unittest.TestCase):
             ({"_paired_factor_coordinates": True}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
-            ({"fuse_joint_velocity_limits": True}, "fused velocity clamp"),
             ({"_parallel_contact_paths": False, "_parallel_contact_paths_reason": regularized}, "regularization"),
             ({"_route_pins": {"placement": "general"}}, "general placement"),
             ({"_route_pins": {"tiers": 0}}, "tiers=0"),

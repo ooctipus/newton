@@ -545,9 +545,7 @@ def _sweep(solver) -> dict:
         "reason": solve.route.reason,
         "driver": driver,
         "driver_reason": solve.driver.reason,
-        "schedule": solver.options.pgs_schedule,
         "iterations": int(solver.options.pgs_iterations),
-        "velocity_iterations": int(solver.options.pgs_velocity_iterations),
         "mf_meta_pack": mf_meta_pack,
         "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
         "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
@@ -612,19 +610,15 @@ def _readout(solver, record) -> dict:
         reason = "pgs_solve_readout is off."
     elif record["driver"] == "direct":
         reason = "Each launch of a counted kernel solves its worlds."
-    elif record["driver"] in ("contact_then_internal", "dense_split"):
+    elif record["driver"] == "dense_split":
         reason = "Two row sets sweep in separate launches, so a solve counts once per launch."
     else:
-        reason = (
-            f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch; a launch "
-            "whose row phase holds none of a world's rows can return before its first sweep, which counts that "
-            "world in no slot and not as skipped."
-        )
+        reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
     return {
         "mode": solver.options.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
-        # Passes whose solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
-        "skipped_passes": list(solver._solve_readout.skipped_passes) if counted else [],
+        # Whether the solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
+        "counts_skipped": bool(counted) and solver._solve_readout.counts_skipped,
         "reason": reason,
     }
 
@@ -784,21 +778,14 @@ def _velocity_limits(solver) -> dict:
         joint, reason = "off", "enable_joint_velocity_limits is False."
     elif solver._sparse_velocity_limits:
         joint, reason = "sparse_factor_rows", "Native sparse factors solve velocity-limit rows in factor coordinates."
-    elif solver.fuse_joint_velocity_limits:
-        joint = "fused_clamp"
-        reason = "Driven DOFs take the stateless end-of-iteration clamp; undriven limited DOFs keep dedicated rows."
     else:
-        joint, reason = (
-            "rows",
-            "Dedicated velocity-limit rows (the fused clamp needs matrix-free physx_pgs drives, a finite "
-            "activation fraction and model joint velocity limits).",
-        )
+        joint, reason = "rows", "Dedicated velocity-limit rows."
     free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     limits = bool(solver.laws.has_rigid_body_velocity_limits)
     matrix_free = solver._matrix_free
     model = solver.model
     prescale = solver.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
-    # The law the matrix-free sweep kernels were built with; the fused drive clamp keeps PhysX's.
+    # The law the matrix-free sweep kernels were built with.
     law, law_reason = solver.laws.velocity_limit_sweep_law()
     return {
         "joint": joint,

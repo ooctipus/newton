@@ -354,10 +354,10 @@ def _free_body() -> LoopSweep:
 
 def _laws(solve_policy: SolvePolicy) -> RowLaws:
     """The loop sweeps' row laws under ``solve_policy``."""
-    return RowLaws(drive=False, regularize=True, policy=solve_policy)
+    return RowLaws(regularize=True, policy=solve_policy)
 
 
-"""The loop sweeps' row laws: no drive rows; a contact's step takes its regularization weight when ``regularize``."""
+"""The loop sweeps' row laws: a contact's step takes its regularization weight when ``regularize``."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

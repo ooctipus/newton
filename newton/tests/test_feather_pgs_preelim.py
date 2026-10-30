@@ -294,20 +294,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertFalse(solver._preelim_active)
         self.assertTrue(any("requires CUDA" in str(w.message) for w in caught))
 
-    def test_velocity_iterations_warn_and_fall_back(self):
-        """The TGS velocity pass is unsupported in v1: warn and fall back."""
-        model = _build_four_bar().finalize()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_iterations=16,
-                pgs_velocity_iterations=4,
-                enable_bilateral_preelimination=True,
-            )
-        self.assertFalse(solver._preelim_active)
-        self.assertTrue(any("velocity_iterations" in str(w.message) for w in caught))
-
 
 if __name__ == "__main__":
     unittest.main()

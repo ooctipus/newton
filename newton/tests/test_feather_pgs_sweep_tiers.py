@@ -57,7 +57,6 @@ CALLS = (
         {"rows": 32, "sweeps": 112, **_INK, "row_inputs": _keyed(True), "linked_rows": True},
     ),
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, "inkernel_response": (18, 0, 0, 0)}),
-    ("drive", (64, 32, 18, "120"), {"rows": 32, "sweeps": 42, **_INK, "has_drive_rows": True}),
     ("rows_64", (96, 32, 18, "120"), {"rows": 64, "min_rows": 32, "sweeps": 60, **_INK}),
     (
         "rows_96_last_word",
@@ -108,7 +107,6 @@ class TestParallelTier(unittest.TestCase):
             {"rows": 30, "sweeps": 1, **_INK},
             {"rows": 32, "sweeps": 1, "min_rows": 32, **_INK},
             {"rows": 32, "sweeps": 1, "inkernel_response": (12, 7, 0, 12)},
-            {"rows": 32, "sweeps": 1, **_INK, "has_drive_rows": True, "row_inputs": _keyed(False)},
         )
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs):
@@ -125,15 +123,6 @@ class TestParallelTier(unittest.TestCase):
                 # The CUDA body ends at the CPU branch, which fails a CPU build (device_preludes.CUDA_ONLY).
                 body = source[: source.rindex("#else\n")]
                 self.assertTrue(body.rstrip().endswith("SYNC();"), body[-200:])
-
-    def test_drive_rows_take_the_drive_law_only_with_drive_rows(self):
-        args = (64, 32, 18, "120")
-        driven = _source(args, {"rows": 32, "sweeps": 1, **_INK, "has_drive_rows": True})
-        self.assertIn("ProjectionLaw::physx_drive(s_y[i], r - s_drive_rhs[i]", driven)
-        undriven = _source(args, {"rows": 32, "sweeps": 1, **_INK})
-        self.assertNotIn("physx_drive", undriven)
-        self.assertNotIn("s_drive", undriven)
-        self.assertIn("(i >= dense_lo && row_type != 1) ? 1 : 0;", undriven)
 
     def test_formed_diagonals_freeze_their_rows_after_the_staging(self):
         """A row the formed diagonal freezes changes its kind only once every lane has read the kinds."""

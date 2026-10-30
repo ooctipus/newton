@@ -4,13 +4,13 @@
 """Declarative device fields: one declaration per field, from allocation to the Warp structs kernels take.
 
 A :class:`Field` names a device array (or a scalar) once: its element type,
-its shape as dimension names, its fill, whether it takes a gradient and a debug
-mirror, and where a binding finds it. Everything else derives from it:
+its shape as dimension names, its fill, whether it takes a gradient, and where
+a binding finds it. Everything else derives from it:
 
 - :class:`FieldGroup` holds fields that share dimensions and are allocated
   together; :meth:`SolverArrays.allocate` allocates a group on its owner, each
-  field as the owner's attribute of the field's name, with the owner's device,
-  gradient policy and debug mirrors;
+  field as the owner's attribute of the field's name, with the owner's device
+  and gradient policy;
 - :func:`struct` generates the Warp struct of a set of fields, so a kernel
   takes one argument where it listed every array;
 - :func:`bind` fills an instance of such a struct from the objects that hold
@@ -31,9 +31,6 @@ import warp as wp
 
 __all__ = ["Field", "FieldGroup", "SolverArrays", "bind", "fields_of", "replace", "struct", "upload"]
 
-MIRROR_PREFIX = "_debug_position_"
-"""Attribute prefix of a field's debug mirror (the solver's position-problem snapshot)."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Field:
@@ -49,8 +46,6 @@ class Field:
     """Initial value: 0 zeros the array, another value fills it, ``None`` leaves it uninitialized."""
     grad: bool = True
     """Allocate a gradient when the allocation asks for gradients."""
-    mirror: bool = False
-    """Keep a debug mirror, ``_debug_position_<name>``, when the allocation keeps mirrors."""
     owner: str = "solver"
     """Role of the object a :func:`bind` reads the field from (a keyword of the call)."""
     attr: str | None = None
@@ -92,27 +87,20 @@ class FieldGroup:
         """The group of the fields whose owner role is ``role`` (for example the ones an owner allocates)."""
         return FieldGroup(*(field for field in self.fields if field.owner == role))
 
-    @property
-    def mirrored(self) -> tuple[Field, ...]:
-        """The fields with a debug mirror."""
-        return tuple(field for field in self.fields if field.mirror)
-
 
 class SolverArrays:
-    """Allocates field groups on an owner with one device, gradient policy and debug-mirror policy.
+    """Allocates field groups on an owner with one device and gradient policy.
 
     Args:
         owner: The object whose attributes the fields become.
         device: Device of every array.
         requires_grad: Allocate gradients for the fields that take them.
-        mirrors: Allocate the debug mirrors of mirrored fields (otherwise they are ``None``).
     """
 
-    def __init__(self, owner, device, *, requires_grad: bool = False, mirrors: bool = False):
+    def __init__(self, owner, device, *, requires_grad: bool = False):
         self.owner = owner
         self.device = device
         self.requires_grad = bool(requires_grad)
-        self.mirrors = bool(mirrors)
         self._placeholders: dict[tuple, wp.array] = {}
 
     def array(self, field: Field, sizes: dict[str, int], requires_grad: bool | None = None) -> wp.array:
@@ -126,12 +114,11 @@ class SolverArrays:
         return wp.full(shape, field.fill, dtype=field.dtype, device=self.device, requires_grad=grad)
 
     def allocate(self, group, /, *, owner=None, requires_grad: bool | None = None, **sizes: int) -> dict[str, wp.array]:
-        """Allocate every field of ``group`` at ``sizes`` and give it to its owner, with its debug mirror.
+        """Allocate every field of ``group`` at ``sizes`` and give it to its owner.
 
         Args:
             group: The fields.
-            owner: Where the arrays go instead of the allocator's owner: an object (attributes) or a dict (items,
-                without mirrors).
+            owner: Where the arrays go instead of the allocator's owner: an object (attributes) or a dict (items).
             requires_grad: Overrides the allocator's gradient policy for this group.
             sizes: The size of every dimension name the fields use.
 
@@ -145,11 +132,8 @@ class SolverArrays:
             arrays[field.name] = array
             if isinstance(owner, dict):
                 owner[field.name] = array
-                continue
-            setattr(owner, field.name, array)
-            if field.mirror:
-                mirror = self.array(field, sizes, requires_grad) if self.mirrors else None
-                setattr(owner, MIRROR_PREFIX + field.name, mirror)
+            else:
+                setattr(owner, field.name, array)
         return arrays
 
     def allocate_words(self, group, /) -> wp.array:
@@ -189,25 +173,10 @@ class SolverArrays:
                 setattr(owner, field.name, array)
         return arrays
 
-    def mirror(self, group) -> None:
-        """Allocate the debug mirrors of ``group``'s fields at the shapes of the owner's current arrays.
-
-        For fields the owner holds as views of other storage (an alias, a placeholder).
-        """
-        for field in group.mirrored:
-            array = getattr(self.owner, field.name)
-            mirror = None
-            if self.mirrors:
-                grad = self.requires_grad and field.grad
-                mirror = wp.zeros(array.shape, dtype=field.dtype, device=self.device, requires_grad=grad)
-            setattr(self.owner, MIRROR_PREFIX + field.name, mirror)
-
     def release(self, group) -> None:
-        """Set every field of ``group`` and its mirror to ``None`` on the owner: the feature is off."""
+        """Set every field of ``group`` to ``None`` on the owner: the feature is off."""
         for field in group:
             setattr(self.owner, field.name, None)
-            if field.mirror:
-                setattr(self.owner, MIRROR_PREFIX + field.name, None)
 
     def placeholder(self, dtype, shape: tuple = (1,), fill=0) -> wp.array:
         """The shared array of ``dtype``, ``shape`` and ``fill`` for operands of a feature that is off.
@@ -221,13 +190,6 @@ class SolverArrays:
             array = self.array(Field("placeholder", dtype, tuple(shape), fill=fill, grad=False), {})
             self._placeholders[key] = array
         return array
-
-    def snapshot(self, group) -> None:
-        """Copy every mirrored field of ``group`` into its mirror (no-op without mirrors)."""
-        if not self.mirrors:
-            return
-        for field in group.mirrored:
-            wp.copy(getattr(self.owner, MIRROR_PREFIX + field.name), getattr(self.owner, field.name))
 
 
 _STRUCT_FIELDS: dict[Any, tuple[Field, ...]] = {}

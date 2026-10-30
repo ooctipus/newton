@@ -18,7 +18,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     BodyFactors,
     compute_world_contact_bias,
 )
-from newton.tests.feather_pgs_law_harness import position_pass
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
@@ -155,7 +154,7 @@ def test_regularization_fixed_points(test: unittest.TestCase, device):
         test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
-def _stack_scene(device, g, velocity_iterations=2):
+def _stack_scene(device, g):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.003
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -177,7 +176,6 @@ def _stack_scene(device, g, velocity_iterations=2):
     solver = newton.solvers.SolverFeatherPGS(
         model,
         pgs_iterations=8,
-        pgs_velocity_iterations=velocity_iterations,
         pgs_contact_regularization=g,
         pgs_warmstart=True,
     )
@@ -250,16 +248,6 @@ def test_regularization_cpu_route_documented_sag(test: unittest.TestCase, device
         test.assertAlmostEqual(sag, expected, delta=0.15 * expected, msg=f"split sag {sag * 1000:.2f} mm")
 
 
-def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
-    """The velocity-only pass solves the exact rigid law: a settled stack holds
-    its height to well under a millimetre over the last second."""
-    with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, velocity_iterations=4)
-        _, zs = _run(model, pipeline, solver, 240)
-        drift = abs(zs[-1] - zs[179])
-        test.assertLess(drift, 5.0e-4, f"top box kept sinking ({drift * 1000:.2f} mm over the last second)")
-
-
 def test_regularization_indeterminate_split(test: unittest.TestCase, device):
     """A plank on three identical supports has no unique rigid force split;
     the regularizer must select the symmetric one (outer supports equal)."""
@@ -287,7 +275,6 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_iterations=8,
-            pgs_velocity_iterations=2,
             pgs_contact_regularization=0.02,
             pgs_warmstart=True,
         )
@@ -356,7 +343,7 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
 def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
     """The standalone MF route must not read its one-element inactive weight argument."""
     with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0, velocity_iterations=0)
+        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0)
         body_q, _zs = _run(model, pipeline, solver, 1)
         test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
@@ -387,10 +374,7 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
                 1,
                 DT,
                 1.0,
-                1.0,
-                1.0,
                 0.5,
-                *position_pass(device),
             ],
             device=device,
         )
@@ -410,7 +394,6 @@ def test_assembled_dense_regularization_fixed_point(test: unittest.TestCase, dev
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_iterations=400,
-            pgs_velocity_iterations=0,
             pgs_contact_regularization=g,
             enable_contact_friction=False,
             dense_max_constraints=64,
@@ -489,7 +472,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
         solver = newton.solvers.SolverFeatherPGS(
             model,
             pgs_iterations=16,
-            pgs_velocity_iterations=0,
             pgs_contact_regularization=g,
             pgs_warmstart=True,
         )
@@ -565,12 +547,6 @@ add_function_test(
     "test_regularization_cpu_route_documented_sag",
     test_regularization_cpu_route_documented_sag,
     devices=["cpu"],
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_regularization_velocity_pass_exempt",
-    test_regularization_velocity_pass_exempt,
-    devices=get_selected_cuda_test_devices(),
 )
 add_function_test(
     TestFeatherPGSRegularization,

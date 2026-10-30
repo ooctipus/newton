@@ -432,12 +432,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "step": scalars(rng, n),
             "accumulated": flags(),
         }
-    if name == "velocity_clamp_impulse":
-        return {
-            "jv": scalars(rng, n, 3.0),
-            "limit": rng.uniform(0.1, 3.0, n).astype(np.float32),
-            "diagonal": rng.uniform(0.1, 2.0, n).astype(np.float32),
-        }
     if name in ("joint_limit_side",):
         lower = scalars(rng, n)
         upper = lower + np.abs(scalars(rng, n))
@@ -606,20 +600,6 @@ def bind_struct(struct_type, values, device):
 def contact_input(values, device):
     """The :data:`ContactInput` of a scene's values (:func:`bind_struct`)."""
     return bind_struct(ContactInput, values, device)
-
-
-def position_pass(device) -> list:
-    """The trailing operands of ``kernels.compute_world_contact_bias``'s position pass: no velocity pass (0), whose
-    world coordinates, packed rows, velocities and restitution threshold it then never reads."""
-    return [
-        0,
-        wp.zeros((1, 1), dtype=wp.int32, device=device),
-        row_support(np.full((1, 1, 2), -1, dtype=np.int32), [0], [0], 0, device),
-        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
-        wp.zeros(1, dtype=wp.float32, device=device),
-        wp.zeros(1, dtype=wp.float32, device=device),
-        0.0,
-    ]
 
 
 def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:

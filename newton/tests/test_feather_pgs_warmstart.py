@@ -281,7 +281,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
     def test_constructor_layout_and_decay_validation(self):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
         start = parameters.index("pgs_warmstart")
-        self.assertEqual(parameters[start : start + 2], ("pgs_warmstart", "pgs_schedule"))
+        self.assertEqual(parameters[start : start + 2], ("pgs_warmstart", "mf_max_constraints"))
         self.assertGreater(
             parameters.index("pgs_warmstart_decay"), parameters.index("articulation_pair_contact_gap_gate")
         )

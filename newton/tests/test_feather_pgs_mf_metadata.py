@@ -154,7 +154,6 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     4,
                     65535,
                     6,
-                    has_drive_rows=False,
                     has_dense_velocity_limit_rows=False,
                     shared_metadata=False,
                     stream_mf_impulses=stream,
@@ -309,17 +308,14 @@ def _solve_parent_rows(device, parents):
         iterations=8,
         omega=1.0,
         regularize=0,
-        row_phase=0,
         friction_start_iteration=0,
         iteration_offset=0,
-        freeze_drive_rows=0,
     )
     kernel = sweep_routes.mf_gs_kernel(
         8,
         capacity,
         29,
         str(device.arch),
-        has_drive_rows=False,
         has_dense_velocity_limit_rows=False,
         shared_metadata=False,
         stream_mf_impulses=True,
@@ -413,59 +409,55 @@ def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free stepping requires CUDA")
 class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
     def test_no_free_rigid_bodies_skip_pack_and_keep_steps(self):
-        """Skip both pack launches without free rigid bodies and match the unskipped steps bit for bit."""
+        """Skip the pack launch without free rigid bodies and match the unskipped steps bit for bit."""
         model = _build_pendulums(wp.get_device("cuda:0"))
         steps = 16
-        for velocity_iterations in (0, 2):
-            with self.subTest(velocity_iterations=velocity_iterations):
-                runs = []
-                for unconditional in (False, True):
-                    solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=velocity_iterations)
-                    self.assertFalse(solver.forest.has_free_rigid_bodies)
-                    # The pack kernel is built only where it launches.
-                    self.assertIsNone(solver._pack_mf_meta_kernel)
-                    if unconditional:
-                        _launch_pack_unconditionally(solver)
-                    runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
-                (skipping, skipped_packs, skipped), (legacy, legacy_packs, unskipped) = runs
-                self.assertEqual(skipped_packs, [])
-                # The route record says what the step did. The legacy arm's pack is replaced on the
-                # instance, so only the skipping arm's record describes its launches.
-                pack = skipping.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
-                self.assertFalse(pack["launched"])
-                self.assertIsNone(pack["kernel"])
-                # The legacy arm proves both call sites ran: position pass, then velocity pass.
-                passes = 2 if velocity_iterations else 1
-                expected = [legacy.mf_rhs, legacy.mf_rhs_unbiased][:passes] * steps
-                self.assertEqual(len(legacy_packs), len(expected))
-                for actual, rhs in zip(legacy_packs, expected, strict=True):
-                    self.assertIs(actual, rhs)
-                self.assertTrue(np.all(skipped["contact_count"] > 0))
-                self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
-                np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
-                np.testing.assert_array_equal(skipped["mf_meta_packed"], 0)
-                for name, value in skipped.items():
-                    np.testing.assert_array_equal(value, unskipped[name], err_msg=name)
+        runs = []
+        for unconditional in (False, True):
+            solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6)
+            self.assertFalse(solver.forest.has_free_rigid_bodies)
+            # The pack kernel is built only where it launches.
+            self.assertIsNone(solver._pack_mf_meta_kernel)
+            if unconditional:
+                _launch_pack_unconditionally(solver)
+            runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
+        (skipping, skipped_packs, skipped), (legacy, legacy_packs, unskipped) = runs
+        self.assertEqual(skipped_packs, [])
+        # The route record says what the step did. The legacy arm's pack is replaced on the
+        # instance, so only the skipping arm's record describes its launches.
+        pack = skipping.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
+        self.assertFalse(pack["launched"])
+        self.assertIsNone(pack["kernel"])
+        # The legacy arm proves the call site ran on every step.
+        self.assertEqual(len(legacy_packs), steps)
+        for actual in legacy_packs:
+            self.assertIs(actual, legacy.mf_rhs)
+        self.assertTrue(np.all(skipped["contact_count"] > 0))
+        self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
+        np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
+        np.testing.assert_array_equal(skipped["mf_meta_packed"], 0)
+        for name, value in skipped.items():
+            np.testing.assert_array_equal(value, unskipped[name], err_msg=name)
 
-    def test_free_rigid_bodies_keep_both_pack_launches(self):
-        """Pack the position and velocity problems on every step when free rigid bodies exist."""
+    def test_free_rigid_bodies_pack_every_step(self):
+        """Pack the problem on every step when free rigid bodies exist."""
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.01
         builder.add_ground_plane()
         box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
         builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05)
         model = builder.finalize(device=wp.get_device("cuda:0"))
-        solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6, pgs_velocity_iterations=2)
+        solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6)
         self.assertTrue(solver.forest.has_free_rigid_bodies)
         steps = 4
         packed, values = _step_matrix_free(model, solver, steps=steps)
         self.assertGreater(int(values["mf_constraint_count"].max()), 0)
-        self.assertEqual(len(packed), 2 * steps)
+        self.assertEqual(len(packed), steps)
         pack = solver.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
         self.assertTrue(pack["launched"])
         self.assertEqual(pack["kernel"], solver._pack_mf_meta_kernel.key)
-        for index, rhs in enumerate(packed):
-            self.assertIs(rhs, solver.mf_rhs_unbiased if index % 2 else solver.mf_rhs)
+        for rhs in packed:
+            self.assertIs(rhs, solver.mf_rhs)
 
 
 if __name__ == "__main__":

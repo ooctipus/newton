@@ -106,7 +106,7 @@ def _factory_calls():
             "mf_gs",
             sweep_routes.mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
-            {"has_drive_rows": False},
+            {},
         ),
         (
             "paired",
@@ -198,9 +198,7 @@ def _vote_census():
             (
                 _axis("shared_metadata"),
                 _axis("stream_mf_impulses"),
-                _axis("has_drive_rows"),
                 _axis("has_dense_velocity_limit_rows"),
-                _axis("fuse_vel_limits"),
                 ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
                 _axis("skip_tier_rows", (0, 32)),
@@ -475,7 +473,7 @@ class TestExitLaw(unittest.TestCase):
             {
                 "sparse": 80,
                 "sparse_lanes": 32,
-                "mf_gs": 336,
+                "mf_gs": 144,
                 "paired": 6,
                 "local": 24,
                 "packets": 24,
@@ -494,19 +492,6 @@ class TestExitLaw(unittest.TestCase):
                 votes = sum("changed = 1;" in line for line in body.splitlines())
                 self.assertGreaterEqual(body.count("solve_trace_change("), votes)
                 self.assertEqual(body.count("solve_trace_sweep("), 1)
-
-    def test_trace_names_the_fused_drive_clamp_a_velocity_limit(self):
-        """Trace the matrix-free sweep's fused drive velocity clamp under the velocity-limit kind, not the drive's."""
-        kernel = sweep_routes.mf_gs_kernel.__wrapped__(
-            64, 32, 12, "120", has_drive_rows=True, fuse_vel_limits=True, solve_policy=TRACE
-        )
-        snippet = _policy_snippet(self, kernel, "solve_trace_sweep(")
-        velocity_limit = int(kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-        self.assertEqual(TRACE_KINDS[velocity_limit], "velocity_limit")
-        records = [line.strip() for line in snippet.splitlines() if "solve_trace_change(fabsf(delta_fvl)" in line]
-        self.assertEqual(
-            records, [f"if (delta_fvl != 0.0f) solve_trace_change(fabsf(delta_fvl) * (denom_fvl), {velocity_limit});"]
-        )
 
     def test_torsion_votes_under_every_policy(self):
         """Vote the torsion pass's changes under the exit law and the trace, each scaled by its row's diagonal."""
@@ -567,7 +552,6 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertAlmostEqual(summary["full_budget_fraction"], 2.0 / 3.0)
         self.assertAlmostEqual(summary["mean_sweeps"], 10.0 / 3.0)
         self.assertEqual(summary["world_mean_sweeps"]["p50"], 3.0)
-        self.assertEqual(summary["pass"], "position")
         self.assertNotIn("trace", summary)
         json.dumps(record.summary(), allow_nan=False)
 
@@ -601,65 +585,26 @@ class TestSolveReadoutRecord(unittest.TestCase):
         )
         json.dumps(record.summary(), allow_nan=False)
 
-    def test_velocity_pass_counts_in_its_own_slots(self):
-        """Count launches inside the velocity pass in slots of their own budget, apart from the position solve.
-
-        A velocity pass of one or two sweeps exhausts nearly every solve; counted in the position
-        solve's slot, those solves would read as full-budget position solves.
-        """
-        record = SolveReadoutRecord(SWEEPS)
-        counted = SimpleNamespace(key="counted_kernel")
-        position_only = SimpleNamespace(key="position_only")
-        record.register(counted, "mf_gs", readout="sweeps", world_count=2, budget=8, device="cpu", velocity_budget=2)
-        record.register(position_only, "sparse_pgs", readout="sweeps", world_count=2, budget=8, device="cpu")
-        (position,) = record.operands(counted)
-        with record.velocity_pass():
-            (velocity,) = record.operands(counted)
-            self.assertEqual(record.operands(position_only), [])
-        self.assertIs(record.operands(counted)[0], position)
-        self.assertEqual((position.sweeps.shape, velocity.sweeps.shape), ((9, 2), (3, 2)))
-        self.assertEqual(record.kernels, {"counted_kernel": "mf_gs", "position_only": "sparse_pgs"})
-        # Two velocity-pass solves of world 0, both of two sweeps without stopping.
-        sweeps = np.zeros((3, 2), dtype=np.int32)
-        sweeps[2, 0] = 2
-        velocity.sweeps.assign(sweeps)
-        velocity.exhausted.assign(np.array([2, 0], dtype=np.int32))
-        slots = {(slot["kernel"], slot["pass"]): slot for slot in record.summary()["slots"]}
-        self.assertEqual(
-            sorted(slots),
-            [("counted_kernel", "position"), ("counted_kernel", "velocity"), ("position_only", "position")],
-        )
-        self.assertEqual(slots[("counted_kernel", "position")]["solves"], 0)
-        velocity_slot = slots[("counted_kernel", "velocity")]
-        self.assertEqual((velocity_slot["budget"], velocity_slot["solves"], velocity_slot["exhausted"]), (2, 2, 2))
-
-    def test_worlds_without_rows_count_as_skipped_per_pass(self):
-        """Count, per pass, one skipped solve per launch of every world without dense or matrix-free rows.
+    def test_worlds_without_rows_count_as_skipped(self):
+        """Count one skipped solve per launch of every world without dense or matrix-free rows.
 
         The matrix-free sweeps return before their first sweep for such a world, so no slot records
         it; a world's solves are its slots' solves plus its skipped ones.
         """
         record = SolveReadoutRecord(SWEEPS)
         counted = SimpleNamespace(key="counted_kernel")
-        record.register(
-            counted, "parallel_tier", readout="sweeps", world_count=4, budget=4, device="cpu", velocity_budget=2
-        )
-        record.register_skipped(world_count=4, device="cpu", velocity_budget=2)
+        record.register(counted, "parallel_tier", readout="sweeps", world_count=4, budget=4, device="cpu")
+        record.register_skipped(world_count=4, device="cpu")
         # World 0 holds dense rows and world 2 matrix-free rows; worlds 1 and 3 have none.
         dense = wp.array([4, 0, 0, 0], dtype=wp.int32, device="cpu")
         free = wp.array([0, 0, 2, 0], dtype=wp.int32, device="cpu")
         for _ in range(2):
             record.count_skipped(dense, free)
-        with record.velocity_pass():
-            record.count_skipped(dense, free)
         # A second registration keeps the counters.
         record.register_skipped(world_count=4, device="cpu")
         summary = record.summary()
-        self.assertEqual(
-            summary["skipped"],
-            [{"pass": "position", "solves": 4, "worlds": 2}, {"pass": "velocity", "solves": 2, "worlds": 2}],
-        )
-        self.assertEqual([slot["solves"] for slot in summary["slots"]], [0, 0])
+        self.assertEqual(summary["skipped"], {"solves": 4, "worlds": 2})
+        self.assertEqual([slot["solves"] for slot in summary["slots"]], [0])
         json.dumps(summary, allow_nan=False)
 
     def test_skip_counters_need_a_readout_and_a_registering_route(self):
@@ -671,7 +616,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
                 if register:
                     record.register_skipped(world_count=2, device="cpu")
                 record.count_skipped(empty, empty)
-                self.assertEqual(record.summary()["skipped"], [])
+                self.assertIsNone(record.summary()["skipped"])
 
     def test_trace_record_summarizes_stops_reasons_and_final_changes(self):
         """Summarize the trace's per-tolerance stopping sweeps, exit reasons and final-sweep changes."""
@@ -731,7 +676,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
         """Name every constraint type at its own index of the trace's kinds, followed by the kind of no change."""
         names = {
             kernels.PGS_CONSTRAINT_TYPE_CONTACT: "contact",
-            kernels.PGS_CONSTRAINT_TYPE_JOINT_TARGET: "drive",
+            1: "unused",
             kernels.PGS_CONSTRAINT_TYPE_FRICTION: "friction",
             kernels.PGS_CONSTRAINT_TYPE_JOINT_LIMIT: "joint_limit",
             kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: "velocity_limit",
@@ -816,11 +761,11 @@ def _sweep_record(**fields):
     return record
 
 
-def _policy_solver(*, readout="sweeps", skipped=("position",), **attributes):
+def _policy_solver(*, readout="sweeps", skipped=True, **attributes):
     """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
     return SimpleNamespace(
         _solve_policy=SolvePolicy(readout=readout),
-        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, skipped_passes=tuple(skipped)),
+        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, counts_skipped=skipped),
         **attributes,
         options=SimpleNamespace(pgs_solve_readout=readout),
     )
@@ -831,7 +776,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
 
     def test_every_driver_records_the_one_law(self):
         """Record the same exit law under every driver: a launch of part of a solve stops under it too."""
-        for driver in ("direct", "dense_split", "physx_grasp"):
+        for driver in ("direct", "dense_split", "debug_loop"):
             with self.subTest(driver=driver):
                 solver, record = _policy_solver(), _sweep_record(driver=driver)
                 sweep = {
@@ -841,34 +786,24 @@ class TestSweepPolicyRecords(unittest.TestCase):
                 self.assertEqual(sweep["exit_law"]["law"], "rounding_floor")
                 json.dumps(sweep, allow_nan=False)
 
-    def test_phase_launches_count_once_each(self):
-        """Say that a contact-then-internal solve counts once per row-phase launch.
-
-        A driver that launches one row phase at a time counts per launch too, and its sweeps
-        return before their first sweep for a world without rows of the launch's phase (the
-        matrix-free sweep at the velocity-limit phase, the incremental tier at the drive-and-limit,
-        contact and velocity-limit phases), so the record says that such a launch counts the world
-        nowhere.
-        """
-        record = _sweep_record(driver="contact_then_internal")
+    def test_split_launches_count_once_each(self):
+        """Say that a dense-split solve counts once per launch, and a direct one once per solve."""
+        record = _sweep_record(driver="dense_split")
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
-        for driver in ("physx_grasp",):
-            with self.subTest(driver=driver):
-                reason = path_selection._readout(_policy_solver(), _sweep_record(driver=driver))["reason"]
-                self.assertIn("counts are per launch", reason)
-                self.assertIn("in no slot and not as skipped", reason)
+        reason = path_selection._readout(_policy_solver(), _sweep_record(driver="debug_loop"))["reason"]
+        self.assertIn("counts are per launch", reason)
 
-    def test_records_name_the_passes_that_count_skipped_solves(self):
-        """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""
+    def test_records_say_whether_skipped_solves_count(self):
+        """Say whether the solves of worlds without rows count as skipped, and not without counted sweeps."""
         record = _sweep_record()
-        for skipped in ((), ("position",), ("position", "velocity")):
+        for skipped in (False, True):
             with self.subTest(skipped=skipped):
                 readout = path_selection._readout(_policy_solver(skipped=skipped), record)
-                self.assertEqual(readout["skipped_passes"], list(skipped))
+                self.assertEqual(readout["counts_skipped"], skipped)
         solver = _policy_solver()
-        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=("position",))
-        self.assertEqual(path_selection._readout(solver, record)["skipped_passes"], [])
+        solver._solve_readout = SimpleNamespace(kernels={}, counts_skipped=True)
+        self.assertFalse(path_selection._readout(solver, record)["counts_skipped"])
 
 
 if __name__ == "__main__":

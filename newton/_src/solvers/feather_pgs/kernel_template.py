@@ -307,7 +307,7 @@ class SweepTier:
         kernel: The tier's Warp kernel.
         block_dim: Threads per block of its tiled launches.
         tier: Its index among the parallel tiers' world lists, or ``None`` for a tier on the general queue.
-        response_inputs: It takes the in-kernel response inputs after ``freeze_drive_rows``.
+        response_inputs: It takes the in-kernel response inputs after ``iteration_offset``.
         kinetic_rows: It reads the keyed rows' operands after those.
         linked_rows: It projects each friction pair on its patch ring's pooled normal load.
         velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.

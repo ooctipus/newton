@@ -208,7 +208,7 @@ def free_body_row_rhs(
     row_w = float(1.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         cap = contact_depenetration_cap(body_a, body_b, max_depenetration_velocity)
-        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, 1.0, speculative_scale, contact_w, cap, 0.0)
+        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, 1.0, speculative_scale, contact_w, cap)
         if restitution > 0.0:
             fires, bounce = contact_restitution_rhs(
                 phi, incident - target, target, restitution, dt, restitution_threshold
@@ -281,7 +281,7 @@ def free_body_rows_kernel(
     """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
 
     One thread per row slot (``world * mf_max_constraints + row``). A restitutive contact first stores its incident
-    velocity ``J v_hat`` from the writers' ``J`` (the velocity pass rebounds from it too). The row weight is written
+    velocity ``J v_hat`` from the writers' ``J``. The row weight is written
     only when contacts are regularized (``contact_w < 1``).
     """
     tid = wp.tid()

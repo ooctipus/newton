@@ -218,11 +218,11 @@ def _readout_calls():
         kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs, patch_only
     factory = sweep_routes.mf_gs_kernel.__wrapped__
-    no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
+    no_limits = {"has_dense_velocity_limit_rows": False}
     for args, kwargs in (
-        ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
-        ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
-        ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+        ((192, 64, 22, _ARCH), {}),
+        ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
+        ((192, 64, 15, _ARCH), {**no_limits, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, {**kwargs, **readout}, False
     factory = sweep_routes_local.paired_factor_kernel.__wrapped__
@@ -421,40 +421,38 @@ def _solver_factory_calls():
     for dofs in (1, 2):
         factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {"units": True}
-    for skip_rows, drives, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
+    for skip_rows, limits, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
             "skip_tier_rows": skip_rows,
-            "has_drive_rows": drives,
+            "has_dense_velocity_limit_rows": limits,
             "factor_coordinates": coordinates,
             "independent_components": components,
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # Streamed metadata with the packed row types and parents resident, which single-wave launches
-    # of large dense capacities select under either law; drives add the limit scans' global reads.
-    for drives in (False, True):
+    # of large dense capacities select under either law; limits add the limit scans' global reads.
+    for limits in (False, True):
         kwargs = {
             "shared_metadata": False,
             "resident_row_metadata": True,
-            "has_drive_rows": drives,
-            "has_dense_velocity_limit_rows": drives,
-            "skip_tier_rows": 0 if drives else 32,
+            "has_dense_velocity_limit_rows": limits,
+            "skip_tier_rows": 0 if limits else 32,
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The accumulated velocity-limit law of the serial sweeps; the stateless law keeps the pins above.
-    for skip_rows, drives in itertools.product((0, 32), (False, True)):
-        kwargs = {"skip_tier_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
+    for skip_rows in (0, 32):
+        kwargs = {"skip_tier_rows": skip_rows, "velocity_limit_law": "accumulated"}
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     # The resident row metadata cases above, under the accumulated law.
-    for drives in (False, True):
+    for limits in (False, True):
         kwargs = {
             "shared_metadata": False,
             "resident_row_metadata": True,
-            "has_drive_rows": drives,
-            "has_dense_velocity_limit_rows": drives,
-            "skip_tier_rows": 0 if drives else 32,
+            "has_dense_velocity_limit_rows": limits,
+            "skip_tier_rows": 0 if limits else 32,
             "velocity_limit_law": "accumulated",
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
@@ -520,14 +518,14 @@ def _suite_shape_calls():
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
-    no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
+    no_limits = {"has_dense_velocity_limit_rows": False}
     factory = sweep_routes.mf_gs_kernel.__wrapped__
     for args, kwargs in (
-        ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
-        ((192, 64, 22, _ARCH), {"has_drive_rows": False, "skip_tier_rows": 128}),
-        ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
-        ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
-        ((72, 32, 18, _ARCH), {**no_drives, "skip_tier_rows": 48}),
+        ((192, 64, 22, _ARCH), {}),
+        ((192, 64, 22, _ARCH), {"skip_tier_rows": 128}),
+        ((192, 64, 15, _ARCH), {**no_limits, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+        ((192, 64, 29, _ARCH), {**no_limits, "factor_coordinates": True, "independent_components": True}),
+        ((72, 32, 18, _ARCH), {**no_limits, "skip_tier_rows": 48}),
     ):
         yield "sweep_routes.mf_gs_kernel", factory, args, kwargs
     factory = sweep_routes_sparse.sparse_kernel.__wrapped__

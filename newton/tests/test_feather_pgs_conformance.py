@@ -38,10 +38,9 @@ Scenes and features
     free cube, and two articulations above the held-tree owner's caps (a
     66-coordinate humanoid-like tree, a 100-link snake with and without joint
     armature). Articulated contact
-    scenes hold two worlds that differ, so a world mix-up shows. Variants: PhysX
-    drives, velocity iterations, warm start, contact compliance, contact
-    torsion, ``contact_update="unit"``, restitution, bilateral pre-elimination,
-    joint and rigid-body velocity limits.
+    scenes hold two worlds that differ, so a world mix-up shows. Variants: warm
+    start, contact compliance, contact torsion, ``contact_update="unit"``,
+    restitution, bilateral pre-elimination, joint and rigid-body velocity limits.
 
 Metrics
     Computed on the host from the model, the states before and after each
@@ -1051,7 +1050,7 @@ class Physics:
     iterations: int
     """Gate budget N of every route."""
     variant: tuple = ()
-    """``(option, value)`` pairs every route of this problem shares (velocity iterations, compliance...)."""
+    """``(option, value)`` pairs every route of this problem shares (compliance, torsion...)."""
     label: str = ""
 
     @property
@@ -1515,11 +1514,6 @@ def cuda_groups() -> list:
         Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL)),
         Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL)),
-        Group(
-            _physics(scenes.chain(), None, 16, "physx_drives", drive_mode="physx_pgs"),
-            ref,
-            (MF_DEFAULT.but("mf_physx_drives", expect={"held_tree.owner": None}),),
-        ),
         Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
         Group(
             # Pre-elimination solves the iterative connect rows' problem exactly: compare with the iterative reference.
@@ -1555,11 +1549,6 @@ def cuda_groups() -> list:
                 SPARSE.but("sparse_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True}),
                 MF_PARALLEL,
             ),
-        ),
-        Group(
-            _physics(scenes.box_drop(), "point", 32, "velocity_iterations", pgs_velocity_iterations=4),
-            ref,
-            (MF_GENERAL,),
         ),
         Group(
             _physics(

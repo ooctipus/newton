@@ -239,7 +239,7 @@ def sparse_diagonal_source(
     scheduled = contact_triples or contact_units
 
     warp = Lanes(32)
-    laws = RowLaws(drive=False, regularize=False, policy=solve_policy)
+    laws = RowLaws(regularize=False, policy=solve_policy)
     rows = WorldRows(M, lanes=warp)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
 

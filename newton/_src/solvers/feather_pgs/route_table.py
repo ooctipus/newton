@@ -30,13 +30,7 @@ class Laws:
     limits: bool
     """Joint position limits take rows (``enable_joint_limits``)."""
     velocity_limits: bool
-    """Joint velocity limits take rows or the fused clamp (``enable_joint_velocity_limits``)."""
-    drives: str
-    """``"augmented"`` drives fold into the mass matrix; ``"physx_pgs"`` drives take rows."""
-    schedule: str
-    """The row-kind order of a sweep (``pgs_schedule``)."""
-    velocity_pass: bool
-    """Unbiased velocity iterations follow the position solve."""
+    """Joint velocity limits take rows (``enable_joint_velocity_limits``)."""
     warm_start: bool
     """Contact impulses carry from the previous step."""
     debug_rows: bool
@@ -54,22 +48,12 @@ class Laws:
     forward_cuda: bool
     """CUDA without gradient recording: native kernels without adjoints may run."""
 
-    PLAIN = (
-        "the interleaved schedule with augmented drives and no velocity iterations, warm start, debug rows or "
-        "bilateral pre-elimination"
-    )
+    PLAIN = "no warm start, debug rows or bilateral pre-elimination"
 
     @property
     def plain(self) -> bool:
         """The sweep policy the specialized placements assume (:attr:`PLAIN`)."""
-        return bool(
-            self.schedule == "interleaved"
-            and self.drives == "augmented"
-            and not self.velocity_pass
-            and not self.warm_start
-            and not self.debug_rows
-            and not self.preelimination
-        )
+        return not (self.warm_start or self.debug_rows or self.preelimination)
 
     @property
     def agnostic(self) -> bool:
@@ -98,9 +82,6 @@ class Laws:
             compliance=bool(options.contact_compliance),
             limits=bool(options.enable_joint_limits),
             velocity_limits=bool(options.enable_joint_velocity_limits),
-            drives=options.drive_mode,
-            schedule=options.pgs_schedule,
-            velocity_pass=options.pgs_velocity_iterations != 0,
             warm_start=bool(options.pgs_warmstart),
             debug_rows=bool(options.pgs_debug),
             preelimination=bool(preelimination),
@@ -130,23 +111,17 @@ _REQUIREMENTS = {
     "no_connect": (lambda laws: not laws.connect, "no connect rows"),
     "no_loops": (lambda laws: not laws.loops, "no loop-closing joints"),
     "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
-    "interleaved": (lambda laws: laws.schedule == "interleaved", "the interleaved row schedule"),
-    "augmented": (lambda laws: laws.drives == "augmented", "augmented drives"),
-    "no_velocity_pass": (lambda laws: not laws.velocity_pass, "no separate velocity iterations"),
     "no_debug_rows": (lambda laws: not laws.debug_rows, "no debug row snapshots"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
 }
 
 CAPABILITIES = {
     # The held tree's evaluation of the dynamics (its topology fit is the held groups' own proof).
-    "held": ("forward_cuda", "augmented", "no_velocity_pass", "no_connect", "no_loops", "no_debug_rows"),
+    "held": ("forward_cuda", "no_connect", "no_loops", "no_debug_rows"),
     # The packed placement of a single tree: native sparse factors and their sweep.
     "packed": (
         "forward_cuda",
-        "interleaved",
-        "augmented",
         "iterations",
-        "no_velocity_pass",
         "no_debug_rows",
         "unregularized",
         "no_preelimination",

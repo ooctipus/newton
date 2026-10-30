@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, position_pass, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, world_restitution_layout
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -226,10 +226,7 @@ def _run_general(data, layout, beta):
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
-        inputs=[
-            *(records, layout.counts, ROWS, data.dt, data.bias_scale, data.speculative_scale, 1.0, data.contact_w),
-            *position_pass(device),
-        ],
+        inputs=[records, layout.counts, ROWS, data.dt, data.speculative_scale, data.contact_w],
         device=device,
     )
     bias = rows.rhs.numpy().copy()

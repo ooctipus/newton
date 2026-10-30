@@ -12,10 +12,8 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     BodyFactors,
-    compute_mf_rhs_bias,
     compute_world_contact_bias,
 )
-from newton.tests.feather_pgs_law_harness import row_support
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -93,7 +91,6 @@ def _build_v_jaws(tilt_deg: float, geometry: str = "box"):
 
 _SQUEEZE_SOLVER = {
     "pgs_iterations": 64,
-    "pgs_velocity_iterations": 0,
     "pgs_beta": 0.05,
     "pgs_contact_regularization": 0.01,
     "contact_friction_gap_threshold": 0.001,
@@ -338,7 +335,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         self.assertLess(abs(bq[box][2] - bq[jaws[0]][2]), 0.01)
 
 
-def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, device="cpu"):
+def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
 
     ``phi`` holds what the row builders store: raw separation for dense rows (paired with
@@ -364,16 +361,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             rhs=rhs,
             row_w=zeros3(),
         )
-        # The position pass: no velocity-pass operands are read.
-        none = wp.zeros((1, 1), dtype=wp.int32, device=device)
-        packed = row_support(np.full((1, 3, 2), -1, dtype=np.int32), [0], [0], 0, device)
-        velocity = wp.zeros((1,), dtype=wp.float32, device=device)
-        wp.launch(
-            compute_world_contact_bias,
-            dim=3,
-            inputs=[rows, count, 3, dt, bias_scale, 1.0, 1.0, 1.0, 0, none, packed, zJ(), velocity, velocity, 0.5],
-            device=device,
-        )
+        wp.launch(compute_world_contact_bias, dim=3, inputs=[rows, count, 3, dt, 1.0, 1.0], device=device)
     elif family == "mf_setup":
         wp.launch(
             response_builds_rows.free_body_rows_kernel,
@@ -409,45 +397,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             outputs=[zeros3(), zeros3()],
             device=device,
         )
-    elif family == "mf_velocity":
-        mf_rows = field_group.upload(
-            MfRows,
-            device,
-            body_a=neg1,
-            body_b=neg1,
-            dof_a=neg1,
-            dof_b=neg1,
-            Z_a=zJ(),
-            Z_b=zJ(),
-            phi=phi_arr,
-            row_type=row_type,
-            target=zeros3(),
-            restitution=zeros3(),
-            incident=zeros3(),
-            rhs=rhs,
-        )
-        velocity = wp.zeros((1,), dtype=wp.float32, device=device)
-        wp.launch(
-            compute_mf_rhs_bias,
-            dim=3,
-            inputs=[
-                mf_rows,
-                count,
-                BodyFactors(),
-                0,
-                inf,
-                pgs_beta,
-                dt,
-                bias_scale,
-                1.0,
-                velocity,
-                0,
-                0,
-                0.5,
-                3,
-            ],
-            device=device,
-        )
     else:
         raise ValueError(family)
     return rhs.numpy()[0]
@@ -466,23 +415,18 @@ def _build_two_world_free_model(device):
 class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
     """Device-agnostic checks of the anchor bookkeeping (run on CPU)."""
 
-    def test_rhs_bias_matches_on_every_row_family_and_vanishes_in_velocity_pass(self):
-        """Apply equal positional bias on all row families and drop it in velocity-only passes."""
+    def test_rhs_bias_matches_on_every_row_family(self):
+        """Apply equal positional bias on all row families."""
         pgs_beta, fa_beta, dt = 0.05, 0.3, 0.005
         phi_n, e0, e1 = -2.0e-3, 1.0e-4, -2.5e-4
         expect_pos = np.array([pgs_beta * phi_n / dt, fa_beta * e0 / dt, fa_beta * e1 / dt], dtype=np.float32)
-        dense = lambda s: _rhs_for_family(  # noqa: E731
-            "dense", phi=[phi_n, e0, e1], row_beta=[pgs_beta, fa_beta, fa_beta], pgs_beta=pgs_beta, dt=dt, bias_scale=s
+        dense = _rhs_for_family(
+            "dense", phi=[phi_n, e0, e1], row_beta=[pgs_beta, fa_beta, fa_beta], pgs_beta=pgs_beta, dt=dt
         )
         pre = [phi_n, fa_beta * e0, fa_beta * e1]
-        np.testing.assert_allclose(dense(1.0), expect_pos, rtol=1.0e-5)
-        np.testing.assert_allclose(dense(0.0), 0.0, atol=1.0e-9)
-        got = _rhs_for_family("mf_setup", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+        np.testing.assert_allclose(dense, expect_pos, rtol=1.0e-5)
+        got = _rhs_for_family("mf_setup", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt)
         np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg="mf_setup")
-        got = _rhs_for_family("mf_velocity", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
-        np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg="mf_velocity")
-        got0 = _rhs_for_family("mf_velocity", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=0.0)
-        np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg="mf_velocity")
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""

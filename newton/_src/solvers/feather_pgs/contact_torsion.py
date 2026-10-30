@@ -19,19 +19,15 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
-import warp as wp
 
 from ...geometry import GeoType
 from ...utils.selection import match_labels
 from .capture_joins import capturing
-from .dense_rows import RowSupport
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
-    world_contact_row_dot,
 )
-from .row_laws import CONTACT_END_GAP_SLOP
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, vote
 
 _TOUCH_TOLERANCE = 1.0e-5
@@ -109,7 +105,6 @@ def _validate_torsion_mode(laws):
     if (
         not laws.model.device.is_cuda
         or laws.model.requires_grad
-        or options.pgs_schedule != "interleaved"
         or options.pgs_warmstart
         or options.pgs_debug
         or options.contact_compliance
@@ -119,8 +114,6 @@ def _validate_torsion_mode(laws):
             "Contact torsion requires CUDA non-differentiable matrix_free/immediate/current/"
             "interleaved, without warmstart, compliance, or debug"
         )
-    if options.pgs_velocity_iterations > 0 and options.enable_bilateral_preelimination:
-        raise ValueError("Contact torsion velocity post-passes require enable_bilateral_preelimination=False")
 
 
 @dataclass
@@ -304,78 +297,6 @@ def validate_torsion_step(solver):
             raise RuntimeError("Contact torsion graph capture requires device preparation with deferred validation")
 
 
-@wp.kernel
-def _prepare_velocity_torsion_rows(
-    count: wp.array[int],
-    capacity: int,
-    row_type: wp.array2d[int],
-    group: wp.array2d[int],
-    phi: wp.array2d[float],
-    target: wp.array2d[float],
-    position_velocity: wp.array[float],
-    dof_indices: wp.array2d[int],
-    row_support: RowSupport,
-    packed_J: wp.array3d[float],
-    dt: float,
-    rhs: wp.array2d[float],
-):
-    """Conclude speculative spin admission without discarding touching support."""
-    tid = wp.tid()
-    world = tid // capacity
-    spin = tid % capacity
-    if spin >= count[world] or row_type[world, spin] != PGS_CONSTRAINT_TYPE_TORSION:
-        return
-    touching = bool(False)
-    for row in range(count[world]):
-        if row_type[world, row] == PGS_CONSTRAINT_TYPE_CONTACT and group[world, row] == spin:
-            speed = world_contact_row_dot(dof_indices, row_support, packed_J, position_velocity, world, row)
-            end_gap = phi[world, row] + dt * (speed - target[world, row])
-            # Retain touching support through rebound, with the existing end-gap
-            # slop as the initial touching tolerance. Otherwise require contact
-            # by the position end. Final normal load still bounds all traction.
-            if phi[world, row] <= CONTACT_END_GAP_SLOP or end_gap <= CONTACT_END_GAP_SLOP:
-                touching = True
-    # The angular row has no positional spring: retain prescribed angular
-    # target motion but not position-solve contact correction or restitution.
-    rhs[world, spin] = -target[world, spin]
-    # Keep the undivided coefficient: still-loaded normal rows retain sliding
-    # friction even when separated support retires the additional spin row.
-    group[world, spin] = -1 if touching else _TORSION_SPIN_RETIRED
-    # Do not zero lambda here. The coupled sweep must apply Y * (new - old)
-    # to refund position-phase spin and tangential impulses coherently.
-
-
-def prepare_torsion_velocity_pass(solver, dt):
-    """Conclude touching eligibility and angular RHS for the unbiased pass.
-
-    Keep accumulated impulses and their velocity response from the position
-    solve. Each velocity sweep then recomputes the shared sliding/spin bound
-    from its final normal load and applies every impulse delta once. Initially
-    touching rows retain admission through rebound, using end-gap slop as the
-    initial touching tolerance. Final normal load remains authoritative, even
-    within this tolerance. Unreached groups refund carried spin.
-    """
-    wp.launch(
-        _prepare_velocity_torsion_rows,
-        dim=solver.forest.world_count * solver.dense_max_constraints,
-        inputs=[
-            solver.constraint_count,
-            solver.dense_max_constraints,
-            solver.row_type,
-            solver._contact_torsion_group,
-            solver.phi,
-            solver.target_velocity,
-            solver.v_out_snap,
-            solver.forest.world_dof_indices,
-            solver._row_support(),
-            solver._packed_J,
-            dt,
-        ],
-        outputs=[solver.rhs_unbiased],
-        device=solver.model.device,
-    )
-
-
 def prepare_torsion_rows(solver, state, augmented_state, contacts):
     """Append current touching-group angular rows before H-inverse/J response."""
     validate_torsion_step(solver)
@@ -537,7 +458,7 @@ def torque_sweep_source(op, policy: SolvePolicy = DEFAULT_POLICY):
     )
     torsion_vote = vote(policy, (torsion,), flag="iteration_changed", pad=" " * 20)
     return f"""
-        if (row_phase == 0 || row_phase == 1 || row_phase == 4) {{
+        {{
             for (int spin = 0; spin < m_dense; ++spin) {{
                 if (world_row_type.data[off_dense + spin] != {PGS_CONSTRAINT_TYPE_TORSION}) continue;
                 float radius = contact_torsion_radius;

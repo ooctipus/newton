@@ -163,14 +163,13 @@ def factory_calls():
         {},
         {"shared_metadata": False},
         {"stream_mf_impulses": True},
-        {"fuse_vel_limits": True},
         {"contact_torsion": True},
         {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
         {"skip_tier_rows": 32},
         {"factor_coordinates": True},
         {"factor_coordinates": True, "independent_components": True},
     )
-    for base in ({}, {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}):
+    for base in ({}, {"has_dense_velocity_limit_rows": False}):
         for change in toggles:
             yield "sweep_routes.mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
 
@@ -486,9 +485,7 @@ def census_calls():
     mf_gs = (
         _axis("shared_metadata", (True, False)),
         _axis("stream_mf_impulses"),
-        _axis("has_drive_rows", (True, False)),
         _axis("has_dense_velocity_limit_rows", (True, False)),
-        _axis("fuse_vel_limits"),
         ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
         _axis("contact_torsion"),
         _axis("factor_coordinates"),
@@ -562,7 +559,6 @@ def census_calls():
                     {"rows": rows, "min_rows": low, "sweeps": 24, "inkernel_response": (18, 0, 0, 0)}
                     for rows, low in ((32, 0), (48, 32), (128, 96))
                 ),
-                _axis("has_drive_rows"),
                 _axis("linked_rows"),
                 _axis("velocity_limit_pass"),
             ),
@@ -581,7 +577,6 @@ def census_calls():
                     }
                     for rows, low in ((32, 0), (64, 32), (96, 64), (128, 96))
                 ),
-                _axis("has_drive_rows"),
                 _axis("linked_rows"),
                 _axis("velocity_limit_pass"),
             ),

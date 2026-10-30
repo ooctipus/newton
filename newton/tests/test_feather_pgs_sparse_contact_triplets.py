@@ -448,7 +448,6 @@ class TestSparseContactTriplets(unittest.TestCase):
             ):
                 solver = SolverFeatherPGS(
                     model,
-                    drive_mode="augmented",
                     friction_anchor_beta=0.0,
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
@@ -776,7 +775,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ):
                 solver = SolverFeatherPGS(
                     model,
-                    drive_mode="augmented",
                     enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=192,

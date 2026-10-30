@@ -215,12 +215,10 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,
-            drive_mode="augmented",
             friction_anchor_beta=friction_anchor_beta,
             enable_joint_limits=True,
             enable_joint_velocity_limits=True,
             pgs_iterations=8,
-            pgs_velocity_iterations=0,
             pgs_warmstart=False,
             pgs_beta=0.07,
             pgs_cfm=2e-4,

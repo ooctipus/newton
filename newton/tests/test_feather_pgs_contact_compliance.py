@@ -70,10 +70,8 @@ def run_fixture(
         options = dict(
             # Isolate the normal material law from positional patch friction.
             friction_anchor_beta=0.0,
-            pgs_schedule="interleaved",
             enable_restitution=False,
             pgs_iterations=iterations,
-            pgs_velocity_iterations=0,
             dense_max_constraints=32,
             mf_max_constraints=32,
             pgs_beta=0.05,
@@ -158,7 +156,6 @@ def run_native_hydro_fixture(*, articulated=True):
                 model,
                 contact_compliance=enabled,
                 friction_anchor_beta=0.0,
-                pgs_schedule="interleaved",
                 enable_restitution=False,
                 pgs_iterations=128,
                 pgs_contact_regularization=0.0,

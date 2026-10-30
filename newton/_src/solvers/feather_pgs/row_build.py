@@ -348,7 +348,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         weight = float(1.0)
         if row == 0:
             rhs, weight = contact_rhs(
-                phi, data.beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
+                phi, data.beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0
             )
             if restitution > 0.0:
                 relative = incident_projection(data, body_a, art_a, p0, direction)

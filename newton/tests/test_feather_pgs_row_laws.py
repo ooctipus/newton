@@ -19,7 +19,6 @@ from newton.tests.feather_pgs_law_harness import (
     joint_type,
     mismatches,
     register_device_tests,
-    row_support,
     scalars,
     unified,
     world_row_support,
@@ -71,16 +70,12 @@ def _rows(rng, worlds, rows):
 
 
 def test_row_rhs_matches_world_contact_bias(test, device):
-    """Equal ``kernels.compute_world_contact_bias`` bitwise for every row kind and bias setting."""
+    """Equal ``kernels.compute_world_contact_bias`` bitwise for every row kind and setting."""
     rng = np.random.default_rng(11)
     worlds, rows = 16, 64
     phi, kind, beta, target = _rows(rng, worlds, rows)
-    for dt, bias_scale, contact_spec, limit_spec, contact_w in (
-        (1.0 / 60.0, 1.0, 1.0, 1.0, 1.0),
-        (1.0 / 120.0, 0.0, 0.0, 1.0, 0.5),
-        (7.0e-3, 0.7, 0.3, 0.2, 0.98),
-    ):
-        with test.subTest(dt=dt, bias_scale=bias_scale, contact_w=contact_w):
+    for dt, contact_spec, contact_w in ((1.0 / 60.0, 1.0, 1.0), (1.0 / 120.0, 0.0, 0.5), (7.0e-3, 0.3, 0.98)):
+        with test.subTest(dt=dt, contact_spec=contact_spec, contact_w=contact_w):
             out = call(
                 kernels.compute_world_contact_bias,
                 worlds * rows,
@@ -92,17 +87,8 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 world_row_type=kind,
                 world_target_velocity=target,
                 dt=dt,
-                bias_scale=bias_scale,
                 contact_speculative_scale=contact_spec,
-                joint_limit_speculative_scale=limit_spec,
                 contact_w=contact_w,
-                velocity_pass=0,
-                world_dof_indices=np.zeros((worlds, 1), dtype=np.int32),
-                row_support=row_support(np.full((worlds, rows, 2), -1, dtype=np.int32), [0], [0], 0, device),
-                packed_J=np.zeros((worlds, rows, 1), dtype=np.float32),
-                world_position_velocity=np.zeros(1, dtype=np.float32),
-                world_incident_velocity=np.zeros(1, dtype=np.float32),
-                restitution_velocity_threshold=0.0,
                 mf_constraint_count=np.zeros(worlds, dtype=np.int32),
                 owned_rows_le=0,
                 world_rhs=np.zeros((worlds, rows), dtype=np.float32),
@@ -117,9 +103,9 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 kind=kind,
                 target=target,
                 dt=dt,
-                bias_scale=bias_scale,
+                bias_scale=1.0,
                 contact_speculative_scale=contact_spec,
-                limit_speculative_scale=limit_spec,
+                limit_speculative_scale=1.0,
                 contact_w=contact_w,
                 rhs=np.zeros((worlds, rows), dtype=np.float32),
                 row_w=np.zeros((worlds, rows), dtype=np.float32),
@@ -229,9 +215,7 @@ def _law_mf_position_rhs(
     w = float(1.0)
     if kind == row_laws.ROW_CONTACT:
         cap = row_laws.contact_depenetration_cap(ba, bb, rigid_body_max_depenetration_velocity)
-        value, w = row_laws.contact_rhs(
-            phi, pgs_beta, target, inv_dt, 1.0, contact_speculative_scale, contact_w, cap, 0.0
-        )
+        value, w = row_laws.contact_rhs(phi, pgs_beta, target, inv_dt, 1.0, contact_speculative_scale, contact_w, cap)
         restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = float(0.0)
@@ -332,177 +316,6 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     test.assertFalse(mismatches(reference_rhs.ravel()[untouched, None], law_rhs.ravel()[untouched, None]).any())
 
 
-@wp.func
-def _row_dot(
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    dof_a: int,
-    dof_b: int,
-    world_dof_indices: wp.array2d[int],
-    velocity: wp.array[float],
-    world: int,
-    i: int,
-):
-    """``J v`` of one free-body row over a global velocity: body ``a``'s six products, then ``b``'s, from zero."""
-    out = float(0.0)
-    if dof_a >= 0:
-        for k in range(6):
-            out += mf_J_a[world, i, k] * velocity[world_dof_indices[world, dof_a + k]]
-    if dof_b >= 0:
-        for k in range(6):
-            out += mf_J_b[world, i, k] * velocity[world_dof_indices[world, dof_b + k]]
-    return out
-
-
-@wp.kernel
-def _law_mf_pass_rhs(
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_dof_a: wp.array2d[int],
-    mf_dof_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    world_dof_indices: wp.array2d[int],
-    mf_phi: wp.array2d[float],
-    mf_row_type: wp.array2d[int],
-    mf_target_velocity: wp.array2d[float],
-    mf_row_restitution: wp.array2d[float],
-    rigid_body_max_depenetration_velocity: wp.array[float],
-    pgs_beta: float,
-    dt: float,
-    bias_scale: float,
-    speculative_scale: float,
-    position_velocity: wp.array[float],
-    incident_velocity: wp.array[float],
-    preserve_unreached_speculative: int,
-    apply_restitution: int,
-    restitution_velocity_threshold: float,
-    rhs: wp.array2d[float],
-    incident: wp.array2d[float],
-):
-    world, i = wp.tid()
-    target = mf_target_velocity[world, i]
-    phi = mf_phi[world, i]
-    kind = mf_row_type[world, i]
-    inv_dt = 1.0 / dt
-    value = float(0.0)
-    if kind == row_laws.ROW_CONTACT:
-        end_gap = float(0.0)
-        if preserve_unreached_speculative != 0 and phi > 0.0:
-            jv = _row_dot(
-                mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, position_velocity, world, i
-            )
-            end_gap = phi + dt * (jv - target)
-        cap = row_laws.contact_depenetration_cap(
-            mf_body_a[world, i], mf_body_b[world, i], rigid_body_max_depenetration_velocity
-        )
-        value, _w = row_laws.contact_rhs(
-            phi, pgs_beta, target, inv_dt, bias_scale, speculative_scale, 1.0, cap, end_gap
-        )
-        restitution = float(0.0)
-        if apply_restitution != 0:
-            restitution = mf_row_restitution[world, i]
-        if restitution > 0.0:
-            relative_incident = _row_dot(
-                mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, incident_velocity, world, i
-            )
-            incident[world, i] = relative_incident
-            relative_incident -= target
-            fires, bounce = row_laws.contact_restitution_rhs(
-                phi, relative_incident, target, restitution, dt, restitution_velocity_threshold
-            )
-            if fires:
-                value = bounce
-    elif kind == row_laws.ROW_FRICTION:
-        value, _w = row_laws.row_rhs(kind, phi, 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
-    else:
-        value = phi - target
-    rhs[world, i] = value
-
-
-def test_contact_rhs_matches_mf_rhs_bias(test, device):
-    """Equal ``compute_mf_rhs_bias`` in its position and velocity passes.
-
-    The velocity pass keeps a separated row's speculative bias while the position
-    solve's linearized end gap is open; the law reads that gap as ``end_gap``.
-    """
-    rng = np.random.default_rng(14)
-    worlds, rows = 8, 48
-    layout = _mf_layout(rng, worlds, rows)
-    phi = scalars(rng, worlds * rows, 0.02).reshape(worlds, rows)
-    kind = rng.choice(np.array([0, 0, 0, 2, 4], dtype=np.int32), (worlds, rows))
-    target = scalars(rng, worlds * rows, 0.1).reshape(worlds, rows)
-    dof_a = np.where(layout["mf_body_a"] >= 0, 0, -1).astype(np.int32)
-    dof_b = np.where(layout["mf_body_b"] >= 0, 6, -1).astype(np.int32)
-    indices = (12 * np.arange(worlds)[:, None] + np.arange(12)[None, :]).astype(np.int32)
-    common = {
-        "mf_body_a": layout["mf_body_a"],
-        "mf_body_b": layout["mf_body_b"],
-        "mf_dof_a": dof_a,
-        "mf_dof_b": dof_b,
-        "mf_J_a": layout["mf_Z_a"],
-        "mf_J_b": layout["mf_Z_b"],
-        "world_dof_indices": indices,
-        "mf_phi": phi,
-        "mf_row_type": kind,
-        "mf_target_velocity": target,
-        "mf_row_restitution": rng.choice(np.array([0.0, 0.6], dtype=np.float32), (worlds, rows)),
-        "rigid_body_max_depenetration_velocity": layout["rigid_body_max_depenetration_velocity"],
-        "pgs_beta": 0.3,
-        "dt": 1.0 / 60.0,
-        "position_velocity": rng.normal(size=12 * worlds).astype(np.float32),
-        "incident_velocity": rng.normal(size=12 * worlds).astype(np.float32),
-        "restitution_velocity_threshold": 0.1,
-    }
-    incident = np.abs(common["incident_velocity"]).reshape(worlds, 12)
-    incident_terms = np.where(dof_a >= 0, (np.abs(layout["mf_Z_a"]) * incident[:, None, :6]).sum(axis=2), 0.0)
-    incident_terms += np.where(dof_b >= 0, (np.abs(layout["mf_Z_b"]) * incident[:, None, 6:]).sum(axis=2), 0.0)
-    # Body 2w at world coordinates [0, 6), body 2w + 1 at [6, 12): identity factors keep Z = J and u = v.
-    factors, _lower = _body_factors(rng, 2 * worlds, device, identity=True)
-    for bias_scale, speculative, preserve, restitution in ((1.0, 0.8, 0, 1), (0.0, 0.0, 1, 1), (0.5, 1.0, 1, 0)):
-        with test.subTest(bias_scale=bias_scale, preserve=preserve, restitution=restitution):
-            settings = {
-                "bias_scale": bias_scale,
-                "speculative_scale": speculative,
-                "preserve_unreached_speculative": preserve,
-                "apply_restitution": restitution,
-            }
-            law = call(
-                _law_mf_pass_rhs,
-                (worlds, rows),
-                device,
-                rhs=np.zeros((worlds, rows), dtype=np.float32),
-                incident=np.zeros((worlds, rows), dtype=np.float32),
-                **common,
-                **settings,
-            )
-            out = call(
-                kernels.compute_mf_rhs_bias,
-                worlds * rows,
-                device,
-                mf_constraint_count=np.full(worlds, rows, dtype=np.int32),
-                has_target_velocity=1,
-                mf_max_constraints=rows,
-                mf_rhs=np.zeros((worlds, rows), dtype=np.float32),
-                mf_Z_a=common["mf_J_a"],
-                mf_Z_b=common["mf_J_b"],
-                mf_row_incident=law["incident"],
-                factors=factors,
-                **common,
-                **settings,
-            )
-            # A restitution row's target is -target + e (J v - target): its terms include the row's J v products.
-            magnitude = np.abs(phi) * 60.0 + 2.0 * np.abs(target) + incident_terms
-            worst = unified(
-                f"mf rhs passes (compute_mf_rhs_bias, bias_scale {bias_scale}, preserve {preserve})",
-                out["mf_rhs"].numpy().ravel(),
-                law["rhs"].numpy().ravel(),
-                magnitude.ravel(),
-                2.0,
-            )
-            test.assertLessEqual(worst, 2.0)
-
-
 def _dense_layout(rng, worlds, rows, dofs, device):
     """Packed rows (:mod:`.packed_rows`) over every world coordinate."""
     return {
@@ -510,109 +323,6 @@ def _dense_layout(rng, worlds, rows, dofs, device):
         "row_support": world_row_support(worlds, rows, dofs, device),
         "packed_J": rng.normal(size=(worlds, rows, dofs)).astype(np.float32),
     }
-
-
-@wp.kernel
-def _law_velocity_pass(
-    world_dof_indices: wp.array2d[int],
-    row_support: kernels.RowSupport,
-    packed_J: wp.array3d[float],
-    world_phi: wp.array2d[float],
-    world_row_type: wp.array2d[int],
-    world_target_velocity: wp.array2d[float],
-    world_row_restitution: wp.array2d[float],
-    world_position_velocity: wp.array[float],
-    world_incident_velocity: wp.array[float],
-    dt: float,
-    apply_restitution: int,
-    restitution_velocity_threshold: float,
-    rhs: wp.array2d[float],
-):
-    world, i = wp.tid()
-    inv_dt = 1.0 / dt
-    phi = world_phi[world, i]
-    kind = world_row_type[world, i]
-    target = world_target_velocity[world, i]
-    value = -target
-    if kind == row_laws.ROW_CONTACT:
-        fires = bool(False)
-        bounce = float(0.0)
-        restitution = float(0.0)
-        if apply_restitution != 0:
-            restitution = world_row_restitution[world, i]
-        if restitution > 0.0:
-            relative_incident = (
-                kernels.world_contact_row_dot(
-                    world_dof_indices, row_support, packed_J, world_incident_velocity, world, i
-                )
-                - target
-            )
-            fires, bounce = row_laws.contact_restitution_rhs(
-                phi, relative_incident, target, restitution, dt, restitution_velocity_threshold
-            )
-        if fires:
-            value = bounce
-        else:
-            end_gap = float(0.0)
-            if phi > 0.0:
-                jv = kernels.world_contact_row_dot(
-                    world_dof_indices, row_support, packed_J, world_position_velocity, world, i
-                )
-                end_gap = phi + dt * (jv - target)
-            value, _w = row_laws.contact_rhs(phi, 0.0, target, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
-    elif kind == row_laws.ROW_JOINT_LIMIT:
-        value = row_laws.limit_rhs(phi, 0.0, target, inv_dt, 0.0, 1.0)
-    elif kind == row_laws.ROW_JOINT_TARGET:
-        value = 0.0
-    rhs[world, i] = value
-
-
-def test_velocity_pass_matches_world_contact_bias(test, device):
-    """Equal ``compute_world_contact_bias``'s velocity pass (the dense rows' velocity iterations).
-
-    The pass is the contact law with no Baumgarte and no speculative scale, keeping
-    a separated row's bias while its end gap is open, and the limit law with no
-    Baumgarte: the row law with its bias scales at 0.
-    """
-    rng = np.random.default_rng(15)
-    worlds, rows, dofs = 8, 32, 12
-    phi, kind, _, target = _rows(rng, worlds, rows)
-    common = {
-        **_dense_layout(rng, worlds, rows, dofs, device),
-        "world_phi": phi,
-        "world_row_type": kind,
-        "world_target_velocity": target,
-        "world_row_restitution": rng.choice(np.array([0.0, 0.5], dtype=np.float32), (worlds, rows)),
-        "world_position_velocity": rng.normal(scale=0.1, size=dofs * worlds).astype(np.float32),
-        "world_incident_velocity": rng.normal(size=dofs * worlds).astype(np.float32),
-        "dt": 1.0 / 60.0,
-        "apply_restitution": 1,
-        "restitution_velocity_threshold": 0.2,
-    }
-    out = call(
-        kernels.compute_world_contact_bias,
-        worlds * rows,
-        device,
-        world_constraint_count=np.full(worlds, rows, dtype=np.int32),
-        max_constraints=rows,
-        world_row_beta=rng.uniform(0.0, 1.0, (worlds, rows)).astype(np.float32),
-        bias_scale=0.0,
-        contact_speculative_scale=0.0,
-        joint_limit_speculative_scale=1.0,
-        contact_w=1.0,
-        velocity_pass=1,
-        world_rhs=np.zeros((worlds, rows), dtype=np.float32),
-        **common,
-    )
-    law = call(_law_velocity_pass, (worlds, rows), device, rhs=np.zeros((worlds, rows), dtype=np.float32), **common)
-    np.testing.assert_array_equal(out["world_rhs"].numpy(), law["rhs"].numpy())
-    unified(
-        "dense velocity pass (compute_world_contact_bias), signs of zero",
-        out["world_rhs"].numpy().ravel(),
-        law["rhs"].numpy().ravel(),
-        np.abs(phi.ravel()) * 60.0 + np.abs(target.ravel()),
-        0.0,
-    )
 
 
 @wp.kernel
@@ -720,7 +430,7 @@ def _law_restitution_accumulated(
     phi = world_phi[world, i]
     # The geometric bias the position pass added: the contact law with no target.
     bias, _w = row_laws.contact_rhs(
-        phi, world_row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0, 0.0
+        phi, world_row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0
     )
     relative_incident = rhs[world, i] - bias
     if row_laws.contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
@@ -1021,8 +731,6 @@ def test_velocity_limit_active_matches_velocity_limit_slots(test, device):
                 prescribed=np.zeros(count, dtype=np.int32),
                 joint_qd=qd,
                 velocity_limit_activation_fraction=fraction,
-                drive_slot=np.full(1, -1, dtype=np.int32),
-                skip_driven=0,
                 art_to_world=np.arange(arts, dtype=np.int32),
                 max_constraints=4 * dofs,
                 velocity_limit_slot=np.full(2 * count, -1, dtype=np.int32),

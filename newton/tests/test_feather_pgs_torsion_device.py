@@ -487,7 +487,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
     def test_cuda_loaded_closed_linkage(self):
         """Preserve loaded loop-closure behavior with active spin rows in both profiles."""
-        for velocity, regularization in ((16, 0.0), (0, 0.01)):
+        for regularization in (0.0, 0.01):
             results = []
             for device_preparation in (False, True):
                 builder = _build_four_bar()
@@ -497,7 +497,6 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 solver = newton.solvers.SolverFeatherPGS(
                     model,
                     pgs_iterations=64,
-                    pgs_velocity_iterations=velocity,
                     pgs_contact_regularization=regularization,
                     contact_torsion_radius=0.01,
                     enable_bilateral_preelimination=False,
@@ -546,10 +545,9 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
             enable_device_torsion(solver).prepare(state, augmented, contacts)
 
         for patches in (False, True):
-            for velocity, regularization in ((16, 0.0), (0, 0.01)):
+            for regularization in (0.0, 0.01):
                 options = {
                     "pgs_iterations": 16,
-                    "pgs_velocity_iterations": velocity,
                     "pgs_contact_regularization": regularization,
                     "enable_bilateral_preelimination": False,
                     "sliding": 0.03,
@@ -562,7 +560,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                     actual, *_ = fixture(0.01, **options)
                 for key in expected:
                     np.testing.assert_allclose(
-                        actual[key], expected[key], rtol=3e-5, atol=3e-6, err_msg=f"{patches=} {velocity=} {key=}"
+                        actual[key], expected[key], rtol=3e-5, atol=3e-6, err_msg=f"{patches=} {regularization=} {key=}"
                     )
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
@@ -672,14 +670,13 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
     def test_cuda_full_solver_graph(self):
         """Match captured and eager solves through the default-off public device API."""
 
-        for velocity, regularization in ((16, 0.0), (0, 0.01)):
+        for regularization in (0.0, 0.01):
             results = []
             for captured in (False, True):
                 _, solver, model, a, contacts = fixture(
                     0.01,
                     pins={},
                     pgs_iterations=16,
-                    pgs_velocity_iterations=velocity,
                     pgs_contact_regularization=regularization,
                     enable_bilateral_preelimination=False,
                     sliding=0.01,
