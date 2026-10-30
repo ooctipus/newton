@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 from functools import cache
+from typing import NamedTuple
 
 import numpy as np
 import warp as wp
@@ -44,7 +45,7 @@ from . import kernel_template
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .row_metadata import _mf_parent_expression
 from .staging import STATIC_SHARED_BYTES, Buffer, Staging, static_budget
 
@@ -123,44 +124,52 @@ UNIT_FIELDS = FieldGroup(
 """The units and colors of each slot's world (``unit``: the slot's unit capacity, :func:`unit_capacity`; ``color``:
 one more)."""
 
-SLOT_ENTRIES = 36
-"""Entries a color slot stages per unit: for each of its (up to three) rows ``r``, the six ``Z_a`` and ``Z_b``
-entries, at ``r * 12 + side * 6 + k``."""
-
-SLOT_MU, SLOT_WEIGHT = SLOT_ENTRIES, SLOT_ENTRIES + 1
-"""The slot's scalars after its entries: the friction coefficient of its first tangent and its normal row's
-regularization weight."""
-
 RING_MEMBERS = 8
 """Other normals of a patch ring a slot stages for its friction pair's pooled load; a larger ring walks its links."""
 
-SLOT_RING = 9
-"""The slot words of a friction unit's patch ring: from ``SLOT_RING``, the other normal rows of its ring in ring order
-(two 16-bit rows a word, 0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`)."""
 
-SLOT_WORDS = SLOT_RING + RING_MEMBERS // 2 + 1
-"""Words a color slot stages per unit: for each of its (up to three) rows ``r``, at ``r * 3``, the bits of its stored
-inverse diagonal, of its right-hand side, and its type and parent word (``mf_meta``'s ``y``, ``z``, ``w``); then its
-patch ring (:data:`SLOT_RING`)."""
+class SlotLayout(NamedTuple):
+    """A color slot's fields per unit of at most ``rows`` rows: a contact's normal row and friction pair, and under
+    contact torsion its spin row (:func:`slot_layout`).
 
-_SLOT_MU = wp.constant(SLOT_MU)
-_SLOT_WEIGHT = wp.constant(SLOT_WEIGHT)
-_SLOT_RING = wp.constant(SLOT_RING)
+    ``fields`` floats: each row ``r``'s six ``Z_a`` and ``Z_b`` entries at ``r * 12 + side * 6 + k``, then the first
+    tangent's friction coefficient (at ``mu``), the normal row's regularization weight (``weight``) and a spin row's
+    torsional coefficient (``spin_mu``). ``words`` words: each row ``r``'s bits of its stored inverse diagonal, of its
+    right-hand side, and its type and parent word (``mf_meta``'s ``y``, ``z``, ``w``) at ``r * 3``, then from
+    ``ring`` a friction unit's patch ring: the other normal rows of its ring in ring order (two 16-bit rows a word,
+    0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`). ``metric`` floats: a
+    friction unit's cached metric and Gram couplings (:func:`.sweep_routes._colored_metrics`)."""
+
+    rows: int
+    fields: int
+    words: int
+    metric: int
+    mu: int
+    weight: int
+    spin_mu: int
+    ring: int
+
+
+def slot_layout(torsion: bool) -> SlotLayout:
+    """The slot layout of units with spin rows (contact ``torsion``) or without."""
+    rows = 4 if torsion else 3
+    entries, ring = 12 * rows, 3 * rows
+    words = ring + RING_MEMBERS // 2 + 1
+    return SlotLayout(rows, entries + 2 + torsion, words, 6 if torsion else 7, entries, entries + 1, entries + 2, ring)
+
+
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
-
-METRIC_FIELDS = 7
-"""Floats of a friction unit's cached metric: its pair's metric (scale, the two eigenvalues, the larger's axis) and
-the pair's Gram couplings with the normal row, ``Z_n . Z_t1`` and ``Z_n . Z_t2``."""
 
 SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
-    Field("slot_data", wp.float32, ("slot", SLOT_ENTRIES + 2, "unit")),
-    Field("slot_words", wp.int32, ("slot", SLOT_WORDS, "unit")),
-    # The friction pair metric and Gram couplings of each staged friction unit (METRIC_FIELDS), formed by the
+    Field("slot_data", wp.float32, ("slot", "slot_field", "unit")),
+    Field("slot_words", wp.int32, ("slot", "slot_word", "unit")),
+    # The friction metric and Gram couplings of each staged friction unit (SlotLayout.metric), formed by the
     # colored sweep once per launch.
-    Field("slot_metric", wp.float32, ("slot", METRIC_FIELDS, "unit")),
+    Field("slot_metric", wp.float32, ("slot", "slot_metric", "unit")),
 )
-"""A world's units' rows as the colored sweep reads them: by color slot, field by field (:func:`stage_slots`)."""
+"""A world's units' rows as the colored sweep reads them: by color slot, field by field (:func:`stage_slots`), in a
+:class:`SlotLayout`."""
 
 
 @wp.kernel(enable_backward=False)
@@ -175,23 +184,24 @@ def stage_slots(
     mf_row_mu: wp.array2d[float],
     mf_row_w: wp.array2d[float],
     regularize: int,
+    layout_rows: int,
     slot_data: wp.array3d[float],
     slot_words: wp.array3d[wp.int32],
 ):
     """Gather each colored world's unit rows into its slot's slot-major :data:`SLOT_FIELDS` (one thread per slot and
-    unit).
+    unit), in the :class:`SlotLayout` of units of at most ``layout_rows`` rows.
 
-    A unit stages only what its rows hold: its friction coefficient when it has a friction pair, and its normal row's
-    weight from ``mf_row_w`` only when ``regularize`` is set (the sweeps' run-time switch); otherwise the solver binds
-    a one-element stand-in for the weights, and the row's weight is 1.
+    A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
+    when it has one, and its normal row's weight from ``mf_row_w`` only when ``regularize`` is set (the sweeps'
+    run-time switch); otherwise the solver binds a one-element stand-in for the weights, and the row's weight is 1.
     """
     slot, p = wp.tid()
     world = slot_world[slot]
     if world_colored[world] == 0 or p >= unit_count[world]:
         return
     row = color_slot[slot, p, 0]
-    rows = color_slot[slot, p, 1] & 3
-    for r in range(3):
+    rows = color_slot[slot, p, 1] & 7
+    for r in range(4):
         if r < rows:
             for k in range(6):
                 slot_data[slot, r * 12 + k, p] = mf_Z_a[world, row + r, k]
@@ -199,15 +209,22 @@ def stage_slots(
             slot_words[slot, r * 3, p] = mf_meta[world, (row + r) * 4 + 1]
             slot_words[slot, r * 3 + 1, p] = mf_meta[world, (row + r) * 4 + 2]
             slot_words[slot, r * 3 + 2, p] = mf_meta[world, (row + r) * 4 + 3]
+    entries = layout_rows * 12
     mu = float(0.0)
-    if rows == 3:
+    if rows >= 3:
         mu = mf_row_mu[world, row + 1]
-    slot_data[slot, _SLOT_MU, p] = mu
+    slot_data[slot, entries, p] = mu
     weight = float(1.0)
     if regularize != 0:
         weight = mf_row_w[world, row]
-    slot_data[slot, _SLOT_WEIGHT, p] = weight
-    if rows == 3:
+    slot_data[slot, entries + 1, p] = weight
+    if layout_rows > 3:
+        # The spin row's torsional coefficient (contact torsion).
+        spin_mu = float(0.0)
+        if rows > 3:
+            spin_mu = mf_row_mu[world, row + 3]
+        slot_data[slot, entries + 2, p] = spin_mu
+    if rows >= 3:
         # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
         words = wp.vec4i(-1, -1, -1, -1)
         members = int(0)
@@ -228,9 +245,10 @@ def stage_slots(
             hop += 1
             link = (mf_meta[world, r * 4 + 3] >> 16) & 0xFFFF
             r = wp.where(link == 0xFFFF, -1, link)
+        ring = layout_rows * 3
         for k in range(_RING_MEMBERS // 2):
-            slot_words[slot, _SLOT_RING + k, p] = words[k]
-        slot_words[slot, _SLOT_RING + _RING_MEMBERS // 2, p] = members
+            slot_words[slot, ring + k, p] = words[k]
+        slot_words[slot, ring + _RING_MEMBERS // 2, p] = members
 
 
 UNIT_ROWS = 3
@@ -249,15 +267,25 @@ def unit_capacity(mf_rows: int) -> int:
 @dataclasses.dataclass(frozen=True)
 class UnitPlan:
     """Shapes of the unit data: every world's counts, and per slot (a world that can take the colored mapping) its
-    units and colors, which the slot's unit capacity bounds (:func:`unit_capacity`)."""
+    units and colors, which the slot's unit capacity bounds (:func:`unit_capacity`), in its ``layout``."""
 
     worlds: int
     slots: int
     units: int
+    layout: SlotLayout
 
     @property
     def sizes(self) -> dict[str, int]:
-        return {"world": self.worlds, "slot": self.slots, "unit": self.units, "color": self.units + 1}
+        layout = self.layout
+        return {
+            "world": self.worlds,
+            "slot": self.slots,
+            "unit": self.units,
+            "color": self.units + 1,
+            "slot_field": layout.fields,
+            "slot_word": layout.words,
+            "slot_metric": layout.metric,
+        }
 
 
 def capable_worlds(free_bodies, mf_rows: int, rule: ColoredRule = COLORED_RULE):
@@ -493,11 +521,28 @@ def build_staging(dofs: int) -> Staging:
     )
 
 
+_UNIT_ROWS = """            while (row + rows < end && rows < 3) {
+                const int packed = mf_meta.data[off_meta + (row + rows) * 4 + 3];
+                if ((packed & 0xFFFF) != FRICTION || (PARENT(packed)) != row) break;"""
+"""The unit builder's rows of a unit after its normal: its friction pair."""
+
+_SPIN_UNIT_ROWS = """            while (row + rows < end && rows < 4) {
+                const int packed = mf_meta.data[off_meta + (row + rows) * 4 + 3];
+                if ((packed & 0xFFFF) != (rows < 3 ? FRICTION : TORSION) || (PARENT(packed)) != row) break;"""
+"""Under contact torsion: its friction pair, then its spin row."""
+
+
 def build_units_kernel(
-    mf_rows: int, dofs: int, units: int, *, rule: ColoredRule = COLORED_RULE, static_bytes: int = STATIC_SHARED_BYTES
+    mf_rows: int,
+    dofs: int,
+    units: int,
+    *,
+    rule: ColoredRule = COLORED_RULE,
+    static_bytes: int = STATIC_SHARED_BYTES,
+    torsion: bool = False,
 ) -> wp.Kernel:
     """The unit builder of worlds with ``mf_rows`` free-body rows and ``dofs`` coordinates, in slots of ``units``
-    units (:func:`unit_capacity`).
+    units (:func:`unit_capacity`); under contact ``torsion`` a unit's spin row follows its pair.
 
     One block of :data:`BUILD_WARPS` warps per world: launch ``dim=[worlds]`` tiled with ``block_dim=32 *
     BUILD_WARPS``. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and ``mf_meta``; outputs:
@@ -510,13 +555,17 @@ def build_units_kernel(
     staging.check("the unit builder", static_bytes)
     parent = _mf_parent_expression("packed", mf_rows).replace("packed", "PACKED_WORD")
     words = (dofs + 31) // 32
+    body = _BUILD_SOURCE
+    if torsion:
+        body = f"#define TORSION {int(PGS_CONSTRAINT_TYPE_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
+        body = body.replace("#endif", "#undef TORSION\n#endif")
     source = (
         f"#define MF_ROWS {mf_rows}\n#define UNITS {int(units)}\n#define MIN_UNITS {int(rule.min_units)}\n"
         f"#define WARPS {BUILD_WARPS}\n#define COLORED(N_UNITS, N_COLORS) {rule.condition('(N_UNITS)', '(N_COLORS)')}\n"
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
         f"#define CONTACT {int(PGS_CONSTRAINT_TYPE_CONTACT)}\n#define FRICTION {int(PGS_CONSTRAINT_TYPE_FRICTION)}\n"
         f"#define PARENT(PACKED_WORD) ({parent})\n"
-        + _BUILD_SOURCE.replace("SHARED_DECLARATIONS", staging.declarations()).replace(
+        + body.replace("SHARED_DECLARATIONS", staging.declarations()).replace(
             "#endif",
             "#undef MF_ROWS\n#undef UNITS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
             "#undef WORDS\n"
@@ -532,7 +581,7 @@ def build_units_kernel(
         ("unit_status", wp.array[int]),
     )
     return KernelTemplate(
-        f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}",
+        f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
         dispatch=kernel_template.WORLDS,
@@ -557,14 +606,26 @@ class ColoredUnits:
         device: The solver's CUDA device.
         worlds: The capable worlds, in world order: slot ``k`` holds world ``worlds[k]``.
         rule: Which of them take the colored mapping at a pack (:class:`ColoredRule`).
+        torsion: Contact torsion: a unit's spin row follows its friction pair (:func:`slot_layout`).
     """
 
-    def __init__(self, world_count: int, mf_rows: int, dofs: int, device, *, worlds, rule: ColoredRule = COLORED_RULE):
+    def __init__(
+        self,
+        world_count: int,
+        mf_rows: int,
+        dofs: int,
+        device,
+        *,
+        worlds,
+        rule: ColoredRule = COLORED_RULE,
+        torsion: bool = False,
+    ):
         self.world_count, self.mf_rows = int(world_count), int(mf_rows)
         self.unit_capacity = unit_capacity(self.mf_rows)
         slot_world = np.asarray(worlds, dtype=np.int32)
         self.slot_count = int(slot_world.size)
-        sizes = UnitPlan(self.world_count, self.slot_count, self.unit_capacity).sizes
+        self.layout = slot_layout(torsion)
+        sizes = UnitPlan(self.world_count, self.slot_count, self.unit_capacity, self.layout).sizes
         self.units = {
             field.name: wp.zeros(field.shape(sizes), dtype=field.dtype, device=device)
             for field in (*WORLD_FIELDS, *UNIT_FIELDS)
@@ -580,7 +641,12 @@ class ColoredUnits:
         self.status = wp.zeros(1, dtype=wp.int32, device=device)
         self.rule = rule
         self.build_kernel = build_units_kernel(
-            self.mf_rows, int(dofs), self.unit_capacity, rule=rule, static_bytes=static_budget(device.arch)
+            self.mf_rows,
+            int(dofs),
+            self.unit_capacity,
+            rule=rule,
+            static_bytes=static_budget(device.arch),
+            torsion=torsion,
         )
         self.device = device
 
@@ -620,6 +686,7 @@ class ColoredUnits:
                 mf_row_mu,
                 mf_row_w,
                 int(regularize),
+                self.layout.rows,
             ],
             outputs=[self.slots["slot_data"], self.slots["slot_words"]],
             device=self.device,

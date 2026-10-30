@@ -514,7 +514,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assert_sparse_state(graph)
 
     def test_unsupported_configurations_keep_existing_path(self):
-        """Reject full-support chains, torsion and oversized dense rows.
+        """Reject full-support chains and oversized dense rows, and take contact torsion's spin rows.
 
         Joint velocity limits are not among them: they compose with sparse
         factors under either friction law (test_feather_pgs_path_selection).
@@ -522,10 +522,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         chain = _build_chain("cuda:0", base_z=1.2, contact_sphere="deep", ground=False)
         self.assertIsNone(_make_solver(chain, True)._sparse_mass_matrix_size)
         model = _build_model()
-        for options in (
-            {"contact_torsion": True},
-            {"dense_max_constraints": _over_budget_rows(model)},
-        ):
+        self.assertIsNotNone(_make_solver(model, True, contact_torsion=True)._sparse_mass_matrix_size)
+        for options in ({"dense_max_constraints": _over_budget_rows(model)},):
             with self.subTest(options=options):
                 solver = _make_solver(model, True, **options)
                 self.assertIsNone(solver._sparse_mass_matrix_size)

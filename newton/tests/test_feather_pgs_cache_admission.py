@@ -76,7 +76,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         seen = []
 
         def recording(solver, source):
-            seen.append((solver.laws.set.agnostic, solver.laws.set.point, solver._parallel_contact_paths))
+            seen.append((solver.laws.set.point, solver._parallel_contact_paths))
             return setup(solver, source)
 
         with (
@@ -85,8 +85,8 @@ class TestHeldTreeContactLaw(unittest.TestCase):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                    # Both laws are law-agnostic and may run the parallel tiers.
-                    self.assertEqual(seen[-1], (True, law == "point", True))
+                    # Both laws may run the parallel tiers.
+                    self.assertEqual(seen[-1], (law == "point", True))
                     self.assertEqual(solver.laws.set.contact, law)
 
 

@@ -339,6 +339,16 @@ def free_body_spin_jacobian(normal: wp.vec3) -> wp.spatial_vector:
     return wp.spatial_vector(wp.vec3(0.0), normal)
 
 
+@wp.func
+def contact_row_entry(row: int, motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3, origin: wp.vec3):
+    """Return contact row ``row``'s entry for the motion column ``motion`` (:func:`contact_row_frame`'s ``direction``
+    and endpoint ``point``): the spin row's :func:`spin_entry` about the normal, any other row's
+    :func:`jacobian_entry`."""
+    if row == CONTACT_SPIN_ROW:
+        return spin_entry(motion, direction)
+    return jacobian_entry(motion, direction, point, origin)
+
+
 @CONTACT_LAW.law
 def prescribed_target(
     body_a: int,

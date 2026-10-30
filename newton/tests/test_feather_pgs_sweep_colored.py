@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import unittest
 from unittest import mock
 
@@ -29,7 +30,11 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sweep_units
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
@@ -159,32 +164,40 @@ class TestStageSlots(unittest.TestCase):
     """The slot staging (:func:`.sweep_units.stage_slots`) reads only what its units' rows hold, on every device."""
 
     WORLDS, ROWS = 2, 8
-    # Each world's units as (first row, rows): contacts with their friction pair and contacts without one.
-    UNITS = (((0, 3), (3, 1)), ((0, 1), (1, 3), (4, 1)))
 
-    def _stage(self, device, weights, regularize: int) -> tuple:
-        """Stage :attr:`UNITS` with the row weights ``weights``; the staged weights and friction coefficients."""
+    @staticmethod
+    def units(torsion: bool) -> tuple:
+        """Each world's units as (first row, rows): contacts with their friction pair (and spin row under contact
+        ``torsion``) and contacts without one."""
+        full = 4 if torsion else 3
+        return (((0, full), (full, 1)), ((0, 1), (1, full), (1 + full, 1)))
+
+    def _stage(self, device, weights, regularize: int, torsion: bool) -> tuple:
+        """Stage :meth:`units` with the row weights ``weights``: the staged units, their slot fields in the layout,
+        and the rows' coefficients."""
         rng = np.random.default_rng(7)
+        layout, units = sweep_units.slot_layout(torsion), self.units(torsion)
         meta = np.zeros((self.WORLDS, self.ROWS, 4), dtype=np.int64)
-        records = np.zeros((self.WORLDS, len(max(self.UNITS, key=len)), 4), dtype=np.int32)
-        for world, units in enumerate(self.UNITS):
-            for p, (row, rows) in enumerate(units):
+        records = np.zeros((self.WORLDS, max(len(world) for world in units), 4), dtype=np.int32)
+        for world, world_units in enumerate(units):
+            for p, (row, rows) in enumerate(world_units):
                 records[world, p] = (row, rows, 2 * p, 2 * p + 1)
-                # A normal row links no patch ring (0xFFFF); its friction pair's parent is the normal.
+                # A normal row links no patch ring (0xFFFF); its friction pair's (and spin row's) parent is the normal.
                 meta[world, row, 3] = PGS_CONSTRAINT_TYPE_CONTACT | (0xFFFF << 16)
                 for r in range(row + 1, row + rows):
-                    meta[world, r, 3] = PGS_CONSTRAINT_TYPE_FRICTION | (row << 16)
+                    kind = PGS_CONSTRAINT_TYPE_TORSION if r == row + 3 else PGS_CONSTRAINT_TYPE_FRICTION
+                    meta[world, r, 3] = kind | (row << 16)
         meta = meta.astype(np.uint32).view(np.int32).reshape(self.WORLDS, 4 * self.ROWS)
         mu = rng.uniform(0.1, 1.0, (self.WORLDS, self.ROWS)).astype(np.float32)
-        slot_data = wp.zeros((self.WORLDS, sweep_units.SLOT_ENTRIES + 2, records.shape[1]), dtype=float, device=device)
-        slot_words = wp.zeros((self.WORLDS, sweep_units.SLOT_WORDS, records.shape[1]), dtype=wp.int32, device=device)
+        slot_data = wp.zeros((self.WORLDS, layout.fields, records.shape[1]), dtype=float, device=device)
+        slot_words = wp.zeros((self.WORLDS, layout.words, records.shape[1]), dtype=wp.int32, device=device)
         wp.launch(
             sweep_units.stage_slots,
             dim=records.shape[:2],
             inputs=[
                 wp.array(np.arange(self.WORLDS), dtype=wp.int32, device=device),
                 wp.ones(self.WORLDS, dtype=wp.int32, device=device),
-                wp.array([len(units) for units in self.UNITS], dtype=wp.int32, device=device),
+                wp.array([len(world) for world in units], dtype=wp.int32, device=device),
                 wp.array(records, dtype=wp.int32, device=device),
                 wp.array(meta, dtype=wp.int32, device=device),
                 wp.array(rng.standard_normal((self.WORLDS, self.ROWS, 6)), dtype=float, device=device),
@@ -192,34 +205,45 @@ class TestStageSlots(unittest.TestCase):
                 wp.array(mu, dtype=float, device=device),
                 weights,
                 regularize,
+                layout.rows,
             ],
             outputs=[slot_data, slot_words],
             device=device,
         )
-        data = slot_data.numpy()
         staged = [
-            (world, p, row, rows) for world, units in enumerate(self.UNITS) for p, (row, rows) in enumerate(units)
+            (world, p, row, rows)
+            for world, world_units in enumerate(units)
+            for p, (row, rows) in enumerate(world_units)
         ]
-        return staged, data[:, sweep_units.SLOT_WEIGHT], data[:, sweep_units.SLOT_MU], mu
+        return staged, slot_data.numpy(), layout, mu
 
     def test_unweighted_rows_never_index_the_weights(self):
         """An unweighted row law binds a one-element stand-in for the row weights, as the solver does. It sits at the
         start of a buffer whose every other element is NaN, so a read of any other row's weight stages NaN; every
-        unit stages the weight 1 and its friction pair's coefficient, a unit without a pair 0. A weighted law stages
-        each normal row's weight."""
+        unit stages the weight 1, its friction pair's coefficient and its spin row's, a unit without them 0. A weighted
+        law stages each normal row's weight."""
         for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
-            with self.subTest(device=device):
-                guard = np.full((self.WORLDS, self.ROWS), np.nan, dtype=np.float32)
-                guard[0, 0] = 1.0
-                stand_in = wp.array(guard, dtype=float, device=device)[:1, :1]
-                staged, weight, mu, row_mu = self._stage(device, stand_in, 0)
-                for world, p, row, rows in staged:
-                    self.assertEqual(weight[world, p], 1.0, f"world {world} unit {p}: the stand-in was indexed")
-                    self.assertEqual(mu[world, p], row_mu[world, row + 1] if rows == 3 else 0.0)
-                weights = np.random.default_rng(3).uniform(0.2, 0.9, (self.WORLDS, self.ROWS)).astype(np.float32)
-                staged, weight, _, _ = self._stage(device, wp.array(weights, dtype=float, device=device), 1)
-                for world, p, row, _ in staged:
-                    self.assertEqual(weight[world, p], weights[world, row])
+            for torsion in (False, True):
+                with self.subTest(device=device, torsion=torsion):
+                    guard = np.full((self.WORLDS, self.ROWS), np.nan, dtype=np.float32)
+                    guard[0, 0] = 1.0
+                    stand_in = wp.array(guard, dtype=float, device=device)[:1, :1]
+                    staged, data, layout, row_mu = self._stage(device, stand_in, 0, torsion)
+                    for world, p, row, rows in staged:
+                        self.assertEqual(
+                            data[world, layout.weight, p], 1.0, f"world {world} unit {p}: stand-in indexed"
+                        )
+                        self.assertEqual(data[world, layout.mu, p], row_mu[world, row + 1] if rows >= 3 else 0.0)
+                        if torsion:
+                            self.assertEqual(
+                                data[world, layout.spin_mu, p], row_mu[world, row + 3] if rows > 3 else 0.0
+                            )
+                    weights = np.random.default_rng(3).uniform(0.2, 0.9, (self.WORLDS, self.ROWS)).astype(np.float32)
+                    staged, data, layout, _ = self._stage(
+                        device, wp.array(weights, dtype=float, device=device), 1, torsion
+                    )
+                    for world, p, row, _ in staged:
+                        self.assertEqual(data[world, layout.weight, p], weights[world, row])
 
 
 class TestColoredSweep(unittest.TestCase):
@@ -276,7 +300,7 @@ class TestColoredSweep(unittest.TestCase):
         self.assertGreater(record["storage_bytes"], 0)
         # A slot holds a unit for every three rows of the row capacity.
         capacity = sweep_units.unit_capacity(solver.mf_max_constraints)
-        self.assertEqual(units.slots["slot_data"].shape, (units.slot_count, sweep_units.SLOT_ENTRIES + 2, capacity))
+        self.assertEqual(units.slots["slot_data"].shape, (units.slot_count, units.layout.fields, capacity))
 
     def test_a_color_never_shares_a_body_or_a_patch(self):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
@@ -357,12 +381,14 @@ class TestColoredSweep(unittest.TestCase):
 
 
 def _conformance_tests():
-    """One conformance check per (scene, law): the gate's laws and the distance to its converged reference; and the
-    compliant stack's material contacts, whose units step by the weights their slots stage."""
+    """One conformance check per (scene, law, contact torsion): the gate's laws and the distance to its converged
+    reference; and the compliant stack's material contacts, whose units step by the weights their slots stage."""
+    variants = ({}, {"contact_torsion": True})
     problems = [
-        conf._physics(dataclasses.replace(scene, deterministic_contacts=True), law, 32)
-        for law in ("point", "patch")
-        for scene in (tray(), conf.scenes.box_stack())
+        conf._physics(
+            dataclasses.replace(scene, deterministic_contacts=True), law, 32, "torsion" if variant else "", **variant
+        )
+        for law, variant, scene in itertools.product(("point", "patch"), variants, (tray(), conf.scenes.box_stack()))
     ]
     problems.append(conf._physics(conf.scenes.compliant_stack(), "point", 32, "compliance", contact_compliance=True))
     for physics in problems:

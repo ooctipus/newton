@@ -162,8 +162,6 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    if torsion and row_inputs is not None:
-        raise ValueError("keyed rows write no spin row (contact torsion)")
     laws = RowLaws(regularize=bool(weighted), material=bool(material), torsion=torsion, policy=solve_policy)
     store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted))
     whitened = WhitenedRows(

@@ -11,8 +11,10 @@ def _sparse_contact_projection_source(
     *,
     dof_count: int,
     scratch_stride: int = 0,
+    rows: int = 3,
 ) -> str:
-    """Generate the three-direction sparse product, preserving reduction order.
+    """Generate the sparse product of a contact's ``rows`` directions (three, four with a spin row), preserving
+    reduction order.
 
     ``shared_mask`` consumes a Jacobian in shared scratch and walks the actual
     supporting factor entries of one output coordinate. Geometry, row
@@ -27,7 +29,7 @@ def _sparse_contact_projection_source(
         raise ValueError("Use shared_mask sparse projection")
     if scratch_stride < dof_count:
         raise ValueError("Shared Jacobian storage must cover all coordinates")
-    initialize = "auto value = wp::vec3(0.0f);"
+    initialize = f"auto value = wp::vec{rows}(0.0f);"
     begin = """
         const int begin = factor_row_offsets.data[node];
         const int first = node - (factor_row_offsets.data[node + 1] - begin) + 1;
@@ -42,11 +44,11 @@ def _sparse_contact_projection_source(
     output, weight = "value.c[row]", "factor"
     operand = f"jacobian[row * {scratch_stride} + column]"
     # Preserve dynamic direction admission in the ordinary producer.
-    accumulate = """
+    accumulate = f"""
         #pragma unroll
-            for (int row = 0; row < 3; ++row) {
-                if (row < row_count) { $ACCUMULATE }
-            }
+            for (int row = 0; row < {rows}; ++row) {{
+                if (row < row_count) {{ $ACCUMULATE }}
+            }}
         """
     end = "pending &= pending - 1;\n        }"
 

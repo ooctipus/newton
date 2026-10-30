@@ -38,6 +38,7 @@ from .sweep import (
     JOINT_LIMIT,
     TORSION,
     UNIT_HELD,
+    ReducedPairCoupling,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -724,15 +725,12 @@ def _paired_rows(ctx: RowContext, laws: RowLaws, end: str, *, friction: bool = T
 
 
 @dataclasses.dataclass(frozen=True)
-class _UnitFactorRows(UnitOperator, FactorRows):
+class _UnitFactorRows(UnitOperator, ReducedPairCoupling, FactorRows):
     """A contact unit's factor rows (:class:`.sweep.UnitOperator`): the unit's ladder (:func:`_contact_unit`) also
     reduces the pair's coupling and the rows' terms' magnitudes, so a moved tangent votes on a lower bound of its terms
     that is the row-by-row sweep's own when the normal did not move."""
 
     magnitudes = True
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        return f"{indent}const float {out} = unit_cross;"
 
 
 def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:

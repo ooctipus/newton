@@ -1659,12 +1659,16 @@ def cuda_groups() -> list:
             Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL)),
             Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
-            # The Jacobi tiers' radial projection of the friction triple (keyed rows write no spin row: the general
-            # producer feeds the tiers), against the general route's sequential sweep.
+            # Native sparse factors' spin rows (and their quads where triplets fuse) and the Jacobi tiers' radial
+            # projection of the friction triple (fed by the general producer, and by the keyed rows' decode),
+            # against the general route's sequential sweep.
             Group(
                 _physics(scenes.legged(), law, 32, "torsion", contact_torsion=True),
                 ref,
-                (MF_PARALLEL.but("mf_parallel_torsion", expect={"friction.torsion": True}),),
+                tuple(
+                    route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
+                    for route in (SPARSE, *triplets, MF_PARALLEL, KEYED_PARALLEL)
+                ),
             ),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
             Group(
@@ -1686,6 +1690,16 @@ def cuda_groups() -> list:
                 _physics(scenes.keyboard(), law, 16),
                 ref,
                 (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY),
+            ),
+            # The sparse diagonal's and the compact boundary's spin rows (their units and quads), against the general
+            # route's.
+            Group(
+                _physics(scenes.keyboard(), law, 16, "torsion", contact_torsion=True),
+                ref,
+                tuple(
+                    route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
+                    for route in (SPARSE_DIAGONAL, COMPACT_BOUNDARY)
+                ),
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST)),
             # The paired factor sweep's contact units and quads with spin rows, against the general route's.

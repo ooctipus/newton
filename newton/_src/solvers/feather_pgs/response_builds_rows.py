@@ -50,11 +50,13 @@ import warp as wp
 from . import field_group, kernel_template
 from .contact_input import ContactInput, contact_frame
 from .contact_laws import (
+    CONTACT_SPIN_ROW,
     contact_friction,
     contact_restitution,
+    contact_row_entry,
     contact_row_frame,
     free_body_jacobian,
-    jacobian_entry,
+    prescribed_spin_target,
     prescribed_target,
 )
 from .dense_rows import DenseRows, MfRows
@@ -67,6 +69,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
+    PGS_CONSTRAINT_TYPE_TORSION,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
     BodyFactors,
     block_kit,
@@ -81,6 +84,7 @@ from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import BILATERAL_PIVOT, PROJECTION_LAW
 from .response_builds_dense import _indent, _Vec6, whiten_six
 from .response_operator import FreeBodyZ
+from .row_build import contact_torsion_mu
 from .row_laws import (
     ROW_LAW,
     contact_depenetration_cap,
@@ -512,6 +516,7 @@ CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name
 
 @wp.func
 def sparse_pair_slot(
+    row: int,
     art: int,
     body: int,
     negate: bool,
@@ -526,7 +531,8 @@ def sparse_pair_slot(
     direction: wp.vec3,
     point: wp.vec3,
 ):
-    """One endpoint's sparse slot: its world coordinate (-1 for none) and whitened entry ``Z = J / sqrt(m)``.
+    """One endpoint's sparse slot of contact row ``row``: its world coordinate (-1 for none) and whitened entry
+    ``Z = J / sqrt(m)`` (:func:`.contact_laws.contact_row_entry`).
 
     The entry of the second endpoint is negated (``negate``): a row pushes its endpoints apart. A body's coordinate
     holds a slot only inside its articulation's window.
@@ -539,7 +545,7 @@ def sparse_pair_slot(
             local = dof - dof_start[art]
             if local >= 0 and local < size:
                 coordinate = dof_offset[art] + local
-                value = jacobian_entry(motion[dof], direction, point, origin[art]) * wp.sqrt(inverse_mass[dof])
+                value = contact_row_entry(row, motion[dof], direction, point, origin[art]) * wp.sqrt(inverse_mass[dof])
                 if negate:
                     value = -value
     return coordinate, value
@@ -547,6 +553,7 @@ def sparse_pair_slot(
 
 @wp.func
 def sparse_pair_slots(
+    row: int,
     art_a: int,
     body_a: int,
     point_a: wp.vec3,
@@ -563,9 +570,10 @@ def sparse_pair_slots(
     motion: wp.array[wp.spatial_vector],
     origin: wp.array[wp.vec3],
 ):
-    """A row's two sparse slots (:func:`sparse_pair_slot`), merged into the first when they share a coordinate:
-    ``(coordinate, Z)`` of slot 0, then of slot 1."""
+    """Contact row ``row``'s two sparse slots (:func:`sparse_pair_slot`), merged into the first when they share a
+    coordinate: ``(coordinate, Z)`` of slot 0, then of slot 1."""
     coord_a, value_a = sparse_pair_slot(
+        row,
         art_a,
         body_a,
         False,
@@ -581,6 +589,7 @@ def sparse_pair_slots(
         point_a,
     )
     coord_b, value_b = sparse_pair_slot(
+        row,
         art_b,
         body_b,
         True,
@@ -656,13 +665,15 @@ def sparse_pair_contact_rows_kernel(
         art_a = data.art0[c]
         art_b = data.art1[c]
         rows = data.slots_needed[c]
-        for row in range(3):
+        # The normal, its tangents and, under contact torsion, its spin row.
+        for row in range(4):
             if row >= rows:
                 continue
             direction, p0, p1 = contact_row_frame(
                 row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
             )
             coord_a, value_a, coord_b, value_b = sparse_pair_slots(
+                row,
                 art_a,
                 body_a,
                 p0,
@@ -691,6 +702,7 @@ def sparse_pair_row_response(
     data: ContactInput,
     boundary: CompactBoundary,
     world: int,
+    row: int,
     output_row: int,
     group: int,
     has_dense: bool,
@@ -702,8 +714,8 @@ def sparse_pair_row_response(
     p0: wp.vec3,
     p1: wp.vec3,
 ):
-    """Write one compact-boundary row whitened: its dense-six part, its sparse slots and its diagonal ``(|Z|^2 + sum_s
-    Z_s^2) + cfm``.
+    """Write contact row ``row`` of the compact boundary whitened: its dense-six part, its sparse slots and its
+    diagonal ``(|Z|^2 + sum_s Z_s^2) + cfm`` (:func:`.contact_laws.contact_row_entry`).
 
     The dense Jacobian sums both endpoints' entries per coordinate of the six-coordinate articulation (each where
     the body's coordinate mask holds the coordinate), then is whitened in registers.
@@ -717,15 +729,20 @@ def sparse_pair_row_response(
             bit = wp.uint32(1) << wp.uint32(dof)
             if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
                 if (data.body_mask[body0] & bit) != wp.uint32(0):
-                    value0 = jacobian_entry(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
+                    value0 = contact_row_entry(
+                        row, data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0]
+                    )
             if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
-                    value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
+                    value1 = -contact_row_entry(
+                        row, data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
+                    )
             jacobian[dof] = value0 + value1
         whitened, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
         for dof in range(6):
             boundary.Z[group, output_row, dof] = whitened[dof]
     coord0, value0, coord1, value1 = sparse_pair_slots(
+        row,
         art0,
         body0,
         p0,
@@ -1574,8 +1591,8 @@ when the live coefficient is zero), with explicit coordinates."""
 # tangent metric (``ProjectionLaw::friction_pair_metric``) of the diagonals as written.
 
 _TRIPLET_RECORD = """
-    if (row_count == 3) {
-        SUM(cross.c[0], cross.c[1], cross.c[2]);
+    if (row_count == $ROWS) {
+        SUM($CHANNELS);
         if (LANE == 0) {
             float* record = row_free_response.data
                 + (world * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
@@ -1583,17 +1600,24 @@ _TRIPLET_RECORD = """
             record[1] = cross.c[1];
             record[2] = cross.c[2];
             record[3] = 1.0f / (norm.c[0] + cfm);
-            // The tangent pair's metric (ProjectionLaw::friction_pair_metric), which the triplet sweeps reuse.
-            const auto metric = ProjectionLaw::friction_pair_metric(norm.c[1] + cfm, cross.c[2], norm.c[2] + cfm);
-            record[4] = metric.v1;
-            record[5] = metric.v2;
-            record[6] = metric.v3[0];
-            record[7] = metric.v3[1];
+$TAIL
         }
     }
 """
 """A full triplet's block record (:data:`.sparse_contact.CONTACT_RECORD_FLOATS` floats), from the lanes' cross terms
-reduced in one ladder and the diagonals as written."""
+reduced in one ladder and the diagonals as written: then the pair's metric (:data:`_PAIR_METRIC_RECORD`), or a
+quad's spin couplings (:data:`_SPIN_RECORD`)."""
+
+_PAIR_METRIC_RECORD = """            // The tangent pair's metric (ProjectionLaw::friction_pair_metric), which the triplet sweeps reuse.
+            const auto metric = ProjectionLaw::friction_pair_metric(norm.c[1] + cfm, cross.c[2], norm.c[2] + cfm);
+            record[4] = metric.v1;
+            record[5] = metric.v2;
+            record[6] = metric.v3[0];
+            record[7] = metric.v3[1];"""
+_SPIN_RECORD = """            // The spin row's couplings W_ns, W_t1s, W_t2s (contact torsion); the friction triple's law forms its metric.
+            record[4] = spin_cross.c[0];
+            record[5] = spin_cross.c[1];
+            record[6] = spin_cross.c[2];"""
 
 _CONTACT_ROWS = """
 #if defined(__CUDA_ARCH__)
@@ -1609,7 +1633,7 @@ _CONTACT_ROWS = """
     const auto jacobian_value = [&](const auto& motion, int side, int row) {
         const auto linear = wp::vec3(motion.c[0], motion.c[1], motion.c[2]);
         const auto angular = wp::vec3(motion.c[3], motion.c[4], motion.c[5]);
-        $GEOMETRY_DOT
+        ${SPIN_VALUE}$GEOMETRY_DOT
         return wp::dot(direction, linear) + wp::dot(angular_wrench, angular);
     };
     unsigned long long mask_a = 0, mask_b = 0;
@@ -1618,8 +1642,8 @@ _CONTACT_ROWS = """
     const int row_offset = world * row_factor.shape[1] + slot;
     const int support_capacity = row_factor.shape[2];
     int count = 0;
-    auto norm = wp::vec3(0.0f);
-${CROSS_DECL}    auto incident = wp::vec3(0.0f);
+    auto norm = $VEC(0.0f);
+${CROSS_DECL}    auto incident = $VEC(0.0f);
     // Physical blocks remain a short prefix; ordinary free/free contacts use
     // native MF storage, so production rows have at most one such block.
     int first_endpoint = 0;
@@ -1638,7 +1662,7 @@ ${CROSS_DECL}    auto incident = wp::vec3(0.0f);
                 const auto motion = joint_S_s.data[start + node];
                 const float velocity = v_hat.data[start + node];
 #pragma unroll
-                for (int row = 0; row < 3; ++row) {
+                for (int row = 0; row < $ROWS; ++row) {
                     if (row >= row_count) continue;
                     float value = 0.0f;
                     if (art == art_a) value += jacobian_value(motion, 0, row);
@@ -1650,31 +1674,31 @@ ${CROSS_DECL}    auto incident = wp::vec3(0.0f);
             SYNC();
             const int factor_base = group * 36;
             for (int node = LANE; node < 6; node += STRIDE) {
-                auto value = wp::vec3(0.0f);
+                auto value = $VEC(0.0f);
                 for (int column = 0; column <= node; ++column) {
                     const float factor = free_inverse_factor.data[factor_base + node * 6 + column];
 #pragma unroll
-                    for (int row = 0; row < 3; ++row) {
+                    for (int row = 0; row < $ROWS; ++row) {
                         if (row < row_count) value.c[row] += factor * jacobian[row * $PLANE + column];
                     }
                 }
 #pragma unroll
-                for (int row = 0; row < 3; ++row) {
+                for (int row = 0; row < $ROWS; ++row) {
                     if (row < row_count) free_factor[row * $PLANE + node] = value.c[row];
                 }
             }
             SYNC();
             for (int node = LANE; node < 6; node += STRIDE) {
-                auto response = wp::vec3(0.0f);
+                auto response = $VEC(0.0f);
                 for (int column = node; column < 6; ++column) {
                     const float factor = free_inverse_factor.data[factor_base + column * 6 + node];
 #pragma unroll
-                    for (int row = 0; row < 3; ++row) {
+                    for (int row = 0; row < $ROWS; ++row) {
                         if (row < row_count) response.c[row] += factor * free_factor[row * $PLANE + column];
                     }
                 }
 #pragma unroll
-                for (int row = 0; row < 3; ++row) {
+                for (int row = 0; row < $ROWS; ++row) {
                     if (row >= row_count) continue;
                     const int response_offset = (row_offset + row) * support_capacity;
                     const float value = jacobian[row * $PLANE + node];
@@ -1694,7 +1718,7 @@ ${FREE_CROSS}            }
                 const auto motion = joint_S_s.data[start + physical];
                 const float velocity = v_hat.data[start + physical];
 #pragma unroll
-                for (int row = 0; row < 3; ++row) {
+                for (int row = 0; row < $ROWS; ++row) {
                     if (row >= row_count) continue;
                     float value = 0.0f;
                     if (art == art_a && (mask_a & bit) != 0)
@@ -1713,7 +1737,7 @@ ${FREE_CROSS}            }
                 $SPARSE_PROJECTION
                 const int index = count + COUNT(mask & (bit - 1ull));
 #pragma unroll
-                for (int row = 0; row < 3; ++row) {
+                for (int row = 0; row < $ROWS; ++row) {
                     if (row >= row_count) continue;
                     const int response_offset = (row_offset + row) * support_capacity;
 $FACTOR_STORE
@@ -1726,7 +1750,7 @@ ${FACTOR_CROSS}            }
         SYNC();
     }
 #pragma unroll
-    for (int row = 0; row < 3; ++row) {
+    for (int row = 0; row < $ROWS; ++row) {
         if (row >= row_count) continue;
         const int response_offset = (row_offset + row) * support_capacity;
         for (int index = count + LANE; index < support_capacity; index += STRIDE) {
@@ -1797,11 +1821,19 @@ _PREPARED_GEOMETRY_DOT = """
 """
 
 
-def _contact_rows_source(n: int, lanes: int, warps: int, prepare_rows: bool, table: bool, records: bool) -> str:
-    """The native projection of one contact's rows (see the section's comment), for ``lanes`` lanes per contact."""
+def _contact_rows_source(
+    n: int, lanes: int, warps: int, prepare_rows: bool, table: bool, records: bool, torsion: bool
+) -> str:
+    """The native projection of one contact's rows (see the section's comment), for ``lanes`` lanes per contact; under
+    contact ``torsion`` a fourth row, its spin row ``J = n . S_ang``."""
     groups = warps * 32 // lanes
     scratch = max(n, 6) + 6
     geometry = 27 if prepare_rows else 0
+    rows = 4 if torsion else 3
+    # The record's Gram couplings: (channel, its component, the two rows).
+    couplings = [("cross", k, a, b) for k, (a, b) in enumerate(((0, 1), (0, 2), (1, 2)))]
+    if torsion:
+        couplings += [("spin_cross", a, a, 3) for a in range(3)]
     explicit = f"!{str(table).lower()}"
     free_store = store_entry("response_offset", "count + node", "offset + node", "value", explicit)
     factor_store = store_entry("response_offset", "index", "offset + node", "value.c[row]", explicit)
@@ -1814,41 +1846,52 @@ def _contact_rows_source(n: int, lanes: int, warps: int, prepare_rows: bool, tab
         "RECORD": "",
     }
     if records:
+
+        def sums(entry) -> str:
+            lines = (f"                    {name}.c[{k}] += {entry(a, b)};" for name, k, a, b in couplings)
+            return f"                if (row_count == {rows}) {{\n" + "\n".join(lines) + "\n                }\n"
+
+        free = lambda a, b: f"{'jacobian[node]' if a == 0 else f'jacobian[{a * scratch} + node]'} * response.c[{b}]"  # noqa: E731
         cross = {
-            "CROSS_DECL": "    auto cross = wp::vec3(0.0f);\n",
+            "CROSS_DECL": "    auto cross = wp::vec3(0.0f);\n"
+            + ("    auto spin_cross = wp::vec3(0.0f);\n" if torsion else ""),
             "FREE_RESPONSE": "",
-            "FREE_CROSS": f"""                if (row_count == 3) {{
-                    cross.c[0] += jacobian[node] * response.c[1];
-                    cross.c[1] += jacobian[node] * response.c[2];
-                    cross.c[2] += jacobian[{scratch} + node] * response.c[2];
-                }}
-""",
-            "FACTOR_CROSS": """                if (row_count == 3) {
-                    cross.c[0] += value.c[0] * value.c[1];
-                    cross.c[1] += value.c[0] * value.c[2];
-                    cross.c[2] += value.c[1] * value.c[2];
-                }
-""",
-            "RECORD": _TRIPLET_RECORD,
+            "FREE_CROSS": sums(free),
+            "FACTOR_CROSS": sums(lambda a, b: f"value.c[{a}] * value.c[{b}]"),
+            "RECORD": kernel_template.substitute(
+                _TRIPLET_RECORD,
+                ROWS=rows,
+                CHANNELS=", ".join(f"{name}.c[{k}]" for name, k, _, _ in couplings),
+                TAIL=_SPIN_RECORD if torsion else _PAIR_METRIC_RECORD,
+            ),
         }
     geometry_cuda, geometry_cpu, geometry_dot = _GEOMETRY_CUDA, _GEOMETRY_CPU, _GEOMETRY_DOT
+    normal = "directions_shared.data[0][0], directions_shared.data[0][1], directions_shared.data[0][2]"
     if prepare_rows:
         geometry_cuda = (
-            f"volatile float* geometry = jacobian + {3 * scratch};\nif (LANE == 0) {{\n"
+            f"volatile float* geometry = jacobian + {rows * scratch};\nif (LANE == 0) {{\n"
             + _GEOMETRY_COPY
             + "}\nSYNC();\n"
         )
         geometry_cpu = "float geometry[27];\n" + _GEOMETRY_COPY
         geometry_dot = _PREPARED_GEOMETRY_DOT
+        normal = "geometry[0], geometry[1], geometry[2]"
+    # The spin row turns about the normal, row 0's direction (:func:`.contact_laws.spin_entry`).
+    spin = f"if (row == 3) return wp::dot(wp::vec3({normal}), angular);" if torsion else ""
     return kernel_template.substitute(
         _CONTACT_ROWS,
-        SPARSE_PROJECTION=_sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=scratch),
+        SPARSE_PROJECTION=_sparse_contact_projection_source(
+            "shared_mask", dof_count=n, scratch_stride=scratch, rows=rows
+        ),
         GEOMETRY_CUDA=geometry_cuda,
         GEOMETRY_CPU=geometry_cpu,
         GEOMETRY_DOT=geometry_dot,
-        STORAGE=groups * (3 * scratch + geometry),
+        SPIN_VALUE=spin,
+        ROWS=rows,
+        VEC=f"wp::vec{rows}",
+        STORAGE=groups * (rows * scratch + geometry),
         LANES=lanes,
-        SCRATCH=3 * scratch + geometry,
+        SCRATCH=rows * scratch + geometry,
         PLANE=scratch,
         JACOBIAN=max(n, 6),
         N=n,
@@ -1869,6 +1912,7 @@ def factor_contact_rows_kernel(
     prepare_rows: bool = False,
     use_support_table: bool = False,
     contact_records: bool = False,
+    torsion: bool = False,
 ) -> wp.Kernel:
     """Pack each contact's rows in factor coordinates (see the section's comment), a lane group per contact.
 
@@ -1876,7 +1920,9 @@ def factor_contact_rows_kernel(
     ``prepare_rows`` it also writes the rows' records and right-hand sides by the row laws (bias, ``cfm`` and, after
     the projection, a restitutive normal's rebound from its incident velocity). ``use_support_table`` publishes each
     row's support class instead of its coordinates (one factored articulation per world, no free-body response);
-    ``contact_records`` writes each full triplet's block record into ``row_free_response`` (it needs both). A grid of
+    ``contact_records`` writes each full triplet's block record into ``row_free_response`` (it needs both). Under contact
+    ``torsion`` a friction contact's fourth row is its spin row (:func:`.row_build.write_contact_row`'s), and a full
+    quad's record holds its spin couplings in place of the pair's metric. A grid of
     workers strides over the contacts: ``total_num_workers * lanes_per_contact`` threads in blocks of
     ``warps_per_block * 32``; the CPU runs a contact's group on one thread. Arrays must be contiguous.
     """
@@ -1886,7 +1932,7 @@ def factor_contact_rows_kernel(
     if contact_records and not (prepare_rows and use_support_table):
         raise ValueError("Contact records require prepared rows and the row support table")
     snippet = dual_native(
-        _contact_rows_source(n, lanes, warps, prepare_rows, use_support_table, contact_records),
+        _contact_rows_source(n, lanes, warps, prepare_rows, use_support_table, contact_records, torsion),
         preludes=(lane_group(lanes), *PROJECTION_LAW.preludes()),
     )
 
@@ -1947,7 +1993,7 @@ def factor_contact_rows_kernel(
         worker = tid // lanes
         total_contacts = data.count[0]
         for c in range(worker, total_contacts, total_num_workers):
-            row_count = wp.min(data.slots_needed[c], 3)
+            row_count = wp.min(data.slots_needed[c], wp.static(3 + int(torsion)))
             if data.path[c] != 0 or data.slot[c] < 0 or row_count <= 0:
                 continue
             art_a = data.art0[c]
@@ -2030,6 +2076,14 @@ def factor_contact_rows_kernel(
                             mu *= data.friction_weight[c]
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION
                         parent = data.slot[c]
+                    if wp.static(torsion):
+                        if lane == CONTACT_SPIN_ROW:
+                            # The spin row: the torsional coefficient, its rhs minus the prescribed bodies' spin.
+                            target = prescribed_spin_target(
+                                body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v
+                            )
+                            mu = contact_torsion_mu(data, c)
+                            row_type = PGS_CONSTRAINT_TYPE_TORSION
                     # The position pass's row law (bias scale 1) and its regularization weight; a material normal's
                     # own law.
                     rhs, row_w = row_rhs(
@@ -2143,6 +2197,8 @@ def factor_contact_rows_kernel(
         name += "_support_table"
     if contact_records:
         name += "_contact_records"
+    if torsion:
+        name += "_torsion"
     return python_kernel(contact_kernel, name)
 
 

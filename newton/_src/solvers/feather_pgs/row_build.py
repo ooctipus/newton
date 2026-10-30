@@ -28,6 +28,7 @@ from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_friction,
     contact_materials,
+    contact_row_entry,
     contact_row_frame,
     jacobian_entry,
     prescribed_spin_target,
@@ -310,15 +311,11 @@ def endpoint_projection(
     data: ContactInput, body: int, art: int, size: int, dof: int, row: int, point: wp.vec3, direction: wp.vec3
 ):
     """Read current response masks and current world-origin motion columns: contact row ``row``'s entry at
-    coordinate ``dof`` (:func:`.contact_laws.jacobian_entry`, the spin row's :func:`.contact_laws.spin_entry`)."""
+    coordinate ``dof`` (:func:`.contact_laws.contact_row_entry`)."""
     value = float(0.0)
     if body >= 0 and art >= 0 and data.response_dofs[art] == size:
         if (data.body_mask[body] & (wp.uint32(1) << wp.uint32(dof))) != wp.uint32(0):
-            motion = data.motion[data.dof_start[art] + dof]
-            if row == CONTACT_SPIN_ROW:
-                value = spin_entry(motion, direction)
-            else:
-                value = jacobian_entry(motion, direction, point, data.origin[art])
+            value = contact_row_entry(row, data.motion[data.dof_start[art] + dof], direction, point, data.origin[art])
     return value
 
 

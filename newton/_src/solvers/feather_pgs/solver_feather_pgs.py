@@ -87,6 +87,7 @@ from .joint_table import bind_free_bodies
 from .kernel_template import Dispatch, KernelTemplate, SweepTier, python_kernel
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_TORSION,
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
@@ -1063,10 +1064,8 @@ class SolverFeatherPGS(SolverBase):
         # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
         # each test their own fit once no earlier case holds the class, and the first that fits claims it.
         self.routes = RouteTable(self._route_pins)
-        # Case K2, a tree beside a star: the sparse diagonal, which does not solve the appended torsion row.
-        declined = self.routes.taken("K2") or (
-            "Contact torsion keeps the general response." if self.laws.contact_torsion_enabled else None
-        )
+        # Case K2, a tree beside a star: the sparse diagonal.
+        declined = self.routes.taken("K2")
         sparse_diagonal_pair = (
             None
             if declined
@@ -1356,15 +1355,15 @@ class SolverFeatherPGS(SolverBase):
             self._hinv_jt_diag_sizes = frozenset()
         # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
         # six-coordinate dense articulation (decided before the buffers: it clears its own rows, so their Jacobian
-        # needs no second buffer). It writes the point and the patch row law; torsion and compliance keep ordinary
-        # rows.
+        # needs no second buffer). It writes every contact row law: point and patch friction, contact torsion's spin
+        # rows and material contacts.
         from .compact_contact import supported  # noqa: PLC0415
 
-        declined = capable("compact", self.laws.set)
-        if declined is None and not supported(self):
-            declined = (
-                "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
-            )
+        declined = (
+            None
+            if supported(self)
+            else "Declined: requires the six-coordinate sparse-diagonal triple or unit contract and no row checks."
+        )
         self._compact_contact_boundary = declined is None
         self._compact_contact_reason = declined or "Admitted: the six-coordinate sparse-diagonal triples or units."
         self._allocate_buffers(model)
@@ -2483,6 +2482,7 @@ class SolverFeatherPGS(SolverBase):
             int(max_support),
             velocity_limits=velocity_candidate,
             linked_rows=self.laws.friction_anchors_enabled,
+            torsion=self.laws.contact_torsion_enabled,
         )
         # Patch friction keeps the packed lanes of small worlds, so size them from the
         # full sweep before the active-row scan claims whole warps.
@@ -2611,12 +2611,15 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_row_free_response = self._arrays.placeholder(wp.float32, (1, 1, 1))
         self._sparse_free_factor_dummy = self._arrays.placeholder(wp.float32, (1, 6, 6))
         self._sparse_contact_lanes = 8
+        # Contact torsion: each friction contact's spin row is the fourth of its unit.
+        torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
         self._sparse_contact_response_kernel = response_builds_rows.factor_contact_rows_kernel(
             size,
             lanes_per_contact=self._sparse_contact_lanes,
             prepare_rows=True,
             use_support_table=use_support_table,
             **({"contact_records": True} if self._sparse_contact_records is not None else {}),
+            **torsion,
         )
         self._pgs_solve_sparse_kernel = self._sweep_kernel(
             "sparse_pgs",
@@ -2630,6 +2633,7 @@ class SolverFeatherPGS(SolverBase):
             linked_rows=self.laws.friction_anchors_enabled,
             device_arch=model.device.arch,
             weighted=self.laws.set.weighted,
+            **torsion,
         )
 
     def _sweep_kernel(self, route: str, factory, *args, readout_budget: int | None = None, **kwargs):
@@ -3374,6 +3378,7 @@ class SolverFeatherPGS(SolverBase):
                 self._sparse_diagonal_response_size,
                 device_arch,
                 units=self._sparse_diagonal_contact_units,
+                torsion=self.laws.contact_torsion_enabled,
             )
             if sparse_contact_schedule
             else None
@@ -3385,6 +3390,7 @@ class SolverFeatherPGS(SolverBase):
                 device_arch,
                 build_serial_contacts=self._sparse_diagonal_speculative_contact_batches,
                 units=self._sparse_diagonal_contact_units,
+                torsion=self.laws.contact_torsion_enabled,
             )
             if sparse_contact_schedule
             else None
@@ -3401,6 +3407,7 @@ class SolverFeatherPGS(SolverBase):
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
                 contact_units=self._sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
+                torsion=self.laws.contact_torsion_enabled,
             )
             if self._sparse_diagonal_contact_solve
             else None
@@ -3483,6 +3490,7 @@ class SolverFeatherPGS(SolverBase):
                     model.device,
                     worlds=capable,
                     rule=rule,
+                    torsion=self.laws.contact_torsion_enabled,
                 )
                 self._pgs_solve_mf_colored_kernel = self._sweep_kernel(
                     "mf_colored",
@@ -7534,13 +7542,16 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
     device_arch: str,
     *,
     units: bool = False,
+    torsion: bool = False,
 ) -> "wp.Kernel":
     """Mark contact triples whose response is confined to one sparse coordinate.
 
     ``units`` marks patch contact units instead: a normal row, followed by its two
-    tangent rows only when the contact owns a friction anchor.
+    tangent rows only when the contact owns a friction anchor. Under contact
+    ``torsion`` a friction contact's spin row follows its tangents (four rows).
     """
     del device_arch
+    full = 3 + int(torsion)
     sparse_size = int(sparse_response_dofs)
     if sparse_size <= 0:
         raise ValueError("sparse response DOFs must be positive")
@@ -7555,7 +7566,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         for contact in range(worker, total_contacts, total_num_workers):
             slot = data.slot[contact]
             rows = data.slots_needed[contact]
-            if data.path[contact] != 0 or slot < 0 or (rows != 1 and rows != 3):
+            if data.path[contact] != 0 or slot < 0 or (rows != 1 and rows != full):
                 continue
 
             art_a = data.art0[contact]
@@ -7578,8 +7589,9 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
             elif coord_1 >= 0 and coord_0 < 0:
                 sparse_row_dof[world, slot, 0] = -2
 
+    suffix = "_torsion" if torsion else ""
     if units:
-        name = f"mark_independent_sparse_contact_candidates_{sparse_size}_units"
+        name = f"mark_independent_sparse_contact_candidates_{sparse_size}_units{suffix}"
         return python_kernel(mark_independent_sparse_contact_units_template, name)
 
     def mark_independent_sparse_contact_candidates_template(
@@ -7591,7 +7603,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         total_contacts = data.count[0]
         for contact in range(worker, total_contacts, total_num_workers):
             slot = data.slot[contact]
-            if data.path[contact] != 0 or slot < 0 or data.slots_needed[contact] != 3:
+            if data.path[contact] != 0 or slot < 0 or data.slots_needed[contact] != full:
                 continue
 
             art_a = data.art0[contact]
@@ -7614,7 +7626,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
             elif coord_1 >= 0 and coord_0 < 0:
                 sparse_row_dof[world, slot, 0] = -2
 
-    name = f"mark_independent_sparse_contact_candidates_{sparse_size}"
+    name = f"mark_independent_sparse_contact_candidates_{sparse_size}{suffix}"
     return python_kernel(mark_independent_sparse_contact_candidates_template, name)
 
 
@@ -7626,26 +7638,30 @@ def _get_build_independent_sparse_contact_groups_kernel(
     *,
     build_serial_contacts: bool = False,
     units: bool = False,
+    torsion: bool = False,
 ) -> "wp.Kernel":
     """Build exact independent and serial contact schedules for sparse diagonal response.
 
     ``units`` schedules patch contact units instead of contact triples (see
     :func:`_build_independent_sparse_contact_units_kernel`). Each world's warp
     links the scalar triples and lists the remaining ones in parallel; the
-    schedules equal those of serial walks over the segment's whole triples.
+    schedules equal those of serial walks over the segment's whole triples. Under
+    contact ``torsion`` a contact's spin row follows its tangents: four rows apart.
     """
     del device_arch
     M = int(max_constraints)
     D = int(max_world_dofs)
     if units:
-        return _build_independent_sparse_contact_units_kernel(M, D, build_serial_contacts)
+        return _build_independent_sparse_contact_units_kernel(M, D, build_serial_contacts, torsion)
+    # The serial list's capacity, a triple's (four-row contacts need less).
     S = (M + 2) // 3
+    R = 4 if torsion else 3
     serial_schedule = (
         f"""
     // Compact the remaining contacts in original row order. The solve may
     // inspect up to four normals concurrently, but any active batch is still
     // applied through this serial list in exact GS order.
-{_list_serial_contacts_source(count="triple_count", stride=3, head="true", serial_capacity=S)}
+{_list_serial_contacts_source(count="triple_count", stride=R, head="true", serial_capacity=S)}
     SYNC();
 """
         if build_serial_contacts
@@ -7659,14 +7675,14 @@ def _get_build_independent_sparse_contact_groups_kernel(
     const int sparse_world_base = world * {M} * 2;
     const unsigned earlier_lanes = (1u << lane) - 1u;
     // The contact segment's whole triples.
-    const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / 3 : 0;
+    const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / {R} : 0;
     for (int coordinate = lane; coordinate < {D}; coordinate += 32)
         group_heads.data[head_base + coordinate] = -1;
     SYNC();
 
     // Reserve every diagonal coordinate used by a coupled contact. A scalar
     // row sharing one must remain in the serial chain to preserve GS order.
-    for (int normal = contact_start + lane * 3; normal + 2 < contact_end; normal += 96) {{
+    for (int normal = contact_start + lane * {R}; normal + {R - 1} < contact_end; normal += {32 * R}) {{
         const int sparse_row = sparse_world_base + normal * 2;
         const int coord_0 = sparse_row_dof.data[sparse_row];
         const int coord_1 = sparse_row_dof.data[sparse_row + 1];
@@ -7680,7 +7696,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
 
     // Link each coordinate's scalar triples in ascending row order, so that
     // every negative link reproduces the original GS order.
-{_link_scalar_contacts_source(count="triple_count", stride=3, head="true", dofs=D)}
+{_link_scalar_contacts_source(count="triple_count", stride=R, head="true", dofs=D)}
 {serial_schedule}
 
     int count = 0;
@@ -7698,6 +7714,8 @@ def _get_build_independent_sparse_contact_groups_kernel(
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
+    if torsion:
+        name += "_torsion"
     return KernelTemplate(
         name,
         kernel_template.params(
@@ -7812,7 +7830,9 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
 """
 
 
-def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_contacts: bool) -> "wp.Kernel":
+def _build_independent_sparse_contact_units_kernel(
+    M: int, D: int, build_serial_contacts: bool, torsion: bool = False
+) -> "wp.Kernel":
     """Build the independent and serial schedules over patch contact units.
 
     Under patch friction a contact's rows form a unit: its normal row, followed by
@@ -7825,10 +7845,18 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     Two serial walks over the rows define the schedules. When the rows form units
     as the producers write them, both walks visit exactly the non-friction rows,
     and the warp builds the same links, heads and serial list in parallel; lane 0
-    runs the walks for any other row layout.
+    runs the walks for any other row layout. Under contact ``torsion`` a unit's
+    spin row follows its tangents and names its head too.
     """
-    friction = int(PGS_CONSTRAINT_TYPE_FRICTION)
-    unit_head = f"world_row_type.data[row_base + normal] != {friction}"
+    friction, spin = int(PGS_CONSTRAINT_TYPE_FRICTION), int(PGS_CONSTRAINT_TYPE_TORSION)
+    R = 4 if torsion else 3
+
+    def member(row: str) -> str:
+        """Whether row ``row`` belongs to the unit of an earlier head (a tangent, or a spin row)."""
+        kind = f"world_row_type.data[row_base + {row}]"
+        return f"({kind} == {friction} || {kind} == {spin})" if torsion else f"{kind} == {friction}"
+
+    unit_head = f"!{member('normal')}" if torsion else f"world_row_type.data[row_base + normal] != {friction}"
     # The serial walks that define the schedules, which lane 0 runs for any other row layout.
     serial_walks = f"""
     // Prepending candidates in reverse row order makes each negative link
@@ -7838,7 +7866,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         int row = contact_end - 1;
         while (row >= contact_start) {{
             int normal = row;
-            if (world_row_type.data[row_base + row] == {friction}) {{
+            if ({member("row")}) {{
                 const int head = world_row_parent.data[row_base + row];
                 if (head >= contact_start && head < row) normal = head;
             }}
@@ -7881,10 +7909,10 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
                 || sparse_row_dof.data[sparse_row + 1] < -1;
             if (!scheduled_independently)
                 serial_normals.data[world * {M} + serial_count++] = normal;
-            const bool owns_tangents = normal + 2 < contact_end
+            const bool owns_tangents = normal + {R - 1} < contact_end
                 && world_row_type.data[row_base + normal + 1] == {friction}
                 && world_row_parent.data[row_base + normal + 1] == normal;
-            normal += owns_tangents ? 3 : 1;
+            normal += owns_tangents ? {R} : 1;
         }}
         serial_count_out.data[world] = serial_count;
     }}
@@ -7899,6 +7927,13 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         else ""
     )
     parallel_links = _link_scalar_contacts_source(count="contact_end - contact_start", stride=1, head=unit_head, dofs=D)
+    # A unit's rows: its head, then nothing or its tangents (and spin row) naming it, then the next head.
+    layout = "if (tangent_1 && !(named_1 && tangent_2 && named_2 && !tangent_3)) rows_form_units = false;"
+    if torsion:
+        layout = f"""const bool spin_3 = normal + 3 < contact_end && world_row_type.data[row_base + normal + 3] == {spin};
+        const bool named_3 = normal + 3 < contact_end && world_row_parent.data[row_base + normal + 3] == normal;
+        const bool member_4 = normal + 4 < contact_end && {member("normal + 4")};
+        if (tangent_1 && !(named_1 && tangent_2 && named_2 && spin_3 && named_3 && !member_4)) rows_form_units = false;"""
 
     snippet = f"""    const int lane = LANE;
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];
@@ -7917,19 +7952,19 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     // followed by the next head or the segment end, directly or after its two
     // tangent rows naming it. Both serial walks then visit exactly the heads.
     bool rows_form_units = contact_start >= contact_end
-        || world_row_type.data[row_base + contact_start] != {friction};
+        || {f"!{member('contact_start')}" if torsion else f"world_row_type.data[row_base + contact_start] != {friction}"};
     for (int normal = contact_start + lane; normal < contact_end; normal += 32) {{
         const int sparse_row = sparse_world_base + normal * 2;
         const int coord_0 = sparse_row_dof.data[sparse_row];
         const int coord_1 = sparse_row_dof.data[sparse_row + 1];
-        const bool unit_head = world_row_type.data[row_base + normal] != {friction};
+        const bool unit_head = {unit_head};
         const bool tangent_1 = normal + 1 < contact_end && world_row_type.data[row_base + normal + 1] == {friction};
         const bool tangent_2 = normal + 2 < contact_end && world_row_type.data[row_base + normal + 2] == {friction};
         const bool tangent_3 = normal + 3 < contact_end && world_row_type.data[row_base + normal + 3] == {friction};
         const bool named_1 = normal + 1 < contact_end && world_row_parent.data[row_base + normal + 1] == normal;
         const bool named_2 = normal + 2 < contact_end && world_row_parent.data[row_base + normal + 2] == normal;
         if (!unit_head) continue;
-        if (tangent_1 && !(named_1 && tangent_2 && named_2 && !tangent_3)) rows_form_units = false;
+        {layout}
         const bool scalar_candidate = coord_0 < -1 || coord_1 < -1;
         if (!scalar_candidate) {{
             if (coord_0 >= 0) atomicExch(&group_heads.data[head_base + coord_0], -2);
@@ -7963,7 +7998,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
-    name += "_units"
+    name += "_units" + ("_torsion" if torsion else "")
     return KernelTemplate(
         name,
         kernel_template.params(

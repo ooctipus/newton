@@ -437,7 +437,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         Which owner claims a world is recorded where it is decided (routes.stages, each owner's reason); the
         friction record names only the owners that need point friction. Contact torsion keeps the tiers' admission
-        (the keyed rows, which write no spin row, decline it) whatever the flags say.
+        whatever the flags say.
         """
         model = _cpu_free_body_model()
         routes = SolverFeatherPGS(model).get_path_selection()["routes"]

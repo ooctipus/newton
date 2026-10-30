@@ -53,10 +53,8 @@ class _LawsProbe(SimpleNamespace):
 
 
 class _AdmissionProbe(SimpleNamespace):
-    # Patch friction may run the parallel tiers, as point friction may.
-    @property
-    def _parallel_contact_paths(self):
-        return self.laws.set.agnostic
+    # Every contact law may run the parallel tiers.
+    _parallel_contact_paths = True
 
 
 def _eligible_solver():

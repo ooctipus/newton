@@ -342,6 +342,7 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
             friction_anchors_enabled=anchors,
             friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
             friction_anchor_beta=beta,
+            contact_torsion_enabled=False,
         ),
         options=SimpleNamespace(**{name: getattr(data, field) for name, field in _OPTIONS_FIELDS.items()}),
         # Launches sized by contact rows go through the pool, eagerly here.

@@ -75,8 +75,9 @@ def clear_contact_response(
 
 @wp.kernel
 def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
-    """Publish each contact's rows in their original collision order, one thread per row (3 per contact): its records
-    (:func:`.row_build.write_contact_row`), then its whitened dense-six part and sparse slots.
+    """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
+    contact torsion): its records (:func:`.row_build.write_contact_row`), then its whitened dense-six part and sparse
+    slots.
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
@@ -100,7 +101,7 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
         has_dense = has_dense or data.response_dofs[art1] == 6
     group = boundary.dense_group[world]
     sparse_pair_row_response(
-        data, boundary, world, slot + row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
+        data, boundary, world, row, slot + row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
     )
 
 
@@ -127,7 +128,10 @@ def launch_contacts(solver, data, workers):
     # would overflow.
     pool = solver._contact_pool
     count = data.count
-    pool.launch(produce_contacts, (pool.launch_rows(), 3), inputs=[data, boundary, patch_row_law(solver)], extent=count)
+    rows = 4 if solver.laws.contact_torsion_enabled else 3
+    pool.launch(
+        produce_contacts, (pool.launch_rows(), rows), inputs=[data, boundary, patch_row_law(solver)], extent=count
+    )
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     pool.launch(

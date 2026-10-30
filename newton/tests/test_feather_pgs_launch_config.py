@@ -554,8 +554,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     )
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse diagonal contact response requires CUDA")
-    def test_sparse_diagonal_owner_yields_to_contact_torsion(self):
-        """Keep the worlds of a model with contact torsion on the general owner, which solves its spin rows."""
+    def test_sparse_diagonal_owner_takes_contact_torsion(self):
+        """Keep the sparse-diagonal owner and its schedule under contact torsion, which solves the spin rows."""
         model = _build_sparse_diagonal_pair_model(device="cuda:0")
         solvers = {
             torsion: SolverFeatherPGS(
@@ -570,8 +570,10 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         }
         self.assertTrue(solvers[False]._sparse_diagonal_contact_solve)
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
-        self.assertFalse(solvers[True]._sparse_diagonal_contact_solve)
-        self.assertFalse(solvers[True]._sparse_diagonal_contact_triples)
+        self.assertTrue(solvers[True]._sparse_diagonal_contact_solve)
+        self.assertEqual(
+            solvers[True]._sparse_diagonal_contact_triples, solvers[False]._sparse_diagonal_contact_triples
+        )
 
     @unittest.skipUnless(wp.is_cuda_available(), "compact diagonal inertia requires CUDA")
     def test_compact_diagonal_inertia_refreshes_masked_inertial_changes(self):

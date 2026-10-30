@@ -64,20 +64,14 @@ class Laws:
         return self.regularized or self.compliance
 
     @property
-    def agnostic(self) -> bool:
-        """The contact rows follow the point or the patch row law, which every row writer implements (no torsion
-        row; a material normal is the row law's, with its compliance)."""
-        return not self.torsion
-
-    @property
     def point(self) -> bool:
         """Point-friction rows of the point row law."""
-        return self.agnostic and self.contact == "point"
+        return self.contact == "point"
 
     @property
     def patch(self) -> bool:
         """Patch-friction rows of the patch row law."""
-        return self.agnostic and self.contact == "patch"
+        return self.contact == "patch"
 
     @classmethod
     def build(cls, laws, options, model, *, preelimination: bool) -> Laws:
@@ -102,17 +96,15 @@ class Laws:
 
     def record(self) -> dict:
         """The laws as a JSON-compliant record, with the derived ones."""
-        return {**asdict(self), "plain": self.plain, "agnostic": self.agnostic, "weighted": self.weighted}
+        return {**asdict(self), "plain": self.plain, "weighted": self.weighted}
 
 
 # Each requirement a placement or schedule may hold: (test of the laws, what it requires).
 _REQUIREMENTS = {
     "cuda": (lambda laws: laws.cuda, "a CUDA device (their native bodies are written for CUDA only)"),
     "plain": (lambda laws: laws.plain, Laws.PLAIN),
-    "agnostic": (lambda laws: laws.agnostic, "the point or patch row law (no torsion)"),
     "limits": (lambda laws: laws.limits, "joint-limit rows (enable_joint_limits)"),
     "no_velocity_limits": (lambda laws: not laws.velocity_limits, "no joint velocity-limit rows"),
-    "no_torsion": (lambda laws: not laws.torsion, "no torsion row"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
     "no_connect": (lambda laws: not laws.connect, "no connect rows"),
     "no_loops": (lambda laws: not laws.loops, "no loop-closing joints"),
@@ -130,7 +122,6 @@ CAPABILITIES = {
         "iterations",
         "no_debug_rows",
         "no_preelimination",
-        "no_torsion",
         "no_connect",
         "no_loops",
     ),
@@ -145,11 +136,9 @@ CAPABILITIES = {
     # The Jacobi tiers of dense trees beside a free body (case K4).
     "tiers": ("cuda",),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect", "no_torsion"),
-    # The compact boundary's row producer of a star beside a six-coordinate arm.
-    "compact": ("agnostic",),
+    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
     # The colored mapping of the free-body rows' contact units.
-    "colored": ("cuda", "no_torsion"),
+    "colored": ("cuda",),
 }
 """The laws each placement or schedule implements, by owner: what its admission reads through :func:`capable`."""
 
@@ -162,7 +151,6 @@ _LABELS = {
     "components": "Components need",
     "tiers": "The Jacobi tiers need",
     "keyed_rows": "Keyed rows need",
-    "compact": "Compact contacts need",
     "colored": "Colored units need",
 }
 

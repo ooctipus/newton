@@ -205,6 +205,7 @@ class TestCoalescedContact(unittest.TestCase):
             laws=SimpleNamespace(
                 **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},
                 friction_anchors_enabled=False,
+                contact_torsion_enabled=False,
                 friction_anchor_beta=0.0,
                 friction_patches=SimpleNamespace(view=point_row_law("cpu", 16).patches),
             ),

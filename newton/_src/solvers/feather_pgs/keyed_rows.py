@@ -22,19 +22,19 @@ import warp as wp
 from ...sim import ModelFlags
 from . import field_group
 from .contact_input import ContactInput, contact_frame
-from .contact_laws import CONTACT_LAW, contact_friction, contact_row_frame
+from .contact_laws import CONTACT_LAW, CONTACT_SPIN_ROW, contact_friction, contact_row_frame
 from .dense_rows import RowSupport, jacobian_row
 from .device_preludes import warp_stride
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
 from .kernel_template import substitute
-from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
 from .law_source import law_preludes
 from .prefix_rows import LAW, VELOCITY_LAW
 from .route_table import capable
-from .row_build import endpoint_projection, write_contact_row
+from .row_build import contact_torsion_mu, endpoint_projection, write_contact_row
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin
@@ -74,7 +74,8 @@ KineticRows = field_group.struct("KineticRows", KINETIC_ROWS, __name__)
 
 @wp.kernel(enable_backward=False)
 def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
-    """Emit each allocated contact row's key (raw contact ID and row direction).
+    """Emit each allocated contact row's key (raw contact ID and row direction: the normal, the tangents and, under
+    contact torsion, the spin row).
 
     Under persistent patch friction also the type, parent and undivided coefficient of each row: the patch
     link runs after this launch and before any row is read, links each normal row into its patch ring and
@@ -100,6 +101,10 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                         data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
                         data.row_parent[world, row] = -1
                         data.row_mu[world, row] = mu
+                    elif direction == CONTACT_SPIN_ROW:
+                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
+                        data.row_parent[world, row] = slot
+                        data.row_mu[world, row] = contact_torsion_mu(data, contact)
                     else:
                         data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
                         data.row_parent[world, row] = slot
@@ -110,7 +115,7 @@ ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
 """Device preludes of the row source: the contact and row laws it calls (``ContactLaw::...``, ``RowLaw::...``)."""
 
 
-def _row_source(*, layout, patch=False, weighted=False):
+def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     """Decode a dense row from its key into the parallel tiers' row ``Zi`` and its records.
 
     A prefix row's key ``~(2 d + side)`` gives a unit coefficient. A contact row takes its geometry, frame, target,
@@ -121,9 +126,18 @@ def _row_source(*, layout, patch=False, weighted=False):
     ``weighted`` writes each row's weight (the relative regularization's, 1 for a firing rebound) and, under
     ``contact_compliance``, a material contact's law as :func:`.row_build.write_contact_row` does: its normal's rhs
     and compliance (:func:`.row_laws.contact_material_rhs`, zero on every other row), no restitution and its
-    tangents' friction scale; the tiers form its weight from that compliance.
+    tangents' friction scale; the tiers form its weight from that compliance. Under contact ``torsion`` a key's fourth
+    direction is the spin row (:func:`.row_build.write_contact_row`'s): its entries ``n . S_ang``, its coefficient the
+    shapes' torsional friction, its rhs minus the prescribed spin.
     """
     dofs, output = layout.dofs, "Zi[q * ZS]"
+    entry = "ContactLaw::jacobian_entry(S, direction, point, c.origin.data[art])"
+    kind = "r == 0 ? 0 : 2"
+    target = "ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v)"
+    if torsion:
+        entry = f"(r == 3 ? ContactLaw::spin_entry(S, direction) : {entry})"
+        kind = f"r == 0 ? 0 : (r == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
+        target = f"r == 3 ? ContactLaw::prescribed_spin_target(ba, aa, bb, ab, normal, c.prescribed, c.body_v)\n            : {target}"
     prefix = substitute(
         """
         const int token = ~key, d = token / 2;
@@ -141,7 +155,7 @@ def _row_source(*, layout, patch=False, weighted=False):
             if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
                 || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
             const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
-            value += sign * ContactLaw::jacobian_entry(S, direction, point, c.origin.data[art]);
+            value += sign * {entry};
     """
     projection = substitute(
         """
@@ -171,6 +185,8 @@ def _row_source(*, layout, patch=False, weighted=False):
             "const wp::vec3 fa = patch_law.patches.point_a.data[contact], fb = patch_law.patches.point_b.data[contact];"
         )
         tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
+        if torsion:
+            tangent_phi = f"(r == 3 ? 0.0f : {tangent_phi})"
         tangent_beta = "patch_law.beta"
         row_law = "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n"
     else:
@@ -178,7 +194,7 @@ def _row_source(*, layout, patch=False, weighted=False):
         tangent_phi = "0.0f"
         tangent_beta = "0.0f"
         row_law = (
-            "        c.row_type.data[at] = r == 0 ? 0 : 2;\n"
+            f"        c.row_type.data[at] = {kind};\n"
             "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
             "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
             "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n"
@@ -208,7 +224,13 @@ def _row_source(*, layout, patch=False, weighted=False):
         c.row_w.data[at] = weight;
         if (c.material != 0) c.row_eps.data[at] = eps;
 """
-    rhs = rhs.replace("${TANGENT_BETA}", tangent_beta)
+    rhs = rhs.replace("${TANGENT_BETA}", tangent_beta).replace(
+        "RowLaw::row_rhs(r == 0 ? 0 : 2,", f"RowLaw::row_rhs({kind},"
+    )
+    if torsion:
+        # The spin row's coefficient is the shapes' torsional friction.
+        spin_mu = "r == 3 ? ContactLaw::contact_friction(sa, sb, c.material_mu_torsional) : "
+        materials = materials.replace("const float friction = ", f"const float friction = {spin_mu}")
     if patch:
         metadata = "built_rhs = rhs;"
     else:
@@ -238,7 +260,7 @@ ${PREFIX}
         }
         ${FRICTION_LOCATION}
         const auto [direction, p0, p1] = ContactLaw::contact_row_frame(r, c.shared_anchor, normal, t0, t1, pa, pb, fa, fb);
-        const float target = ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v);
+        const float target = ${TARGET};
 ${MATERIALS}
 ${PROJECTION}
         const float phi = r == 0 ? separation : ${TANGENT_PHI};
@@ -270,6 +292,7 @@ ${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
         ROW_LAW=row_law,
         PRIVATE_METADATA=metadata,
         DOFS=dofs,
+        TARGET=target,
     )
 
 
@@ -334,12 +357,21 @@ def materialize_general_rows(
             J_b[at[0], row, at[1] + local] = value
 
 
-def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False, weighted=False):
+def _key_kind(key: str, torsion: bool) -> str:
+    """The row type of a contact row from its key's direction: the normal's, a tangent's or, under contact torsion,
+    the spin row's."""
+    if torsion:
+        return f"({key} & 3) == 0 ? 0 : (({key} & 3) == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
+    return f"({key} & 3) == 0 ? 0 : 2"
+
+
+def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False, weighted=False, torsion=False):
     """Decode physical endpoints in the ordinary factor stage.
 
     ``patch`` writes the persistent patch row law and reads every row's parent and
     coefficient as the scatter and the patch link left them; point friction builds
-    them with the row. ``weighted`` writes the rows' weights and material contacts' law (:func:`_row_source`).
+    them with the row. ``weighted`` writes the rows' weights and material contacts' law, ``torsion`` decodes the spin
+    rows (:func:`_row_source`).
     """
     if (na, nb, oa, ob, dofs) != (
         layout.primary,
@@ -365,7 +397,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
             const auto& z = kinetic_rows;
             {built}
     """
-        + _row_source(layout=layout, patch=patch, weighted=weighted)
+        + _row_source(layout=layout, patch=patch, weighted=weighted, torsion=torsion)
         + f"""
             if ({key} >= 0) {publish}
     """
@@ -375,7 +407,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
         physical_row=reader,
         preludes=ROW_PRELUDES,
         arguments=arguments,
-        row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
+        row_type=f"({key} >= 0 ? ({_key_kind(key, torsion)}) : world_row_type.data[off_dense + i])",
         rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",
         parent=parent,
         mu=mu,
@@ -391,7 +423,8 @@ def get_parallel_factory(original, layout):
     """
 
     def factory(*args, linked_rows=False, weighted=False, **kwargs):
-        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows, weighted=weighted)
+        torsion = kwargs.get("torsion", False)
+        inputs = partial(get_direct_parallel_inputs, layout, patch=linked_rows, weighted=weighted, torsion=torsion)
         return original(*args, row_inputs=inputs, linked_rows=linked_rows, weighted=weighted, **kwargs)
 
     return factory

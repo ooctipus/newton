@@ -23,7 +23,7 @@ from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, Lanes, SparsePairZ
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
@@ -32,6 +32,8 @@ from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    TORSION,
+    ReducedPairCoupling,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -152,7 +154,7 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
 
 
 @dataclasses.dataclass(frozen=True)
-class _UnitPairZ(UnitOperator, SparsePairZ):
+class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
     """A coupled contact unit's rows (normal ``head``, tangents ``head + 1``, ``head + 2``) in the warp's layout
     (:class:`.sweep.UnitOperator`).
 
@@ -160,39 +162,55 @@ class _UnitPairZ(UnitOperator, SparsePairZ):
     (:func:`.response_builds_rows.sparse_pair_slots`), so the lane that owns a coordinate holds all three rows' entries
     there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
     ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
+    Under contact torsion (``spin``) the unit's fourth row is its spin row (``head + 3``), on the same coordinates.
     """
 
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        return f"{indent}const float {out} = unit_cross;"
+    spin: bool = False
 
     def unit_terms(self, head: str, indent: str) -> str:
-        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
-        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder."""
-        lane, P = self.lanes.lane, self.dofs
+        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``, ``unit_z3`` of a spin row) and
+        the velocity on their coordinate (``unit_u``), then reduce the rows' velocity terms and the rows' couplings in
+        one ladder."""
+        lane, P, rows = self.lanes.lane, self.dofs, range(4 if self.spin else 3)
+        spin = (
+            (
+                "float unit_jv3 = unit_z3 * unit_u;",
+                "float gram_n3 = unit_z0 * unit_z3, unit_cross13 = unit_z1 * unit_z3, "
+                "unit_cross23 = unit_z2 * unit_z3;",
+            )
+            if self.spin
+            else ()
+        )
+        sums = ("unit_jv3", "gram_n3", "unit_cross13", "unit_cross23") if self.spin else ()
         lines = [
             "int unit_coord = -1;",
-            "float unit_z0 = 0.0f, unit_z1 = 0.0f, unit_z2 = 0.0f;",
+            f"float {', '.join(f'unit_z{k} = 0.0f' for k in rows)};",
             f"if ({lane} < {P}) {{",
             f"    unit_coord = {self.offset} + {lane};",
             f"    const int unit_dense = ({self.group} * {self.rows} + {head}) * {P} + {lane};",
-            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in range(3)),
+            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in rows),
             f"}} else if ({lane} <= {P + 1}) {{",
             f"    const int unit_sparse = ({self.base} + {head}) * 2 + {lane} - {P};",
             f"    unit_coord = {self.sparse_dof}.data[unit_sparse];",
-            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in range(3)),
+            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in rows),
             "}",
             f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
             "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
             "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
-            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
+            *spin,
+            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross", *sums),
         ]
         return "\n".join(indent + line for line in lines)
 
     def unit_apply(self, indent: str) -> str:
         """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
+        change = "(unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2"
+        moved = "unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f"
+        if self.spin:
+            change, moved = f"({change}) + unit_z3 * unit_ds", f"{moved} || unit_ds != 0.0f"
         lines = [
-            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
-            f"    {self.velocity.at('unit_coord')} = unit_u + ((unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2);",
+            f"if (({moved}) && unit_coord >= 0)",
+            f"    {self.velocity.at('unit_coord')} = unit_u + ({change});",
             self.lanes.sync(),
         ]
         return "\n".join(indent + line for line in lines)
@@ -206,6 +224,7 @@ def sparse_diagonal_source(
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -224,7 +243,8 @@ def sparse_diagonal_source(
     per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
-    otherwise the sweep enters the batch at its first active contact.
+    otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
+    spin row follows its pair (four rows: a triple's stride is four), solved with it.
 
     Returns the body and its staging.
     """
@@ -241,9 +261,11 @@ def sparse_diagonal_source(
     batch_contacts = 32 // batch_lanes
     serial_stride = M if contact_units else (M + 2) // 3
     scheduled = contact_triples or contact_units
+    # A friction contact's rows: its normal, its pair and, under torsion, its spin row.
+    R = 4 if torsion else 3
 
     warp = Lanes(32)
-    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy)
+    laws = RowLaws(regularize=weighted, material=material, policy=solve_policy, torsion=torsion)
     rows = WorldRows(M, lanes=warp)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
 
@@ -276,17 +298,23 @@ def sparse_diagonal_source(
         visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a known kind other than
         friction admits no pair."""
         ctx = context(lanes, friction=kind in (None, FRICTION))
-        return f"{pad}const int row_type = {rows.kind('i') if kind is None else kind};\n" + row_visit(
-            ctx,
-            laws,
-            parent=rows.parent("i") if parent is None else parent,
-            check="denom",
-            declare=f"const float denom = {rows.diag('i')};",
-            entries=ctx.operator.consume("i", ""),
-            pad=pad,
+        # A spin row is solved with its friction pair.
+        skip = f"{pad}if (row_type == {TORSION}) continue;\n" if torsion and kind is None else ""
+        return (
+            f"{pad}const int row_type = {rows.kind('i') if kind is None else kind};\n"
+            + skip
+            + row_visit(
+                ctx,
+                laws,
+                parent=rows.parent("i") if parent is None else parent,
+                check="denom",
+                declare=f"const float denom = {rows.diag('i')};",
+                entries=ctx.operator.consume("i", ""),
+                pad=pad,
+            )
         )
 
-    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row), spin=torsion)
     unit_rows = contact_unit(
         dataclasses.replace(context(warp), operator=unit_op),
         laws,
@@ -297,7 +325,9 @@ def sparse_diagonal_source(
         check="denom",
         pad="    ",
     )
-    loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", "i + 1", "i + 2"))
+    loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", *(f"i + {r}" for r in range(1, R))))
+    # While friction is delayed the visit of a contact's pair zeroes its other rows: its second tangent (and spin).
+    held = "".join(f"{rows.peek(f'head + {r}')} = 0.0f;" for r in range(2, R))
 
     def coupled(condition: str, advance: str = "i") -> str:
         """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair) and the unit is
@@ -310,8 +340,8 @@ def sparse_diagonal_source(
 {unit_op.unit_terms("head", "        ")}
 {indent(unit_rows, "    ")}
 {unit_op.unit_apply("        ")}
-{friction_gate(str(FRICTION), f"{rows.peek('head + 2')} = 0.0f;", warp.sync(), "        ", skip=False)}
-        {advance} += 2;
+{friction_gate(str(FRICTION), held, warp.sync(), "        ", skip=False)}
+        {advance} += {R - 1};
         continue;
     }}
 }}"""
@@ -330,13 +360,12 @@ def sparse_diagonal_source(
         )
 
     def inactive_pair(condition: str, advance: str) -> str:
-        """Skip a contact's tangent rows when they hold nothing and its patch carries no load."""
+        """Skip a contact's tangent rows (and spin row) when they hold nothing and its patch carries no load."""
+        empty = "".join(f"\n                && {rows.peek(f'i + {r}')} == 0.0f" for r in range(1, R))
         return (
-            f"            if ({condition}\n"
-            f"                && {rows.peek('i + 1')} == 0.0f\n"
-            f"                && {rows.peek('i + 2')} == 0.0f) {{\n"
+            f"            if ({condition}{empty}) {{\n"
             f"                const float patch_load = {indent(rows.ring_load('i'), '                ').lstrip()};\n"
-            f"                if (patch_load <= 0.0f) {advance} += 2;\n"
+            f"                if (patch_load <= 0.0f) {advance} += {R - 1};\n"
             "            }"
         )
 
@@ -353,7 +382,7 @@ def sparse_diagonal_source(
 {pad}    const int i = head + 1;
 {visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
 {pad}}} while (false);
-{friction_gate(str(FRICTION), f"{rows.peek('head + 2')} = 0.0f;", "", pad, skip=False)}"""
+{friction_gate(str(FRICTION), held, "", pad, skip=False)}"""
         if contact_units:
             tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         independent_phase = f"""
@@ -387,7 +416,7 @@ def sparse_diagonal_source(
             f"    [&](int patch_row) {{ return {rows.parent('patch_row', enclosed=True)}; }},\n"
             f"    [&](int r) {{ return {rows.peek('r')} > 0.0f; }})"
         )
-        tangents_zero = f"{rows.peek('candidate_normal + 1')} == 0.0f && {rows.peek('candidate_normal + 2')} == 0.0f"
+        tangents_zero = " && ".join(f"{rows.peek(f'candidate_normal + {r}')} == 0.0f" for r in range(1, R))
         if contact_units:
             noop = f"""candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f;
     // Only a unit with tangent rows reads them and its ring's load.
@@ -427,35 +456,35 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     elif contact_triples and not speculative_contact_batches:
         serial = f"""        for (int i = 0; i < row_count; ++i) {{
             if (i >= contact_start) {{
-                const int normal = contact_start + ((i - contact_start) / 3) * 3;
+                const int normal = contact_start + ((i - contact_start) / {R}) * {R};
                 if ({independent("normal")}) {{
-                    i = normal + 2;
+                    i = normal + {R - 1};
                     continue;
                 }}
             }}
-{coupled("i >= contact_start && (i - contact_start) % 3 == 0")}
+{coupled(f"i >= contact_start && (i - contact_start) % {R} == 0")}
 {row}
-{inactive_pair("i >= contact_start && (i - contact_start) % 3 == 0", "i")}
+{inactive_pair(f"i >= contact_start && (i - contact_start) % {R} == 0", "i")}
         }}"""
     elif contact_triples:
         serial = f"""        const int serial_contact_count = sparse_contact_serial_count.data[world];
-        const int serial_row_end = contact_start + serial_contact_count * 3;
+        const int serial_row_end = contact_start + serial_contact_count * {R};
         for (int serial_row = 0; serial_row < serial_row_end; ++serial_row) {{
             int i = serial_row;
             int contact_component = -1;
             if (serial_row >= contact_start) {{
-                const int contact_index = (serial_row - contact_start) / 3;
-                if (serial_row - contact_start == contact_index * 3 && (contact_index & {batch_contacts - 1}) == 0) {{
+                const int contact_index = (serial_row - contact_start) / {R};
+                if (serial_row - contact_start == contact_index * {R} && (contact_index & {batch_contacts - 1}) == 0) {{
 {indent(batch("contact_index", "serial_contact_count"), "                    ")}
                     if (noop_lanes == MASK) {{
                         const int remaining_contacts = serial_contact_count - contact_index;
-                        serial_row += (remaining_contacts < {batch_contacts} ? remaining_contacts : {batch_contacts}) * 3 - 1;
+                        serial_row += (remaining_contacts < {batch_contacts} ? remaining_contacts : {batch_contacts}) * {R} - 1;
                         continue;
                     }}
-                    serial_row += (FIRST(~noop_lanes) >> {batch_shift}) * 3;
+                    serial_row += (FIRST(~noop_lanes) >> {batch_shift}) * {R};
                 }}
-                contact_component = (serial_row - contact_start) % 3;
-                i = sparse_contact_serial_normals.data[world * {serial_stride} + (serial_row - contact_start) / 3]
+                contact_component = (serial_row - contact_start) % {R};
+                i = sparse_contact_serial_normals.data[world * {serial_stride} + (serial_row - contact_start) / {R}]
                     + contact_component;
             }}
 {coupled("contact_component == 0", "serial_row")}
@@ -474,7 +503,8 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}
         }}"""
     else:
-        # Units have one or three rows: the loop walks real rows and enters each serial unit at its head.
+        # Units have one or three rows (four with a spin row): the loop walks real rows and enters each serial unit at
+        # its head.
         serial = f"""        const int serial_unit_count = sparse_contact_serial_count.data[world];
         int serial_unit = 0;
         int unit_end = contact_start;
@@ -500,7 +530,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                 unit_end = i + 1;
                 tangent_unit = -1;
                 if ({owns_tangents("i", " " * 20)}) {{
-                    unit_end = i + 3;
+                    unit_end = i + {R};
                     tangent_unit = i;
                 }}
             }}
@@ -585,7 +615,8 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {limit_stores}
 #endif
 """
-    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *solve_policy.preludes)
+    cone = (CONE_LAW,) if torsion else ()
+    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *solve_policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -599,6 +630,7 @@ def sparse_diagonal_kernel(
     contact_triples: bool = False,
     speculative_contact_batches: bool = False,
     contact_units: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -612,6 +644,7 @@ def sparse_diagonal_kernel(
         contact_triples=contact_triples,
         speculative_contact_batches=speculative_contact_batches,
         contact_units=contact_units,
+        torsion=torsion,
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
@@ -624,6 +657,7 @@ def sparse_diagonal_kernel(
         + ("_units" if contact_units else "")
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
+        + ("_torsion" if torsion else "")
         + solve_policy.suffix
     )
     extra = (*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments)

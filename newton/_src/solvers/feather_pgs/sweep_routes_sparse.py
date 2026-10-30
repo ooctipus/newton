@@ -37,7 +37,7 @@ from . import kernel_template
 from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
-from .projection_laws import PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
@@ -48,9 +48,11 @@ from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    TORSION,
     UNIT_HELD,
     VELOCITY_LIMIT,
     CachedPairMetric,
+    ReducedPairCoupling,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -125,7 +127,8 @@ class SparseSweep:
     """A sparse sweep's configuration, as the factory's options resolve.
 
     Contact triplets need the support table, three rows, and the active-row scan or linked rows; linked rows
-    take part only in an active-row scan or a contact unit.
+    take part only in an active-row scan or a contact unit. Under contact ``torsion`` a contact unit is a quad: its
+    spin row follows its pair.
     """
 
     rows: int
@@ -139,6 +142,7 @@ class SparseSweep:
     velocity_limits: bool
     local: bool
     warm_start: bool
+    torsion: bool
     policy: SolvePolicy
     weighted: bool = False
     material: bool = False
@@ -161,6 +165,7 @@ class SparseSweep:
         suffix += "_warm_start" if self.warm_start else ""
         suffix += "_weighted" if self.weighted else ""
         suffix += "_material" if self.material else ""
+        suffix += "_torsion" if self.torsion else ""
         return f"sweep_sparse_{self.rows}_{self.dofs}_{self.support}{suffix}{self.policy.suffix}"
 
 
@@ -179,6 +184,7 @@ def _resolve(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -201,7 +207,7 @@ def _resolve(
     if local_factors and (D > 16 or M > 64 or active_rows or contact_triplets):
         raise ValueError("local factor storage requires a small complete articulated sweep")
     active = bool(active_rows)
-    triplets = bool(contact_triplets) and (active or bool(linked_rows)) and bool(use_support_table) and M >= 3
+    triplets = bool(contact_triplets) and (active or bool(linked_rows)) and bool(use_support_table) and M >= 3 + torsion
     linked = bool(linked_rows) and (active or triplets)
     return SparseSweep(
         rows=M,
@@ -215,6 +221,7 @@ def _resolve(
         velocity_limits=bool(velocity_limits),
         local=bool(local_factors),
         warm_start=bool(warm_start),
+        torsion=bool(torsion),
         policy=solve_policy,
         weighted=bool(weighted),
         material=bool(material),
@@ -341,9 +348,11 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
 
     A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is
     negative (or not finite), every other non-friction row always; a delayed friction row is zeroed. A first
-    tangent is selected while its normal is selected or its pair holds impulse, a patch pair while any normal of
-    its ring is. A row a sweep's earlier updates violate waits for the next sweep.
+    tangent is selected while its normal is selected or its pair (or, under contact torsion, its spin row) holds
+    impulse, a patch pair while any normal of its ring is. A row a sweep's earlier updates violate waits for the next
+    sweep.
     """
+    held = "s_impulse[parent + 2] != 0.0f" + (" || s_impulse[parent + 3] != 0.0f" if sweep.torsion else "")
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     # The delta is zero at the first sweep unless warm starting seeded it.
     dot = serial.accumulate("dot", "row", "")
@@ -352,7 +361,7 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
     if sweep.linked:
         tangent = (
             "const auto normal_selected = [&](int r) { return ((s_normal_words[r / 32] >> (r & 31)) & 1u) != 0u; };\n"
-            "selected = row == parent + 1 && (s_impulse[row] != 0.0f || s_impulse[parent + 2] != 0.0f\n"
+            f"selected = row == parent + 1 && (s_impulse[row] != 0.0f || {held}\n"
             "    || (parent >= 0 && (normal_selected(parent)\n"
             "        || RING_ANY(parent, count, ring_parent, normal_selected))));"
         )
@@ -360,7 +369,7 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
         tangent = (
             "selected = row == parent + 1 && (\n"
             "    ((s_normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u\n"
-            "    || s_impulse[row] != 0.0f || s_impulse[parent + 2] != 0.0f);"
+            f"    || s_impulse[row] != 0.0f || {held});"
         )
     lane_zero = op.lanes.first
     text = f"""for (int first = 0; first < count; first += 32) {{
@@ -452,8 +461,9 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     """Row ``i``'s visit and update under the shared row law (:func:`.sweep.row_visit`).
 
     The friction gate, then the first tangent of a pair on its ring's disk; the residual reduces the pair's
-    second-tangent term and coupling with it (:meth:`.SparseFactor.residual`). Velocity-limit rows wait for the
-    last-word pass (``skip_velocity_limits``). The first lane stores the impulses after every lane has read them.
+    second-tangent term and coupling with it (:meth:`.SparseFactor.residual`), and under contact torsion its spin
+    row's, which the pair's visit solves. Velocity-limit rows wait for the last-word pass (``skip_velocity_limits``).
+    The first lane stores the impulses after every lane has read them.
     """
     lanes = rows.lanes
     op = dataclasses.replace(op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
@@ -477,8 +487,11 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
     head = [
         f"int row_type = {rows.kind('i')};",
         f"if (row_type == {VELOCITY_LIMIT}) continue;" if skip_velocity_limits else "",
+        # A spin row is solved with its friction pair (contact torsion).
+        f"if (row_type == {TORSION}) continue;" if laws.torsion else "",
     ]
-    residual = op.residual("jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}")
+    spin = {"spin": "parent + 3"} if laws.torsion else {}
+    residual = op.residual("jv", pad, sibling="parent + 2", paired=f"row_type == {FRICTION}", **spin)
     visit = row_visit(
         ctx,
         laws,
@@ -509,6 +522,12 @@ class _UnitFactor(UnitOperator, CachedPairMetric, SparseFactor):
         return f"(r == 0 ? -{residual} * unit_inverse : -{residual} / {self.diagonal(row)})"
 
 
+@dataclasses.dataclass(frozen=True)
+class _SpinUnitFactor(ReducedPairCoupling, _UnitFactor):
+    """A quad's rows in a contact unit (contact torsion): the record holds its rows' Gram couplings, the pair's
+    ``W_t1t2`` among them; the friction triple's law forms its metric."""
+
+
 def _record(width: int, row: str) -> str:
     """The address of the contact record of the triplet that holds row ``row``."""
     return f"contact_records.data + (static_cast<size_t>(world) * contact_records.shape[1] + {row} / 3) * {width}"
@@ -532,6 +551,11 @@ def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: 
     S = sweep.support
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked else 0)
     count = op.entries
+    torsion = laws.torsion
+    # The unit's rows: each one's index, entry and response names (``_entry``, ``_responses``), velocity term.
+    unit_rows = [("i", "normal", "unit_jv0"), ("tangent", "tangent", "unit_jv1"), ("sibling", "sibling", "unit_jv2")]
+    if torsion:
+        unit_rows.append(("spin", "spin", "unit_jv3"))
     setup = ""
     if sweep.linked:
         setup = f"""// Each anchor's other ring members, at most three, in the order the pair update pools them; -1 marks a
@@ -566,31 +590,34 @@ SYNC();"""
         else ""
     )
     gather = op.entries_loop(
-        f"""const bool stored = entry < {S};
-const float normal_entry = stored ? {op.element("i")} : 0.0f;
-const float tangent_entry = stored ? {op.element("tangent")} : 0.0f;
-const float sibling_entry = stored ? {op.element("sibling")} : 0.0f;
-const int index = stored ? {_class_coordinate("row_class", S)} : -1;
-indices[q] = index;
-normal_responses[q] = index >= 0 ? normal_entry : 0.0f;
-tangent_responses[q] = index >= 0 ? tangent_entry : 0.0f;
-sibling_responses[q] = index >= 0 ? sibling_entry : 0.0f;
-velocities[q] = index >= 0 ? s_delta[index] : 0.0f;
-if (index >= 0) {{
-    unit_jv0 += normal_responses[q] * velocities[q];
-    unit_jv1 += tangent_responses[q] * velocities[q];
-    unit_jv2 += sibling_responses[q] * velocities[q];
-}}""",
+        "\n".join(
+            [
+                f"const bool stored = entry < {S};",
+                *(f"const float {name}_entry = stored ? {op.element(row)} : 0.0f;" for row, name, _ in unit_rows),
+                f"const int index = stored ? {_class_coordinate('row_class', S)} : -1;",
+                "indices[q] = index;",
+                *(f"{name}_responses[q] = index >= 0 ? {name}_entry : 0.0f;" for _, name, _ in unit_rows),
+                "velocities[q] = index >= 0 ? s_delta[index] : 0.0f;",
+                "if (index >= 0) {",
+                *(f"    {term} += {name}_responses[q] * velocities[q];" for _, name, term in unit_rows),
+                "}",
+            ]
+        ),
         "        ",
     )
+    # Per coordinate the normal's change, the spin row's (contact torsion), then the pair's: the row loop's order.
+    changes = [("normal", "unit_dn"), *((("spin", "unit_ds"),) if torsion else ()), ("sibling", "unit_dt2")]
     apply = op.entries_loop(
-        """if (indices[q] >= 0) {
-    float value = velocities[q];
-    if (unit_dn != 0.0f) value += normal_responses[q] * unit_dn;
-    if (unit_dt2 != 0.0f) value += sibling_responses[q] * unit_dt2;
-    if (unit_dt1 != 0.0f) value += tangent_responses[q] * unit_dt1;
-    s_delta[indices[q]] = value;
-}""",
+        "\n".join(
+            [
+                "if (indices[q] >= 0) {",
+                "    float value = velocities[q];",
+                *(f"    if ({d} != 0.0f) value += {name}_responses[q] * {d};" for name, d in changes),
+                "    if (unit_dt1 != 0.0f) value += tangent_responses[q] * unit_dt1;",
+                "    s_delta[indices[q]] = value;",
+                "}",
+            ]
+        ),
         "            ",
         entry=False,
     )
@@ -614,7 +641,9 @@ if (index >= 0) {{
         def ring_load(parent: str, load: str) -> str:
             return f"unit_ring_load({load})"
 
-    unit_op = _UnitFactor(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
+    unit_op = (_SpinUnitFactor if torsion else _UnitFactor)(
+        **{field.name: getattr(op, field.name) for field in dataclasses.fields(op)}
+    )
     ctx = RowContext(
         row="i",
         kind="row_type",
@@ -622,7 +651,7 @@ if (index >= 0) {{
         load=rows.load,
         store=rows.store,
         rhs=rows.rhs_of,
-        mu=lambda row: "mu",
+        mu=lambda row: "unit_spin_mu" if row == "spin" else "mu",
         weight=rows.weight,
         eps=rows.eps,
         parent="parent",
@@ -635,40 +664,70 @@ if (index >= 0) {{
 const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
     # The guards admitted the normal (a positive diagonal); the rows read the unit's staged values as it loaded them.
     rows_text = contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check=None, held=True, pad="        ")
-    held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
+    held = "\n".join(unit_held_loads(ctx, name, "head", "        ", torsion=torsion) for name in UNIT_HELD)
+    # Under contact torsion the quad's spin row: its guards, record couplings and staged values (its record's second
+    # half holds W_ns, W_t1s and W_t2s, :func:`.response_builds_rows.factor_contact_rows_kernel`).
+    spin = {
+        "last": "i + 3" if torsion else "i + 2",
+        "type": f" & (s_type[i + 3] == {TORSION})" if torsion else "",
+        "rows": ", spin = i + 3" if torsion else "",
+        "guards": """
+    const int spin_class = support.row_class.data[offset + spin];
+    const int spin_parent = world_row_parent.data[offset + spin];"""
+        if torsion
+        else "",
+        "check": " && spin_parent == i && spin_class == row_class" if torsion else "",
+        "record": "spin_coupling" if torsion else "basis",
+        "mu": "\n        const float unit_spin_mu = world_row_mu.data[offset + spin];" if torsion else "",
+        "responses": f"\n        float spin_responses[{count}];" if torsion else "",
+        "terms": ", unit_jv3 = 0.0f" if torsion else "",
+        "sum": ", unit_jv3" if torsion else "",
+        "change": " || unit_ds != 0.0f" if torsion else "",
+    }
+    metric = (
+        "        const float unit_cross = coupling.z, gram_n3 = spin_coupling.x, unit_cross13 = spin_coupling.y,\n"
+        "            unit_cross23 = spin_coupling.z;"
+        if torsion
+        else cached_pair_law("UNIT_PAIR", "tangent_scale", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
+    )
+    scale = (
+        ""
+        if torsion
+        else """
+        // The pair's metric is relative to its larger tangent diagonal, as the pair law scales it.
+        const float tangent_scale = fmaxf(fmaxf(unit_diag1, unit_diag2), 1.0e-20f);"""
+    )
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
-if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
-    && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION})
+if ({entry_guard}{spin["last"]} < count && global_iter >= friction_start_iteration
+    && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION}){spin["type"]}
         & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
-    const int head = i, tangent = i + 1, sibling = i + 2;
+    const int head = i, tangent = i + 1, sibling = i + 2{spin["rows"]};
     // The guards load together; the rows, the record and the coordinates then load together.
     const int row_class = support.row_class.data[offset + i];
     const int tangent_class = support.row_class.data[offset + tangent];
     const int sibling_class = support.row_class.data[offset + sibling];
     const int tangent_parent = world_row_parent.data[offset + tangent];
-    const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}
+    const int sibling_parent = world_row_parent.data[offset + sibling];{spin["guards"]}{normal_parent}
     if (tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
-        && row_class == tangent_class{point_guard}) {{
+        && row_class == tangent_class{spin["check"]}{point_guard}) {{
         const float* record = {_record(width, "i")};
         const float4 coupling = *reinterpret_cast<const float4*>(record);
-        const float4 basis = *reinterpret_cast<const float4*>(record + 4);{ring_read}
-        const float mu = world_row_mu.data[offset + tangent];
+        const float4 {spin["record"]} = *reinterpret_cast<const float4*>(record + 4);{ring_read}
+        const float mu = world_row_mu.data[offset + tangent];{spin["mu"]}
         int indices[{count}];
         float velocities[{count}], normal_responses[{count}];
-        float tangent_responses[{count}], sibling_responses[{count}];
-        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
+        float tangent_responses[{count}], sibling_responses[{count}];{spin["responses"]}
+        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f{spin["terms"]};
 {gather}
         // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
-{held}
-        // The pair's metric is relative to its larger tangent diagonal, as the pair law scales it.
-        const float tangent_scale = fmaxf(fmaxf(unit_diag1, unit_diag2), 1.0e-20f);
-        SUM(unit_jv0, unit_jv1, unit_jv2);
+{held}{scale}
+        SUM(unit_jv0, unit_jv1, unit_jv2{spin["sum"]});
         // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
         const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;
-{cached_pair_law("UNIT_PAIR", "tangent_scale", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")}{ring}
+{metric}{ring}
 {rows_text}
-        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
+        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f{spin["change"]}) {{
 {apply}
         }}
         consumed_tangent = tangent;
@@ -709,7 +768,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     lanes = Lanes(L)
     rows = SparseRows(M, lanes)
     op = factor_operator(sweep)
-    laws = RowLaws(regularize=sweep.weighted, material=sweep.material, policy=sweep.policy)
+    laws = RowLaws(regularize=sweep.weighted, material=sweep.material, policy=sweep.policy, torsion=sweep.torsion)
     staging = _staging(sweep, rows, op)
 
     setup = []
@@ -777,7 +836,8 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = s_impulse[i];
 #endif
 """
-    preludes = (lane_group(L), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW), *sweep.policy.preludes)
+    cone = (CONE_LAW,) if sweep.torsion else ()
+    preludes = (lane_group(L), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *sweep.policy.preludes)
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -796,6 +856,7 @@ def sparse_source(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
@@ -816,6 +877,7 @@ def sparse_source(
             local_factors=local_factors,
             warm_start=warm_start,
             linked_rows=linked_rows,
+            torsion=torsion,
             solve_policy=solve_policy,
             weighted=weighted,
             material=material,
@@ -839,6 +901,7 @@ def sparse_kernel(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
+    torsion: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     device_arch=None,
     weighted: bool = False,
@@ -864,6 +927,7 @@ def sparse_kernel(
         local_factors=local_factors,
         warm_start=warm_start,
         linked_rows=linked_rows,
+        torsion=torsion,
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,

@@ -847,6 +847,14 @@ class UnitOperator:
         return f"\n{indent}unit_dt2 += {sibling_delta};" + self.apply(delta, indent)
 
 
+class ReducedPairCoupling:
+    """A unit operator mixin whose placement reduces the pair's coupling ``Z_t1 . Z_t2`` with the unit's terms
+    (``unit_cross``), or caches it with them."""
+
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        return f"{indent}const float {out} = unit_cross;"
+
+
 class CachedPairMetric:
     """A unit operator mixin whose pair law reads the pair's metric cached for the unit (:func:`cached_pair_law`): the
     visit forms no coupling."""

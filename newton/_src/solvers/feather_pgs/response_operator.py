@@ -1613,6 +1613,30 @@ class SparsePairZ(ResponseOperator):
             f"{indent}sibling_residual += {rhs(sibling)};"
         )
 
+    def spin_terms(self, row: str, sibling: str, spin: str, rhs: Callable[[str], str], indent: str) -> str:
+        """The spin row's terms (contact torsion): its residual, and its couplings with the row and the sibling, each
+        an entry product on the visited row's coordinate, which a contact's rows share (one thread: its slot's)."""
+        if not self.lanes.parallel:
+            return (
+                f"{self._slot(spin, 'spin_entry', indent)}\n"
+                f"{indent}const float spin_z = {self.sparse_z}.data[spin_entry];\n"
+                f"{indent}float spin_residual = __fmul_rn(spin_z, {self.velocity.at(self.coordinate)});\n"
+                f"{indent}spin_residual += {rhs(spin)};\n"
+                f"{indent}float spin_cross = z * spin_z;\n"
+                f"{indent}float spin_cross_sibling = sib_z * spin_z;"
+            )
+        lines = [
+            self._entries(spin, "spin_coord", "spin_z", ""),
+            "float spin_z_here = spin_z;",
+            *self._here(spin, "spin_z_here"),
+            f"float spin_residual = spin_coord >= 0 ? spin_z * {self.velocity.at('spin_coord')} : 0.0f;",
+            "float spin_cross = coord >= 0 ? z * spin_z_here : 0.0f;",
+            "float spin_cross_sibling = coord >= 0 ? sib_z_here * spin_z_here : 0.0f;",
+            self.lanes.reduce("spin_residual", "spin_cross", "spin_cross_sibling"),
+            f"spin_residual += {rhs(spin)};",
+        ]
+        return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
+
     def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
         """``float out = Z_i^T Z_s`` of the visited row ``row``: each lane's entry times the sibling's on its
         coordinate (a sparse slot's, when the sibling carries that coordinate), reduced."""

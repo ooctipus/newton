@@ -32,6 +32,7 @@ from .sweep import (
     VELOCITY_LIMIT,
     CachedPairMetric,
     FreeBodyRows,
+    ReducedPairCoupling,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -195,8 +196,6 @@ COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns. The largest color measured holds
 237 units (coins) and 139 (hardware), and a unit's staged registers (up to 193) leave room for 256 threads."""
 
-METRIC_FIELDS = sweep_units.METRIC_FIELDS
-
 COLOR_CHUNK = 256
 """Color offsets a colored block stages at a time: a world's colors are bounded by its units, not by the block."""
 
@@ -229,10 +228,45 @@ class _GramUnitBodyZ(UnitOperator, CachedPairMetric, FreeBodyZ):
     coordinates after its rows (:func:`_unit_apply`)."""
 
 
-def _unit_terms(pad: str) -> str:
+@dataclasses.dataclass(frozen=True)
+class _GramSpinUnitBodyZ(UnitOperator, ReducedPairCoupling, FreeBodyZ):
+    """The colored unit's rows with a spin row (contact torsion): as :class:`_GramUnitBodyZ`, its rows' Gram couplings
+    from the unit's cache (the pair's ``unit_cross`` among them); the friction triple's law forms its metric."""
+
+
+_UNIT_ROWS = (("n", "unit_jv0", "unit_dn"), ("t1", "unit_jv1", "unit_dt1"), ("t2", "unit_jv2", "unit_dt2"))
+"""A colored unit's rows: each one's partial sum, velocity term and deferred change, at ``E``'s ``12 r``."""
+_SPIN_ROW = ("spin", "unit_jv3", "unit_ds")
+"""Under contact torsion the unit's fourth row, its spin row."""
+
+
+def _unit_rows(torsion: bool) -> tuple:
+    return (*_UNIT_ROWS, _SPIN_ROW) if torsion else _UNIT_ROWS
+
+
+_PAIR_METRIC = ("metric.v0", "metric.v1", "metric.v2", "metric.v3[0]", "metric.v3[1]")
+"""A colored friction unit's cached pair metric (``ProjectionLaw::friction_pair_metric``): scale, the two eigenvalues,
+the larger's axis."""
+_PAIR_COUPLINGS = (("gram_n1", 0, 1), ("gram_n2", 0, 2))
+"""The Gram couplings a colored friction unit caches after its pair's metric: each one's name and rows (``E``'s
+``12 r``), the pair's tangents with the normal."""
+_SPIN_COUPLINGS = (("gram_n3", 0, 3), ("unit_cross", 1, 2), ("unit_cross13", 1, 3), ("unit_cross23", 2, 3))
+"""Under contact torsion the rest of the unit's couplings (the friction triple's law forms its own metric)."""
+
+
+def _unit_couplings(torsion: bool) -> tuple[int, tuple]:
+    """A colored unit's cached Gram couplings and their start in its metric: after the friction pair's metric
+    (:data:`_PAIR_METRIC`), or under contact ``torsion`` from the start, with the spin row's."""
+    return (0, (*_PAIR_COUPLINGS, *_SPIN_COUPLINGS)) if torsion else (len(_PAIR_METRIC), _PAIR_COUPLINGS)
+
+
+def _unit_terms(pad: str, *, torsion: bool = False) -> str:
     """Native statements, after a unit's ``E``, ``metric``, ``rows`` and ``dof_a``, ``dof_b`` are declared: the unit's
     velocity on its bodies (``unit_u``), its rows' velocity terms from it (each side's six products, then the sides
-    added) and the cached Gram couplings of the pair with the normal."""
+    added) and the cached Gram couplings of the pair with the normal; under ``torsion`` the spin row's term too and
+    every coupling of the unit's rows (:attr:`.sweep_units.SlotLayout.metric`)."""
+    rows = _unit_rows(torsion)
+    start, couplings = _unit_couplings(torsion)
     lines = [
         "float unit_u[12];",
         "#pragma unroll",
@@ -240,37 +274,50 @@ def _unit_terms(pad: str) -> str:
         "    unit_u[k] = dof_a >= 0 ? s_v[dof_a + k] : 0.0f;",
         "    unit_u[6 + k] = dof_b >= 0 ? s_v[dof_b + k] : 0.0f;",
         "}",
-        "float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;",
+        f"float {', '.join(f'{term} = 0.0f' for _, term, _ in rows)};",
         "#pragma unroll",
         "for (int side = 0; side < 2; ++side) {",
         "    if ((side == 0 ? dof_a : dof_b) < 0) continue;",
-        "    float n = 0.0f, t1 = 0.0f, t2 = 0.0f;",
+        f"    float {', '.join(f'{part} = 0.0f' for part, _, _ in rows)};",
         "#pragma unroll",
         "    for (int k = 0; k < 6; ++k) {",
         "        const float u = unit_u[side * 6 + k];",
-        "        n += E[side * 6 + k] * u;",
-        "        t1 += E[12 + side * 6 + k] * u;",
-        "        t2 += E[24 + side * 6 + k] * u;",
+        *(
+            f"        {part} += E[{f'{12 * r} + ' if r else ''}side * 6 + k] * u;"
+            for r, (part, _, _) in enumerate(rows)
+        ),
         "    }",
-        "    unit_jv0 += n;",
-        "    unit_jv1 += t1;",
-        "    unit_jv2 += t2;",
+        *(f"    {term} += {part};" for part, term, _ in rows),
         "}",
-        "const float gram_n1 = metric[5], gram_n2 = metric[6];",
+        f"const float {', '.join(f'{name} = metric[{start + f}]' for f, (name, _, _) in enumerate(couplings))};",
     ]
     return indent("\n".join(lines), pad)
 
 
-def _unit_apply(pad: str) -> str:
-    """The unit's deferred changes in one pass: ``u += Z_n dn + Z_t1 dt1 + Z_t2 dt2`` on each of its bodies."""
+def _unit_apply(pad: str, *, torsion: bool = False) -> str:
+    """The unit's deferred changes in one pass: ``u += Z_n dn + Z_t1 dt1 + Z_t2 dt2`` on each of its bodies (and
+    ``Z_s ds`` of its spin row under ``torsion``)."""
+    rows = _unit_rows(torsion)
+    changes = [change for _, _, change in rows]
+
+    def sum_(side: int) -> str:
+        terms = [
+            f"E[{f'{12 * r + 6 * side} + ' if 12 * r + 6 * side else ''}k] * {change}"
+            for r, change in enumerate(changes)
+        ]
+        total = f"{terms[0]} + {terms[1]}"
+        for term in terms[2:]:
+            total = f"({total}) + {term}"
+        return total
+
     lines = [
-        "if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {",
+        f"if ({' || '.join(f'{change} != 0.0f' for change in changes)}) {{",
         "#pragma unroll",
         "    for (int k = 0; k < 6; ++k) {",
         "        if (dof_a >= 0)",
-        "            s_v[dof_a + k] = unit_u[k] + ((E[k] * unit_dn + E[12 + k] * unit_dt1) + E[24 + k] * unit_dt2);",
+        f"            s_v[dof_a + k] = unit_u[k] + ({sum_(0)});",
         "        if (dof_b >= 0)",
-        "            s_v[dof_b + k] = unit_u[6 + k] + ((E[6 + k] * unit_dn + E[18 + k] * unit_dt1) + E[30 + k] * unit_dt2);",
+        f"            s_v[dof_b + k] = unit_u[6 + k] + ({sum_(1)});",
         "    }",
         "}",
     ]
@@ -296,20 +343,22 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
     law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
     unit_rows = FreeBodyRows(M_MF, stream=free.stream, lanes=Lanes(1))
     arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
+    torsion = laws.torsion
+    layout = sweep_units.slot_layout(torsion)
 
     def unit_offset(row: str) -> str:
-        offsets = {"i": "r", "sib": "2"}
+        offsets = {"i": "r", "sib": "2", **({"spin": "3"} if torsion else {})}
         if row not in offsets:
-            raise ValueError(f"the colored unit reads rows i and sib, not {row!r}")
+            raise ValueError(f"the colored unit reads rows {sorted(offsets)}, not {row!r}")
         return offsets[row]
 
-    unit_op = _GramUnitBodyZ(
+    unit_op = (_GramSpinUnitBodyZ if torsion else _GramUnitBodyZ)(
         Lanes(1),
         velocity=Velocity("s_v"),
         entry=lambda array, row, k: f"E[{unit_offset(row)} * 12 + {arrays[array] * 6} + {k}]",
         inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])",
     )
-    ring, members = sweep_units.SLOT_RING, sweep_units.RING_MEMBERS
+    ring, members = layout.ring, sweep_units.RING_MEMBERS
 
     def ring_load(parent: str) -> str:
         # The staged ring's members in ring order (the walk's sum, without its chain of global loads), or the walk.
@@ -324,8 +373,8 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
         load=unit_rows.load,
         store=unit_rows.store,
         rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3 + 1])",
-        mu=lambda row: f"E[{sweep_units.SLOT_MU}]",
-        weight=lambda row: f"E[{sweep_units.SLOT_WEIGHT}]",
+        mu=lambda row: f"E[{layout.spin_mu if row == 'spin' else layout.mu}]",
+        weight=lambda row: f"E[{layout.weight}]",
         eps=unit_rows.eps,
         parent="parent",
         ring_load=ring_load,
@@ -351,15 +400,30 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
             "                    if (k < members) load += member[k];",
             "                return load;",
             "            };",
-            "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
-            "            // the unit loads with its fields.",
-            f"            float metric[{METRIC_FIELDS}];",
-            cached_pair_law(
-                "FRICTION_PAIR_CACHED", "metric[0]", "metric[1]", "metric[2]", ("metric[3]", "metric[4]"), " " * 12
+            *(
+                (
+                    "            // The unit's Gram couplings, cached once per launch before the sweeps, which it loads with its",
+                    "            // fields; the friction triple's law forms its metric.",
+                    f"            float metric[{layout.metric}];",
+                )
+                if torsion
+                else (
+                    "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
+                    "            // the unit loads with its fields.",
+                    f"            float metric[{layout.metric}];",
+                    cached_pair_law(
+                        "FRICTION_PAIR_CACHED",
+                        "metric[0]",
+                        "metric[1]",
+                        "metric[2]",
+                        ("metric[3]", "metric[4]"),
+                        " " * 12,
+                    ),
+                )
             ),
         ]
     )
-    fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
+    fields, words = layout.fields, layout.words
     declare = f"""const int i = unit_row + r;
 int4 meta;
 meta.x = 0;
@@ -404,71 +468,105 @@ const float mf_diag = __int_as_float(meta.y);"""
 #pragma unroll
                     for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {units}];
 #pragma unroll
-                    for (int f = 0; f < {METRIC_FIELDS}; ++f)
-                        metric[f] = slot_metric.data[unit_slot * {METRIC_FIELDS * units} + p + f * {units}];
-{_unit_terms(" " * 20)}
+                    for (int f = 0; f < {layout.metric}; ++f)
+                        metric[f] = slot_metric.data[unit_slot * {layout.metric * units} + p + f * {units}];
+{_unit_terms(" " * 20, torsion=torsion)}
 {unit}
-{_unit_apply(" " * 20)}
-                    // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
-                    if (rows == 3 && ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration))
-                        s_lam_mf[unit_row + 2] = 0.0f;
+{_unit_apply(" " * 20, torsion=torsion)}
+{_second_tangent_gate(torsion)}
                 }}
                 __syncthreads();
             }}"""
 
 
-def _colored_metrics(units: int) -> str:
-    """Before the sweeps, every thread forms the friction pair metric of the world's staged friction units (a unit of
-    three rows) at block stride and stores it in its slot's metric cache (``slot_metric``: scale, the two
-    eigenvalues and the larger's axis, then the pair's Gram couplings with the normal, field by field across the
-    units), which the pair law and the unit's terms read at every visit."""
-    fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
-    arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
-    op = FreeBodyZ(
-        Lanes(1),
-        velocity=Velocity("s_v"),
-        entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {arrays[array] * 6} + {k}]",
-        inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
-    )
-    return f"""    {{
-        const int staged = color_offset.data[off_color + color_count.data[world]];
-        for (int p = tid; p < staged; p += blockDim.x) {{
-            const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));
-            if ((slot.y & 3) != 3) continue;
-            const int dof_a = slot.z, dof_b = slot.w;
-            const int slot_base = unit_slot * {fields * units} + p;
-            const int word_base = unit_slot * {words * units} + p;
-            float E[{fields}];
-            int W[{words}];
-#pragma unroll
-            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];
-#pragma unroll
-            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {units}];
-{_colored_pair_metric(op, " " * 12)}
-            // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,
-            // body a's then b's products.
-            float gram_n1 = 0.0f, gram_n2 = 0.0f;
-            for (int k = 0; k < 6; ++k) {{
-                if (dof_a >= 0) {{
-                    gram_n1 += E[k] * E[12 + k];
-                    gram_n2 += E[k] * E[24 + k];
-                }}
-                if (dof_b >= 0) {{
-                    gram_n1 += E[6 + k] * E[18 + k];
-                    gram_n2 += E[6 + k] * E[30 + k];
-                }}
-            }}
-            const int at = unit_slot * {METRIC_FIELDS * units} + p;
-            slot_metric.data[at] = metric.v0;
-            slot_metric.data[at + {units}] = metric.v1;
-            slot_metric.data[at + {2 * units}] = metric.v2;
-            slot_metric.data[at + {3 * units}] = metric.v3[0];
-            slot_metric.data[at + {4 * units}] = metric.v3[1];
-            slot_metric.data[at + {5 * units}] = gram_n1;
-            slot_metric.data[at + {6 * units}] = gram_n2;
-        }}
-    }}
-    __syncthreads();"""
+def _second_tangent_gate(torsion: bool) -> str:
+    """After a friction unit: its second tangent (and spin row) are the first tangent's visit's; only the
+    delayed-friction gate holds them."""
+    gate = "ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration)"
+    if torsion:
+        return f"""                    // The pair's second tangent and the spin row: the first's visit solved them; only the delayed-friction
+                    // gate holds them.
+                    if (rows == 4 && {gate}) {{
+                        s_lam_mf[unit_row + 2] = 0.0f;
+                        s_lam_mf[unit_row + 3] = 0.0f;
+                    }}"""
+    return f"""                    // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
+                    if (rows == 3 && {gate})
+                        s_lam_mf[unit_row + 2] = 0.0f;"""
+
+
+def _colored_metrics(units: int, *, torsion: bool = False) -> str:
+    """Before the sweeps, every thread forms the cached metric of the world's staged friction units at block stride
+    and stores it in its slot's metric cache (``slot_metric``, field by field across the units), which the unit's law
+    and terms read at every visit: a friction pair's metric (scale, the two eigenvalues and the larger's axis), then
+    its Gram couplings (:func:`_unit_couplings`)."""
+    layout = sweep_units.slot_layout(torsion)
+    fields, words = layout.fields, layout.words
+    couplings = _unit_couplings(torsion)[1]
+    names = [name for name, _, _ in couplings]
+    head = [
+        "    {",
+        "        const int staged = color_offset.data[off_color + color_count.data[world]];",
+        "        for (int p = tid; p < staged; p += blockDim.x) {",
+        "            const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));",
+        f"            if ((slot.y & {7 if torsion else 3}) != {layout.rows}) continue;",
+        "            const int dof_a = slot.z, dof_b = slot.w;",
+        f"            const int slot_base = unit_slot * {fields * units} + p;",
+    ]
+    stage = [
+        "#pragma unroll",
+        f"            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];",
+    ]
+    values = names
+    if torsion:
+        rows = [*head, f"            float E[{fields}];", *stage]
+        rows.append("            // The Gram couplings of the unit's rows: per coordinate, body a's then b's products.")
+    else:
+        arrays = {"mf_Z_a": 0, "mf_Z_b": 1}
+        op = FreeBodyZ(
+            Lanes(1),
+            velocity=Velocity("s_v"),
+            entry=lambda array, row, k: f"E[{ {'i': 'r', 'sib': '2'}[row] } * 12 + {arrays[array] * 6} + {k}]",
+            inverse=lambda row: "mf_diag" if row == "i" else "__int_as_float(W[2 * 3])",
+        )
+        rows = [
+            *head,
+            f"            const int word_base = unit_slot * {words * units} + p;",
+            f"            float E[{fields}];",
+            f"            int W[{words}];",
+            *stage,
+            "#pragma unroll",
+            f"            for (int f = 0; f < 9; ++f) W[f] = slot_words.data[word_base + f * {units}];",
+            _colored_pair_metric(op, " " * 12),
+            "            // The Gram couplings of the pair's tangents with the normal, Z_n . Z_t1 and Z_n . Z_t2: per coordinate,",
+            "            // body a's then b's products.",
+        ]
+        values = [*_PAIR_METRIC, *names]
+
+    def products(side: int) -> list[str]:
+        entry = lambda row: f"E[{12 * row + 6 * side} + k]" if 12 * row + 6 * side else "E[k]"  # noqa: E731
+        return [f"                    {name} += {entry(a)} * {entry(b)};" for name, a, b in couplings]
+
+    rows += [
+        f"            float {', '.join(f'{name} = 0.0f' for name in names)};",
+        "            for (int k = 0; k < 6; ++k) {",
+        "                if (dof_a >= 0) {",
+        *products(0),
+        "                }",
+        "                if (dof_b >= 0) {",
+        *products(1),
+        "                }",
+        "            }",
+        f"            const int at = unit_slot * {layout.metric * units} + p;",
+        *(
+            f"            slot_metric.data[at{f' + {f * units}' if f else ''}] = {value};"
+            for f, value in enumerate(values)
+        ),
+        "        }",
+        "    }",
+        "    __syncthreads();",
+    ]
+    return "\n".join(rows)
 
 
 def mf_gs_staging(
@@ -556,8 +654,6 @@ def mf_gs_source(
         raise ValueError("Independent components require the paired factor-coordinate solve")
     if lanes not in (1, 32) or (colored and lanes != 32):
         raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
-    if contact_torsion and (colored or colored_worlds):
-        raise ValueError("The colored units solve no spin rows (contact torsion)")
     _validate_dense_metadata_encoding(max_constraints)
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
@@ -649,7 +745,7 @@ def mf_gs_source(
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
     sync = "__syncthreads();" if colored else "SYNC();"
-    metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF)) if colored else ""
+    metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF), torsion=contact_torsion) if colored else ""
     # The launch's prologue after the marks: the marked articulations entering factor coordinates, and the colored
     # units' pair metrics.
     prologue = "\n".join(
