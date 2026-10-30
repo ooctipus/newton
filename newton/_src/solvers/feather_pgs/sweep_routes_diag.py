@@ -7,12 +7,14 @@
 (:class:`.SparsePairZ`), one warp per world, in factor coordinates: ``u = L^T P v`` on the dense articulation and
 ``u = sqrt(m) v`` on a diagonal coordinate, entered once after the velocity is staged and left once before it is written
 back. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
-coupled rows in order (plain, contact triples or contact units, optionally with speculative batches). Its working set
-fits the static budget of the device it is built for (:func:`.staging.arch_budget`).
+coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
+contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
+budget of the device it is built for (:func:`.staging.arch_budget`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 from functools import cache
 
 import warp as wp
@@ -32,8 +34,10 @@ from .sweep import (
     JOINT_LIMIT,
     RowContext,
     RowLaws,
+    UnitOperator,
     WorldRows,
     change_vote,
+    contact_unit,
     end_sweep,
     friction_gate,
     indent,
@@ -145,6 +149,53 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
     return "\n".join(declarations), "\n".join(loads), "\n".join(rows), "\n".join(stores)
 
 
+@dataclasses.dataclass(frozen=True)
+class _UnitPairZ(UnitOperator, SparsePairZ):
+    """A coupled contact unit's rows (normal ``head``, tangents ``head + 1``, ``head + 2``) in the warp's layout
+    (:class:`.sweep.UnitOperator`).
+
+    A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
+    (:func:`.response_builds_rows.sparse_pair_slots`), so the lane that owns a coordinate holds all three rows' entries
+    there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
+    ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
+    """
+
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        return f"{indent}const float {out} = unit_cross;"
+
+    def unit_terms(self, head: str, indent: str) -> str:
+        """Declare this lane's entries of the unit's rows (``unit_z0``..``unit_z2``) and the velocity on their
+        coordinate (``unit_u``), then reduce the rows' velocity terms and the pair's couplings in one ladder."""
+        lane, P = self.lanes.lane, self.dofs
+        lines = [
+            "int unit_coord = -1;",
+            "float unit_z0 = 0.0f, unit_z1 = 0.0f, unit_z2 = 0.0f;",
+            f"if ({lane} < {P}) {{",
+            f"    unit_coord = {self.offset} + {lane};",
+            f"    const int unit_dense = ({self.group} * {self.rows} + {head}) * {P} + {lane};",
+            *(f"    unit_z{k} = {self.Z}.data[unit_dense + {k * P}];" for k in range(3)),
+            f"}} else if ({lane} <= {P + 1}) {{",
+            f"    const int unit_sparse = ({self.base} + {head}) * 2 + {lane} - {P};",
+            f"    unit_coord = {self.sparse_dof}.data[unit_sparse];",
+            *(f"    unit_z{k} = {self.sparse_z}.data[unit_sparse + {2 * k}];" for k in range(3)),
+            "}",
+            f"const float unit_u = unit_coord >= 0 ? {self.velocity.at('unit_coord')} : 0.0f;",
+            "float unit_jv0 = unit_z0 * unit_u, unit_jv1 = unit_z1 * unit_u, unit_jv2 = unit_z2 * unit_u;",
+            "float gram_n1 = unit_z0 * unit_z1, gram_n2 = unit_z0 * unit_z2, unit_cross = unit_z1 * unit_z2;",
+            self.lanes.reduce("unit_jv0", "unit_jv1", "unit_jv2", "gram_n1", "gram_n2", "unit_cross"),
+        ]
+        return "\n".join(indent + line for line in lines)
+
+    def unit_apply(self, indent: str) -> str:
+        """The unit's changes in one pass on this lane's coordinate; the lanes synchronize after it."""
+        lines = [
+            "if ((unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) && unit_coord >= 0)",
+            f"    {self.velocity.at('unit_coord')} = unit_u + ((unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2);",
+            self.lanes.sync(),
+        ]
+        return "\n".join(indent + line for line in lines)
+
+
 def sparse_diagonal_source(
     max_constraints: int,
     max_world_dofs: int,
@@ -163,7 +214,10 @@ def sparse_diagonal_source(
     :class:`.SparsePairZ`'s warp layout, all in factor coordinates (entered once after the velocity is staged, left
     once before it is written back). ``contact_triples`` schedules point contacts (a normal and two tangent
     rows each), ``contact_units`` patch contacts (a normal, and its tangent pair only when it owns an anchor); both
-    skip an independent contact in the serial order and a pair whose patch carries no load. With
+    skip an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
+    one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
+    (:func:`.sweep.contact_unit`) and visits an unloaded one, and a chain's contacts, row by row: a chain runs one lane
+    per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
     otherwise the sweep enters the batch at its first active contact.
@@ -189,17 +243,14 @@ def sparse_diagonal_source(
     rows = WorldRows(M, lanes=warp)
     staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=32)
 
-    def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
-        """Row ``i``'s visit in a layout: the warp's (every lane stores, the warp synchronizes after the apply) or one
-        thread's (an independent scalar contact on ``scalar_coord``). A ``kind`` (and a friction row's ``parent``)
-        known where the visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a
-        known kind other than friction admits no pair."""
+    def context(lanes: Lanes, *, friction: bool = True) -> RowContext:
+        """The rows' context in a layout at row ``i``: the warp's (every lane stores, the warp synchronizes after the
+        apply) or one thread's (an independent scalar contact on ``scalar_coord``)."""
         diagonal = lambda row: "denom" if row == "i" else rows.diag(row)  # noqa: E731
-        op = SparsePairZ(P, M, lanes, diagonal=diagonal)
-        ctx = RowContext(
+        return RowContext(
             row="i",
             kind="row_type",
-            operator=op,
+            operator=SparsePairZ(P, M, lanes, diagonal=diagonal),
             load=rows.peek,
             store=lambda row, value: f"{rows.peek(row)} = {value};",
             rhs=rows.rhs_of,
@@ -212,17 +263,54 @@ def sparse_diagonal_source(
             # Every lane (or the one thread) stores what it computed; a pair finishes its second tangent in its branch,
             # on the entries it kept (SparsePairZ.pair_entries).
             owned=False,
-            friction=kind in (None, FRICTION),
+            friction=friction,
         )
+
+    def visit(lanes: Lanes, pad: str, *, kind: int | None = None, parent: str | None = None) -> str:
+        """Row ``i``'s visit in a layout (:func:`context`). A ``kind`` (and a friction row's ``parent``) known where the
+        visit is emitted replaces the row's metadata, so the visit compiles to that kind's law; a known kind other than
+        friction admits no pair."""
+        ctx = context(lanes, friction=kind in (None, FRICTION))
         return f"{pad}const int row_type = {rows.kind('i') if kind is None else kind};\n" + row_visit(
             ctx,
             laws,
             parent=rows.parent("i") if parent is None else parent,
             check="denom",
             declare=f"const float denom = {rows.diag('i')};",
-            entries=op.consume("i", ""),
+            entries=ctx.operator.consume("i", ""),
             pad=pad,
         )
+
+    unit_op = _UnitPairZ(P, M, warp, diagonal=lambda row: "denom" if row == "i" else rows.diag(row))
+    unit_rows = contact_unit(
+        dataclasses.replace(context(warp), operator=unit_op),
+        laws,
+        rows="3",
+        declare=f"const int i = head + r;\nconst int row_type = r == 0 ? {CONTACT} : {FRICTION};\n"
+        f"const float denom = {rows.diag('i')};",
+        parent="head",
+        check="denom",
+        pad="    ",
+    )
+    loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", "i + 1", "i + 2"))
+
+    def coupled(condition: str, advance: str = "i") -> str:
+        """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair) and the unit is
+        loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`), its second tangent only zeroed
+        while friction is delayed; the loop then moves ``advance`` past its rows. An unloaded unit falls through to
+        the loop's row visits."""
+        text = f"""if ({condition}) {{
+    if ({loaded}) {{
+        const int head = i;
+{unit_op.unit_terms("head", "        ")}
+{indent(unit_rows, "    ")}
+{unit_op.unit_apply("        ")}
+{friction_gate(str(FRICTION), f"{rows.peek('head + 2')} = 0.0f;", warp.sync(), "        ", skip=False)}
+        {advance} += 2;
+        continue;
+    }}
+}}"""
+        return indent(text, " " * 12)
 
     def independent(head: str) -> str:
         """Whether the contact headed by row ``head`` belongs to an independent chain (a slot holds a link)."""
@@ -324,7 +412,11 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 
     row = visit(warp, "            ")
     if not scheduled:
+        # The rows hold no schedule: a normal row owning the tangent pair after it heads a contact unit, unless a
+        # chain's link marks it (its rows keep their visits, as a scheduled sweep's chain phase visits them).
+        head = f"({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}\n{' ' * 16}&& !({independent('i')})"
         serial = f"""        for (int i = 0; i < row_count; ++i) {{
+{coupled(head)}
 {row}
         }}"""
     elif contact_triples and not speculative_contact_batches:
@@ -336,6 +428,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                     continue;
                 }}
             }}
+{coupled("i >= contact_start && (i - contact_start) % 3 == 0")}
 {row}
 {inactive_pair("i >= contact_start && (i - contact_start) % 3 == 0", "i")}
         }}"""
@@ -360,6 +453,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                 i = sparse_contact_serial_normals.data[world * {serial_stride} + (serial_row - contact_start) / 3]
                     + contact_component;
             }}
+{coupled("contact_component == 0", "serial_row")}
 {row}
 {inactive_pair("contact_component == 0", "serial_row")}
         }}"""
@@ -370,6 +464,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                 const int unit_head = ({rows.kind("i")}) == {FRICTION} ? {rows.parent("i")} : i;
                 if ({independent("unit_head")}) continue;
             }}
+{coupled(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}")}
 {row}
 {inactive_pair(f"i >= contact_start && ({rows.kind('i')}) == {CONTACT} && {owns_tangents('i', ' ' * 16)}", "i")}
         }}"""
@@ -404,6 +499,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
                     tangent_unit = i;
                 }}
             }}
+{coupled("i == tangent_unit")}
 {row}
 {inactive_pair("i == tangent_unit", "i")}
         }}"""

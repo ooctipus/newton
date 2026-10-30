@@ -107,6 +107,28 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertEqual(text.count("const float sib_z = sparse_row_z.data[sib_entry];"), 1)
             self.assertIn("s_v[scalar_coord] += sib_z * sib_delta;", text)
             self.assertIn("if (sib_coord >= 0) s_v[sib_coord] += sib_z * sib_delta;", text)
+        # Every schedule solves a loaded coupled contact unit by the unit law in the warp's layout, before the row visits
+        # an unloaded unit falls through to: the unit's three rows on a lane's coordinate, their velocity terms and the
+        # pair's couplings in one ladder, the rows by the row law, one apply, the loop past the unit. A chain's contacts
+        # keep their row visits (one lane per contact: a unit branch there would split the warp's lanes).
+        loaded = "if (s_lam_dense[i] != 0.0f || s_lam_dense[i + 1] != 0.0f || s_lam_dense[i + 2] != 0.0f) {"
+        for text in (plain, triples, units):
+            self.assertEqual(text.count("SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);"), 1)
+            self.assertEqual(text.count(loaded), 1)
+            self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", text)
+            self.assertIn(
+                "s_v[unit_coord] = unit_u + ((unit_z0 * unit_dn + unit_z1 * unit_dt1) + unit_z2 * unit_dt2);", text
+            )
+            self.assertLess(text.index(loaded), text.rindex("const int row_type = s_meta_dense[i]"))
+        for text in (triples, units):
+            start = text.index("const int independent_group_count")
+            chains = text[start : text.index("SYNC();", start)]
+            self.assertNotIn("unit_jv", chains)
+            self.assertIn("float jv = __fmul_rn(z, s_v[scalar_coord]);", chains)
+        # The plain schedule has no chain phase: a contact a chain's link marks keeps its row visits there too, so every
+        # schedule solves the same rows by the same law (the CUDA twins compare the schedules bit for bit).
+        marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
+        self.assertLess(plain.index(marked), plain.index(loaded))
         # The rows act in factor coordinates: the dense articulation enters (u = L^T P v) once after the velocity is
         # staged and leaves once before it is written back; a diagonal coordinate scales by its m^-1/2.
         for text in (plain, triples, units):
