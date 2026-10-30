@@ -434,6 +434,7 @@ _MOTION_SLOTS = ts.Storage(
 _REDUCE_SLOTS = ts.Storage({"wrench": "s[$WRENCH+6*({node})+({k})]", "moment": "s[$MOMENT+13*({node})+({k})]"})
 _EXTERNAL_SLOTS = ts.Storage({"wrench": "s[6*({node})+({k})]"})
 _MOTION = ts.TWIST.with_zero_acceleration()
+"""The motion scan's combine where no joint has an own bias acceleration (:attr:`.TreeLayout.own_bias`)."""
 _REDUCE = ts.add(ts.Group("wrench", 6), ts.Group("moment", INERTIA_CHANNELS, "refresh"))
 _EXTERNAL = ts.add(ts.Group("wrench", 6))
 _TWIST_SUM = ts.add(ts.Group("twist", 6))
@@ -719,7 +720,7 @@ def get_helpers(
     default is the form CUDA owners launch.
     """
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
-    motion_source = _down(layout, _MOTION, schedules.motion, _MOTION_SLOTS)
+    motion_source = _down(layout, ts.TWIST if layout.own_bias else _MOTION, schedules.motion, _MOTION_SLOTS)
     reduction = _reduction(_REDUCE, schedules.reduce, _REDUCE_SLOTS)
     collect_source = layout.native(
         _COLLECT,
@@ -745,6 +746,13 @@ def get_helpers(
         )
     )
     def _load_motion(address: wp.uint64, body: int, acceleration: int) -> wp.spatial_vector: ...
+
+    @wp.func_native(
+        layout.render(
+            "float* s=reinterpret_cast<float*>(address)+$MOTION+$SIX_BODIES;for(int k=0;k<6;++k)s[6*body+k]=a[k];"
+        )
+    )
+    def _store_bias(address: wp.uint64, body: int, a: wp.spatial_vector): ...
 
     @wp.func_native(
         layout.render("float* s=reinterpret_cast<float*>(address)+$ORIGIN+3*shift;for(int k=0;k<3;++k)s[k]=v[k];")
@@ -871,6 +879,7 @@ def get_helpers(
         _scan_poses=_scan_poses,
         _storage=_host_storage(layout) if host else _storage,
         _store_axis=_store_axis,
+        _store_bias=_store_bias,
         _store_motion=_store_motion,
         _store_origin=_store_origin,
         _store_terms=_store_terms,
@@ -941,10 +950,10 @@ def get_state_kernel(
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
     scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
-    _storage, _store_motion, _load_motion = h._storage, h._store_motion, h._load_motion
+    _storage, _store_motion, _load_motion, _store_bias = h._storage, h._store_motion, h._load_motion, h._store_bias
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
     bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.root_dofs == 6
-    roots, free_roots, forest = len(layout.roots), layout.free_roots, layout.forest
+    roots, free_roots, forest, own_bias = len(layout.roots), layout.free_roots, layout.forest, layout.own_bias
 
     @wp.func
     def admit(
@@ -1148,9 +1157,16 @@ def get_state_kernel(
 
     @wp.func
     def motion(
-        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: HeldPlan, data: PublicationData, qd: wp.array[float]
+        g: TreeGroup,
+        origin: wp.vec3,
+        shift: wp.vec3,
+        plan: HeldPlan,
+        data: PublicationData,
+        q: wp.array[float],
+        qd: wp.array[float],
     ):
-        """Store each joint's axes and relative velocity at the origin, then complete the motion scan.
+        """Store each joint's axes, relative velocity and (:attr:`.TreeLayout.own_bias`) own bias acceleration at the
+        origin of the coordinates ``q`` and velocities ``qd``, then complete the motion scan.
 
         ``clocked`` records local body 0's anchor, joint-motion and store
         cycles in ``stage_clocks`` columns 22-24.
@@ -1171,12 +1187,14 @@ def get_state_kernel(
             anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
             if wp.static(clocked):
                 clock_m1 = _clock()
-            velocity = joint_motion(
+            velocity, bias = joint_motion(
                 data.joint_type[joint],
                 data.joint_axis,
                 data.joint_dof_dim[joint, 0],
                 data.joint_dof_dim[joint, 1],
                 anchor,
+                q,
+                data.joint_q_start[joint],
                 qd,
                 data.joint_qd_start[joint],
                 data.joint_S_s,
@@ -1188,6 +1206,8 @@ def get_state_kernel(
             for k in range(count):
                 _store_axis(g.address, start - g.ds + k, data.joint_S_s[start + k])
             _store_motion(g.address, local, velocity)
+            if wp.static(own_bias):
+                _store_bias(g.address, local, bias)
             if wp.static(clocked):
                 clock_m3 = _clock()
                 if local == 0 and data.stage_clocks.shape[0] > g.group:
@@ -1314,7 +1334,7 @@ def get_state_kernel(
             qd = motion_qd
         if wp.static(clocked):
             clock_3 = _clock()
-        motion(g, origin, shift, plan, data, qd)
+        motion(g, origin, shift, plan, data, q, qd)
         if wp.static(clocked):
             clock_4 = _clock()
         publish(g, origin, shift, plan, data, cache)

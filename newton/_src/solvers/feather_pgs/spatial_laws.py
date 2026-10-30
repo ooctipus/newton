@@ -51,7 +51,12 @@ site's spelling sits from it.
 import warp as wp
 
 from ...sim import JointType
-from ...sim.articulation import compute_2d_rotational_dofs, compute_3d_rotational_dofs
+from ...sim.articulation import (
+    compute_2d_rotational_dofs,
+    compute_3d_rotational_dofs,
+    transform_2d_rotational_axes,
+    transform_3d_rotational_axes,
+)
 from .device_preludes import DevicePrelude
 from .law_source import LawFamily
 
@@ -405,53 +410,82 @@ def joint_motion(
     lin_axis_count: int,
     ang_axis_count: int,
     anchor: wp.transform,
+    joint_q: wp.array[float],
+    q_start: int,
     joint_qd: wp.array[float],
     qd_start: int,
     joint_S_s: wp.array[wp.spatial_vector],
-) -> wp.spatial_vector:
-    """Store a joint's motion-subspace columns about the origin in ``joint_S_s`` and return its twist.
+) -> tuple[wp.spatial_vector, wp.spatial_vector]:
+    """Store a joint's motion-subspace columns about the origin in ``joint_S_s``; return its twist and its own bias
+    acceleration.
 
     ``anchor`` is the joint's parent anchor relative to the origin; every column is :func:`motion_axis`
     of an axis (the kind a constant in each branch) but a free joint's, whose coordinates are the root's
-    velocity and angular velocity in its rotated frame.
+    velocity and angular velocity in its rotated frame. A D6 joint is the chain of its axes that
+    :func:`joint_transform` composes: its linear axes slide along the anchor's, then each angular axis,
+    carried through the rotations before it, turns about the joint origin the linear coordinates moved. Its
+    twist and own bias acceleration are that chain's, composed by :func:`twist_compose`; every other joint's own
+    bias is zero.
     """
+    bias = wp.spatial_vector()
     if joint_type == JointType.PRISMATIC:
         column = motion_axis(anchor, joint_axis[qd_start], False)
         joint_S_s[qd_start] = column
-        return column * joint_qd[qd_start]
+        return column * joint_qd[qd_start], bias
     if joint_type == JointType.REVOLUTE:
         column = motion_axis(anchor, joint_axis[qd_start], True)
         joint_S_s[qd_start] = column
-        return column * joint_qd[qd_start]
+        return column * joint_qd[qd_start], bias
     if joint_type == JointType.D6:
         twist = wp.spatial_vector()
+        position = wp.vec3(0.0)
         # Unrolled, each axis kind a constant, as the one-axis branches.
         if lin_axis_count > 0:
             column = motion_axis(anchor, joint_axis[qd_start + 0], False)
             twist += column * joint_qd[qd_start + 0]
             joint_S_s[qd_start + 0] = column
+            position += joint_axis[qd_start + 0] * joint_q[q_start + 0]
         if lin_axis_count > 1:
             column = motion_axis(anchor, joint_axis[qd_start + 1], False)
             twist += column * joint_qd[qd_start + 1]
             joint_S_s[qd_start + 1] = column
+            position += joint_axis[qd_start + 1] * joint_q[q_start + 1]
         if lin_axis_count > 2:
             column = motion_axis(anchor, joint_axis[qd_start + 2], False)
             twist += column * joint_qd[qd_start + 2]
             joint_S_s[qd_start + 2] = column
+            position += joint_axis[qd_start + 2] * joint_q[q_start + 2]
         first = qd_start + lin_axis_count
+        angle = q_start + lin_axis_count
+        pivot = wp.transform(wp.transform_point(anchor, position), wp.transform_get_rotation(anchor))
+        axis_0 = wp.vec3(0.0)
+        axis_1 = wp.vec3(0.0)
+        axis_2 = wp.vec3(0.0)
+        if ang_axis_count == 1:
+            axis_0 = joint_axis[first + 0]
+        if ang_axis_count == 2:
+            axis_0, axis_1 = transform_2d_rotational_axes(joint_axis[first + 0], joint_axis[first + 1], joint_q[angle])
+        if ang_axis_count == 3:
+            axis_0, axis_1, axis_2 = transform_3d_rotational_axes(
+                joint_axis[first + 0],
+                joint_axis[first + 1],
+                joint_axis[first + 2],
+                joint_q[angle + 0],
+                joint_q[angle + 1],
+            )
         if ang_axis_count > 0:
-            column = motion_axis(anchor, joint_axis[first + 0], True)
-            twist += column * joint_qd[first + 0]
+            column = motion_axis(pivot, axis_0, True)
             joint_S_s[first + 0] = column
+            twist, bias = twist_compose(twist, bias, column * joint_qd[first + 0], wp.spatial_vector())
         if ang_axis_count > 1:
-            column = motion_axis(anchor, joint_axis[first + 1], True)
-            twist += column * joint_qd[first + 1]
+            column = motion_axis(pivot, axis_1, True)
             joint_S_s[first + 1] = column
+            twist, bias = twist_compose(twist, bias, column * joint_qd[first + 1], wp.spatial_vector())
         if ang_axis_count > 2:
-            column = motion_axis(anchor, joint_axis[first + 2], True)
-            twist += column * joint_qd[first + 2]
+            column = motion_axis(pivot, axis_2, True)
             joint_S_s[first + 2] = column
-        return twist
+            twist, bias = twist_compose(twist, bias, column * joint_qd[first + 2], wp.spatial_vector())
+        return twist, bias
     if joint_type == JointType.BALL:
         x = motion_axis(anchor, wp.vec3(1.0, 0.0, 0.0), True)
         y = motion_axis(anchor, wp.vec3(0.0, 1.0, 0.0), True)
@@ -459,7 +493,7 @@ def joint_motion(
         joint_S_s[qd_start + 0] = x
         joint_S_s[qd_start + 1] = y
         joint_S_s[qd_start + 2] = z
-        return x * joint_qd[qd_start + 0] + y * joint_qd[qd_start + 1] + z * joint_qd[qd_start + 2]
+        return x * joint_qd[qd_start + 0] + y * joint_qd[qd_start + 1] + z * joint_qd[qd_start + 2], bias
     if joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
         rotation = wp.transform_get_rotation(anchor)
         linear = wp.vec3(joint_qd[qd_start + 0], joint_qd[qd_start + 1], joint_qd[qd_start + 2])
@@ -473,8 +507,8 @@ def joint_motion(
         joint_S_s[qd_start + 3] = wp.spatial_vector(wp.vec3(), ex)
         joint_S_s[qd_start + 4] = wp.spatial_vector(wp.vec3(), ey)
         joint_S_s[qd_start + 5] = wp.spatial_vector(wp.vec3(), ez)
-        return wp.spatial_vector(wp.quat_rotate(rotation, linear), wp.quat_rotate(rotation, angular))
-    return wp.spatial_vector()
+        return wp.spatial_vector(wp.quat_rotate(rotation, linear), wp.quat_rotate(rotation, angular)), bias
+    return wp.spatial_vector(), bias
 
 
 @SPATIAL.law

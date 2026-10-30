@@ -100,6 +100,8 @@ def make_plan(model, operator, *, complete=True):
     )
     if not np.all(np.isin(types[:, non_root], descendants)):
         raise ValueError("Cached trees require fixed, scalar, D6 or ball descendant joints")
+    linear, angular = model.joint_dof_dim.numpy()[joints[0]].T
+    own_bias = bool(np.any((types[0] == int(JointType.D6)) & (((linear > 0) & (angular > 0)) | (angular > 1))))
     if not np.all(counts == counts[0]) or not np.all(
         qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
     ):
@@ -145,5 +147,6 @@ def make_plan(model, operator, *, complete=True):
         root_coordinates=tuple(root_coordinates),
         root_offsets=offsets,
         root_families=tuple(int(v) for v in getattr(operator, "root_families", ())) or (dofs,),
+        own_bias=own_bias,
     )
     return layout, parent

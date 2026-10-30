@@ -399,6 +399,7 @@ def _joints(
     law_transform: wp.array[wp.transform],
     reference_transform: wp.array[wp.transform],
     twist: wp.array[wp.spatial_vector],
+    bias: wp.array[wp.spatial_vector],
     columns: wp.array[wp.spatial_vector],
 ):
     i = wp.tid()
@@ -407,7 +408,47 @@ def _joints(
     reference_transform[i] = featherstone.jcalc_transform(
         t, joint_axis, 6 * i, lin_count[i], ang_count[i], joint_q, 7 * i
     )
-    twist[i] = spatial_laws.joint_motion(t, joint_axis, lin_count[i], ang_count[i], anchor[i], joint_qd, 6 * i, columns)
+    velocity, own = spatial_laws.joint_motion(
+        t, joint_axis, lin_count[i], ang_count[i], anchor[i], joint_q, 7 * i, joint_qd, 6 * i, columns
+    )
+    twist[i] = velocity
+    bias[i] = own
+
+
+def _rotate(axis, angle, vector):
+    """``vector`` turned by ``angle`` about the unit ``axis`` (Rodrigues, float64)."""
+    return (
+        vector * np.cos(angle)
+        + np.cross(axis, vector) * np.sin(angle)
+        + axis * np.dot(axis, vector) * (1.0 - np.cos(angle))
+    )
+
+
+def _motion_cross(first, second):
+    """The motion cross product of two twists in Newton's layout ``(v, w)``."""
+    return np.r_[np.cross(first[3:], second[:3]) + np.cross(first[:3], second[3:]), np.cross(first[3:], second[3:])]
+
+
+def _d6_chain(R, p, axes, q, qd, lin, ang):
+    """A D6 joint's columns, twist and own bias as the chain of its axes (float64): the linear axes slide along the
+    anchor's; each angular axis, carried through the rotations before it, turns about the joint origin the linear
+    coordinates moved; the bias sums the motion cross products of each link of the chain with every later one."""
+    origin = p + R @ sum((axes[k] * q[k] for k in range(lin)), np.zeros(3))
+    columns = [np.r_[R @ axes[k], 0.0, 0.0, 0.0] for k in range(lin)]
+    turned = []
+    for k in range(ang):
+        axis = axes[lin + k].astype(np.float64)
+        for previous, angle in turned:
+            axis = _rotate(previous, angle, axis)
+        turned.append((axis, q[lin + k]))
+        w = R @ axis
+        columns.append(np.r_[np.cross(origin, w), w])
+    chain = [sum((columns[k] * qd[k] for k in range(lin)), np.zeros(6))]
+    chain += [columns[lin + k] * qd[lin + k] for k in range(ang)]
+    bias = sum(
+        (_motion_cross(chain[j], chain[k]) for j in range(len(chain)) for k in range(j + 1, len(chain))), np.zeros(6)
+    )
+    return np.asarray(columns), sum(chain, np.zeros(6)), bias
 
 
 def test_joint_laws(test, device):
@@ -431,6 +472,10 @@ def test_joint_laws(test, device):
     ang = np.array([kinds[k][2] for k in pick], dtype=np.int32)
     axes = rng.standard_normal((count * 6, 3))
     axes = (axes / np.linalg.norm(axes, axis=1, keepdims=True)).astype(np.float32)
+    # A D6's angular axes are orthonormal, as importers build them (Newton's axis transport orthonormalizes a pair).
+    for i in np.flatnonzero(types == int(JointType.D6)):
+        frame = np.linalg.qr(rng.standard_normal((3, 3)))[0].T.astype(np.float32)
+        axes[6 * i + lin[i] : 6 * i + lin[i] + ang[i]] = frame[: ang[i]]
     q = rng.uniform(-1.0, 1.0, count * 7).astype(np.float32)
     for i in np.flatnonzero((types == int(JointType.BALL)) | (types == int(JointType.FREE))):
         first = 7 * i + (3 if types[i] == int(JointType.FREE) else 0)
@@ -450,10 +495,11 @@ def test_joint_laws(test, device):
         wp.zeros(count, dtype=wp.transform, device=device),
         wp.zeros(count, dtype=wp.transform, device=device),
         wp.zeros(count, dtype=wp.spatial_vector, device=device),
+        wp.zeros(count, dtype=wp.spatial_vector, device=device),
         wp.zeros(count * 6, dtype=wp.spatial_vector, device=device),
     ]
     wp.launch(_joints, count, inputs=arrays, outputs=outputs, device=device)
-    law, reference, twist, columns = (o.numpy() for o in outputs)
+    law, reference, twist, bias, columns = (o.numpy() for o in outputs)
     np.testing.assert_array_equal(law, reference)
     R = _quat_matrix(anchor[:, 3:])
     p = anchor[:, :3].astype(np.float64)
@@ -461,10 +507,15 @@ def test_joint_laws(test, device):
         if types[i] == int(JointType.FIXED):
             np.testing.assert_array_equal(twist[i], 0.0)
             continue
+        own = np.zeros(6)
         if types[i] == int(JointType.FREE):
             expected = [np.r_[R[i] @ e, 0, 0, 0] for e in np.eye(3)] + [np.r_[0, 0, 0, R[i] @ e] for e in np.eye(3)]
         elif types[i] == int(JointType.BALL):
             expected = [np.r_[np.cross(p[i], R[i] @ e), R[i] @ e] for e in np.eye(3)]
+        elif types[i] == int(JointType.D6):
+            expected, _, own = _d6_chain(
+                R[i], p[i], axes[6 * i : 6 * i + 6], q[7 * i : 7 * i + 7], qd[6 * i : 6 * i + 6], lin[i], ang[i]
+            )
         else:
             kinds_of = [False] * lin[i] + [True] * ang[i]
             expected = []
@@ -473,8 +524,10 @@ def test_joint_laws(test, device):
                 expected.append(np.r_[np.cross(p[i], w), w] if angular else np.r_[w, 0, 0, 0])
         expected = np.asarray(expected)
         got = columns[6 * i : 6 * i + len(expected)]
-        _close(test, got, expected, 4.0 * (1.0 + np.abs(p[i]).max()), 8.0, f"joint_motion columns {types[i]}")
-        _close(test, twist[i], expected.T @ qd[6 * i : 6 * i + len(expected)], 16.0, 16.0, "joint_motion twist")
+        scale = 1.0 + np.abs(p[i]).max() + 2.0 * float(types[i] == int(JointType.D6))
+        _close(test, got, expected, 4.0 * scale, 8.0, f"joint_motion columns {types[i]}")
+        _close(test, twist[i], expected.T @ qd[6 * i : 6 * i + len(expected)], 16.0 * scale, 16.0, "joint_motion twist")
+        _close(test, bias[i], own, 16.0 * scale, 32.0, f"joint_motion own bias {types[i]}")
 
 
 @wp.kernel(enable_backward=False)

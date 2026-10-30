@@ -234,7 +234,7 @@ def joint_origin(node: int, d: DynamicsData) -> wp.vec3:
 
 @wp.func
 def relative_twist(node: int, d: DynamicsData):
-    """A joint's twist about the origin, its motion columns stored; no own acceleration."""
+    """A joint's twist about the origin and its own bias acceleration, its motion columns stored."""
     parent = d.joint_parent[node]
     anchor = d.joint_X_p[node]
     if parent >= 0:
@@ -242,17 +242,19 @@ def relative_twist(node: int, d: DynamicsData):
     local = wp.transform(
         wp.transform_get_translation(anchor) - joint_origin(node, d), wp.transform_get_rotation(anchor)
     )
-    twist = joint_motion(
+    twist, bias = joint_motion(
         d.joint_type[node],
         d.joint_axis,
         d.joint_dof_dim[node, 0],
         d.joint_dof_dim[node, 1],
         local,
+        d.joint_q,
+        d.joint_q_start[node],
         d.joint_qd,
         d.joint_qd_start[node],
         d.joint_S_s,
     )
-    return twist, wp.spatial_vector()
+    return twist, bias
 
 
 @wp.func

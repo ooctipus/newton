@@ -30,6 +30,10 @@ class TreeLayout:
     root_coordinates: tuple[int, ...] = ()
     root_offsets: tuple[int, ...] = (0,)
     root_families: tuple[int, ...] = ()
+    # A joint with its own bias acceleration: a D6 whose axes form a chain
+    # (linear and angular axes, or several angular ones). The motion scan
+    # then reads each joint's own bias instead of taking it as zero.
+    own_bias: bool = False
 
     def __post_init__(self):
         if not (1 <= self.bodies <= 64 and 1 <= self.dofs <= 64 and 0 <= self.max_depth < self.bodies):
