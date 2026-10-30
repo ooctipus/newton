@@ -361,6 +361,36 @@ def _scalar_laws(
     out[i, 9] = row[2]
 
 
+@wp.kernel
+def _disk(pair: wp.array[wp.vec2], radius: wp.array[float], out: wp.array[wp.vec2]):
+    i = wp.tid()
+    out[i] = laws.disk(pair[i], radius[i])
+
+
+def test_disk_keeps_a_pair_inside_it(test, device):
+    """Keep a pair inside its disk bit for bit and scale one outside onto it; the CUDA rendering divides only outside,
+    so a sticking pair's visit takes no division. (A pair on the boundary goes either way with the device's rounding
+    of its magnitude, as before.)"""
+    rng = np.random.default_rng(29)
+    n = 4096
+    pair = rng.normal(size=(n, 2)).astype(np.float32)
+    magnitude = np.sqrt((pair.astype(np.float64) ** 2).sum(axis=1)).astype(np.float32)
+    scale = rng.choice(np.array([0.5, 2.0], np.float32), n)
+    radius = (magnitude * scale).astype(np.float32)
+    radius[:8] = 0.0
+    pair[:4] = 0.0
+    out = call(_disk, n, device, pair=pair, radius=radius, out=np.zeros((n, 2), np.float32))["out"].numpy()
+    inside = ~pair.any(axis=1) | ((scale == 2.0) & (radius > 0.0))
+    test.assertTrue(inside.any() and (~inside).any())
+    np.testing.assert_array_equal(out[inside].view(np.uint32), pair[inside].view(np.uint32))
+    scaled = np.sqrt((out[~inside].astype(np.float64) ** 2).sum(axis=1))
+    np.testing.assert_allclose(scaled, radius[~inside], rtol=1e-6, atol=1e-30)
+    source = laws.PROJECTION_LAW.prelude().source
+    body = source[source.index(" disk(wp::vec2 pair, float radius) {") :]
+    body = body[: body.index("\n        }\n")]
+    test.assertIn("if (magnitude > radius) {\n                return wp::mul(pair, radius / magnitude);", body)
+
+
 def test_scalar_laws(test, device):
     """Hold each scalar law's definition: steps, sets, velocity limits and the friction gate.
 

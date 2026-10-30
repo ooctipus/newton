@@ -92,10 +92,12 @@ def box(impulse: float, lower: float, upper: float) -> float:
 def disk(pair: wp.vec2, radius: float) -> wp.vec2:
     """Scale a tangent impulse pair back onto the disk of ``radius`` when it lies outside.
 
-    The scale is selected, not branched, as the sweeps' own projections selected it.
+    A pair inside keeps its impulses: the scale's division is taken only outside, off the path of a pair that sticks.
     """
     magnitude = wp.sqrt(pair[0] * pair[0] + pair[1] * pair[1])
-    return pair * wp.where(magnitude > radius, radius / magnitude, 1.0)
+    if magnitude > radius:
+        return pair * (radius / magnitude)
+    return pair
 
 
 @PROJECTION_LAW.law
