@@ -9,7 +9,7 @@ the native sparse factor, when the solver admitted one, makes one complete group
 otherwise each size group of the dense factors is a group with its held leaf-first Cholesky or diagonal response
 (:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
 group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a solver's
-dynamics stay on the serial passes; :func:`install` installs the owner.
+dynamics stay on the serial passes; :func:`install` returns the owner.
 """
 
 from types import SimpleNamespace
@@ -92,9 +92,9 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
             return "No articulation has response coordinates."
     if sparse is not None and solver.forest.has_prescribed_response:
         return "The sparse factor's group holds no prescribed articulations."
-    if not solver._fk_id_cache_available:
+    if not solver.factor.fk_id_cache_available:
         return "The FK/ID cache is unavailable."
-    if not solver._parallel_augmented_drive_topology:
+    if not solver.factor.parallel_drives:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
     if sparse is not None:
         return None
@@ -268,12 +268,12 @@ class TreeSparseOperator:
             dim=s.forest.n_arts_by_size[n] * 32,
             inputs=[
                 s.forest.group_to_art[n],
-                s.mass_update_mask,
+                s.factor.mass_update_mask,
                 s.forest.articulation_dof_start,
                 self.kinetic_state.geometric,
-                s.R_by_size[n],
-                s._augmented_drive_row_by_dof,
-                s.aug_row_K,
+                s.factor.R_by_size[n],
+                s.factor.drive_row_by_dof,
+                s.factor.aug_row_K,
                 s._sparse_mass_matrix_indices,
             ],
             outputs=[s._sparse_Linv, s._sparse_mass_matrix_status],
@@ -302,12 +302,12 @@ class TreeHeldOperator:
         self.data.valid = wp.ones(len(group), dtype=int, device=device)
         self.data.status = wp.zeros(len(group), dtype=int, device=device)
         if self.diagonal:
-            self.data.inverse = solver._diagonal_inverse_mass
+            self.data.inverse = solver.factor.diagonal_inverse_mass
             self.geometry_index = wp.array(np.diag(physical_index).copy(), dtype=int, device=device)
             self.geometry_group = wp.array(np.arange(len(group), dtype=np.int32), dtype=int, device=device)
             self.refresh_kernel = _diagonal_geometry
         else:
-            self.data.lower = solver.L_by_size[size]
+            self.data.lower = solver.factor.L_by_size[size]
             index = leaf_index(physical_index)
             self.geometry_index = wp.array(index, dtype=int, device=device)
             self.refresh_kernel = factor_warps_kernel(size, index)
@@ -326,16 +326,16 @@ class TreeHeldOperator:
                 inputs=[
                     self.plan.group_to_art,
                     solver.forest.articulation_dof_start,
-                    solver.mass_update_mask,
+                    solver.factor.mass_update_mask,
                     self.geometry_index,
                     self.geometry_group,
                     self.kinetic_state.geometric,
-                    solver.R_by_size[size],
-                    solver._augmented_drive_row_by_dof,
-                    solver.aug_row_K,
+                    solver.factor.R_by_size[size],
+                    solver.factor.drive_row_by_dof,
+                    solver.factor.aug_row_K,
                     size,
                 ],
-                outputs=[solver._diagonal_inverse_mass],
+                outputs=[solver.factor.diagonal_inverse_mass],
                 device=solver.model.device,
             )
         else:
@@ -345,16 +345,16 @@ class TreeHeldOperator:
                 inputs=[
                     solver.forest.n_arts_by_size[size],
                     solver.forest.articulation_dof_start,
-                    solver.mass_update_mask,
+                    solver.factor.mass_update_mask,
                     self.plan.group_to_art,
-                    solver.R_by_size[size],
+                    solver.factor.R_by_size[size],
                     self.factor_schedule,
-                    solver._augmented_drive_row_by_dof,
-                    solver.aug_row_K,
+                    solver.factor.drive_row_by_dof,
+                    solver.factor.aug_row_K,
                     self.kinetic_state.geometric,
                     self.geometry_index,
                 ],
-                outputs=[solver.L_by_size[size]],
+                outputs=[solver.factor.L_by_size[size]],
                 block_dim=128,
                 device=solver.model.device,
             )
@@ -362,9 +362,9 @@ class TreeHeldOperator:
     def bind_response(self):
         """Bind current held-array descriptors before a new launch or capture."""
         if self.diagonal:
-            self.data.inverse = self.solver._diagonal_inverse_mass
+            self.data.inverse = self.solver.factor.diagonal_inverse_mass
         else:
-            self.data.lower = self.solver.L_by_size[self.size]
+            self.data.lower = self.solver.factor.L_by_size[self.size]
 
 
 class PrescribedRootOperator:
@@ -457,7 +457,7 @@ def forest_families(solver):
     families = [0 if pres else size for size, pres in signature]
     for size in sorted({f for f in families if f}):
         if size == solver._compact_diagonal_mass_size:
-            if solver._diagonal_inverse_mass is None:
+            if solver.factor.diagonal_inverse_mass is None:
                 return None
         elif not 1 <= size <= 32 or solver._execution_plan.use_diagonal_mass(size):
             return None
@@ -511,7 +511,7 @@ class ForestHeldOperator:
         self.data.valid = wp.ones(worlds, dtype=int, device=device)
         self.data.status = wp.zeros(worlds, dtype=int, device=device)
         self.data.inverse = (
-            solver._diagonal_inverse_mass
+            solver.factor.diagonal_inverse_mass
             if any(f < 0 for f in self.root_families)
             else wp.zeros(model.joint_dof_count, dtype=float, device=device)
         )
@@ -556,7 +556,7 @@ class ForestHeldOperator:
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
-            setattr(self.data, "lower" if r == 0 else f"lower{r}", solver.L_by_size[family])
+            setattr(self.data, "lower" if r == 0 else f"lower{r}", solver.factor.L_by_size[family])
         if not any(f > 0 for f in self.root_families):
             self.data.lower = wp.zeros((1, 1, 1), dtype=float, device=device)
         for r, family in enumerate(self.root_families):
@@ -577,16 +577,16 @@ class ForestHeldOperator:
                     inputs=[
                         solver.forest.group_to_art[size],
                         solver.forest.articulation_dof_start,
-                        solver.mass_update_mask,
+                        solver.factor.mass_update_mask,
                         geometry_index,
                         geometry_group,
                         self.kinetic_state.geometric,
-                        solver.R_by_size[size],
-                        solver._augmented_drive_row_by_dof,
-                        solver.aug_row_K,
+                        solver.factor.R_by_size[size],
+                        solver.factor.drive_row_by_dof,
+                        solver.factor.aug_row_K,
                         size,
                     ],
-                    outputs=[solver._diagonal_inverse_mass],
+                    outputs=[solver.factor.diagonal_inverse_mass],
                     device=solver.model.device,
                 )
                 continue
@@ -596,17 +596,17 @@ class ForestHeldOperator:
                 inputs=[
                     solver.forest.n_arts_by_size[family],
                     solver.forest.articulation_dof_start,
-                    solver.mass_update_mask,
+                    solver.factor.mass_update_mask,
                     solver.forest.group_to_art[family],
-                    solver.R_by_size[family],
+                    solver.factor.R_by_size[family],
                     schedule,
-                    solver._augmented_drive_row_by_dof,
-                    solver.aug_row_K,
+                    solver.factor.drive_row_by_dof,
+                    solver.factor.aug_row_K,
                     self.kinetic_state.geometric,
                     geometry_index,
                     geometry_group,
                 ],
-                outputs=[solver.L_by_size[family]],
+                outputs=[solver.factor.L_by_size[family]],
                 block_dim=128,
                 device=solver.model.device,
             )
@@ -615,7 +615,7 @@ class ForestHeldOperator:
         """Rebind the solver's held factors before a launch or capture."""
         for r, family in enumerate(self.root_families):
             if family > 0:
-                setattr(self.data, "lower" if r == 0 else f"lower{r}", self.solver.L_by_size[family])
+                setattr(self.data, "lower" if r == 0 else f"lower{r}", self.solver.factor.L_by_size[family])
 
 
 class HeldTree:
@@ -801,28 +801,27 @@ def options_decline(solver) -> str | None:
     return None
 
 
-def install(solver) -> None:
-    """Install the held tree as ``solver._tree_kinetic_state`` where :func:`options_decline` and :func:`decline` admit
-    it, with the reason.
+def install(solver) -> tuple[HeldTree | None, str]:
+    """The held tree where :func:`options_decline` and :func:`decline` admit it, with the reason
+    (:meth:`.tree_factor.TreeFactor.install` takes both).
 
     The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
     where :func:`sparse_decline` and :func:`compact_decline` admit them, so the held tree takes every solver that
     holds one.
     """
-    solver._tree_kinetic_state = None
+    held = None
     reason = options_decline(solver)
     if reason is None:
         reason = decline(solver)
         if reason is None:
             try:
-                solver._tree_kinetic_state = HeldTree(solver, admission=admitted)
+                held = HeldTree(solver, admission=admitted)
             except ValueError as error:
                 reason = f"The topology does not fit the held groups: {error}"
         if reason is None:
-            solver._fk_id_cache_enabled = True
             reason = (
                 "Automatic cache selection: tree cache admitted for this topology, representation and state lifecycle."
             )
         else:
             reason = f"Ordinary dynamics retained: {reason}"
-    solver._cached_dynamics_selection_reason = reason
+    return held, reason

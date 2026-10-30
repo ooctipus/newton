@@ -353,8 +353,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         self.assertEqual(optimized.forest.diagonal_mass_sizes, frozenset((16,)))
         self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
-        self.assertIsNone(optimized._cholesky_kernels_by_size[16])
-        self.assertIsNone(optimized._triangular_solve_kernels_by_size[16])
+        # No dense factor or triangular-solve kernel: the held tree factors in stage 1, or the diagonal route.
+        ordinary = optimized.factor.ordinary
+        if ordinary is not None:
+            self.assertIsNone(ordinary.cholesky_kernels_by_size[16])
+            self.assertIsNone(ordinary.triangular_solve_kernels_by_size[16])
         self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
 
         forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
@@ -607,7 +610,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             state_in.clear_forces()
             solver.step(state_in, state_out, control, None, 1.0 / 120.0)
             state_in, state_out = state_out, state_in
-            return solver._diagonal_inverse_mass.numpy()[branch_dofs].copy()
+            return solver.factor.diagonal_inverse_mass.numpy()[branch_dofs].copy()
 
         body_mass = model.body_mass.numpy()
         armature = model.joint_armature.numpy()[branch_dofs]
@@ -645,11 +648,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             enable_joint_limits=False,
             dense_max_constraints=16,
         )
-        self.assertIsNone(optimized._tree_kinetic_state)
+        self.assertIsNone(optimized.factor.held)
         self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
         # Both evaluate the drives with the joint forces in one pass and add K after the assembly.
-        self.assertFalse(optimized._parallel_augmented_drive_topology)
-        self.assertFalse(reference._parallel_augmented_drive_topology)
+        self.assertFalse(optimized.factor.parallel_drives)
+        self.assertFalse(reference.factor.parallel_drives)
 
         q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)
         qd = np.tile(np.array([0.1, -0.05, 0.2], dtype=np.float32), 2)

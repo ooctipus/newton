@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.tree_factor import TreeFactor
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
@@ -129,9 +130,9 @@ def _run_floating_trajectory(model, solver, num_steps, *, invalidate_fk_each_ste
     for _ in range(num_steps):
         if invalidate_fk_each_step:
             # A reset also refreshes mass factors; isolate FK/ID reuse instead.
-            solver._fk_id_cache_valid.zero_()
+            solver.factor.fk_id_cache_valid.zero_()
         solver.step(state_0, state_1, control, contacts, DT)
-        mass_masks.append(solver.mass_update_mask.numpy().copy())
+        mass_masks.append(solver.factor.mass_update_mask.numpy().copy())
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
             values.append(getattr(state_0, name).numpy().copy())
@@ -171,10 +172,10 @@ def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_each_step):
     for _ in range(num_steps):
         if invalidate_fk_each_step:
             # A reset also refreshes mass factors; isolate FK/ID reuse instead.
-            solver._fk_id_cache_valid.zero_()
+            solver.factor.fk_id_cache_valid.zero_()
         model.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
-        mass_masks.append(solver.mass_update_mask.numpy().copy())
+        mass_masks.append(solver.factor.mass_update_mask.numpy().copy())
         state_0, state_1 = state_1, state_0
         for name, values in history.items():
             values.append(getattr(state_0, name).numpy().copy())
@@ -199,7 +200,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             model = _build("cuda:0", worlds=3)
             with mock.patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}):
                 solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, friction_anchor_beta=0.0)
-            owner = solver._tree_kinetic_state
+            owner = solver.factor.held
             self.assertIsNotNone(owner)
             self.assertTrue(owner.bank_compare)
             state_in, state_out = model.state(), model.state()
@@ -215,7 +216,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                     qd[model.joint_qd_start.numpy()[joint]] += 0.25
                     state_in.joint_qd.assign(qd)
                 if forced:
-                    solver._fk_id_cache_valid.zero_()
+                    solver.factor.fk_id_cache_valid.zero_()
                 before = [group.data.generation.numpy().copy() for group in owner.groups]
                 solver.step(state_in, state_out, control, contacts, DT)
                 state_in.assign(state_out)
@@ -238,15 +239,15 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         model = _build_floating_model("cuda:0")
         solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
 
-        self.assertTrue(solver._fk_id_cache_enabled)
+        self.assertTrue(solver.factor.fk_id_cache_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
         """Keep the unconditional FK/ID launch output valid without reuse."""
         model = _build_model("cuda:0", num_worlds=1, ground=False)
         solver = _ordinary_solver(model, enable_joint_velocity_limits=True)
-        self.assertFalse(solver._fk_id_cache_enabled)
-        self.assertEqual(solver._fk_id_cache_valid.shape[0], model.articulation_count)
+        self.assertFalse(solver.factor.fk_id_cache_enabled)
+        self.assertEqual(solver.factor.fk_id_cache_valid.shape[0], model.articulation_count)
 
         state_in = _make_initial_state(model)
         state_out = model.state()
@@ -403,7 +404,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, DT)
             state_0, state_1 = state_1, state_0
             self.assertEqual(
-                solver.mass_update_mask.numpy().tolist(),
+                solver.factor.mass_update_mask.numpy().tolist(),
                 expected,
                 f"unexpected mass_update_mask after step {step_index}",
             )
@@ -423,8 +424,8 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         model.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
 
-        self.assertEqual(solver.mass_update_mask.numpy().tolist(), [1, 1])
-        self.assertEqual(solver._mass_update_requested.numpy().tolist(), [0, 0])
+        self.assertEqual(solver.factor.mass_update_mask.numpy().tolist(), [1, 1])
+        self.assertEqual(solver.factor.mass_update_requested.numpy().tolist(), [0, 0])
 
     def test_held_tree_route_consumes_mass_requests(self):
         """Refresh the held tree once and consume every request, as the ordinary route's tail does."""
@@ -437,20 +438,19 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         ):
             with self.subTest(force=force, step=step, requested=requested):
                 calls = []
-                owner = SimpleNamespace(
+                factor = SimpleNamespace(
                     model=SimpleNamespace(articulation_count=3, device=wp.get_device("cpu")),
-                    _step=step,
-                    _force_mass_update=force,
-                    _tree_kinetic_state=SimpleNamespace(refresh=calls.append),
-                    _mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
+                    force_mass_update=force,
+                    held=SimpleNamespace(refresh=calls.append),
+                    mass_update_requested=wp.array(requested, dtype=int, device="cpu"),
                     mass_update_mask=wp.zeros(3, dtype=int, device="cpu"),
                     options=SimpleNamespace(update_mass_matrix_interval=2),
                 )
-                SolverFeatherPGS._stage1_crba(owner, owner, None)
-                self.assertEqual(calls, [owner])
-                np.testing.assert_array_equal(owner.mass_update_mask.numpy(), expected)
-                np.testing.assert_array_equal(owner._mass_update_requested.numpy(), [0, 0, 0])
-                self.assertFalse(owner._force_mass_update)
+                TreeFactor.refresh(factor, None, step)
+                self.assertEqual(calls, [factor])
+                np.testing.assert_array_equal(factor.mass_update_mask.numpy(), expected)
+                np.testing.assert_array_equal(factor.mass_update_requested.numpy(), [0, 0, 0])
+                self.assertFalse(factor.force_mass_update)
 
     def test_teardown_drains_device_without_accessing_finalized_streams(self):
         """Drain all owned streams without dereferencing finalized handles."""
@@ -463,9 +463,8 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._local_internal_stream = local
         solver._local_residual_stream = residual
         solver._local_pair_stream = local
-        solver._articulation_dynamics_stream = dynamics
+        solver.factor = SimpleNamespace(dynamics_stream=dynamics, size_streams={3: local, 6: size})
         solver._memset_stream = memset
-        solver._size_streams = {3: local, 6: size}
         solver.model = mock.Mock(device=object())
         with (
             mock.patch.object(wp, "synchronize_stream", side_effect=AssertionError("finalized handle")),
@@ -481,9 +480,9 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._local_internal_stream = None
         solver._local_residual_stream = None
         solver._local_pair_stream = None
-        solver._articulation_dynamics_stream = None
+        solver.factor.dynamics_stream = None
         solver._memset_stream = None
-        solver._size_streams = {}
+        solver.factor.size_streams = {}
         solver.model = None
 
     def test_mass_refresh_has_no_obsolete_limit_count_state(self):

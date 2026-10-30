@@ -13,7 +13,7 @@ from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau_and_augmented_drives,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
+from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
@@ -69,8 +69,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         pgs_iterations=8,
                     )
                     # Ball roots keep the held tree out: ordinary dynamics evaluate the drives with the joint forces.
-                    self.assertIsNone(solver._tree_kinetic_state)
-                    self.assertFalse(solver._parallel_augmented_drive_topology)
+                    self.assertIsNone(solver.factor.held)
+                    self.assertFalse(solver.factor.parallel_drives)
                     initial_qd = state.joint_qd.numpy()[dofs].copy()
                     position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
                     following = model.state()
@@ -122,7 +122,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         rows[dofs], q_indices[dofs] = joints * max_dofs, coords
                         target_indices[dofs] = targets
                         wp.launch(
-                            _prepare_augmented_joint_drives_by_dof,
+                            prepare_augmented_drives,
                             dim=model.joint_dof_count,
                             inputs=[
                                 wp.array(rows, dtype=int, device=device),
@@ -305,7 +305,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
 
         def prepare_by_dof(ke, kd, stiffness, tau):
             wp.launch(
-                _prepare_augmented_joint_drives_by_dof,
+                prepare_augmented_drives,
                 dim=2,
                 inputs=[rows, rows, rows, joint_q, joint_qd, ke, kd, target_q, target_qd, effort_limit, 0.1],
                 outputs=[stiffness, tau],

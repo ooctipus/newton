@@ -521,7 +521,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 solver.qd_work.fill_(_UNWRITTEN)
                 destinations = []
                 with _recording_copies(destinations):
-                    solver._launch_velocity_prescale(state.joint_qd, solver.qd_work)
+                    solver.factor.prescale_velocity(state.joint_qd, solver.qd_work)
                 self.assertEqual(destinations, [])
                 expected = _serial(_model_layout(model, joint_qd), device)
                 self.assertFalse(np.array_equal(expected, joint_qd))
@@ -553,7 +553,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 solver.qd_work.fill_(_UNWRITTEN)
                 destinations = []
                 with _recording_copies(destinations):
-                    stage3_qd = solver._stage1_fk_id(state, solver, following)
+                    stage3_qd = solver.factor.fk_id(state, following, solver._step, solver.qd_work)
                 self.assertIs(stage3_qd, solver.qd_work)
                 self.assertFalse(any(destination is solver.qd_work for destination in destinations))
                 expected = _serial(_model_layout(model, joint_qd), device)
@@ -584,7 +584,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 enable_joint_velocity_limits=True,
                 friction_anchor_beta=friction_anchor_beta,
             )
-        self.assertIsNotNone(solver._tree_kinetic_state)
+        self.assertIsNotNone(solver.factor.held)
         pipeline = newton.CollisionPipeline(model, deterministic=friction_anchor_beta > 0.0)
         contacts = pipeline.contacts()
         states, control = (model.state(), model.state()), model.control()
@@ -611,8 +611,8 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         inputs = [wp.full(model.joint_dof_count, _UNWRITTEN, dtype=float, device=device) for _ in range(2)]
         consumed = [wp.full(model.joint_dof_count, _UNWRITTEN, dtype=float, device=device) for _ in range(2)]
         launches, predicted = [], []
-        launch = solver._launch_velocity_prescale
-        predict = solver._tree_kinetic_state.predict
+        launch = solver.factor.prescale_velocity
+        predict = solver.factor.held.predict
 
         def recording_launch(joint_qd, prescaled_joint_qd):
             destinations = []
@@ -630,8 +630,8 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             predicted.append(velocity)
             predict(state, augmented, step_control, velocity, dt)
 
-        solver._launch_velocity_prescale = recording_launch
-        solver._tree_kinetic_state.predict = recording_predict
+        solver.factor.prescale_velocity = recording_launch
+        solver.factor.held.predict = recording_predict
         # Finish the uncaptured steps first: the seeded events below do not order their buffer clears.
         wp.synchronize_device(device)
         with wp.ScopedCapture(device=device) as capture:

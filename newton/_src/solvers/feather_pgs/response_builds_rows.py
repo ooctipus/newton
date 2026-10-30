@@ -492,15 +492,15 @@ FREE_BODY_Z = FreeBodyZBuild(
 # A sparse-diagonal row acts on a world's compact dense articulation (its dense part) and on at most two scalar
 # coordinates of diagonal-mass articulations (its slots), as a whitened row in factor coordinates: the dense part
 # ``Z = L^-1 P J^T`` through the articulation's leaf-first factor (stored in place of the producers' ``J``), and a slot
-# ``Z_s = J_s / sqrt(m_s)``, a star's factor being diagonal (``s = m^-1/2``, the square root of the held tree's
-# ``_diagonal_inverse_mass``). An endpoint has a slot when its articulation has the sparse size and its body a single
+# ``Z_s = J_s / sqrt(m_s)``, a star's factor being diagonal (``s = m^-1/2``, the square root of the tree factor's
+# ``diagonal_inverse_mass``). An endpoint has a slot when its articulation has the sparse size and its body a single
 # response coordinate; two slots on one coordinate merge into the first. ``A_ii = |Z|^2 + sum_s Z_s^2 + cfm``.
 
 
 COMPACT_BOUNDARY = (
     Field("body_single_dof", wp.int32, ("body",), owner="forest", attr="body_single_response_dof"),
     Field("dof_offset", wp.int32, ("articulation",), owner="forest", attr="articulation_world_dof_offset"),
-    Field("inverse_mass", wp.float32, ("dof",), attr="_diagonal_inverse_mass"),
+    Field("inverse_mass", wp.float32, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
     Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
     Field("factor", wp.float32, ("group", 6, 6), owner="six"),
     Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),

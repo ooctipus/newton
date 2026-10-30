@@ -106,7 +106,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
             for _ in range(4):
                 _step(ordinary)
         self.compare(ordinary, keyed)
-        held = keyed[1].L_by_size[9].numpy().copy()
+        held = keyed[1].factor.L_by_size[9].numpy().copy()
         for model, solver, state, *_ in (ordinary, keyed):
             q = state.joint_q.numpy()
             q[2] += 0.01
@@ -115,7 +115,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (ordinary, keyed):
             _step(case)
-        np.testing.assert_array_equal(keyed[1].L_by_size[9].numpy()[1], held[1])
+        np.testing.assert_array_equal(keyed[1].factor.L_by_size[9].numpy()[1], held[1])
         self.compare(ordinary, keyed)
 
     def test_default_request_selects_keyed_inputs(self):

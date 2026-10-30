@@ -218,7 +218,7 @@ def _held_tree(shape, worlds, device, lanes=None, schedules=None):
 def _repair(owner, state_in, solver, dt):
     """A repair of every group: the caches invalidated, then a begin."""
     owner.invalidate()
-    owner.begin(state_in, solver, state_in.joint_qd, dt, True)
+    owner.begin(state_in, solver.factor, state_in.joint_qd, dt, True)
 
 
 def bench_lanes(args, device):
@@ -236,7 +236,7 @@ def bench_lanes(args, device):
             configurations.append((chain_lanes, tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)))
         for lanes, schedules in configurations:
             model, solver = _held_tree(shape, args.worlds, device, lanes, schedules)
-            owner = solver._tree_kinetic_state
+            owner = solver.factor.held
             if owner is None:
                 continue
             (group,) = owner.groups
@@ -246,7 +246,7 @@ def bench_lanes(args, device):
             state_in.body_f.assign(rng.normal(0, 0.1, (model.body_count, 6)).astype(np.float32))
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             dt = 1.0 / 240.0
-            solver._last_step_dt = dt
+            solver.factor.last_step_dt = dt
 
             repair = functools.partial(_repair, owner, state_in, solver, dt)
             repair()

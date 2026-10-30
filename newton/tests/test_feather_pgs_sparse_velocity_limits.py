@@ -480,7 +480,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (reference, candidate):
             sparse_scene.step(case)
-        np.testing.assert_array_equal(candidate[1].mass_update_mask.numpy(), [1, 0])
+        np.testing.assert_array_equal(candidate[1].factor.mass_update_mask.numpy(), [1, 0])
         np.testing.assert_array_equal(candidate[1]._sparse_Linv.numpy()[1], held[1])
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:

@@ -290,16 +290,16 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.J_by_size[size],
             solver.Y_by_size[size],
             solver.H_by_size[size],
-            solver.L_by_size[size],
+            solver.factor.L_by_size[size],
         ):
             self.assertEqual(array.shape, (1, 1, 1))  # Only argument stand-ins remain.
         for name in ("tau_by_size", "qdd_by_size"):
-            self.assertNotIn(size, getattr(solver, name))
-        for name in (
-            "_cholesky_kernels_by_size",
-            "_triangular_solve_kernels_by_size",
-        ):
-            self.assertIsNone(getattr(solver, name)[size])
+            self.assertNotIn(size, getattr(solver.factor, name))
+        # The held tree factors natively; ordinary stages would build no dense factor or trisolve kernel for it.
+        ordinary = solver.factor.ordinary
+        if ordinary is not None:
+            self.assertIsNone(ordinary.cholesky_kernels_by_size[size])
+            self.assertIsNone(ordinary.triangular_solve_kernels_by_size[size])
         np.testing.assert_array_equal(solver._sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.constraint_overflow.numpy().any())
         for name in STATE_FIELDS:
@@ -483,7 +483,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (dense, sparse):
             _step(case)
-        np.testing.assert_array_equal(sparse[1].mass_update_mask.numpy(), [1, 0])
+        np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 0])
         np.testing.assert_array_equal(sparse[1]._sparse_Linv.numpy()[1], held[1])
         self.assert_states_close(dense[2], sparse[2])
         for model, solver, *_ in (dense, sparse):
@@ -493,7 +493,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
         for case in (dense, sparse):
             _step(case)
-        np.testing.assert_array_equal(sparse[1].mass_update_mask.numpy(), [1, 1])
+        np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 1])
         self.assertFalse(np.array_equal(sparse[1]._sparse_Linv.numpy()[0], held[0]))
         self.assert_states_close(dense[2], sparse[2])
         self.assert_sparse_state(sparse)

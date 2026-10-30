@@ -32,9 +32,8 @@ import warp as wp
 from ...core.contact_pool import ContactField, model_contact_pool
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
-from ...sim.articulation import eval_fk
 from ...sim.contacts import contact_capacity_blocks
-from ...sim.enums import BodyFlags, JointType
+from ...sim.enums import JointType
 from ...utils.deprecation import deprecate_nonkeyword_arguments
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
@@ -66,7 +65,6 @@ from . import (
 )
 from . import route_table as _route_table
 from . import row_metadata as _row_metadata
-from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
@@ -92,18 +90,13 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     RIGID_SPEED_ROWS,
-    BodyFactors,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_mimic_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
-    apply_augmented_mass_diagonal_grouped,
-    apply_free_root_transport_to_predictor,
-    apply_free_root_velocity_corrections,
     apply_world_contact_restitution_matrix_free,
     build_joint_limit_rows_for_size,
-    build_mass_update_mask,
     build_mf_contact_rows,
     classify_local_solve_worlds,
     classify_parallel_sweep_tiers,
@@ -111,18 +104,11 @@ from .kernels import (
     clear_local_solve_diag,
     clear_sparse_diagonal_response_prefix,
     compact_local_pair_candidates,
-    compute_com_transforms,
     compute_contact_linear_force_from_impulses,
-    compute_velocity_predictor,
     compute_world_contact_bias,
-    eval_rigid_tau_and_augmented_drives,
     finalize_constraint_counts_with_status,
     gather_dense_warmstart,
     gather_mf_warmstart,
-    gather_tau_to_groups,
-    integrate_generalized_joints,
-    invalidate_articulation_fk_id_cache,
-    invalidate_fk_id_cache_for_articulations,
     local_solve_launch_gate,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
@@ -137,17 +123,10 @@ from .kernels import (
     prepare_fused_diagonal_joint_limits,
     prepare_world_contact_rows,
     prepare_world_impulses,
-    prescale_joint_velocity_limits,
     record_world_contact_runs,
-    remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
-    scatter_qdd_from_groups,
     snapshot_contact_warmstart,
     snapshot_dense_phase_bound,
-    solve_diagonal_mass,
-    trisolve_loop,
-    update_body_qd_from_featherstone,
-    update_qdd_from_velocity,
 )
 from .path_selection import (
     applied_options,
@@ -160,10 +139,6 @@ from .row_build import contact_row_prelude, populate_world_J_masked
 from .rows import JOINT_LIMIT_WARPS_PER_BLOCK, RowLaws
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
-    ARTICULATION_ORIGIN,
-    ARTICULATION_WORK,
-    AUGMENTED_DRIVE_ROWS,
-    BODY_INERTIA,
     CAPACITY_STATUS,
     CONTACT_RUNS,
     DENSE_ROW_EPS,
@@ -172,7 +147,6 @@ from .solver_fields import (
     DENSE_WARMSTART,
     DOF_WORK,
     FUSED_DIAGONAL_LIMITS,
-    JOINT_FOREST,
     MF_COUNTERS,
     MF_ROW_EPS,
     MF_ROW_WEIGHTS,
@@ -184,8 +158,7 @@ from .solver_fields import (
     PREELIMINATION,
     ROW_SLOT_UNBOUNDED,
     ROW_WATERMARKS,
-    SIZE_FACTORS,
-    SIZE_GROUPED_SOLVE,
+    SIZE_RESPONSE,
     SIZE_SYSTEM,
     SPARSE_CONTACT_GROUPS,
     SPARSE_CONTACT_RECORDS,
@@ -194,7 +167,6 @@ from .solver_fields import (
     SPARSE_FACTOR,
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
-    STATE_AUX,
     WORLD_RESPONSE,
     WORLD_ROW_STATE,
     Connects,
@@ -215,15 +187,7 @@ from .sparse_mass_matrix import (
 from .staging import arch_budget, factor_budget
 from .step_plan import StepPlan, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
-from .tree_passes import (
-    SERIAL_BLOCK_DIM,
-    DynamicsData,
-    composite_inertia,
-    crba_fill,
-    fk_id,
-    inverse_dynamics_tau,
-    refresh_body_inertia,
-)
+from .tree_factor import TreeFactor
 from .tree_plan import TreePlan, local_parents
 
 # Parallel tiers grid-stride over per-tier world lists from this many tiers on: one classify launch against
@@ -257,47 +221,6 @@ _LOCAL_SOLVE_MAX_ROWS = 20
 _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 _PERSISTENT_HINV_JT_MIN_DOF = 17
-
-
-@wp.kernel
-def _prepare_augmented_joint_drives_by_dof(
-    drive_row_by_dof: wp.array[int],
-    drive_q_index_by_dof: wp.array[int],
-    drive_target_index_by_dof: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    dt: float,
-    row_K: wp.array[float],
-    drive_tau: wp.array[float],
-):
-    """Evaluate dynamic drive terms from an immutable DOF-to-row topology."""
-    dof = wp.tid()
-    drive_tau[dof] = 0.0
-
-    row = drive_row_by_dof[dof]
-    if row < 0:
-        return
-
-    ke = joint_target_ke[dof]
-    kd = joint_target_kd[dof]
-    K = ke * dt * dt + kd * dt
-    if K <= 0.0:
-        row_K[row] = 0.0
-        return
-
-    q = joint_q[drive_q_index_by_dof[dof]]
-    qd = joint_qd[dof]
-    u0 = -(ke * (q - joint_target_pos[drive_target_index_by_dof[dof]] + dt * qd) + kd * (qd - joint_target_vel[dof]))
-    effort_limit = joint_effort_limit[dof]
-    if effort_limit > 0.0:
-        u0 = wp.clamp(u0, -effort_limit, effort_limit)
-    row_K[row] = K
-    drive_tau[dof] = u0
 
 
 @wp.kernel
@@ -1011,32 +934,17 @@ class SolverFeatherPGS(SolverBase):
         self.small_dof_threshold = small_dof_threshold
 
         self._step = 0
-        self._force_mass_update = False
-        self._mass_update_requested = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        # Host mirror of the global mass-update flag evaluated by the last
-        # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
-        self._mass_update_global_flag = True
-        self._last_step_dt = None
-        self._fk_id_cache_available = bool(model.articulation_count and model.joint_count)
-        # The held tree's cache of next-step dynamics (held_tree.install enables it); ordinary dynamics derive
-        # them from the state at every step, on CUDA as on the CPU.
-        self._fk_id_cache_enabled = False
-        self._fk_id_cache_source_state = None
-        self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        # Allocate the solver-owned augmented state here rather than on the first step(): a
-        # wp.zeros() issued inside a CUDA graph capture becomes a memset node that replays every
-        # launch and wiped the cached bias forces (body_f_s) at the first substep of each replay.
-        self._allocate_state_aux_vars(model)
+        # The tree factor: the augmented state, the mass-update cadence and the FK/ID cache now; its masks, drives,
+        # factors and evaluator as construction reaches them.
+        self.factor = TreeFactor(model, options, nvtx=nvtx)
 
         self.forest: ForestPlan | None = None
         # The model's joint forest (Model.joint_ancestor): conditioning depths, body maps, CRBA's ancestor test.
         forest = joint_forest(model)
-        self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
-        self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
-        self._apply_kinematic_state(self._kinematic_state(forest))
+        self.factor.apply_kinematic_state(self.factor.kinematic_state(forest))
         # The forest plan: topology, groups, root kinds, world mapping, body maps. The matrix-free formulation
         # elides fully-kinematic free bases from the compact response mapping of its rows.
-        self.forest = ForestPlan.build(model, forest, self._kinematic_dof_mask_host)
+        self.forest = ForestPlan.build(model, forest, self.factor.kinematic_dof_mask_host)
         self._compact_contact_jacobian = bool(
             model.device.is_cuda
             and self.forest.body_response_dof_mask is not None
@@ -1050,14 +958,9 @@ class SolverFeatherPGS(SolverBase):
         # Axis 2 of the route table, the row laws, which every owner's admission reads (route_table.capable).
         self.laws.decide(preelimination=self._preelim_active)
         laws = self.laws.set
-        self._setup_passive_joint_forces(model)
+        # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
+        self.factor.plan(self.forest, self.laws)
         self._setup_fused_diagonal_joint_limits(model)
-        # The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
-        # wherever each coordinate has one owning drive row. The held tree's admission, which the
-        # representations only it evaluates (the compact diagonal, the native sparse factor) read before they are
-        # chosen, needs them; ordinary dynamics drop them once the held tree declines (below) and evaluate drives
-        # with the joint forces.
-        self._setup_parallel_augmented_drive_topology(model, self.forest.articulation_max_dofs > 0)
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
@@ -1460,14 +1363,14 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._arrays.allocate(SPARSE_CONTACT_SERIAL, world=1, serial=1)
         self._allocate_mf_buffers(model)
-        self._body_factors_data = self._build_body_factors()
+        self.factor.build_body_factors()
         self.mf_target_velocity = (
             wp.zeros_like(self.mf_rhs)
             if self.forest.has_prescribed_response
             else self._arrays.placeholder(wp.float32, (1, 1))
         )
         self._allocate_debug_buffers(model)
-        self._scatter_armature_to_groups()
+        self.factor.scatter_armature()
         self._plan_tier_rows()
         self._allocate_packed_rows()
         # The producers of the local owners' rows (case K3) and of the tiers' rows (case K4), each admitted by its
@@ -1558,15 +1461,8 @@ class SolverFeatherPGS(SolverBase):
         # then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
 
-        held_tree.install(self)
-        # Ordinary dynamics take the CPU's drive pass and layout (_stage1_drives: the joint forces and the drives in
-        # one launch, K added after the assembly); the per-coordinate drive rows are the held tree's.
-        # Their preparation overlaps FK/ID on a stream of its own.
-        if self._tree_kinetic_state is None:
-            self._parallel_augmented_drive_topology = False
-        self._articulation_dynamics_stream = (
-            wp.Stream(model.device) if self._parallel_augmented_drive_topology and model.device.is_cuda else None
-        )
+        # The tree factor's evaluator: the held tree where it admits the solver, else the ordinary stages.
+        self.factor.install(self)
 
         # Worlds whose every candidate row separates at the predictor skip row
         # allocation entirely (resolved_worlds.py); the mask is empty when the
@@ -1583,7 +1479,7 @@ class SolverFeatherPGS(SolverBase):
         diagonal = self.routes.case == "K2"
         route = self.routes.finish(
             self.laws.set,
-            evaluator="held" if self._tree_kinetic_state is not None else "ordinary",
+            evaluator="held" if self.factor.held is not None else "ordinary",
             producer=contact_row_plan(self).producer,
             packed=self._packed_response,
             tier_rows=self._ink_skip_rows(),
@@ -1596,6 +1492,8 @@ class SolverFeatherPGS(SolverBase):
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
         self._plan = StepPlan.build(route, self)
         self._build_stage_kernels()
+        if self.factor.ordinary is not None:
+            self.factor.ordinary.build_kernels(self._plan)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -1656,15 +1554,15 @@ class SolverFeatherPGS(SolverBase):
         host-only, detached from solver state and JSON-compliant (non-finite
         floats are strings).
         """
-        cached = self._tree_kinetic_state is not None
+        cached = self.factor.held is not None
         selection = {
             "sparse_mass_matrix": "on" if self.routes.row.case == "K1" else "off",
             "cached_dynamics": "on" if cached else "off",
             "publication": "cached" if cached else "ordinary",
-            "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
+            "cached_prediction": "tree" if cached else None,
             "reasons": {
                 "sparse_mass_matrix": self.routes.row.reasons["K1"],
-                "cached_dynamics": self._cached_dynamics_selection_reason,
+                "cached_dynamics": self.factor.held_reason,
                 "publication": "Paired cache owns next-state publication."
                 if cached
                 else "Ordinary state publication remains active.",
@@ -1675,74 +1573,6 @@ class SolverFeatherPGS(SolverBase):
         selection["options"] = options_selection(self)
         selection["environment"] = copy.deepcopy(self._environment_record)
         return selection
-
-    def _kinematic_state(self, forest: TreePlan) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
-        """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
-
-        The effective armature also holds the least armature that keeps the mass matrix of a deep
-        articulation within float32 factorization (:func:`conditioning_armature`).
-
-        The coordinate mask is the rows' prescribed coordinates (:data:`.joint_table.JOINTS`): none takes a row on
-        it alone.
-
-        Returns:
-            ``(armature, joint_mask, dof_mask, floor)`` for :meth:`_apply_kinematic_state`.
-
-        Raises:
-            RuntimeError: If the flags make a DOF of a sparse split or
-                velocity-limit response kinematic, or a DOF of a
-                prescribed-response articulation dynamic. Both need a new solver.
-        """
-        model = self.model
-        armature = model.joint_armature.numpy().copy()
-        joint_mask = np.zeros(model.joint_count, dtype=np.int32)
-        dof_mask = np.zeros(model.joint_dof_count, dtype=np.int32)
-
-        if model.body_count and model.joint_count:
-            kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
-            joint_child = model.joint_child.numpy()
-            joint_qd_start = model.joint_qd_start.numpy()
-            kinematic_joints = np.flatnonzero(kinematic_bodies[joint_child])
-            joint_mask[kinematic_joints] = 1
-            dof_start = joint_qd_start[kinematic_joints]
-            joint, offset = host_index.expand(np.maximum(joint_qd_start[kinematic_joints + 1] - dof_start, 0))
-            dof_mask[dof_start[joint] + offset] = 1
-            armature[dof_start[joint] + offset] = 1.0e10
-
-        if getattr(self, "_sparse_velocity_limits", False) and np.any(dof_mask):
-            raise RuntimeError(
-                "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
-            )
-
-        if self.forest is not None:
-            selected = np.nonzero(self.forest.prescribed_articulation_host != 0)[0]
-            for articulation in selected:
-                dof_start = int(self.forest.articulation_dof_start_host[articulation])
-                dof_count = int(self.forest.articulation_dof_count_host[articulation])
-                if not np.all(dof_mask[dof_start : dof_start + dof_count] != 0):
-                    raise RuntimeError(
-                        "A prescribed-response articulation changed kinematic membership; "
-                        "reconstruct the solver and recapture its CUDA graph."
-                    )
-        armature, floor = conditioning_armature(model, armature, forest)
-        return armature, joint_mask, dof_mask, floor
-
-    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
-        """Publish derived kinematic masks and armature in place, where captured graphs read them."""
-        armature, joint_mask, dof_mask, floor = kinematic
-        if floor.coordinates and floor != getattr(self, "_armature_floor", None):
-            warnings.warn(
-                f"SolverFeatherPGS adds joint armature, up to {floor.largest:.3g}, to {floor.coordinates} "
-                f"coordinate(s) of {floor.articulations} articulation(s) whose mass matrix float32 cannot factor "
-                "without it (routes.dynamics.armature_floor). Give these joints armature to choose it yourself.",
-                UserWarning,
-                stacklevel=3,
-            )
-        self._armature_floor = floor
-        self._joint_armature_effective = armature
-        self._kinematic_dof_mask_host = dof_mask.copy()
-        self._kinematic_joint_mask.assign(joint_mask)
-        self._kinematic_dof_mask.assign(dof_mask)
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -1777,7 +1607,7 @@ class SolverFeatherPGS(SolverBase):
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
         kinematic = (
-            self._kinematic_state(self.forest.joint_forest)
+            self.factor.kinematic_state(self.forest.joint_forest, sparse_velocity_limits=self._sparse_velocity_limits)
             if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
             else None
         )
@@ -1793,52 +1623,7 @@ class SolverFeatherPGS(SolverBase):
             self._row_packets.validate_notification(flags)
         if self._keyed_rows is not None:
             self._keyed_rows.validate_notification(flags)
-        # The owner's proof stores a moved joint frame as its new reference, so it runs
-        # after every check that can still refuse the notification.
-        tree_kinetic = getattr(self, "_tree_kinetic_state", None)
-        frames_proven = tree_kinetic is not None and tree_kinetic.validate_model(flags)
-        self._forget_repair_continuity()
-        cache_inputs = int(flags) & int(
-            ModelFlags.JOINT_PROPERTIES
-            | ModelFlags.JOINT_DOF_PROPERTIES
-            | ModelFlags.BODY_PROPERTIES
-            | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.MODEL_PROPERTIES
-        )
-        if frames_proven and cache_inputs == int(ModelFlags.JOINT_PROPERTIES):
-            # The owner's device checksums of every joint frame and axis just
-            # matched (an exact host fingerprint on CPU), and stepping never reads
-            # Model.joint_q: every cache input is as it was. Isaac Lab notifies so
-            # on each fixed-root pose write. A moved frame leaves the flag in place
-            # and invalidates every cache below.
-            cache_inputs = 0
-        elif tree_kinetic is not None and not frames_proven:
-            from .tree_kinetic_owner import proof_runs  # noqa: PLC0415
-
-            if proof_runs(flags):
-                # The owner's proof ran and found a moved joint frame (a changed axis
-                # raises in every group's proof): invalidate every cache, whichever flag
-                # announced the move.
-                cache_inputs |= int(ModelFlags.JOINT_PROPERTIES)
-        if tree_kinetic is not None and cache_inputs:
-            tree_kinetic.invalidate()
-        if self._fk_id_cache_enabled and cache_inputs:
-            self._fk_id_cache_valid.zero_()
-        if kinematic is not None:
-            self._apply_kinematic_state(kinematic)
-            self._scatter_armature_to_groups()
-            self._mass_update_requested.fill_(1)
-        if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
-            # Re-derive the COM frames baked from body_com in _allocate_common_buffers so runtime
-            # CoM randomization reaches FK; mass and inertia are read live.
-            wp.launch(
-                compute_com_transforms,
-                self.model.body_count,
-                inputs=[self.model.body_com],
-                outputs=[self.body_X_com],
-                device=self.model.device,
-            )
-            self._mass_update_requested.fill_(1)
+        self.factor.notify_model_changed(flags, kinematic)
         if flags & (
             ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
@@ -1875,34 +1660,19 @@ class SolverFeatherPGS(SolverBase):
         if self.forest.world_count == 0:
             return
 
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            self._tree_kinetic_state.invalidate(world_mask)
+        if self.factor.held is not None:
+            self.factor.held.invalidate(world_mask)
 
         wp.launch(
             _reset_solver_status,
             dim=max(self.forest.world_count, self.model.articulation_count),
-            inputs=[world_mask, self.forest.art_to_world, self._mass_update_requested, self.constraint_overflow],
+            inputs=[world_mask, self.forest.art_to_world, self.factor.mass_update_requested, self.constraint_overflow],
             device=self.model.device,
         )
         if self.laws.friction_anchors_enabled:
             # Use the world associated with each stored patch anchor.
             self.laws.friction_patches.reset(world_mask)
-        if self._fk_id_cache_enabled:
-            wp.launch(
-                invalidate_articulation_fk_id_cache,
-                dim=self.model.articulation_count,
-                inputs=[world_mask, self.forest.art_to_world],
-                outputs=[self._fk_id_cache_valid],
-                device=self.model.device,
-            )
-        if (
-            self._fk_id_cache_enabled
-            and self._fk_id_cache_source_state is not None
-            and state is not self._fk_id_cache_source_state
-            and not getattr(getattr(self, "_tree_kinetic_state", None), "bank_compare", False)
-        ):
-            self._fk_id_cache_valid.zero_()
-            self._fk_id_cache_source_state = state
+        self.factor.reset_cache(state, world_mask)
         self._clear_warmstart_history(world_mask)
 
     def _clear_warmstart_history(self, world_mask: wp.array | None) -> None:
@@ -2006,21 +1776,6 @@ class SolverFeatherPGS(SolverBase):
         """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
         return self.laws.loop_joint_anchors(joint)
 
-    def _forget_repair_continuity(self) -> None:
-        """Launch the held-tree owner's next repair after a host call that changes its validity or inputs."""
-        owner = getattr(self, "_tree_kinetic_state", None)
-        if owner is not None:
-            owner.forget_continuity()
-
-    def _track_step_dt(self, dt: float) -> None:
-        """Record the step duration; a change refreshes mass and invalidates the FK/ID cache of every articulation."""
-        if self._last_step_dt is not None and abs(self._last_step_dt - dt) > 1.0e-8:
-            self._force_mass_update = True
-            if self._fk_id_cache_enabled:
-                self._fk_id_cache_valid.zero_()
-            self._forget_repair_continuity()
-        self._last_step_dt = dt
-
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
 
@@ -2034,19 +1789,7 @@ class SolverFeatherPGS(SolverBase):
             articulations: Optional device array of articulation indices whose joint
                 state changed. ``None`` invalidates every articulation.
         """
-        if not self._fk_id_cache_enabled:
-            return
-        self._forget_repair_continuity()
-        if articulations is None:
-            self._fk_id_cache_valid.zero_()
-            return
-        wp.launch(
-            invalidate_fk_id_cache_for_articulations,
-            dim=articulations.shape[0],
-            inputs=[articulations],
-            outputs=[self._fk_id_cache_valid],
-            device=self.model.device,
-        )
+        self.factor.notify_state_changed(articulations)
 
     def _build_preelimination_plan(self, model) -> None:
         """The bilateral elimination's tables (:func:`.response_builds_rows.elimination`).
@@ -2134,96 +1877,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[self._packed_Z, self.rhs, self.diag],
             device=self.model.device,
         )
-
-    def _stage6_project_bilateral_velocity(self) -> None:
-        """Enforce J_B v_out = -b_B once, after v_out holds the predictor and every warm start: the block weights, then
-        ``v -= P^T L^-T Z_B y`` (:func:`.packed_rows.project_kernel`)."""
-        dense = int(self._packed_dense)
-        for size in self.forest.size_groups:
-            wp.launch(
-                self._elimination.weights,
-                dim=self.forest.n_arts_by_size[size],
-                inputs=[
-                    field_group.bind(Preelim, solver=self),
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.forest.articulation_dof_start,
-                    self.forest.articulation_world_dof_offset,
-                    dense,
-                    self._packed_J,
-                    self.rhs,
-                    self.v_out,
-                    size,
-                ],
-                device=self.model.device,
-            )
-            wp.launch(
-                packed_rows.project_kernel(self._elimination.rows),
-                dim=self.forest.n_arts_by_size[size],
-                inputs=[
-                    self.L_by_size[size],
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.forest.articulation_dof_start,
-                    self.forest.articulation_world_dof_offset,
-                    size,
-                    dense,
-                    self._preelim_art_to_idx,
-                    self._preelim_slots,
-                    self._preelim_nB,
-                    self._preelim_weight,
-                    self._packed_Z,
-                ],
-                outputs=[self.v_out],
-                device=self.model.device,
-            )
-
-    def _setup_passive_joint_forces(self, model) -> None:
-        """Select the passive spring/damping arrays applied in the inverse-dynamics pass.
-
-        The toggles resolve here, once, to fixed device arrays (zeros when disabled or
-        absent on the model), so inverse-dynamics launches stay CUDA-graph-safe. Springs
-        on unsupported DOF types (BALL / FREE / DISTANCE coordinates) warn and are masked
-        off — only REVOLUTE, PRISMATIC, and D6 DOFs receive the explicit spring torque.
-        """
-        device = model.device
-        n_dofs = int(model.joint_dof_count)
-
-        def _zeros():
-            return self._arrays.placeholder(wp.float32, (n_dofs,))
-
-        spring_k = getattr(model, "joint_spring_stiffness", None)
-        spring_ref = getattr(model, "joint_spring_ref", None)
-        if spring_k is None or spring_ref is None:
-            self._passive_spring_stiffness = _zeros()
-            self._passive_spring_ref = _zeros()
-        else:
-            k_np = spring_k.numpy()
-            if np.any(k_np != 0.0) and model.joint_count:
-                # Mask springs on unsupported joint types (kernel applies them per 1-DoF axis).
-                supported = (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
-                joint_type = model.joint_type.numpy()
-                # joint_qd_start is sentinel-closed (length joint_count + 1).
-                dof_joint, _ = host_index.expand(np.diff(model.joint_qd_start.numpy()))
-                bad = (k_np != 0.0) & ~np.isin(joint_type[dof_joint], supported)
-                if np.any(bad):
-                    warnings.warn(
-                        f"SolverFeatherPGS: passive joint springs on {int(bad.sum())} DOF(s) of "
-                        "unsupported joint types (only REVOLUTE/PRISMATIC/D6 are supported); "
-                        "those springs are ignored.",
-                        stacklevel=2,
-                    )
-                    k_np = k_np.copy()
-                    k_np[bad] = 0.0
-                    spring_k = wp.array(k_np, dtype=wp.float32, device=device)
-            self._passive_spring_stiffness = spring_k
-            self._passive_spring_ref = spring_ref
-
-        damping = getattr(model, "joint_damping", None)
-        if damping is None:
-            self._passive_joint_damping = _zeros()
-        else:
-            self._passive_joint_damping = damping
 
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -2378,7 +2031,7 @@ class SolverFeatherPGS(SolverBase):
                     ),
                     (not self._route_pins.get("tiers"), "A test pin builds the Jacobi tiers (tiers) on dense storage."),
                     (
-                        self._parallel_augmented_drive_topology,
+                        self.factor.parallel_drives,
                         "Drive topology is not supported by native sparse factors.",
                     ),
                     (
@@ -2414,7 +2067,7 @@ class SolverFeatherPGS(SolverBase):
             )
             return
         response_dofs = self.forest.response_dof_count
-        if velocity_candidate and (self.forest.has_prescribed_response or np.any(self._kinematic_dof_mask_host)):
+        if velocity_candidate and (self.forest.has_prescribed_response or np.any(self.factor.kinematic_dof_mask_host)):
             self.routes.reasons["K1"] = "Sparse velocity rows do not support prescribed-coordinate topology."
             return
         free_rigid = self.forest.is_free_rigid_host != 0
@@ -2849,25 +2502,9 @@ class SolverFeatherPGS(SolverBase):
             return None
         return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
-    def _upload_joint_forest(self, model: Model) -> None:
-        """Upload the joint forest's depth-first order, positions and subtree ends (``tree_passes.crba_fill``'s
-        ancestor test) and its up flags (the up scans', :attr:`.tree_plan.TreePlan.up_flags`)."""
-        if not model.joint_count:
-            self._arrays.release(JOINT_FOREST)
-            return
-        forest = self.forest.joint_forest
-        self._arrays.upload(
-            JOINT_FOREST,
-            _joint_dfs_order=forest.dfs_order,
-            _joint_dfs_position=forest.dfs_position,
-            _joint_dfs_end=forest.dfs_end,
-            _joint_up_flags=forest.up_flags,
-        )
-
     def _allocate_common_buffers(self, model):
         arrays = self._arrays
         if model.joint_count:
-            arrays.allocate(ARTICULATION_WORK, articulation=model.articulation_count)
             arrays.allocate(DOF_WORK, dof=model.joint_dof_count)
             # Stage-3 snapshots for external NaN dumpers, which read their values
             # by these names: None unless opted in.
@@ -2876,107 +2513,16 @@ class SolverFeatherPGS(SolverBase):
             else:
                 arrays.release(STAGE3_SNAPSHOTS)
         else:
-            arrays.release(ARTICULATION_WORK)
             arrays.release(DOF_WORK)
             arrays.release(STAGE3_SNAPSHOTS)
 
-        self._diagonal_inverse_mass = (
-            wp.zeros_like(model.joint_qd) if self.forest.diagonal_mass_sizes else arrays.placeholder(wp.float32)
-        )
         self._fused_diagonal_limit_dof_mask = (
             wp.array(self._fused_diagonal_limit_dof_mask_host, dtype=wp.int32, device=model.device)
             if self._fused_diagonal_joint_limits
             else arrays.placeholder(wp.int32)
         )
-
-        if model.body_count:
-            arrays.allocate(BODY_INERTIA, body=model.body_count)
-            self._upload_joint_forest(model)
-            wp.launch(
-                compute_com_transforms,
-                model.body_count,
-                inputs=[model.body_com],
-                outputs=[self.body_X_com],
-                device=model.device,
-            )
-        else:
-            arrays.release(BODY_INERTIA)
-
-        if not model.articulation_count or not model.joint_count:
-            self.articulation_origin = None
-            return
-
-        arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
-
-    def _setup_parallel_augmented_drive_topology(self, model, eligible: bool) -> None:
-        """Allocate the augmented drive rows and separate immutable per-coordinate row ownership from per-step
-        coefficients, where ``eligible``."""
-        if model.articulation_count and model.joint_count and self.forest.articulation_max_dofs:
-            self._arrays.allocate(
-                AUGMENTED_DRIVE_ROWS,
-                articulation=model.articulation_count,
-                drive_row=model.articulation_count * self.forest.articulation_max_dofs,
-            )
-        self._parallel_augmented_drive_topology = False
-        self._augmented_drive_row_by_dof = wp.full(
-            (max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device
-        )
-        self._augmented_drive_q_index_by_dof = None
-        self._augmented_drive_target_index_by_dof = None
-        if not eligible or self.forest.has_loop_joints or not model.joint_dof_count:
-            return
-
-        dof_count = int(model.joint_dof_count)
-        # Every DOF must lie in exactly one articulation's DOF range.
-        range_start = self.forest.articulation_dof_start_host.astype(np.int64)
-        owner, local_dof = host_index.expand(self.forest.articulation_dof_count_host)
-        owned_dof = range_start[owner] + local_dof
-        if np.any(np.bincount(owned_dof[owned_dof < dof_count], minlength=dof_count)[:dof_count] != 1):
-            return
-
-        joint_type = model.joint_type.numpy()
-        joint_q_start = model.joint_q_start.numpy()
-        joint_target_q_start = model.joint_target_q_start.numpy()
-        joint_qd_start = model.joint_qd_start.numpy()
-        joint_dof_dim = model.joint_dof_dim.numpy()
-        articulation_start = model.articulation_start.numpy()
-        max_dofs = self.forest.articulation_max_dofs
-
-        drive_row_by_dof = np.full(dof_count, -1, dtype=np.int32)
-        drive_q_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
-        drive_target_index_by_dof = np.full(dof_count, -1, dtype=np.int32)
-        row_dof_index = np.zeros(model.articulation_count * max_dofs, dtype=np.int32)
-        supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
-        # Each articulation's supported joint axes, in joint order, take its first max_dofs row slots.
-        first_joint = articulation_start[: model.articulation_count]
-        articulation, position = host_index.expand(
-            np.maximum(articulation_start[1 : model.articulation_count + 1] - first_joint, 0)
-        )
-        joint = first_joint[articulation] + position
-        driven = np.isin(joint_type[joint], supported)
-        articulation, joint = articulation[driven], joint[driven]
-        axis_joint, axis = host_index.expand(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
-        articulation, joint = articulation[axis_joint], joint[axis_joint]
-        axis_count = np.bincount(articulation, minlength=model.articulation_count)
-        slot = host_index.segmented_rank(articulation)
-        slotted = slot < max_dofs
-        articulation, joint, axis, slot = articulation[slotted], joint[slotted], axis[slotted], slot[slotted]
-        dof = joint_qd_start[joint] + axis
-        row = articulation * max_dofs + slot
-        drive_row_by_dof[dof] = row
-        drive_q_index_by_dof[dof] = joint_q_start[joint] + axis
-        drive_target_index_by_dof[dof] = joint_target_q_start[joint] + axis
-        row_dof_index[row] = dof
-        row_counts = np.minimum(axis_count, max_dofs).astype(np.int32)
-
-        self._augmented_drive_row_by_dof = wp.array(drive_row_by_dof, dtype=wp.int32, device=model.device)
-        self._augmented_drive_q_index_by_dof = wp.array(drive_q_index_by_dof, dtype=wp.int32, device=model.device)
-        self._augmented_drive_target_index_by_dof = wp.array(
-            drive_target_index_by_dof, dtype=wp.int32, device=model.device
-        )
-        self.aug_row_counts.assign(row_counts)
-        self.aug_row_dof_index.assign(row_dof_index)
-        self._parallel_augmented_drive_topology = True
+        # The tree factor's mass-update mask, compact inverse mass, body inertia records and articulation origins.
+        self.factor.allocate_common()
 
     def _memset_clears_jacobian(self, size: int) -> bool:
         """Whether the memset stream clears a size group's active Jacobian rows between uses (double-buffered on CUDA):
@@ -2991,13 +2537,9 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_buffers(self, model):
         self.H_by_size = {}
-        self.L_by_size = {}
         self.J_by_size = {}
         self.Y_by_size = {}
         self.diag_by_size = {}
-        self.R_by_size = {}
-        self.tau_by_size = {}
-        self.qdd_by_size = {}
         if not self.forest.size_groups:
             self._dummy_hinv_diag = None
             self._H_bufs = None
@@ -3010,6 +2552,8 @@ class SolverFeatherPGS(SolverBase):
         double_buffered = self._double_buffer and device.is_cuda
         self._H_bufs = [{}, {}] if double_buffered else None
         self._J_bufs = [{}, {}] if double_buffered else None
+        # The tree factor's L and R (compact and sparse sizes keep (1, 1, 1) placeholders of L) and dense-solve scratch.
+        self.factor.allocate_size_groups((self._compact_diagonal_mass_size, self._sparse_mass_matrix_size))
 
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
@@ -3037,10 +2581,7 @@ class SolverFeatherPGS(SolverBase):
                 "y_row": y or self.dense_max_constraints,
                 "y_size": y or size,
             }
-            buffers = arrays.allocate(SIZE_FACTORS, owner={}, **sizes)
-            if not compact_diagonal_mass:
-                # Grouped scratch belongs to the dense triangular solve, not the compact paths.
-                buffers.update(arrays.allocate(SIZE_GROUPED_SOLVE, owner={}, **sizes))
+            self.Y_by_size[size] = arrays.allocate(SIZE_RESPONSE, owner={}, **sizes)["Y"]
             # Double buffering gives the mass matrix and Jacobian of a size group two sets; the second Jacobian only
             # where the memset stream clears the rows between uses, else both sets share one.
             systems = (
@@ -3052,8 +2593,6 @@ class SolverFeatherPGS(SolverBase):
                 system = arrays.allocate(SIZE_SYSTEM, owner={}, **{**sizes, **one})
                 H_by_size[size] = system["H"]
                 J_by_size[size] = self._J_bufs[0][size] if shared else system["J"]
-            for name, array in buffers.items():
-                getattr(self, f"{name}_by_size")[size] = array
             self.diag_by_size[size] = (
                 wp.zeros((n_arts, self.dense_max_constraints), dtype=wp.float32, device=device)
                 if size in self._hinv_jt_diag_sizes and not sparse_response
@@ -3232,29 +2771,6 @@ class SolverFeatherPGS(SolverBase):
             self._arrays.allocate(PGS_MF_DIAGNOSTICS, **sizes)
         else:
             self._diag_prev_mf_impulses = None
-
-    def _scatter_armature_to_groups(self):
-        """Copy armature from model (DOF-ordered) to size-grouped storage."""
-        if not self.forest.size_groups:
-            return
-
-        armature_np = self._joint_armature_effective
-        art_dof_start_np = self.forest.articulation_dof_start_host
-        art_H_rows_np = self.forest.articulation_dof_count_host
-
-        # R_by_size is sized to actual DOF count (matches H_by_size allocation)
-        for size in self.forest.size_groups:
-            n_arts = self.forest.n_arts_by_size[size]
-            R_np = np.zeros((n_arts, size), dtype=np.float32)
-
-            group_to_art_np = np.flatnonzero(self.forest.response_dof_count == size)
-            for group_idx in range(n_arts):
-                art_idx = group_to_art_np[group_idx]
-                dof_start = art_dof_start_np[art_idx]
-                dof_count = art_H_rows_np[art_idx]
-                R_np[group_idx, :dof_count] = armature_np[dof_start : dof_start + dof_count]
-
-            self.R_by_size[size].assign(R_np)
 
     def _init_tiled_kernels(self, model):
         """Build the paired response and the sweeps.
@@ -3568,18 +3084,7 @@ class SolverFeatherPGS(SolverBase):
         read on the launch stream, which the pool registers. A trim therefore
         waits for none of them (:meth:`ContactPool.add_reader_stream`).
         """
-        self._size_streams: dict[int, wp.Stream | None] = {}
-        self._size_events: dict[int, wp.Event | None] = {}
-
-        if model.device.is_cuda and len(self.forest.size_groups) > 1:
-            for size in self.forest.size_groups:
-                self._size_streams[size] = wp.Stream(model.device)
-                self._size_events[size] = wp.Event(model.device)
-        else:
-            # No streams needed for CPU or single size group
-            for size in self.forest.size_groups:
-                self._size_streams[size] = None
-                self._size_events[size] = None
+        self.factor.init_size_streams()
         self._local_internal_stream = (
             wp.Stream(model.device)
             if model.device.is_cuda
@@ -3773,8 +3278,8 @@ class SolverFeatherPGS(SolverBase):
                     self.forest.articulation_dof_start,
                     self._local_solve_owner,
                     self.constraint_count,
-                    self.L_by_size[primary_size],
-                    self.L_by_size[secondary_group_size],
+                    self.factor.L_by_size[primary_size],
+                    self.factor.L_by_size[secondary_group_size],
                     self._packed_J,
                     self._row_sides,
                     self.forest.articulation_response_dof_count,
@@ -3913,24 +3418,14 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=64,
                 device=self.model.device,
             )
-            indices = self._sparse_mass_matrix_indices
-            size = self._sparse_mass_matrix_size
-            wp.launch(
-                response_builds_rows.factor_publish_kernel,
-                dim=(self.forest.n_arts_by_size[size], size),
-                inputs=[
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.forest.articulation_world_dof_offset,
-                    self.forest.articulation_dof_start,
-                    indices.permutation,
-                    indices.lookup,
-                    self._sparse_Linv,
-                    self._sparse_factor_velocity_delta,
-                    self.v_hat,
-                ],
-                outputs=[self.v_out],
-                device=self.model.device,
+            self.factor.leave(
+                "sparse",
+                self.v_out,
+                size=self._sparse_mass_matrix_size,
+                indices=self._sparse_mass_matrix_indices,
+                Linv=self._sparse_Linv,
+                delta=self._sparse_factor_velocity_delta,
+                base=self.v_hat,
             )
             return
         if route == "sparse_diagonal":
@@ -3957,14 +3452,14 @@ class SolverFeatherPGS(SolverBase):
                     self._sparse_contact_serial_normals,
                     self._sparse_diagonal_dense_offsets,
                     self._sparse_diagonal_dense_groups,
-                    self.L_by_size[dense_size],
+                    self.factor.L_by_size[dense_size],
                     self.J_by_size[dense_size],
                     self._sparse_diagonal_row_dof,
                     self._sparse_diagonal_row_z,
                     self._fused_diagonal_limit_active,
                     self._fused_diagonal_limit_lower_rhs,
                     self._fused_diagonal_limit_upper_rhs,
-                    self._diagonal_inverse_mass,
+                    self.factor.diagonal_inverse_mass,
                     self.options.pgs_cfm,
                     iterations,
                     omega,
@@ -4059,8 +3554,8 @@ class SolverFeatherPGS(SolverBase):
                             self.row_parent,
                             self.row_mu,
                             self.mf_constraint_count if components is None else components.selector,
-                            self.L_by_size[primary_size],
-                            self.L_by_size[secondary_size],
+                            self.factor.L_by_size[primary_size],
+                            self.factor.L_by_size[secondary_size],
                             self._paired_factor_primary_groups_by_world,
                             self._paired_factor_secondary_groups_by_world,
                             self._paired_factor_primary_offsets_by_world,
@@ -4111,7 +3606,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_impulses,
                 self.mf_Z_a,
                 self.mf_Z_b,
-                self._body_factors(),
+                self.factor.view(),
                 self.mf_row_mu,
                 self.mf_row_w,
                 iterations,
@@ -4326,14 +3821,14 @@ class SolverFeatherPGS(SolverBase):
                     "contact_matching enabled (rigid_contact_match_index is None). Build the "
                     'CollisionPipeline / Contacts with contact_matching="latest" (or "sticky").'
                 )
-        self._track_step_dt(dt)
+        self.factor.track_step_dt(dt)
 
         model = self.model
 
         if control is None:
             control = model.control(clone_variables=False)
-        # The step's state-derived dynamics are the solver's own (no state carries them: there are no gradients).
-        state_aug = self
+        # The step's state-derived dynamics are the tree factor's (no state carries them: there are no gradients).
+        state_aug = self.factor
         self._last_debug_state_aug = state_aug
 
         if collide_done_event is not None and state_in.particle_count > 0:
@@ -4356,47 +3851,15 @@ class SolverFeatherPGS(SolverBase):
                 self.J_world = self.J_by_size[self.forest.size_groups[0]]
             self._wait_memset_done(wp.get_stream(model.device), self._buf_idx)
 
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 1: FK/ID + drives + CRBA
-        # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
-            drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
-            stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
-
-            if model.articulation_count:
-                inverse_dynamics_ready = self._stage1_complete_joint_tau(
-                    state_in, state_aug, control, dt, drive_rows_ready
-                )
-            else:
-                inverse_dynamics_ready = None
-
-            self._stage1_crba(state_aug, drive_rows_ready)
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 2: Cholesky
-        # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
-            for size, ctx in self._for_sizes():
-                with ctx:
-                    self._stage2_factor(size)
-        # ══════════════════════════════════════════════════════════════
-        # STAGE 3: Triangular solve + v_hat
-        # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if inverse_dynamics_ready is not None:
-                wp.get_stream(model.device).wait_event(inverse_dynamics_ready)
-            if self._tree_kinetic_state is not None:
-                self._tree_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
-                self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
-            else:
-                self._stage3_zero_qdd(state_aug)
-                for size, ctx in self._for_sizes():
-                    with ctx:
-                        self._stage3_trisolve(size, state_aug)
-                self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
-            if self._debug_stage3_snapshots:
-                wp.copy(self._debug_stage3_qd_work, stage3_qd)
-                wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-                wp.copy(self._debug_stage3_v_hat, self.v_hat)
+        # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
+        stage3_qd, inverse_dynamics_ready = self.factor.factor(
+            state_in, control, state_out, dt, self._step, self.qd_work
+        )
+        self.factor.predict(state_in, control, stage3_qd, inverse_dynamics_ready, dt, self.v_hat)
+        if self._debug_stage3_snapshots:
+            wp.copy(self._debug_stage3_qd_work, stage3_qd)
+            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
+            wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:
@@ -4413,7 +3876,7 @@ class SolverFeatherPGS(SolverBase):
         # The response Y = H^-1 J^T of each size that builds one, the diagonals (from J Y, or the packed rows'
         # |Z|^2) and the bias (the sweeps compute J v each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
-            for size, ctx in self._for_sizes():
+            for size, ctx in self.factor.for_sizes():
                 with ctx:
                     self._stage4_response(size)
             packed_diag = self._stage4_compute_matrix_free_diag()
@@ -4499,21 +3962,55 @@ class SolverFeatherPGS(SolverBase):
                 self._stage4_bilateral_preelim()
 
             # Initialize v_out = v_hat before GS loop
-            self._stage6_prepare_world_velocity()
+            self.factor.enter(self.v_hat, self.v_out)
             if self.options.pgs_warmstart and self._sparse_mass_matrix_size is None:
                 # Matrix-free GS updates velocity from impulse deltas, so
                 # cached dense lambdas must be represented in v_out before
                 # the first delta is computed: v += P^T L^-T Z lambda from the
                 # packed rows. Native sparse factors seed their sweep's factor
                 # delta from the carried impulses instead.
-                self._stage6_apply_packed_impulses()
-            self._apply_mf_warmstart_velocity(self.v_out)
+                self.factor.leave(
+                    "packed",
+                    self.v_out,
+                    base=self.v_hat,
+                    Z=self._packed_Z,
+                    dense=self._packed_dense,
+                    sides=self._row_sides,
+                    counts=self.constraint_count,
+                    impulses=self.impulses,
+                )
+            if self.options.pgs_warmstart and self.forest.has_free_rigid_bodies:
+                # The carried free-body impulses' velocity, on every free rigid body the rows hold.
+                self.factor.leave(
+                    "bodies",
+                    self.v_out,
+                    body_a=self.mf_body_a,
+                    body_b=self.mf_body_b,
+                    counts=self.mf_constraint_count,
+                    Z_a=self.mf_Z_a,
+                    Z_b=self.mf_Z_b,
+                    row_type=self.mf_row_type,
+                    impulses=self.mf_impulses,
+                )
             if self._preelim_active:
                 # One-shot bilateral projection: J_B v_out = -b_B, preserved by
                 # every sweep impulse through the corrected columns. Keep
                 # this after every warm-start velocity install so a carried
                 # contact cannot reopen the projected closure.
-                self._stage6_project_bilateral_velocity()
+                self.factor.leave(
+                    "bilateral",
+                    self.v_out,
+                    elimination=self._elimination,
+                    block=field_group.bind(Preelim, solver=self),
+                    Z=self._packed_Z,
+                    J=self._packed_J,
+                    dense=self._packed_dense,
+                    rhs=self.rhs,
+                    art_to_block=self._preelim_art_to_idx,
+                    slots=self._preelim_slots,
+                    block_rows=self._preelim_nB,
+                    weight=self._preelim_weight,
+                )
 
             # Pack MF metadata into int4 structs for coalesced 128-bit loads
             self._pack_mf_meta(self.mf_rhs)
@@ -4556,7 +4053,7 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_impulses,
                             self._diag_prev_mf_impulses,
                             self.mf_max_constraints,
-                            self._body_factors(),
+                            self.factor.view(),
                             self.v_out,
                         ],
                         outputs=[self._diag_metrics],
@@ -4592,7 +4089,7 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_constraint_count,
                             self.mf_impulses,
                             self.mf_max_constraints,
-                            self._body_factors(),
+                            self.factor.view(),
                             self.v_out,
                         ],
                         outputs=[self._diag_ncp_metrics],
@@ -4614,9 +4111,8 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate
         # ══════════════════════════════════════════════════════════════
-        with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
-            self._stage6_update_qdd(state_in, state_aug, dt)
-            self._stage6_integrate(state_in, state_aug, state_out, dt)
+        self.factor.finish(state_in, state_out, dt, self._step)
+        self.integrate_particles(model, state_in, state_out, dt)
 
         # ── MF warm-start carry: snapshot this step's converged impulses +
         # row-type table + per-(sorted)-contact slot map so step N+1 can seed
@@ -4676,7 +4172,7 @@ class SolverFeatherPGS(SolverBase):
         # makes the memset stream wait — this is what forks it into graph capture.
         # J must be zeroed every step (constraint rows are rebuilt per step),
         # but H is only zeroed on steps whose host-evaluated global mass-update
-        # flag was 1 (see _stage1_crba): with update_mass_matrix_interval=N and
+        # flag was 1 (see TreeFactor.refresh): with update_mass_matrix_interval=N and
         # graphs capturing a multiple of N steps, each buffer ping-pongs with
         # period 2 and is consumed by steps of a fixed flag parity, so the
         # baked memset cadence matches the baked rebuild cadence. Skipping the
@@ -4694,7 +4190,7 @@ class SolverFeatherPGS(SolverBase):
                     wp.copy(self._j_active_counts[self._buf_idx], self.constraint_count)
                 with wp.ScopedStream(self._memset_stream):
                     for size in self.forest.size_groups:
-                        if self._mass_update_global_flag and size not in self._plan.unread_mass_sizes:
+                        if self.factor.mass_update_global_flag and size not in self._plan.unread_mass_sizes:
                             self._H_bufs[self._buf_idx][size].zero_()
                         if size not in clear:
                             continue
@@ -4911,7 +4407,7 @@ class SolverFeatherPGS(SolverBase):
         if contacts is None or contacts.rigid_contact_count is None:
             return
 
-        dt = self._last_step_dt
+        dt = self.factor.last_step_dt
         inv_dt = 0.0 if dt is None or dt <= 0.0 else 1.0 / dt
         enable_friction_flag = 1 if self.options.enable_contact_friction else 0
         mf_impulses = getattr(self, "mf_impulses", None)
@@ -4963,11 +4459,6 @@ class SolverFeatherPGS(SolverBase):
                 max_blocks=self._contact_capacity_blocks,
             )
 
-    def _allocate_state_aux_vars(self, model):
-        """Allocate the state-derived dynamics (maximal coordinates) on the solver."""
-        if model.body_count:
-            self._arrays.allocate(STATE_AUX, dof=model.joint_dof_count, body=model.body_count)
-
     def _eval_particle_forces(self, state_in: State, control: Control, contacts: Contacts):
         model = self.model
 
@@ -4992,381 +4483,15 @@ class SolverFeatherPGS(SolverBase):
         # particle shape contact
         eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
 
-    @contextmanager
-    def _parallel_size_region(self):
-        """Context for parallel dispatch across size groups."""
-        if not self.model.device.is_cuda or len(self.forest.size_groups) <= 1:
-            yield
-            return
-
-        main_stream = wp.get_stream(self.model.device)
-        self._init_event = main_stream.record_event()
-        try:
-            yield
-        finally:
-            for size in self.forest.size_groups:
-                stream = self._size_streams.get(size)
-                if stream is not None:
-                    main_stream.wait_event(stream.record_event())
-            self._init_event = None
-
-    @contextmanager
-    def _on_size_stream(self, size: int):
-        """Execute block on this size's CUDA stream."""
-        stream = self._size_streams.get(size)
-        init_event = getattr(self, "_init_event", None)
-        if stream is not None and init_event is not None:
-            stream.wait_event(init_event)
-            with wp.ScopedStream(stream):
-                yield
-        else:
-            yield
-
-    @contextmanager
-    def _size_ctx(self, size: int):
-        with self._on_size_stream(size):
-            yield
-
-    def _for_sizes(self):
-        # convenience generator; keeps step code tight
-        with self._parallel_size_region():
-            for size in self.forest.size_groups:
-                yield size, self._size_ctx(size)
-
-    def _dynamics(
-        self, state: State | None, state_aug: State, control: Control | None = None, **values
-    ) -> DynamicsData:
-        """Bind the dynamics passes' struct (:data:`.tree_passes.DynamicsData`).
-
-        ``state`` holds the coordinates the passes read and receives the poses and COM twists they publish
-        (``None`` for passes that read neither); ``state_aug`` the augmented state. ``values`` are the launch's
-        switches (zero unless given) and field overrides, such as the prescaled velocities of ``joint_qd``.
-        """
-        arrays = self._arrays
-        values.setdefault("write_inertia_records", 0)
-        if state is None:
-            for name in ("joint_q", "joint_qd"):
-                values.setdefault(name, arrays.placeholder(wp.float32))
-            values.setdefault("body_q", arrays.placeholder(wp.transform))
-            values.setdefault("body_qd", arrays.placeholder(wp.spatial_vector))
-            values.setdefault("body_f", arrays.placeholder(wp.spatial_vector))
-        elif "body_f" not in values:
-            values["body_f"] = state.body_f if state.body_count else arrays.placeholder(wp.spatial_vector)
-        if control is None:
-            values.setdefault("joint_f", arrays.placeholder(wp.float32))
-        return field_group.bind(
-            DynamicsData,
-            model=self.model,
-            solver=self,
-            forest=self.forest,
-            state=state,
-            aug=state_aug,
-            control=control,
-            **values,
-        )
-
-    def _launch_velocity_prescale(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
-        """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
-        model = self.model
-        if not model.articulation_count:
-            wp.copy(prescaled_joint_qd, joint_qd)
-            return
-        wp.launch(
-            prescale_joint_velocity_limits,
-            dim=self.laws.velocity_prescale_threads,
-            inputs=[
-                bind_joint_table(self),
-                model.articulation_count,
-                self.laws.velocity_prescale_lanes,
-                joint_qd,
-            ],
-            outputs=[prescaled_joint_qd],
-            device=model.device,
-        )
-
-    def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> wp.array:
-        """Forward kinematics and inverse-dynamics terms; returns the predictor's velocity (prescaled when limited)."""
-        model = self.model
-
-        # evaluate joint inertias, motion vectors, and forces
-        if self._fk_id_cache_enabled:
-            if not getattr(getattr(self, "_tree_kinetic_state", None), "bank_compare", False):
-                # Owners that compare input banks validate a changed bank on the device.
-                if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
-                    self._fk_id_cache_valid.zero_()
-                    self._forget_repair_continuity()
-            self._fk_id_cache_source_state = state_in
-        else:
-            state_aug.body_f_s.zero_()
-        if self.options.enable_joint_velocity_limits:
-            self._launch_velocity_prescale(state_in.joint_qd, self.qd_work)
-            stage3_qd = self.qd_work
-        else:
-            stage3_qd = state_in.joint_qd
-
-        refresh_composite = (self._step % self.options.update_mass_matrix_interval) == 0 or self._force_mass_update
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            self._tree_kinetic_state.begin(
-                state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite, state_out=state_out
-            )
-            return stage3_qd
-        # A refresh step places every body's inertia record for the composite inertia.
-        dynamics = self._dynamics(state_in, state_aug, joint_qd=stage3_qd, write_inertia_records=int(refresh_composite))
-        wp.launch(
-            fk_id, dim=model.articulation_count, inputs=[dynamics], block_dim=SERIAL_BLOCK_DIM, device=model.device
-        )
-        if model.body_count:
-            wp.launch(
-                update_body_qd_from_featherstone,
-                dim=model.body_count,
-                inputs=[
-                    state_aug.body_v_s,
-                    state_in.body_q,
-                    model.body_com,
-                    self.forest.body_to_articulation,
-                    self.articulation_origin,
-                ],
-                outputs=[state_out.body_qd],
-                device=model.device,
-            )
-        return stage3_qd
-
-    def _stage1_prepare_augmented_drives(
-        self, state_in: State, state_aug: State, control: Control, dt: float
-    ) -> wp.Event | None:
-        """Launch the per-coordinate augmented-drive preparation independently of FK/ID."""
-        if not self._parallel_augmented_drive_topology:
-            return None
-
-        model = self.model
-        dynamics_stream = self._articulation_dynamics_stream
-        if dynamics_stream is not None:
-            dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
-        with wp.ScopedStream(dynamics_stream, sync_enter=False):
-            scalar = getattr(self._tree_kinetic_state, "scalar", None)
-            if scalar is not None:
-                # Scalar branches evaluate their drives in their predict.
-                scalar.launch_other_drives(state_in, state_aug, control, dt)
-            else:
-                wp.launch(
-                    _prepare_augmented_joint_drives_by_dof,
-                    dim=model.joint_dof_count,
-                    inputs=[
-                        self._augmented_drive_row_by_dof,
-                        self._augmented_drive_q_index_by_dof,
-                        self._augmented_drive_target_index_by_dof,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        dt,
-                    ],
-                    outputs=[self.aug_row_K, state_aug.joint_tau],
-                    block_dim=256,
-                    device=model.device,
-                )
-        return None if dynamics_stream is None else dynamics_stream.record_event()
-
-    def _launch_rigid_tau(self, state_in: State, state_aug: State, control: Control) -> None:
-        """Launch inverse dynamics for the non-actuator torque bucket."""
-        model = self.model
-        wp.launch(
-            inverse_dynamics_tau,
-            dim=model.articulation_count,
-            inputs=[self._dynamics(state_in, state_aug, control)],
-            block_dim=SERIAL_BLOCK_DIM,
-            device=model.device,
-        )
-
-    def _stage1_complete_joint_tau(
-        self,
-        state_in: State,
-        state_aug: State,
-        control: Control,
-        dt: float,
-        drive_rows_ready: wp.Event | None,
-    ) -> wp.Event | None:
-        """Complete ``joint_tau``: the CPU's one pass of joint forces and drives, or the held tree's drives."""
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            # joint_tau currently holds only u0. Current external/control/bias
-            # contributions are added by the retained-W predictor after waiting.
-            return drive_rows_ready
-        self._stage1_drives(state_in, state_aug, control, dt)
-        return None
-
-    def _stage1_drives(self, state_in: State, state_aug: State, control: Control, dt: float):
-        """Populate ``state_aug.joint_tau`` and apply the effort-limit clamp.
-
-        Torque-bucket ownership after this routine returns:
-
-        - ``state_aug.joint_tau`` holds the rigid / passive / Coriolis /
-          gravity / external / :attr:`~newton.Control.joint_f` contribution
-          summed with the clamped explicit-PD drive contribution ``u0``.
-        - The implicit-PD drive response is carried by ``self.aug_row_K``
-          and realized through ``H_tilde^{-1}`` during the linear solve.
-
-        :attr:`~newton.Model.joint_effort_limit` is always applied as
-        an **actuator-only** clamp on ``u0`` *before* it is added to
-        ``joint_tau``; the rigid / passive / external bucket is left uncapped
-        (MuJoCo ``actuatorfrcrange`` / PhysX drive ``maxForce`` convention).
-
-        """
-        model = self.model
-
-        if model.articulation_count:
-            if self.forest.articulation_max_dofs > 0:
-                wp.launch(
-                    eval_rigid_tau_and_augmented_drives,
-                    dim=model.articulation_count,
-                    inputs=[
-                        self._dynamics(state_in, state_aug, control),
-                        self.forest.articulation_dof_count,
-                        model.joint_target_q_start,
-                        model.joint_target_ke,
-                        model.joint_target_kd,
-                        control.joint_target_q,
-                        control.joint_target_qd,
-                        model.joint_effort_limit,
-                        self.forest.articulation_max_dofs,
-                        dt,
-                    ],
-                    outputs=[self.aug_row_counts, self.aug_row_dof_index],
-                    block_dim=SERIAL_BLOCK_DIM,
-                    device=model.device,
-                )
-                return
-            # Evaluate joint torques. After this launch `joint_tau` owns
-            # the rigid / passive / Coriolis / gravity / external /
-            # `control.joint_f` bucket only; the actuator-drive bucket has
-            # not been added yet.
-            self._launch_rigid_tau(state_in, state_aug, control)
-
-    def _stage1_crba(
-        self,
-        state_aug: State,
-        drive_rows_ready: wp.Event | None,
-    ):
-        model = self.model
-        global_flag = (
-            1 if ((self._step % self.options.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-        )
-        # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
-        # time. With K physics steps captured per graph, replays repeat the
-        # K-step flag pattern captured starting at the capture-time _step, so
-        # only intervals that divide the captured pattern behave as requested
-        # (e.g. a 2-step graph captured at _step=0 bakes [1, 0]: interval=2 is
-        # exact, interval>=3 silently degrades to an effective interval of 2).
-        # The same flag gates the H memsets below and at end of step so the
-        # baked memset cadence always matches the baked update cadence.
-        self._mass_update_global_flag = bool(global_flag)
-
-        wp.launch(
-            build_mass_update_mask,
-            dim=model.articulation_count,
-            inputs=[
-                global_flag,
-                self._mass_update_requested,
-            ],
-            outputs=[self.mass_update_mask],
-            device=model.device,
-        )
-
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            if drive_rows_ready is not None:
-                wp.get_stream(model.device).wait_event(drive_rows_ready)
-            self._tree_kinetic_state.refresh(state_aug)
-            # Consume requests just like the common tail. Leaving either set
-            # changes the held-factor cadence on subsequent captured steps.
-            self._mass_update_requested.zero_()
-            self._force_mass_update = False
-            return
-
-        # The composite and every mass consumer read inertia records about the origin: the records of
-        # articulations a reuse step's mask selects are placed at their current poses first.
-        dynamics = self._dynamics(None, state_aug)
-        if not global_flag:
-            wp.launch(
-                refresh_body_inertia, dim=model.joint_count, inputs=[dynamics], block_dim=128, device=model.device
-            )
-
-        # The composite inertia of the articulations the mass mask selects.
-        wp.launch(
-            composite_inertia,
-            dim=model.articulation_count,
-            inputs=[dynamics],
-            device=model.device,
-            block_dim=SERIAL_BLOCK_DIM,
-        )
-
-        # Zeroing H is hygiene, not a correctness requirement: H is only read
-        # by the Cholesky kernels, which early-exit when mass_update_mask is 0,
-        # and a masked rebuild never relies on a zeroed buffer because
-        # crba_fill STORES every structural nonzero (full ancestor
-        # chain incl. the whole diagonal) before apply_augmented_mass_diagonal
-        # _grouped ADDS K onto that freshly stored diagonal under the same
-        # mask. Structural zeros are written by no kernel and stay zero from
-        # allocation. Skipping the memset on global_flag==0 steps therefore
-        # leaves limit-change refreshes (device-side mask) exact while saving
-        # the per-step memset.
-        for size in self.forest.size_groups:
-            n_arts = self.forest.n_arts_by_size[size]
-            if self._H_bufs is None and global_flag:  # not double-buffered
-                self.H_by_size[size].zero_()
-            wp.launch(
-                crba_fill,
-                dim=int(n_arts * size),
-                inputs=[
-                    dynamics,
-                    self._body_inertia_terms if size in self.forest.free_body_inertia_sizes else self.body_I_c,
-                    self.forest.group_to_art[size],
-                    size,
-                ],
-                outputs=[self.H_by_size[size]],
-                device=model.device,
-                block_dim=128,
-            )
-            # K after the assembly.
-            wp.launch(
-                apply_augmented_mass_diagonal_grouped,
-                dim=n_arts,
-                inputs=[
-                    self.forest.group_to_art[size],
-                    self.forest.articulation_dof_start,
-                    size,
-                    self.forest.articulation_max_dofs,
-                    self.mass_update_mask,
-                    self.aug_row_counts,
-                    self.aug_row_dof_index,
-                    self.aug_row_K,
-                ],
-                outputs=[self.H_by_size[size]],
-                device=model.device,
-            )
-
-        self._mass_update_requested.zero_()
-
-        self._force_mass_update = False
-
     def _build_stage_kernels(self) -> None:
-        """Build the stage-3 and stage-4 kernels the plan's tables launch, and only those (one entry per size)."""
-        plan, arch, threads, rows = self._plan, self.model.device.arch, self.tile_threads, self.dense_max_constraints
+        """Build the stage-4 kernels the plan's response table launches, and only those (one entry per size)."""
+        plan, threads, rows = self._plan, self.tile_threads, self.dense_max_constraints
         sizes = self.forest.size_groups
 
         def routed(stage, size, route):
             entry = getattr(plan, stage).get(size)
             return entry is not None and entry.name == route
 
-        self._cholesky_kernels_by_size = {
-            size: response_builds_dense.factor_tiles_kernel(size, threads) if routed("factor", size, "tiles") else None
-            for size in sizes
-        }
-        self._triangular_solve_kernels_by_size = {
-            size: _get_triangular_solve_kernel(size, arch, threads) if routed("trisolve", size, "tiles") else None
-            for size in sizes
-        }
         self._hinv_jt_kernels_by_size = {}
         self._hinv_jt_chunk_count_by_size = {}
         for size in sizes:
@@ -5397,219 +4522,6 @@ class SolverFeatherPGS(SolverBase):
             )
             for size in plan.sizes("response", "grouped")
         }
-
-    def _stage2_factor(self, size: int) -> None:
-        """Factor one size's mass matrix along the plan's stage-2 route: none for compact, sparse and fused sizes."""
-        route = self._plan.factor[size].name
-        if route == "diagonal":
-            self._stage2_cholesky_diagonal(size)
-        elif route == "tiles":
-            self._stage2_cholesky_tiled(size)
-        elif route == "loop":
-            self._stage2_cholesky_loop(size)
-
-    def _stage2_cholesky_diagonal(self, size: int) -> None:
-        """Factor an articulation group known to have diagonal generalized inertia."""
-        n_arts = self.forest.n_arts_by_size[size]
-        wp.launch(
-            response_builds_dense.factor_coordinates_kernel(),
-            dim=n_arts * size,
-            inputs=[
-                self.H_by_size[size],
-                self.R_by_size[size],
-                self.forest.group_to_art[size],
-                self.mass_update_mask,
-                size,
-            ],
-            outputs=[self.L_by_size[size]],
-            device=self.model.device,
-        )
-
-    def _stage2_cholesky_tiled(self, size: int):
-        """Factor a tiled size's H (factor route ``tiles``)."""
-        model = self.model
-        n_arts = self.forest.n_arts_by_size[size]
-        wp.launch_tiled(
-            self._cholesky_kernels_by_size[size],
-            dim=[n_arts],
-            inputs=[
-                self.H_by_size[size],
-                self.R_by_size[size],
-                self.forest.group_to_art[size],
-                self.mass_update_mask,
-            ],
-            outputs=[self.L_by_size[size]],
-            block_dim=self.tile_threads,
-            device=model.device,
-        )
-
-    def _stage2_cholesky_loop(self, size: int):
-        """Factor a loop size's H (factor route ``loop``)."""
-        model = self.model
-        n_arts = self.forest.n_arts_by_size[size]
-        wp.launch(
-            response_builds_dense.factor_articulations_kernel(),
-            dim=n_arts,
-            inputs=[
-                self.H_by_size[size],
-                self.R_by_size[size],
-                self.forest.group_to_art[size],
-                self.mass_update_mask,
-                size,
-            ],
-            outputs=[self.L_by_size[size]],
-            device=model.device,
-        )
-
-    def _stage3_zero_qdd(self, state_aug: State):
-        state_aug.joint_qdd.zero_()
-
-    def _stage3_trisolve(self, size: int, state_aug: State) -> None:
-        """Solve one size's unconstrained acceleration along the plan's stage-3 route."""
-        route = self._plan.trisolve[size].name
-        if route == "diagonal":
-            self._stage3_trisolve_diagonal(size, state_aug)
-        elif route == "tiles":
-            self._stage3_trisolve_tiled(size, state_aug)
-        else:
-            self._stage3_trisolve_loop(size, state_aug)
-
-    def _stage3_trisolve_diagonal(self, size: int, state_aug: State) -> None:
-        """Apply a diagonal generalized inertia inverse to joint forces."""
-        wp.launch(
-            solve_diagonal_mass,
-            dim=self.forest.n_arts_by_size[size] * size,
-            inputs=[
-                self.L_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.articulation_dof_start,
-                size,
-                state_aug.joint_tau,
-            ],
-            outputs=[state_aug.joint_qdd],
-            device=self.model.device,
-        )
-
-    def _stage3_trisolve_tiled(self, size: int, state_aug: State):
-        model = self.model
-        n_arts = self.forest.n_arts_by_size[size]
-
-        wp.launch(
-            gather_tau_to_groups,
-            dim=n_arts,
-            inputs=[
-                state_aug.joint_tau,
-                self.forest.group_to_art[size],
-                self.forest.articulation_dof_start,
-                size,
-            ],
-            outputs=[self.tau_by_size[size]],
-            device=model.device,
-        )
-        wp.launch_tiled(
-            self._triangular_solve_kernels_by_size[size],
-            dim=[n_arts],
-            inputs=[
-                self.L_by_size[size],
-                self.tau_by_size[size],
-            ],
-            outputs=[self.qdd_by_size[size]],
-            block_dim=self.tile_threads,
-            device=model.device,
-        )
-        wp.launch(
-            scatter_qdd_from_groups,
-            dim=n_arts,
-            inputs=[
-                self.qdd_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.articulation_dof_start,
-                size,
-            ],
-            outputs=[state_aug.joint_qdd],
-            device=model.device,
-        )
-
-    def _stage3_trisolve_loop(self, size: int, state_aug: State):
-        model = self.model
-        n_arts = self.forest.n_arts_by_size[size]
-        wp.launch(
-            trisolve_loop,
-            dim=n_arts,
-            inputs=[
-                self.L_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.articulation_dof_start,
-                size,
-                state_aug.joint_tau,
-            ],
-            outputs=[state_aug.joint_qdd],
-            device=model.device,
-        )
-
-    def _stage3_compute_v_hat(self, state_in: State, state_aug: State, dt: float, stage3_qd: wp.array):
-        model = self.model
-        if not model.joint_count:
-            return
-        wp.launch(
-            compute_velocity_predictor,
-            dim=model.joint_dof_count,
-            inputs=[
-                stage3_qd,
-                self._kinematic_dof_mask,
-                dt,
-            ],
-            outputs=[state_aug.joint_qdd, self.v_hat],
-            device=model.device,
-        )
-        self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt)
-
-    def _stage3_correct_free_root_velocity(
-        self, state_in: State, stage3_qd: wp.array, dt: float, *, apply_transport: bool = True
-    ) -> None:
-        """Apply canonical gyro physics after either ordinary or private prediction."""
-        model = self.model
-        # Keep v_hat on jcalc_integrate's free-root convention. The compact
-        # launch excludes every non-root joint; a live device mask handles
-        # runtime kinematic changes without changing graph topology.
-        if not self.forest.free_root_joint_count:
-            return
-        if self.forest.free_rigid_body_count:
-            wp.launch(
-                apply_free_root_velocity_corrections,
-                dim=self.forest.free_root_joint_count,
-                inputs=[
-                    self.forest.free_root_joint_indices,
-                    model.joint_qd_start,
-                    model.joint_child,
-                    self.forest.body_to_articulation,
-                    self.forest.is_free_rigid,
-                    self.forest.art_group_idx,
-                    self._kinematic_joint_mask,
-                    state_in.body_q,
-                    model.body_inertia,
-                    self.L_by_size[6],
-                    stage3_qd,
-                    dt,
-                    apply_transport,
-                ],
-                outputs=[self.v_hat],
-                device=model.device,
-            )
-        elif apply_transport:
-            wp.launch(
-                apply_free_root_transport_to_predictor,
-                dim=self.forest.free_root_joint_count,
-                inputs=[
-                    self.forest.free_root_joint_indices,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    stage3_qd,
-                    dt,
-                ],
-                outputs=[self.v_hat],
-                device=model.device,
-            )
 
     def _build_friction_patches(self, state_in, contacts):
         """Construct the shared contact law independently of the dynamics owner."""
@@ -5957,7 +4869,7 @@ class SolverFeatherPGS(SolverBase):
                         self.forest.body_to_articulation,
                         model.joint_ancestor,
                         state_aug.joint_S_s,
-                        self.articulation_origin,
+                        self.factor.articulation_origin,
                         self.options.pgs_beta,
                         self.options.pgs_cfm,
                         support,
@@ -6004,6 +4916,7 @@ class SolverFeatherPGS(SolverBase):
             law = field_group.bind(
                 prefix_rows.PrefixLaw,
                 solver=self,
+                factor=self.factor,
                 laws=self.laws,
                 options=self.options,
                 model=model,
@@ -6354,7 +5267,7 @@ class SolverFeatherPGS(SolverBase):
                             self._sparse_diagonal_response_size,
                             self.forest.articulation_world_dof_offset,
                             self.forest.body_single_response_dof,
-                            self._diagonal_inverse_mass,
+                            self.factor.diagonal_inverse_mass,
                             law,
                         ],
                         outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_z],
@@ -6718,7 +5631,7 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 wpb,
                 n_arts,
-                self.L_by_size[size],
+                self.factor.L_by_size[size],
                 self.J_by_size[size],
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
@@ -6747,7 +5660,7 @@ class SolverFeatherPGS(SolverBase):
             self._hinv_jt_kernels_by_size[size],
             dim=[n_arts, self._hinv_jt_chunk_count_by_size[size]],
             inputs=[
-                self.L_by_size[size],
+                self.factor.L_by_size[size],
                 self.J_by_size[size],
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
@@ -6767,7 +5680,7 @@ class SolverFeatherPGS(SolverBase):
             response_builds_dense.response_diagonal_kernel(),
             dim=n_arts * self.dense_max_constraints,
             inputs=[
-                self.L_by_size[size],
+                self.factor.L_by_size[size],
                 self.J_by_size[size],
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
@@ -6869,12 +5782,12 @@ class SolverFeatherPGS(SolverBase):
         skip = 0 if self.options.pgs_warmstart else int(self._ink_skip_rows())
         skip_local = int(self._row_packets is not None and not self.options.pgs_warmstart)
         # A compact or sparse size keeps a placeholder factor: its rows have no dense factor.
-        sizes = tuple(sorted(size for size in self.forest.size_groups if self.L_by_size[size].shape[1] == size))
+        sizes = tuple(sorted(size for size in self.forest.size_groups if self.factor.L_by_size[size].shape[1] == size))
         wp.launch(
             packed_rows.pack_kernel(sizes),
             dim=self.forest.world_count * self.dense_max_constraints,
             inputs=[
-                *(self.L_by_size[size] for size in sizes),
+                *(self.factor.L_by_size[size] for size in sizes),
                 self._row_sides,
                 self.forest.articulation_response_dof_count,
                 self.forest.art_group_idx,
@@ -6980,8 +5893,8 @@ class SolverFeatherPGS(SolverBase):
         groups' factors (the primary's for a model without a secondary), the packed rows' Jacobian and the rows'
         cfm."""
         na, nb = self._ink_sizes[0], self._ink_sizes[1]
-        L_b = self.L_by_size[nb] if nb else self.L_by_size[na]
-        return [self._ink_meta, self.L_by_size[na], L_b, self._packed_J, self.row_cfm]
+        L_b = self.factor.L_by_size[nb] if nb else self.factor.L_by_size[na]
+        return [self._ink_meta, self.factor.L_by_size[na], L_b, self._packed_J, self.row_cfm]
 
     def _admit_parallel_contact_paths(self) -> tuple[bool, str]:
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
@@ -7053,7 +5966,7 @@ class SolverFeatherPGS(SolverBase):
             response_builds_dense.response_lanes_kernel(),
             dim=n_arts * 32,
             inputs=[
-                self.L_by_size[size],
+                self.factor.L_by_size[size],
                 self.J_by_size[size],
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
@@ -7079,7 +5992,7 @@ class SolverFeatherPGS(SolverBase):
             response_builds_dense.response_rows_kernel(),
             dim=n_arts * self.dense_max_constraints,
             inputs=[
-                self.L_by_size[size],
+                self.factor.L_by_size[size],
                 self.J_by_size[size],
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
@@ -7168,7 +6081,7 @@ class SolverFeatherPGS(SolverBase):
                 response_builds_rows.SPARSE_PAIR.whiten(),
                 dim=self.forest.world_count * rows,
                 inputs=[
-                    self.L_by_size[size],
+                    self.factor.L_by_size[size],
                     self._sparse_diagonal_dense_groups,
                     self.constraint_count,
                     self.dense_phase_bounds,
@@ -7253,11 +6166,11 @@ class SolverFeatherPGS(SolverBase):
                 self._sparse_diagonal_dense_offsets,
                 self._sparse_diagonal_dense_groups,
                 dense_size,
-                self.L_by_size[dense_size] if sparse else self._dummy_world_J,
+                self.factor.L_by_size[dense_size] if sparse else self._dummy_world_J,
                 self.J_by_size[dense_size] if sparse else self._dummy_world_J,
                 self._sparse_diagonal_row_dof,
                 self._sparse_diagonal_row_z,
-                self._diagonal_inverse_mass,
+                self.factor.diagonal_inverse_mass,
                 dt,
                 self.laws.effective_restitution_velocity_threshold,
                 int(self.laws.set.weighted),
@@ -7279,61 +6192,6 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _stage6_prepare_world_velocity(self):
-        wp.copy(self.v_out, self.v_hat)
-
-    def _apply_mf_warmstart_velocity(self, velocity: wp.array) -> None:
-        """Install the carried free-body impulses' velocity into a live velocity state, on every free rigid body the
-        rows hold (:func:`.response_builds_rows.free_body_publish_kernel`, one thread per free rigid body)."""
-        if not self.options.pgs_warmstart or not self.forest.has_free_rigid_bodies:
-            return
-        wp.launch(
-            response_builds_rows.free_body_publish_kernel,
-            dim=self.forest.free_rigid_body_count,
-            inputs=[
-                self.forest.free_rigid_body_indices,
-                self.forest.free_rigid_body_world,
-                self.mf_body_a,
-                self.mf_body_b,
-                self.mf_constraint_count,
-                self.mf_Z_a,
-                self.mf_Z_b,
-                self.mf_row_type,
-                self.mf_impulses,
-                self._body_factors(),
-            ],
-            outputs=[velocity],
-            device=self.model.device,
-        )
-
-    def _stage6_apply_packed_impulses(self) -> None:
-        """``v_out = v_hat + P^T L^-T sum_r Z_r lambda_r`` of every articulation with a dense factor, from the packed
-        rows (:func:`.packed_rows.apply_kernel`), a launch per size group."""
-        for size in self.forest.size_groups:
-            if self.L_by_size[size].shape[1] != size:
-                continue  # A compact or sparse size keeps a placeholder: its rows have no dense factor.
-            wp.launch(
-                packed_rows.apply_kernel(),
-                dim=self.forest.n_arts_by_size[size],
-                inputs=[
-                    self.L_by_size[size],
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.forest.articulation_dof_start,
-                    self.forest.articulation_response_dof_count,
-                    size,
-                    self._row_sides,
-                    self.constraint_count,
-                    self.forest.articulation_world_dof_offset,
-                    int(self._packed_dense),
-                    self._packed_Z,
-                    self.impulses,
-                    self.v_hat,
-                ],
-                outputs=[self.v_out],
-                device=self.model.device,
-            )
-
     def _mf_pgs_setup(self, state_aug: State, dt: float):
         """MF PGS setup: whiten the free-body rows through each body's held factor, their diagonals and RHS."""
         model = self.model
@@ -7344,7 +6202,7 @@ class SolverFeatherPGS(SolverBase):
             inputs=[
                 bind_mf_rows(self),
                 self.mf_constraint_count,
-                self._body_factors(),
+                self.factor.view(),
                 int(self.forest.has_prescribed_response),
                 self.v_hat,
                 self.laws.rigid_body_max_depenetration_velocity,
@@ -7362,130 +6220,6 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _build_body_factors(self) -> BodyFactors:
-        """Each free body's held factor and coordinates (:class:`.kernels.BodyFactors`): the dynamics' size-6 factors
-        ``L_by_size[6]`` (armature included), which whiten its rows and map its velocity into factor coordinates, and
-        the lookup of a body's factor by its first global coordinate. Built once with the buffers: a captured step
-        allocates and copies nothing."""
-        device = self.model.device
-        dof_factor = np.full(max(int(self.model.joint_dof_count), 1), -1, dtype=np.int32)
-        if self.forest.has_free_rigid_bodies:
-            free = np.flatnonzero(self.forest.is_free_rigid_host != 0)
-            factor_index = self.forest.art_group_idx.numpy()[free]
-            starts = self.forest.articulation_dof_start.numpy()[free]
-            held = factor_index >= 0
-            dof_factor[starts[held]] = factor_index[held]
-        factors = BodyFactors()
-        factors.body_to_articulation = self.forest.body_to_articulation
-        factors.factor_index = self.forest.art_group_idx
-        factors.dof_start = self.forest.articulation_dof_start
-        factors.dof_factor = wp.array(dof_factor, dtype=wp.int32, device=device)
-        lower = self.L_by_size.get(6) if self.forest.has_free_rigid_bodies else None
-        factors.L = lower if lower is not None else wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
-        # Every articulation's dense factor, by address: the size groups' factors are allocated once, with the buffers.
-        art_count = max(int(self.model.articulation_count), 1)
-        first_art = np.full(max(int(self.model.joint_dof_count), 1), -1, dtype=np.int32)
-        sizes = np.zeros(art_count, dtype=np.int32)
-        offsets = np.zeros(art_count, dtype=np.int32)
-        addresses = np.zeros(art_count, dtype=np.uint64)
-        if int(self.model.articulation_count) > 0:
-            starts = self.forest.articulation_dof_start.numpy()
-            counts = self.forest.articulation_response_dof_count.numpy()
-            world_offsets = self.forest.articulation_world_dof_offset
-            offsets[:] = world_offsets.numpy() if world_offsets is not None else 0
-            sizes[:] = counts
-            responding = np.flatnonzero(counts > 0)
-            first_art[starts[responding]] = responding
-            for size, lower_group in self.L_by_size.items():
-                if lower_group.shape[1] != size or size not in self.forest.group_to_art:
-                    continue  # A compact or sparse size keeps a placeholder: no dense factor.
-                arts = self.forest.group_to_art[size].numpy()
-                addresses[arts] = lower_group.ptr + np.arange(len(arts), dtype=np.uint64) * np.uint64(size * size * 4)
-        factors.first_art = wp.array(first_art, dtype=wp.int32, device=device)
-        factors.size = wp.array(sizes, dtype=wp.int32, device=device)
-        factors.world_offset = wp.array(offsets, dtype=wp.int32, device=device)
-        factors.address = wp.array(addresses, dtype=wp.uint64, device=device)
-        return factors
-
-    def _body_factors(self) -> BodyFactors:
-        """The free bodies' factors and coordinates (:meth:`_build_body_factors`)."""
-        return self._body_factors_data
-
-    def _remove_free_root_transport(self, state_in: State, state_aug: State):
-        """Invert jcalc_integrate's free-root transport so it realizes the solved velocity exactly.
-
-        Runs after every velocity-to-acceleration conversion; no-op (no
-        launch) for fixed-base models.
-        """
-        if not self.forest.free_root_joint_count:
-            return
-        model = self.model
-        wp.launch(
-            remove_free_root_transport_from_qdd,
-            dim=self.forest.free_root_joint_count,
-            inputs=[
-                self.forest.free_root_joint_indices,
-                model.joint_qd_start,
-                self._kinematic_joint_mask,
-                state_in.joint_qd,
-            ],
-            outputs=[state_aug.joint_qdd],
-            device=model.device,
-        )
-
-    def _stage6_update_qdd(self, state_in: State, state_aug: State, dt: float):
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            return  # finish owns conversion, free-root transport and integration
-        model = self.model
-        wp.launch(
-            update_qdd_from_velocity,
-            dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, self._kinematic_dof_mask, 1.0 / dt],
-            outputs=[self.v_out, state_aug.joint_qdd],
-            device=model.device,
-        )
-        self._remove_free_root_transport(state_in, state_aug)
-
-    def _stage6_integrate(self, state_in: State, state_aug: State, state_out: State, dt: float):
-        model = self.model
-        if getattr(self, "_tree_kinetic_state", None) is not None:
-            next_refresh = ((self._step + 1) % self.options.update_mass_matrix_interval) == 0
-            self._tree_kinetic_state.finish(state_in, state_aug, state_out, dt, next_refresh)
-            self._fk_id_cache_source_state = state_out
-            return
-
-        if model.joint_count:
-            wp.launch(
-                kernel=integrate_generalized_joints,
-                dim=model.joint_count,
-                inputs=[
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    model.joint_dof_dim,
-                    model.body_com,
-                    model.joint_X_c,
-                    state_in.joint_q,
-                    state_in.joint_qd,
-                    state_aug.joint_qdd,
-                    dt,
-                    self.options.angular_damping,
-                ],
-                outputs=[state_out.joint_q, state_out.joint_qd],
-                device=model.device,
-            )
-
-            self._stage7_update_kinematics(state_out, state_aug)
-
-        self.integrate_particles(model, state_in, state_out, dt)
-
-    def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
-        """Publish the output state's kinematics (ordinary dynamics derive the next step's from the state)."""
-        eval_fk(self.model, state_out.joint_q, state_out.joint_qd, state_out)
-
     def __del__(self):
         """Drain queued work without accessing cyclically finalized streams."""
         if sys.is_finalizing():
@@ -7502,38 +6236,6 @@ class SolverFeatherPGS(SolverBase):
         except (AttributeError, RuntimeError, TypeError):
             # CUDA/Python callables may already be unavailable at shutdown.
             pass
-
-
-@cache
-def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) -> "wp.Kernel":
-    """Build specialized triangular solve kernel for given DOF count.
-
-    Solves H x = b with the leaf-first factor ``P H P^T = L L^T`` by tiled forward and backward substitution, the
-    coordinates reversed by indexed loads and stores.
-    """
-    TILE_DOF_LOCAL = wp.constant(int(n_dofs))
-    TILE_DOF_LAST = wp.constant(int(n_dofs) - 1)
-
-    def trisolve_tiled_template(
-        L_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
-        tau_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
-        qdd_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
-    ):
-        idx = wp.tid()
-        reverse = wp.tile_arange(TILE_DOF_LAST, -1, -1, dtype=int)
-        L_tile = wp.tile_load(L_group[idx], shape=(TILE_DOF_LOCAL, TILE_DOF_LOCAL), bounds_check=False)
-        tau_tile = wp.tile_load_indexed(tau_group[idx], indices=reverse, shape=(TILE_DOF_LOCAL, 1), axis=0)
-
-        # Forward substitution: L * z = P tau
-        z_tile = wp.tile_lower_solve(L_tile, tau_tile)
-
-        # Backward substitution: L^T * (P qdd) = z
-        Lt_tile = wp.tile_transpose(L_tile)
-        qdd_tile = wp.tile_upper_solve(Lt_tile, z_tile)
-
-        wp.tile_store_indexed(qdd_group[idx], indices=reverse, t=qdd_tile, axis=0)
-
-    return python_kernel(trisolve_tiled_template, f"trisolve_tiled_{n_dofs}_bd{tile_threads}")
 
 
 @cache

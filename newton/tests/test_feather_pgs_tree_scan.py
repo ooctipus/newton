@@ -458,9 +458,9 @@ class TestHeldTreeChains(unittest.TestCase):
                     ),
                 ):
                     solver = _make_solver(model, True)
-                self.assertIsNotNone(solver._tree_kinetic_state)
+                self.assertIsNotNone(solver.factor.held)
                 # The sparse factor's held group is the owner's only group.
-                (owner,) = solver._tree_kinetic_state.groups
+                (owner,) = solver.factor.held.groups
                 self.assertEqual((owner.layout.lanes, owner.layout.pack, owner.block_dim), (64, 1, 64))
                 self.assertEqual(owner.schedules, on_chains)
                 rng = np.random.default_rng(13)
@@ -473,7 +473,7 @@ class TestHeldTreeChains(unittest.TestCase):
                 state.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
                 expected = model.state()
                 newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
-                owner.begin(state, solver, state.joint_qd, 1.0 / 240.0, True)
+                owner.begin(state, solver.factor, state.joint_qd, 1.0 / 240.0, True)
                 np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
                 np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
                 np.testing.assert_array_equal(owner.status.numpy(), 0)

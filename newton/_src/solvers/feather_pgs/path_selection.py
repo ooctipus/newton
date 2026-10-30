@@ -193,7 +193,7 @@ def measurement_selection(solver) -> dict:
 
 
 def _held_tree_groups(solver) -> tuple:
-    owner = solver._tree_kinetic_state
+    owner = solver.factor.held
     if owner is None:
         return None, []
     groups = list(owner.groups)
@@ -204,11 +204,11 @@ def _held_tree_groups(solver) -> tuple:
 
 
 def _held_tree(solver) -> dict:
-    owner = solver._tree_kinetic_state
+    owner = solver.factor.held
     kind, groups = _held_tree_groups(solver)
     return {
         "owner": kind,
-        "reason": solver._cached_dynamics_selection_reason,
+        "reason": solver.factor.held_reason,
         "layout_reason": getattr(owner, "forest_reason", None),
         # Whether a diagonal-mass group of world-fixed roots over one-coordinate
         # leaves runs as scalar branches.
@@ -679,11 +679,11 @@ def _resolved_worlds(solver) -> dict:
 
 
 def _publication(solver) -> dict:
-    if solver._tree_kinetic_state is not None:
+    if solver.factor.held is not None:
         owner, reason = "cached", "The held-tree owner publishes next-step state."
     else:
         owner, reason = "ordinary", "Separate launches integrate and publish the next state."
-    cache = "in_place" if solver._fk_id_cache_enabled else "off"
+    cache = "in_place" if solver.factor.fk_id_cache_enabled else "off"
     return {
         "owner": owner,
         "reason": reason,
@@ -808,7 +808,7 @@ def _dynamics(solver) -> dict:
             "response_only": bool(solver._packed_response),
             "reason": solver._packed_response_reason,
         },
-        "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
+        "parallel_augmented_drive_topology": bool(solver.factor.parallel_drives),
         "double_buffer": bool(solver._double_buffer),
         # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset
         # stream: empty without a double buffer, where the ordinary route's stage 1 clears H before
@@ -817,7 +817,7 @@ def _dynamics(solver) -> dict:
         "double_buffer_mass_matrix_clear_dofs": []
         if solver._memset_stream is None
         else sorted(int(size) for size in solver.forest.size_groups if size not in solver._plan.unread_mass_sizes),
-        "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),
+        "size_group_streams": any(stream is not None for stream in solver.factor.size_streams.values()),
         "preelimination": bool(solver._preelim_active),
         "mimic_rows": int(solver.laws.mimic_count or 0),
         "connect_rows": int(solver.laws.connect_count or 0),
@@ -828,8 +828,8 @@ def _dynamics(solver) -> dict:
 
 
 def _armature_floor(solver) -> dict:
-    # Mirrors _kinematic_state: the armature conditioning_armature added to deep articulations.
-    floor = solver._armature_floor
+    # Mirrors TreeFactor.kinematic_state: the armature conditioning_armature added to deep articulations.
+    floor = solver.factor.armature_floor
     if floor.evaluated == 0:
         reason = f"No articulation has a root-to-leaf path of {DEEP_CHAIN_JOINTS} joints or more; none is evaluated."
     elif floor.coordinates == 0:

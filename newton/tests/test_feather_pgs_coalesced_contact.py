@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs import contact_input, response_builds_rows
 from newton.tests import test_feather_pgs_compact_contact as baseline
 from newton.tests.feather_pgs_patch_parity import point_row_law
 from newton.tests.test_feather_pgs_compact_contact import (
+    _FACTOR_FIELDS,
     _FOREST_FIELDS,
     _LAUNCH_FIELDS,
     _LAWS_FIELDS,
@@ -198,7 +199,9 @@ class TestCoalescedContact(unittest.TestCase):
             dense_phase_bounds=aux.bounds,
             constraint_count=wp.zeros(2, dtype=int, device="cpu"),
             model=SimpleNamespace(device="cpu", shape_body=data.shape_body),
-            L_by_size={6: data.factor},
+            factor=SimpleNamespace(
+                **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
+            ),
             J_by_size={6: data.Z},
             _mark_independent_sparse_contact_candidates_kernel=marker,
             # Point friction: the patch row law with beta 0 and a disabled view.

@@ -27,6 +27,7 @@ from newton._src.solvers.feather_pgs import (
 )
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton._src.solvers.feather_pgs.tree_ordinary import OrdinaryTree
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver
 
@@ -187,9 +188,9 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertIsInstance(owner, HeldTree)
-        validity_arrays = [solver._fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
+        validity_arrays = [solver.factor.fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
         invalidators = [cached_state_binding._invalidate_kernel(group._cache_to_art.shape[1]) for group in owner.groups]
 
         def mark_valid():
@@ -260,10 +261,10 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         self.assertEqual(invalidating_launches(JOINT), [])
         with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary"}):
             ordinary = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        ordinary._fk_id_cache_enabled = True
-        ordinary._fk_id_cache_valid.fill_(1)
+        ordinary.factor.fk_id_cache_enabled = True
+        ordinary.factor.fk_id_cache_valid.fill_(1)
         ordinary.notify_model_changed(JOINT)
-        np.testing.assert_array_equal(ordinary._fk_id_cache_valid.numpy(), 0)
+        np.testing.assert_array_equal(ordinary.factor.fk_id_cache_valid.numpy(), 0)
 
     def test_refused_notification_stores_no_moved_frame(self):
         """Store no moved frame in the held-tree proof when a row owner refuses the notification.
@@ -275,9 +276,9 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertIsInstance(owner, HeldTree)
-        validity_arrays = [solver._fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
+        validity_arrays = [solver.factor.fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
 
         def refuse(flags):
             raise RuntimeError("Row topology changed; reconstruct the solver")
@@ -315,7 +316,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                 finals = {}
                 for mode, per_step in (("plain", 1), ("notified", 1), ("invalidated", 2)):
                     model, solver = _owned_case(name, device)
-                    owner = solver._tree_kinetic_state
+                    owner = solver.factor.held
                     self.assertIsNotNone(owner, "The fixture must admit a held-tree owner")
                     if name == "forest":
                         self.assertEqual(len(owner.groups), 1, owner.forest_reason)
@@ -356,7 +357,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         for captured in (False, True):
             model = _build(device, worlds=8)
             solver = _mixed_solver(model)
-            owner = solver._tree_kinetic_state
+            owner = solver.factor.held
             self.assertIsNotNone(owner)
             rollout = _Rollout(model, solver)
             rollout.block()
@@ -391,11 +392,11 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cuda:0"), worlds=4)
         solver = _mixed_solver(model)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertIsNotNone(owner)
         rollout = _Rollout(model, solver)
         rollout.block()
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
         root = _fixed_root(model, 2)
         base = int(model.joint_child.numpy()[root])
         before = rollout.states[0].body_q.numpy()[base].copy()
@@ -403,17 +404,17 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         moved[root, 0] += 0.1
         model.joint_X_p.assign(moved)
         solver.notify_model_changed(JOINT)
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 0)
         for group in owner.groups:
             np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
         rollout.block()
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
         shift = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         np.testing.assert_allclose(rollout.states[0].body_q.numpy()[base], before + shift, atol=1.0e-6)
         solver.notify_model_changed(JOINT)
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
         solver.notify_model_changed(JOINT | newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 0)
         for group in owner.groups:
             np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
 
@@ -470,16 +471,16 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     """
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-    solver.options = solver.laws.options = dataclasses.replace(
+    solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
         solver.options, enable_joint_velocity_limits=motion_velocity
     )
     solver._route_pins.update(pins or {})
     owner = HeldTree(solver)
-    solver._tree_kinetic_state = owner
-    solver._fk_id_cache_enabled = True
+    solver.factor.held = owner
+    solver.factor.fk_id_cache_enabled = True
     states = [model.state(), model.state()]
-    solver._last_step_dt = DT
-    return model, solver, owner, states, solver
+    solver.factor.last_step_dt = DT
+    return model, solver, owner, states, solver.factor
 
 
 class TestFeatherPGSInputBank(unittest.TestCase):
@@ -490,27 +491,27 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         and the step hands the owner its output bank. An owner that validates by identity alone
         (a motion-velocity layout) is still invalidated when the input is not the last output.
         """
-        model, solver, _, states, augmented = _cpu_owner()
+        model, solver, _, states, _augmented = _cpu_owner()
         calls = []
         for bank_compare in (True, False):
             with self.subTest(bank_compare=bank_compare):
-                solver._tree_kinetic_state = SimpleNamespace(
+                solver.factor.held = SimpleNamespace(
                     bank_compare=bank_compare,
                     begin=lambda *args, **kwargs: calls.append(kwargs),
                     invalidate=lambda world_mask=None: None,
                     forget_continuity=lambda: None,
                 )
                 expected = int(bank_compare)
-                solver._fk_id_cache_valid.fill_(1)
-                solver._fk_id_cache_source_state = states[1]
-                solver._stage1_fk_id(states[0], augmented, states[1])
-                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), expected)
+                solver.factor.fk_id_cache_valid.fill_(1)
+                solver.factor.fk_id_cache_source_state = states[1]
+                solver.factor.fk_id(states[0], states[1], solver._step, solver.qd_work)
+                np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
                 self.assertIs(calls[-1].get("state_out"), states[1])
-                solver._fk_id_cache_valid.fill_(1)
-                solver._fk_id_cache_source_state = states[1]
+                solver.factor.fk_id_cache_valid.fill_(1)
+                solver.factor.fk_id_cache_source_state = states[1]
                 none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
                 solver.reset(states[0], none)
-                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), expected)
+                np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), expected)
 
     def test_comparison_runs_when_the_stamps_name_the_output_bank(self):
         """Compare the banks when the stamps may name the step's output bank, and nowhere else.
@@ -608,7 +609,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
                     before = _generations(owner)
                     for _ in range(steps):
                         if mode == "forced":
-                            solver._fk_id_cache_valid.zero_()
+                            solver.factor.fk_id_cache_valid.zero_()
                         rollout.step()
                     for start, end in zip(before, _generations(owner), strict=True):
                         np.testing.assert_array_equal(end - start, per_step * steps, err_msg=mode)
@@ -650,7 +651,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
                     q[model.joint_q_start.numpy()[joint]] += np.float32(0.05)
                     rollout.states[0].joint_q.assign(q)
                     if forced:
-                        solver._fk_id_cache_valid.zero_()
+                        solver.factor.fk_id_cache_valid.zero_()
                     before = _generations(owner)
                     rollout.step()
                     written = model.joint_articulation.numpy()[joint]
@@ -701,7 +702,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         """Repair every group after a copy-back under joint velocity limits, whose repair reads prescaled velocities."""
         model = _build(wp.get_device("cuda:0"), worlds=4, speed_limit=0.8)
         solver = _mixed_solver(model, enable_joint_velocity_limits=True)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertIsNotNone(owner)
         self.assertFalse(owner.bank_compare)
         rollout = _Rollout(model, solver, copy_back=True)
@@ -715,7 +716,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
     @staticmethod
     def _owned(name, device, **options):
         model, solver = _owned_case(name, device, **options)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         if owner is None:
             raise AssertionError(f"The {name} fixture must admit a held-tree owner")
         if name == "forest" and not (len(owner.groups) == 1 and owner.groups[0].layout.forest):
@@ -858,10 +859,10 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
             ("reset", lambda: solver.reset(banks[1], no_worlds)),
             ("notify_state_changed", solver.notify_state_changed),
             ("notify_model_changed", lambda: solver.notify_model_changed(JOINT)),
-            ("step duration", lambda: solver._track_step_dt(2.0 * DT)),
+            ("step duration", lambda: solver.factor.track_step_dt(2.0 * DT)),
         ):
             with self.subTest(host_call=name):
-                solver._last_step_dt = DT
+                solver.factor.last_step_dt = DT
                 self.assertEqual(step(), 0)
                 repairs(owner, functools.partial(owner.finish, banks[0], case[4], banks[1], DT, False), 7)
                 call()
@@ -948,7 +949,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                         elif hook == "notify_state_changed":
                             solver.notify_state_changed()
                         else:
-                            solver._track_step_dt(1.5 * DT)
+                            solver.factor.track_step_dt(1.5 * DT)
                         rollout.step()
 
                     advance = block
@@ -977,7 +978,7 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = _build(device, worlds=4, speed_limit=0.8)
         solver = _mixed_solver(model, enable_joint_velocity_limits=True)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertFalse(owner.skip_captured_repairs)
         rollout = _Rollout(model, solver)
         rollout.block()
@@ -1133,8 +1134,8 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                 return TestFeatherPGSInputBank._owned(name, device, update_mass_matrix_interval=1)
             model = _build(device, worlds=8)
             solver = _mixed_solver(model, lanes=8, update_mass_matrix_interval=1)
-            self.assertEqual([group.layout.pack for group in _groups(solver._tree_kinetic_state)], [4, 4])
-            return model, solver, solver._tree_kinetic_state
+            self.assertEqual([group.layout.pack for group in _groups(solver.factor.held)], [4, 4])
+            return model, solver, solver.factor.held
 
         for name, classified in itertools.product(("mixed", "packed", "forest", "sparse"), (False, True)):
             with self.subTest(owner=name, classified=classified):
@@ -1158,7 +1159,7 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                     before = _generations(owner)
                     for _ in range(replays - 1):
                         if forced:
-                            solver._fk_id_cache_valid.zero_()
+                            solver.factor.fk_id_cache_valid.zero_()
                         wp.capture_launch(capture.graph)
                     for start, end in zip(before, _generations(owner), strict=True):
                         np.testing.assert_array_equal(end - start, (1 + forced) * (replays - 1), err_msg=f"{forced=}")
@@ -1195,7 +1196,7 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                 finals = []
                 for classified in (False, True):
                     model, solver = build()
-                    owner = solver._tree_kinetic_state
+                    owner = solver.factor.held
                     self.assertIsNotNone(owner)
                     groups = len(_groups(owner))
                     motion = name == "motion"
@@ -1363,7 +1364,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                 for captured in (False, True):
                     with patch.object(tree_kinetic_owner, "listed_repair_blocks", return_value=1):
                         model, solver = build()
-                    owner = solver._tree_kinetic_state
+                    owner = solver.factor.held
                     self.assertIsNotNone(owner)
                     groups = _groups(owner)
                     for group in groups:
@@ -1530,7 +1531,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
                     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-                    solver.options = solver.laws.options = dataclasses.replace(
+                    solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
                         solver.options, enable_joint_velocity_limits=motion
                     )
                     owner = HeldTree(solver)
@@ -1552,23 +1553,23 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                         self.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
                         groups.append((group, kernels))
                     states, control = [model.state(), model.state()], model.control()
-                    solver._last_step_dt = DT
+                    solver.factor.last_step_dt = DT
                     # A motion-velocity owner reads a prescaled velocity bank of its own.
                     velocities = [wp.clone(state.joint_qd) if motion else state.joint_qd for state in states]
                     for source, refresh in ((0, True), (1, False)):
                         state, output, velocity = states[source], states[1 - source], velocities[source]
-                        owner.begin(state, solver, velocity, DT, refresh)
-                        solver.mass_update_mask.fill_(1)
-                        owner.refresh(solver)
-                        owner.predict(state, solver, control, velocity, DT)
+                        owner.begin(state, solver.factor, velocity, DT, refresh)
+                        solver.factor.mass_update_mask.fill_(1)
+                        owner.refresh(solver.factor)
+                        owner.predict(state, solver.factor, control, velocity, DT)
                         solver.v_out.assign(solver.v_hat)
-                        owner.finish(state, solver, output, DT, refresh)
+                        owner.finish(state, solver.factor, output, DT, refresh)
                     # A copy of the bank the last finish published, one coordinate changed.
                     states[1].assign(states[0])
                     coordinates = states[1].joint_q.numpy()
                     coordinates[0] += np.float32(0.01)
                     states[1].joint_q.assign(coordinates)
-                    owner.begin(states[1], solver, velocities[1], DT, False, state_out=states[0])
+                    owner.begin(states[1], solver.factor, velocities[1], DT, False, state_out=states[0])
                     # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
                     # free body and an arm), and every kind would still run with one group's classified forms skipped.
                     for group, kernels in groups:
@@ -1613,7 +1614,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         for name, build in cases.items():
             with self.subTest(owner=name):
                 solver = build()
-                owner = solver._tree_kinetic_state
+                owner = solver.factor.held
                 self.assertIsNotNone(owner)
                 # On a one-block grid, which also makes that block stride over every listed block.
                 _classify_every_launch(owner)
@@ -1624,11 +1625,11 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                 rollout.block()
                 state = rollout.states[0]
                 for seed in range(4):
-                    data = _groups(owner)[0]._publication(state, solver, state, DT)
+                    data = _groups(owner)[0]._publication(state, solver.factor, state, DT)
                     arrays = {}
                     for index, group in enumerate(_groups(owner)):
                         arrays.update({f"{index}.{key}": value for key, value in _repair_arrays(group, data).items()})
-                    arrays["requests"] = solver._mass_update_requested
+                    arrays["requests"] = solver.factor.mass_update_requested
                     self._scramble(rng, owner, solver)
                     start = {key: value.numpy().copy() for key, value in arrays.items()}
                     results = []
@@ -1640,7 +1641,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                             # Eagerly, after a finish that published this bank.
                             group._published, group._published_capture = (state.joint_q.ptr, state.joint_qd.ptr), 0
                             group._continuity = None
-                        owner.begin(state, solver, state.joint_qd, DT, bool(seed % 2))
+                        owner.begin(state, solver.factor, state.joint_qd, DT, bool(seed % 2))
                         results.append({key: value.numpy().copy() for key, value in arrays.items()})
                         if classify:
                             listed = [
@@ -1680,7 +1681,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         for name, build in cases.items():
             with self.subTest(owner=name):
                 solver = build()
-                owner = solver._tree_kinetic_state
+                owner = solver.factor.held
                 self.assertIsNotNone(owner)
                 self.assertTrue(owner.bank_compare)
                 packs = [group.layout.pack for group in _groups(owner)]
@@ -1688,11 +1689,11 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                 rollout = _Rollout(solver.model, solver, copy_back=True)
                 rollout.block()
                 state, output = rollout.states
-                data = _groups(owner)[0]._publication(state, solver, state, DT)
+                data = _groups(owner)[0]._publication(state, solver.factor, state, DT)
                 arrays = {}
                 for index, group in enumerate(_groups(owner)):
                     arrays.update({f"{index}.{key}": value for key, value in _repair_arrays(group, data).items()})
-                arrays["requests"] = solver._mass_update_requested
+                arrays["requests"] = solver.factor.mass_update_requested
                 for group in _groups(owner):
                     np.testing.assert_array_equal(group.data.source_q.numpy(), output.joint_q.ptr)
                 for seed in range(4):
@@ -1711,7 +1712,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                             # Eagerly, after a finish that published the output bank.
                             group._published, group._published_capture = (output.joint_q.ptr, output.joint_qd.ptr), 0
                             group._continuity = None
-                        owner.begin(state, solver, state.joint_qd, DT, bool(seed % 2), state_out=output)
+                        owner.begin(state, solver.factor, state.joint_qd, DT, bool(seed % 2), state_out=output)
                         results.append({key: value.numpy().copy() for key, value in arrays.items()})
                         if classify:
                             listed = [
@@ -1730,10 +1731,10 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
     def _scramble(rng, owner, solver):
         """Invalidate, request, stale and foreign-stamp random groups."""
         arts = solver.model.articulation_count
-        valid = solver._fk_id_cache_valid.numpy()
+        valid = solver.factor.fk_id_cache_valid.numpy()
         valid[rng.random(arts) < 0.3] = 0
-        solver._fk_id_cache_valid.assign(valid)
-        solver._mass_update_requested.assign((rng.random(arts) < 0.2).astype(np.int32))
+        solver.factor.fk_id_cache_valid.assign(valid)
+        solver.factor.mass_update_requested.assign((rng.random(arts) < 0.2).astype(np.int32))
         for group in _groups(owner):
             count = group.group_count
             geometry = group.geometry_valid.numpy()
@@ -1794,8 +1795,16 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             {size: route.name for size, route in routes.items()},
             {2: "none", 4: "diagonal", 6: "loop", 18: "loop", 24: "tiles", 25: "tiles"},
         )
-        for name in ("_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):
-            setattr(solver, name, functools.partial(getattr(SolverFeatherPGS, name), solver))
+        # The ordinary evaluator's view of the solver: its plan and mass matrices, the tree factor's L, R and mask.
+        ordinary = SimpleNamespace(
+            solver=solver,
+            model=solver.model,
+            forest=solver.forest,
+            tree=SimpleNamespace(
+                mass_update_mask=solver.mass_update_mask, R_by_size=solver.R_by_size, L_by_size=solver.L_by_size
+            ),
+            cholesky_kernels_by_size=solver._cholesky_kernels_by_size,
+        )
         launched = []
 
         def record(kernel, *args, inputs=(), **kwargs):
@@ -1806,7 +1815,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 solver._plan = SimpleNamespace(factor=table)
                 for size, route in table.items():
                     launched.clear()
-                    SolverFeatherPGS._stage2_factor(solver, size)
+                    OrdinaryTree.factor(ordinary, size)
                     reads = any(item is solver.H_by_size[size] for item in launched)
                     self.assertEqual(reads, not owner and route.name != "none", f"size {size}, owner {owner}")
 
@@ -1817,14 +1826,15 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         from the factorizations a step runs.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
+        with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         state_in, state_out = model.state(), model.state()
         newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        factor = SolverFeatherPGS._stage2_factor
-        with patch.object(SolverFeatherPGS, "_stage2_factor", autospec=True, side_effect=factor) as recorded:
+        factor = OrdinaryTree.factor
+        with patch.object(OrdinaryTree, "factor", autospec=True, side_effect=factor) as recorded:
             solver.step(state_in, state_out, model.control(), None, DT)
         self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.forest.size_groups))
-        self.assertTrue(all(call.args[0] is solver for call in recorded.call_args_list))
+        self.assertTrue(all(call.args[0] is solver.factor.ordinary for call in recorded.call_args_list))
 
     def test_owner_stage1_writes_no_mass_matrix(self):
         """Leave every dense mass matrix untouched in stage 1 while a held-tree owner refreshes the factors.
@@ -1855,14 +1865,15 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 patch.object(wp, "launch_tiled", launch),
                 patch.object(wp.array, "zero_", zero),
             ):
-                solver._stage1_crba(solver, None)
+                solver.factor.refresh(None, solver._step)
             return [array for array in matrices if any(item is array for item in touched)]
 
         refreshed = []
-        solver._tree_kinetic_state = SimpleNamespace(refresh=refreshed.append)
+        solver.factor.held = SimpleNamespace(refresh=refreshed.append)
         self.assertEqual(touched_matrices(), [])
-        self.assertEqual(refreshed, [solver])
-        solver._tree_kinetic_state = None
+        self.assertEqual(refreshed, [solver.factor])
+        solver.factor.held = None
+        solver.factor.ordinary = OrdinaryTree(solver)
         self.assertEqual(len(touched_matrices()), len(matrices))
 
     def test_clear_record_names_the_double_buffer(self):
@@ -1885,7 +1896,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             with self.subTest(owner=owner):
                 model = _build(device, worlds=4)
                 solver = _mixed_solver(model, owner=owner)
-                self.assertEqual(solver._tree_kinetic_state is not None, owner)
+                self.assertEqual(solver.factor.held is not None, owner)
                 self.assertIsNotNone(solver._memset_stream)
                 record = solver.get_path_selection()["routes"]["dynamics"]["double_buffer_mass_matrix_clear_dofs"]
                 self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.forest.size_groups))
@@ -1916,7 +1927,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         for poisoned in (False, True):
             model = _build(device, worlds=4)
             solver = _mixed_solver(model)
-            self.assertIsNotNone(solver._tree_kinetic_state)
+            self.assertIsNotNone(solver.factor.held)
             if poisoned:
                 for _, _, array in _mass_matrices(solver):
                     array.fill_(float("nan"))

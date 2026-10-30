@@ -563,6 +563,7 @@ class LocalRowPackets:
             self.prefix,
             solver=solver,
             forest=solver.forest,
+            factor=solver.factor,
             laws=solver.laws,
             options=solver.options,
             model=solver.model,

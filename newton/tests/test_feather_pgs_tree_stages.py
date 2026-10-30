@@ -118,7 +118,7 @@ def _launch(group, kernel, data, velocity, start):
             group.plan,
             data,
             group.data,
-            group.solver._mass_update_requested,
+            group.solver.factor.mass_update_requested,
             1,
             velocity,
             group._repair_blocks,
@@ -220,9 +220,9 @@ class TestTreeKineticStages(unittest.TestCase):
                 self.assertFalse(group.motion_velocity)
                 before = {name: array.numpy().copy() for name, array in _state_arrays(group).items()}
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.begin(state, solver, other, DT, True)
+                    group.begin(state, solver.factor, other, DT, True)
                 with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
-                    group.predict(state, solver, control, other, DT)
+                    group.predict(state, solver.factor, control, other, DT)
                 for name, array in _state_arrays(group).items():
                     np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
 
@@ -238,7 +238,7 @@ class TestTreeKineticStages(unittest.TestCase):
         for alternate in (False, True):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-            solver.options = solver.laws.options = dataclasses.replace(
+            solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
                 solver.options, enable_joint_velocity_limits=alternate
             )
             owner = HeldTree(solver)
@@ -254,7 +254,7 @@ class TestTreeKineticStages(unittest.TestCase):
                 ):
                     with self.subTest(alternate=alternate, layout=group.layout.root_families, kernel=name):
                         self.assertEqual(group.motion_velocity, alternate)
-                        data = group._publication(state, solver, published, DT)
+                        data = group._publication(state, solver.factor, published, DT)
                         start = {key: array.numpy().copy() for key, array in _state_arrays(group, data).items()}
                         plain = _launch(group, kernel, data, state.joint_qd, start)
                         poisoned = _launch(group, kernel, data, nan, start)

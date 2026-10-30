@@ -80,7 +80,7 @@ class TestTreeMimicCache(unittest.TestCase):
                 cases, graphs = [], []
                 for enabled in (False, True):
                     solver = solver_for(model, enabled)
-                    self.assertEqual(solver._tree_kinetic_state is not None, enabled)
+                    self.assertEqual(solver.factor.held is not None, enabled)
                     self.assertTrue(solver._sparse_velocity_limits)
                     self.assertEqual(solver.laws.mimic_count, 2)
                     first, second, control = model.state(), model.state(), model.control()
@@ -136,7 +136,7 @@ class TestTreeMimicCache(unittest.TestCase):
                             rtol=4e-4,
                             err_msg=name,
                         )
-                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.groups[0].status.numpy(), 0)
+                    np.testing.assert_array_equal(cases[1][0].factor.held.groups[0].status.numpy(), 0)
                 self.assertTrue(contact_seen)
 
     def test_mimic_closure_converges(self):
@@ -164,7 +164,7 @@ class TestTreeMimicCache(unittest.TestCase):
         states = []
         for enabled in (False, True):
             solver = solver_for(model, enabled, interval=3)
-            self.assertEqual(solver._tree_kinetic_state is not None, enabled)
+            self.assertEqual(solver.factor.held is not None, enabled)
             first, second, control = model.state(), model.state(), model.control()
             target = control.joint_target_q.numpy()
             target[::2] = 0.4
@@ -189,8 +189,8 @@ class TestTreeMimicCache(unittest.TestCase):
             warnings.simplefilter("always")
             solver = solver_for(model, True)
         self.assertTrue(any("couples a DOF to itself" in str(m.message) for m in messages))
-        self.assertIsNone(solver._tree_kinetic_state)
-        self.assertFalse(solver._fk_id_cache_enabled)
+        self.assertIsNone(solver.factor.held)
+        self.assertFalse(solver.factor.fk_id_cache_enabled)
 
 
 if __name__ == "__main__":

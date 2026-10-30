@@ -27,11 +27,13 @@ def fixture(floating, device):
     for item in (solver, reference):
         # Exercise the motion/predictor kernels directly on CPU too; complete
         # velocity-limit solving remains CUDA/matrix-free and is tested below.
-        item.options = item.laws.options = dataclasses.replace(item.options, enable_joint_velocity_limits=True)
-        item._fk_id_cache_enabled = False
-        item._passive_spring_stiffness.fill_(0.27)
-        item._passive_spring_ref.fill_(-0.1)
-        item._passive_joint_damping.fill_(0.19)
+        item.options = item.laws.options = item.factor.options = dataclasses.replace(
+            item.options, enable_joint_velocity_limits=True
+        )
+        item.factor.fk_id_cache_enabled = False
+        item.factor.passive_spring_stiffness.fill_(0.27)
+        item.factor.passive_spring_ref.fill_(-0.1)
+        item.factor.passive_joint_damping.fill_(0.19)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner
     return model, solver, reference, operator, owner, mass
@@ -104,7 +106,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 state.body_f.assign(rng.normal(0, 0.07, (model.body_count, 6)).astype(np.float32))
                 control.joint_f.assign(rng.normal(0, 0.13, model.joint_dof_count).astype(np.float32))
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                reference._last_step_dt = solver._last_step_dt = dt
+                reference.factor.last_step_dt = solver.factor.last_step_dt = dt
                 physical = physical_mass(model, state)
                 matrices = [physical[w * count : (w + 1) * count, w * count : (w + 1) * count] for w in range(2)]
                 previous_generation = None
@@ -112,11 +114,11 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 captured = None
                 for epoch, limit in enumerate((0.25, 0.1, 10.0, 10.0, 10.0)):
                     model.joint_velocity_limit.fill_(limit)
-                    if reference._fk_id_cache_enabled:
-                        reference._fk_id_cache_valid.zero_()
-                    motion = reference._stage1_fk_id(state, reference, model.state())
-                    reference._stage1_drives(state, reference, control, dt)
-                    rhs = reference.joint_tau.numpy().reshape(2, count).astype(float)
+                    if reference.factor.fk_id_cache_enabled:
+                        reference.factor.fk_id_cache_valid.zero_()
+                    motion = reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
+                    reference.factor.ordinary.joint_tau(state, control, dt)
+                    rhs = reference.factor.joint_tau.numpy().reshape(2, count).astype(float)
                     actual_motion = motion.numpy()
                     self.assertEqual(motion.ptr, reference.qd_work.ptr)
                     if epoch < 2:
@@ -126,16 +128,16 @@ class TestPrescaledTreeContract(unittest.TestCase):
                             np.testing.assert_array_equal(actual_motion[:6], raw[:6])
                     else:
                         np.testing.assert_array_equal(actual_motion, raw)
-                    solver.joint_tau.zero_()
+                    solver.factor.joint_tau.zero_()
                     if captured is not None and epoch != 4:
                         wp.capture_launch(captured)
                     else:
-                        owner.begin(state, solver, motion, dt, epoch in (0, 4))
+                        owner.begin(state, solver.factor, motion, dt, epoch in (0, 4))
                         if epoch == 0:
-                            solver.mass_update_mask.fill_(1)
-                            operator.refresh(solver)
+                            solver.factor.mass_update_mask.fill_(1)
+                            operator.refresh(solver.factor)
                             held = solver._sparse_Linv.numpy().copy()
-                        owner.predict(state, solver, control, motion, dt)
+                        owner.predict(state, solver.factor, control, motion, dt)
                     generation = owner.data.generation.numpy().copy()
                     if previous_generation is not None:
                         np.testing.assert_array_equal(generation - previous_generation, [int(epoch != 3), 0])
@@ -146,12 +148,13 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     expected = np.empty_like(raw, dtype=float)
                     for world, matrix in enumerate(matrices):
                         np.testing.assert_allclose(
-                            solver.R_by_size[count].numpy()[world], reference.R_by_size[count].numpy()[world]
+                            solver.factor.R_by_size[count].numpy()[world],
+                            reference.factor.R_by_size[count].numpy()[world],
                         )
                         expected[world * count : (world + 1) * count] = np.linalg.solve(
-                            matrix + np.diag(solver.R_by_size[count].numpy()[world]), rhs[world]
+                            matrix + np.diag(solver.factor.R_by_size[count].numpy()[world]), rhs[world]
                         )
-                    np.testing.assert_allclose(solver.joint_qdd.numpy(), expected, atol=3e-5, rtol=3e-4)
+                    np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected, atol=3e-5, rtol=3e-4)
                     velocity = actual_motion.astype(float) + dt * expected
                     if floating:
                         for world in range(2):
@@ -165,8 +168,8 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     np.testing.assert_array_equal(owner.status.numpy(), 0)
                     if epoch == 0 and device.startswith("cuda"):
                         with wp.ScopedCapture(device=device) as capture:
-                            owner.begin(state, solver, motion, dt, False)
-                            owner.predict(state, solver, control, motion, dt)
+                            owner.begin(state, solver.factor, motion, dt, False)
+                            owner.predict(state, solver.factor, control, motion, dt)
                         captured = capture.graph
                 current = owner.data.current_valid.numpy().copy()
                 generation = owner.data.generation.numpy().copy()
@@ -178,12 +181,12 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 ]
                 for value in invalid:
                     with self.assertRaises(RuntimeError):
-                        owner.begin(state, solver, value, dt, False)
+                        owner.begin(state, solver.factor, value, dt, False)
                     np.testing.assert_array_equal(owner.data.current_valid.numpy(), current)
                     np.testing.assert_array_equal(owner.data.generation.numpy(), generation)
                 other = wp.array(raw, dtype=float, device=device)
                 with self.assertRaisesRegex(RuntimeError, "differs from the current-cache binding"):
-                    owner.predict(state, solver, control, other, dt)
+                    owner.predict(state, solver.factor, control, other, dt)
 
     def test_current_motion_cpu(self):
         """Match raw passive forces and prescaled bias across mutable working epochs."""
@@ -199,8 +202,8 @@ class TestPrescaledTreeContract(unittest.TestCase):
         """Ordinary dynamics (here by the evaluator pin) keep no FK/ID cache of their own."""
         model = split.branched_model(floating=False)
         solver = split.make_solver(model, True, pins={"evaluator": "ordinary"}, enable_joint_velocity_limits=True)
-        self.assertIsNone(solver._tree_kinetic_state)
-        self.assertFalse(solver._fk_id_cache_enabled)
+        self.assertIsNone(solver.factor.held)
+        self.assertFalse(solver.factor.fk_id_cache_enabled)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
     def test_loaded_steps_and_masked_reset(self):
@@ -220,11 +223,11 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         )
                         for enabled in (False, True)
                     ]
-                    self.assertIsNone(solvers[0]._tree_kinetic_state)
-                    self.assertIsNotNone(solvers[1]._tree_kinetic_state)
-                    self.assertFalse(solvers[0]._fk_id_cache_enabled)
-                    self.assertTrue(solvers[1]._fk_id_cache_enabled)
-                    self.assertTrue(solvers[1]._tree_kinetic_state.groups[0].motion_velocity)
+                    self.assertIsNone(solvers[0].factor.held)
+                    self.assertIsNotNone(solvers[1].factor.held)
+                    self.assertFalse(solvers[0].factor.fk_id_cache_enabled)
+                    self.assertTrue(solvers[1].factor.fk_id_cache_enabled)
+                    self.assertTrue(solvers[1].factor.held.groups[0].motion_velocity)
                     pairs = [[model.state(), model.state()] for _ in solvers]
                     controls = [model.control() for _ in solvers]
                     pipelines = [newton.CollisionPipeline(model, rigid_contact_max=32) for _ in solvers]
@@ -281,7 +284,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         enable_joint_velocity_limits=True,
                         update_mass_matrix_interval=2,
                     )
-                    self.assertEqual(solver._tree_kinetic_state is not None, enabled)
+                    self.assertEqual(solver.factor.held is not None, enabled)
                     first, second, control = model.state(), model.state(), model.control()
                     newton.eval_fk(model, first.joint_q, first.joint_qd, first)
                     pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
@@ -329,7 +332,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                             rtol=3e-4,
                             err_msg=name,
                         )
-                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.groups[0].status.numpy(), 0)
+                    np.testing.assert_array_equal(cases[1][0].factor.held.groups[0].status.numpy(), 0)
                 self.assertTrue(contact_seen)
 
 

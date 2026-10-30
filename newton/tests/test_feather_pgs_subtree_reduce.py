@@ -87,7 +87,7 @@ def _rollout(model, *, level_loop, steps=60):
             update_mass_matrix_interval=2,
             friction_anchor_beta=0.0,
         )
-    owner = getattr(solver, "_tree_kinetic_state", None)
+    owner = solver.factor.held
     # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
     pipeline = newton.CollisionPipeline(model, deterministic=True)
     contacts = pipeline.contacts()

@@ -789,7 +789,7 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
                 coordinates = dof[world, row, held]
                 jacobian[world, row, coordinates] = J[world, row, held]
                 if n not in factors:
-                    factors[n] = solver.L_by_size[n].numpy().astype(np.float64)
+                    factors[n] = solver.factor.L_by_size[n].numpy().astype(np.float64)
                 L = np.tril(factors[n][groups[art]])
                 # Leaf-first positions: factor coordinate i is the side's coordinate n - 1 - i.
                 response[world, row, coordinates] = np.linalg.solve(L.T, Z[world, row, held][::-1])[::-1]

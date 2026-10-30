@@ -316,7 +316,7 @@ class TreeKineticState:
         field_group.SolverArrays(self.data, device).allocate(
             native.KINETIC_CACHE.owned("cache"), group=groups, dof=dofs, body=bodies, entry=self.layout.entries
         )
-        self.data.current_valid = solver._fk_id_cache_valid
+        self.data.current_valid = solver.factor.fk_id_cache_valid
         self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
         # A classified repair's block lists (at most one entry per block each) and their
         # counts (repair, comparison), allocated before any capture.
@@ -439,6 +439,7 @@ class TreeKineticState:
         return field_group.bind(
             ForceInput,
             solver=solver,
+            factor=solver.factor,
             model=solver.model,
             state_in=state_in,
             state_aug=state_aug,
@@ -602,7 +603,7 @@ class TreeKineticState:
             self.plan,
             data,
             self.data,
-            self.solver._mass_update_requested,
+            self.solver.factor.mass_update_requested,
             int(global_refresh),
             stage3_qd,
         ]
@@ -747,7 +748,7 @@ class TreeKineticState:
                 self.plan,
                 data,
                 self.data,
-                self.solver._mass_update_requested,
+                self.solver.factor.mass_update_requested,
                 int(next_refresh),
                 # The repair inputs of the shared launch ABI, unread by a finish.
                 state_in.joint_qd,

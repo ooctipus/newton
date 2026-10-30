@@ -301,8 +301,8 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         qdd_np = np.array((0.3, -0.4, 0.5, 0.1, -0.2, 0.25), dtype=np.float32)
         state_in.joint_qd.assign(qd_np)
         solver.qd_work.assign(qd_np)
-        solver.joint_qdd.assign(qdd_np)
-        solver._stage3_compute_v_hat(state_in, solver, DT, solver.qd_work)
+        solver.factor.joint_qdd.assign(qdd_np)
+        solver.factor.ordinary.velocity_predictor(state_in, solver.qd_work, DT)
         transport = np.cross(qd_np[3:6], qd_np[0:3])
         expected_v_hat = qd_np + qdd_np * DT
         expected_v_hat[0:3] += transport * DT
@@ -310,11 +310,11 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
 
         v_out_np = np.array((1.8, 0.1, -0.15, 0.05, 19.5, 0.25), dtype=np.float32)
         solver.v_out.assign(v_out_np)
-        solver._stage6_update_qdd(state_in, solver, DT)
+        solver.factor.ordinary.update_qdd(state_in, DT)
         expected_qdd = (v_out_np - qd_np) / DT
         expected_qdd[0:3] -= transport
-        np.testing.assert_allclose(solver.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
-        solver._stage6_integrate(state_in, solver, state_out, DT)
+        np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
+        solver.factor.ordinary.integrate(state_in, state_out, DT)
         np.testing.assert_allclose(state_out.joint_qd.numpy(), v_out_np, rtol=1e-6, atol=1e-6)
 
     def test_compact_root_metadata_includes_standalone_joint(self):

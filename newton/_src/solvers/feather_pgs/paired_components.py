@@ -96,7 +96,7 @@ class PairedComponents:
             self.data,
             solver=solver,
             components=SimpleNamespace(world_count=self.world_count, selector=self.data.selector),
-            L=solver.L_by_size[self.primary_size],
+            L=solver.factor.L_by_size[self.primary_size],
             rhs=rhs,
             mf_meta=mf_meta,
         )

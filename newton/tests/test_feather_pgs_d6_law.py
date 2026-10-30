@@ -87,7 +87,7 @@ def _fly(model, velocity, dt, seconds):
     for _ in range(round(seconds / dt)):
         solver.step(state, other, control, None, dt)
         state, other = other, state
-    evaluator = "held" if solver._tree_kinetic_state is not None else "ordinary"
+    evaluator = "held" if solver.factor.held is not None else "ordinary"
     return (
         state.body_qd.numpy()[body].astype(float),
         state.body_q.numpy()[body].astype(float),

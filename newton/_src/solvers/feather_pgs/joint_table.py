@@ -33,13 +33,13 @@ JOINTS = (
     Field("joint_velocity_limit", wp.float32, ("dof",), owner="model"),
     Field("joint_limit_lower", wp.float32, ("dof",), owner="model"),
     Field("joint_limit_upper", wp.float32, ("dof",), owner="model"),
-    Field("prescribed", wp.int32, ("dof",), owner="solver", attr="_kinematic_dof_mask"),
+    Field("prescribed", wp.int32, ("dof",), owner="factor", attr="kinematic_dof_mask"),
     Field("articulation_H_rows", wp.int32, ("articulation",), owner="forest", attr="articulation_dof_count"),
     Field("art_to_world", wp.int32, ("articulation",), owner="forest"),
 )
 """The model's joint topology, drive gains, effort, velocity and position limits (its live arrays, so a write
-reaches the rows without a notification), the solver's prescribed coordinates, and the solver's articulation
-coordinate starts, coordinate counts and worlds.
+reaches the rows without a notification), the tree factor's prescribed coordinates, and the forest plan's
+articulation coordinate starts, coordinate counts and worlds.
 
 A prescribed coordinate (``prescribed``, the body flags' kinematic coordinate mask) takes no row on it alone: no
 position limit, velocity limit or drive. Its 1e10 armature leaves such a row a response of about 1e-10 against its
@@ -51,7 +51,7 @@ JointTable = field_group.struct("JointTable", JOINTS, __name__)
 
 def bind(solver, data=None):
     """Bind the model's and the solver's joint table into a :data:`JointTable` (``data``: an instance to refill)."""
-    return field_group.bind(JointTable, data, model=solver.model, solver=solver, forest=solver.forest)
+    return field_group.bind(JointTable, data, model=solver.model, factor=solver.factor, forest=solver.forest)
 
 
 FREE_BODIES = (

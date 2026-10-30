@@ -19,9 +19,9 @@ articulation's tree joints with the pass's per-node laws, all from
 * :data:`crba_fill`: a PATH from each column's joint to the root.
 
 Every pass reads one struct, :data:`DynamicsData`, generated from the field
-declarations :data:`DYNAMICS` and bound on the host from the model, the solver,
-the states and the control (:func:`.field_group.bind`). Values live in the
-body-indexed arrays the solver holds: a joint's slot is its child body and its
+declarations :data:`DYNAMICS` and bound on the host from the model, the forest plan,
+the tree factor, the states and the control (:func:`.field_group.bind`). Values live in the
+body-indexed arrays the tree factor holds: a joint's slot is its child body and its
 parent slot its parent body (``joint_parent``).
 """
 
@@ -81,24 +81,24 @@ DYNAMICS = (
     Field("body_inertia", wp.mat33, ("body",), owner="model"),
     Field("body_flags", wp.int32, ("body",), owner="model"),
     Field("gravity", wp.vec3, ("world",), owner="model"),
-    # The solver's tables and derived state.
+    # The forest plan's tables and the tree factor's derived state.
     Field("articulation_joint_end", wp.int32, ("articulation",), owner="forest"),
     Field("articulation_dof_start", wp.int32, ("articulation",), owner="forest"),
     Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
-    Field("body_X_com", wp.transform, ("body",)),
+    Field("body_X_com", wp.transform, ("body",), owner="factor"),
     Field("is_free_rigid", wp.int32, ("articulation",), owner="forest"),
-    Field("articulation_origin", wp.vec3, ("articulation",)),
-    Field("body_inertia_terms", inertia_record, ("body",), attr="_body_inertia_terms"),
-    Field("body_I_c", inertia_record, ("body",)),
-    Field("mass_update_mask", wp.int32, ("articulation",)),
-    Field("spring_stiffness", wp.float32, ("dof",), attr="_passive_spring_stiffness"),
-    Field("spring_reference", wp.float32, ("dof",), attr="_passive_spring_ref"),
-    Field("damping", wp.float32, ("dof",), attr="_passive_joint_damping"),
-    Field("row_K", wp.float32, ("drive_row",), attr="aug_row_K"),
-    Field("dfs_order", wp.int32, ("joint",), attr="_joint_dfs_order"),
-    Field("dfs_position", wp.int32, ("joint",), attr="_joint_dfs_position"),
-    Field("dfs_end", wp.int32, ("joint",), attr="_joint_dfs_end"),
-    Field("up_flags", wp.int32, ("joint",), attr="_joint_up_flags"),
+    Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"),
+    Field("body_inertia_terms", inertia_record, ("body",), owner="factor"),
+    Field("body_I_c", inertia_record, ("body",), owner="factor"),
+    Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
+    Field("spring_stiffness", wp.float32, ("dof",), owner="factor", attr="passive_spring_stiffness"),
+    Field("spring_reference", wp.float32, ("dof",), owner="factor", attr="passive_spring_ref"),
+    Field("damping", wp.float32, ("dof",), owner="factor", attr="passive_joint_damping"),
+    Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
+    Field("dfs_order", wp.int32, ("joint",), owner="factor", attr="_joint_dfs_order"),
+    Field("dfs_position", wp.int32, ("joint",), owner="factor", attr="_joint_dfs_position"),
+    Field("dfs_end", wp.int32, ("joint",), owner="factor", attr="_joint_dfs_end"),
+    Field("up_flags", wp.int32, ("joint",), owner="factor", attr="_joint_up_flags"),
     # The state the passes read coordinates from and publish poses and COM twists to.
     Field("joint_q", wp.float32, ("coord",), owner="state"),
     Field("joint_qd", wp.float32, ("dof",), owner="state"),
@@ -118,9 +118,9 @@ DYNAMICS = (
     # The launch's switches.
     Field("write_inertia_records", wp.int32, owner="step"),
 )
-"""Everything the dynamics passes read and write, by owner role: ``model``; the solver (the default);
-``state``, whose coordinates the passes read and to which they publish poses and COM twists; ``aug``, the
-augmented state; ``control``; ``step``, the launch's switches."""
+"""Everything the dynamics passes read and write, by owner role: ``model``; ``forest``, the forest plan;
+``factor``, the tree factor; ``state``, whose coordinates the passes read and to which they publish poses and COM
+twists; ``aug``, the augmented state (the tree factor's); ``control``; ``step``, the launch's switches."""
 
 DynamicsData = field_group.struct("DynamicsData", DYNAMICS, __name__)
 """The dynamics passes' one argument (:func:`.field_group.bind` fills it)."""

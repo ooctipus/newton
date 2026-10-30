@@ -320,6 +320,7 @@ _LAUNCH_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if f
 _FOREST_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "forest"}
 _LAWS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "laws"}
 _OPTIONS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "options"}
+_FACTOR_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "factor"}
 
 
 def launch_solver(data, aux, *, anchors, beta=0.0):
@@ -334,7 +335,9 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
         slot_counter=aux.counts,
         dense_phase_bounds=aux.bounds,
         model=SimpleNamespace(device=aux.device, shape_body=data.shape_body),
-        L_by_size={6: data.factor},
+        factor=SimpleNamespace(
+            **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
+        ),
         J_by_size={6: data.Z},
         _mark_independent_sparse_contact_candidates_kernel=object(),
         laws=SimpleNamespace(

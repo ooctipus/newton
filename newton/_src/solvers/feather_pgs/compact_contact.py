@@ -108,7 +108,12 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
 def launch_contacts(solver, data, workers):
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
     boundary = field_group.bind(
-        CompactBoundary, solver=solver, forest=solver.forest, factor=solver.L_by_size[6], Z=solver.J_by_size[6]
+        CompactBoundary,
+        solver=solver,
+        forest=solver.forest,
+        inverse_mass=solver.factor.diagonal_inverse_mass,
+        factor=solver.factor.L_by_size[6],
+        Z=solver.J_by_size[6],
     )
     # Allocation has completed, but constraint_count is finalized later. Keep
     # this clear and the following producer ordered on the current stream.

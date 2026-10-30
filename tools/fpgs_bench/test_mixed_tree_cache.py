@@ -106,7 +106,7 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
         # Direct CPU physical tests supply the original compact descriptor;
         # production admission and complete stepping remain CUDA-only.
         solver._compact_diagonal_mass_size = 4
-        solver._diagonal_inverse_mass = wp.zeros(model.joint_dof_count, dtype=float, device=model.device)
+        solver.factor.diagonal_inverse_mass = wp.zeros(model.joint_dof_count, dtype=float, device=model.device)
     return solver
 
 
@@ -137,20 +137,24 @@ class TestMixedTreeCache(unittest.TestCase):
             state.body_f.assign(rng.normal(0, 0.2, (model.body_count, 6)).astype(np.float32))
             control.joint_f.assign(rng.uniform(-0.2, 0.2, model.joint_dof_count).astype(np.float32))
             for item in (solver, reference):
-                item._last_step_dt = DT
-                item._fk_id_cache_enabled = False
-                item._passive_spring_stiffness.fill_(0.31)
-                item._passive_spring_ref.fill_(-0.07)
-                item._passive_joint_damping.fill_(0.12)
+                item.factor.last_step_dt = DT
+                item.factor.fk_id_cache_enabled = False
+                item.factor.passive_spring_stiffness.fill_(0.31)
+                item.factor.passive_spring_ref.fill_(-0.07)
+                item.factor.passive_joint_damping.fill_(0.12)
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            reference._stage1_fk_id(state, reference, model.state())
-            reference._stage1_drives(state, reference, control, DT)
-            rhs = reference.joint_tau.numpy().astype(float)
+            reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
+            reference.factor.ordinary.joint_tau(state, control, DT)
+            rhs = reference.factor.joint_tau.numpy().astype(float)
             physical = physical_mass(model, state)
-            solver.joint_tau.zero_()
-            owner.begin(state, solver, state.joint_qd, DT, True)
-            np.testing.assert_allclose(solver.joint_S_s.numpy(), reference.joint_S_s.numpy(), atol=4e-6, rtol=3e-5)
-            np.testing.assert_allclose(solver.body_v_s.numpy(), reference.body_v_s.numpy(), atol=4e-6, rtol=3e-5)
+            solver.factor.joint_tau.zero_()
+            owner.begin(state, solver.factor, state.joint_qd, DT, True)
+            np.testing.assert_allclose(
+                solver.factor.joint_S_s.numpy(), reference.factor.joint_S_s.numpy(), atol=4e-6, rtol=3e-5
+            )
+            np.testing.assert_allclose(
+                solver.factor.body_v_s.numpy(), reference.factor.body_v_s.numpy(), atol=4e-6, rtol=3e-5
+            )
             expected = np.zeros(model.joint_dof_count)
             starts = solver.forest.articulation_dof_start.numpy()
             for group in owner.groups:
@@ -161,35 +165,37 @@ class TestMixedTreeCache(unittest.TestCase):
                     block = physical[np.ix_(ids, ids)]
                     packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
                     np.testing.assert_allclose(group.geometric.numpy()[index], packed, atol=4e-6, rtol=4e-5)
-                    expected[ids] = np.linalg.solve(block + np.diag(solver.R_by_size[n].numpy()[index]), rhs[ids])
+                    expected[ids] = np.linalg.solve(
+                        block + np.diag(solver.factor.R_by_size[n].numpy()[index]), rhs[ids]
+                    )
                     if not model.device.is_cuda and not operator.diagonal:
-                        lower = solver.L_by_size[n].numpy()
-                        lower[index] = np.linalg.cholesky(block + np.diag(solver.R_by_size[n].numpy()[index]))
-                        solver.L_by_size[n].assign(lower)
-            solver.mass_update_mask.fill_(1)
-            owner.refresh(solver)
+                        lower = solver.factor.L_by_size[n].numpy()
+                        lower[index] = np.linalg.cholesky(block + np.diag(solver.factor.R_by_size[n].numpy()[index]))
+                        solver.factor.L_by_size[n].assign(lower)
+            solver.factor.mass_update_mask.fill_(1)
+            owner.refresh(solver.factor)
             held = {
                 group.layout.dofs: (
-                    solver._diagonal_inverse_mass.numpy().copy()
+                    solver.factor.diagonal_inverse_mass.numpy().copy()
                     if group.sparse.diagonal
-                    else solver.L_by_size[group.layout.dofs].numpy().copy()
+                    else solver.factor.L_by_size[group.layout.dofs].numpy().copy()
                 )
                 for group in owner.groups
             }
-            owner.predict(state, solver, control, state.joint_qd, DT)
-            np.testing.assert_allclose(solver.joint_qdd.numpy(), expected, atol=5e-5, rtol=5e-4)
+            owner.predict(state, solver.factor, control, state.joint_qd, DT)
+            np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected, atol=5e-5, rtol=5e-4)
             np.testing.assert_allclose(solver.v_hat.numpy(), raw + DT * expected, atol=4e-6, rtol=3e-5)
             solver.v_out.assign(solver.v_hat)
-            owner.finish(state, solver, output, DT, False)
+            owner.finish(state, solver.factor, output, DT, False)
             public_state(self, model, output)
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
-            owner.begin(output, solver, output.joint_qd, DT, False)
+            owner.begin(output, solver.factor, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
             mask = wp.array([False, True, False], dtype=wp.bool, device=device)
             owner.invalidate(mask)
-            np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), [1, 1, 0, 0, 1, 1])
-            owner.begin(output, solver, output.joint_qd, DT, False)
+            np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), [1, 1, 0, 0, 1, 1])
+            owner.begin(output, solver.factor, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 arts = group.sparse.plan.group_to_art.numpy()
                 np.testing.assert_array_equal(
@@ -197,34 +203,38 @@ class TestMixedTreeCache(unittest.TestCase):
                 )
             requests = np.zeros(model.articulation_count, np.int32)
             requests[-1] = 1
-            solver._mass_update_requested.assign(requests)
+            solver.factor.mass_update_requested.assign(requests)
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
-            owner.begin(output, solver, output.joint_qd, DT, False)
+            owner.begin(output, solver.factor, output.joint_qd, DT, False)
             for group, before in zip(owner.groups, generation, strict=False):
                 arts = group.sparse.plan.group_to_art.numpy()
                 np.testing.assert_array_equal(
                     group.data.generation.numpy() - before, arts == model.articulation_count - 1
                 )
-            solver._mass_update_requested.zero_()
+            solver.factor.mass_update_requested.zero_()
             bank = model.state()
             for key in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
                 wp.copy(getattr(bank, key), getattr(output, key))
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
             # The copy holds the words of the bank the caches were stamped with: no group repairs.
-            owner.begin(bank, solver, bank.joint_qd, DT, False, state_out=output)
+            owner.begin(bank, solver.factor, bank.joint_qd, DT, False, state_out=output)
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
-            solver.mass_update_mask.zero_()
-            owner.refresh(solver)
+            solver.factor.mass_update_mask.zero_()
+            owner.refresh(solver.factor)
             for group in owner.groups:
-                value = solver._diagonal_inverse_mass if group.sparse.diagonal else solver.L_by_size[group.layout.dofs]
+                value = (
+                    solver.factor.diagonal_inverse_mass
+                    if group.sparse.diagonal
+                    else solver.factor.L_by_size[group.layout.dofs]
+                )
                 np.testing.assert_array_equal(value.numpy(), held[group.layout.dofs])
             if model.device.is_cuda:
                 wp.synchronize()  # Complete fixture allocations before graph capture.
                 with wp.ScopedCapture(device=device) as capture:
                     owner.invalidate(mask)
-                    owner.begin(bank, solver, bank.joint_qd, DT, False)
-                    owner.predict(bank, solver, control, bank.joint_qd, DT)
+                    owner.begin(bank, solver.factor, bank.joint_qd, DT, False)
+                    owner.predict(bank, solver.factor, control, bank.joint_qd, DT)
                 generation = [group.data.generation.numpy().copy() for group in owner.groups]
                 for _ in range(3):
                     wp.capture_launch(capture.graph)
@@ -242,14 +252,14 @@ class TestMixedTreeCache(unittest.TestCase):
         model = model_fixture()
         solver = make_solver(model)
         owner = HeldTree(solver)
-        solver._fk_id_cache_valid.fill_(1)
+        solver.factor.fk_id_cache_valid.fill_(1)
         original = solver.forest.group_to_art[9]
         values = original.numpy()
         for changed in (values[::-1].copy(), np.full_like(values, values[0])):
             solver.forest.group_to_art[9] = wp.array(changed, dtype=int, device=model.device)
             with self.assertRaises((ValueError, RuntimeError)):
                 owner.validate_model()
-            np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
+            np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
         solver.forest.group_to_art[9] = original
         owner.validate_model()
 

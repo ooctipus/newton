@@ -280,7 +280,7 @@ def _rollout(
             **({} if rows is None else {"dense_max_constraints": rows}),
             **(attrs or {}),
         )
-    state_owner = getattr(solver, "_tree_kinetic_state", None)
+    state_owner = solver.factor.held
     # Sorted contacts give both arms one contact and row order whatever the thread scheduling of the atomic pair,
     # contact and row allocations. The arms are then compared, not two schedules: resting boxes and feet are
     # statically indeterminate supports, on which the order alone moves an 8-iteration rollout by up to 2.4e-4
@@ -678,7 +678,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
 
             def repose(solver, contacts, model=model, steps=steps):
                 steps.append(len(steps))
-                held = solver._tree_kinetic_state
+                held = solver.factor.held
                 if held is not None:
                     # Every finish and every recomputing repair adds one to its tree's generation.
                     generations.append([int(group.data.generation.numpy().sum()) for group in held.groups])
@@ -693,7 +693,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         (_, owner_solver, owner, cached, cached_qd) = rollouts[1]
         self.assertIsNone(plain_owner)
         self.assertIsInstance(owner, HeldTree)
-        self.assertIs(owner_solver._tree_kinetic_state, owner)
+        self.assertIs(owner_solver.factor.held, owner)
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

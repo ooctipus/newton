@@ -41,50 +41,50 @@ STAGE3_SNAPSHOTS = FieldGroup(
 """Stage-3 snapshots for external NaN dumpers (opt-in)."""
 
 ARTICULATION_WORK = FieldGroup(
-    Field("mass_update_mask", wp.int32, ("articulation",)),
+    Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
 )
 
 BODY_INERTIA = FieldGroup(
-    Field("body_X_com", wp.transform, ("body",), fill=None),
-    Field("body_I_c", inertia_record, ("body",), fill=None),
-    Field("_body_inertia_terms", inertia_record, ("body",), fill=None),
+    Field("body_X_com", wp.transform, ("body",), fill=None, owner="factor"),
+    Field("body_I_c", inertia_record, ("body",), fill=None, owner="factor"),
+    Field("body_inertia_terms", inertia_record, ("body",), fill=None),
 )
 """Body inertia about the articulation origin as inertia records (:data:`.spatial_laws.inertia_record`): each
-body's own (``_body_inertia_terms``) and its subtree's composite (``body_I_c``)."""
+body's own (``body_inertia_terms``) and its subtree's composite (``body_I_c``)."""
 
-ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",)))
+ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"))
 
 JOINT_FOREST = FieldGroup(
-    Field("_joint_dfs_order", wp.int32, ("joint",)),
-    Field("_joint_dfs_position", wp.int32, ("joint",)),
-    Field("_joint_dfs_end", wp.int32, ("joint",)),
-    Field("_joint_up_flags", wp.int32, ("joint",)),
+    Field("_joint_dfs_order", wp.int32, ("joint",), owner="factor"),
+    Field("_joint_dfs_position", wp.int32, ("joint",), owner="factor"),
+    Field("_joint_dfs_end", wp.int32, ("joint",), owner="factor"),
+    Field("_joint_up_flags", wp.int32, ("joint",), owner="factor"),
 )
 """The articulation joints' forest (:class:`.tree_plan.TreePlan`) on the device: its depth-first order, each
 joint's position and each position's subtree end (the CRBA's ancestor test), and how the up scans meet each
 joint (:attr:`.tree_plan.TreePlan.up_flags`)."""
 
 AUGMENTED_DRIVE_ROWS = FieldGroup(
-    Field("aug_row_counts", wp.int32, ("articulation",)),
-    Field("aug_row_dof_index", wp.int32, ("drive_row",)),
-    Field("aug_row_K", wp.float32, ("drive_row",)),
+    Field("aug_row_counts", wp.int32, ("articulation",), owner="factor"),
+    Field("aug_row_dof_index", wp.int32, ("drive_row",), owner="factor"),
+    Field("aug_row_K", wp.float32, ("drive_row",), owner="factor"),
 )
 """Augmented drive rows, ``max_dofs`` per articulation."""
 
 STATE_AUX = FieldGroup(
-    Field("joint_qdd", wp.float32, ("dof",)),
-    Field("joint_tau", wp.float32, ("dof",), fill=None),
-    Field("joint_S_s", wp.spatial_vector, ("dof",), fill=None),
-    Field("body_q_com", wp.transform, ("body",), fill=None),
-    Field("body_I_s", wp.spatial_matrix, ("body",), fill=None),
-    Field("body_v_s", wp.spatial_vector, ("body",), fill=None),
-    Field("body_a_s", wp.spatial_vector, ("body",), fill=None),
+    Field("joint_qdd", wp.float32, ("dof",), owner="factor"),
+    Field("joint_tau", wp.float32, ("dof",), fill=None, owner="factor"),
+    Field("joint_S_s", wp.spatial_vector, ("dof",), fill=None, owner="factor"),
+    Field("body_q_com", wp.transform, ("body",), fill=None, owner="factor"),
+    Field("body_I_s", wp.spatial_matrix, ("body",), fill=None, owner="factor"),
+    Field("body_v_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
+    Field("body_a_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
     # Without a memset: the first step may run inside a CUDA graph capture, and a captured memset would erase the
     # cached body forces on every replay while the FK/ID cache stays valid. Stage 1 writes body_f_s before reading it.
-    Field("body_f_s", wp.spatial_vector, ("body",), fill=None),
-    Field("body_ft_s", wp.spatial_vector, ("body",)),
+    Field("body_f_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
+    Field("body_ft_s", wp.spatial_vector, ("body",), owner="factor"),
 )
-"""Per-state derived dynamics (maximal coordinates), allocated on the state they derive from."""
+"""The augmented state: the step's derived dynamics (maximal coordinates), allocated on the tree factor."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Size groups
@@ -92,11 +92,14 @@ STATE_AUX = FieldGroup(
 
 SIZE_FACTORS = FieldGroup(
     Field("L", wp.float32, ("factor_art", "factor_size", "factor_size")),
-    Field("Y", wp.float32, ("y_art", "y_row", "y_size")),
     Field("R", wp.float32, ("art", "size")),
 )
-"""One size group's mass factor, response and armature; compact and sparse sizes keep (1, 1, 1) placeholders, and
-so does the response of the matrix-free sweeps, which read the packed rows."""
+"""One size group's mass factor and armature (the tree factor's); compact and sparse sizes keep (1, 1, 1)
+placeholders of the factor."""
+
+SIZE_RESPONSE = FieldGroup(Field("Y", wp.float32, ("y_art", "y_row", "y_size")))
+"""One size group's response; compact and sparse sizes keep a (1, 1, 1) placeholder, and so do the matrix-free
+sweeps, which read the packed rows."""
 
 SIZE_GROUPED_SOLVE = FieldGroup(
     Field("tau", wp.float32, ("art", "size", 1)),

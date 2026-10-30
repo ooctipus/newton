@@ -116,7 +116,7 @@ for kind in ("kuka", "franka"):
         dense_max_constraints=192,
         friction_anchor_beta=0.0,
     )
-    owner = getattr(solver, "_tree_kinetic_state", None)
+    owner = solver.factor.held
     clocks = getattr(solver, "_stage_clocks", None)
     print(
         f"\n== {kind}: dofs {model.joint_dof_count // WORLDS} bodies {model.body_count // WORLDS} owner {type(owner).__name__}",

@@ -15,6 +15,7 @@ import dataclasses
 import functools
 import json
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -22,9 +23,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import kernels as fk
-from newton._src.solvers.feather_pgs import path_selection, tree_passes, tree_scan
+from newton._src.solvers.feather_pgs import path_selection, tree_factor, tree_passes, tree_scan
 from newton._src.solvers.feather_pgs import scalar_branches as sb
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
@@ -36,9 +36,9 @@ from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
 # Fields the scalar family stops writing for its bodies; no consumer on its route reads them.
-DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
+DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
 # Fields the held owner writes only for free bodies, not for a fixed-base arm (it publishes body_v_s).
-ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
+ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
 # CUDA bounds against ordinary dynamics: the keys' are FMA contraction and the rounding of the
 # inverse-mass projection and gravity force, which ordinary dynamics evaluates in another order;
 # the arm leaves the serial route for the held owner's float order.
@@ -235,9 +235,9 @@ def cpu_solver(model, size):
     """
     with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
         solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
-    solver._setup_parallel_augmented_drive_topology(model, True)
+    solver.factor.setup_drives(True)
     solver._compact_diagonal_mass_size = size
-    solver._fk_id_cache_enabled = True
+    solver.factor.fk_id_cache_enabled = True
     return solver
 
 
@@ -288,7 +288,7 @@ def ordinary_head(model, *, rows=64, **options):
 def ordinary_inverse_mass(solver, size):
     """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its leaf-first diagonal
     factor (``L_jj = sqrt(H_ii + R_i)``, ``i = n - 1 - j``), for every coordinate (zero outside the group)."""
-    factor = solver.L_by_size[size].numpy().astype(np.float64)
+    factor = solver.factor.L_by_size[size].numpy().astype(np.float64)
     starts = solver.forest.articulation_dof_start.numpy()[solver.forest.group_to_art[size].numpy()]
     inverse = np.zeros(solver.model.joint_dof_count)
     for group, start in enumerate(starts):
@@ -676,11 +676,14 @@ class _PrismaticRoute:
 
     def begin(self, state):
         s, model = self.solver, self.model
-        wp.copy(self.previous, s._fk_id_cache_valid)
+        wp.copy(self.previous, s.factor.fk_id_cache_valid)
         wp.launch(
             _oracle_fk_id,
             dim=model.articulation_count,
-            inputs=[s._dynamics(state, s, articulation_joint_end=self.joint_end), s._fk_id_cache_valid],
+            inputs=[
+                s.factor.ordinary.dynamics(state, articulation_joint_end=self.joint_end),
+                s.factor.fk_id_cache_valid,
+            ],
             device=self.device,
         )
         wp.launch(
@@ -696,26 +699,33 @@ class _PrismaticRoute:
                 state.joint_qd,
                 model.joint_X_p,
                 model.joint_X_c,
-                s.body_X_com,
+                s.factor.body_X_com,
                 model.joint_axis,
                 s.forest.body_to_articulation,
                 model.body_mass,
-                s.articulation_origin,
+                s.factor.articulation_origin,
                 model.gravity,
             ],
-            outputs=[state.body_q, s.body_q_com, s.joint_S_s, s.body_v_s, s.body_a_s, s.body_f_s],
+            outputs=[
+                state.body_q,
+                s.factor.body_q_com,
+                s.factor.joint_S_s,
+                s.factor.body_v_s,
+                s.factor.body_a_s,
+                s.factor.body_f_s,
+            ],
             device=self.device,
         )
 
     def predict(self, state, control, dt):
         s, model, size = self.solver, self.model, self.size
         wp.launch(
-            solver_module._prepare_augmented_joint_drives_by_dof,
+            tree_factor.prepare_augmented_drives,
             dim=model.joint_dof_count,
             inputs=[
-                s._augmented_drive_row_by_dof,
-                s._augmented_drive_q_index_by_dof,
-                s._augmented_drive_target_index_by_dof,
+                s.factor.drive_row_by_dof,
+                s.factor.drive_q_index_by_dof,
+                s.factor.drive_target_index_by_dof,
                 state.joint_q,
                 state.joint_qd,
                 model.joint_target_ke,
@@ -725,14 +735,14 @@ class _PrismaticRoute:
                 model.joint_effort_limit,
                 dt,
             ],
-            outputs=[s.aug_row_K, s.joint_tau],
+            outputs=[s.factor.aug_row_K, s.factor.joint_tau],
             device=self.device,
         )
         count = self.group.shape[0] * size
         wp.launch(
             _direct_branch_tau,
             dim=count,
-            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control)],
+            inputs=[self.group, self.offsets, size, s.factor.ordinary.dynamics(state, control)],
             device=self.device,
         )
         wp.launch(
@@ -741,32 +751,38 @@ class _PrismaticRoute:
             inputs=[
                 model.articulation_start,
                 s.forest.articulation_dof_start,
-                s.mass_update_mask,
+                s.factor.mass_update_mask,
                 model.joint_child,
-                s.joint_S_s,
+                s.factor.joint_S_s,
                 model.body_mass,
-                s._body_inertia_terms,
+                s.factor.body_inertia_terms,
                 self.group,
                 self.offsets,
-                s.R_by_size[size],
-                s._augmented_drive_row_by_dof,
-                s.aug_row_K,
+                s.factor.R_by_size[size],
+                s.factor.drive_row_by_dof,
+                s.factor.aug_row_K,
             ],
-            outputs=[s._diagonal_inverse_mass],
+            outputs=[s.factor.diagonal_inverse_mass],
             device=self.device,
         )
         wp.launch(
             _apply_inverse_mass,
             dim=count,
-            inputs=[s._diagonal_inverse_mass, self.group, s.forest.articulation_dof_start, size, s.joint_tau],
-            outputs=[s.joint_qdd],
+            inputs=[
+                s.factor.diagonal_inverse_mass,
+                self.group,
+                s.forest.articulation_dof_start,
+                size,
+                s.factor.joint_tau,
+            ],
+            outputs=[s.factor.joint_qdd],
             device=self.device,
         )
         wp.launch(
             fk.compute_velocity_predictor,
             dim=model.joint_dof_count,
-            inputs=[state.joint_qd, s._kinematic_dof_mask, dt],
-            outputs=[s.joint_qdd, s.v_hat],
+            inputs=[state.joint_qd, s.factor.kinematic_dof_mask, dt],
+            outputs=[s.factor.joint_qdd, s.v_hat],
             device=self.device,
         )
 
@@ -775,8 +791,8 @@ class _PrismaticRoute:
         wp.launch(
             fk.update_qdd_from_velocity,
             dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, s._kinematic_dof_mask, 1.0 / dt],
-            outputs=[s.v_out, s.joint_qdd],
+            inputs=[state_in.joint_qd, s.factor.kinematic_dof_mask, 1.0 / dt],
+            outputs=[s.v_out, s.factor.joint_qdd],
             device=self.device,
         )
         wp.launch(
@@ -788,13 +804,13 @@ class _PrismaticRoute:
                 model.joint_child,
                 model.joint_q_start,
                 model.joint_qd_start,
-                s._kinematic_joint_mask,
+                s.factor.kinematic_joint_mask,
                 model.joint_dof_dim,
                 model.body_com,
                 model.joint_X_c,
                 state_in.joint_q,
                 state_in.joint_qd,
-                s.joint_qdd,
+                s.factor.joint_qdd,
                 dt,
                 0.0,
             ],
@@ -804,7 +820,10 @@ class _PrismaticRoute:
         wp.launch(
             _oracle_kinematics,
             dim=model.articulation_count,
-            inputs=[s._dynamics(state_out, s, articulation_joint_end=self.joint_end), s._fk_id_cache_valid],
+            inputs=[
+                s.factor.ordinary.dynamics(state_out, articulation_joint_end=self.joint_end),
+                s.factor.fk_id_cache_valid,
+            ],
             device=self.device,
         )
         wp.launch(
@@ -819,20 +838,20 @@ class _PrismaticRoute:
                 state_out.joint_qd,
                 model.joint_X_p,
                 model.joint_X_c,
-                s.body_X_com,
+                s.factor.body_X_com,
                 model.joint_axis,
-                s.joint_S_s,
+                s.factor.joint_S_s,
                 s.forest.body_to_articulation,
                 state_out.body_q,
-                s.body_q_com,
+                s.factor.body_q_com,
                 model.body_mass,
-                s.articulation_origin,
+                s.factor.articulation_origin,
                 model.gravity,
-                s.body_v_s,
-                s.body_a_s,
-                s.body_f_s,
+                s.factor.body_v_s,
+                s.factor.body_a_s,
+                s.factor.body_f_s,
                 state_out.body_qd,
-                s._dynamics(state_out, s, write_inertia_records=1),
+                s.factor.ordinary.dynamics(state_out, write_inertia_records=1),
             ],
             device=self.device,
         )
@@ -855,7 +874,7 @@ class _Pair:
         self.controls = {name: model.control() for name in ("head", "mine")}
         if poison:
             for name in DROPPED_FIELDS:
-                getattr(self.mine, name).fill_(float("nan"))
+                getattr(self.mine.factor, name).fill_(float("nan"))
         starts = model.articulation_start.numpy()
         self.arts = self.mine.forest.group_to_art[size].numpy()
         self.bodies = np.concatenate([model.joint_child.numpy()[starts[a] : starts[a + 1]] for a in self.arts])
@@ -883,7 +902,7 @@ class _Pair:
         """Select every articulation for the inverse-mass refresh, or none."""
         values = np.full(self.model.articulation_count, int(refresh), dtype=np.int32)
         for solver in (self.head, self.mine):
-            solver.mass_update_mask.assign(values)
+            solver.factor.mass_update_mask.assign(values)
 
     def step(self, test):
         """Advance both routes one substep and compare what each phase publishes.
@@ -895,28 +914,49 @@ class _Pair:
         mine_in, mine_out = self.states["mine"]
         tag = f"step {self.step_index}"
         self.route.begin(head_in)
-        self.state.begin(mine_in, self.mine, mine_in.joint_qd, DT, True)
+        self.state.begin(mine_in, self.mine.factor, mine_in.joint_qd, DT, True)
         same(test, head_in.body_q, mine_in.body_q, self.bodies, f"{tag} input body_q")
-        same(test, self.head.joint_S_s, self.mine.joint_S_s, self.dofs, f"{tag} input joint_S_s")
-        same(test, self.head.articulation_origin, self.mine.articulation_origin, self.arts, f"{tag} input origin")
+        same(test, self.head.factor.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
+        same(
+            test,
+            self.head.factor.articulation_origin,
+            self.mine.factor.articulation_origin,
+            self.arts,
+            f"{tag} input origin",
+        )
         self.route.predict(head_in, self.controls["head"], DT)
-        self.state.predict(mine_in, self.mine, self.controls["mine"], mine_in.joint_qd, DT)
-        same(test, self.head._diagonal_inverse_mass, self.mine._diagonal_inverse_mass, self.dofs, f"{tag} inverse mass")
-        for name in ("joint_qdd", "v_hat"):
-            same(test, getattr(self.head, name), getattr(self.mine, name), self.dofs, f"{tag} {name}")
+        self.state.predict(mine_in, self.mine.factor, self.controls["mine"], mine_in.joint_qd, DT)
+        same(
+            test,
+            self.head.factor.diagonal_inverse_mass,
+            self.mine.factor.diagonal_inverse_mass,
+            self.dofs,
+            f"{tag} inverse mass",
+        )
+        same(test, self.head.factor.joint_qdd, self.mine.factor.joint_qdd, self.dofs, f"{tag} joint_qdd")
+        same(test, self.head.v_hat, self.mine.v_hat, self.dofs, f"{tag} v_hat")
         solved = self.head.v_hat.numpy() + self.rng.uniform(-0.03, 0.03, self.model.joint_dof_count).astype(np.float32)
         for solver in (self.head, self.mine):
             solver.v_out.assign(solved)
         self.route.finish(head_in, head_out, DT)
-        self.state.finish(mine_in, self.mine, mine_out, DT, False)
+        self.state.finish(mine_in, self.mine.factor, mine_out, DT, False)
         for name, index in (("joint_q", self.coordinates), ("joint_qd", self.dofs)):
             same(test, getattr(head_out, name), getattr(mine_out, name), index, f"{tag} {name}")
         for name in ("body_q", "body_qd"):
             same(test, getattr(head_out, name), getattr(mine_out, name), self.bodies, f"{tag} {name}")
-        for name in ("joint_qdd", "v_out", "joint_S_s"):
-            same(test, getattr(self.head, name), getattr(self.mine, name), self.dofs, f"{tag} finish {name}")
-        same(test, self.head.articulation_origin, self.mine.articulation_origin, self.arts, f"{tag} origin")
-        np.testing.assert_array_equal(self.mine._fk_id_cache_valid.numpy()[self.arts], 1)
+        for name in ("joint_qdd", "joint_S_s"):
+            same(
+                test,
+                getattr(self.head.factor, name),
+                getattr(self.mine.factor, name),
+                self.dofs,
+                f"{tag} finish {name}",
+            )
+        same(test, self.head.v_out, self.mine.v_out, self.dofs, f"{tag} finish v_out")
+        same(
+            test, self.head.factor.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} origin"
+        )
+        np.testing.assert_array_equal(self.mine.factor.fk_id_cache_valid.numpy()[self.arts], 1)
         self.states["head"].reverse()
         self.states["mine"].reverse()
         self.step_index += 1
@@ -972,7 +1012,7 @@ def check_owner_launches(test, device):
                 else:
                     model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
                     solver = recipe_solver(model, scalar=True)
-                    owner = solver._tree_kinetic_state
+                    owner = solver.factor.held
                 test.assertIsInstance(owner, HeldTree)
                 test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
                 test.assertFalse(owner.bank_compare)
@@ -1005,23 +1045,23 @@ def check_owner_launches(test, device):
                     groups.append((group, kernels))
                 test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
                 states, control = [model.state(), model.state()], model.control()
-                solver._last_step_dt = DT
+                solver.factor.last_step_dt = DT
                 for source, refresh in ((0, True), (1, False)):
                     state, output = states[source], states[1 - source]
-                    owner.begin(state, solver, state.joint_qd, DT, refresh)
-                    owner.scalar.launch_other_drives(state, solver, control, DT)
-                    solver.mass_update_mask.fill_(1)
-                    owner.refresh(solver)
-                    owner.predict(state, solver, control, state.joint_qd, DT)
+                    owner.begin(state, solver.factor, state.joint_qd, DT, refresh)
+                    owner.scalar.launch_other_drives(state, solver.factor, control, DT)
+                    solver.factor.mass_update_mask.fill_(1)
+                    owner.refresh(solver.factor)
+                    owner.predict(state, solver.factor, control, state.joint_qd, DT)
                     solver.v_out.assign(solver.v_hat)
-                    owner.finish(state, solver, output, DT, refresh)
+                    owner.finish(state, solver.factor, output, DT, refresh)
                 # A copy of the bank the last finish published, one coordinate changed: identity validation
                 # launches the one-pass repair, which compares nothing.
                 states[1].assign(states[0])
                 coordinates = states[1].joint_q.numpy()
                 coordinates[0] += np.float32(0.01)
                 states[1].joint_q.assign(coordinates)
-                owner.begin(states[1], solver, states[1].joint_qd, DT, False, state_out=states[0])
+                owner.begin(states[1], solver.factor, states[1].joint_qd, DT, False, state_out=states[0])
             for group, kernels in groups:
                 if group is owner.scalar:
                     ran = {kernel for kernel, _ in launched}
@@ -1116,7 +1156,7 @@ class TestScalarBranchRule(unittest.TestCase):
         plan, _reason = sb.plan_scalar_branches(solver)
         self.assertIsNotNone(plan)
         # A drive row that reads another coordinate than its leaf's, and leaves out of coordinate order.
-        q_index = solver._augmented_drive_q_index_by_dof.numpy()
+        q_index = solver.factor.drive_q_index_by_dof.numpy()
         q_index[plan.dofs[0]] += 1
         q_index = wp.array(q_index, dtype=int, device=model.device)
         offsets = dict(solver.forest.crba_dof_joint_offset_by_size)
@@ -1141,15 +1181,15 @@ class TestScalarBranchRule(unittest.TestCase):
                 "do not follow its leaves",
             ),
             (
-                "_parallel_augmented_drive_topology",
-                "_parallel_augmented_drive_topology",
-                False,
+                "factor.parallel_drives",
+                "factor",
+                SimpleNamespace(**{**vars(solver.factor), "parallel_drives": False}),
                 "owned drive-row topology",
             ),
             (
-                "_augmented_drive_q_index_by_dof",
-                "_augmented_drive_q_index_by_dof",
-                q_index,
+                "factor.drive_q_index_by_dof",
+                "factor",
+                SimpleNamespace(**{**vars(solver.factor), "drive_q_index_by_dof": q_index}),
                 "do not read its leaf coordinates",
             ),
         ):
@@ -1181,7 +1221,7 @@ class TestScalarBranchRule(unittest.TestCase):
         # Every group proves its inputs unchanged: the notification keeps the caches.
         self.assertTrue(owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
         owner.invalidate()
-        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+        np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 0)
         with mock.patch.dict(solver._route_pins, {"grouping": "forest"}):
             forced = HeldTree(solver)
         self.assertIn("Scalar branches own", forced.forest_reason)
@@ -1206,7 +1246,7 @@ class TestScalarBranchRule(unittest.TestCase):
         with mock.patch.object(solver, "_scalar_branches", None):
             owners["plain"] = HeldTree(solver)
         s0, s1 = model.state(), model.state()
-        solver._last_step_dt = DT
+        solver.factor.last_step_dt = DT
         kinds = {}
         for owner in owners.values():
             for group in owner.groups:
@@ -1238,9 +1278,9 @@ class TestScalarBranchRule(unittest.TestCase):
                     # Nothing that compares is bound where nothing may compare.
                     bound = {key for key in ("bank", "bank_repair") if record["kernels"][key] is not None}
                     self.assertEqual(bound, {"bank_repair"} if compare else set())
-                launches(lambda owner=owner: owner.finish(s0, solver, s1, DT, False))
+                launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT, False))
                 self.assertEqual(
-                    launches(lambda owner=owner: owner.begin(s0, solver, s0.joint_qd, DT, False, state_out=s1)),
+                    launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, False, state_out=s1)),
                     copy_back,
                 )
 
@@ -1298,7 +1338,7 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver)
-        with mock.patch.object(solver, "_tree_kinetic_state", HeldTree(solver)):
+        with mock.patch.object(solver.factor, "held", HeldTree(solver)):
             held = path_selection._held_tree(solver)
         json.dumps(held, allow_nan=False)
         self.assertEqual(held["owner"], "mixed")
@@ -1344,11 +1384,13 @@ class TestScalarBranchKernels(unittest.TestCase):
                     q = current.joint_q.numpy()
                     q[pair.coordinates[: pair.plan.size]] -= 0.001
                     current.joint_q.assign(q)
-                pair.head._fk_id_cache_valid.assign(
+                pair.head.factor.fk_id_cache_valid.assign(
                     np.where(pair.head.forest.art_to_world.numpy() == 0, 0, 1).astype(np.int32)
                 )
                 pair.state.invalidate(mask)
-                np.testing.assert_array_equal(pair.mine._fk_id_cache_valid.numpy()[pair.arts], [0] + [1] * (worlds - 1))
+                np.testing.assert_array_equal(
+                    pair.mine.factor.fk_id_cache_valid.numpy()[pair.arts], [0] + [1] * (worlds - 1)
+                )
             if step == 4:
                 # Re-pose the branch roots through their frames and notify, as Isaac Lab's resets do.
                 roots = pair.model.articulation_start.numpy()[pair.arts]
@@ -1358,8 +1400,8 @@ class TestScalarBranchKernels(unittest.TestCase):
                 pair.model.joint_X_p.assign(frames)
                 # The owner's tree groups report the moved frames; the solver then invalidates every cache.
                 pair.state.invalidate()
-                pair.head._fk_id_cache_valid.zero_()
-                np.testing.assert_array_equal(pair.mine._fk_id_cache_valid.numpy()[pair.arts], 0)
+                pair.head.factor.fk_id_cache_valid.zero_()
+                np.testing.assert_array_equal(pair.mine.factor.fk_id_cache_valid.numpy()[pair.arts], 0)
             pair.step(self)
 
     def test_kinematic_and_held_mass_steps_match(self):
@@ -1371,13 +1413,13 @@ class TestScalarBranchKernels(unittest.TestCase):
         model.body_flags.assign(flags)
         for solver in (pair.head, pair.mine):
             solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-        kinematic = pair.dofs[np.flatnonzero(pair.mine._kinematic_dof_mask.numpy()[pair.dofs])]
+        kinematic = pair.dofs[np.flatnonzero(pair.mine.factor.kinematic_dof_mask.numpy()[pair.dofs])]
         self.assertEqual(len(kinematic), 1)
         for step in range(4):
             pair.inputs()
             pair.mass_mask(step == 0)
             pair.step(self)
-        np.testing.assert_array_equal(pair.mine.joint_qdd.numpy()[kinematic], 0.0)
+        np.testing.assert_array_equal(pair.mine.factor.joint_qdd.numpy()[kinematic], 0.0)
 
     def test_other_drives_match_the_drive_kernel(self):
         """Prepare the drives outside the branches as the full drive kernel does and leave the branches' alone.
@@ -1405,12 +1447,12 @@ class TestScalarBranchKernels(unittest.TestCase):
         control.joint_target_qd.assign(rng.uniform(-0.1, 0.1, control.joint_target_qd.shape[0]).astype(np.float32))
         head = pair.head
         wp.launch(
-            solver_module._prepare_augmented_joint_drives_by_dof,
+            tree_factor.prepare_augmented_drives,
             dim=model.joint_dof_count,
             inputs=[
-                head._augmented_drive_row_by_dof,
-                head._augmented_drive_q_index_by_dof,
-                head._augmented_drive_target_index_by_dof,
+                head.factor.drive_row_by_dof,
+                head.factor.drive_q_index_by_dof,
+                head.factor.drive_target_index_by_dof,
                 state.joint_q,
                 state.joint_qd,
                 model.joint_target_ke,
@@ -1420,23 +1462,25 @@ class TestScalarBranchKernels(unittest.TestCase):
                 model.joint_effort_limit,
                 DT,
             ],
-            outputs=[head.aug_row_K, head.joint_tau],
+            outputs=[head.factor.aug_row_K, head.factor.joint_tau],
             device=model.device,
         )
-        pair.mine.aug_row_K.fill_(-7.0)
-        pair.mine.joint_tau.fill_(-7.0)
-        pair.state.launch_other_drives(state, pair.mine, control, DT)
+        pair.mine.factor.aug_row_K.fill_(-7.0)
+        pair.mine.factor.joint_tau.fill_(-7.0)
+        pair.state.launch_other_drives(state, pair.mine.factor, control, DT)
         others = pair.state.other_drive_dofs.numpy()
         np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
         self.assertEqual(path_selection._tree_group(pair.state)["drive_dofs"], len(others))
-        rows = pair.mine._augmented_drive_row_by_dof.numpy()
-        np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[others], head.joint_tau.numpy()[others])
+        rows = pair.mine.factor.drive_row_by_dof.numpy()
+        np.testing.assert_array_equal(pair.mine.factor.joint_tau.numpy()[others], head.factor.joint_tau.numpy()[others])
         other_rows = rows[others][rows[others] >= 0]
-        np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[other_rows], head.aug_row_K.numpy()[other_rows])
-        self.assertIn(0.0, head.aug_row_K.numpy()[other_rows])
-        self.assertIn(np.float32(1.0e-3), np.abs(head.joint_tau.numpy()[others]))
-        np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[pair.dofs], -7.0)
-        np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
+        np.testing.assert_array_equal(
+            pair.mine.factor.aug_row_K.numpy()[other_rows], head.factor.aug_row_K.numpy()[other_rows]
+        )
+        self.assertIn(0.0, head.factor.aug_row_K.numpy()[other_rows])
+        self.assertIn(np.float32(1.0e-3), np.abs(head.factor.joint_tau.numpy()[others]))
+        np.testing.assert_array_equal(pair.mine.factor.joint_tau.numpy()[pair.dofs], -7.0)
+        np.testing.assert_array_equal(pair.mine.factor.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
 
 
 def _close(test, expected, actual, index, tag, *, rtol, atol):
@@ -1550,7 +1594,7 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
         travel.append(following.joint_q.numpy()[coordinates].astype(np.float64))
         if diagonal is None:
             diagonal = solver.diag.numpy()[rows].astype(np.float64)
-            axes = solver.joint_S_s.numpy()[dofs, :3].astype(np.float64)
+            axes = solver.factor.joint_S_s.numpy()[dofs, :3].astype(np.float64)
             normals = contacts.rigid_contact_normal.numpy()[: len(pairs)].astype(np.float64)
             along = np.sum(normals * axes, axis=1)
             closed_form = along * along / _key_inertia(model, keys, dofs, axes) + solver.options.pgs_cfm
@@ -1723,17 +1767,17 @@ class TestScalarBranchOwner(unittest.TestCase):
         """
         for names, bodies in ((DROPPED_FIELDS, layout.key_bodies), (ARM_DROPPED_FIELDS, layout.arm_bodies)):
             for name in names:
-                array = getattr(solver, name)
+                array = getattr(solver.factor, name)
                 values = array.numpy()
                 values[bodies] = np.nan
                 array.assign(values)
-        tau, stiffness = solver.joint_tau.numpy(), solver.aug_row_K.numpy()
+        tau, stiffness = solver.factor.joint_tau.numpy(), solver.factor.aug_row_K.numpy()
         tau[layout.key_dofs] = np.nan
-        rows = solver._augmented_drive_row_by_dof.numpy()[layout.key_dofs]
+        rows = solver.factor.drive_row_by_dof.numpy()[layout.key_dofs]
         # A coordinate without a drive row (-1) must not poison the last row, which is an arm's.
         stiffness[rows[rows >= 0]] = np.nan
-        solver.joint_tau.assign(tau)
-        solver.aug_row_K.assign(stiffness)
+        solver.factor.joint_tau.assign(tau)
+        solver.factor.aug_row_K.assign(stiffness)
 
     def _assert_routes(self, head, scalar):
         """Require the routes an A/B compares: the head's ordinary dynamics and the scalar owner.
@@ -1742,9 +1786,9 @@ class TestScalarBranchOwner(unittest.TestCase):
         the arm's group, which the recipe cannot run (see
         ``test_owner_fixtures_give_the_keys_their_own_group``).
         """
-        self.assertIsNone(head._tree_kinetic_state)
+        self.assertIsNone(head.factor.held)
         self.assertIsNone(head._scalar_branches)
-        owner = scalar._tree_kinetic_state
+        owner = scalar.factor.held
         self.assertIsInstance(owner, HeldTree)
         self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
         self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
@@ -1838,7 +1882,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             _close(
                 self,
                 ordinary_inverse_mass(head, KEYBOARD_LEAVES),
-                scalar._diagonal_inverse_mass,
+                scalar.factor.diagonal_inverse_mass,
                 layout.key_dofs,
                 f"{tag} minv",
                 **KEY_BOUND,
@@ -1962,7 +2006,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         with mock.patch.object(wp, "launch", record):
             solver.step(states[0], states[1], control, contacts, DT)
         kernels = [kernel for kernel, _dim in launched]
-        self.assertNotIn(solver_module._prepare_augmented_joint_drives_by_dof, kernels)
+        self.assertNotIn(tree_factor.prepare_augmented_drives, kernels)
         dims = [dim for kernel, dim in launched if kernel is sb.prepare_listed_augmented_drives]
         self.assertEqual(dims, [model.joint_dof_count - STAR_LEAVES * model.world_count])
         self.assertTrue(np.isfinite(states[1].joint_q.numpy()).all())
@@ -2011,9 +2055,9 @@ class TestScalarBranchOwner(unittest.TestCase):
                 states[index] = [following, current]
                 travel[index].append(following.joint_q.numpy()[layout.key_coordinates].copy())
             if step == 0:
-                axes = solvers[1].joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
+                axes = solvers[1].factor.joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
                 np.testing.assert_allclose(
-                    solvers[0].joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7
+                    solvers[0].factor.joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7
                 )
         travel = np.asarray(travel, dtype=np.float64)
         np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-5, atol=1.0e-8)
@@ -2080,8 +2124,10 @@ class TestScalarBranchOwner(unittest.TestCase):
 
         # A free step publishes the motion axes; the pusher presses the key closest to vertical.
         advance()
-        axes = solvers[1].joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
-        np.testing.assert_allclose(solvers[0].joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7)
+        axes = solvers[1].factor.joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
+        np.testing.assert_allclose(
+            solvers[0].factor.joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7
+        )
         key = int(np.argmax(np.abs(axes[:PRESS_LEAVES, 2])))
         self.assertGreater(abs(axes[key, 2]), 0.5)
         pressed = layout.key_leaves.reshape(worlds, -1)[:, key]
@@ -2176,7 +2222,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self._assert_routes(head, scalar)
         # The head route converged: the same solver with many more sweeps.
         reference = recipe_solver(model, scalar=False, pins=_ORDINARY, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
-        self.assertIsNone(reference._tree_kinetic_state)
+        self.assertIsNone(reference.factor.held)
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.options.pgs_beta, dt=DT)
 
@@ -2187,7 +2233,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         solver = recipe_solver(model, scalar=True)
         self.assertIsNone(solver._scalar_branches)
         self.assertIn("revolute leaves run in the held tree's diagonal-mass group", solver._scalar_branches_reason)
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         self.assertIsNone(owner.scalar)
         responses = sorted(group._response for group in owner.groups)
         self.assertEqual(responses, ["cholesky", "diagonal"])

@@ -67,8 +67,8 @@ class TestTreeForestSteps(unittest.TestCase):
         for permuted, motion in ((False, False), (True, False), (True, True)):
             with self.subTest(permuted=permuted, motion=motion):
                 cases = [make_case(enabled, permuted=permuted, motion=motion) for enabled in (False, True)]
-                self.assertIsNone(cases[0][1]._tree_kinetic_state)
-                self.assertIsNotNone(cases[1][1]._tree_kinetic_state)
+                self.assertIsNone(cases[0][1].factor.held)
+                self.assertIsNotNone(cases[1][1].factor.held)
                 coupled = False
                 for index in range(24):
                     orders = []
@@ -90,7 +90,7 @@ class TestTreeForestSteps(unittest.TestCase):
                     model, solver, state, _, _, _, contacts = cases[1]
                     public_state(self, model, state)
                     inspector.assert_sparse_state(cases[1])
-                    np.testing.assert_array_equal(solver._tree_kinetic_state.groups[0].data.current_valid.numpy(), 1)
+                    np.testing.assert_array_equal(solver.factor.held.groups[0].data.current_valid.numpy(), 1)
                     count = int(contacts.rigid_contact_count.numpy()[0])
                     bodies, arts = model.shape_body.numpy(), solver.forest.body_to_articulation.numpy()
                     for a, b in zip(
@@ -130,9 +130,7 @@ class TestTreeForestSteps(unittest.TestCase):
                     for case in cases:
                         inspector.assert_sparse_state(case)
                     public_state(self, cases[1][0], cases[1][2])
-                    np.testing.assert_array_equal(
-                        cases[1][1]._tree_kinetic_state.groups[0].data.current_valid.numpy(), 1
-                    )
+                    np.testing.assert_array_equal(cases[1][1].factor.held.groups[0].data.current_valid.numpy(), 1)
                     inspector.assert_states_close(cases[0][2], cases[1][2])
 
 

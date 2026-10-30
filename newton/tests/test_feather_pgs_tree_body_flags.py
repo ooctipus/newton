@@ -175,15 +175,15 @@ def _snapshot(state):
 def _solver_snapshot(solver):
     """Everything a body-flag notification may change in the solver and its owner."""
     arrays = {
-        "kinematic_dof_mask_host": solver._kinematic_dof_mask_host,
-        "kinematic_dof_mask": solver._kinematic_dof_mask,
-        "kinematic_joint_mask": solver._kinematic_joint_mask,
-        "joint_armature_effective": solver._joint_armature_effective,
-        "fk_id_cache_valid": solver._fk_id_cache_valid,
-        "mass_update_requested": solver._mass_update_requested,
-        **{f"R_by_size[{size}]": solver.R_by_size[size] for size in solver.forest.size_groups},
+        "kinematic_dof_mask_host": solver.factor.kinematic_dof_mask_host,
+        "kinematic_dof_mask": solver.factor.kinematic_dof_mask,
+        "kinematic_joint_mask": solver.factor.kinematic_joint_mask,
+        "joint_armature_effective": solver.factor.armature,
+        "fk_id_cache_valid": solver.factor.fk_id_cache_valid,
+        "mass_update_requested": solver.factor.mass_update_requested,
+        **{f"R_by_size[{size}]": solver.factor.R_by_size[size] for size in solver.forest.size_groups},
     }
-    owner = solver._tree_kinetic_state
+    owner = solver.factor.held
     for index, group in enumerate(getattr(owner, "groups", ())):
         for name in ("geometry_valid", "generation", "geometry_generation", "status"):
             arrays[f"group {index} {name}"] = getattr(group.data, name)
@@ -241,11 +241,11 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
 
     def _notify(self, model, solver, body, flag):
         """Set one body's flag and notify; any owner and its route record must survive."""
-        owner = solver._tree_kinetic_state
+        owner = solver.factor.held
         route = solver.get_path_selection()["routes"]["held_tree"]
         _set_flag(model, body, flag)
         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-        self.assertIs(solver._tree_kinetic_state, owner)
+        self.assertIs(solver.factor.held, owner)
         self.assertEqual(solver.get_path_selection()["routes"]["held_tree"], route)
 
     def _phases(self, model, solver, body, flags, *, load, wrench, steps, graph=False):
@@ -297,7 +297,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         _set_flag(model, links[2], KINEMATIC)
                         solver = _solver(model, beta, cached)
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                            self.assertIsInstance(solver.factor.held, HeldTree)
                         runs[cached, bool(load.any())] = _Rollout(model, solver, links[2], load).run(40)
                     moving = runs["off", True]
                     self.assertGreater(float(np.abs(moving["joint_qd"]).max()), 0.1, "the chain keeps moving")
@@ -362,7 +362,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     model, body = _toggle_scene()
                     solver = _solver(model, beta, cached, update_mass_matrix_interval=100)
                     if cached == "auto":
-                        self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                        self.assertIsInstance(solver.factor.held, HeldTree)
                     runs[cached] = self._phases(
                         model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60
                     )
@@ -395,7 +395,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60, graph=graph
                     )
                 replayed = runs["replayed owner"]
-                self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                self.assertIsInstance(solver.factor.held, HeldTree)
                 self._assert_phases_close(replayed, runs["eager owner"])
                 self._assert_phases_close(replayed, runs["eager ordinary"])
                 self.assertGreater(float(replayed[1]["body_q"][body, 0]), 0.05)
@@ -417,7 +417,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         solver = _solver(model, beta, cached)
                         self.assertTrue(solver.forest.has_prescribed_response)
                         if cached == "auto":
-                            groups = solver._tree_kinetic_state.groups
+                            groups = solver.factor.held.groups
                             if forest == "1":
                                 self.assertEqual([group.layout.root_families for group in groups], [(0, 6)])
                             else:
@@ -450,7 +450,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, links = _chain(floating=base == "floating")
                         solver = _solver(model, beta, cached)
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                            self.assertIsInstance(solver.factor.held, HeldTree)
                         runs[cached] = self._phases(
                             model, solver, links[link], flags, load=links[load], wrench=wrench, steps=20
                         )
@@ -498,7 +498,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, driver, struck = scene()
                         solver = _solver(model, beta, cached)
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
+                            self.assertIsInstance(solver.factor.held, HeldTree)
                             classifier = solver._resolved_worlds_owner
                             self.assertIsNotNone(classifier, solver._resolved_worlds_reason)
                             self.assertTrue(classifier.published)
@@ -519,7 +519,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                 with self.subTest(law=law, cached_dynamics=cached):
                     model, box, probe = _pair_scene()
                     solver = _solver(model, beta, cached)
-                    owner = solver._tree_kinetic_state
+                    owner = solver.factor.held
                     self.assertEqual(owner is not None, cached == "auto")
                     _Rollout(model, solver, probe, wrench).run(5)
                     before = _solver_snapshot(solver)
@@ -530,7 +530,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     with self.assertRaises(RuntimeError) as raised:
                         solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
                     self.assertEqual(str(raised.exception), PRESCRIBED_ERROR)
-                    self.assertIs(solver._tree_kinetic_state, owner)
+                    self.assertIs(solver.factor.held, owner)
                     after = _solver_snapshot(solver)
                     self.assertEqual(after.keys(), before.keys())
                     for key, value in before.items():

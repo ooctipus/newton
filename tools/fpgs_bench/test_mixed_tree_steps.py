@@ -99,7 +99,7 @@ class TestMixedTreeSteps(unittest.TestCase):
             a, b = (getattr(case[2], name).numpy().reshape(case[0].world_count, -1).astype(float) for case in cases)
             error = np.linalg.norm(a - b, axis=1) / (1 + np.linalg.norm(a, axis=1))
             self.assertLess(float(error.max()), 7e-4, name)
-        for group in cases[1][1]._tree_kinetic_state.groups:
+        for group in cases[1][1].factor.held.groups:
             np.testing.assert_array_equal(group.status.numpy(), 0)
             np.testing.assert_array_equal(group.data.current_valid.numpy(), 1)
 
@@ -108,18 +108,18 @@ class TestMixedTreeSteps(unittest.TestCase):
         model, solver, *_ = case
         physical = physical_mass(model, state)
         starts = solver.forest.articulation_dof_start.numpy()
-        rows, coefficients = solver._augmented_drive_row_by_dof.numpy(), solver.aug_row_K.numpy()
-        for group in solver._tree_kinetic_state.groups:
+        rows, coefficients = solver.factor.drive_row_by_dof.numpy(), solver.factor.aug_row_K.numpy()
+        for group in solver.factor.held.groups:
             operator, size = group.sparse, group.layout.dofs
             for index, art in enumerate(operator.plan.group_to_art.numpy()):
                 ids = np.arange(starts[art], starts[art] + size)
-                regularizer = solver.R_by_size[size].numpy()[index].astype(float)
+                regularizer = solver.factor.R_by_size[size].numpy()[index].astype(float)
                 regularizer += [max(0.0, float(coefficients[rows[dof]])) if rows[dof] >= 0 else 0 for dof in ids]
                 expected = physical[np.ix_(ids, ids)] + np.diag(regularizer)
                 if operator.diagonal:
-                    actual = np.diag(1.0 / solver._diagonal_inverse_mass.numpy()[ids])
+                    actual = np.diag(1.0 / solver.factor.diagonal_inverse_mass.numpy()[ids])
                 else:
-                    lower = np.tril(solver.L_by_size[size].numpy()[index].astype(float))
+                    lower = np.tril(solver.factor.L_by_size[size].numpy()[index].astype(float))
                     actual = lower @ lower.T
                 np.testing.assert_allclose(actual, expected, atol=5e-6, rtol=5e-5)
 
@@ -127,8 +127,8 @@ class TestMixedTreeSteps(unittest.TestCase):
         """Preserve coupled steps, held factors, selective resets and numeric updates."""
         for reordered in (False, True):
             cases = self.make_cases(reordered)
-            self.assertIsNone(cases[0][1]._tree_kinetic_state)
-            self.assertIsNotNone(cases[1][1]._tree_kinetic_state)
+            self.assertIsNone(cases[0][1].factor.held)
+            self.assertIsNotNone(cases[1][1].factor.held)
             held = None
             for index in range(24):
                 for arm, case in enumerate(cases):
@@ -143,10 +143,13 @@ class TestMixedTreeSteps(unittest.TestCase):
                     cases[arm] = step(case)
                     if arm and index == 0:
                         self.assert_factor(cases[arm], state)
-                        held = solver.L_by_size[9].numpy().copy(), solver._diagonal_inverse_mass.numpy().copy()
+                        held = (
+                            solver.factor.L_by_size[9].numpy().copy(),
+                            solver.factor.diagonal_inverse_mass.numpy().copy(),
+                        )
                     if arm and index == 1:
-                        np.testing.assert_array_equal(solver.L_by_size[9].numpy(), held[0])
-                        np.testing.assert_array_equal(solver._diagonal_inverse_mass.numpy(), held[1])
+                        np.testing.assert_array_equal(solver.factor.L_by_size[9].numpy(), held[0])
+                        np.testing.assert_array_equal(solver.factor.diagonal_inverse_mass.numpy(), held[1])
                 self.assert_pair(cases)
             wp.synchronize()  # Finish auxiliary streams before replacing this fixture.
 

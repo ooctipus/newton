@@ -1125,7 +1125,7 @@ def test_dense_rows_mark_only_sides_with_coordinates(test, device):
     wp.launch(
         _guarded_factor_marks(capacity, dofs),
         dim=1,
-        inputs=[solver.constraint_count, solver._row_sides, solver._body_factors(), marks],
+        inputs=[solver.constraint_count, solver._row_sides, solver.factor.view(), marks],
         device=device,
     )
     marks = marks.numpy().reshape(model.world_count, words + 2)

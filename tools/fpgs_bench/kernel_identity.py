@@ -153,11 +153,10 @@ def factory_calls():
         response_builds_dense,
         sweep_routes,
         sweep_routes_tiers,
+        tree_ordinary,
     )
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
-    name = "solver_feather_pgs."
     mf_gs = _unwrapped(sweep_routes.mf_gs_kernel)
     toggles = (
         {},
@@ -201,7 +200,12 @@ def factory_calls():
             {"geometric_stride": size * size + 1, "geometric_group": True},
         )
         yield dense + "factor_tiles_kernel", tiles, (size,), {}
-        yield name + "_get_triangular_solve_kernel", _unwrapped(solver._get_triangular_solve_kernel), (size, ARCH), {}
+        yield (
+            "tree_ordinary.triangular_solve_kernel",
+            _unwrapped(tree_ordinary.triangular_solve_kernel),
+            (size, ARCH),
+            {},
+        )
     yield from held_factor_calls()
 
 

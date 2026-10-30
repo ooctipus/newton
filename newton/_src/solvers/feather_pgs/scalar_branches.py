@@ -539,15 +539,15 @@ def plan_scalar_branches(solver, *, size: int | None = None) -> tuple[ScalarBran
     offsets = solver.forest.crba_dof_joint_offset_by_size[size].numpy()
     if kinds.shape[1] != size or not np.array_equal(offsets, np.arange(1, size + 1)):
         return None, "The diagonal-mass group's coordinates do not follow its leaves."
-    if not solver._parallel_augmented_drive_topology:
+    if not solver.factor.parallel_drives:
         return None, "Scalar branches evaluate the augmented drives of the owned drive-row topology."
     roots = model.articulation_start.numpy()[articulations]
     leaf = np.arange(size)[None, :]
     dofs = model.joint_qd_start.numpy()[roots][:, None] + leaf
     coordinates = model.joint_q_start.numpy()[roots][:, None] + leaf
-    driven = solver._augmented_drive_row_by_dof.numpy()[dofs] >= 0
+    driven = solver.factor.drive_row_by_dof.numpy()[dofs] >= 0
     # The kernels read a driven leaf's coordinate directly; the drive rows must address the same one.
-    if np.any(solver._augmented_drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
+    if np.any(solver.factor.drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
         return None, "The augmented drives of the diagonal-mass group do not read its leaf coordinates."
     plan = ScalarBranchPlan(
         size=int(size),
@@ -647,7 +647,7 @@ class ScalarBranchState:
             world_mask,
             self._cache_to_art,
             self.solver.forest.art_to_world,
-            self.solver._fk_id_cache_valid,
+            self.solver.factor.fk_id_cache_valid,
             self._geometry_valid,
         )
 
@@ -682,7 +682,7 @@ class ScalarBranchState:
                 self.dof_joint_offset,
                 model.articulation_start,
                 solver.forest.articulation_dof_start,
-                solver._fk_id_cache_valid,
+                solver.factor.fk_id_cache_valid,
                 model.joint_child,
                 model.joint_q_start,
                 model.joint_X_p,
@@ -691,7 +691,7 @@ class ScalarBranchState:
                 model.body_com,
                 state_in.joint_q,
             ],
-            outputs=[state_in.body_q, state_aug.joint_S_s, solver.articulation_origin],
+            outputs=[state_in.body_q, state_aug.joint_S_s, solver.factor.articulation_origin],
             block_dim=_REPAIR_BLOCK_DIM,
             device=model.device,
         )
@@ -700,7 +700,7 @@ class ScalarBranchState:
         """Prepare the augmented drives of the DOFs outside the branches, whose ``predict`` folds its own.
 
         Writes the drive rows' ``K`` and the drive forces into ``joint_tau`` as
-        ``_prepare_augmented_joint_drives_by_dof`` does, for the listed DOFs only.
+        :func:`.tree_factor.prepare_augmented_drives` does, for the listed DOFs only.
         """
         if self.other_drive_dofs is None:
             return
@@ -710,9 +710,9 @@ class ScalarBranchState:
             dim=self.other_drive_dofs.shape[0],
             inputs=[
                 self.other_drive_dofs,
-                solver._augmented_drive_row_by_dof,
-                solver._augmented_drive_q_index_by_dof,
-                solver._augmented_drive_target_index_by_dof,
+                solver.factor.drive_row_by_dof,
+                solver.factor.drive_q_index_by_dof,
+                solver.factor.drive_target_index_by_dof,
                 state_in.joint_q,
                 state_in.joint_qd,
                 model.joint_target_ke,
@@ -722,7 +722,7 @@ class ScalarBranchState:
                 model.joint_effort_limit,
                 dt,
             ],
-            outputs=[solver.aug_row_K, state_aug.joint_tau],
+            outputs=[solver.factor.aug_row_K, state_aug.joint_tau],
             block_dim=256,
             device=model.device,
         )
@@ -756,21 +756,21 @@ class ScalarBranchState:
             state_in.joint_q,
             state_in.joint_qd,
             stage3_qd,
-            solver._passive_spring_stiffness,
-            solver._passive_spring_ref,
-            solver._passive_joint_damping,
-            solver._kinematic_dof_mask,
-            solver.mass_update_mask,
-            solver.R_by_size[self.size],
-            solver._augmented_drive_row_by_dof,
-            solver._augmented_drive_target_index_by_dof,
+            solver.factor.passive_spring_stiffness,
+            solver.factor.passive_spring_ref,
+            solver.factor.passive_joint_damping,
+            solver.factor.kinematic_dof_mask,
+            solver.factor.mass_update_mask,
+            solver.factor.R_by_size[self.size],
+            solver.factor.drive_row_by_dof,
+            solver.factor.drive_target_index_by_dof,
             model.joint_target_ke,
             model.joint_target_kd,
             control.joint_target_q,
             control.joint_target_qd,
             model.joint_effort_limit,
             dt,
-            solver._diagonal_inverse_mass,
+            solver.factor.diagonal_inverse_mass,
         ]
         wp.launch(
             self.predictor_kernel,
@@ -802,8 +802,8 @@ class ScalarBranchState:
             model.joint_X_c,
             model.joint_axis,
             model.body_com,
-            solver._kinematic_dof_mask,
-            solver._kinematic_joint_mask,
+            solver.factor.kinematic_dof_mask,
+            solver.factor.kinematic_joint_mask,
             state_in.joint_q,
             state_in.joint_qd,
             dt,
@@ -821,8 +821,8 @@ class ScalarBranchState:
                 state_out.body_q,
                 state_out.body_qd,
                 state_aug.joint_S_s,
-                solver.articulation_origin,
-                solver._fk_id_cache_valid,
+                solver.factor.articulation_origin,
+                solver.factor.fk_id_cache_valid,
             ],
             device=model.device,
         )

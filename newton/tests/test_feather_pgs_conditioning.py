@@ -65,7 +65,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
         model, solver, added = _solver(scenes.long_chain(armature=0.0))
         floor = solver.get_path_selection()["routes"]["dynamics"]["armature_floor"]
         self.assertEqual((floor["evaluated_articulations"], floor["articulations"]), (1, 1))
-        extra = solver._joint_armature_effective - model.joint_armature.numpy()
+        extra = solver.factor.armature - model.joint_armature.numpy()
         self.assertEqual(floor["coordinates"], int(np.count_nonzero(extra)))
         self.assertAlmostEqual(floor["largest"], float(extra.max()), places=6)
         # The free root's translations and tilts keep their armature; its yaw gains the most.
@@ -82,7 +82,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
                 floor = solver.get_path_selection()["routes"]["dynamics"]["armature_floor"]
                 self.assertEqual(floor["evaluated_articulations"], 0)
                 self.assertEqual(floor["coordinates"], 0)
-                np.testing.assert_array_equal(solver._joint_armature_effective, model.joint_armature.numpy())
+                np.testing.assert_array_equal(solver.factor.armature, model.joint_armature.numpy())
                 self.assertEqual(added, [])
 
     def test_geared_chain_lifts_only_its_root_yaw(self):
@@ -91,7 +91,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
         model, solver, _ = _solver(scenes.long_chain())
         floor = solver.get_path_selection()["routes"]["dynamics"]["armature_floor"]
         self.assertEqual(floor["evaluated_articulations"], 1)
-        extra = solver._joint_armature_effective - model.joint_armature.numpy()
+        extra = solver.factor.armature - model.joint_armature.numpy()
         self.assertEqual(np.flatnonzero(extra).tolist(), [5])
         self.assertLess(float(extra[5]), 1.0e-5)
 
@@ -110,7 +110,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
         size = solver.forest.size_groups[0]
-        self.assertTrue(np.isfinite(solver.L_by_size[size].numpy()).all())
+        self.assertTrue(np.isfinite(solver.factor.L_by_size[size].numpy()).all())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_cuda_adds_the_cpu_armature(self):
@@ -122,8 +122,8 @@ class TestFeatherPGSConditioning(unittest.TestCase):
         """
         model, cpu, _ = _solver(scenes.long_chain(armature=0.0), "cpu")
         _, cuda, _ = _solver(scenes.long_chain(armature=0.0), "cuda:0")
-        extra = cpu._joint_armature_effective - model.joint_armature.numpy()
-        cuda_extra = cuda._joint_armature_effective - model.joint_armature.numpy()
+        extra = cpu.factor.armature - model.joint_armature.numpy()
+        cuda_extra = cuda.factor.armature - model.joint_armature.numpy()
         np.testing.assert_allclose(cuda_extra, extra, rtol=0.0, atol=0.1 * float(extra.max()))
         self.assertAlmostEqual(float(cuda_extra.sum()), float(extra.sum()), delta=0.02 * float(extra.sum()))
 

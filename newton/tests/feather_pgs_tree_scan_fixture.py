@@ -471,7 +471,7 @@ def articulated_model(shapes, worlds: int, device, seed: int = 0):
 
 @dataclass
 class GeneralRoute:
-    """A model's general-route passes on a solver's own arrays and binding (``_dynamics``), with random
+    """A model's general-route passes on a solver's own arrays and binding (``factor.ordinary.dynamics``), with random
     external wrenches, generalized forces, and passive springs and dampers on the one-coordinate axes."""
 
     model: object
@@ -479,7 +479,7 @@ class GeneralRoute:
     state: object
     control: object
     aug: object
-    """The augmented state: the solver, which holds the step's state-derived dynamics."""
+    """The augmented state: the solver's tree factor, which holds the step's state-derived dynamics."""
     size_groups: list
     """Per coordinate count: ``(size, group_to_art)``, the articulations of that size."""
     H: dict
@@ -505,13 +505,13 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
         model.joint_type.numpy()[dof_joint], (int(newton.JointType.REVOLUTE), int(newton.JointType.PRISMATIC))
     )
     for name, low, high in (
-        ("_passive_spring_stiffness", 0.5, 2.0),
-        ("_passive_spring_ref", -0.5, 0.5),
-        ("_passive_joint_damping", 0.1, 0.5),
+        ("passive_spring_stiffness", 0.5, 2.0),
+        ("passive_spring_ref", -0.5, 0.5),
+        ("passive_joint_damping", 0.1, 0.5),
     ):
         values = np.where(axes, rng.uniform(low, high, dofs), 0.0).astype(np.float32)
-        setattr(solver, name, wp.array(values, dtype=float, device=device))
-    solver.mass_update_mask.fill_(1)
+        setattr(solver.factor, name, wp.array(values, dtype=float, device=device))
+    solver.factor.mass_update_mask.fill_(1)
     starts = model.articulation_start.numpy()
     counts = np.diff(model.joint_qd_start.numpy()[starts])
     sizes = [int(size) for size in np.unique(counts)]
@@ -520,7 +520,7 @@ def general_route(model, seed: int = 3) -> GeneralRoute:
         solver,
         state,
         control,
-        solver,
+        solver.factor,
         [(size, wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device)) for size in sizes],
         {size: wp.zeros((int(np.sum(counts == size)), size, size), dtype=float, device=device) for size in sizes},
     )
@@ -536,7 +536,7 @@ def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None,
     from newton._src.solvers.feather_pgs import tree_passes  # noqa: PLC0415
 
     m, solver, device = route.model, route.solver, route.model.device
-    dynamics = solver._dynamics(route.state, route.aug, route.control, **values)
+    dynamics = solver.factor.ordinary.dynamics(route.state, route.control, **values)
     kernels = {
         "fk_id": (tree_passes.fk_id, tree_passes.SERIAL_BLOCK_DIM),
         "tau": (tree_passes.inverse_dynamics_tau, tree_passes.SERIAL_BLOCK_DIM),
@@ -559,7 +559,7 @@ def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None,
             wp.launch,
             tree_passes.crba_fill,
             group_to_art.size * size,
-            inputs=[dynamics, solver.body_I_c, group_to_art, size],
+            inputs=[dynamics, solver.factor.body_I_c, group_to_art, size],
             outputs=[route.H[size]],
             block_dim=block_dim or 128,
             device=device,

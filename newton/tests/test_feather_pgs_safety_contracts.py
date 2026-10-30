@@ -42,20 +42,20 @@ class TestFeatherPGSSafety(unittest.TestCase):
                 mask = wp.array([True, False], dtype=wp.bool, device=device)
                 solver.reset(state, mask)
                 solver.step(state, output, control, None, 0.01)
-                np.testing.assert_array_equal(solver.mass_update_mask.numpy(), [1, 0])
+                np.testing.assert_array_equal(solver.factor.mass_update_mask.numpy(), [1, 0])
                 if wp.get_device(device).is_cuda:
-                    first_mask = wp.empty_like(solver.mass_update_mask)
+                    first_mask = wp.empty_like(solver.factor.mass_update_mask)
                     with wp.ScopedCapture(device=device) as capture:
                         solver.seed_double_buffer_events()
                         solver.reset(state, mask)
                         solver.step(state, output, control, None, 0.01)
-                        wp.copy(first_mask, solver.mass_update_mask)
+                        wp.copy(first_mask, solver.factor.mass_update_mask)
                         solver.step(state, output, control, None, 0.01)
                     mask.assign(np.array([False, True]))
                     wp.capture_launch(capture.graph)
                     np.testing.assert_array_equal(first_mask.numpy(), [0, 1])
                     # The request is consumed by the first step; the next reuses both factors.
-                    np.testing.assert_array_equal(solver.mass_update_mask.numpy(), [0, 0])
+                    np.testing.assert_array_equal(solver.factor.mass_update_mask.numpy(), [0, 0])
 
     def test_unmatched_pipeline_clears_stale_contact_identity(self):
         """Cold-start a matched buffer when its current producer disables matching."""

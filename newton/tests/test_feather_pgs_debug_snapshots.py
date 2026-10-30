@@ -369,7 +369,7 @@ def test_opt_in_keeps_snapshot_attributes(test, device):
                 velocity = (
                     solver.qd_work if solver.options.enable_joint_velocity_limits else run["inputs"][step].joint_qd
                 )
-                expected = [velocity, solver.joint_qdd, solver.v_hat]
+                expected = [velocity, solver.factor.joint_qdd, solver.v_hat]
                 test.assertEqual(len(taken), len(SNAPSHOTS), step)
                 for (dest, src), name, source in zip(taken, SNAPSHOTS, expected, strict=True):
                     test.assertIs(dest, getattr(solver, name), (step, name))

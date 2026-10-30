@@ -135,7 +135,7 @@ def _permuted_slots(solver, contacts, shift):
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
         _sparse_mass_matrix_size=None,
         # The bodies' factors, which whitened the rows.
-        L_by_size=solver.L_by_size,
+        factor=SimpleNamespace(L_by_size=solver.factor.L_by_size),
         forest=SimpleNamespace(
             body_to_articulation=solver.forest.body_to_articulation, art_group_idx=solver.forest.art_group_idx
         ),

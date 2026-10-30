@@ -474,6 +474,7 @@ class KeyedRows:
             PrefixInput,
             self.prefix,
             solver=s,
+            factor=s.factor,
             laws=s.laws,
             options=s.options,
             model=s.model,

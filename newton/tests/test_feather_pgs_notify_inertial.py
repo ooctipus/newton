@@ -110,7 +110,7 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         device = wp.get_device()
         model = _build_model(device)
         solver = SolverFeatherPGS(model)
-        stale_X_com = solver.body_X_com.numpy().copy()
+        stale_X_com = solver.factor.body_X_com.numpy().copy()
 
         body_com = model.body_com.numpy()
         body_com[0] = NEW_COM
@@ -119,13 +119,13 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         body_mass[0] *= 2.0
         model.body_mass.assign(body_mass)
 
-        np.testing.assert_array_equal(solver.body_X_com.numpy(), stale_X_com)
+        np.testing.assert_array_equal(solver.factor.body_X_com.numpy(), stale_X_com)
         solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
 
         np.testing.assert_allclose(
-            solver.body_X_com.numpy()[0][:3], np.asarray(NEW_COM, dtype=np.float32), rtol=0.0, atol=0.0
+            solver.factor.body_X_com.numpy()[0][:3], np.asarray(NEW_COM, dtype=np.float32), rtol=0.0, atol=0.0
         )
-        self.assertEqual(solver._mass_update_requested.numpy()[0], 1)
+        self.assertEqual(solver.factor.mass_update_requested.numpy()[0], 1)
 
     def test_com_change_with_notify_matches_freshly_built_solver(self):
         """Verify a mid-run COM change plus notify reproduces baked-COM dynamics.

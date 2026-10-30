@@ -218,8 +218,8 @@ def test_mixed_arm_and_spinning_bodies(test, device):
                 return np.asarray(values)
 
             initial_energy = energies(states[0])
-            test.assertIn(6, solver.L_by_size)
-            test.assertIn(19, solver.L_by_size)
+            test.assertIn(6, solver.factor.L_by_size)
+            test.assertIn(19, solver.factor.L_by_size)
 
             def step(scenes=scenes):
                 """Advance the mixed scene and its independent controls together."""
@@ -269,18 +269,24 @@ class TestFeatherPGSGyroscopic(unittest.TestCase):
         qd = solver._debug_stage3_qd_work
         explicit = qd.numpy() + dt * solver._debug_stage3_joint_qdd.numpy()
         solver.v_hat.assign(explicit)
-        solver._stage3_correct_free_root_velocity(state, qd, dt)
+        solver.factor.correct_free_root_velocity(state, qd, dt, solver.v_hat)
         expected = solver.v_hat.numpy().copy()
         self.assertGreater(np.max(np.abs(expected[3:] - explicit[3:])), 1.0e-4)
         solver.v_hat.assign(explicit)
         wp.launch(
             kernels.apply_free_root_transport_to_predictor,
             dim=solver.forest.free_root_joint_count,
-            inputs=[solver.forest.free_root_joint_indices, model.joint_qd_start, solver._kinematic_joint_mask, qd, dt],
+            inputs=[
+                solver.forest.free_root_joint_indices,
+                model.joint_qd_start,
+                solver.factor.kinematic_joint_mask,
+                qd,
+                dt,
+            ],
             outputs=[solver.v_hat],
             device=model.device,
         )
-        solver._stage3_correct_free_root_velocity(state, qd, dt, apply_transport=False)
+        solver.factor.correct_free_root_velocity(state, qd, dt, solver.v_hat, apply_transport=False)
         np.testing.assert_array_equal(solver.v_hat.numpy(), expected)
 
 

@@ -71,7 +71,7 @@ def check_physics(test, device):
             state.body_q,
             model.body_com,
             solver.forest.body_to_articulation,
-            solver.articulation_origin,
+            solver.factor.articulation_origin,
         ],
         outputs=[state.body_qd],
         device=device,
@@ -101,8 +101,8 @@ def check_physics(test, device):
     q_start = model.joint_q_start.numpy()
     dof_joint = np.repeat(np.arange(model.joint_count), np.diff(qd_start))
     q = reference.joint_q.numpy()[q_start[dof_joint]].astype(np.float64)
-    passive = solver._passive_spring_stiffness.numpy() * (solver._passive_spring_ref.numpy() - q)
-    passive -= solver._passive_joint_damping.numpy() * qd
+    passive = solver.factor.passive_spring_stiffness.numpy() * (solver.factor.passive_spring_ref.numpy() - q)
+    passive -= solver.factor.passive_joint_damping.numpy() * qd
     expected = (
         route.control.joint_f.numpy()
         + passive
@@ -115,12 +115,12 @@ def check_physics(test, device):
 
     # Composite inertia: each body's record plus its subtree's, children after parents in joint order.
     run_pass(route, "composite_inertia")
-    composite = solver._body_inertia_terms.numpy().astype(np.float64)
+    composite = solver.factor.body_inertia_terms.numpy().astype(np.float64)
     parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
     for joint in range(model.joint_count - 1, -1, -1):
         if parent[joint] >= 0:
             composite[parent[joint]] += composite[child[joint]]
-    test.assertLess(_gap(solver.body_I_c.numpy(), composite), 16.0, "composite inertia")
+    test.assertLess(_gap(solver.factor.body_I_c.numpy(), composite), 16.0, "composite inertia")
 
     # Joint-space inertias: Newton's mass matrix; each entry written once, so exactly symmetric.
     run_pass(route, "crba")
@@ -142,11 +142,10 @@ class _Stages:
 
         self.solver = SolverFeatherPGS(model)
         self.state, self.out = model.state(), model.state()
-        self.aug = self.solver
 
     def mass_matrices(self) -> list:
-        self.solver._stage1_fk_id(self.state, self.aug, self.out)
-        self.solver._stage1_crba(self.aug, None)
+        self.solver.factor.fk_id(self.state, self.out, self.solver._step, self.solver.qd_work)
+        self.solver.factor.refresh(None, self.solver._step)
         return [self.solver.H_by_size[size] for size in self.solver.forest.size_groups]
 
 
@@ -181,7 +180,7 @@ def check_up_scans_read_no_stale_slot(test, device):
         run_inputs(route, name)
         results = []
         for fill in (0.0, np.nan):
-            array = getattr(route.aug if name == "tau" else route.solver, scratch)
+            array = getattr(route.aug, scratch)
             array.assign(np.full(array.numpy().shape, fill, dtype=np.float32))
             route.aug.joint_tau.zero_()
             run_pass(route, name, write_inertia_records=1)

@@ -27,7 +27,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     """
     Z_a = solver.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
-    factors = solver.L_by_size[6].numpy().astype(np.float64)
+    factors = solver.factor.L_by_size[6].numpy().astype(np.float64)
     articulation = solver.forest.body_to_articulation.numpy()
     group = solver.forest.art_group_idx.numpy()
     row_type = solver.mf_row_type.numpy()

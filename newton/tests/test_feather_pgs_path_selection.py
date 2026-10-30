@@ -323,7 +323,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
-        solver.options = solver.laws.options = dataclasses.replace(solver.options, pgs_iterations=3)
+        solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
+            solver.options, pgs_iterations=3
+        )
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
 
     def test_positional_options_warn_and_build_the_keyword_solver(self):
@@ -754,7 +756,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             self.assertIn("friction_anchor_beta", patch_sparse["active_rows_reason"])
             self.assertIn("Small worlds", patch_sparse["contact_triplets_reason"])
         tree = routes["held_tree"]
-        self.assertEqual(tree["owner"] is None, point._tree_kinetic_state is None)
+        self.assertEqual(tree["owner"] is None, point.factor.held is None)
         for group in tree["groups"]:
             self.assertIn(group["lanes"], (4, 8, 16, 32, 64))
             self.assertEqual(len(group["roots"]), len(group["root_families"]))
@@ -1016,7 +1018,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         builder.replicate(world, 2)
         model = builder.finalize(device="cuda:0")
         solver = _make_solver(model, False, friction_anchor_beta=0.0)
-        self.assertIsNone(solver._tree_kinetic_state)
+        self.assertIsNone(solver.factor.held)
         self.assertIn("Ordinary dynamics retained", solver.get_path_selection()["reasons"]["cached_dynamics"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
