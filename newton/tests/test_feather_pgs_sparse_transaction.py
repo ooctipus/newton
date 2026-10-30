@@ -318,24 +318,32 @@ class TestContactUnits(unittest.TestCase):
                     "const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;", unit
                 )
                 self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", unit)
-                self.assertIn("r == 0 ? -residual * unit_inverse : -residual / denom", unit)
+                self.assertIn(
+                    "r == 0 ? -residual * unit_inverse : -residual / (r == 0 ? unit_diag0 : unit_diag1)", unit
+                )
                 self.assertEqual("normal_parent < 0" in unit, not linked)
                 # Linked visits pool listed members and walk only rings longer than four members.
                 self.assertEqual("ring.w < 0" in unit, linked)
                 self.assertEqual("make_int4(first, second, third, others)" in snippet, linked)
                 self.assertEqual(unit.count("RING_LOAD("), int(linked))
-                # Every lane reads the unit's impulses with its rows, before the reduction; each row's law then
-                # orders every lane's reads before lane 0's writes with a warp barrier: shuffles order execution, not
-                # memory.
+                # Every lane reads the unit's staged values (impulses, right-hand sides, diagonals) with its rows,
+                # before the reduction; each row's law then orders every lane's reads before lane 0's writes with a
+                # warp barrier: shuffles order execution, not memory.
                 reduction = unit.index("SUM(")
-                self.assertLess(unit.index("unit_lam1 = s_impulse[tangent]"), reduction)
-                self.assertLess(unit.index("unit_lam0 = s_impulse[i]"), reduction)
+                for held in (
+                    "unit_lam1 = s_impulse[head + 1]",
+                    "unit_rhs2 = s_rhs[head + 2]",
+                    "unit_diag1 = s_diag[head + 1]",
+                ):
+                    self.assertLess(unit.index(held), reduction)
                 self.assertLess(unit.index("SYNC();"), unit.index("if (lane == 0) s_impulse[i] = new_impulse;"))
                 # The rows read those registers and pool the ring from the normal's new impulse in a register, so
                 # they read no store of the unit: only the normal's stores wait for the lanes (beside the gate's own
-                # barrier), and the unit synchronizes once, after its apply.
+                # barrier), and the unit synchronizes once, after its apply. Nor do they read a staged right-hand side
+                # or diagonal, which would wait for the normal's barrier.
                 rows = unit[unit.index("for (int r = 0; r < 2; ++r) {") : unit.index("if (unit_dn != 0.0f ||")]
                 self.assertEqual(re.findall(r"s_impulse\[[^\]]*\](?! = )", rows), [])
+                self.assertEqual(re.findall(r"s_(?:rhs|diag)\[", rows), [])
                 self.assertIn("if (r == 0) SYNC();", rows)
                 self.assertEqual(rows.count("SYNC();"), 2)
                 self.assertRegex(snippet[start:], r"consumed_tangent = tangent;\s+SYNC\(\);")

@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.response_operator import Lanes, ResidualBlo
 from newton._src.solvers.feather_pgs.solve_policy import Change, SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
     FRICTION,
+    UNIT_HELD,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -23,6 +24,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     friction_radius,
     row_update,
     row_visit,
+    unit_held_loads,
 )
 
 
@@ -185,11 +187,14 @@ class TestRowVisit(unittest.TestCase):
 class TestContactUnit(unittest.TestCase):
     """A contact unit's rows by the row law (:func:`.sweep.contact_unit`): where the lanes synchronize."""
 
-    def _unit(self, lanes=None, check=None, held=("lam0", "lam1", "lam2"), **options):
-        ctx = dataclasses.replace(
+    def _context(self, lanes=None, **options):
+        return dataclasses.replace(
             _context(_UnitRows(diagonal=lambda row: f"A[{row}]"), lanes, **options),
             ring_load=lambda parent, load=None: f"RING_LOAD({load or f'lam[{parent}]'})",
         )
+
+    def _unit(self, lanes=None, check=None, held=True, **options):
+        ctx = self._context(lanes, **options)
         declare = "const int i = head + r;\nconst int row_type = r == 0 ? 0 : 2;\nconst float denom = A[i];"
         laws = RowLaws(regularize=False)
         return contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check=check, held=held, pad="")
@@ -201,7 +206,7 @@ class TestContactUnit(unittest.TestCase):
         unit's apply."""
         unit = self._unit()
         self.assertEqual(re.findall(r"lam\[[^\]]*\](?! = )", unit), [])
-        self.assertIn("float unit_normal = lam0;", unit)
+        self.assertIn("float unit_normal = unit_lam0;", unit)
         self.assertIn("RING_LOAD(unit_normal)", unit)
         self.assertRegex(
             unit,
@@ -209,6 +214,25 @@ class TestContactUnit(unittest.TestCase):
         )
         self.assertEqual(unit.count("SYNC();"), 2)
         self.assertNotIn("if (denom <= 0.0f", unit)
+
+    def test_held_rows_read_no_staged_value_after_a_barrier(self):
+        """A barrier orders the reads after it, so the held rows read their right-hand sides and diagonals, like their
+        impulses, from the registers the placement loaded with the unit (:func:`.sweep.unit_held_loads`), the pair's
+        too: no staged read waits for the normal's stores."""
+        unit = self._unit()
+        self.assertEqual(re.findall(r"\b(?:rhs|A)\[[^\]]*\]", unit), ["A[i]"])  # the declared diagonal, unread
+        self.assertIn("float residual = jv + (r == 0 ? unit_rhs0 : unit_rhs1);", unit)
+        self.assertIn("(unit_jv2 + gram_n2 * unit_dn) + unit_rhs2;", unit)
+        self.assertIn("fabsf(delta_impulse) * ((r == 0 ? unit_diag0 : unit_diag1))", unit)
+        ctx = self._context()
+        self.assertEqual(
+            [unit_held_loads(ctx, name, "h", "") for name in UNIT_HELD],
+            [
+                "const float unit_lam0 = lam[h], unit_lam1 = lam[h + 1], unit_lam2 = lam[h + 2];",
+                "const float unit_rhs0 = rhs[h], unit_rhs1 = rhs[h + 1], unit_rhs2 = rhs[h + 2];",
+                "const float unit_diag0 = A[h], unit_diag1 = A[h + 1], unit_diag2 = A[h + 2];",
+            ],
+        )
 
     def test_a_normal_the_visit_may_skip_leaves_every_rows_stores_waiting(self):
         """Where the placement did not admit the normal, a skipped normal leaves the pair's stores first."""
@@ -222,14 +246,14 @@ class TestContactUnit(unittest.TestCase):
         """Rows that every lane stores alike, or one thread's, hold nothing and synchronize only at the gate."""
         for lanes, owned in ((Lanes(32), False), (Lanes(1), True)):
             with self.subTest(width=lanes.width):
-                unit = self._unit(lanes, check="denom", held=None, owned=owned)
+                unit = self._unit(lanes, check="denom", held=False, owned=owned)
                 self.assertNotIn("unit_normal", unit)
                 self.assertIn("RING_LOAD(lam[parent])", unit)
                 self.assertEqual(unit.count("SYNC();"), int(lanes.parallel))
 
     def test_owned_rows_hold_their_impulses_exactly_where_the_lanes_share_the_stores(self):
         with self.assertRaises(ValueError):
-            self._unit(held=None)
+            self._unit(held=False)
         with self.assertRaises(ValueError):
             self._unit(Lanes(1))
 

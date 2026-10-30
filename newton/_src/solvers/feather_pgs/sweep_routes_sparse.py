@@ -48,6 +48,7 @@ from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    UNIT_HELD,
     VELOCITY_LIMIT,
     CachedPairMetric,
     RowContext,
@@ -58,6 +59,7 @@ from .sweep import (
     end_sweep,
     indent,
     row_visit,
+    unit_held_loads,
     velocity_limit_pass,
 )
 
@@ -600,7 +602,7 @@ if (index >= 0) {{
     ctx = RowContext(
         row="i",
         kind="row_type",
-        operator=dataclasses.replace(unit_op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row)),
+        operator=dataclasses.replace(unit_op, diagonal=rows.diag),
         load=rows.load,
         store=rows.store,
         rhs=rows.rhs_of,
@@ -614,19 +616,10 @@ if (index >= 0) {{
         pair_law="UNIT_PAIR(0, ",
     )
     declare = f"""const int i = head + r;
-const int row_type = r == 0 ? {CONTACT} : {FRICTION};
-const float denom = s_diag[i];"""
-    # The guards admitted the normal (a positive diagonal); the rows read the unit's impulses as it loaded them.
-    rows_text = contact_unit(
-        ctx,
-        laws,
-        rows="3",
-        declare=declare,
-        parent="head",
-        check=None,
-        held=("unit_lam0", "unit_lam1", "unit_lam2"),
-        pad="        ",
-    )
+const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
+    # The guards admitted the normal (a positive diagonal); the rows read the unit's staged values as it loaded them.
+    rows_text = contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check=None, held=True, pad="        ")
+    held = "\n".join(unit_held_loads(ctx, name, "head", "        ") for name in UNIT_HELD)
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
@@ -650,10 +643,10 @@ if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
         float tangent_responses[{count}], sibling_responses[{count}];
         float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
 {gather}
-        // The unit's impulses load with its rows, off the reduction's chain; the rows' law reads them.
-        const float unit_lam0 = s_impulse[i], unit_lam1 = s_impulse[tangent], unit_lam2 = s_impulse[sibling];
+        // The unit's staged values load with its rows, off the reduction's chain; the rows' law reads them.
+{held}
         // The pair's metric is relative to its larger tangent diagonal, as the pair law scales it.
-        const float tangent_scale = fmaxf(fmaxf(s_diag[tangent], s_diag[sibling]), 1.0e-20f);
+        const float tangent_scale = fmaxf(fmaxf(unit_diag1, unit_diag2), 1.0e-20f);
         SUM(unit_jv0, unit_jv1, unit_jv2);
         // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
         const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;

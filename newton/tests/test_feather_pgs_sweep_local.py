@@ -184,6 +184,12 @@ class TestPairedFactorRoute(unittest.TestCase):
             # pair's first), no row synchronizes after its stores, and the unit does once after its apply.
             self.assertEqual(re.findall(r"s_lam\[[^\]]*\](?! = )", units), [])
             self.assertIn("RING_LOAD(unit_normal, parent, m, ring_parent, ring_impulse)", units)
+            # Nor do they read a staged right-hand side or diagonal after a barrier: the unit holds them too, loaded
+            # before its ladder (the normal's check reads its declared diagonal before its barrier).
+            for held in ("unit_rhs0 = s_rhs[head]", "unit_diag2 = s_diag[head + 2]"):
+                self.assertLess(units.index(held), units.index(unit))
+            rows = units[units.index("for (int r = 0; r < 2; ++r) {") : units.index(apply)]
+            self.assertEqual(re.findall(r"s_(?:rhs|diag)\[[^\]]*\]", rows), ["s_diag[i]"])
             self.assertEqual(units.count("SYNC();"), 3)
             self.assertRegex(units, re.escape(apply) + r"\s+SYNC\(\);\s+}$")
             rest = body[body.index(units) + len(units) :]

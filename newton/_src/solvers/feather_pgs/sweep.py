@@ -720,6 +720,19 @@ def cached_pair_law(name: str, scale: str, low: str, high: str, axis: tuple[str,
     return "\n".join(pad + line for line in lines)
 
 
+UNIT_HELD = ("unit_lam", "unit_rhs", "unit_diag")
+"""The registers in which a contact unit's placement holds its rows' staged values (:func:`contact_unit`), numbered by
+the unit's row (0 the normal, 1 and 2 its pair): the impulses, right-hand sides and diagonals."""
+
+
+def unit_held_loads(ctx: RowContext, name: str, head: str, pad: str) -> str:
+    """Declare the held registers ``name`` (one of :data:`UNIT_HELD`) of the contact unit headed by row ``head``, read
+    from the row store of ``ctx``: a placement's loads with the unit's rows, ahead of its reduction."""
+    read = dict(zip(UNIT_HELD, (ctx.load, ctx.rhs, ctx.operator.diagonal), strict=True))[name]
+    rows = (head, f"{head} + 1", f"{head} + 2")
+    return f"{pad}const float " + ", ".join(f"{name}{k} = {read(row)}" for k, row in enumerate(rows)) + ";"
+
+
 def contact_unit(
     ctx: RowContext,
     laws: RowLaws,
@@ -728,7 +741,7 @@ def contact_unit(
     declare: str,
     parent: str,
     check: str | None,
-    held: tuple[str, str, str] | None = None,
+    held: bool = False,
     pad: str,
 ) -> str:
     """The rows of a contact unit by the row law (BACKBONE §1 step 5), after the placement's one reduction of the
@@ -741,20 +754,34 @@ def contact_unit(
     skips its row leaves it (a one-pass loop), not the unit.
 
     The rows defer their applies, so none synchronizes the lanes after it: the placement does once, after the unit's
-    apply. Where the rows' first lane owns the stores, the placement holds the unit's three impulses in registers
-    (``held``: the normal's and the two tangents', loaded before its reduction), which the rows read, and the pair
-    pools its ring from the normal's new impulse in a register (``unit_normal``, what the normal stores). The rows then
-    read no store of the unit, so only the unit's first stores wait for every lane's reads: the normal's where the
-    placement admitted it, else each row's (a skipped normal leaves the pair's stores first). Rows that every lane
-    stores alike, or one thread's, read only their own stores.
+    apply. Where the rows' first lane owns the stores, the placement holds the unit's staged values in registers
+    (``held``: :data:`UNIT_HELD`, the impulses, right-hand sides and diagonals of the normal and its two tangents,
+    loaded with its rows ahead of its reduction, :func:`unit_held_loads`), which the rows read, and the pair pools its
+    ring from the normal's new impulse in a register (``unit_normal``, what the normal stores). The rows then read no
+    store of the unit, so only the unit's first stores wait for every lane's reads: the normal's where the placement
+    admitted it, else each row's (a skipped normal leaves the pair's stores first). Nor does a row read its staged
+    values after such a barrier, which orders the reads after it (a memory fence): the pair's right-hand sides and
+    diagonals would load after the normal's stores, on the unit's critical chain. Rows that every lane stores alike, or
+    one thread's, pass no barrier and read their own stores.
     """
-    if (ctx.owned and ctx.lanes.parallel) != (held is not None):
-        raise ValueError("a contact unit holds its impulses in registers exactly where its first lane owns the stores")
+    if (ctx.owned and ctx.lanes.parallel) != held:
+        raise ValueError(
+            "a contact unit holds its staged values in registers exactly where its first lane owns the stores"
+        )
     unit = dataclasses.replace(ctx, fenced=False, synced=False, first_store="r == 0" if check is None else None)
     declarations = [f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;"]
-    if held is not None:
-        normal, tangent, sibling = held
-        loads = {ctx.row: f"(r == 0 ? {normal} : {tangent})", f"{ctx.row} + 1": sibling, "sib": sibling}
+    if held:
+        if ctx.operator.diagonal is None:
+            raise ValueError("a held contact unit reads its rows' diagonals")
+        impulse, rhs, diagonal = UNIT_HELD
+
+        def held_row(name: str, row: str) -> str | None:
+            # The visited row (the normal, then the first tangent), the row after it and the pair's second tangent.
+            index = {ctx.row: (0, 1), f"{ctx.row} + 1": (1, 2), "sib": (2, 2)}
+            if row not in index:
+                return None
+            normal, pair = index[row]
+            return f"{name}{pair}" if normal == pair else f"(r == 0 ? {name}{normal} : {name}{pair})"
 
         def store(row: str, value: str) -> str:
             stored = ctx.store(row, value)
@@ -762,11 +789,15 @@ def contact_unit(
 
         unit = dataclasses.replace(
             unit,
-            load=lambda row: loads.get(row) or ctx.load(row),
+            operator=dataclasses.replace(
+                ctx.operator, diagonal=lambda row: held_row(diagonal, row) or ctx.operator.diagonal(row)
+            ),
+            load=lambda row: held_row(impulse, row) or ctx.load(row),
+            rhs=lambda row: held_row(rhs, row) or ctx.rhs(row),
             store=store,
             ring_load=lambda row: ctx.ring_load(row, "unit_normal"),
         )
-        declarations.append(f"{pad}float unit_normal = {normal};")
+        declarations.append(f"{pad}float unit_normal = {impulse}0;")
     visit = row_visit(unit, laws, parent=parent, check=check, pad=pad + "    ")
     lines = [
         *declarations,

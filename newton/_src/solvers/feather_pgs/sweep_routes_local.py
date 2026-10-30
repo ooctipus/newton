@@ -36,6 +36,7 @@ from .sweep import (
     CONTACT,
     FRICTION,
     JOINT_LIMIT,
+    UNIT_HELD,
     RowContext,
     RowLaws,
     UnitOperator,
@@ -49,6 +50,7 @@ from .sweep import (
     pair_update,
     row_update,
     row_visit,
+    unit_held_loads,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -722,23 +724,19 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     )
 
     diagonal = lambda row: "denom" if row == "i" else f"s_diag[{row}]"  # noqa: E731
+    unit_ctx = dataclasses.replace(rows, operator=dataclasses.replace(unit, diagonal=diagonal))
     unit_rows = contact_unit(
-        dataclasses.replace(rows, operator=dataclasses.replace(unit, diagonal=diagonal)),
-        laws,
-        rows="3",
-        declare=declare,
-        parent="head",
-        check="denom",
-        held=("unit_lam0", "unit_lam1", "unit_lam2"),
-        pad="    ",
+        unit_ctx, laws, rows="3", declare=declare, parent="head", check="denom", held=True, pad="    "
     )
 
+    impulses, *staged = UNIT_HELD
     lines = [
         f"const float row_z = {op.load('head')};",
         f"const float tangent1_z = {op.load('head + 1')};",
         f"const float tangent2_z = {op.load('head + 2')};",
-        "const float unit_lam0 = s_lam[head], unit_lam1 = s_lam[head + 1], unit_lam2 = s_lam[head + 2];",
+        unit_held_loads(unit_ctx, impulses, "head", ""),
         "if (unit_lam0 != 0.0f || unit_lam1 != 0.0f || unit_lam2 != 0.0f) {",
+        *(unit_held_loads(unit_ctx, name, "head", "    ") for name in staged),
         "    // The unit's velocity terms, the pair's Gram couplings with the normal and their magnitudes, in one ladder.",
         unit._sums(channels, "    ", magnitudes=("gram_n1", "gram_n2")),
         unit_rows,
