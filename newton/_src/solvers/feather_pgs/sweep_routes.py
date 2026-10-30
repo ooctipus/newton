@@ -32,16 +32,19 @@ from .sweep import (
     FRICTION,
     JOINT_LIMIT,
     VELOCITY_LIMIT,
+    CachedPairMetric,
     FreeBodyRows,
     RowContext,
     RowLaws,
+    UnitOperator,
     WorldRows,
+    cached_pair_law,
+    contact_unit,
     dense_rows_block,
     end_sweep,
     free_body_rows_block,
     fused_clamp_pass,
     indent,
-    row_visit,
     speed_rows_pass,
     velocity_limit_pass,
 )
@@ -255,43 +258,17 @@ color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FI
 
 
 @dataclasses.dataclass(frozen=True)
-class _CachedPairBodyZ(FreeBodyZ):
-    """The colored unit's operator: a friction pair's coupling feeds only its metric, which the unit's metric cache
-    holds (:func:`_colored_metrics`), so the visit forms none."""
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
-
-
-@dataclasses.dataclass(frozen=True)
-class _GramUnitBodyZ(_CachedPairBodyZ):
-    """The colored unit's rows on the unit's cached Gram block ``G = Z^T Z`` of its normal and friction rows.
-
-    Every row's velocity term is reduced from the unit's velocity ``u`` before the unit's first row
-    (``unit_jv0``..``unit_jv2``, :func:`_unit_terms`), at once; the friction pair's are then corrected by the normal
-    row's change through the cached couplings, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``. The applies are deferred
-    (``unit_dn``, ``unit_dt1``, ``unit_dt2``) to one pass over the unit's coordinates after its rows
-    (:func:`_unit_apply`): in exact arithmetic the sequential sweep, with one dot product round and one apply round
-    off the pair's critical path.
-    """
-
-    def residual(self, out: str, indent: str) -> str:
-        return f"{indent}float {out} = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;"
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        return f"{indent}float {out} = (unit_jv2 + gram_n2 * unit_dn) + {rhs};"
-
-    def apply(self, delta: str, indent: str) -> str:
-        return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        return f"\n{indent}unit_dt2 += {delta};"
+class _GramUnitBodyZ(UnitOperator, CachedPairMetric, FreeBodyZ):
+    """The colored unit's rows (:class:`.sweep.UnitOperator`): one thread per unit, every row's velocity term reduced
+    from the unit's velocity ``u`` before the unit's first row (:func:`_unit_terms`), the Gram couplings and the
+    pair's metric from the unit's cache formed once per launch (:func:`_colored_metrics`), one pass over the unit's
+    coordinates after its rows (:func:`_unit_apply`)."""
 
 
 def _unit_terms(pad: str) -> str:
     """Native statements, after a unit's ``E``, ``metric``, ``rows`` and ``dof_a``, ``dof_b`` are declared: the unit's
     velocity on its bodies (``unit_u``), its rows' velocity terms from it (each side's six products, then the sides
-    added), the cached Gram couplings of the pair with the normal, and the deferred changes."""
+    added) and the cached Gram couplings of the pair with the normal."""
     lines = [
         "float unit_u[12];",
         "#pragma unroll",
@@ -316,7 +293,6 @@ def _unit_terms(pad: str) -> str:
         "    unit_jv2 += t2;",
         "}",
         "const float gram_n1 = metric[5], gram_n2 = metric[6];",
-        "float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;",
     ]
     return indent("\n".join(lines), pad)
 
@@ -413,15 +389,31 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
             "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
             "            // the unit loads with its fields.",
             f"            float metric[{METRIC_FIELDS}];",
-            "            const auto FRICTION_PAIR_CACHED = [&](int, float, float, float, wp::vec2 residual, wp::vec2 old,",
-            "                                                  float radius, float relaxation) -> wp::vec2 {",
-            "                return ProjectionLaw::friction_pair_from_metric(metric[0], metric[1], metric[2],",
-            "                    wp::vec2(metric[3], metric[4]), residual, old, radius, relaxation);",
-            "            };",
+            cached_pair_law(
+                "FRICTION_PAIR_CACHED", "metric[0]", "metric[1]", "metric[2]", ("metric[3]", "metric[4]"), " " * 12
+            ),
         ]
     )
     fields, words = sweep_units.SLOT_ENTRIES + 2, sweep_units.SLOT_WORDS
-    visit = row_visit(unit_ctx, laws, parent=unit_rows.parent_of("packed_tp"), check="mf_diag", pad=" " * 24)
+    declare = f"""const int i = unit_row + r;
+int4 meta;
+meta.x = 0;
+meta.y = W[r * 3];
+meta.z = W[r * 3 + 1];
+meta.w = W[r * 3 + 2];
+const int packed_tp = meta.w;
+// The unit builder's rows: a contact, then its friction pair (each copy knows its kind).
+const int mf_rt = r == 0 ? {CONTACT} : {FRICTION};
+const float mf_diag = __int_as_float(meta.y);"""
+    unit = contact_unit(
+        unit_ctx,
+        laws,
+        rows="rows",
+        declare=declare,
+        parent=unit_rows.parent_of("packed_tp"),
+        check="mf_diag",
+        pad=" " * 20,
+    )
     return f"""{ring_sum}
             const int colors = color_count.data[world];
             for (int color = 0; color < colors; ++color) {{
@@ -450,24 +442,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int, units: int) -> 
                     for (int f = 0; f < {METRIC_FIELDS}; ++f)
                         metric[f] = slot_metric.data[unit_slot * {METRIC_FIELDS * units} + p + f * {units}];
 {_unit_terms(" " * 20)}
-#pragma unroll
-                    for (int r = 0; r < 2; ++r) {{
-                        if (r >= rows) break;
-                        // One pass of the row law; its `continue` leaves the row.
-                        for (int once = 0; once < 1; ++once) {{
-                            const int i = unit_row + r;
-                            int4 meta;
-                            meta.x = 0;
-                            meta.y = W[r * 3];
-                            meta.z = W[r * 3 + 1];
-                            meta.w = W[r * 3 + 2];
-                            const int packed_tp = meta.w;
-                            // The unit builder's rows: a contact, then its friction pair (each copy knows its kind).
-                            const int mf_rt = r == 0 ? {CONTACT} : {FRICTION};
-                            const float mf_diag = __int_as_float(meta.y);
-{visit}
-                        }}
-                    }}
+{unit}
 {_unit_apply(" " * 20)}
                     // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
                     if (rows == 3 && ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration))

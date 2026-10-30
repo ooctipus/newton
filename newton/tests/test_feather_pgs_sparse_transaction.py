@@ -7,7 +7,6 @@ A contact unit solves a normal and its friction pair on their Gram block, in exa
 row-by-row updates, so its CUDA twins match the ordinary sweep and the physical reference to rounding, not bitwise.
 """
 
-import re
 import unittest
 from itertools import product
 from unittest import mock
@@ -307,28 +306,30 @@ class TestContactUnits(unittest.TestCase):
                 self.assertRegex(snippet, rf"(normal|i) / 3\) \* {width}")
                 start = snippet.index("const int tangent_parent = world_row_parent.data[offset + tangent];")
                 unit = snippet[start : snippet.index("consumed_tangent = tangent;", start)]
-                # One reduction of the three residuals together, and no other.
+                # One reduction of the three residuals together, and no other; the rows then run the row law on the
+                # unit's operator (sweep.contact_unit): the pair's terms moved through the record's couplings, the
+                # normal stepped by the record's 1/W_nn, the pair's law from the record's metric.
                 self.assertEqual(unit.count("SUM("), 1)
-                self.assertIn("SUM(normal_dot, tangent_dot, sibling_dot);", unit)
+                self.assertIn("SUM(unit_jv0, unit_jv1, unit_jv2);", unit)
                 self.assertNotIn("__shfl", unit)
                 self.assertIn("ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,", unit)
-                self.assertIn("wp::vec2(tangent_residual + coupling.x * normal_change,", unit)
-                self.assertIn("normal_residual * coupling.w", unit)
+                self.assertIn(
+                    "const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;", unit
+                )
+                self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", unit)
+                self.assertIn("r == 0 ? -residual * unit_inverse : -residual / denom", unit)
                 self.assertEqual("normal_parent < 0" in unit, not linked)
                 # Linked visits pool listed members and walk only rings longer than four members.
-                self.assertEqual("ring.w >= 0" in unit, linked)
+                self.assertEqual("ring.w < 0" in unit, linked)
                 self.assertEqual("make_int4(first, second, third, others)" in snippet, linked)
                 self.assertEqual(unit.count("RING_LOAD("), int(linked))
-                # Every lane reads the visit's impulses with its rows, before the reduction, and a
-                # warp barrier orders all reads before lane 0's first write: shuffles order
-                # execution, not memory.
-                self.assertIn("SYNC();", unit)
+                # Every lane reads the unit's impulses with its rows, before the reduction; each row's law then
+                # orders every lane's reads before lane 0's writes with a warp barrier: shuffles order execution, not
+                # memory.
                 reduction = unit.index("SUM(")
-                barrier = unit.index("SYNC();")
-                self.assertLess(unit.index("old_tangent = s_impulse[tangent]"), reduction)
-                self.assertLess(unit.index("old_normal = s_impulse[i]"), reduction)
-                self.assertLess(barrier, unit.index("if (lane == 0) s_impulse[i] = new_normal;"))
-                self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", unit[barrier:]), [])
+                self.assertLess(unit.index("unit_lam1 = s_impulse[tangent]"), reduction)
+                self.assertLess(unit.index("unit_lam0 = s_impulse[i]"), reduction)
+                self.assertLess(unit.index("SYNC();"), unit.index("if (lane == 0) s_impulse[i] = new_impulse;"))
 
     def test_route_record_names_no_transaction_cpu(self):
         """Record the sparse route without a transaction field or switch: contact units are the one law."""

@@ -18,6 +18,9 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   (unilateral, friction pair, PhysX drive, velocity limit, bilateral), the change vote (:func:`change_vote`) and the
   apply. Every block of every sweep runs it; a friction pair solved as one unit runs its pair law and tail
   (:func:`pair_update`);
+- the **contact unit** is a contact normal and its friction pair visited by the row law on the unit's Gram block
+  (:func:`contact_unit`, :class:`UnitOperator`): the placement reduces the unit's terms once and applies its changes
+  once, the pair's terms moved by the normal's change;
 - the **Jacobi law** steps every row of a world at once instead, a lane each (:class:`JacobiRows`,
   :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, the radial projection of each friction
   pair, Nesterov's momentum with adaptive restart and the relative change vote, the operator forming each row's
@@ -676,6 +679,100 @@ def row_visit(
         row_update(ctx, laws, residual="jv", pad=pad),
     ]
     return "\n".join(line for line in lines if line)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The contact unit: a contact normal and its friction pair on the unit's Gram block
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class UnitOperator:
+    """A placement operator's rows in a contact unit (:func:`contact_unit`): a mixin ahead of the operator.
+
+    A contact unit is a contact normal (the unit's row ``r == 0``) and its friction pair (``r == 1``: the first tangent,
+    the second its sibling), visited by the row law (:func:`row_visit`) one after the other on the unit's Gram block
+    ``G = Z^T Z``. The placement reduces the unit's three velocity terms once, before its rows (``unit_jv0``,
+    ``unit_jv1``, ``unit_jv2``), and gives the pair's Gram couplings with the normal (``gram_n1``, ``gram_n2``): a cache
+    formed once per launch, the builder's record, or the same reduction. The rows read the pair's terms moved by the
+    normal's change, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``, and defer their applies into ``unit_dn``, ``unit_dt1``
+    and ``unit_dt2``, which the placement applies once after the unit: in exact arithmetic the row-by-row sweep. The
+    pair's coupling ``Z_t1 . Z_t2`` is the placement's (:meth:`coupling`), or none where its pair law reads a metric
+    cached for the unit (:class:`CachedPairMetric`).
+    """
+
+    def residual(self, out: str, indent: str) -> str:
+        return f"{indent}float {out} = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;"
+
+    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
+        return f"{indent}float {out} = (unit_jv2 + gram_n2 * unit_dn) + {rhs};"
+
+    def pair_entries(self, sibling: str, indent: str) -> str:
+        return ""
+
+    def pair_terms(self, row: str, sibling: str, rhs: Callable[[str], str], indent: str, *, own: bool = False) -> str:
+        if own:
+            raise ValueError("a contact unit's first tangent reads its moved residual through the row visit")
+        lines = (
+            self.sibling_residual("sibling_residual", sibling, indent, rhs(sibling)),
+            self.coupling("cross", row, sibling, indent),
+        )
+        return "\n".join(line for line in lines if line != "")
+
+    def apply(self, delta: str, indent: str) -> str:
+        return f"\n{indent}if (r == 0) unit_dn += {delta}; else unit_dt1 += {delta};"
+
+    def apply_row(self, row: str, delta: str, indent: str) -> str:
+        return f"\n{indent}unit_dt2 += {delta};"
+
+    def apply_pair(self, sibling_delta: str, delta: str, indent: str) -> str:
+        return f"\n{indent}unit_dt2 += {sibling_delta};" + self.apply(delta, indent)
+
+
+class CachedPairMetric:
+    """A unit operator mixin whose pair law reads the pair's metric cached for the unit (:func:`cached_pair_law`): the
+    visit forms no coupling."""
+
+    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
+        return f"{indent}const float {out} = 0.0f;  // the cached metric replaces the coupling"
+
+
+def cached_pair_law(name: str, scale: str, low: str, high: str, axis: tuple[str, str], pad: str) -> str:
+    """Declare ``name``, the friction pair's law (:attr:`RowContext.pair_law`'s arguments after one leading ``int``)
+    from a metric cached for the unit: its tangent ``scale``, the two eigenvalues ``low`` and ``high`` and the larger's
+    ``axis`` (:func:`.projection_laws.friction_pair_from_metric`); the visit's diagonals and coupling go unread."""
+    lines = [
+        f"const auto {name} = [&](int, float, float, float, wp::vec2 residual, wp::vec2 old,",
+        f"{' ' * (len(name) + 18)}float radius, float relaxation) -> wp::vec2 {{",
+        f"    return ProjectionLaw::friction_pair_from_metric({scale}, {low}, {high},",
+        f"        wp::vec2({axis[0]}, {axis[1]}), residual, old, radius, relaxation);",
+        "};",
+    ]
+    return "\n".join(pad + line for line in lines)
+
+
+def contact_unit(ctx: RowContext, laws: RowLaws, *, rows: str, declare: str, parent: str, check: str, pad: str) -> str:
+    """The rows of a contact unit by the row law (BACKBONE §1 step 5), after the placement's one reduction of the
+    unit's terms and before its one apply of the unit's changes (both the placement's).
+
+    Row ``r`` of the unit (the normal, then its pair at the first tangent; ``rows`` is the unit's row count, one for a
+    normal without a pair, else three) declares its index ``i``, kind and response (``declare``, which ``check`` reads:
+    the row law runs when it is positive) and runs :func:`row_visit` with the unit's operator (:class:`UnitOperator`),
+    the pair at the normal ``parent``. A visit that skips its row leaves it (a one-pass loop), not the unit.
+    """
+    visit = row_visit(ctx, laws, parent=parent, check=check, pad=pad + "    ")
+    lines = [
+        f"{pad}float unit_dn = 0.0f, unit_dt1 = 0.0f, unit_dt2 = 0.0f;",
+        "#pragma unroll",
+        f"{pad}for (int r = 0; r < 2; ++r) {{",
+        f"{pad}    if (r >= {rows}) break;",
+        f"{pad}    // One pass of the row law; its `continue` leaves the row.",
+        f"{pad}    for (int once = 0; once < 1; ++once) {{",
+        indent(declare, pad + "        "),
+        visit,
+        f"{pad}    }}",
+        f"{pad}}}",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

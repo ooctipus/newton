@@ -64,14 +64,7 @@ _LOUD = re.compile(r"\(!\(fabsf\(.+\) <= .+\)\)")
 
 # Velocity-scaled changes each factory call's law must read: every vote site with its own A_ii.
 _SCALED_VOTES = {
-    "sparse": (
-        "fabsf(delta_impulse) * (denom)",
-        "fabsf(sib_delta) * (s_diag[sib])",
-        "fabsf(normal_change) * (s_diag[i])",
-        "fabsf(tangent_change) * (s_diag[tangent])",
-        "fabsf(sibling_change) * (s_diag[sibling])",
-        "!sweep_violation_any",
-    ),
+    "sparse": ("fabsf(delta_impulse) * (denom)", "fabsf(sib_delta) * (s_diag[sib])", "!sweep_violation_any"),
     "sparse_lanes": ("fabsf(delta_impulse) * (denom)", "fabsf(sib_delta) * (s_diag[sib])"),
     "mf_gs": (
         "fabsf(delta_impulse) * (denom)",

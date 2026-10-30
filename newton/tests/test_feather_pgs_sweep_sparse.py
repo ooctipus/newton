@@ -187,12 +187,12 @@ class TestSparseSweepConfiguration(unittest.TestCase):
     def test_first_lane_stores_after_every_lane_read(self):
         """Store an impulse from the first lane only after a barrier behind every lane's read.
 
-        A row's (and its pair's) impulse and a contact unit's normal impulse are stored after a barrier behind every
-        lane's read of them: shuffles order execution, not memory.
+        A row's (and its pair's) impulse, in the ordinary update and in a contact unit's rows (the row law), is stored
+        after a barrier behind every lane's read of it: shuffles order execution, not memory.
         """
         spans = (
             ("float old_impulse = row_impulse;", "if (lane == 0) s_impulse[i] = new_impulse;"),
-            ("const float old_normal = s_impulse[i];", "if (lane == 0) s_impulse[i] = new_normal;"),
+            ("float old_impulse = (r == 0 ? unit_lam0 : unit_lam1);", "if (lane == 0) s_impulse[i] = new_impulse;"),
         )
         seen = set()
         for label, M, D, S, kwargs, policy in CONFIGURATIONS:

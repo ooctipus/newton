@@ -49,9 +49,12 @@ from .sweep import (
     FRICTION,
     JOINT_LIMIT,
     VELOCITY_LIMIT,
+    CachedPairMetric,
     RowContext,
     RowLaws,
-    change_vote,
+    UnitOperator,
+    cached_pair_law,
+    contact_unit,
     end_sweep,
     indent,
     row_visit,
@@ -480,56 +483,19 @@ def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_vel
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Contact units: a contact normal and its friction pair in one visit, on their Gram block
+# Contact units: a contact normal and its friction pair on their Gram block, by the row law
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _triplet_vote(laws: RowLaws, pad: str) -> str:
-    """A unit's vote under the exit law: the normal's change and the pair's (:func:`_tangent_state`), each in its
-    storage's form: the normal's from the record's ``1 / W_nn``, the tangents' from their staged diagonals."""
-    changes = (
-        Change("normal_change", "normal_bound", str(CONTACT), "s_diag[i]"),
-        Change("tangent_change", "tangent_bound", str(FRICTION), "s_diag[tangent]", scaled=True),
-        Change("sibling_change", "sibling_bound", str(FRICTION), "s_diag[sibling]", scaled=True),
-    )
-    return change_vote(laws, changes, pad)
+@dataclasses.dataclass(frozen=True)
+class _UnitFactor(UnitOperator, CachedPairMetric, SparseFactor):
+    """A triplet's rows in a contact unit (:class:`.sweep.UnitOperator`): the unit's one reduction gathers the three
+    rows' entries, its Gram couplings and the pair's metric are the triplet's block record, and the normal steps by the
+    record's ``1/W_nn``. Every sparse row keeps its diagonal ``A_ii`` (``s_diag``), so the unit's rows vote in the
+    velocity form, as the sparse rows' storage gives it (the storage question, option 1)."""
 
-
-def _triplet_pair(pair_law: str) -> str:
-    """The pair's update at the new normal load: project the pair on its disk by ``pair_law`` and store it from the
-    first lane (every lane read the pair's impulses before the normal's store). A zero disk without carried impulse is
-    skipped."""
-    lines = [
-        "if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {",
-        "    wp::vec2 pair(0.0f);",
-        "    if (radius > 0.0f) {",
-        indent(pair_law, "        "),
-        "    }",
-        "    pair = ProjectionLaw::disk(pair, radius);",
-        "    const float new_tangent = pair[0], new_sibling = pair[1];",
-        "    tangent_change = new_tangent - old_tangent;",
-        "    sibling_change = new_sibling - old_sibling;",
-        "    if (lane == 0) { s_impulse[tangent] = new_tangent; s_impulse[sibling] = new_sibling; }",
-        "}",
-    ]
-    return "\n".join(lines)
-
-
-def _tangent_state(bounds: tuple[str, str]) -> str:
-    """The pair's changes (zero for a skipped pair) and their bounds under the exit law (``bounds``)."""
-    tangent_bound, sibling_bound = bounds
-    return (
-        "float tangent_change = 0.0f, sibling_change = 0.0f, "
-        f"tangent_bound = {tangent_bound}, sibling_bound = {sibling_bound};"
-    )
-
-
-def _pair_bounds(tangent_dot: str, sibling_dot: str, tangent_rhs: str, sibling_rhs: str) -> tuple[str, str]:
-    """The bounds of a triplet's tangent pair from the reduced sums of its residuals, at its old impulses."""
-    return (
-        bound(tangent_rhs, f"fabsf({tangent_dot})", "old_tangent", diagonal="s_diag[tangent]"),
-        bound(sibling_rhs, f"fabsf({sibling_dot})", "old_sibling", diagonal="s_diag[sibling]"),
-    )
+    def step(self, residual: str, row: str) -> str:
+        return f"(r == 0 ? -{residual} * unit_inverse : -{residual} / {self.diagonal(row)})"
 
 
 def _record(width: int, row: str) -> str:
@@ -538,19 +504,19 @@ def _record(width: int, row: str) -> str:
 
 
 def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: RowLaws, pad: str) -> tuple[str, str]:
-    """The contact unit law on the triplet's Gram block: its setup (linked: the rings' records), and its visit of row
-    ``i``.
+    """The contact unit on the triplet's Gram block (:func:`.sweep.contact_unit`): its setup (linked: the rings'
+    records), and its visit of row ``i``.
 
     A contact normal followed by its two tangents in the staged metadata loads in one group: the three rows'
     entries (every stored entry, then masked by its coordinate), the triplet's block record (``contact_records``:
     the Gram couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn`` and the pair's eigenbasis relative to its larger tangent
-    diagonal) and its friction coefficient; one reduction gives the three residuals. The normal steps with the
-    record's ``1/W_nn``, the pair solves at the new load from the record's metric, its residuals moved by the normal
-    change through ``W_nt`` (in exact arithmetic the sequential sweep); each coordinate takes the normal's, then the
-    second tangent's, then the first tangent's change and is written back once. With ``linked`` a pass at entry
-    stores each anchor's other ring members, at most three, behind its record in the order the pair update pools
-    them (-1: a longer ring, which keeps the walk). The first lane stores the impulses after every lane read them; a
-    row the guards decline keeps the ordinary update.
+    diagonal) and its friction coefficient; one reduction gives the three rows' velocity terms. The rows then run the
+    row law (:class:`_UnitFactor`): the normal steps with the record's ``1/W_nn``, the pair solves at the new load from
+    the record's metric, its residuals moved by the normal change through ``W_nt`` (in exact arithmetic the sequential
+    sweep); each coordinate takes the normal's, then the second tangent's, then the first tangent's change and is
+    written back once. With ``linked`` a pass at entry stores each anchor's other ring members, at most three, behind
+    its record in the order the pair update pools them (-1: a longer ring, which keeps the walk). A row the guards
+    decline keeps the ordinary update.
     """
     S = sweep.support
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked else 0)
@@ -600,48 +566,67 @@ tangent_responses[q] = index >= 0 ? tangent_entry : 0.0f;
 sibling_responses[q] = index >= 0 ? sibling_entry : 0.0f;
 velocities[q] = index >= 0 ? s_delta[index] : 0.0f;
 if (index >= 0) {{
-    normal_dot += normal_responses[q] * velocities[q];
-    tangent_dot += tangent_responses[q] * velocities[q];
-    sibling_dot += sibling_responses[q] * velocities[q];
+    unit_jv0 += normal_responses[q] * velocities[q];
+    unit_jv1 += tangent_responses[q] * velocities[q];
+    unit_jv2 += sibling_responses[q] * velocities[q];
 }}""",
         "        ",
     )
     apply = op.entries_loop(
         """if (indices[q] >= 0) {
     float value = velocities[q];
-    if (normal_change != 0.0f) value += normal_responses[q] * normal_change;
-    if (sibling_change != 0.0f) value += sibling_responses[q] * sibling_change;
-    if (tangent_change != 0.0f) value += tangent_responses[q] * tangent_change;
+    if (unit_dn != 0.0f) value += normal_responses[q] * unit_dn;
+    if (unit_dt2 != 0.0f) value += sibling_responses[q] * unit_dt2;
+    if (unit_dt1 != 0.0f) value += tangent_responses[q] * unit_dt1;
     s_delta[indices[q]] = value;
 }""",
         "            ",
         entry=False,
     )
-    load, ring = "new_normal", ""
+    ring_load, ring = rows.load, ""
     if sweep.linked:
-        load = "load"
+        # The ring pools as the pair update walks it, from the normal's new load on.
         ring = f"""
-        // The ring pools as the pair update walks it, from the new normal on.
-        float load = new_normal;
-        if (ring.w >= 0) {{
+        const auto unit_ring_load = [&](float load) -> float {{
+            if (ring.w < 0) return {rows.ring_load("head", "load")};
             if (ring.w > 0) load += s_impulse[ring.x];
             if (ring.w > 1) load += s_impulse[ring.y];
             if (ring.w > 2) load += s_impulse[ring.z];
-        }} else {{
-            load = {rows.ring_load("i", "load")};
-        }}"""
-    pair_law = """// W_nt moves the tangent residuals by the normal change; the eigenbasis is relative to the larger tangent
-// diagonal, as the pair law scales it.
-pair = ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y, wp::vec2(basis.z, basis.w),
-    wp::vec2(tangent_residual + coupling.x * normal_change, sibling_residual + coupling.y * normal_change),
-    wp::vec2(old_tangent, old_sibling), radius, omega);"""
-    pair = _triplet_pair(pair_law)
+            return load;
+        }};"""
+
+        def ring_load(parent):
+            return f"unit_ring_load({rows.load(parent)})"
+
+    unit_op = _UnitFactor(**{field.name: getattr(op, field.name) for field in dataclasses.fields(op)})
+    # The visited row's and its sibling's impulses as the unit loaded them; the ring's pool reads the stores.
+    held = {"i": "(r == 0 ? unit_lam0 : unit_lam1)", "sib": "unit_lam2"}
+    ctx = RowContext(
+        row="i",
+        kind="row_type",
+        operator=dataclasses.replace(unit_op, diagonal=lambda row: "denom" if row == "i" else rows.diag(row)),
+        load=lambda row: held.get(row) or rows.load(row),
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=lambda row: "mu",
+        # No contact regularization: the laws read no weight.
+        weight=lambda row: "1.0f",
+        parent="parent",
+        ring_load=ring_load,
+        lanes=rows.lanes,
+        fenced=False,
+        pair_law="UNIT_PAIR(0, ",
+    )
+    declare = f"""const int i = head + r;
+const int row_type = r == 0 ? {CONTACT} : {FRICTION};
+const float denom = s_diag[i];"""
+    rows_text = contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check="denom", pad="        ")
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
 if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
     && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION})
         & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
-    const int tangent = i + 1, sibling = i + 2;
+    const int head = i, tangent = i + 1, sibling = i + 2;
     // The guards load together; the rows, the record and the coordinates then load together.
     const int row_class = support.row_class.data[offset + i];
     const int tangent_class = support.row_class.data[offset + tangent];
@@ -657,30 +642,18 @@ if ({entry_guard}i + 2 < count && global_iter >= friction_start_iteration
         int indices[{count}];
         float velocities[{count}], normal_responses[{count}];
         float tangent_responses[{count}], sibling_responses[{count}];
-        float normal_dot = 0.0f, tangent_dot = 0.0f, sibling_dot = 0.0f;
+        float unit_jv0 = 0.0f, unit_jv1 = 0.0f, unit_jv2 = 0.0f;
 {gather}
-        // The visit's staged values load with the rows, off the reduction's chain.
-        const float old_normal = s_impulse[i];
-        const float old_tangent = s_impulse[tangent], old_sibling = s_impulse[sibling];
-        const float normal_rhs = s_rhs[i], tangent_rhs = s_rhs[tangent], sibling_rhs = s_rhs[sibling];
+        // The unit's impulses load with its rows, off the reduction's chain; the rows' law reads them.
+        const float unit_lam0 = s_impulse[i], unit_lam1 = s_impulse[tangent], unit_lam2 = s_impulse[sibling];
+        // The pair's metric is relative to its larger tangent diagonal, as the pair law scales it.
         const float tangent_scale = fmaxf(fmaxf(s_diag[tangent], s_diag[sibling]), 1.0e-20f);
-        SUM(normal_dot, tangent_dot, sibling_dot);
-        const float normal_residual = normal_dot + normal_rhs;
-        const float tangent_residual = tangent_dot + tangent_rhs;
-        const float sibling_residual = sibling_dot + sibling_rhs;
-        const float normal_bound = {bound("normal_rhs", "fabsf(normal_dot)", "old_normal", step="coupling.w")};
-        const float new_normal = ProjectionLaw::unilateral(
-            ProjectionLaw::relaxed_step(old_normal, -normal_residual * coupling.w, omega));
-        const float normal_change = new_normal - old_normal;{ring}
-        const float radius = fmaxf(mu * {load}, 0.0f);
-        {_tangent_state(_pair_bounds("tangent_dot", "sibling_dot", "tangent_rhs", "sibling_rhs"))}
-        // Shuffles order execution, not memory: every lane has read the triplet's impulses before the first
-        // lane writes them.
-        SYNC();
-        if (lane == 0) s_impulse[i] = new_normal;
-{indent(pair, "        ")}
-        if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-{_triplet_vote(laws, "            ")}
+        SUM(unit_jv0, unit_jv1, unit_jv2);
+        // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
+        const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;
+{cached_pair_law("UNIT_PAIR", "tangent_scale", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")}{ring}
+{rows_text}
+        if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f) {{
 {apply}
         }}
         consumed_tangent = tangent;
