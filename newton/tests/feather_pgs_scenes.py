@@ -18,13 +18,19 @@ Scenes by topology:
   :func:`mimic_pair`, :func:`spring_hinge`, :func:`pushed_arm`;
 - articulations in contact: :func:`legged` (a free-floating base on legs),
   :func:`gripper` (an articulation holding a free box), :func:`keyboard` (a
-  diagonal-mass articulation pressed by a six-coordinate arm), :func:`hand`
-  (a 17-coordinate articulation pressing a free cube), :func:`torsion_pad`
-  and :func:`compliant_ball`;
+  diagonal-mass articulation pressed by a six-coordinate arm) and :func:`hand`
+  (a 17-coordinate articulation pressing a free cube);
 - articulations above the held-tree owner's cap of 64 bodies and 64
   coordinates: :func:`sprawl` (a humanoid-like tree with two hands, 66
   coordinates) and :func:`long_chain` (a 100-link snake), both resting on the
-  ground through one contact per link.
+  ground through one contact per link;
+- contact torsion, each on single-point contacts where point friction has no
+  lever arm: :func:`spin_decay` (T1), :func:`twist_threshold` (T2),
+  :func:`pinch_twist` (T3, the soft-finger grasp) and :func:`slide_spin`
+  (T4, the limit surface); contact compliance: :func:`compliant_drop` (C1),
+  :func:`compliant_plate` (C2, a unique elastic split), :func:`compliant_stack`
+  (C3) and :func:`compliant_pinch` (C4). Their references are in
+  :mod:`newton.tests.feather_pgs_references`.
 
 Fixed-base articulations hang from a shapeless base welded to the world, as
 robot descriptions root them; articulation shapes collide with everything but
@@ -103,10 +109,11 @@ class Scene:
     deterministic_contacts: bool = False
     """Whether the collision pipeline sorts its contacts (``deterministic=True``), so repeats of a route agree
     bitwise and the reference's run-to-run spread holds no contact or row order."""
-    contact_stiffness: float = 0.0
-    """Per-contact stiffness [N/m] written after each collision pass; 0 keeps hard contact."""
-    contact_damping: float = 0.0
-    """Per-contact damping [N·s/m] written with the stiffness."""
+    contact_stiffness: tuple[float, ...] = ()
+    """Contact stiffness [N/m] of each world, written per contact after each collision pass; empty keeps hard
+    contact."""
+    contact_damping: tuple[float, ...] = ()
+    """Contact damping [N·s/m] of each world, written with the stiffness."""
     passive: bool = False
     """Whether no drive, external force or spring injects energy, so mechanical energy cannot grow."""
     tags: frozenset = frozenset()
@@ -988,81 +995,6 @@ def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: i
     )
 
 
-def torsion_pad(*, torques: tuple[float, ...] = (0.1, 0.4), mu: float = 0.5, radius: float = 0.1) -> Scene:
-    """A 1 kg sphere on a six-coordinate D6 joint resting on the ground under a yaw torque, one world per torque.
-
-    A sphere touches the ground at one point, so tangential friction resists
-    no spin: only the torsion row of an effective spin radius ``R`` does, and
-    it holds the sphere while ``|torque| <= mu * m * g * R``. Above that the
-    sphere spins up at ``(torque - mu m g R) / (0.4 m r^2)``.
-    """
-
-    def build(device):
-        builder = _builder()
-        builder.add_ground_plane(cfg=_cfg(mu=mu))
-        axis = newton.ModelBuilder.JointDofConfig
-        for _ in torques:
-            builder.begin_world()
-            body = builder.add_link(
-                xform=wp.transform(wp.vec3(0.0, 0.0, radius + 0.001)), mass=1.0, inertia=_sphere_inertia(1.0, radius)
-            )
-            builder.add_shape_sphere(body, radius=radius, cfg=_cfg(mu=mu, density=0.0))
-            joint = builder.add_joint_d6(
-                -1,
-                body,
-                linear_axes=[axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)],
-                angular_axes=[axis(axis=newton.Axis.X), axis(axis=newton.Axis.Y), axis(axis=newton.Axis.Z)],
-                parent_xform=wp.transform(wp.vec3(0.0, 0.0, radius + 0.001)),
-            )
-            builder.add_articulation([joint])
-            builder.end_world()
-        return _finalize(builder, device)
-
-    def control(model, control, state, step):
-        if step == 0:
-            forces = np.zeros(model.joint_f.shape[0], dtype=np.float32)
-            for world, torque in enumerate(torques):
-                forces[world * 6 + 5] = torque
-            control.joint_f.assign(forces)
-
-    return Scene(
-        "torsion_pad",
-        build,
-        dt=1.0 / 240.0,
-        steps=120,
-        params={"mu": [mu] * len(torques), "torques": torques, "mass": 1.0, "radius": radius},
-        control=control,
-        tags=frozenset({"torsion"}),
-    )
-
-
-def compliant_ball(*, stiffness: float = 3000.0, damping: float = 20.0, mass: float = 0.3) -> Scene:
-    """A 0.05 m free sphere resting on a compliant contact of ``stiffness`` [N/m] and ``damping`` [N·s/m]."""
-    radius = 0.05
-
-    def build(device):
-        builder = _builder()
-        builder.rigid_gap = 0.005
-        builder.add_ground_plane(cfg=_cfg(mu=0.5))
-        body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, radius)), mass=mass, inertia=_sphere_inertia(mass, radius)
-        )
-        builder.add_shape_sphere(body, radius=radius, cfg=_cfg(mu=0.5, density=0.0))
-        return _finalize(builder, device)
-
-    return Scene(
-        "compliant_ball",
-        build,
-        dt=0.005,
-        steps=200,
-        params={"mu": [0.5], "stiffness": stiffness, "mass": mass, "radius": radius},
-        rigid_contact_max=32,
-        contact_stiffness=stiffness,
-        contact_damping=damping,
-        tags=frozenset({"contact_compliance"}),
-    )
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Large articulations (above the held-tree owner's 64-body, 64-coordinate cap)
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1276,4 +1208,293 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         control=control,
         deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "large_articulation"}),
+    )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Contact torsion and contact compliance (the CT benchmark; references in newton.tests.feather_pgs_references)
+# ---------------------------------------------------------------------------------------------------------------------
+
+SPIN = {"mass": 1.0, "radius": 0.05, "mu": 0.5, "spin_radius": 0.01}
+"""The torsion spheres: 1 kg, 0.05 m, ``mu`` 0.5 on the ground, effective spin radius ``r`` = 0.01 m (torsional
+capacity ``mu m g r``)."""
+
+PINCH = {"mass": 0.5, "half": (0.01, 0.1, 0.01), "tip": 0.01, "pad": (0.005, 0.02, 0.02), "mu": 1.0, "squeeze": 5.0}
+"""The pinched bar (0.5 kg, 0.02 x 0.2 x 0.02 m), its fingertip spheres or box pads and their squeeze force [N]."""
+
+
+def _spin_sphere(builder, *, free: bool = False, omega: float = 0.0) -> None:
+    """Add a :data:`SPIN` sphere resting on the ground, on a six-coordinate D6 joint to the world or free, spinning
+    at ``omega`` [rad/s] about the vertical (coordinate 5 of either joint)."""
+    xform = wp.transform(wp.vec3(0.0, 0.0, SPIN["radius"] + 0.0005))
+    inertia = _sphere_inertia(SPIN["mass"], SPIN["radius"])
+    if free:
+        body = builder.add_body(xform=xform, mass=SPIN["mass"], inertia=inertia)
+    else:
+        body = builder.add_link(xform=xform, mass=SPIN["mass"], inertia=inertia)
+        axes = (newton.Axis.X, newton.Axis.Y, newton.Axis.Z)
+        dof = newton.ModelBuilder.JointDofConfig
+        joint = builder.add_joint_d6(
+            -1,
+            body,
+            linear_axes=[dof(axis=axis) for axis in axes],
+            angular_axes=[dof(axis=axis) for axis in axes],
+            parent_xform=xform,
+        )
+        builder.add_articulation([joint])
+    builder.add_shape_sphere(body, radius=SPIN["radius"], cfg=_cfg(mu=SPIN["mu"], density=0.0))
+    builder.joint_qd[builder.joint_qd_start[-1] + 5] = omega
+
+
+def spin_decay(*, free: bool = False, omega: float = 10.0) -> Scene:
+    """T1: a :data:`SPIN` sphere spinning at ``omega`` [rad/s] on its one ground contact, on a D6 joint or free.
+
+    Point friction has no lever arm about the contact normal, so only torsion
+    resists the spin: it decays at ``mu m g r / I`` = 49.05 rad/s² and stops
+    after 0.204 s. Without torsion the sphere spins on.
+    """
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=SPIN["mu"]))
+        _spin_sphere(builder, free=free, omega=omega)
+        return _finalize(builder, device)
+
+    params = {**SPIN, "mu": [SPIN["mu"]], "omega": omega}
+    name = "spin_decay_free" if free else "spin_decay"
+    return Scene(name, build, dt=1.0 / 240.0, steps=96, params=params, tags=frozenset({"torsion"}))
+
+
+def twist_threshold(*, fractions: tuple[float, ...] = (0.5, 0.9, 1.1, 2.0)) -> Scene:
+    """T2: a :data:`SPIN` sphere on a D6 joint at rest under a yaw torque of ``fraction`` times its torsional
+    capacity ``mu m g r``, one world per fraction: it holds at or below 1 and above spins up at
+    ``(fraction - 1) mu m g r / I``."""
+    capacity = SPIN["mu"] * SPIN["mass"] * GRAVITY * SPIN["spin_radius"]
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=SPIN["mu"]))
+        for _ in fractions:
+            builder.begin_world()
+            _spin_sphere(builder)
+            builder.end_world()
+        return _finalize(builder, device)
+
+    def control(model, control, state, step):
+        if step == 0:
+            forces = np.zeros(model.joint_f.shape[0], dtype=np.float32)
+            forces[5::6] = np.asarray(fractions) * capacity
+            control.joint_f.assign(forces)
+
+    params = {**SPIN, "mu": [SPIN["mu"]] * len(fractions), "fractions": fractions, "capacity": capacity}
+    return Scene(
+        "twist_threshold", build, dt=1.0 / 240.0, steps=60, params=params, control=control, tags=frozenset({"torsion"})
+    )
+
+
+def _pinch(offsets: tuple[float, ...], *, pads: bool) -> newton.ModelBuilder:
+    """Per world, a free :data:`PINCH` bar 0.5 m up whose centre lies ``offset`` [m] along ``y`` from the pinch axis
+    ``x``, and two fingertips on prismatic ``x`` joints to the world touching its faces on that axis: spheres, or box
+    pads. Per world the bodies are the bar and the left and right tips; the coordinates the bar's six, then the tips'."""
+    p = PINCH
+    builder = _builder()
+    builder.rigid_gap = 0.005
+    tip = _cfg(mu=p["mu"], density=0.0, group=SELF)
+    for offset in offsets:
+        builder.begin_world()
+        bar = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, offset, 0.5)), mass=p["mass"], inertia=_box_inertia(p["mass"], *p["half"])
+        )
+        builder.add_shape_box(bar, hx=p["half"][0], hy=p["half"][1], hz=p["half"][2], cfg=_cfg(mu=p["mu"], density=0.0))
+        for side in (-1.0, 1.0):
+            xform = wp.transform(wp.vec3(side * (p["half"][0] + (p["pad"][0] if pads else p["tip"])), 0.0, 0.5))
+            body = builder.add_link(xform=xform, mass=0.05, inertia=_sphere_inertia(0.05, p["tip"]))
+            builder.add_articulation([builder.add_joint_prismatic(-1, body, axis=newton.Axis.X, parent_xform=xform)])
+            if pads:
+                builder.add_shape_box(body, hx=p["pad"][0], hy=p["pad"][1], hz=p["pad"][2], cfg=tip)
+            else:
+                builder.add_shape_sphere(body, radius=p["tip"], cfg=tip)
+        builder.end_world()
+    return builder
+
+
+def _squeeze(model, control, state, step):
+    """Press each world's tips toward each other with :data:`PINCH`'s squeeze force (written once)."""
+    if step == 0:
+        forces = np.zeros(model.joint_f.shape[0], dtype=np.float32)
+        forces[6::8] = PINCH["squeeze"]
+        forces[7::8] = -PINCH["squeeze"]
+        control.joint_f.assign(forces)
+
+
+def pinch_twist(*, offsets: tuple[float, ...] = (0.004, 0.007, 0.011, 0.02), spin_radius: float = 0.005) -> Scene:
+    """T3, the soft-finger grasp: two sphere fingertips squeeze a free :data:`PINCH` bar on its pinch axis, one world
+    per ``offset`` [m] of the bar's centre from the axis.
+
+    Each contact carries half the weight tangentially, and gravity twists the
+    bar about the axis with ``m g d``. Torsion of effective radius ``r`` holds
+    it while ``m g d <= 2 r sqrt((mu F)^2 - (m g / 2)^2)`` (the elliptic cone:
+    8.9 mm); a law that gives the spin only the pair's leftover holds
+    ``2 r (mu F - m g / 2)`` (5.2 mm), so 7 mm separates the two. Without
+    torsion the bar pivots at every offset.
+    """
+    p = PINCH
+    inertia = p["mass"] * ((2.0 * p["half"][1]) ** 2 + (2.0 * p["half"][2]) ** 2) / 12.0
+    params = {**p, "mu": [p["mu"]] * len(offsets), "offsets": offsets, "spin_radius": spin_radius, "inertia": inertia}
+    return Scene(
+        "pinch_twist",
+        lambda device: _finalize(_pinch(offsets, pads=False), device),
+        dt=1.0 / 240.0,
+        steps=72,
+        params=params,
+        control=_squeeze,
+        deterministic_contacts=True,
+        tags=frozenset({"torsion", "grasp"}),
+    )
+
+
+def slide_spin(*, speed: float = 1.0, omega: float = 20.0) -> Scene:
+    """T4, the limit surface: a :data:`SPIN` sphere sliding at ``speed`` [m/s] and spinning at ``omega`` [rad/s] on
+    its ground contact, on world-fixed prismatic ``x``, ``y``, ``z`` joints and a yaw joint (no rolling).
+
+    The exact limit surface of a uniform patch of equal spin capacity stops
+    both motions together at 0.552 s; a law that solves the friction pair first
+    stops sliding at 0.204 s and leaves the spin unresisted meanwhile. (A D6
+    joint sliding while spinning this fast gains speed, so the chain is used.)
+    """
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=SPIN["mu"]))
+        xform = wp.transform(wp.vec3(0.0, 0.0, SPIN["radius"] + 0.0005))
+        tiny = wp.mat33(np.eye(3, dtype=np.float32) * np.float32(1.0e-9))
+        parent, joints = -1, []
+        for axis in (newton.Axis.X, newton.Axis.Y, newton.Axis.Z):
+            link = builder.add_link(xform=xform, mass=1.0e-6, inertia=tiny)
+            joints.append(
+                builder.add_joint_prismatic(parent, link, axis=axis, parent_xform=xform if parent < 0 else None)
+            )
+            parent = link
+        body = builder.add_link(xform=xform, mass=SPIN["mass"], inertia=_sphere_inertia(SPIN["mass"], SPIN["radius"]))
+        joints.append(builder.add_joint_revolute(parent, body, axis=newton.Axis.Z))
+        builder.add_articulation(joints)
+        builder.add_shape_sphere(body, radius=SPIN["radius"], cfg=_cfg(mu=SPIN["mu"], density=0.0))
+        builder.joint_qd[0], builder.joint_qd[3] = speed, omega
+        return _finalize(builder, device)
+
+    params = {**SPIN, "mu": [SPIN["mu"]], "speed": speed, "omega": omega, "body": 3}
+    return Scene("slide_spin", build, dt=1.0 / 240.0, steps=168, params=params, tags=frozenset({"torsion"}))
+
+
+def compliant_drop(*, dampings: tuple[float, ...] = (0.0, 2.0, 20.0), stiffness: float = 1000.0) -> Scene:
+    """C1: a 0.3 kg, 0.05 m sphere dropped 2 cm onto a compliant ground contact of ``stiffness`` [N/m], one world
+    per damping [N·s/m].
+
+    The material law ``F = max(0, -k phi - c u)``, with no dashpot across an
+    open gap, integrated by the step: the drop rebounds, peaks and rests as the
+    law's backward-Euler recurrence, at rest ``phi = -m g / k``.
+    """
+    mass, radius, height = 0.3, 0.05, 0.02
+
+    def build(device):
+        builder = _builder()
+        builder.rigid_gap = 0.03
+        builder.add_ground_plane(cfg=_cfg(mu=0.5))
+        for _ in dampings:
+            builder.begin_world()
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, radius + height)), mass=mass, inertia=_sphere_inertia(mass, radius)
+            )
+            builder.add_shape_sphere(body, radius=radius, cfg=_cfg(mu=0.5, density=0.0))
+            builder.end_world()
+        return _finalize(builder, device)
+
+    return Scene(
+        "compliant_drop",
+        build,
+        dt=1.0 / 480.0,
+        steps=480,
+        params={"mu": [0.5] * len(dampings), "mass": mass, "radius": radius, "height": height},
+        contact_stiffness=(stiffness,) * len(dampings),
+        contact_damping=dampings,
+        tags=frozenset({"contact_compliance"}),
+    )
+
+
+def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0) -> Scene:
+    """C2: a 1 kg, 0.2 x 0.2 x 0.04 m plate whose centre of mass lies at (3, 1.5) cm rests on four compliant corner
+    contacts.
+
+    Rigid contacts leave the corner forces statically indeterminate; compliant
+    ones give the unique elastic split
+    ``F_i = m g [1/4 + e_x x_i / 4a² + e_y y_i / 4b²]`` = 1.349, 2.820, 2.085,
+    3.556 N, and a mean indentation ``m g / 4k``.
+    """
+    mass, half, com = 1.0, (0.1, 0.1, 0.02), (0.03, 0.015)
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=0.5))
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, half[2] + 0.0005)),
+            com=wp.vec3(com[0], com[1], 0.0),
+            mass=mass,
+            inertia=_box_inertia(mass, *half),
+        )
+        builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2], cfg=_cfg(mu=0.5, density=0.0))
+        return _finalize(builder, device)
+
+    return Scene(
+        "compliant_plate",
+        build,
+        dt=1.0 / 240.0,
+        steps=240,
+        params={"mu": [0.5], "mass": mass, "half": half, "com": com, "stiffness": stiffness},
+        contact_stiffness=(stiffness,),
+        contact_damping=(damping,),
+        deterministic_contacts=True,
+        tags=frozenset({"contact_compliance"}),
+    )
+
+
+def compliant_stack(*, count: int = 4, stiffness: float = 2.0e4, damping: float = 100.0) -> Scene:
+    """C3: ``count`` 0.5 kg, 0.1 m cubes stacked 0.5 mm apart on compliant ground, every interface compliant with
+    four corner contacts: interface ``j`` (0 the ground) carries ``(n - j) m g`` and compresses
+    ``(n - j) m g / 4k`` = 245, 184, 123, 61 um."""
+    mass, half = 0.5, 0.05
+
+    def build(device):
+        builder = _builder()
+        builder.add_ground_plane(cfg=_cfg(mu=0.5))
+        for level in range(count):
+            _free_box(builder, (0.0, 0.0, half * (2 * level + 1) + 0.0005 * (level + 1)), half=half, mass=mass)
+        return _finalize(builder, device)
+
+    return Scene(
+        "compliant_stack",
+        build,
+        dt=1.0 / 240.0,
+        steps=360,
+        params={"mu": [0.5], "mass": mass, "half": half, "count": count, "stiffness": stiffness},
+        contact_stiffness=(stiffness,),
+        contact_damping=(damping,),
+        deterministic_contacts=True,
+        tags=frozenset({"contact_compliance"}),
+    )
+
+
+def compliant_pinch(*, stiffness: float = 5.0e3, damping: float = 20.0) -> Scene:
+    """C4: two box pads squeeze a free :data:`PINCH` bar through compliant contacts: each pad's contacts compress
+    ``F / (n k)`` together (0.25 mm with four), and friction ``2 mu F`` = 10 N holds the 4.9 N bar."""
+    return Scene(
+        "compliant_pinch",
+        lambda device: _finalize(_pinch((0.0,), pads=True), device),
+        dt=1.0 / 240.0,
+        steps=120,
+        params={**PINCH, "mu": [PINCH["mu"]], "stiffness": stiffness},
+        control=_squeeze,
+        contact_stiffness=(stiffness,),
+        contact_damping=(damping,),
+        deterministic_contacts=True,
+        tags=frozenset({"contact_compliance", "grasp"}),
     )

@@ -35,9 +35,11 @@ Scenes and features
     loop, a mimic pair, a spring hinge, an arm under joint velocity limits, a
     legged robot standing on a free base, a gripper lifting a box, a
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
-    free cube, and two articulations above the held-tree owner's caps (a
+    free cube, two articulations above the held-tree owner's caps (a
     66-coordinate humanoid-like tree, a 100-link snake with and without joint
-    armature). Articulated contact
+    armature), and the CT benchmark of contact torsion (a decaying spin, a
+    twist threshold, a soft-finger pinch) and contact compliance (a drop, a
+    plate's elastic split, a stack, a compliant pinch). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: warm
     start, contact compliance, contact torsion, ``contact_update="unit"``,
     restitution, bilateral pre-elimination, joint and rigid-body velocity limits.
@@ -61,14 +63,17 @@ Metrics
       violation, loop-closure gap and mimic error;
     - momentum balance of every floating articulation against the exported
       forces (and the angular balance of free rigid bodies under point
-      friction), which checks the force export on every route;
+      friction without torsion, whose spin torque the export does not carry),
+      which checks the force export on every route;
     - scene laws: sliding acceleration ``g (sin a - mu cos a)`` and no creep on
       the incline (on CPU also at every step and every budget from 32 to 2,000
       sweeps, :func:`incline_steady_slide_laws`), rebound ``v+ = -e u``, speed
-      limits, the spring hinge's
-      discrete oscillator, the compliant rest height ``r - m g / k``, torsional
-      stiction and spin-up, the lifted box following the gripper, and the
-      exported force on a pressed key balancing its drive.
+      limits, the spring hinge's discrete oscillator, the lifted box following
+      the gripper, the exported force on a pressed key balancing its drive,
+      and the CT benchmark's references (:mod:`newton.tests.feather_pgs_references`):
+      torsional decay, stiction and spin-up, the soft-finger pinch's hold, a
+      compliant drop against its material law's recurrence, the plate's
+      elastic split, the stack's compressions and the pads' compression.
 
     Individual contact forces are not compared between routes: a statically
     indeterminate distribution (a box's four corners, the lateral friction of
@@ -129,6 +134,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -257,6 +263,28 @@ class _Recorder:
         return history
 
 
+@wp.kernel
+def _world_material(
+    count: wp.array[wp.int32],
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_world: wp.array[wp.int32],
+    world_stiffness: wp.array[float],
+    world_damping: wp.array[float],
+    stiffness: wp.array[float],
+    damping: wp.array[float],
+    friction: wp.array[float],
+):
+    """Give each contact its world's material (a global shape's contact takes its other shape's world)."""
+    c = wp.tid()
+    if c >= count[0]:
+        return
+    world = wp.max(shape_world[shape0[c]], shape_world[shape1[c]])
+    stiffness[c] = world_stiffness[world]
+    damping[c] = world_damping[world]
+    friction[c] = 1.0
+
+
 def simulate(
     scene: scenes.Scene, route: Route, device, *, options: dict | None = None, steps: int | None = None
 ) -> Run:
@@ -281,10 +309,19 @@ def simulate(
     # The history holds the rows the scene's contacts can fill (its budget), not every row the
     # contact buffers' first pages map, which can be a hundred times more.
     recorded = min(contacts.rigid_contact_max, pipeline.rigid_contact_max)
-    if scene.contact_stiffness > 0.0:
+    material = None
+    if scene.contact_stiffness:
         capacity = contacts.rigid_contact_normal.shape[0]
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
             setattr(contacts, name, wp.zeros(capacity, dtype=float, device=model.device))
+        material = [
+            contacts.rigid_contact_count,
+            contacts.rigid_contact_shape0,
+            contacts.rigid_contact_shape1,
+            model.shape_world,
+            wp.array(scene.contact_stiffness, dtype=float, device=model.device),
+            wp.array(scene.contact_damping, dtype=float, device=model.device),
+        ]
     merged = {**BASE_OPTIONS, **scene.solver_options, **(options or {}), **route.options}
     with route_context(route):
         solver = SolverFeatherPGS(model, **merged)
@@ -309,10 +346,13 @@ def simulate(
             if scene.control is not None:
                 scene.control(model, control, state, step)
             pipeline.collide(state, contacts)
-            if scene.contact_stiffness > 0.0:
-                contacts.rigid_contact_stiffness.fill_(scene.contact_stiffness)
-                contacts.rigid_contact_damping.fill_(scene.contact_damping)
-                contacts.rigid_contact_friction.fill_(1.0)
+            if material is not None:
+                outputs = [
+                    contacts.rigid_contact_stiffness,
+                    contacts.rigid_contact_damping,
+                    contacts.rigid_contact_friction,
+                ]
+                wp.launch(_world_material, dim=capacity, inputs=material, outputs=outputs, device=model.device)
             pre = {name: getattr(contacts, name)[:recorded] for name in CONTACT_FIELDS[:-1]}
             pre["contact_count"] = contacts.rigid_contact_count
             if model.body_count:
@@ -920,31 +960,121 @@ def spring_laws(run: Run) -> list:
     return [("angle error [rad]", float(np.abs(run.joint_q[:, 0] - np.asarray(expected)).max()), 1.0e-4)]
 
 
-def compliance_laws(run: Run) -> list:
-    """A sphere on a compliant contact rests at ``r - m g / k``."""
-    params = run.scene.params
-    expected = params["radius"] - params["mass"] * scenes.GRAVITY / params["stiffness"]
-    return [("rest height error [m]", abs(float(run.body_q[-1, 0, 2]) - expected), 1.0e-5)]
-
-
-def torsion_laws(run: Run) -> list:
-    """A sphere under a yaw torque below ``mu m g R`` holds; above it spins up at ``(torque - mu m g R) / I``."""
+def spin_decay_laws(run: Run) -> list:
+    """T1: a spin about the normal of one contact decays at ``mu m g r / I`` (fitted from 95% down to 10% of its
+    start) and stops."""
     params, dt = run.scene.params, run.scene.dt
-    spin_radius = run.options["contact_torsion_radius"]
-    mass, radius = params["mass"], params["radius"]
-    inertia = 0.4 * mass * radius * radius
-    laws = []
+    inertia = 0.4 * params["mass"] * params["radius"] ** 2
+    expected = params["mu"][0] * params["mass"] * scenes.GRAVITY * params["spin_radius"] / inertia
+    omega = run.body_qd[:, 0, 5]
+    band = np.flatnonzero((omega >= 0.1 * params["omega"]) & (omega <= 0.95 * params["omega"]))
+    rate = -np.polyfit(band * dt, omega[band], 1)[0]
+    return [("decay rate error [1]", abs(rate / expected - 1.0), 2.0e-2), ("end spin [rad/s]", abs(omega[-1]), 1.0e-3)]
+
+
+def twist_laws(run: Run) -> list:
+    """T2: a sphere under a yaw torque within its torsional capacity holds; above it spins up at the excess over
+    its inertia."""
+    params, dt = run.scene.params, run.scene.dt
+    inertia = 0.4 * params["mass"] * params["radius"] ** 2
     start = run.scene.steps // 3
-    for world, (torque, mu) in enumerate(zip(params["torques"], params["mu"], strict=True)):
-        capacity = mu * mass * scenes.GRAVITY * spin_radius
+    laws = []
+    for world, fraction in enumerate(params["fractions"]):
         omega = run.body_qd[:, world, 5]
-        if torque < capacity:
+        if fraction <= 1.0:
             laws.append((f"world {world} spin [rad/s]", float(np.abs(omega[start:]).max()), 1.0e-3))
         else:
             measured = (omega[-1] - omega[start]) / ((run.scene.steps - start) * dt)
-            expected = (torque - capacity) / inertia
+            expected = (fraction - 1.0) * params["capacity"] / inertia
             laws.append((f"world {world} spin acceleration error [1]", abs(measured / expected - 1.0), 2.0e-2))
     return laws
+
+
+def pinch_laws(run: Run) -> list:
+    """T3: the pinched bar holds where gravity's twist is within the elliptic soft-finger capacity of its two
+    contacts, and turns where it exceeds it."""
+    params = run.scene.params
+    laws = []
+    for world, offset in enumerate(params["offsets"]):
+        reference = refs.pinch_twist(
+            params["mass"], offset, params["mu"][world], params["squeeze"], params["spin_radius"], params["inertia"]
+        )
+        bar = run.body_q[:, 3 * world]
+        twist = np.abs(2.0 * np.arctan2(bar[:, 3], bar[:, 6]))
+        if reference[2]:
+            laws.append((f"world {world} twist [rad]", float(twist.max()), 1.0e-3))
+        else:
+            laws.append((f"world {world} twist shortfall [rad]", 0.05 - float(twist[-1]), 0.0))
+    return laws
+
+
+def compliant_drop_laws(run: Run) -> list:
+    """C1: each drop follows its material law's backward-Euler recurrence: the gap over the run, and the rebound,
+    the peak penetration and the rest within 1%."""
+    params, dt, steps = run.scene.params, run.scene.dt, run.scene.steps
+    t = np.arange(steps + 1) * dt
+    laws = []
+    for world, (stiffness, damping) in enumerate(
+        zip(run.scene.contact_stiffness, run.scene.contact_damping, strict=True)
+    ):
+        phi, u = run.body_q[:, world, 2] - params["radius"], run.body_qd[:, world, 2]
+        phi_ref, u_ref = refs.compliant_drop(params["mass"], stiffness, damping, params["height"], dt=dt, steps=steps)
+        sim, ref = (refs.drop_metrics(t, *trace, params["height"]) for trace in ((phi, u), (phi_ref, u_ref)))
+        rest = params["mass"] * scenes.GRAVITY / stiffness
+        laws += [
+            (f"world {world} gap error [m]", float(np.abs(phi - phi_ref).max()), 1.0e-5),
+            (f"world {world} rebound error [1]", abs(sim["e"] - ref["e"]), 1.0e-2),
+            (f"world {world} peak error [1]", abs(sim["peak"] / ref["peak"] - 1.0), 1.0e-2),
+            (f"world {world} rest error [m g / k]", abs(sim["rest"] - ref["rest"]) / rest, 1.0e-2),
+        ]
+    return laws
+
+
+def plate_laws(run: Run) -> list:
+    """C2: the plate's corner contacts carry the unique elastic split within 2%, and it sinks by ``m g / 4k``."""
+    params = run.scene.params
+    half, com = params["half"], params["com"]
+    _, expected, indentation = refs.plate_on_springs(params["mass"], *half[:2], *com, params["stiffness"])
+    shape_body = model_data(run.scene)[0].shape_body
+    entry = run.contacts[-1]
+    normal = np.abs(np.einsum("ij,ij->i", entry["force"], entry["rigid_contact_normal"]))
+    measured = np.zeros(4)
+    for side in ("0", "1"):
+        shape, point = entry[f"rigid_contact_shape{side}"], entry[f"rigid_contact_point{side}"]
+        mine = (shape >= 0) & (shape_body[np.maximum(shape, 0)] == 0)
+        np.add.at(measured, (point[mine, 0] > 0) + 2 * (point[mine, 1] > 0), normal[mine])
+    sink = half[2] - run.body_q[-1, 0, 2]
+    return [
+        ("corner force error [1]", float(np.abs(measured / expected - 1.0).max()), 2.0e-2),
+        ("indentation error [1]", abs(sink / indentation - 1.0), 2.0e-2),
+    ]
+
+
+def stack_laws(run: Run) -> list:
+    """C3: each interface of the stack compresses by its load over its four contacts' stiffness, within 3%."""
+    params = run.scene.params
+    expected = refs.stack_compression(params["count"], params["mass"], params["stiffness"])
+    z = run.body_q[-1, : params["count"], 2]
+    measured = np.r_[params["half"] - z[0], 2.0 * params["half"] - np.diff(z)]
+    return [
+        (f"interface {j} compression error [1]", abs(measured[j] / expected[j] - 1.0), 3.0e-2)
+        for j in range(params["count"])
+    ]
+
+
+def pad_laws(run: Run) -> list:
+    """C4: each pad's contacts compress by the squeeze over their stiffness within 5%, and the bar does not slip."""
+    params = run.scene.params
+    per_pad = len(run.contacts[-1]["force"]) // 2
+    expected = params["squeeze"] / (per_pad * params["stiffness"])
+    bar, left, right = run.body_q[-1, :3, 0]
+    reach = params["half"][0] + params["pad"][0]
+    slip = run.body_q[-1, 0, 2] - run.body_q[run.scene.steps // 2, 0, 2]
+    return [
+        ("left pad compression error [1]", abs((left + reach - bar) / expected - 1.0), 5.0e-2),
+        ("right pad compression error [1]", abs((bar + reach - right) / expected - 1.0), 5.0e-2),
+        ("bar slip [m]", abs(slip), 1.0e-4),
+    ]
 
 
 def grasp_laws(run: Run) -> list:
@@ -991,8 +1121,13 @@ SCENE_LAWS = {
     "box_push": speed_limit_laws,
     "pushed_arm": joint_speed_limit_laws,
     "spring_hinge": spring_laws,
-    "compliant_ball": compliance_laws,
-    "torsion_pad": torsion_laws,
+    "spin_decay": spin_decay_laws,
+    "twist_threshold": twist_laws,
+    "pinch_twist": pinch_laws,
+    "compliant_drop": compliant_drop_laws,
+    "compliant_plate": plate_laws,
+    "compliant_stack": stack_laws,
+    "compliant_pinch": pad_laws,
     "gripper": grasp_laws,
     "gripper_table": grasp_laws,
     "keyboard": keyboard_laws,
@@ -1104,6 +1239,12 @@ class Reference:
     mimic: float | None
 
 
+def _torque_balance(physics: Physics) -> bool:
+    """Whether the free bodies' angular balance applies: under point friction, whose rows act at the exported
+    witness points, and without torsion, whose spin torque the export does not carry."""
+    return physics.law == "point" and "torsion" not in physics.scene.tags
+
+
 def reference(physics: Physics, route: Route, device) -> Reference:
     """Run the reference route at the gate budget and converged, and derive the trajectory tolerance.
 
@@ -1146,7 +1287,7 @@ def reference(physics: Physics, route: Route, device) -> Reference:
         spread=spread,
         tolerance=tolerance,
         laws=contact_laws(budget, data, patch=physics.law == "patch"),
-        momentum=momentum_balance(budget, data, torque=physics.law == "point"),
+        momentum=momentum_balance(budget, data, torque=_torque_balance(physics)),
         limit=limit_violation(budget, data),
         loop=loop_gap(budget, joints),
         mimic=mimic_error(budget, joints),
@@ -1189,6 +1330,8 @@ CPU_SPLIT_UNIT = CPU_SPLIT.but(
     "cpu_split_unit", options={"contact_update": "unit"}, expect={"sweep.contact_update.law": "unit"}
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
+MF_TORSION = MF_DEFAULT.but("mf_torsion", expect={"friction.torsion": True})
+MF_COMPLIANCE = MF_DEFAULT.but("mf_compliance", expect={"sweep.driver": "contact_compliance"})
 MF_GENERAL = Route(
     "mf_general",
     "cuda",
@@ -1451,6 +1594,7 @@ def cuda_groups() -> list:
     """Problems of the CUDA matrix: every route each scene admits, against the CUDA reference."""
     ref = REFERENCE_CUDA
     vlimits = {"enable_joint_velocity_limits": True}
+    twist = scenes.twist_threshold()
     groups = []
     for law in _laws():
         # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
@@ -1489,14 +1633,9 @@ def cuda_groups() -> list:
             # armature it needs near the head, the same on every route.
             Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT,)),
             Group(
-                _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
+                _physics(twist, law, 32, "torsion", contact_torsion_radius=twist.params["spin_radius"]),
                 ref,
-                (
-                    MF_DEFAULT.but(
-                        "mf_torsion", pins={"torsion_preparation": "host"}, expect={"friction.torsion": True}
-                    ),
-                    MF_DEFAULT.but("mf_torsion_device"),
-                ),
+                (MF_TORSION.but("mf_torsion_host", pins={"torsion_preparation": "host"}), MF_TORSION),
             ),
         ]
     groups += [
@@ -1545,19 +1684,20 @@ def cuda_groups() -> list:
                 MF_PARALLEL,
             ),
         ),
-        Group(
-            _physics(
-                scenes.compliant_ball(),
-                "point",
-                16,
-                "compliance",
-                contact_compliance=True,
-                enable_restitution=False,
-            ),
-            ref,
-            (MF_DEFAULT.but("mf_compliance", expect={"sweep.driver": "contact_compliance"}),),
-        ),
     ]
+    # The CT benchmark's checks that today's torsion and compliance pass. T1 on a free body, T3 at 7 mm (where the
+    # elliptic cone holds and the pair-first law slips) and T4 join with the ball law.
+    for scene in (scenes.spin_decay(), scenes.pinch_twist(offsets=(0.004, 0.011, 0.02))):
+        torsion = {"contact_torsion_radius": scene.params["spin_radius"]}
+        groups.append(Group(_physics(scene, "point", 32, "torsion", **torsion), ref, (MF_TORSION,)))
+    compliance = {"contact_compliance": True, "enable_restitution": False}
+    for scene in (
+        scenes.compliant_drop(),
+        scenes.compliant_plate(),
+        scenes.compliant_stack(),
+        scenes.compliant_pinch(),
+    ):
+        groups.append(Group(_physics(scene, "point", 32, "compliance", **compliance), ref, (MF_COMPLIANCE,)))
     return groups
 
 
@@ -1644,7 +1784,7 @@ def run_checks(group: Group, route: Route, device) -> list:
         )
     # A rigid-body speed clamp removes momentum outside the contact rows, which the export does not report.
     if "rigid_body_velocity_limits" not in physics.scene.tags:
-        balance = momentum_balance(run, data, torque=physics.law == "point")
+        balance = momentum_balance(run, data, torque=_torque_balance(physics))
         for kind, value in balance.items():
             if value is not None:
                 relative = LAW_FACTOR * (ref.momentum[kind] or 0.0) if kind == "articulated" else 0.0
