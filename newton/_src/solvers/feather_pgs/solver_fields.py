@@ -212,7 +212,7 @@ PREELIMINATION = FieldGroup(
     # A projection's block weights (the predictor's, then the leave's).
     Field("_preelim_weight", wp.float32, ("preelim_row",), grad=False),
 )
-"""Fixed-capacity bilateral elimination buffers, ``PREELIM_MAX_ROWS`` rows per eliminating articulation."""
+"""Bilateral elimination buffers: per eliminating articulation, the model's largest block of rows and its square."""
 
 Preelim = field_group.struct(
     "Preelim",

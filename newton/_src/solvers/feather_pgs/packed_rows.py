@@ -31,7 +31,7 @@ rows are never cleared. The build (:func:`pack_kernel`, one launch) whitens the 
 entries past the sides and forms their diagonals (the parallel tiers whiten their worlds' rows in the kernel from
 the rows' sides: the build leaves them without a warm start). The
 warm start applies the rows' impulses through them (:func:`apply_kernel`), and bilateral pre-elimination corrects
-them (:data:`.response_builds_rows.ELIMINATION`) and projects the velocity onto its blocks (:func:`project_kernel`).
+them (:func:`.response_builds_rows.elimination`) and projects the velocity onto its blocks (:func:`project_kernel`).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from . import kernel_template
 from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup
 from .kernel_template import THREADS, KernelTemplate
-from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, PREELIM_MAX_ROWS
+from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskySolve, Reversed
 
 __all__ = ["PACKED_ROWS", "PACKED_SIDES", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
@@ -294,15 +294,15 @@ _PROJECT_ABI = kernel_template.params(
     ("v_out", wp.array[float]),
 )
 """A size group's bilateral projection: its factors and articulations, the blocks' rows and weights
-(:data:`.response_builds_rows.ELIMINATION`), the packed rows and the velocity."""
+(:func:`.response_builds_rows.elimination`), the packed rows and the velocity."""
 
 
 @functools.cache
-def project_kernel() -> wp.Kernel:
-    """Project the velocity onto each articulation's bilateral block, ``v -= P^T L^-T Z_B y`` with the block's
-    weights ``y`` (:func:`.response_builds_rows.bilateral_weights_kernel`), one thread per articulation of the size
-    group (``dim = articulations``): enter ``u = L^T P v``, subtract ``Z_B y`` in block order, leave (Z0), in place
-    in ``v_out``."""
+def project_kernel(rows: int) -> wp.Kernel:
+    """Project the velocity onto each articulation's bilateral block of up to ``rows`` rows, ``v -= P^T L^-T Z_B y``
+    with the block's weights ``y`` (:func:`.response_builds_rows.elimination`), one thread per articulation of the
+    size group (``dim = articulations``): enter ``u = L^T P v``, subtract ``Z_B y`` in block order, leave (Z0), in
+    place in ``v_out``."""
 
     def L(row, col):
         return f"L_group.data[((size_t)group * n_dofs + ({row})) * n_dofs + ({col})]"
@@ -321,7 +321,7 @@ def project_kernel() -> wp.Kernel:
     const int first = dense != 0 ? articulation_world_dof_offset.data[art] : 0;
     const int capacity = packed_Z.shape[1];
     const int support = packed_Z.shape[2];
-    const int base = pe * {PREELIM_MAX_ROWS};
+    const int base = pe * {int(rows)};
     float* v_last = &v_out.data[start + n_dofs - 1];
 {solve.enter(velocity, velocity)}
     for (int e = 0; e < n_dofs; ++e) {{
@@ -335,5 +335,10 @@ def project_kernel() -> wp.Kernel:
 {solve.leave(velocity, velocity)}
 """
     return KernelTemplate(
-        "project_dense_rows", _PROJECT_ABI, body, dispatch=THREADS, dual=True, native_name="project_dense_rows_native"
+        f"project_dense_rows_{int(rows)}",
+        _PROJECT_ABI,
+        body,
+        dispatch=THREADS,
+        dual=True,
+        native_name="project_dense_rows_native",
     ).kernel()

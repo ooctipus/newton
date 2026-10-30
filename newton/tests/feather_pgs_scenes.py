@@ -625,6 +625,104 @@ def five_bar_leg(*, trunk_mass: float = 2.0, radius: float = 0.01) -> Scene:
     )
 
 
+def stewart_platform(*, platform_mass: float = 2.0, push: float = 0.03) -> Scene:
+    """A 6-UPS Stewart platform pressed onto a table: six legs (a universal joint at the base, a driven prismatic
+    actuator, a ball joint at the platform); the platform rides on leg 0, legs 1-5 close on it through ball loop
+    joints (fifteen connect rows on one articulation). The actuators retract by ``push``, driving the platform into
+    the table, so every closure carries the contact load (LC design §3.2)."""
+
+    def build(device):
+        builder = _builder()
+        rb, rp, zp, hp = 0.3, 0.15, 0.45, 0.02
+        ang_b = np.radians([0, 120, 120, 240, 240, 360]) + np.radians([-15, 15, -15, 15, -15, 15])
+        ang_p = np.radians([0, 120, 120, 240, 240, 360]) + np.radians([-45, 45, -45, 45, -45, 45])
+        base_points = [np.array([rb * np.cos(a), rb * np.sin(a), 0.0]) for a in ang_b]
+        platform_points = [np.array([rp * np.cos(a), rp * np.sin(a), zp]) for a in ang_p]
+        builder.add_shape_box(
+            -1, xform=wp.transform(wp.vec3(0.0, 0.0, zp - hp - 0.1)), hx=0.5, hy=0.5, hz=0.1, cfg=_cfg()
+        )
+        platform = builder.add_link(
+            xform=wp.transform(wp.vec3(0.0, 0.0, zp)),
+            mass=platform_mass,
+            inertia=_box_inertia(platform_mass, rp, rp, hp),
+        )
+        builder.add_shape_box(platform, hx=rp * 0.8, hy=rp * 0.8, hz=hp, cfg=_cfg(density=0.0))
+        silent = newton.ModelBuilder.ShapeConfig(density=0.0, has_shape_collision=False)
+        joints, loops = [], []
+        for leg, (b, p) in enumerate(zip(base_points, platform_points, strict=True)):
+            axis = (p - b) / np.linalg.norm(p - b)
+            x = np.cross([0.0, 1.0, 0.0], axis)
+            x /= np.linalg.norm(x)
+            y = np.cross(axis, x)
+            length = float(np.linalg.norm(p - b))
+            cross = builder.add_link(
+                xform=wp.transform(wp.vec3(*b)), mass=0.05, inertia=_box_inertia(0.05, 0.01, 0.01, 0.01)
+            )
+            cylinder_c = b + axis * 0.3 * length
+            cylinder = builder.add_link(
+                xform=wp.transform(wp.vec3(*cylinder_c)), mass=0.5, inertia=_box_inertia(0.5, 0.02, 0.02, 0.15 * length)
+            )
+            builder.add_shape_box(cylinder, hx=0.02, hy=0.02, hz=0.02, cfg=silent)
+            piston_c = p - axis * 0.3 * length
+            piston = builder.add_link(
+                xform=wp.transform(wp.vec3(*piston_c)), mass=0.3, inertia=_box_inertia(0.3, 0.015, 0.015, 0.15 * length)
+            )
+            builder.add_shape_box(piston, hx=0.015, hy=0.015, hz=0.015, cfg=silent)
+            joints.append(
+                builder.add_joint_revolute(-1, cross, axis=wp.vec3(*x), parent_xform=wp.transform(wp.vec3(*b)))
+            )
+            joints.append(
+                builder.add_joint_revolute(
+                    cross, cylinder, axis=wp.vec3(*y), child_xform=wp.transform(wp.vec3(*(b - cylinder_c)))
+                )
+            )
+            joints.append(
+                builder.add_joint_prismatic(
+                    cylinder,
+                    piston,
+                    axis=wp.vec3(*axis),
+                    parent_xform=wp.transform(wp.vec3(*(piston_c - cylinder_c))),
+                    target_ke=20000.0,
+                    target_kd=400.0,
+                )
+            )
+            if leg == 0:
+                joints.append(
+                    builder.add_joint_ball(
+                        piston,
+                        platform,
+                        parent_xform=wp.transform(wp.vec3(*(p - piston_c))),
+                        child_xform=wp.transform(wp.vec3(*(p - np.array([0.0, 0.0, zp])))),
+                    )
+                )
+            else:
+                loops.append((piston, p - piston_c, p - np.array([0.0, 0.0, zp])))
+        builder.add_articulation(joints)
+        for piston, parent_anchor, child_anchor in loops:
+            builder.add_joint_ball(
+                piston,
+                platform,
+                parent_xform=wp.transform(wp.vec3(*parent_anchor)),
+                child_xform=wp.transform(wp.vec3(*child_anchor)),
+            )
+        return _finalize(builder, device)
+
+    def control(model, control, state, step):
+        if step == 0:
+            _set_targets(model, control, {3 * leg + 2 + (leg > 0): -push for leg in range(6)})
+
+    return Scene(
+        "stewart_platform",
+        build,
+        dt=1.0 / 240.0,
+        steps=120,
+        params={"platform_mass": platform_mass, "push": push},
+        control=control,
+        contact_matching="latest",
+        tags=frozenset({"loop_joints", "contacts"}),
+    )
+
+
 def mimic_pair(*, coef0: float = 0.1, coef1: float = -0.5, leader_target: float = 0.5) -> Scene:
     """Two revolute ``z`` links: the leader driven to ``leader_target``, the follower held by a mimic constraint."""
 

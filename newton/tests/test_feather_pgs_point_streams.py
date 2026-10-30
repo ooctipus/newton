@@ -359,9 +359,18 @@ def _dense_build_calls():
     # and the bilateral projection.
     for sizes in ((6,), (6, 9), (18,), (6, 106)):
         yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
-    for name in ("apply_kernel", "project_kernel"):
-        yield f"packed_rows.{name}", getattr(packed_rows, name).__wrapped__, (), {}
+    yield "packed_rows.apply_kernel", packed_rows.apply_kernel.__wrapped__, (), {}
+    yield "packed_rows.project_kernel", packed_rows.project_kernel.__wrapped__, (8,), {}
     from newton._src.solvers.feather_pgs import response_builds_rows  # noqa: PLC0415
+
+    # The bilateral elimination of blocks of up to eight rows: its setup, correction and projection weights.
+    for part in ("setup", "correct", "weights"):
+        yield (
+            f"response_builds_rows.elimination.{part}",
+            lambda rows, part=part: getattr(response_builds_rows.elimination.__wrapped__(rows), part),
+            (8,),
+            {},
+        )
 
     # The sparse-diagonal rows whitened in place, with their diagonals.
     yield (

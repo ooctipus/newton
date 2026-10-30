@@ -18,17 +18,17 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
+from newton.tests.test_feather_pgs_connect import (
+    _REL_P,
+    _anchor_gaps,
+    _build_carried_load,
+    _build_four_bar,
+    _loop_anchor_gap,
+    _prescribe_carrier,
+)
 
 
 class TestPreeliminationSignature(unittest.TestCase):
-    def test_selective_option_is_keyword_only(self):
-        """Keep the new selective option out of the legacy positional API."""
-        parameters = inspect.signature(newton.solvers.SolverFeatherPGS).parameters
-        option = parameters["bilateral_preelimination_include_mimics"]
-        self.assertEqual(option.kind, inspect.Parameter.KEYWORD_ONLY)
-        self.assertIs(option.default, True)
-
     def test_legacy_joint_gap_position_is_preserved(self):
         """Bind a deprecated positional gap to the gap option without silently coercing it to a boolean."""
         parameters = list(inspect.signature(newton.solvers.SolverFeatherPGS).parameters.values())
@@ -36,10 +36,14 @@ class TestPreeliminationSignature(unittest.TestCase):
         arguments = [parameter.default for parameter in parameters[1:11]] + [0.123]
         model = newton.ModelBuilder().finalize(device="cpu")
         with self.assertWarnsRegex(DeprecationWarning, "'joint_limit_activation_gap' positionally"):
-            solver = newton.solvers.SolverFeatherPGS(model, *arguments, bilateral_preelimination_include_mimics=False)
+            solver = newton.solvers.SolverFeatherPGS(model, *arguments)
         self.assertEqual(solver.options.joint_limit_activation_gap, 0.123)
         self.assertIs(solver.options.enable_bilateral_preelimination, False)
-        self.assertIs(solver.options.bilateral_preelimination_include_mimics, False)
+
+    def test_every_bilateral_row_joins_its_block(self):
+        """One law for every bilateral row: the selective mimic option is gone (pivoting drops dependent rows)."""
+        parameters = inspect.signature(newton.solvers.SolverFeatherPGS).parameters
+        self.assertNotIn("bilateral_preelimination_include_mimics", parameters)
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
@@ -107,78 +111,78 @@ def _build_overcapacity_mixed_bilateral_model():
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSPreelimination(unittest.TestCase):
-    def test_default_preserves_all_bilateral_trajectory(self):
-        """Match the implicit default to explicit all-bilateral elimination."""
+    def test_mimic_and_connect_rows_share_one_block(self):
+        """An articulation's mimic and connect rows form one block, eliminated together."""
         builder = _build_four_bar()
         builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
         model = builder.finalize()
-        solvers = [
-            newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, enable_bilateral_preelimination=True, **options)
-            for options in ({}, {"bilateral_preelimination_include_mimics": True})
-        ]
-        states = [(model.state(), model.state()) for _ in solvers]
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, enable_bilateral_preelimination=True)
+        state_0, state_1 = model.state(), model.state()
         control = model.control()
         targets = model.joint_target_q.numpy().copy()
         targets[0] = 0.6
         control.joint_target_q.assign(targets)
         for _ in range(32):
-            for index, solver in enumerate(solvers):
-                state_in, state_out = states[index]
-                state_in.clear_forces()
-                solver.step(state_in, state_out, control, None, 1.0 / 240.0)
-                states[index] = (state_out, state_in)
-            for attribute in ("joint_q", "joint_qd", "body_q", "body_qd"):
-                a, b = [getattr(pair[0], attribute).numpy() for pair in states]
-                self.assertTrue(np.isfinite(a).all())
-                np.testing.assert_array_equal(a, b)
-        for solver in solvers:
-            self.assertTrue(solver.options.bilateral_preelimination_include_mimics)
-            self.assertTrue(solver._preelim_active)
-            count = int(solver._preelim_nB.numpy()[0])
-            slots = solver._preelim_slots.numpy()[:count]
-            selected_types = solver.row_type.numpy()[0, slots]
-            self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
-            self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
-
-    def test_mimics_can_remain_iterative_when_total_rows_exceed_capacity(self):
-        """Pre-eliminate connect rows while leaving excess mimic rows iterative."""
-        model = _build_overcapacity_mixed_bilateral_model()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            solver_all = newton.solvers.SolverFeatherPGS(
-                model,
-                enable_bilateral_preelimination=True,
-            )
-        self.assertFalse(solver_all._preelim_active)
-        self.assertTrue(any("9 bilateral rows" in str(w.message) for w in caught))
-
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_iterations=8,
-            enable_bilateral_preelimination=True,
-            bilateral_preelimination_include_mimics=False,
-        )
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
         self.assertTrue(solver._preelim_active)
-        self.assertEqual(solver._preelim_count, 1)
+        count = int(solver._preelim_nB.numpy()[0])
+        slots = solver._preelim_slots.numpy()[:count]
+        selected_types = solver.row_type.numpy()[0, slots]
+        self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
+        self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
+    def test_blocks_are_sized_from_the_model(self):
+        """A block takes every bilateral row of its articulation, however many: three connect rows and six mimics
+        (nine rows, past the former capacity of eight) are eliminated, and the pivot keeps one of the six identical
+        mimics, which depend on each other."""
+        model = _build_overcapacity_mixed_bilateral_model()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, enable_bilateral_preelimination=True)
+        self.assertTrue(solver._preelim_active)
+        self.assertEqual(solver._elimination.rows, 9)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(16):
             state_0.clear_forces()
             solver.step(state_0, state_1, control, None, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
-
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
-        self.assertGreater(int(solver._preelim_nB.numpy()[0]), 0)
-        self.assertLessEqual(int(solver._preelim_nB.numpy()[0]), 3)
-        selected = solver._preelim_slots.numpy()[: int(solver._preelim_nB.numpy()[0])]
-        selected_types = solver.row_type.numpy()[0, selected]
-        np.testing.assert_array_equal(selected_types, np.full(len(selected), PGS_CONSTRAINT_TYPE_CONNECT))
-        counts = solver.constraint_count.numpy()
-        rows = solver.row_type.numpy()
-        seen = {int(row) for world in range(rows.shape[0]) for row in rows[world, : counts[world]]}
-        self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
-        self.assertIn(int(PGS_CONSTRAINT_TYPE_MIMIC), seen)
+        count = int(solver._preelim_nB.numpy()[0])
+        kept = solver.row_type.numpy()[0, solver._preelim_slots.numpy()[:count]]
+        self.assertEqual(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
+        self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
+
+    def test_prescribed_parent_closures_are_eliminated(self):
+        """A load pinned to a moving kinematic carrier by three ball closures (nine rows, the carrier's velocity in
+        their right-hand sides) rides along with it under the elimination."""
+        b, carrier, load, joints = _build_carried_load()
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(
+            model, pgs_iterations=16, pgs_beta=0.2, enable_bilateral_preelimination=True
+        )
+        self.assertTrue(solver._preelim_active)
+        articulation = wp.array([int(solver.forest.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        dt = 1.0 / 240.0
+        v = np.array([0.3, 0.0, 0.1])
+        omega = np.array([0.0, 0.0, 1.5])
+        for i in range(240):
+            _prescribe_carrier(model, solver, state_0, articulation, i * dt, v, omega)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, dt)
+            state_0, state_1 = state_1, state_0
+        _prescribe_carrier(model, solver, state_0, articulation, 240 * dt, v, omega)
+        bq = state_0.body_q.numpy().astype(np.float64)
+        self.assertTrue(np.isfinite(bq).all())
+        carrier_t = wp.transform(wp.vec3(*bq[carrier, :3]), wp.quat(*bq[carrier, 3:]))
+        expected = wp.transform_point(carrier_t, wp.vec3(*_REL_P))
+        error = np.linalg.norm(bq[load, :3] - np.array([expected[0], expected[1], expected[2]]))
+        self.assertLess(error, 3.0e-3, f"load lagged the carrier by {error:.4f} m")
+        for gap in _anchor_gaps(model, state_0, joints, solver):
+            self.assertLess(gap, 3.0e-3)
 
     def test_closure_exact_at_low_iterations(self):
         """Pre-elimination makes the loop closure iteration-independent.
@@ -305,13 +309,18 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         """The elimination gives the contacts the closed-loop response, so a loop that carries contact load converges
         at the contacts' own rate, where closure rows in the sweep converge at the closure's coupling to them.
 
-        The five-bar leg stands on its foot, which sits on the loop: 16 sweeps reach the converged trajectory (512
-        sweeps) within 1e-6 m. The four-bar is stopped at its rocker, so the crank's drive load (about 30 N m) crosses
-        the closure into a four-point face contact whose split is statically indeterminate: that contact problem sets
-        its 16-sweep error (3.1e-6 m, the same with the closure exact or regularized), 2000 times below the
-        iterative closure rows' (7.3e-3 m). LC design §3.
+        The five-bar leg stands on its foot, which sits on the loop, and the Stewart platform's five closures
+        (fifteen rows in one block) press it onto a table: 16 sweeps reach the converged trajectory (512 sweeps)
+        within 1e-6 m (measured 0 and 1.5e-8 m; iterative closure rows 1.2e-3 and 7.3e-3 m). The four-bar is stopped
+        at its rocker, so the crank's drive load (about 30 N m) crosses the closure into a four-point face contact
+        whose split is statically indeterminate: that contact problem sets its 16-sweep error (3.1e-6 m, the same with
+        the closure exact or regularized), 2000 times below the iterative closure rows' (7.3e-3 m). LC design §3.
         """
-        for scene, bound in ((scenes.five_bar_leg(), 1.0e-6), (scenes.loaded_four_bar(), 1.0e-5)):
+        for scene, bound in (
+            (scenes.five_bar_leg(), 1.0e-6),
+            (scenes.stewart_platform(), 1.0e-6),
+            (scenes.loaded_four_bar(), 1.0e-5),
+        ):
             with self.subTest(scene=scene.name):
                 solver, fast, loaded = _run_scene(scene, 16)
                 _, converged, _ = _run_scene(scene, 512)

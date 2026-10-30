@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+import functools
+
 import warp as wp
 
 from ...sim import BodyFlags, JointType
@@ -1530,26 +1532,18 @@ def populate_connect_J_for_size(
 
 
 # =============================================================================
-# Bilateral pre-elimination (mimic + connect Schur complement)
+# Bilateral elimination: the block kit
 # =============================================================================
-# The block capacity and solve of response_builds_rows.BilateralElimination, which
-# folds the selected bilateral rows (MIMIC and/or CONNECT) into the response
-# operator. See reports/vishal/robotiq/fpgs_preelimination_design.md
-# (skild-IL-solver).
-
-PREELIM_MAX_ROWS = 8
-"""Per-articulation capacity of the pre-eliminated bilateral block (the
-Robotiq 2F-85 needs 7: one mimic + two 3-row connect closures)."""
-
-_preelim_vec = wp.types.vector(length=PREELIM_MAX_ROWS, dtype=wp.float32)
-_preelim_ivec = wp.types.vector(length=PREELIM_MAX_ROWS, dtype=wp.int32)
+# The factor and register types of response_builds_rows.elimination, which
+# eliminates each articulation's bilateral rows (MIMIC and CONNECT) from the
+# response operator, sized by the model's largest block.
 
 
 @wp.func
 def pivoted_cholesky(n: int, A: wp.array[float], A_start: int, floor: float, L: wp.array[float]) -> int:
     """Factor the ``n x n`` block ``A`` (row-major at ``A_start``) in row order, dropping each row whose pivot falls to
     ``floor`` or below: such a row depends on the rows kept before it. ``L`` (the same layout) holds the factor over
-    the kept rows, a dropped row's column zero. Returns the kept rows as a bit mask."""
+    the kept rows; a dropped row's column, its diagonal included, is zero. Returns the kept count."""
     kept = int(0)
     for j in range(n):
         s = A[A_start + dense_index(n, j, j)]
@@ -1564,38 +1558,37 @@ def pivoted_cholesky(n: int, A: wp.array[float], A_start: int, floor: float, L: 
                 for k in range(j):
                     acc -= L[A_start + dense_index(n, i, k)] * L[A_start + dense_index(n, j, k)]
                 L[A_start + dense_index(n, i, j)] = acc / d
-            kept = kept | (1 << j)
+            kept += 1
         else:
             for i in range(j, n):
                 L[A_start + dense_index(n, i, j)] = 0.0
     return kept
 
 
-@wp.func
-def preelim_solve(
-    n: int,
-    L: wp.array[float],
-    L_start: int,
-    b: _preelim_vec,
-) -> _preelim_vec:
-    """Solve (L L^T) x = b for the packed per-articulation Cholesky factor.
+@functools.cache
+def block_kit(rows: int):
+    """The register types of a bilateral block of up to ``rows`` rows, its values and its row indices, and the solve
+    ``(L L^T) x = b`` of its kept factor (row-major, stride ``n``) with the right-hand side in registers."""
+    vec = wp.types.vector(length=rows, dtype=wp.float32)
+    ivec = wp.types.vector(length=rows, dtype=wp.int32)
 
-    Mirrors :func:`dense_subs` but keeps the right-hand side in registers so
-    per-row callers need no global scratch.
-    """
-    x = _preelim_vec()
-    for i in range(n):
-        s = b[i]
-        for j in range(i):
-            s -= L[L_start + dense_index(n, i, j)] * x[j]
-        x[i] = s / L[L_start + dense_index(n, i, i)]
-    for ii in range(n):
-        i = n - 1 - ii
-        s = x[i]
-        for j in range(i + 1, n):
-            s -= L[L_start + dense_index(n, j, i)] * x[j]
-        x[i] = s / L[L_start + dense_index(n, i, i)]
-    return x
+    def solve(n: int, L: wp.array[float], L_start: int, b: vec) -> vec:
+        x = vec()
+        for i in range(n):
+            s = b[i]
+            for j in range(i):
+                s -= L[L_start + dense_index(n, i, j)] * x[j]
+            x[i] = s / L[L_start + dense_index(n, i, i)]
+        for ii in range(n):
+            i = n - 1 - ii
+            s = x[i]
+            for j in range(i + 1, n):
+                s -= L[L_start + dense_index(n, j, i)] * x[j]
+            x[i] = s / L[L_start + dense_index(n, i, i)]
+        return x
+
+    solve.__name__ = solve.__qualname__ = f"block_solve_{rows}"
+    return vec, ivec, wp.func(solve)
 
 
 # =============================================================================

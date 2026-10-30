@@ -98,7 +98,6 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
-    PREELIM_MAX_ROWS,
     RIGID_SPEED_ROWS,
     BodyFactors,
     allocate_connect_slots,
@@ -742,7 +741,6 @@ class SolverFeatherPGS(SolverBase):
         friction_anchor_beta: float | None = None,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
         contact_update: Literal["sequential", "unit"] = "sequential",
-        bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
         contact_torsion_shape_indices: tuple[int, ...] | None = None,
         contact_torsion_shape_patterns: tuple[str, ...] | None = None,
@@ -923,19 +921,13 @@ class SolverFeatherPGS(SolverBase):
                 explains how to select point friction for the original all-row behavior. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
-            enable_bilateral_preelimination (bool, optional): Pre-eliminate the mimic and
-                connect rows of each articulation through a small Schur complement so every
-                other row (contacts especially) sees the closed-loop effective mass exactly:
-                responses become ``Y' = Y - Y_B S^-1 (J_B Y)`` and the predictor velocity is
-                projected onto the bilateral constraint manifold once per step, replacing the
-                iterative enforcement. Requires CUDA with at most 8 bilateral rows per
-                articulation; unsupported configurations warn and fall back to iterative
-                rows. Defaults to False.
-            bilateral_preelimination_include_mimics (bool, optional): Include mimic rows
-                in the pre-eliminated bilateral block. When False, only connect rows are
-                pre-eliminated and mimic rows remain in the iterative sweep. This avoids
-                making the Schur block singular when a mimic row is nearly dependent on
-                the loop-closure rows. Defaults to True.
+            enable_bilateral_preelimination (bool, optional): Eliminate each articulation's mimic and
+                connect rows exactly (:func:`.response_builds_rows.elimination`): every other row
+                (contacts especially) takes the closed-loop response, ``Z' = (I - Z_B G^-1 Z_B^T) Z``,
+                and the predictor velocity is projected onto the closures once per step. Blocks are
+                sized from the model (an articulation's mimic rows plus three per closure); a row
+                that depends on the others leaves its block. Requires the packed-row (CUDA) routes;
+                the CPU warns and keeps the iterative rows. Defaults to False.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -2307,20 +2299,18 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _build_preelimination_plan(self, model) -> None:
-        """Precompute the static tables for bilateral (mimic + connect) pre-elimination.
+        """The bilateral elimination's tables (:func:`.response_builds_rows.elimination`).
 
-        Builds, per articulation that owns bilateral rows: an index into the packed
-        per-elimination buffers, plus the S-factor scratch. All buffers are allocated
-        once here (CUDA-graph-safe); the slot lists and the S factor are rebuilt every
-        step on device because both the row slots and J_B depend on the current state.
-        Unsupported configurations warn and fall back to iterative bilateral rows.
+        Per articulation that owns mimic or connect rows: an index into the elimination's buffers, which hold up to
+        the model's largest block (an articulation's mimic rows plus three per closure; a closure to a prescribed
+        parent carries the parent's velocity in its right-hand side). The buffers are allocated once here
+        (CUDA-graph-safe); the slot lists and the factor are rebuilt every step on device, since the rows' slots and
+        ``J_B`` depend on the state.
         """
         self._preelim_count = 0
         self._preelim_active = False
-        n_bilateral = int(self.laws.connect_count or 0)
-        if self.options.bilateral_preelimination_include_mimics:
-            n_bilateral += int(self.laws.mimic_count or 0)
-        if not self.options.enable_bilateral_preelimination or n_bilateral == 0:
+        self._elimination = None
+        if not self.options.enable_bilateral_preelimination or not (self.laws.connect_count or self.laws.mimic_count):
             return
         if not self._matrix_free:
             warnings.warn(
@@ -2329,35 +2319,17 @@ class SolverFeatherPGS(SolverBase):
                 stacklevel=2,
             )
             return
-
-        if self.laws.connect_count and np.any(self.laws.connect_parent_prescribed_np != 0):
-            warnings.warn(
-                "SolverFeatherPGS: enable_bilateral_preelimination does not support closures "
-                "with a prescribed (kinematic or world) parent yet; falling back to iterative "
-                "mimic/connect rows.",
-                stacklevel=2,
-            )
-            return
-
-        # Per-articulation bilateral row capacity (upper bound: every valid constraint).
+        # Per-articulation block rows (upper bound: every valid constraint).
         counts = np.zeros(model.articulation_count, dtype=np.int64)
-        if self.laws.mimic_count and self.options.bilateral_preelimination_include_mimics:
+        if self.laws.mimic_count:
             counts += np.diff(self.laws.mimic_art_start_np)
         if self.laws.connect_count:
             counts += 3 * np.bincount(self.laws._connect_art.numpy(), minlength=model.articulation_count)
         arts = np.flatnonzero(counts)
         if not arts.size:
             return
-        n_b_max = int(counts.max())
-        if n_b_max > PREELIM_MAX_ROWS:
-            warnings.warn(
-                f"SolverFeatherPGS: an articulation owns {n_b_max} bilateral rows, more "
-                f"than the pre-elimination capacity of {PREELIM_MAX_ROWS}; falling back "
-                "to iterative mimic/connect rows.",
-                stacklevel=2,
-            )
-            return
-
+        rows = int(counts.max())
+        self._elimination = response_builds_rows.elimination(rows)
         device = model.device
         n_pe = len(arts)
         art_to_idx = np.full(model.articulation_count, -1, dtype=np.int32)
@@ -2366,14 +2338,14 @@ class SolverFeatherPGS(SolverBase):
         self._arrays.allocate(
             PREELIMINATION,
             preelim=n_pe,
-            preelim_row=n_pe * PREELIM_MAX_ROWS,
-            preelim_block=n_pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS,
+            preelim_row=n_pe * rows,
+            preelim_block=n_pe * rows * rows,
         )
         self._preelim_count = n_pe
         self._preelim_active = True
 
     def _stage4_bilateral_preelim(self) -> None:
-        """Eliminate the bilateral blocks on the packed rows (:data:`.response_builds_rows.ELIMINATION`).
+        """Eliminate the bilateral blocks on the packed rows (:func:`.response_builds_rows.elimination`).
 
         Form each articulation's block ``G = Z_B^T Z_B`` and its pivoted factor, then correct every other row, its
         right-hand side and its diagonal. Runs once the right-hand sides are final (bias and restitution) and
@@ -2382,7 +2354,7 @@ class SolverFeatherPGS(SolverBase):
         dense = int(self._packed_dense)
         for size in self.forest.size_groups:
             wp.launch(
-                response_builds_rows.bilateral_setup_kernel,
+                self._elimination.setup,
                 dim=self.forest.n_arts_by_size[size],
                 inputs=[
                     field_group.bind(Preelim, solver=self),
@@ -2393,7 +2365,7 @@ class SolverFeatherPGS(SolverBase):
                     self.laws.mimic_slot if self.laws.mimic_slot is not None else self._dummy_is_free_rigid,
                     self.laws._mimic_art_start if self.laws.mimic_count else self._dummy_is_free_rigid,
                     self.laws._mimic_art_list if self.laws.mimic_count else self._dummy_is_free_rigid,
-                    int(self.laws.mimic_count or 0) if self.options.bilateral_preelimination_include_mimics else 0,
+                    int(self.laws.mimic_count or 0),
                     self.laws.connect_slot if self.laws.connect_slot is not None else self._dummy_is_free_rigid,
                     self.laws._connect_art if self.laws.connect_count else self._dummy_is_free_rigid,
                     int(self.laws.connect_count or 0),
@@ -2404,7 +2376,7 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
         wp.launch(
-            response_builds_rows.bilateral_correct_kernel,
+            self._elimination.correct,
             dim=self.forest.world_count * self.dense_max_constraints,
             inputs=[
                 field_group.bind(Preelim, solver=self),
@@ -2426,7 +2398,7 @@ class SolverFeatherPGS(SolverBase):
         dense = int(self._packed_dense)
         for size in self.forest.size_groups:
             wp.launch(
-                response_builds_rows.bilateral_weights_kernel,
+                self._elimination.weights,
                 dim=self.forest.n_arts_by_size[size],
                 inputs=[
                     field_group.bind(Preelim, solver=self),
@@ -2443,7 +2415,7 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             wp.launch(
-                packed_rows.project_kernel(),
+                packed_rows.project_kernel(self._elimination.rows),
                 dim=self.forest.n_arts_by_size[size],
                 inputs=[
                     self.L_by_size[size],

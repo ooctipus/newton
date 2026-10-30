@@ -58,7 +58,6 @@ _BOOLEANS = (
     "contact_friction_articulation_pairs_only",
     "contact_shared_anchor",
     "enable_bilateral_preelimination",
-    "bilateral_preelimination_include_mimics",
     "enable_restitution",
     "warn_constraint_overflow",
     "pgs_warmstart",
@@ -112,7 +111,6 @@ class Options:
     friction_anchor_beta: Any
     pgs_solve_readout: str
     contact_update: str
-    bilateral_preelimination_include_mimics: bool
     contact_torsion_radius: Any
     contact_torsion_shape_indices: Any
     contact_torsion_shape_patterns: Any
