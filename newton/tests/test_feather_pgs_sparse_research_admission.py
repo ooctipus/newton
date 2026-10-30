@@ -48,7 +48,8 @@ class _LawsProbe(SimpleNamespace):
             connect=bool(self.connect_count),
             loops=self.forest.has_loop_joints,
             iterations=options.pgs_iterations > 0,
-            forward_cuda=True,
+            cuda=True,
+            gradients=False,
         )
 
 

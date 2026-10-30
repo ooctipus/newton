@@ -791,13 +791,14 @@ class HeldTree:
 
 
 def options_decline(solver) -> str | None:
-    """Why the device or a test pin keeps ordinary dynamics, or ``None``.
+    """Why the formulation or a test pin keeps ordinary dynamics, or ``None``.
 
-    The CPU keeps the serial passes, and so does the test pin ``evaluator='ordinary'``. Only the held tree evaluates
-    the native sparse factor and the compact diagonal, so their admissions read this before :func:`install` does.
+    The CPU's split formulation keeps the serial passes, and so does the test pin ``evaluator='ordinary'``. Only the
+    held tree evaluates the native sparse factor and the compact diagonal, so their admissions read this before
+    :func:`install` does.
     """
-    if solver.model.device.is_cpu:
-        return "CPU uses ordinary dynamics; cached prediction requires CUDA."
+    if not solver._matrix_free:
+        return "The split formulation (the CPU's) keeps ordinary dynamics."
     if solver._route_pins.get("evaluator") == "ordinary":
         return "A test pin keeps ordinary dynamics (evaluator='ordinary')."
     return None

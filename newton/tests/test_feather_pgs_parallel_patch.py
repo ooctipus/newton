@@ -1176,6 +1176,7 @@ class TestTierRule(unittest.TestCase):
             dense_max_constraints=192,
             _route_pins={},
             routes=_routes(),
+            laws=SimpleNamespace(set=plain_laws()),
             _parallel_contact_paths=True,
             _parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
             _build_inkernel_response_meta=lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
@@ -1206,6 +1207,8 @@ class TestTierRule(unittest.TestCase):
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
             ({"_parallel_contact_paths": False, "_parallel_contact_paths_reason": regularized}, "regularization"),
             ({"routes": _routes(placement="general")}, "general placement"),
+            # The tiers' bodies are written for CUDA only (the CPU takes the general row).
+            ({"laws": SimpleNamespace(set=plain_laws(cuda=False))}, "CUDA device"),
             ({"_route_pins": {"tiers": 0}}, "tiers=0"),
             (
                 {"_build_inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},

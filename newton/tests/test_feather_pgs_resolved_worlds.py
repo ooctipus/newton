@@ -384,7 +384,7 @@ class TestResolvedWorlds(unittest.TestCase):
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
             _route_pins={},
-            laws=SimpleNamespace(set=plain_laws(forward_cuda=False)),
+            laws=SimpleNamespace(set=plain_laws(gradients=True)),
         )
         classifier = rw.ResolvedWorlds(solver)
         self.assertFalse(classifier.enabled)

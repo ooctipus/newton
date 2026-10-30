@@ -16,9 +16,10 @@ import warp as wp
 
 from . import kernel_template, sweep_units
 from .contact_torsion import torque_sweep_source
-from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
+from .device_preludes import CPU_MATH, RING, SHARED_STORAGE, cuda_native, dual_native, lane_group
 from .kernel_template import KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL, BodyFactors
+from .launch import device_lanes
 from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import PROJECTION_LAW
@@ -118,7 +119,7 @@ class FactorCoordinates:
     @classmethod
     def clear(cls, dofs: int, lane: str) -> str:
         """Clear the bitmap (the first warp, before the loads' barrier)."""
-        return f"for (int w = {lane}; w < {cls.words(dofs)}; w += 32) s_factor_marks[w] = 0u;"
+        return f"for (int w = {lane}; w < {cls.words(dofs)}; w += STRIDE) s_factor_marks[w] = 0u;"
 
     @staticmethod
     def mark(first_row: str, rows: str, thread: str, threads: str) -> str:
@@ -525,6 +526,7 @@ def mf_gs_source(
     skip_tier_rows: int = 0,
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
+    lanes: int = 32,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -538,6 +540,9 @@ def mf_gs_source(
     for the warp's worlds and, with ``colored_worlds`` (the solver builds both), the warp's kernel for the colored
     ones.
 
+    ``lanes`` is the warp mapping's lane group (:func:`.launch.device_lanes`): a warp on CUDA, or one thread, which runs
+    the world on either device (the CPU's mapping), so that body composes for both (:func:`.dual_native`).
+
     Returns the body and its staging.
     """
     if mapping not in MAPPINGS:
@@ -549,18 +554,20 @@ def mf_gs_source(
         raise ValueError("factor coordinates require the paired contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
+    if lanes not in (1, 32) or (colored and lanes != 32):
+        raise ValueError(f"the warp mapping runs 32 lanes or one thread, the colored mapping 32; got {lanes}")
     _validate_dense_metadata_encoding(max_constraints)
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
-    lanes = Lanes(32)
+    row_lanes = Lanes(lanes)
     laws = RowLaws(regularize=True, torsion=contact_torsion, policy=solve_policy)
     dense = WorldRows(
-        M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=lanes
+        M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=row_lanes
     )
-    free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
-    dense_op = packed_operator(max_row_dofs, lanes)
+    free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=row_lanes)
+    dense_op = packed_operator(max_row_dofs, row_lanes)
     bodies = FACTOR_COORDINATES
-    free_op = FreeBodyZ(lanes, factor=bodies.factor)
+    free_op = FreeBodyZ(row_lanes, factor=bodies.factor)
     staging = mf_gs_staging(
         M_D,
         M_MF,
@@ -640,7 +647,7 @@ def mf_gs_source(
         free_phase = free_body_rows_block(free, free_op, laws, admission=_MF_ADMISSION, pad="    ")
         offsets = trace_reduction = ""
 
-    thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "32")
+    thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
     sync = "__syncthreads();" if colored else "SYNC();"
     metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF)) if colored else ""
     # The launch's prologue after the marks: the marked articulations entering factor coordinates, and the colored
@@ -669,13 +676,13 @@ def mf_gs_source(
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}
 
-{first_warp}    for (int i = lane; i < m_dense; i += 32) {{
+{first_warp}    for (int i = lane; i < m_dense; i += STRIDE) {{
 {dense_loads}
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
+    for (int i = lane; i < m_mf; i += STRIDE) {{
         {mf_load}
     }}
-    for (int d = lane; d < {D}; d += 32) {{
+    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
     }}
@@ -700,27 +707,28 @@ def mf_gs_source(
 
     {barrier}
 {indent(bodies.convert_all(D, thread, threads, sync, enter=False), "    ")}
-{first_warp}    for (int d = lane; d < {D}; d += 32) {{
+{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];
     }}
-    for (int i = lane; i < m_dense; i += 32) {{
+    for (int i = lane; i < m_dense; i += STRIDE) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
     }}
-    for (int i = lane; i < m_mf; i += 32) {{
+    for (int i = lane; i < m_mf; i += STRIDE) {{
         {mf_store}
     }}
-{end_first_warp}#endif
-"""
+{end_first_warp}"""
     preludes = (
-        lane_group(32),
+        lane_group(lanes),
         SHARED_STORAGE,
         RING,
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW),
         *solve_policy.preludes,
     )
-    return cuda_native(body, preludes=preludes), staging
+    if lanes == 1:
+        return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
+    return cuda_native(body + "#endif\n", preludes=preludes), staging
 
 
 @cache
@@ -745,9 +753,10 @@ def mf_gs_kernel(
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
-    """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches
-    32 threads per world item and takes :data:`MF_GS_ABI` (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the
-    colored one :data:`COLORED_THREADS` and takes :data:`COLORED_ABI`."""
+    """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
+    warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
+    (:data:`COLORED_WORLDS_ABI` with ``colored_worlds``), the colored one :data:`COLORED_THREADS` and takes
+    :data:`COLORED_ABI`."""
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     snippet, staging = mf_gs_source(
         max_constraints,
@@ -766,6 +775,7 @@ def mf_gs_kernel(
         skip_tier_rows=skip_tier_rows,
         independent_components=independent_components,
         solve_policy=solve_policy,
+        lanes=32 if mapping == "colored" else device_lanes(device_arch),
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))

@@ -43,7 +43,7 @@ from .contact_unit import (
     RING_RESIDUAL,
     RING_SOLUTION,
 )
-from .device_preludes import RING
+from .device_preludes import CPU_MATH, RING
 from .kernel_template import KernelTemplate
 from .kernels import BodyFactors
 from .law_source import law_preludes
@@ -53,7 +53,6 @@ from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound, sweep_exit
 from .staging import Staging
 from .sweep import (
     CONTACT,
-    CPU_MATH,
     FRICTION,
     JOINT_LIMIT,
     VELOCITY_LIMIT,

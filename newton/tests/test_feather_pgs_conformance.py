@@ -1471,6 +1471,22 @@ PAIRED_FOREST = Route(
 )
 
 
+# The CPU's matrix-free formulation, under the test pin formulation="matrix_free" until it is the CPU's own: the held
+# tree and the general row (case K6) at the CPU's lane width, against the CUDA reference's route on the CPU (whose
+# dense kernels are the CPU's own).
+_CPU_MATRIX_FREE = {"formulation": "matrix_free"}
+REFERENCE_CPU = Route(
+    "reference_cpu",
+    "cpu",
+    options=_MF,
+    pins={**_ORDINARY, "placement": "general", "claims": (), **_CPU_MATRIX_FREE},
+    expect={"sweep.route": "matrix_free_gs", "held_tree.owner": None},
+)
+CPU_MATRIX_FREE = Route(
+    "cpu_matrix_free", "cpu", options=_MF, pins=_CPU_MATRIX_FREE, expect={"sweep.route": "matrix_free_gs"}
+)
+
+
 def _unsupported(solver) -> bool:
     return False
 
@@ -1698,6 +1714,23 @@ def cuda_groups() -> list:
         scenes.compliant_pinch(),
     ):
         groups.append(Group(_physics(scene, "point", 32, "compliance", **compliance), ref, (MF_COMPLIANCE,)))
+    return groups
+
+
+def cpu_matrix_free_groups() -> list:
+    """The CUDA matrix's problems on the CPU's matrix-free formulation: the default rules, with the options of the
+    problem's routes (warm start, pre-elimination), against the CPU reference. The CPU refuses contact torsion and
+    compliance until they are row laws (CT)."""
+    groups, seen = [], set()
+    for group in cuda_groups():
+        variant = dict(group.physics.variant)
+        if group.name in seen or "contact_torsion_radius" in variant or "contact_compliance" in variant:
+            continue
+        seen.add(group.name)
+        options = {name: value for route in group.routes for name, value in route.options.items()}
+        name = f"{CPU_MATRIX_FREE.name}_{group.tag}" if group.tag else CPU_MATRIX_FREE.name
+        route = CPU_MATRIX_FREE.but(name, options=options)
+        groups.append(dataclasses.replace(group, reference=REFERENCE_CPU, routes=(route,), findings=()))
     return groups
 
 

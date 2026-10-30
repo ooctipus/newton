@@ -39,7 +39,6 @@ import dataclasses
 from collections.abc import Callable
 from typing import ClassVar
 
-from .device_preludes import DevicePrelude
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -62,17 +61,6 @@ TORSION = int(PGS_CONSTRAINT_TYPE_TORSION)
 def indent(text: str, prefix: str) -> str:
     """Prefix every non-empty line of ``text``."""
     return "\n".join(prefix + line if line.strip() else line for line in text.split("\n"))
-
-
-CPU_MATH = DevicePrelude(
-    "cpu_math",
-    "    // The CUDA math the row law calls: the device's own.",
-    "    // The CUDA math the row law calls, on the CPU: Warp's own maximum (its CPU build declares no fmaxf).\n"
-    "    const auto fmaxf = [](float a, float b) -> float { return wp::max(a, b); };",
-)
-"""The CUDA math intrinsics the row law calls, for a body that also runs on the CPU
-(:func:`.device_preludes.dual_native`): ``fmaxf`` is Warp's ``wp::max`` there, the same maximum up to the sign of a
-zero one; CUDA has its own."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------

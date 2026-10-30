@@ -23,7 +23,7 @@ import dataclasses
 
 import warp as wp
 
-__all__ = ["Mapping", "grid", "launch"]
+__all__ = ["Mapping", "device_lanes", "grid", "launch"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +50,16 @@ class Mapping:
     def block_dim(self) -> int:
         """Threads per block."""
         return self.lanes * self.items_per_block
+
+
+def device_lanes(device_arch, lanes: int = 32) -> int:
+    """Threads of a group of ``lanes`` lanes on ``device_arch``: ``lanes`` on a CUDA architecture (a number, or an
+    offline build's ``"sm_XX"``), one on the CPU (architecture 0), which runs a tiled launch's block on one thread."""
+    try:
+        arch = int(str(device_arch).removeprefix("sm_"))
+    except (TypeError, ValueError):
+        return lanes
+    return lanes if arch > 0 else 1
 
 
 def grid(items: int, mapping: Mapping, device=None) -> int:

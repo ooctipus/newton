@@ -66,6 +66,7 @@ from . import (
     sweep_routes_tiers,
     sweep_units,
 )
+from . import route_table as _route_table
 from . import row_metadata as _row_metadata
 from .capture_joins import capturing
 from .conditioning import ArmatureFloor, conditioning_armature
@@ -631,6 +632,7 @@ class SolverFeatherPGS(SolverBase):
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
     #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel: a dense kernel (CUDA).
+    #   formulation "matrix_free": the CPU solves the rows matrix-free, with the held tree, as CUDA does.
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -1099,8 +1101,8 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_slot_sorted = None
 
         # CUDA solves the rows matrix-free, from their whitened placements; the CPU assembles the Delassus rows
-        # and sweeps them with its loop kernels.
-        self._matrix_free = bool(model.device.is_cuda)
+        # and sweeps them with its loop kernels, unless the test pin formulation="matrix_free" runs CUDA's there.
+        self._matrix_free = bool(model.device.is_cuda or self._route_pins.get("formulation") == "matrix_free")
         self.mf_max_constraints = options.mf_max_constraints
         if self._matrix_free:
             _validate_mf_metadata_encoding(self.mf_max_constraints)
@@ -1148,9 +1150,7 @@ class SolverFeatherPGS(SolverBase):
         # _stage1_crba call; gates the per-step H memsets (see _stage1_crba).
         self._mass_update_global_flag = True
         self._last_step_dt = None
-        self._fk_id_cache_available = bool(
-            model.device.is_cuda and model.articulation_count and model.joint_count and not model.requires_grad
-        )
+        self._fk_id_cache_available = bool(model.articulation_count and model.joint_count and not model.requires_grad)
         # The held tree's cache of next-step dynamics (held_tree.install enables it); ordinary dynamics derive
         # them from the state at every step, on CUDA as on the CPU.
         self._fk_id_cache_enabled = False
@@ -1188,13 +1188,12 @@ class SolverFeatherPGS(SolverBase):
         self._setup_passive_joint_forces(model)
         self._setup_fused_diagonal_joint_limits(model)
         # The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
-        # on CUDA without gradients wherever each coordinate has one owning drive row. The held tree's admission,
-        # which the representations only it evaluates (the compact diagonal, the native sparse factor) read before
-        # they are chosen, needs them; ordinary dynamics drop them once the held tree declines (below) and evaluate
-        # drives with the joint forces, as on the CPU.
+        # without gradients wherever each coordinate has one owning drive row. The held tree's admission, which the
+        # representations only it evaluates (the compact diagonal, the native sparse factor) read before they are
+        # chosen, needs them; ordinary dynamics drop them once the held tree declines (below) and evaluate drives
+        # with the joint forces.
         self._setup_parallel_augmented_drive_topology(
-            model,
-            model.device.is_cuda and not model.requires_grad and self.forest.articulation_max_dofs > 0,
+            model, not model.requires_grad and self.forest.articulation_max_dofs > 0
         )
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
@@ -3735,7 +3734,7 @@ class SolverFeatherPGS(SolverBase):
             if model.device.is_cuda and capable.size > 0:
                 rule = rule.at_scale(capable.size, model.device.sm_count)
                 capable = sweep_units.capable_worlds(self.forest.free_rigid_per_world, self.mf_max_constraints, rule)
-            colored = model.device.is_cuda and capable.size > 0
+            colored = capable.size > 0 and _route_table.capable("colored", self.laws.set) is None
             mf_gs_options = {
                 "has_dense_velocity_limit_rows": self.options.enable_joint_velocity_limits,
                 "shared_metadata": storage.shared_metadata,
@@ -7317,19 +7316,23 @@ class SolverFeatherPGS(SolverBase):
         """
         pinned = self._route_pins.get("tiers")
         self._ink_rows, self._ink_sizes = 0, None
-        reason = self.routes.taken("K4") or first_failed(
-            (
-                (self._mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
-                (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
+        reason = (
+            self.routes.taken("K4")
+            or capable("tiers", self.laws.set)
+            or first_failed(
                 (
-                    not self._preelim_active,
-                    "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew.",
-                ),
-                (
-                    bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
-                    "The tiers serve a tree beside a free body (case K4).",
-                ),
-                (self._parallel_contact_paths, self._parallel_contact_paths_reason),
+                    (self._mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
+                    (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
+                    (
+                        not self._preelim_active,
+                        "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew.",
+                    ),
+                    (
+                        bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
+                        "The tiers serve a tree beside a free body (case K4).",
+                    ),
+                    (self._parallel_contact_paths, self._parallel_contact_paths_reason),
+                )
             )
         )
         if reason is None:

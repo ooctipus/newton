@@ -676,7 +676,7 @@ def decline(solver) -> str | None:
             (laws.agnostic, "Contact torsion and compliance rows are outside the contact laws it classifies."),
             (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
-                laws.forward_cuda
+                not laws.gradients
                 and laws.plain
                 and not laws.regularized
                 and not laws.velocity_limits

@@ -314,6 +314,28 @@ SHARED_STORAGE = DevicePrelude("shared_storage", "    #define SHARED __shared__"
 the stack of the CPU's one thread, which runs the block's lane groups."""
 
 
+CPU_MATH = DevicePrelude(
+    "cpu_math",
+    "    // The CUDA intrinsics the bodies call: the device's own.",
+    """    // The CUDA intrinsics the bodies call, on the CPU, whose build declares none of them: Warp's own minimum and
+    // maximum, the bit casts, the first set bit, the one thread's plain bit or, the 128-bit word.
+    const auto fmaxf = [](float a, float b) -> float { return wp::max(a, b); };
+    const auto fminf = [](float a, float b) -> float { return wp::min(a, b); };
+    const auto __int_as_float = [](int i) -> float { float f; memcpy(&f, &i, sizeof(f)); return f; };
+    const auto __float_as_int = [](float f) -> int { int i; memcpy(&i, &f, sizeof(i)); return i; };
+    const auto __ffs = [](unsigned bits) -> int { return __builtin_ffs(static_cast<int>(bits)); };
+    const auto atomicOr = [](unsigned* word, unsigned bits) -> unsigned {
+        const unsigned old = *word;
+        *word = old | bits;
+        return old;
+    };
+    struct int4 { int x, y, z, w; };""",
+)
+"""The CUDA intrinsics the bodies call, for a body that also runs on the CPU (:func:`dual_native`): ``fminf`` and
+``fmaxf`` are Warp's ``wp::min`` and ``wp::max`` there, the same up to the sign of a zero; ``atomicOr`` is a plain
+``|=`` of the one thread that runs the block; ``int4`` is a struct of four ints. CUDA has its own."""
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Patch rings
 # ---------------------------------------------------------------------------------------------------------------------

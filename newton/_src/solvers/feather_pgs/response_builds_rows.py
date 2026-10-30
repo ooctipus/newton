@@ -58,7 +58,7 @@ from .contact_laws import (
     prescribed_target,
 )
 from .dense_rows import DenseRows, MfRows
-from .device_preludes import cuda_native, dual_native, lane_group
+from .device_preludes import CPU_MATH, dual_native, lane_group
 from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
@@ -408,9 +408,9 @@ def free_body_publish_kernel(
 def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kernel:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
-    A warp per world (``wp.launch_tiled`` over the worlds, 32 threads), a lane per row; the word holds the rows'
-    world coordinates, stored inverse diagonal, right-hand side, type and parent. CUDA only. ``device_arch`` keys
-    the variant.
+    A warp per world (``wp.launch_tiled`` over the worlds, 32 threads; one thread on the CPU), a lane per row; the
+    word holds the rows' world coordinates, stored inverse diagonal, right-hand side, type and parent. ``device_arch``
+    keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
@@ -429,7 +429,6 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
 {word}
         *reinterpret_cast<int4*>(&mf_meta.data[off_meta + i * 4]) = packed;
     }}
-#endif
 """
     return KernelTemplate(
         f"free_body_meta_{mf_max_constraints}",
@@ -443,7 +442,7 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
             ("mf_row_parent", wp.array2d[int]),
             ("mf_meta", wp.array2d[int]),
         ),
-        cuda_native(body, preludes=(lane_group(32),)),
+        dual_native(body, preludes=(lane_group(32), CPU_MATH)),
         dispatch=kernel_template.WORLDS,
         composed=True,
         native_name="free_body_meta_native",
