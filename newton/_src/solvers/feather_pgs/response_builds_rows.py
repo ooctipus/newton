@@ -363,7 +363,6 @@ def free_body_publish_kernel(
     mf_row_type: wp.array2d[int],
     mf_impulses: wp.array2d[float],
     factors: BodyFactors,
-    set_output_to_delta: int,
     # in/out
     velocity: wp.array[float],
 ):
@@ -371,9 +370,8 @@ def free_body_publish_kernel(
     (:func:`free_body_publish`, then the body's factor).
 
     One thread per free rigid body of the model (``publish_body``, in its world ``publish_world``), so every body a
-    world's rows hold is published, however many there are. The change replaces the velocity (``set_output_to_delta``)
-    or is added to it: a warm start installs its impulses' velocity so the velocity and the impulses share one state.
-    A body no row holds is left untouched.
+    world's rows hold is published, however many there are. The change is added to the velocity: a warm start installs
+    its impulses' velocity so the velocity and the impulses share one state. A body no row holds is left untouched.
     """
     tid = wp.tid()
     body = publish_body[tid]
@@ -396,10 +394,7 @@ def free_body_publish_kernel(
     first = body_coordinate(body, factors.body_to_articulation, factors.dof_start)
     delta = factor_leave(factors.L, free_body_factor(body, factors), sums)
     for k in range(6):
-        if set_output_to_delta != 0:
-            velocity[first + k] = delta[k]
-        else:
-            velocity[first + k] += delta[k]
+        velocity[first + k] += delta[k]
 
 
 @cache

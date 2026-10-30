@@ -738,11 +738,9 @@ def _sweep_record(**fields):
             "sparse",
             "sparse_diagonal",
             "paired_factor",
-            "free_body_matrix_free",
             "mf_colored",
             "tiers",
             "local",
-            "dense",
         )
     )
     record.update(route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel")
@@ -765,7 +763,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
 
     def test_every_driver_records_the_one_law(self):
         """Record the same exit law under every driver: a launch of part of a solve stops under it too."""
-        for driver in ("direct", "dense_split", "debug_loop"):
+        for driver in ("direct", "debug_loop", "contact_compliance"):
             with self.subTest(driver=driver):
                 solver, record = _policy_solver(), _sweep_record(driver=driver)
                 sweep = {
@@ -775,10 +773,8 @@ class TestSweepPolicyRecords(unittest.TestCase):
                 self.assertEqual(sweep["exit_law"]["law"], "rounding_floor")
                 json.dumps(sweep, allow_nan=False)
 
-    def test_split_launches_count_once_each(self):
-        """Say that a dense-split solve counts once per launch, and a direct one once per solve."""
-        record = _sweep_record(driver="dense_split")
-        self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
+    def test_partial_launches_count_once_each(self):
+        """Say that a direct solve counts once per solve, and a driver that launches part of one once per launch."""
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
         reason = path_selection._readout(_policy_solver(), _sweep_record(driver="debug_loop"))["reason"]
         self.assertIn("counts are per launch", reason)

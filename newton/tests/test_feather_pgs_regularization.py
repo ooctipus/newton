@@ -11,11 +11,10 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, sweep_routes_split
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
-    BodyFactors,
     compute_world_contact_bias,
 )
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
@@ -75,83 +74,6 @@ def _contact_rows(solver, path_id: int, contact_count: int) -> dict[int, int]:
         if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
             out[c] = int(contact_slot[c])
     return out
-
-
-def _solve_rows(device, n_rows, g, iterations=300):
-    """Solve ``n_rows`` identical unit contact rows on one 6-DOF body with unit
-    mass and rhs = -1 through the reference MF loop kernel."""
-    m = 8
-    J = np.zeros((1, m, 6), dtype=np.float32)
-    for r in range(n_rows):
-        J[0, r, 2] = 1.0
-    row_type = np.zeros((1, m), dtype=np.int32)
-    row_type[0, :n_rows] = PGS_CONSTRAINT_TYPE_CONTACT
-    eff_inv = np.zeros((1, m), dtype=np.float32)
-    eff_inv[0, :n_rows] = 1.0
-    rhs = np.zeros((1, m), dtype=np.float32)
-    rhs[0, :n_rows] = -1.0
-    body_a = np.full((1, m), -1, dtype=np.int32)
-    body_a[0, :n_rows] = 0
-
-    mf_impulses = wp.zeros((1, m), dtype=wp.float32)
-    v_out = wp.zeros(6, dtype=wp.float32)
-    wp.launch(
-        sweep_routes_split.mf_loop_kernel(),
-        dim=1,
-        inputs=[
-            wp.array([n_rows], dtype=wp.int32),
-            wp.array(body_a, dtype=wp.int32),
-            wp.full((1, m), -1, dtype=wp.int32),  # body_b
-            wp.array(J, dtype=wp.float32),  # Z_a (unit mass: Z = J)
-            wp.zeros((1, m, 6), dtype=wp.float32),  # Z_b
-            _unit_factor(),
-            wp.array(eff_inv, dtype=wp.float32),
-            wp.array(rhs, dtype=wp.float32),
-            wp.array(row_type, dtype=wp.int32),
-            wp.full((1, m), -1, dtype=wp.int32),  # row_parent
-            wp.zeros((1, m), dtype=wp.float32),  # row_mu
-            wp.full((1, m), 1.0 / (1.0 + g), dtype=wp.float32),  # mf_row_w
-            wp.array([0], dtype=wp.int32),  # body_to_articulation
-            wp.array([0], dtype=wp.int32),  # art_dof_start
-            iterations,
-            1.0,  # omega
-            1,  # regularize
-            iterations,  # friction_start_iteration (no friction rows)
-            0,  # iteration_offset
-            mf_impulses,
-            v_out,
-        ],
-        device=device,
-    )
-    return mf_impulses.numpy()[0, :n_rows]
-
-
-def _unit_factor():
-    """The one body's unit mass factor, at its first coordinate."""
-    factors = BodyFactors()
-    factors.dof_factor = wp.array(np.array([0, -1, -1, -1, -1, -1], np.int32), dtype=wp.int32)
-    factors.L = wp.array(np.eye(6, dtype=np.float32)[None], dtype=wp.float32)
-    return factors
-
-
-def test_regularization_fixed_points(test: unittest.TestCase, device):
-    """Analytic contracts of the regularized update on unit rows:
-
-    - one determined row converges to ``1/(1+g)`` of the rigid impulse (the
-      documented load deficit);
-    - two redundant identical rows converge to the unique symmetric split
-      ``lambda_1 = lambda_2 = 1/(2+g)``;
-    - ``g = 0`` reproduces the exact rigid law (total impulse 1).
-    """
-    with wp.ScopedDevice(device):
-        g = 0.5
-        lam = _solve_rows(device, 1, g)
-        test.assertAlmostEqual(float(lam[0]), 1.0 / (1.0 + g), places=5)
-        lam = _solve_rows(device, 2, g)
-        test.assertAlmostEqual(float(lam[0]), 1.0 / (2.0 + g), places=5)
-        test.assertAlmostEqual(float(lam[1]), 1.0 / (2.0 + g), places=5)
-        lam = _solve_rows(device, 2, 0.0)
-        test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
 def _stack_scene(device, g):
@@ -481,12 +403,6 @@ class TestFeatherPGSRegularization(unittest.TestCase):
     pass
 
 
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_regularization_fixed_points",
-    test_regularization_fixed_points,
-    devices=get_test_devices(),
-)
 add_function_test(
     TestFeatherPGSRegularization,
     "test_regularization_documented_sag",

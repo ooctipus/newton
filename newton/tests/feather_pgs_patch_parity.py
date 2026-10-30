@@ -70,20 +70,7 @@ def _jacobian(solver, route, world, count):
         from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
-    if solver._matrix_free:
-        return unpacked_rows(solver)[0][world, :count]
-    # Split mode keeps each articulation's columns in its size group; the world's
-    # articulations follow in index order (split construction maps no world offsets).
-    worlds = solver.forest.art_to_world.numpy()
-    blocks = []
-    for size in solver.forest.size_groups:
-        group_jacobian = solver.J_by_size[size].numpy()
-        for group, art in enumerate(solver.forest.group_to_art[size].numpy()):
-            if worlds[art] == world:
-                blocks.append((int(art), group_jacobian[group, :count]))
-    return np.concatenate(
-        [block for _art, block in sorted(blocks, key=lambda item: item[0])] or [np.zeros((count, 0))], axis=1
-    )
+    return unpacked_rows(solver)[0][world, :count]
 
 
 def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, every_row=False):
@@ -298,15 +285,13 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     weight and tangential phi and its friction rows' types, mu, biases and
     impulses (``own`` when both rows link to the anchor's own normal row), plus
     the region's normal load and friction vector. A row's bias is its right-hand
-    side without the predicted velocity's ``J v_hat``, which only dense split
-    rows add in (matrix-free and sparse split rows keep it apart): ``-target``
+    side, which keeps the predicted velocity's ``J v_hat`` apart: ``-target``
     plus the position bias of the row's phi. The record keeps the largest
     position-bias gain of step ``dt`` for normal and anchor rows
     (:func:`assert_patch_rows_close`). ``jacobian`` also records each row's
     physical Jacobian (:func:`contact_rows`).
     """
-    baked = not solver._matrix_free
-    rows = contact_rows(solver, contacts, jacobian=baked or jacobian)
+    rows = contact_rows(solver, contacts, jacobian=jacobian)
     patches = solver.laws.friction_patches
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
     owner = patches.current.owner.numpy()[:count]
@@ -314,16 +299,9 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     location = patches.view.point_a.numpy()[:count].astype(np.float64)
     tangent_phi = patches.view.phi.numpy()[:count].astype(np.float64)
     normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
-    worlds = solver.contact_world.numpy()[:count]
-    velocities = {}
 
     def bias(c, row):
-        if not baked:
-            return row["rhs"].astype(np.float64)
-        w = int(worlds[c])
-        if w not in velocities:
-            velocities[w] = _predicted_velocity(solver, w)
-        return row["rhs"].astype(np.float64) - row["jacobian"].astype(np.float64) @ velocities[w]
+        return row["rhs"].astype(np.float64)
 
     record = {
         "normals": {},
@@ -374,19 +352,6 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
             "friction": friction,
         }
     return record
-
-
-def _predicted_velocity(solver, world):
-    """Return a world's predicted generalized velocity in the column order of its dense split row Jacobians."""
-    v_hat = solver.v_hat.numpy().astype(np.float64)
-    # The world's articulations in index order, as :func:`_jacobian` lays them out.
-    worlds, starts = solver.forest.art_to_world.numpy(), solver.forest.articulation_dof_start.numpy()
-    blocks = []
-    for size in solver.forest.size_groups:
-        for art in solver.forest.group_to_art[size].numpy():
-            if worlds[art] == world:
-                blocks.append((int(art), v_hat[int(starts[art]) : int(starts[art]) + size]))
-    return np.concatenate([block for _art, block in sorted(blocks, key=lambda item: item[0])] or [np.zeros(0)])
 
 
 def _match_anchors(first, second):

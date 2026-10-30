@@ -30,8 +30,6 @@ DOF_WORK = FieldGroup(
     Field("v_hat", wp.float32, ("dof",)),
     Field("v_out", wp.float32, ("dof",)),
     Field("qd_work", wp.float32, ("dof",)),
-    Field("v_mf_accum", wp.float32, ("dof",)),
-    Field("v_out_snap", wp.float32, ("dof",)),
 )
 """Per-DOF velocity work vectors."""
 
@@ -140,9 +138,6 @@ DENSE_ROWS = FieldGroup(
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, grad=False))
 """Per-row regularization weights (speculative and restitution rows keep the rigid law)."""
 
-DENSE_DELASSUS = FieldGroup(Field("C", wp.float32, ("world", "row", "row")))
-"""The assembled Delassus matrices of the CPU's split mode."""
-
 WORLD_RESPONSE = FieldGroup(
     Field("J_world", wp.float32, ("world", "row", "world_dof")),
     Field("Y_world", wp.float32, ("world", "row", "world_dof")),
@@ -189,20 +184,6 @@ VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_sign", wp.float32, ("limit_row",), owner="laws"),
 )
 """Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
-
-DENSE_CONTACT_UNITS = FieldGroup(
-    Field("_dense_unit_state", wp.float32, ("world", "row", "unit_fields"), grad=False),
-    Field("_dense_unit_rows", wp.int32, ("world", "row"), grad=False),
-    Field("_dense_unit_block", wp.float32, ("unit_block",), grad=False),
-)
-"""Per-world contact-unit storage of the dense loop sweep (``contact_update="unit"``)."""
-
-MF_CONTACT_UNITS = FieldGroup(
-    Field("_mf_unit_state", wp.float32, ("world", "mf_row", "unit_fields"), grad=False),
-    Field("_mf_unit_rows", wp.int32, ("world", "mf_row"), grad=False),
-    Field("_mf_unit_block", wp.float32, ("unit_block",), grad=False),
-)
-"""Per-world contact-unit storage of the free-body loop sweep."""
 
 PREELIMINATION = FieldGroup(
     Field("_preelim_slots", wp.int32, ("preelim_row",), fill=-1, grad=False),

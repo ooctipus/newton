@@ -151,8 +151,6 @@ class RowLaws:
         model: Model,
         forest: ForestPlan,
         options: Options,
-        *,
-        matrix_free: bool,
     ) -> RowLaws:
         """Resolve the row laws and build their tables.
 
@@ -160,7 +158,6 @@ class RowLaws:
             model: The model.
             forest: The forest plan.
             options: The solver's options.
-            matrix_free: The matrix-free formulation (CUDA).
 
         Raises:
             ValueError: For a negative or non-finite ``friction_anchor_beta``, patch friction with compliant contacts
@@ -170,7 +167,6 @@ class RowLaws:
         laws.model = model
         laws.forest = forest
         laws.options = options
-        laws.matrix_free = bool(matrix_free)
         laws._arrays = SolverArrays(laws, model.device, requires_grad=model.requires_grad)
 
         # The friction law. How friction_anchor_beta was resolved, for get_path_selection().

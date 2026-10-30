@@ -255,8 +255,6 @@ class RouteRow:
     """Axis 3: the producer of the contact rows (:func:`.contact_row_plan.contact_row_plan`)."""
     packed: bool
     """Axis 3: the matrix-free sweeps read the dense rows packed by support, so no size builds a response."""
-    family: str
-    """Axis 4: the step family, ``"matrix_free"`` on CUDA, the CPU's ``"split_interleaved"`` or ``"dense_split"``."""
     tier_rows: int
     """Axis 4: the dense rows of the worlds the Jacobi tiers own (case K4; 0 without tiers)."""
     sizes: dict[str, int | None]

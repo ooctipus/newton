@@ -13,7 +13,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sweep_routes_split
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _pose_motion, patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -1325,22 +1324,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         box_contacts = [c for c in range(count) if {int(shape_body[s[c]]) for s in shapes} & box_bodies]
         self.assertTrue(box_contacts)
         np.testing.assert_array_equal(solver.laws.friction_patches.previous.valid.numpy()[box_contacts], 0)
-
-    def test_pooled_coulomb_budget(self):
-        """Share the loaded middle normal's budget across two unloaded anchor normals."""
-        device = "cpu"
-        capacity = 32
-        count = wp.array([7], dtype=int, device=device)
-        diag = wp.ones((1, capacity), dtype=float, device=device)
-        matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device=device)
-        rhs = wp.array([[0, -100, 0, -4, 0, -100, 0] + [0] * 25], dtype=float, device=device)
-        impulses = wp.zeros((1, capacity), dtype=float, device=device)
-        rows = wp.array([[0, 2, 2, 0, 0, 2, 2] + [-1] * 25], dtype=int, device=device)
-        parents = wp.array([[3, 0, 0, 4, 0, 4, 4] + [-1] * 25], dtype=int, device=device)
-        mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25] + [0] * 25], dtype=float, device=device)
-        args = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, diag, 0, 0, 0]
-        wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=args, device=device)
-        np.testing.assert_allclose(impulses.numpy()[0], [0, 1, 0, 4, 0, 1, 0] + [0] * 25, atol=1.0e-6)
 
     def test_planar_patch_reduces_friction_rows(self):
         """Retain a box face's four normals while using only two friction anchors."""

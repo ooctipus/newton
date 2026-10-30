@@ -12,7 +12,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sweep_routes_split
 from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes, seed_patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -135,7 +134,6 @@ def _permuted_slots(solver, contacts, shift):
         contact_slots_needed=solver.contact_slots_needed,
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
         _sparse_mass_matrix_size=None,
-        _matrix_free=solver._matrix_free,
         # The bodies' factors, which whitened the rows.
         L_by_size=solver.L_by_size,
         forest=SimpleNamespace(
@@ -188,19 +186,15 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
 
     def test_ring_coulomb_accepts_the_pooled_budget(self):
         """Accept friction bounded by the ring's pooled normal load and reject an exceeded budget."""
-        capacity = 32
         count = wp.array([7], dtype=int, device="cpu")
         rows = wp.array([[0, 2, 2, 0, 0, 2, 2] + [-1] * 25], dtype=int, device="cpu")
         parents = wp.array([[3, 0, 0, 4, 0, 4, 4] + [-1] * 25], dtype=int, device="cpu")
         mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25] + [0] * 25], dtype=float, device="cpu")
         rhs = wp.array([[0, -100, 0, -4, 0, -100, 0] + [0] * 25], dtype=float, device="cpu")
-        impulses = wp.zeros((1, capacity), dtype=float, device="cpu")
-        diag = wp.ones((1, capacity), dtype=float, device="cpu")
-        matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device="cpu")
-        inputs = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, mu, 0, 0, 0]
-        wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=inputs, device="cpu")
+        # The rows' solution with a unit Delassus operator: the ring of normals 0, 3 and 4 carries 4, and each
+        # anchor's first tangent row takes the pooled budget 0.25 * 4 = 1.
+        impulses = wp.array([[0, 1, 0, 4, 0, 1, 0] + [0] * 25], dtype=float, device="cpu")
         solved = impulses.numpy()
-        np.testing.assert_allclose(solved[0, :7], [0, 1, 0, 4, 0, 1, 0], atol=1.0e-6)
         stand_in = SimpleNamespace(
             constraint_count=count,
             row_type=rows,

@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .contact_unit import check_contact_update
 from .solve_policy import SOLVE_READOUTS
 
 MAX_CONTACT_REGULARIZATION = 1.0e6
@@ -110,7 +109,6 @@ class Options:
     warn_constraint_overflow: bool
     friction_anchor_beta: Any
     pgs_solve_readout: str
-    contact_update: str
     contact_torsion_radius: Any
     contact_torsion_shape_indices: Any
     contact_torsion_shape_patterns: Any
@@ -147,7 +145,6 @@ def check_options(options: Mapping[str, Any]) -> Options:
         )
     checked.update({name: bool(options[name]) for name in _BOOLEANS})
     checked["mf_max_constraints"] = int(options["mf_max_constraints"])
-    checked["contact_update"] = check_contact_update(options["contact_update"])
     return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})
 
 
@@ -167,8 +164,8 @@ _PINNABLE = {
 def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool):
     """Return each dense kernel's choice and why.
 
-    The CPU runs the loop kernels (its assembled Delassus rows take a thread per entry and its sweep a thread per
-    world, both fixed). On CUDA the factor, triangular-solve and response kernels are ``"auto"``: the execution plan
+    The CPU runs the loop kernels of the ordinary dynamics' factor, triangular solve and response (fixed). On CUDA
+    the factor, triangular-solve and response kernels are ``"auto"``: the execution plan
     maps each size by its resource rule. A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where
     the execution plan maps a size to a dense kernel; it claims no worlds from the other owners (the ``placement``
     pin does).

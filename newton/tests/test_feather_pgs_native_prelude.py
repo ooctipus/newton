@@ -19,7 +19,7 @@ import pkgutil
 import unittest
 from pathlib import Path
 
-from newton._src.solvers.feather_pgs import contact_unit, device_preludes
+from newton._src.solvers.feather_pgs import device_preludes
 from newton._src.solvers.feather_pgs.contact_laws import CONTACT_LAW
 from newton._src.solvers.feather_pgs.device_preludes import (
     ARCHITECTURE_GUARD,
@@ -267,8 +267,6 @@ class TestDevicePreludeComposition(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)), names)
         for family in _FAMILIES:
             self.assertIn(family.prelude(), self.preludes)
-        # The contact-unit law for native sweeps; its CPU binding backs the Warp loop sweeps' functions.
-        self.assertIn(contact_unit.CONTACT_UNIT, self.preludes)
 
 
 class TestNativeSweepLayout(unittest.TestCase):

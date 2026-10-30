@@ -446,7 +446,6 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                 candidate = _case(True, friction_anchor_beta=beta, **shape)
                 self.assertFalse(reference[1]._sparse_velocity_limits)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
-                self.assertTrue(candidate[1]._matrix_free)
                 self.assertEqual(candidate[1].options.pgs_iterations, 8)
                 for step in range(4):
                     sparse_scene.step(reference)

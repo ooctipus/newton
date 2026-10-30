@@ -69,11 +69,11 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
 
     def test_hetero_constructs(self):
         solver = SolverFeatherPGS(self.hetero_model)
-        self.assertEqual(solver._matrix_free, self.hetero_model.device.is_cuda)
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["route"], "matrix_free_gs")
 
     def test_homogeneous_constructs(self):
         solver = SolverFeatherPGS(self.homogeneous_model)
-        self.assertEqual(solver._matrix_free, self.homogeneous_model.device.is_cuda)
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["route"], "matrix_free_gs")
 
 
 if __name__ == "__main__":

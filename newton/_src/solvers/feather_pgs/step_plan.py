@@ -4,15 +4,14 @@
 """The step's plan: what each stage launches, decided once at construction.
 
 Every stage whose work depends on the articulation size (the stage-2 factor, the
-stage-3 solve of the velocity predictor, the stage-4 contact response and the
-Delassus assembly) has one table: each size's route and the reason for it. The
-solve of stages 5 and 6 has one entry: the branch ``step()`` runs, the rows its
-sweep solves and what drives the sweep. ``step()`` launches through these tables,
+stage-3 solve of the velocity predictor and the stage-4 contact response) has one
+table: each size's route and the reason for it. The solve of stages 5 and 6 has one
+entry: the rows its sweep solves and what drives the sweep. ``step()`` launches through these tables,
 the route record (:mod:`.path_selection`) reports them, and construction builds
 exactly the kernels they name, so the three cannot disagree.
 
 The plan reads the solver's route (its row of the route table: the evaluator, the
-placement case and producer, the step family) and the mapping beside it (the
+placement case and producer) and the mapping beside it (the
 execution plan's resource choices, the kernel choices); it decides nothing that
 construction has not, and nothing in it changes after construction.
 """
@@ -84,21 +83,12 @@ class Route:
 
 @dataclass(frozen=True)
 class SolveRoute:
-    """Stages 5 and 6: the branch of ``step()``, the rows the sweep solves and what drives the sweep."""
+    """Stages 5 and 6: the rows the sweep solves and what drives the sweep."""
 
-    family: str
-    """``"matrix_free"`` (CUDA), ``"split_interleaved"`` or ``"dense_split"`` (the CPU): the branch of ``step()``."""
     route: Route
-    """The rows the sweep solves: ``dense_loop`` (the CPU), ``sparse_pgs``, ``sparse_diagonal`` or
-    ``matrix_free_gs``."""
+    """The rows the sweep solves: ``sparse_pgs``, ``sparse_diagonal`` or ``matrix_free_gs``."""
     driver: Route
-    """What drives the route's sweep each solve: ``direct``, ``split_interleaved``, ``dense_split``, ``debug_loop`` or
-    ``contact_compliance``."""
-
-    @property
-    def assembles_delassus(self) -> bool:
-        """Whether stage 4 assembles the Delassus operator (split mode's dense rows) instead of only the response."""
-        return self.family in ("split_interleaved", "dense_split")
+    """What drives the route's sweep each solve: ``direct``, ``debug_loop`` or ``contact_compliance``."""
 
 
 @dataclass(frozen=True)
@@ -115,8 +105,6 @@ class StepPlan:
     """Stage 4, per size: ``owner`` (a contact owner publishes the response), ``sparse_diagonal``,
     ``packed`` (only the packed rows' build: none reads the response), ``diagonal``, ``grouped``, ``tiles``,
     ``lanes`` or ``rows``."""
-    delassus: Mapping[int, Route]
-    """Stage 4, per size, the CPU's Delassus assembly (``entries``); empty where none is assembled."""
     solve: SolveRoute
     unread_mass_sizes: tuple[int, ...]
     """Sizes whose dense mass matrix no stage reads: every size under a held-tree owner, which refreshes the factors
@@ -131,12 +119,11 @@ class StepPlan:
     def build(cls, row: RouteRow, solver) -> StepPlan:
         """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
         held = row.evaluator == "held"
-        solve = _solve(row, solver)
+        solve = _solve(row)
         return cls(
             factor=MappingProxyType(_factor(row, solver)),
             trisolve=MappingProxyType({} if held else _trisolve(row, solver)),
-            response=MappingProxyType(_response(row, solver, solve)),
-            delassus=MappingProxyType(_delassus(solver, solve)),
+            response=MappingProxyType(_response(row, solver)),
             solve=solve,
             unread_mass_sizes=tuple(solver.forest.size_groups) if held else (),
             jacobian_clear_sizes=()
@@ -158,8 +145,6 @@ class StepPlan:
             "factor": table(self.factor),
             "trisolve": table(self.trisolve) if self.trisolve else None,
             "response": table(self.response),
-            "delassus": table(self.delassus) if self.delassus else None,
-            "solve_family": self.solve.family,
             "unread_mass_dofs": sorted(int(size) for size in self.unread_mass_sizes),
             "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
@@ -213,24 +198,23 @@ def _trisolve(row: RouteRow, solver) -> dict[int, Route]:
     return routes
 
 
-def _response(row: RouteRow, solver, solve: SolveRoute) -> dict[int, Route]:
+def _response(row: RouteRow, solver) -> dict[int, Route]:
     plan = solver._execution_plan
     sizes = solver.forest.size_groups
     owner = row.producer == "compact_contact_boundary" or row.case == "K1"
     routes = {}
     for size in sizes:
         route = None
-        if not solve.assembles_delassus:
-            if owner:
-                route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
-            elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
-                route = Route(
-                    "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
-                )
-            elif row.packed:
-                route = Route(
-                    "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
-                )
+        if owner:
+            route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
+        elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
+            route = Route(
+                "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
+            )
+        elif row.packed:
+            route = Route(
+                "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
+            )
         if route is None and plan.use_diagonal_mass(size):
             route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
         if route is None:
@@ -261,21 +245,8 @@ def _grouped(row: RouteRow, size: int) -> tuple[bool, str]:
     return False, "No in-kernel tier rows to skip: the planned response kernel."
 
 
-def _delassus(solver, solve: SolveRoute) -> dict[int, Route]:
-    if not solve.assembles_delassus:
-        return {}
-    return dict.fromkeys(
-        solver.forest.size_groups, Route("entries", "The CPU assembles each Delassus entry on its own thread.")
-    )
-
-
-def _solve(row: RouteRow, solver) -> SolveRoute:
-    family = row.family
-    dense_split = family != "matrix_free"
-    # The CPU sweeps its assembled Delassus rows, a thread per world.
-    if dense_split:
-        route = Route("dense_loop", "The CPU sweeps the assembled Delassus rows on one thread per world.")
-    elif row.case == "K1":
+def _solve(row: RouteRow) -> SolveRoute:
+    if row.case == "K1":
         route = Route("sparse_pgs", "Native sparse factors own the sweep.")
     elif row.case == "K2":
         route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
@@ -283,28 +254,7 @@ def _solve(row: RouteRow, solver) -> SolveRoute:
         route = Route(
             "matrix_free_gs", "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
         )
-    if family == "split_interleaved":
-        driver = Route(
-            "split_interleaved",
-            "A world holds free bodies and articulations: each iteration runs a one-iteration dense sweep, "
-            "rebuilds the velocity, runs a one-iteration matrix-free sweep and adds its velocity change to "
-            "the dense right-hand side.",
-        )
-    elif dense_split and row.laws.debug_rows:
-        driver = Route(
-            "debug_loop", "pgs_debug launches one dense iteration per dispatch and reads the impulses back after each."
-        )
-    elif dense_split:
-        driver = Route(
-            "dense_split",
-            "One dense dispatch sweeps all iterations"
-            + (
-                "; one matrix-free dispatch then sweeps the free-body rows."
-                if solver.forest.has_free_rigid_bodies
-                else "."
-            ),
-        )
-    elif row.laws.debug_rows:
+    if row.laws.debug_rows:
         driver = Route(
             "debug_loop", "pgs_debug launches the position solve one iteration per dispatch with host reads."
         )
@@ -315,4 +265,4 @@ def _solve(row: RouteRow, solver) -> SolveRoute:
         )
     else:
         driver = Route("direct", "The route sweeps all iterations in one dispatch.")
-    return SolveRoute(family=family, route=route, driver=driver)
+    return SolveRoute(route=route, driver=driver)

@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build the dense response operators' data: the factor of ``H``, ``Y = H^-1 J^T`` and its diagonal, the assembled
-Delassus ``C``, and the velocity the impulses publish.
+"""Build the dense response operators' data: the factor of ``H``, ``Y = H^-1 J^T`` and its diagonal.
 
 A dense response is built per articulation size group in stages (:data:`STAGES`), each one implementation per
-thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the response by size group and the world layout) and
-:data:`ASSEMBLED_BUILDS` (the data of an :class:`.Assembled` sweep). Each stage's arithmetic comes from one small
-dense kit:
+thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the response by size group and the world
+layout). Each stage's arithmetic comes from one small dense kit:
 
 * :class:`.CholeskyFactor`: the leaf-first factor ``P (H + diag(R)) P^T = L L^T`` (``P`` reverses an
   articulation's coordinates, :func:`.leaf_first`) by columns on one thread (``factor`` over articulations, and lane
@@ -17,7 +15,7 @@ dense kit:
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
   group, the paired response), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
   response); a diagonal factor divides twice, unguarded (Zdiv, :func:`diagonal_solve`);
-* :func:`dot`: a sum of products in ascending order from zero (every diagonal, every Delassus entry, the apply);
+* :func:`dot`: a sum of products in ascending order from zero (every diagonal);
 * the tile primitives (``tile_cholesky``, ``tile_lower_solve``, ``tile_upper_solve``, ``tile_matmul``) for the
   tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
   re-derives it.
@@ -46,7 +44,6 @@ from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, 
 from .staging import Buffer, Staging
 
 __all__ = [
-    "ASSEMBLED_BUILDS",
     "DENSE_JY_BUILDS",
     "STAGES",
     "Build",
@@ -55,10 +52,10 @@ __all__ = [
     "whiten_six",
 ]
 
-STAGES = ("factor", "response", "diagonal", "cfm", "delassus", "apply")
+STAGES = ("factor", "response", "diagonal", "cfm")
 """What a build stage writes: the leaf-first factor ``L`` of ``P (H + diag(R)) P^T``; the response ``Y = H^-1 J^T`` (by
 size group, optionally in the world layout, optionally with its diagonal ``J_i Y_i``); the world diagonal ``A_ii = J_i
-Y_i``; its ``cfm``; the Delassus ``C = J Y^T`` with its diagonal; the velocity ``v_hat + Y^T lambda``."""
+Y_i``; its ``cfm``."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -143,8 +140,7 @@ class Build:
 
     Args:
         stage: What it writes (:data:`STAGES`).
-        mapping: How its threads cover the stage's items: its key in :data:`DENSE_JY_BUILDS` or
-            :data:`ASSEMBLED_BUILDS`.
+        mapping: How its threads cover the stage's items: its key in :data:`DENSE_JY_BUILDS`.
         kernel: The Warp kernel.
         grid: The launch's dimensions, by item: a thread grid launches their product as threads, a tiled launch
             them as blocks.
@@ -820,7 +816,7 @@ def diagonal_groups_kernel() -> wp.Kernel:
 @functools.cache
 def cfm_worlds_kernel() -> wp.Kernel:
     """The diagonals' ``cfm``, one thread per world (``dim = worlds``): each row's added atomically, after the
-    Delassus or response diagonal. The parallel tiers' worlds are skipped."""
+    response diagonal. The parallel tiers' worlds are skipped."""
     body = f"""    const int world = tid;
     const int m = world_constraint_count.data[world];
     if ({_skips("m", "world")}) return;
@@ -834,92 +830,6 @@ def cfm_worlds_kernel() -> wp.Kernel:
         ("world_diag", wp.array2d[float]),
     )
     return _kernel("dense_cfm_worlds", params, body)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Stage "delassus": C = J Y^T and its diagonal, accumulated onto a zeroed C and diagonal (S17: array clears)
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@functools.cache
-def delassus_entries_kernel() -> wp.Kernel:
-    """The Delassus of a size group, one thread per articulation entry (``dim = articulations * max_constraints^2``):
-    ``C_ij = sum_k J_ik Y_jk`` in coordinate order, added atomically when nonzero (and to the diagonal)."""
-
-    def J(k):
-        return _element("J_group", "idx", "i", k)
-
-    def Y(k):
-        return _element("Y_group", "idx", "j", k)
-
-    body = f"""    const int j = tid % max_constraints;
-    const int i = (tid / max_constraints) % max_constraints;
-    const int idx = tid / (max_constraints * max_constraints);
-    if (idx >= n_arts) return;
-    const int art = group_to_art.data[idx];
-    const int world = art_to_world.data[art];
-    const int n_constraints = world_constraint_count.data[world];
-    if (i >= n_constraints || j >= n_constraints) return;
-{_indent(dot("val", "n_dofs", J, Y), "    ")}
-    if (val != 0.0f) wp::atomic_add(&{_element("world_C", "world", "i", "j")}, val);
-    if (i == j && val != 0.0f) wp::atomic_add(&{_element("world_diag", "world", "i")}, val);
-"""
-    params = kernel_template.params(
-        ("J_group", wp.array3d[float]),
-        ("Y_group", wp.array3d[float]),
-        ("group_to_art", wp.array[int]),
-        ("art_to_world", wp.array[int]),
-        ("world_constraint_count", wp.array[int]),
-        ("n_dofs", int),
-        ("max_constraints", int),
-        ("n_arts", int),
-        ("world_C", wp.array3d[float]),
-        ("world_diag", wp.array2d[float]),
-    )
-    return _kernel("dense_delassus_entries", params, body)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Stage "apply": v = v_hat + Y^T lambda
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@functools.cache
-def apply_coordinates_kernel() -> wp.Kernel:
-    """The velocity of a size group's impulses, one thread per articulation coordinate (``dim = articulations *
-    n_dofs``): ``v_out = v_hat + sum_c Y_c lambda_c`` over the world's rows in order, zero impulses included."""
-
-    def Y(c):
-        return _element("Y_group", "idx", c, "local_dof")
-
-    def impulse(c):
-        return _element("world_impulses", "world", c)
-
-    body = f"""    const int local_dof = tid % n_dofs;
-    const int idx = tid / n_dofs;
-    if (idx >= n_arts) return;
-    const int art = group_to_art.data[idx];
-    const int world = art_to_world.data[art];
-    const int n_constraints = world_constraint_count.data[world];
-    const int dof_start = art_dof_start.data[art];
-{_indent(dot("delta_v", "n_constraints", Y, impulse, index="c"), "    ")}
-    const int global_dof = dof_start + local_dof;
-    v_out.data[global_dof] = v_hat.data[global_dof] + delta_v;
-"""
-    params = kernel_template.params(
-        ("group_to_art", wp.array[int]),
-        ("art_to_world", wp.array[int]),
-        ("art_dof_start", wp.array[int]),
-        ("n_dofs", int),
-        ("n_arts", int),
-        ("world_constraint_count", wp.array[int]),
-        ("max_constraints", int),
-        ("Y_group", wp.array3d[float]),
-        ("world_impulses", wp.array2d[float]),
-        ("v_hat", wp.array[float]),
-        ("v_out", wp.array[float]),
-    )
-    return _kernel("dense_apply_coordinates", params, body)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -974,9 +884,6 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("diagonal", "rows"): _entry("diagonal", "rows", diagonal_rows_kernel, ("articulations", "rows")),
     ("diagonal", "groups"): _entry("diagonal", "groups", diagonal_groups_kernel, ("worlds", "rows")),
     ("cfm", "worlds"): _CFM_WORLDS,
-    ("apply", "coordinates"): _entry(
-        "apply", "coordinates", apply_coordinates_kernel, ("articulations", "coordinates")
-    ),
 }
 """The builds of the dense response's data, by ``(stage, mapping)``. Each takes its kernel factory's options
 as keywords and returns the :class:`Build`. The mappings: ``articulations``, a thread per articulation; ``coordinates``,
@@ -986,11 +893,3 @@ lane 0 factoring); ``tiles``, a block per articulation (and row chunk) through t
 walking the local owners' general-world queue; ``pairs``, a block per paired world, a thread per row; ``groups``, a
 thread per world row summing its articulations' group diagonals; ``worlds``, a thread per world. ``diagonal`` is the thread-per-row response of a structurally diagonal ``H``.
 The register whitening of the six-coordinate group is a device function, :func:`whiten_six`."""
-
-ASSEMBLED_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
-    ("delassus", "entries"): _entry("delassus", "entries", delassus_entries_kernel, ("articulations", "rows", "rows")),
-    ("cfm", "worlds"): _CFM_WORLDS,
-}
-"""The builds of an :class:`.Assembled` operator's data (the CPU's split mode), by ``(stage, mapping)``: ``C = J Y^T``
-and its diagonal accumulated onto a zeroed ``C`` and diagonal, a thread per entry, then the diagonals' ``cfm``. The
-response itself is a :data:`DENSE_JY_BUILDS` build."""

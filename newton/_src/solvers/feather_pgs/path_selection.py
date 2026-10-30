@@ -92,10 +92,6 @@ def _is_default(value, default) -> bool:
 _EFFECTIVE = {
     # A readout applies only where a sweep kernel carries its counters.
     "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver._solve_readout.kernels else "off",
-    # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
-    "contact_update": lambda solver: (
-        "unit" if solver._dense_contact_unit or solver._free_body_contact_unit else "sequential"
-    ),
 }
 
 
@@ -523,24 +519,15 @@ def _sweep(solver) -> dict:
     row = solver.routes.row
     solve = solver._plan.solve
     route, driver = solve.route.name, solve.driver.name
-    dense_split = solve.assembles_delassus
-    dense = None
-    if dense_split:
-        dense = {"kernels": [_key(solver._pgs_solve_loop_kernel)]}
-    free_body = None
-    if dense_split and solver.forest.has_free_rigid_bodies:
-        free_body = _key(solver._pgs_solve_mf_loop_kernel)
-    mf_meta_pack = None
-    if solver._matrix_free:
-        # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
-        packed = solver._pack_mf_meta_kernel is not None
-        mf_meta_pack = {
-            "launched": packed,
-            "kernel": _key(solver._pack_mf_meta_kernel),
-            "reason": "Free rigid-body rows pack their metadata each step."
-            if packed
-            else "Skipped: without free rigid bodies no matrix-free row exists.",
-        }
+    # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
+    packed = solver._pack_mf_meta_kernel is not None
+    mf_meta_pack = {
+        "launched": packed,
+        "kernel": _key(solver._pack_mf_meta_kernel),
+        "reason": "Free rigid-body rows pack their metadata each step."
+        if packed
+        else "Skipped: without free rigid bodies no matrix-free row exists.",
+    }
     local = None
     if row.case == "K3":
         local = {
@@ -564,12 +551,9 @@ def _sweep(solver) -> dict:
         "mf_colored": _mf_colored(solver),
         "tiers": _tiers(solver),
         "local": local,
-        "dense": dense,
-        "free_body_matrix_free": free_body,
     }
     record["readout"] = _readout(solver, record)
     record["exit_law"] = _exit_law(solver, record)
-    record["contact_update"] = _contact_update(solver, record)
     return record
 
 
@@ -600,18 +584,6 @@ def _mf_colored(solver) -> dict | None:
     }
 
 
-def _sweep_kernels(solver, record) -> set:
-    """Every sweep kernel key of a sweep record."""
-    keys = {record[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs", "free_body_matrix_free")}
-    keys.add((record["mf_colored"] or {}).get("kernel"))
-    keys.update(tier["kernel"] for tier in (record["tiers"] or {}).get("tiers", ()))
-    for owner in ("internal", "pair", "residual"):
-        keys.update((record["local"] or {}).get(owner, {}).values())
-    keys.update((record["dense"] or {}).get("kernels", ()))
-    keys.discard(None)
-    return keys
-
-
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and how a solve counts."""
     counted = solver._solve_readout.kernels
@@ -619,8 +591,6 @@ def _readout(solver, record) -> dict:
         reason = "pgs_solve_readout is off."
     elif record["driver"] == "direct":
         reason = "Each launch of a counted kernel solves its worlds."
-    elif record["driver"] == "dense_split":
-        reason = "Two row sets sweep in separate launches, so a solve counts once per launch."
     else:
         reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
     return {
@@ -644,56 +614,6 @@ def _exit_law(solver, record) -> dict:
             "its velocity sum and its own impulse times A_ii."
         ),
     }
-
-
-def _contact_update(solver, record) -> dict:
-    """Which sweep kernels of the route solve contact units exactly (``contact_update="unit"``), and why not the others."""
-    unit = []
-    if solver._dense_contact_unit:
-        unit.append(record["dense"]["kernels"][0])
-    if solver._free_body_contact_unit:
-        unit.append(record["free_body_matrix_free"])
-    requested = solver.options.contact_update
-    sequential = []
-    if requested == "unit":
-        sequential = sorted(_sweep_kernels(solver, record) - set(unit))
-    if requested == "sequential":
-        reason = (
-            "contact_update is 'sequential': a sweep steps each contact's normal row, then solves its friction pair "
-            "at the held normal load."
-        )
-    elif not sequential:
-        reason = "Every sweep of this route solves each contact unit exactly against its own Delassus block."
-    else:
-        reason = (
-            "Only the CPU's loop sweeps solve contact units: its assembled dense rows' sweep and its free-body "
-            "sweep. The other sweeps keep the sequential law."
-        )
-    return {
-        "requested": requested,
-        "law": "unit" if unit else "sequential",
-        # Sweep kernels that solve contact units, and those that keep the sequential law under a "unit" request.
-        "unit": unit,
-        "sequential": sequential,
-        # How the unit sweeps solve a patch region: one ring unit, or anchor units with the ring's other load held.
-        "patch_units": solver._contact_unit_patch if unit else None,
-        "reason": reason,
-    }
-
-
-def contact_update_warnings(sweep) -> list[str]:
-    """Return a warning when a requested ``contact_update="unit"`` reaches only some sweeps of a sweep record.
-
-    Args:
-        sweep: The ``routes.sweep`` record of :func:`route_selection`.
-    """
-    update = sweep["contact_update"]
-    if update["requested"] != "unit" or not update["sequential"]:
-        return []
-    return [
-        f"contact_update='unit' applies only to some sweeps of this solver: {update['reason']} "
-        f"Sequential: {update['sequential']}."
-    ]
 
 
 def _mf_gs_storage(solver) -> dict | None:
@@ -780,7 +700,6 @@ def _velocity_limits(solver) -> dict:
     else:
         joint, reason = "rows", "Dedicated velocity-limit rows."
     limits = bool(solver.laws.has_rigid_body_velocity_limits)
-    matrix_free = solver._matrix_free
     model = solver.model
     prescale = solver.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
     return {
@@ -793,8 +712,6 @@ def _velocity_limits(solver) -> dict:
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
-        # Split mode's clamp of the solved velocity of free roots (_stage6_clamp_rigid_velocity_limits).
-        "root_clamp": bool(limits and solver.forest.has_root_free and not matrix_free),
     }
 
 
@@ -803,19 +720,16 @@ def _free_rigid_bodies(solver) -> dict:
     count = int(solver.forest.free_rigid_body_count)
     owners = []
     if count:
-        if not solver._matrix_free:
-            owners.append("split_matrix_free_rows")
-        else:
-            if row.case == "K1":
-                owners.append("sparse_free_rows")
-            if solver._paired_response_primary_size is not None:
-                owners.append("paired_factor" if row.case == "K5" else "paired_response")
-            # Built local kernels only.
-            if solver._pgs_solve_local_pair_kernels:
-                owners.append("local_pair")
-            if solver._pgs_solve_local_residual_kernels:
-                owners.append("local_residual")
-            owners.append("matrix_free_rows")
+        if row.case == "K1":
+            owners.append("sparse_free_rows")
+        if solver._paired_response_primary_size is not None:
+            owners.append("paired_factor" if row.case == "K5" else "paired_response")
+        # Built local kernels only.
+        if solver._pgs_solve_local_pair_kernels:
+            owners.append("local_pair")
+        if solver._pgs_solve_local_residual_kernels:
+            owners.append("local_residual")
+        owners.append("matrix_free_rows")
     return {
         "count": count,
         "mixed_worlds": bool(solver.forest.has_mixed_contacts),

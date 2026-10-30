@@ -134,14 +134,13 @@ class ForestPlan:
     # Worlds.
     art_to_world: wp.array | None
     world_art_start: wp.array | None
-    is_one_solve_art_per_world: bool
     world_response_group_art_start: dict
     world_response_group_to_art: dict
-    max_world_dofs: int | None
-    """The widest world's response coordinates (the matrix-free formulation's mapping, else ``None``)."""
-    articulation_world_dof_offset: wp.array | None
-    world_dof_count: wp.array | None
-    world_dof_indices: wp.array | None
+    max_world_dofs: int
+    """The widest world's response coordinates (the matrix-free formulation's world mapping)."""
+    articulation_world_dof_offset: wp.array
+    world_dof_count: wp.array
+    world_dof_indices: wp.array
 
     # Bodies.
     body_to_joint: wp.array | None
@@ -152,18 +151,13 @@ class ForestPlan:
     body_single_response_dof_host: np.ndarray | None
 
     @classmethod
-    def build(
-        cls, model: Model, joint_forest: TreePlan, kinematic_dof_mask: np.ndarray, *, matrix_free: bool
-    ) -> ForestPlan:
+    def build(cls, model: Model, joint_forest: TreePlan, kinematic_dof_mask: np.ndarray) -> ForestPlan:
         """Build the plan from the model's topology.
 
         Args:
             model: The model.
             joint_forest: The model's joint forest (:func:`joint_forest`).
             kinematic_dof_mask: Each coordinate the body flags make kinematic, at construction.
-            matrix_free: The matrix-free formulation (CUDA): it elides prescribed free bodies from the response
-                and maps each world's response compactly (``max_world_dofs`` and its arrays are ``None`` without
-                it).
         """
         plan = SimpleNamespace(joint_forest=joint_forest)
         free_root = None
@@ -173,7 +167,7 @@ class ForestPlan:
             free_root = ((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (
                 model.joint_parent.numpy() < 0
             )
-        _articulations(plan, model, kinematic_dof_mask, free_root, prescribed_response=matrix_free)
+        _articulations(plan, model, kinematic_dof_mask, free_root)
         plan.prescribed_articulation = wp.array(plan.prescribed_articulation_host, dtype=wp.int32, device=model.device)
         plan.has_prescribed_response = bool(np.any(plan.prescribed_articulation_host != 0))
         _coordinates(plan, model)
@@ -186,11 +180,11 @@ class ForestPlan:
         _world_size_groups(plan, model)
         # Loop-closing joints are excluded from the tree and enforced as connect rows.
         plan.has_loop_joints = bool(np.any(plan.loop_joint_articulation >= 0))
-        _world_response_mapping(plan, model, matrix_free)
+        _world_response_mapping(plan, model)
         return cls(**vars(plan))
 
 
-def _articulations(plan, model, kinematic_dof_mask, free_root, *, prescribed_response):
+def _articulations(plan, model, kinematic_dof_mask, free_root):
     """Each articulation's tree joints, coordinates, world, free body and prescribed response."""
     articulation_count = model.articulation_count
     articulation_dof_count = np.zeros(articulation_count, dtype=np.int32)
@@ -296,7 +290,7 @@ def _articulations(plan, model, kinematic_dof_mask, free_root, *, prescribed_res
         free_rigid_body_indices = joint_child[first_joint[free]]
 
     prescribed = np.zeros(articulation_count, dtype=np.int32)
-    if prescribed_response and articulation_count and model.joint_count:
+    if articulation_count and model.joint_count:
         candidates = np.zeros(articulation_count, dtype=np.int32)
         free_six = np.flatnonzero((is_free_rigid != 0) & (articulation_dof_count == 6))
         free_dofs = articulation_dof_start[free_six, None] + np.arange(6)
@@ -418,7 +412,6 @@ def _world_mapping(plan, model):
     if not model.articulation_count:
         plan.art_to_world = None
         plan.world_art_start = None
-        plan.is_one_solve_art_per_world = False
         return
 
     articulation_world = plan.articulation_world
@@ -430,10 +423,6 @@ def _world_mapping(plan, model):
     world_art_counts = np.bincount(articulation_world, minlength=plan.world_count).astype(np.int32)
     world_art_start = host_index.offsets(world_art_counts, dtype=np.int32)
     plan.world_art_start = wp.array(world_art_start, dtype=wp.int32, device=model.device)
-
-    response_world = articulation_world[plan.response_dof_count > 0]
-    world_response_art_counts = np.bincount(response_world, minlength=plan.world_count)
-    plan.is_one_solve_art_per_world = bool(np.all(world_response_art_counts == 1))
 
 
 def _body_maps(plan, model):
@@ -602,14 +591,8 @@ def _world_size_groups(plan, model):
         plan.world_response_group_to_art[int(size)] = wp.array(response_flat_np, dtype=wp.int32, device=device)
 
 
-def _world_response_mapping(plan, model, matrix_free):
+def _world_response_mapping(plan, model):
     """Compact per-world response offsets and global-DOF indices (the matrix-free formulation's)."""
-    plan.max_world_dofs = None
-    plan.articulation_world_dof_offset = None
-    plan.world_dof_count = None
-    plan.world_dof_indices = None
-    if not matrix_free:
-        return
     articulation_world = plan.articulation_world
     response_dof_count = plan.response_dof_count
     articulation_dof_start = plan.articulation_dof_start_host

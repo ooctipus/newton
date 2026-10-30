@@ -674,15 +674,13 @@ class FreeBodyZ(ResponseOperator):
     With lanes, lanes 0-5 own body ``a``'s coordinates and lanes 6-11 body
     ``b``'s, one product each, and the lanes reduce with ``SUM``; the other
     lanes add zero. With one thread (``Lanes(1)``) the visited row ``i``'s
-    entries are read where they are used, in the order split mode's sweep sums
-    them: the residual adds each body's six products as one expression, ``jv
-    += Z_0 u_0 + ... + Z_5 u_5``, body ``a``'s then ``b``'s; a friction pair's
+    entries are read where they are used: the residual adds each body's six
+    products as one expression, ``jv += Z_0 u_0 + ... + Z_5 u_5``, body
+    ``a``'s then ``b``'s; a friction pair's
     sibling residual starts from its right-hand side and its coupling from
     zero, each adding body ``a``'s then ``b``'s product per coordinate, as does
-    the row's own residual where the pair reduces it (``own``). The free-body
-    loop's order (``order="loop"``) adds the residual's products one at a time
-    instead, body ``a``'s six then ``b``'s. The builder stores ``1 / A_ii``
-    (``A_ii = cfm + |Z_a|^2 + |Z_b|^2``).
+    the row's own residual where the pair reduces it (``own``). The builder
+    stores ``1 / A_ii`` (``A_ii = cfm + |Z_a|^2 + |Z_b|^2``).
 
     ``factors`` names the native :class:`.kernels.BodyFactors` operand and
     ``factor`` maps a body's first velocity coordinate (in the sweep's
@@ -696,9 +694,6 @@ class FreeBodyZ(ResponseOperator):
     velocity: Velocity = Velocity()
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
-    order: str = "split"
-    """One thread's residual order: ``"split"`` (each body's products as one expression) or ``"loop"`` (one product
-    at a time)."""
     entry: Callable[[str, str, str], str] | None = None
     """One thread: where entry ``k`` of a row's ``Z_a`` or ``Z_b`` (the array's name) is read, ``entry(array, row,
     k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
@@ -706,11 +701,7 @@ class FreeBodyZ(ResponseOperator):
     factor: Callable[[str], str] | None = None
     name = "free_body_z"
 
-    ORDERS = ("split", "loop")
-
     def __post_init__(self):
-        if self.order not in self.ORDERS:
-            raise ValueError(f"order must be one of {self.ORDERS}, got {self.order!r}")
         if self.entry is not None and self.lanes.parallel:
             raise ValueError("staged entries take the one-thread layout")
 
@@ -815,14 +806,6 @@ class FreeBodyZ(ResponseOperator):
                 )
                 + f"\n{indent}{self.lanes.reduce(f'{out}_partial')}\n{indent}float {out} = {out}_partial;"
             )
-        if self.order == "loop":
-            sides = "\n".join(
-                f"{indent}if ({body} >= 0) {{\n"
-                f"{indent}    for (int k = 0; k < 6; ++k) {out} += {self._at(Z, 'i', 'k')} * {self._v(body, 'k')};\n"
-                f"{indent}}}"
-                for Z, body in ((self.Z_a, "dof_a"), (self.Z_b, "dof_b"))
-            )
-            return f"{indent}float {out} = 0.0f;\n{sides}"
         sides = "\n".join(
             f"{indent}if ({body} >= 0) {{\n{indent}    {out} += "
             + " + ".join(f"{self._at(Z, 'i', k)} * {self._v(body, k)}" for k in range(6))
@@ -897,25 +880,6 @@ class FreeBodyZ(ResponseOperator):
                 self.coupling("cross", row, sibling, indent),
             )
         )
-
-    def shared_coupling(self, out: str, row: str, column: str, bodies: tuple[str, str], indent: str) -> str:
-        """``float out = Z_row Z_column`` over the bodies two rows share (one thread), ``bodies`` the column's.
-
-        The row's bodies are ``dof_a``/``dof_b``; a body is its first velocity coordinate. From zero, each side of
-        the row adds its six products with each side of the column on the same body: ``a`` with ``a``, then with
-        ``b``, then ``b`` with ``a``, then with ``b``.
-        """
-        lines = [f"float {out} = 0.0f;"]
-        for Z, side in ((self.Z_a, "dof_a"), (self.Z_b, "dof_b")):
-            lines.append(f"if ({side} >= 0) {{")
-            for C, other in zip((self.Z_a, self.Z_b), bodies, strict=True):
-                lines += [
-                    f"    if ({side} == {other}) {{",
-                    f"        for (int k = 0; k < 6; ++k) {out} += {self._at(Z, row, 'k')} * {self._at(C, column, 'k')};",
-                    "    }",
-                ]
-            lines.append("}")
-        return "\n".join(indent + line for line in lines)
 
     def apply_row(self, row: str, delta: str, indent: str) -> str:
         """``u += Z_row delta`` for a row outside the pipeline (lanes 0-11; one thread: each coordinate in order)."""
@@ -1669,75 +1633,6 @@ class SparsePairZ(ResponseOperator):
             f"if (apply_coord >= 0) {self.velocity.at('apply_coord')} += apply_z * {delta};",
         ]
         return "".join(f"\n{indent}{line}" for line in "\n".join(lines).split("\n"))
-
-
-@dataclass(frozen=True)
-class Assembled(ResponseOperator):
-    """The assembled Delassus operator ``C = J H^-1 J^T`` of a world's rows, in impulse space, swept by one thread (the
-    CPU's split mode).
-
-    A row's sum starts from its right-hand side ``rhs``, so the residual is whole (:attr:`residual_includes_rhs`),
-    and adds ``C(i, j) lambda_j`` for ``j`` ascending over the ``count`` rows; row ``i`` of ``C`` is
-    ``world_C[off2 + i * stride + j]``. The coupling of rows ``i`` and ``s`` is row ``i``'s entry ``C(i, s)``, read
-    as row ``i``'s sum reads it (``C`` is assembled in floating point and is not exactly symmetric). Built with the
-    response, ``A_ii`` is stored as a value; the step divides by it. Nothing is applied: the impulses are the state.
-    """
-
-    stride: str
-    rhs: Callable[[str], str]
-    """The rows' right-hand sides, which the sums start from."""
-    impulse: str = "s_lam"
-    count: str = "m"
-    diagonal: Callable[[str], str] | None = None
-    inverse: Callable[[str], str] | None = None
-    name = "assembled"
-    applies = False
-    residual_includes_rhs = True
-
-    @staticmethod
-    def build(stage: str, mapping: str, **options):
-        """The launch that builds stage ``stage`` of the operator's data with the thread mapping ``mapping``.
-
-        ``C = J Y^T`` and its diagonal accumulate onto a zeroed ``C`` and diagonal from a size group's response (the
-        dense response build, :data:`.response_builds_dense.DENSE_JY_BUILDS`); then the diagonals' ``cfm``. Returns a
-        :class:`.response_builds_dense.Build` (:data:`.response_builds_dense.ASSEMBLED_BUILDS` lists the stages and
-        mappings).
-        """
-        from .response_builds_dense import ASSEMBLED_BUILDS  # noqa: PLC0415
-
-        return ASSEMBLED_BUILDS[stage, mapping](**options)
-
-    def _row_sum(self, out: str, row: str, start: str, indent: str) -> str:
-        """``float out = start``, then ``C(row, j) lambda_j`` added for ``j`` ascending."""
-        lines = [
-            f"float {out} = {start};",
-            f"const int {out}_row = off2 + {row} * {self.stride};",
-            f"for (int j = 0; j < {self.count}; ++j) {{",
-            f"    const float c = world_C.data[{out}_row + j];",
-            f"    {out} += c * {self.impulse}[j];",
-            "}",
-        ]
-        return "\n".join(indent + line for line in lines)
-
-    def residual(self, out: str, indent: str) -> str:
-        """The whole residual ``rhs_i + C_i lambda`` of the visited row ``i``."""
-        return self._row_sum(out, "i", self.rhs("i"), indent)
-
-    def sibling_residual(self, out: str, sibling: str, indent: str, rhs: str) -> str:
-        """``float out = rhs + C_s lambda``: the sibling's row sum from its right-hand side."""
-        return self._row_sum(out, sibling, rhs, indent)
-
-    def coupling(self, out: str, row: str, sibling: str, indent: str) -> str:
-        """``float out = C(i, s)``, as row ``i``'s sum reads it."""
-        return f"{indent}float {out} = world_C.data[off2 + {row} * {self.stride} + {sibling}];"
-
-    def apply(self, delta: str, indent: str) -> str:
-        """Nothing: the impulses are the state."""
-        return ""
-
-    def apply_row(self, row: str, delta: str, indent: str) -> str:
-        """Nothing: the impulses are the state."""
-        return ""
 
 
 @dataclass(frozen=True)

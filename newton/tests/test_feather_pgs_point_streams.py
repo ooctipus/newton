@@ -349,8 +349,6 @@ def _dense_build_calls():
         "diagonal_rows_kernel",
         "diagonal_groups_kernel",
         "cfm_worlds_kernel",
-        "delassus_entries_kernel",
-        "apply_coordinates_kernel",
     ):
         yield f"response_builds_dense.{name}", getattr(response_builds_dense, name).__wrapped__, (), {}
     from newton._src.solvers.feather_pgs import packed_rows  # noqa: PLC0415
@@ -560,14 +558,6 @@ def _keyed_row_calls():
         yield "keyed_rows.get_parallel_factory", parallel, args, kwargs
 
 
-def _split_loop_calls():
-    """Split mode's loop sweeps (sweep_routes_split.py): assembled and free-body rows, with and without units."""
-    from newton._src.solvers.feather_pgs import sweep_routes_split  # noqa: PLC0415
-
-    for name in ("loop_kernel", "loop_unit_kernel", "mf_loop_kernel", "mf_loop_unit_kernel"):
-        yield f"sweep_routes_split.{name}", getattr(sweep_routes_split, name).__wrapped__, (), {}
-
-
 def _factory_kernels():
     """Kernels of the factories patch integration varies, built with point arguments."""
     kernels = {}
@@ -580,7 +570,6 @@ def _factory_kernels():
         _spliced_sweep_calls(),
         _suite_shape_calls(),
         _keyed_row_calls(),
-        _split_loop_calls(),
         ((name, factory, args, kwargs) for name, factory, args, kwargs, _ in _readout_calls()),
     ):
         try:

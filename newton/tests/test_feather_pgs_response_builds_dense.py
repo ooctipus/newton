@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The dense response builds on their own: the kit's factor against NumPy, its text, the streaming Delassus's
-staging, and the operators' registry of builds by stage and mapping."""
+"""The dense response builds on their own: the kit's factor against NumPy, its text, and the operators' registry of
+builds by stage and mapping."""
 
 import unittest
 
@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import response_builds_dense as builds
-from newton._src.solvers.feather_pgs.response_operator import Assembled, CholeskyFactor, CholeskySolve
+from newton._src.solvers.feather_pgs.response_operator import CholeskyFactor, CholeskySolve
 from newton._src.solvers.feather_pgs.staging import STATIC_SHARED_BUDGETS, STATIC_SHARED_BYTES, static_budget
 
 CPU = "cpu"
@@ -89,14 +89,8 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual((tiles.block_dim, tiles.tiled, tiles.grid), (64, True, ("articulations", "row chunks")))
         warps = builds.DENSE_JY_BUILDS["factor", "warps"](size=9, geometric_index=tuple(range(81)), warps_per_block=2)
         self.assertEqual((warps.block_dim, warps.tiled), (64, False))
-        for stage, _mapping in (*builds.DENSE_JY_BUILDS, *builds.ASSEMBLED_BUILDS):
+        for stage, _mapping in builds.DENSE_JY_BUILDS:
             self.assertIn(stage, builds.STAGES)
-
-    def test_assembled(self):
-        build = Assembled.build("delassus", "entries")
-        self.assertIs(build.kernel, builds.delassus_entries_kernel())
-        with self.assertRaises(KeyError):
-            Assembled.build("factor", "articulations")
 
 
 if __name__ == "__main__":

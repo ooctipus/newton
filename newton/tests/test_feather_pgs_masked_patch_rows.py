@@ -60,27 +60,9 @@ def _arrays(solver):
 
 
 def _rows(solver, contacts):
-    """Each routed contact's rows by contact index, with the Jacobian rows of every articulation it touches.
-
-    Every row's phi and target are recorded, the tangent rows' included. Matrix-free mode reads the
-    world rows. Split mode keeps each articulation's rows in its size group, so a contact's Jacobian
-    concatenates its two articulations' group rows.
-    """
-    if solver._matrix_free:
-        return contact_rows(solver, contacts, jacobian=True, every_row=True)
-    records = contact_rows(solver, contacts, every_row=True)
-    count = len(solver.contact_slot.numpy())
-    slot, needed = solver.contact_slot.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
-    arts = (solver.contact_art_a.numpy()[:count], solver.contact_art_b.numpy()[:count])
-    dofs, groups = solver.forest.articulation_response_dof_count.numpy(), solver.forest.art_group_idx.numpy()
-    jacobians = {size: solver.J_by_size[size].numpy() for size in solver.forest.size_groups}
-    for c, record in records.items():
-        rows = slice(int(slot[c]), int(slot[c]) + int(needed[c]))
-        record["jacobian"] = np.concatenate(
-            [jacobians[int(dofs[art[c]])][groups[art[c]], rows] for art in arts if art[c] >= 0 and dofs[art[c]] > 0],
-            axis=1,
-        )
-    return records
+    """Each routed contact's rows by contact index, with the Jacobian rows of every articulation it touches (the
+    world rows the matrix-free sweeps read). Every row's phi and target are recorded, the tangent rows' included."""
+    return contact_rows(solver, contacts, jacobian=True, every_row=True)
 
 
 _PLAN = solver_module.contact_row_plan

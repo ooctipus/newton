@@ -387,8 +387,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         # The arm and the free box share a world, which one sweep of the general row solves.
         self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
         self.assertEqual(routes["sweep"]["driver"], "direct")
-        self.assertIsNone(routes["sweep"]["dense"])
-        self.assertIsNone(routes["sweep"]["free_body_matrix_free"])
         self.assertEqual(routes["sweep"]["mf_meta_pack"]["kernel"], "free_body_meta_512")
         # The CPU's one thread keeps the impulses and streams the metadata: no shared memory to stage them in.
         storage = routes["sweep"]["mf_gs_storage"]
@@ -492,7 +490,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertTrue(all(reason in entry["reason"] for entry in response.values()), response)
 
     def test_cpu_route_record_matches_launched_kernels(self):
-        """Tie the record's sweep, row builders and root clamp to the kernels one CPU step launches."""
+        """Tie the record's sweep and row builders to the kernels one CPU step launches."""
         for name, model in (
             ("mixed", _cpu_free_body_model()),
             ("mixed_velocity_limits", _cpu_free_body_model(velocity_limit=1.0)),
@@ -510,7 +508,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 methods = routes["contact_rows"]["general_method_by_dof"]
                 self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))
                 assert_row_builders_named(self, routes["contact_rows"], keys)
-                self.assertEqual(routes["velocity_limits"]["root_clamp"], "clamp_free_root_velocity_limits" in keys)
 
     def test_cpu_record_names_every_launched_row_builder(self):
         """Name in builder_by_dof exactly the contact-row builders one CPU step launches, under both laws.
@@ -728,8 +725,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertTrue(limits["rigid_body_limits"])
         self.assertIsNotNone(solver.rigid_velocity_limit_slot)
         self.assertTrue(limits["free_body_rows"])
-        # The matrix-free sweep bounds free rigid bodies with speed rows alone.
-        self.assertFalse(limits["root_clamp"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
     def test_route_record_reports_sparse_rows_and_tree_owner(self):
@@ -852,7 +847,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
                 self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
-                self.assertEqual(pack is None, not solver._matrix_free)
+                self.assertEqual(pack["launched"], solver._pack_mf_meta_kernel is not None)
                 # The MF-GS kernel's name spells the storage the record reports.
                 mf_gs, storage = routes["sweep"]["mf_gs"], routes["sweep"]["mf_gs_storage"]
                 self.assertEqual(storage is None, mf_gs is None)

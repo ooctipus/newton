@@ -17,7 +17,6 @@ from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     BodyFactors,
     allocate_world_contact_slots,
-    apply_world_contact_restitution_accumulated,
     compute_contact_linear_force_from_impulses,
     compute_world_contact_bias,
     populate_world_J_for_compact_size,
@@ -260,21 +259,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
-        device="cpu",
-    )
-    return float(rhs.numpy()[0, 0])
-
-
-def _dense_restitution_rhs(scale: float) -> float:
-    """Apply dense restitution after accumulating the scaled position RHS."""
-    rhs = wp.array([[-2.0 + scale]], dtype=wp.float32, device="cpu")
-    rows = field_group.upload(
-        DenseRows, "cpu", phi=[[1.0]], row_beta=[[0.2]], row_type=[[0]], restitution=[[0.5]], rhs=rhs, row_w=[[0.0]]
-    )
-    wp.launch(
-        apply_world_contact_restitution_accumulated,
-        dim=1,
-        inputs=[rows, wp.array([1], dtype=wp.int32, device="cpu"), 1, 1.0, scale, 0.0, 0],
         device="cpu",
     )
     return float(rhs.numpy()[0, 0])
@@ -673,11 +657,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             with self.subTest(family=name):
                 self.assertEqual(compute_rhs(0.0), 0.0)
                 self.assertAlmostEqual(compute_rhs(1.0), 2.0, places=6)
-
-    def test_dense_restitution_removes_the_scaled_position_bias(self):
-        """Recover the same incident speed before restitution at scales zero and one."""
-        self.assertEqual(_dense_restitution_rhs(0.0), -3.0)
-        self.assertEqual(_dense_restitution_rhs(1.0), -3.0)
 
     def test_gap_gate_prevents_all_route_allocations(self):
         """Drop positive gaps above the gate before any route reserves a slot."""

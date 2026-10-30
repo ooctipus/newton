@@ -59,9 +59,7 @@ from .projection_laws import (
 )
 from .row_build import write_contact_row
 from .row_laws import (
-    contact_restitution_fires,
     contact_restitution_rhs,
-    contact_rhs,
     joint_limit_side,
     limit_rhs,
     mimic_phi,
@@ -127,53 +125,6 @@ def compute_com_transforms(
     tid = wp.tid()
     com = body_com[tid]
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
-
-
-@wp.kernel
-def clamp_free_root_velocity_limits(
-    articulation_start: wp.array[int],
-    joint_child: wp.array[int],
-    body_flags: wp.array[wp.int32],
-    articulation_root_is_free: wp.array[int],
-    articulation_root_dof_start: wp.array[int],
-    rigid_body_max_linear_velocity: wp.array[float],
-    rigid_body_max_angular_velocity: wp.array[float],
-    # outputs
-    qd: wp.array[float],
-):
-    """Clamp free-root linear/angular velocity magnitudes to PhysX rigid-body limits."""
-    art = wp.tid()
-    if articulation_root_is_free[art] == 0:
-        return
-
-    root_joint = articulation_start[art]
-    root_body = joint_child[root_joint]
-    if root_body < 0:
-        return
-    if (body_flags[root_body] & BodyFlags.KINEMATIC) != 0:
-        return
-
-    ds = articulation_root_dof_start[art]
-
-    max_lin = rigid_body_max_linear_velocity[root_body]
-    if max_lin > 0.0 and wp.isfinite(max_lin):
-        lin = wp.vec3(qd[ds + 0], qd[ds + 1], qd[ds + 2])
-        lin_speed = wp.length(lin)
-        if lin_speed > max_lin:
-            scale = max_lin / lin_speed
-            qd[ds + 0] = lin[0] * scale
-            qd[ds + 1] = lin[1] * scale
-            qd[ds + 2] = lin[2] * scale
-
-    max_ang = rigid_body_max_angular_velocity[root_body]
-    if max_ang > 0.0 and wp.isfinite(max_ang):
-        ang = wp.vec3(qd[ds + 3], qd[ds + 4], qd[ds + 5])
-        ang_speed = wp.length(ang)
-        if ang_speed > max_ang:
-            scale = max_ang / ang_speed
-            qd[ds + 3] = ang[0] * scale
-            qd[ds + 4] = ang[1] * scale
-            qd[ds + 5] = ang[2] * scale
 
 
 @wp.func
@@ -2815,112 +2766,6 @@ def apply_world_contact_restitution_matrix_free(
 
 
 @wp.kernel
-def apply_world_contact_restitution_accumulated(
-    rows: DenseRows,
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    dt: float,
-    contact_speculative_scale: float,
-    restitution_velocity_threshold: float,
-    write_row_w: int,
-):
-    """Replace an accumulated impulse-space contact RHS with restitution."""
-    tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
-        return
-    if rows.row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-
-    restitution = rows.restitution[world, i]
-    if restitution <= 0.0:
-        return
-
-    phi = rows.phi[world, i]
-    # The geometric bias the position pass added (bias scale 1): the contact law without a target.
-    geometric_bias, _row_w = contact_rhs(
-        phi, rows.row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0
-    )
-    relative_incident = rows.rhs[world, i] - geometric_bias
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
-        # Impulse-space RHS contains u_incident already.  Replacing geometric
-        # bias with the Newton target yields (1+e)*u_incident.
-        rows.rhs[world, i] = (1.0 + restitution) * relative_incident
-        if write_row_w != 0:
-            rows.row_w[world, i] = 1.0
-
-
-@wp.kernel
-def rhs_accum_world_par_art(
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    art_to_world: wp.array[int],
-    art_dof_start: wp.array[int],
-    v_hat: wp.array[float],
-    group_to_art: wp.array[int],
-    J_group: wp.array3d[float],
-    n_dofs: int,
-    # outputs
-    world_rhs: wp.array2d[float],
-):
-    """
-    Accumulate J*v_hat into world RHS for a single size group.
-
-    RHS = J*v + stabilization (already includes stabilization from compute_world_contact_bias)
-    This kernel is launched once per size group to accumulate velocity contributions.
-    """
-    idx = wp.tid()
-    art = group_to_art[idx]
-    world = art_to_world[art]
-    n_constraints = world_constraint_count[world]
-
-    if n_constraints == 0:
-        return
-
-    dof_start = art_dof_start[art]
-
-    for c in range(n_constraints):
-        jv = float(0.0)
-        for d in range(n_dofs):
-            jv += J_group[idx, c, d] * v_hat[dof_start + d]
-        wp.atomic_add(world_rhs, world, c, jv)  # Add J*v (positive)
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def rhs_accum_world_par_row(
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    art_to_world: wp.array[int],
-    art_dof_start: wp.array[int],
-    v_hat: wp.array[float],
-    group_to_art: wp.array[int],
-    J_group: wp.array3d[float],
-    n_dofs: int,
-    world_rhs: wp.array2d[float],
-):
-    """Accumulate independent rows without changing their serial DOF reduction.
-
-    Use only when each world has one solve articulation. Multiple articulation
-    writers retain the original mapping and its atomic accumulation order.
-    """
-    tid = wp.tid()
-    idx = tid // max_constraints
-    c = tid - idx * max_constraints
-    art = group_to_art[idx]
-    world = art_to_world[art]
-    n_constraints = world_constraint_count[world]
-    if c >= n_constraints:
-        return
-    dof_start = art_dof_start[art]
-    jv = float(0.0)
-    for d in range(n_dofs):
-        jv += J_group[idx, c, d] * v_hat[dof_start + d]
-    # Retain CUDA atomic floating-point semantics, including denormal handling.
-    wp.atomic_add(world_rhs, world, c, jv)
-
-
-@wp.kernel
 def prepare_world_impulses(
     world_constraint_count: wp.array[int],
     max_constraints: int,
@@ -3679,26 +3524,6 @@ def scatter_qdd_from_groups(
     dof_start = articulation_dof_start[art]
     for i in range(n_dofs):
         joint_qdd[dof_start + i] = qdd_group[idx, i, 0]
-
-
-@wp.kernel
-def vector_add_inplace(a: wp.array[float], b: wp.array[float]):
-    """a[i] += b[i]"""
-    i = wp.tid()
-    a[i] = a[i] + b[i]
-
-
-@wp.kernel
-def compute_delta_and_accumulate(
-    v_out: wp.array[float],
-    v_snap: wp.array[float],
-    v_accum: wp.array[float],
-):
-    """delta = v_out - v_snap; v_accum += delta; v_snap = delta (reuse buffer for rhs_accum input)"""
-    i = wp.tid()
-    delta = v_out[i] - v_snap[i]
-    v_accum[i] = v_accum[i] + delta
-    v_snap[i] = delta
 
 
 # =============================================================================

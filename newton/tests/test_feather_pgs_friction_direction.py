@@ -9,8 +9,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sweep_routes_split
-from newton._src.solvers.feather_pgs.solve_policy import QUIET
 
 
 def _slide(device, beta, mesh, angle, articulated=False, *, locked_tangent=False):
@@ -88,83 +86,6 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                 for key, value in watermarks.items():
                     if "overflow" in key or "dropped" in key:
                         self.assertEqual(value, 0, key)
-
-    def test_unequal_tangent_masses(self):
-        """Solve sticking and sliding blocks with rotated, unequal tangent masses in one sweep."""
-        devices = ["cpu"]
-        capacity = 32
-        for device in devices:
-            for angle, small_eigenvalue in (
-                (0.0, 1.0),
-                (0.37, 1.0),
-                (1.1, 1.0),
-                (0.37, 0.0),
-                (0.0, 0.0),
-                (0.0, 1.0e-4),
-                (0.0, 1.0e-6),
-                (0.0, 1.0e-8),
-            ):
-                for regime in ("sticking", "sliding", "fixed", "weak_sliding", "sliding_fixed"):
-                    if regime == "weak_sliding" and small_eigenvalue == 0.0:
-                        continue
-                    sliding = regime in ("sliding", "weak_sliding", "sliding_fixed")
-                    with self.subTest(device=device, angle=angle, small_eigenvalue=small_eigenvalue, regime=regime):
-                        rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
-                        tangent_mass = rotation @ np.diag([small_eigenvalue, 7.0]) @ rotation.T
-                        direction = np.array([0.6, 0.8])
-                        expected = -(0.3 if sliding else 0.1) * direction
-                        if regime == "fixed":
-                            expected = np.array([0.125, 0.0])
-                        velocity = 2.0 * direction if sliding else np.zeros(2)
-                        if regime == "weak_sliding":
-                            # A tiny positive KKT multiplier still requires a boundary impulse.
-                            # Absolute bisection resolution loses the weak direction here.
-                            velocity = small_eigenvalue * direction
-                        matrix = np.eye(capacity, dtype=np.float32)
-                        matrix[1:3, 1:3] = tangent_mass
-                        rhs = np.zeros((1, capacity), dtype=np.float32)
-                        rhs[0, :3] = [-1.0, *(velocity - tangent_mass @ expected)]
-                        if regime == "fixed":
-                            # Power-of-two impulses make the stored row residual exactly zero.
-                            rhs[0, 1:3] = -(matrix[1:3, 1:3] @ expected)
-                        row_types = np.full((1, capacity), -1, dtype=np.int32)
-                        row_types[0, :3] = [0, 2, 2]
-                        parents = np.full((1, capacity), -1, dtype=np.int32)
-                        parents[0, 1:3] = 0
-                        initial = np.zeros((1, capacity), dtype=np.float32)
-                        if regime in ("fixed", "sliding_fixed"):
-                            initial[0, :3] = [1.0, *expected]
-                        impulses = wp.array(initial, dtype=float, device=device)
-                        args = [
-                            wp.array([3], dtype=int, device=device),
-                            wp.array(np.diag(matrix)[None], dtype=float, device=device),
-                            wp.array(matrix[None], dtype=float, device=device),
-                            wp.array(rhs, dtype=float, device=device),
-                            impulses,
-                            1,
-                            1.0,
-                            wp.array(row_types, dtype=int, device=device),
-                            wp.array(parents, dtype=int, device=device),
-                            wp.full((1, capacity), 0.3, dtype=float, device=device),
-                            wp.ones((1, capacity), dtype=float, device=device),  # unread weights: no regularization
-                            0,
-                            0,
-                            0,
-                        ]
-                        wp.launch(sweep_routes_split.loop_kernel(), dim=1, inputs=args, device=device)
-                        actual = impulses.numpy()[0, :3]
-                        if regime == "fixed":
-                            np.testing.assert_array_equal(actual, initial[0, :3])
-                        elif regime == "sliding_fixed":
-                            # A feasible sliding impulse at its KKT point re-solves to itself within the exit law's
-                            # rounding floor, a quiet change.
-                            np.testing.assert_allclose(actual, initial[0, :3], rtol=QUIET, atol=0.0)
-                        elif small_eigenvalue == 0.0 and not sliding:
-                            # A singular sticking block has multiple impulse solutions.
-                            np.testing.assert_allclose(tangent_mass @ actual[1:] + rhs[0, 1:3], 0.0, atol=1.0e-6)
-                            self.assertLessEqual(float(np.linalg.norm(actual[1:])), 0.300001)
-                        else:
-                            np.testing.assert_allclose(actual, [1.0, *expected], atol=1.0e-6)
 
     def test_sliding_direction(self):
         """Oppose sliding in every direction for analytic and mesh boxes, with and without patches."""
