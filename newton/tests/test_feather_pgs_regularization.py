@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     compute_world_contact_bias,
 )
+from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
@@ -74,6 +75,44 @@ def _contact_rows(solver, path_id: int, contact_count: int) -> dict[int, int]:
         if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
             out[c] = int(contact_slot[c])
     return out
+
+
+def _solve_rows(device, n_rows, g, iterations=300):
+    """Solve ``n_rows`` identical unit contact rows on one 6-DOF body with unit mass and rhs = -1 through the general
+    sweep's free-body rows, regularized with the weight ``1 / (1 + g)``."""
+    Z = np.zeros((n_rows, 6))
+    Z[:, 2] = 1.0
+    return sweep_free_body_rows(
+        device,
+        Z,
+        np.full(n_rows, -1.0),
+        np.full(n_rows, PGS_CONSTRAINT_TYPE_CONTACT),
+        np.full(n_rows, -1),
+        np.zeros(n_rows),
+        weights=np.full(n_rows, 1.0 / (1.0 + g)),
+        regularize=True,
+        iterations=iterations,
+    )
+
+
+def test_regularization_fixed_points(test: unittest.TestCase, device):
+    """Analytic contracts of the regularized update on unit rows:
+
+    - one determined row converges to ``1/(1+g)`` of the rigid impulse (the
+      documented load deficit);
+    - two redundant identical rows converge to the unique symmetric split
+      ``lambda_1 = lambda_2 = 1/(2+g)``;
+    - ``g = 0`` reproduces the exact rigid law (total impulse 1).
+    """
+    with wp.ScopedDevice(device):
+        g = 0.5
+        lam = _solve_rows(device, 1, g)
+        test.assertAlmostEqual(float(lam[0]), 1.0 / (1.0 + g), places=5)
+        lam = _solve_rows(device, 2, g)
+        test.assertAlmostEqual(float(lam[0]), 1.0 / (2.0 + g), places=5)
+        test.assertAlmostEqual(float(lam[1]), 1.0 / (2.0 + g), places=5)
+        lam = _solve_rows(device, 2, 0.0)
+        test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
 def _stack_scene(device, g):
@@ -403,6 +442,12 @@ class TestFeatherPGSRegularization(unittest.TestCase):
     pass
 
 
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularization_fixed_points",
+    test_regularization_fixed_points,
+    devices=get_test_devices(),
+)
 add_function_test(
     TestFeatherPGSRegularization,
     "test_regularization_documented_sag",
