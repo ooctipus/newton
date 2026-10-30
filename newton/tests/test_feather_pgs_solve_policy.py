@@ -51,7 +51,6 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     vote,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
-from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_point_streams import _kernel_hash
@@ -135,8 +134,8 @@ def _factory_calls():
     )
 
 
-# An accumulated velocity-limit visit: the law call (projection_laws.velocity_limit_update or speed_row) that selects it.
-_LAW_SITE = re.compile(r"(?:velocity_limit_update|speed_row)\([^;]*, 1\);")
+# A velocity-limit visit: its law call (projection_laws.velocity_limit_update or speed_row).
+_LAW_SITE = re.compile(r"ProjectionLaw::(?:velocity_limit_update|speed_row)\([^;]*\);")
 
 
 def _axis(name, values=(False, True)):
@@ -148,13 +147,10 @@ def _vote_census():
     """Every combination of the flags that add or remove vote sites, per policy factory: ``(name, factory, args, kwargs)``.
 
     The axes follow the exit-voting factories' census in ``tools/fpgs_bench/kernel_identity.py`` at one
-    shape each, crossed with the factories' other options that rewrite their sweeps: the velocity-limit
-    law of the sparse, matrix-free and incremental sweeps and the matrix-free sweep's resident row
-    metadata. The matrix-free sweep keeps the current friction law
-    without torsion, the variants that compile the velocity law; the census pins the others' text
-    unchanged.
+    shape each, crossed with the factories' other options that rewrite their sweeps: the matrix-free
+    sweep's resident row metadata. The matrix-free sweep keeps the current friction law without torsion; the
+    census pins the others' text unchanged.
     """
-    laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     local = (
         _axis("paired_dof_count", (0, 6)),
         _axis("persistent_queue"),
@@ -176,7 +172,6 @@ def _vote_census():
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
-                laws,
             ),
         ),
         (
@@ -188,7 +183,6 @@ def _vote_census():
                 _axis("velocity_limits"),
                 _axis("local_factors"),
                 _axis("warm_start"),
-                laws,
             ),
         ),
         (
@@ -204,7 +198,6 @@ def _vote_census():
                 _axis("skip_tier_rows", (0, 32)),
                 _axis("independent_components"),
                 _axis("resident_row_metadata"),
-                laws,
             ),
         ),
         (
@@ -425,8 +418,8 @@ class TestExitLaw(unittest.TestCase):
 
         Every policy, the plain readout included, must also compose with the factory's other options:
         its kernel is the policy-less kernel's name plus the policy's suffix, it appends one readout
-        operand when it counts, and it keeps the policy-less sweep's velocity-limit law sites, the
-        law's ``_vacc`` name, its row-metadata storage and its record of the law.
+        operand when it counts, and it keeps the policy-less sweep's velocity-limit law sites and its
+        row-metadata storage.
         """
         checked = dict.fromkeys(_SCALED_VOTES, 0)
         for name, factory, args, kwargs in _vote_census():
@@ -436,10 +429,6 @@ class TestExitLaw(unittest.TestCase):
                 continue
             body = max(_native_snippets(plain), key=len)
             law_sites = len(_LAW_SITE.findall(body))
-            accumulated = kwargs.get("velocity_limit_law") == "accumulated"
-            # The law emits what its name says: accumulated sites under its _vacc name, none without it.
-            if ("_vacc" in plain.key) != (law_sites > 0) or (law_sites and not accumulated):
-                self.fail(f"{plain.key} {kwargs}: {law_sites} accumulated law sites")
             if kwargs.get("resident_row_metadata") and ("_smeta" not in plain.key or "s_meta_dense" not in body):
                 self.fail(f"{plain.key} {kwargs}: resident row metadata is not resident")
             for policy in (DEFAULT_POLICY, SWEEPS, TRACE):
@@ -471,9 +460,9 @@ class TestExitLaw(unittest.TestCase):
         self.assertEqual(
             checked,
             {
-                "sparse": 80,
-                "sparse_lanes": 32,
-                "mf_gs": 144,
+                "sparse": 40,
+                "sparse_lanes": 16,
+                "mf_gs": 72,
                 "paired": 6,
                 "local": 24,
                 "packets": 24,

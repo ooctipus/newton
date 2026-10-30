@@ -212,14 +212,8 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
         self._check_rows("cuda:0")
 
 
-def _physical_sweep(
-    jacobian, response, initial, bias, diagonal, kinds, parents, mu, impulses, *, iterations, omega, law="stateless"
-):
-    """Apply ordinary physical rows, then unrelaxed velocity-limit rows with ``law``.
-
-    The stateless law stores each visit's correction; the accumulated law keeps a
-    non-negative total and applies its change.
-    """
+def _physical_sweep(jacobian, response, initial, bias, diagonal, kinds, parents, mu, impulses, *, iterations, omega):
+    """Apply ordinary physical rows, then unrelaxed velocity-limit rows, which keep a non-negative total."""
     velocity, impulses = initial.copy(), impulses.copy()
     ordinary = np.flatnonzero(kinds != VELOCITY_LIMIT)
     mapping = {int(row): i for i, row in enumerate(ordinary)}
@@ -241,13 +235,9 @@ def _physical_sweep(
         impulses[ordinary] = ordinary_impulses
         for row in np.flatnonzero(kinds == VELOCITY_LIMIT):
             residual = jacobian[row] @ velocity + bias[row]
-            if law == "accumulated":
-                total = max(impulses[row] - residual / diagonal[row], 0.0) if diagonal[row] > 0.0 else impulses[row]
-                correction = total - impulses[row]
-                impulses[row] = total
-            else:
-                correction = -residual / diagonal[row] if residual < 0.0 and diagonal[row] > 0.0 else 0.0
-                impulses[row] = correction
+            total = max(impulses[row] - residual / diagonal[row], 0.0) if diagonal[row] > 0.0 else impulses[row]
+            correction = total - impulses[row]
+            impulses[row] = total
             velocity += response[row] * correction
     return velocity, impulses
 
@@ -319,7 +309,6 @@ def _case(
     depth=1,
     activation_fraction=0.0,
     friction_anchor_beta=0.0,
-    velocity_limit_law="stateless",
 ):
     model = sparse_scene.branched_model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
@@ -340,7 +329,6 @@ def _case(
             mf_max_constraints=32,
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
-            velocity_limit_law=velocity_limit_law,
         )
     state, out, control = model.state(), model.state(), model.control()
     qd = state.joint_qd.numpy().copy().reshape(2, -1)
@@ -408,42 +396,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             old_residual = old_j[world, :count] @ old.v_out.numpy()[dofs] + old.rhs.numpy()[world, :count]
             np.testing.assert_allclose(residual[finite], old_residual[finite], atol=5e-5, rtol=5e-4)
 
-    def test_stateless_last_phase_and_physical_response(self):
-        """Ignore old clamp impulses and relaxation while retaining contact-first ordering."""
-        for sign in (-1.0, 1.0):
-            for contact, iterations in ((False, 1), (False, 2), (True, 1), (True, 8)):
-                with self.subTest(sign=sign, contact=contact, iterations=iterations):
-                    data, physical, factor = _solve_data(sign, contact=contact, iterations=iterations, omega=0.4)
-
-                    def factory(capacity, dofs, width, **_kwargs):
-                        return sparse_kernel(
-                            capacity, dofs, width, active_rows=False, use_support_table=True, velocity_limits=True
-                        )
-
-                    with mock.patch.object(triplet_tests, "factory", factory):
-                        solve = triplet_tests.DeviceSolve(data, candidate=True)
-                    solve.launch()
-                    delta, impulses = solve.result()
-                    expected_velocity, expected_impulses = _physical_sweep(*physical, iterations=iterations, omega=0.4)
-                    for world in (0, 2):
-                        velocity = physical[2] + np.linalg.solve(factor.T, delta[world])
-                        np.testing.assert_allclose(velocity, expected_velocity, atol=3e-5, rtol=3e-4)
-                        np.testing.assert_allclose(
-                            impulses[world, : len(expected_impulses)], expected_impulses, atol=3e-5, rtol=3e-4
-                        )
-                        self.assertLessEqual(abs(velocity[0]), 0.25 + 3e-5)
-                        if not contact:
-                            self.assertGreater(abs(velocity[1] - physical[2][1]), 0.01)
-                            if iterations == 2:
-                                np.testing.assert_allclose(impulses[world, :2], 0.0, atol=3e-5)
-                    np.testing.assert_array_equal(delta[1], 0.0)
-
-    def test_accumulated_last_phase_and_physical_response(self):
+    def test_last_phase_and_physical_response(self):
         """Accumulate unrelaxed velocity-limit totals in the last phase, after contact-first ordering.
 
         Velocity-limit rows enter every solve with zero impulse, so the rows start
-        cold here. A second iteration keeps the first one's total where the
-        stateless law stores its zero correction.
+        cold here. A second iteration keeps the first one's total.
         """
         for sign in (-1.0, 1.0):
             for contact, iterations in ((False, 1), (False, 2), (True, 1), (True, 8)):
@@ -460,16 +417,13 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                             active_rows=False,
                             use_support_table=True,
                             velocity_limits=True,
-                            velocity_limit_law="accumulated",
                         )
 
                     with mock.patch.object(triplet_tests, "factory", factory):
                         solve = triplet_tests.DeviceSolve(data, candidate=True)
                     solve.launch()
                     delta, impulses = solve.result()
-                    expected_velocity, expected_impulses = _physical_sweep(
-                        *physical, iterations=iterations, omega=0.4, law="accumulated"
-                    )
+                    expected_velocity, expected_impulses = _physical_sweep(*physical, iterations=iterations, omega=0.4)
                     for world in (0, 2):
                         velocity = physical[2] + np.linalg.solve(factor.T, delta[world])
                         np.testing.assert_allclose(velocity, expected_velocity, atol=3e-5, rtol=3e-4)
@@ -481,22 +435,6 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                             # The violated side keeps its total: 1.75 speed units over the response.
                             self.assertGreater(max(impulses[world, :2]), 0.1)
                     np.testing.assert_array_equal(delta[1], 0.0)
-
-    def test_accumulated_law_matches_the_dense_reference(self):
-        """Accumulate velocity-limit impulses in factor coordinates as the ordinary sweep accumulates them."""
-        for shape in ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1}):
-            with self.subTest(shape=shape):
-                reference = _case(False, velocity_limit_law="accumulated", **shape)
-                candidate = _case(True, velocity_limit_law="accumulated", **shape)
-                self.assertTrue(candidate[1]._sparse_velocity_limits)
-                self.assertIn("_vacc", candidate[1]._pgs_solve_sparse_kernel.key)
-                self.assertIn("_vacc", reference[1]._pgs_solve_mf_gs_kernel.key)
-                for case in (reference, candidate):
-                    self.assertEqual(case[1].get_path_selection()["routes"]["velocity_limits"]["law"], "accumulated")
-                for _ in range(4):
-                    sparse_scene.step(reference)
-                    sparse_scene.step(candidate)
-                    self._assert_state(reference, candidate)
 
     def test_serial_and_branched_dense_reference(self):
         """Keep signed clamps, contacts and momentum response on independent tree shapes under either friction law."""

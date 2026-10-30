@@ -51,9 +51,6 @@ _STREAMED_OPTIONS = (
         "skip_tier_rows": 0,
     },
     {"max_constraints": 1024, "mf_max_constraints": 4096, "max_world_dofs": 604},
-    # The accumulated velocity-limit law, in the dense limit pass and in streamed free-body totals.
-    {"has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
-    {"stream_mf_impulses": True, "velocity_limit_law": "accumulated"},
 )
 
 
@@ -658,7 +655,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         impulses, with delayed friction, iteration offsets and regularization, both one world per block
         and through a two-block queue whose blocks reuse their shared memory across worlds, then once
         more from a captured graph. The limit cases run the end-of-iteration limit scans, which read row
-        types from global memory in both kernels, under either velocity-limit law.
+        types from global memory in both kernels.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -668,12 +665,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             ("large_capacity", (2304, 48, 75), contacts, (220, 300)),
             ("small_capacity", (48, 12, 29), contacts, (5, 9)),
             ("limits", (48, 12, 29), {"has_dense_velocity_limit_rows": True}, (5, 9)),
-            (
-                "accumulated_limits",
-                (48, 12, 29),
-                {"has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
-                (5, 9),
-            ),
             ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True}, (5, 9)),
         )
         settings = (

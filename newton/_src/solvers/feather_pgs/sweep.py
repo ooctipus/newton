@@ -261,20 +261,14 @@ class RowLaws:
     """The physics a sweep's rows obey, beyond each row kind's projection.
 
     Args:
-        velocity_limit_law: ``"stateless"`` or ``"accumulated"`` (:mod:`.velocity_limit_law`).
         regularize: Contact rows take their regularization weight when the run-time ``regularize`` is set.
         torsion: Torsion rows exist; the row loop skips them and the torsion pass solves them.
         policy: The solve policy: the readout beside the exit law.
     """
 
-    velocity_limit_law: str = "stateless"
     regularize: bool = True
     torsion: bool = False
     policy: SolvePolicy = DEFAULT_POLICY
-
-    @property
-    def accumulated(self) -> int:
-        return int(self.velocity_limit_law == "accumulated")
 
 
 def change_vote(laws: RowLaws, changes: tuple[Change, ...], pad: str) -> str:
@@ -366,8 +360,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
         branches.append(
             (
                 f"{kind} == {VELOCITY_LIMIT}",
-                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, "
-                f"{op.scale('residual', row)}, {laws.accumulated});\n"
+                f"const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, {op.scale('residual', row)});\n"
                 "new_impulse = vlim.v0;\n"
                 "delta_impulse = vlim.v1;",
             )
@@ -892,16 +885,14 @@ def free_body_rows_block(
 
 
 def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_dense", pad: str = "            ") -> str:
-    """Dense joint velocity-limit rows after every other row of the sweep, under the sweep's velocity-limit law.
+    """Dense joint velocity-limit rows after every other row of the sweep, under the velocity-limit law.
 
-    The stateless law corrects the current overshoot and stores that correction; the accumulated law keeps a
-    unilateral total, owned by the row's first lane. ``rows`` stages the rows' impulses, kinds, diagonals and
-    right-hand sides (:class:`WorldRows`, or a route's store of the same accessors); the operator reduces each row's
-    velocity term outside the row loop (:meth:`~.ResponseOperator.row_velocity`).
+    Each row keeps a unilateral total (:func:`.projection_laws.velocity_limit_update`), owned by the row's first
+    lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
+    store of the same accessors); the operator reduces each row's velocity term outside the row loop
+    (:meth:`~.ResponseOperator.row_velocity`).
     """
     lanes = rows.lanes
-    accumulated = laws.accumulated
-    old = "old_vlim" if accumulated else "0.0f"
     lines = [
         f"for (int i = 0; i < {end}; i++) {{",
         f"    if (({rows.kind('i', scan=True)}) != {VELOCITY_LIMIT}) continue;",
@@ -912,17 +903,12 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
         "    float jv_vlim = my_sum_vlim;",
         "",
         f"    float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
-    ]
-    if accumulated:
-        lines.append(f"    const float old_vlim = {rows.load('i')};")
-    lines += [
-        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), old, diagonal='denom')};",
-        f"    const auto vlim = ProjectionLaw::velocity_limit_update({old}, residual_vlim, residual_vlim / denom, "
-        f"{accumulated});",
+        f"    const float old_vlim = {rows.load('i')};",
+        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'old_vlim', diagonal='denom')};",
+        "    const auto vlim = ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / denom);",
         "    const float delta_impulse_vlim = vlim.v1;",
+        f"    {lanes.sync()}",
     ]
-    if accumulated:
-        lines.append(f"    {lanes.sync()}")
     change = Change("delta_impulse_vlim", "bound_vlim", str(VELOCITY_LIMIT), "denom", scaled=True)
     lines += [
         f"    {rows.store('i', 'vlim.v0')}",
@@ -986,21 +972,17 @@ def speed_row(
 
     The body's coordinates from ``body`` hold its factor coordinates; the speed is the magnitude of its physical
     velocity there (:meth:`.FreeBodyZ.speed`). The row's law (:func:`.projection_laws.speed_row`) gives its stored
-    value (``store`` stores ``speed_row[0]``, the row's impulse ``load`` under the accumulated law) and the scale that
+    value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale that
     pushes the velocity back along itself (:meth:`.FreeBodyZ.scale_speed`). ``inverse`` is the row's stored inverse
     diagonal.
     """
-    accumulated = laws.accumulated
-    lines = [op.speed("speed_mf_vlim", body, axis, pad)]
-    if accumulated:
-        lines.append(f"{pad}const float old_mf_vlim = {load};")
-    old = "old_mf_vlim" if accumulated else "0.0f"
-    lines += [
-        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', old, step=inverse)};",
-        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, {old}, "
-        f"{accumulated});",
+    lines = [
+        op.speed("speed_mf_vlim", body, axis, pad),
+        f"{pad}const float old_mf_vlim = {load};",
+        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', 'old_mf_vlim', step=inverse)};",
+        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, old_mf_vlim);",
     ]
-    if accumulated and lanes.sync():
+    if lanes.sync():
         lines.append(f"{pad}{lanes.sync()}")
     lines += [
         f"{pad}{store}",
@@ -1059,7 +1041,7 @@ def dense_tier_world(
 
 JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_FROZEN = 0, 1, 2, -1
 """The kinds of a Jacobi row (``s_kind``): its projection, decoded from its type once at staging. A unilateral row
-(contact normals, position limits, accumulated velocity limits) clamps at zero, a friction row's pair projects on its
+(contact normals, position limits, velocity limits) clamps at zero, a friction row's pair projects on its
 disk and a bilateral row takes its step; a frozen row keeps its warm start."""
 
 
@@ -1403,18 +1385,18 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     return "\n".join(line for line in lines if line)
 
 
-def jacobi_limit_pass(rows: JacobiRows, op, laws: RowLaws, *, pad: str = "    ") -> str:
+def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     """The last word of the joint velocity-limit rows after the final Jacobi sweep, on the first warp, in row order.
 
     With ``r_i = b'_i + (A x)_i``, the residual the sweeps use, a violated admitted row (``r_i < 0``) is pushed onto
-    its limit, ``x_i += -r_i / A_ii`` (the stateless law's correction added to the row's accumulated impulse,
-    :func:`.projection_laws.velocity_limit_update`). The pass only pushes: it changes nothing at the sweeps' fixed
-    point, where no row is violated, and gives the limits the last word of a world stopped early, as the
-    Gauss-Seidel sweeps' end pass does. The operator forms ``(A x)_i`` (:meth:`~.ResponseOperator.push_velocity`,
-    on ``w = Y^T x`` where it keeps one, following each push).
+    its limit, ``x_i += -r_i / A_ii`` (the row law's update from a zero impulse,
+    :func:`.projection_laws.velocity_limit_update`, added to the row's total). The pass only pushes: it changes
+    nothing at the sweeps' fixed point, where no row is violated, and gives the limits the last word of a world
+    stopped early, as the Gauss-Seidel sweeps' end pass does. The operator forms ``(A x)_i``
+    (:meth:`~.ResponseOperator.push_velocity`, on ``w = Y^T x`` where it keeps one, following each push).
     """
-    if not rows.limits or not laws.accumulated:
-        raise ValueError("the last word pushes the accumulated velocity-limit rows the rows stage")
+    if not rows.limits:
+        raise ValueError("the last word pushes the velocity-limit rows the rows stage")
     warp = Lanes(32)
     body = "            "
     lines = [
@@ -1428,7 +1410,7 @@ def jacobi_limit_pass(rows: JacobiRows, op, laws: RowLaws, *, pad: str = "    ")
         "            const float r_vlim = s_rhs[i] + part;",
         f"            const float diag_vlim = {op.push_diagonal()};",
         "            const float delta_vlim = diag_vlim > 0.0f",
-        "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim, r_vlim / diag_vlim, 0).v1 : 0.0f;",
+        "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim / diag_vlim).v1 : 0.0f;",
         "            if (delta_vlim != 0.0f) {",
         "                if (lane == 0) s_x[i] += delta_vlim;",
         op.push_apply("delta_vlim", warp, body + "    "),

@@ -45,7 +45,6 @@ from .sweep import (
     speed_rows_pass,
     velocity_limit_pass,
 )
-from .velocity_limit_law import check_velocity_limit_law, velocity_limit_law_suffix
 
 # The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
@@ -525,7 +524,6 @@ def mf_gs_source(
     factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
     independent_components: bool = False,
-    velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
@@ -552,16 +550,10 @@ def mf_gs_source(
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
     _validate_dense_metadata_encoding(max_constraints)
-    accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     M_D, M_MF, D = max_constraints, mf_max_constraints, max_world_dofs
     max_row_dofs = int(max_world_dofs if max_row_dofs is None else max_row_dofs)
     lanes = Lanes(32)
-    laws = RowLaws(
-        velocity_limit_law="accumulated" if accumulated else "stateless",
-        regularize=True,
-        torsion=contact_torsion,
-        policy=solve_policy,
-    )
+    laws = RowLaws(regularize=True, torsion=contact_torsion, policy=solve_policy)
     dense = WorldRows(
         M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=lanes
     )
@@ -751,7 +743,6 @@ def mf_gs_kernel(
     factor_coordinates: bool = False,
     skip_tier_rows: int = 0,
     independent_components: bool = False,
-    velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches
@@ -774,7 +765,6 @@ def mf_gs_kernel(
         factor_coordinates=factor_coordinates,
         skip_tier_rows=skip_tier_rows,
         independent_components=independent_components,
-        velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
     )
     colored = mapping == "colored"
@@ -783,7 +773,6 @@ def mf_gs_kernel(
         f"sweep_mf_{'colored' if colored else 'gs'}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}"
         f"_s{max_row_dofs}"
         f"_densevlim{int(has_dense_velocity_limit_rows)}"
-        + velocity_limit_law_suffix(velocity_limit_law)
         + ("" if shared_metadata else "_gmeta")
         + ("_smeta" if resident_row_metadata else "")
         + ("_glambda" if stream_mf_impulses else "")

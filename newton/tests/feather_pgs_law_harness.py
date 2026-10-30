@@ -423,15 +423,9 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "limit": rng.uniform(0.1, 3.0, n).astype(np.float32),
             "effective_mass": rng.uniform(0.1, 2.0, n).astype(np.float32),
             "old": np.abs(scalars(rng, n)),
-            "accumulated": flags(),
         }
     if name in ("velocity_limit_update",):
-        return {
-            "old": np.abs(scalars(rng, n)),
-            "residual": scalars(rng, n),
-            "step": scalars(rng, n),
-            "accumulated": flags(),
-        }
+        return {"old": np.abs(scalars(rng, n)), "step": scalars(rng, n)}
     if name in ("joint_limit_side",):
         lower = scalars(rng, n)
         upper = lower + np.abs(scalars(rng, n))
@@ -455,8 +449,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             values[param] = ints(0, 8)
         elif param in ("iteration", "start_iteration"):
             values[param] = ints(0, 6)
-        elif param == "accumulated":
-            values[param] = flags()
         elif param in ("inv_dt",):
             values[param] = rng.choice([60.0, 120.0, 1.0 / 7.0e-3, 240.0], n).astype(np.float32)
         elif param in ("dt",):

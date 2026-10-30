@@ -18,7 +18,7 @@ from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tes
 def _padded_problem(sign, iterations):
     """Embed the coupled physical oracle across two support tiles and retain holes."""
     data, physical, factor = velocity_tests._solve_data(sign, contact=True, iterations=iterations, omega=0.4)
-    # Stateless clamps must ignore carried values even when contacts also act.
+    # Velocity-limit rows accumulate onto carried totals, also where contacts act.
     physical[-1][:2] = [3.0, 2.0]
     data["initial_impulses"][:, :2] = physical[-1][:2]
     expected_velocity, expected_impulses = velocity_tests._physical_sweep(*physical, iterations=iterations, omega=0.4)
@@ -55,7 +55,7 @@ def _padded_problem(sign, iterations):
 class TestSparseVelocityPhase(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_padded_velocity_phase_matches_physical_response(self):
-        """Keep signed, stateless final corrections with two tiles and either index layout."""
+        """Keep signed final totals with two tiles and either index layout."""
         for sign in (-1.0, 1.0):
             for iterations in (1, 8):
                 for table in (False, True):

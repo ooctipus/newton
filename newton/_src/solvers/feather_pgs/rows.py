@@ -10,7 +10,7 @@
 - the rigid bodies' speed limits;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
 - the mimic and connect plans (the bilateral rows' tables);
-- the velocity-limit law and the velocity prescale's launch;
+- the velocity prescale's launch;
 - :attr:`RowLaws.set`, the route table's laws axis (:class:`.route_table.Laws`), once the bilateral pre-elimination
   is decided.
 
@@ -602,40 +602,3 @@ class RowLaws:
         if patches is None or not patches.reuse_frames:
             return None
         return patches.frame_status
-
-    # --- the velocity-limit law -------------------------------------------------------------------------------------
-    def velocity_limit_sweep_law(self) -> tuple[str | None, str]:
-        """Return the law the serial matrix-free sweep kernels give velocity-limit rows, and why.
-
-        Recorded as ``routes.velocity_limits.law``; the parallel tiers accumulate joint
-        velocity-limit rows whatever this law (``routes.sweep.tiers.velocity_limit_law``).
-        Split mode has no joint velocity-limit rows and no matrix-free velocity-limit pass,
-        so it applies neither law (``None``); ``routes.velocity_limits.free_body_sweep_law``
-        records the law of its free-body sweep, stateless where free-body velocity-limit
-        rows can exist and ``None`` where none can (no free rigid bodies, native sparse
-        split rows, unregistered speed attributes or an infinite activation fraction). Without velocity-limit rows
-        the kernels keep their stateless build, so a model without limits runs the same
-        kernels under either law.
-        """
-        options = self.options
-        if not self.matrix_free:
-            # The rule, not this solver's outcome: free_body_sweep_law records whether its sweep has such rows.
-            return None, (
-                "The CPU's split sweeps have no joint velocity-limit rows and no velocity-limit pass, so they apply "
-                "neither law. routes.velocity_limits.free_body_sweep_law records the law of its free-body sweep, "
-                "stateless where free-body velocity-limit rows can exist, and the post-solve root clamp, where it "
-                "runs (routes.velocity_limits.root_clamp), keeps its own."
-            )
-        rows = options.enable_joint_velocity_limits or (
-            self.has_rigid_body_velocity_limits and self.forest.free_rigid_body_count > 0
-        )
-        if not rows or np.isinf(options.velocity_limit_activation_fraction):
-            return "stateless", (
-                "No velocity-limit rows can exist: the sweep kernels keep their stateless build under "
-                f"velocity_limit_law={options.velocity_limit_law!r}."
-            )
-        return options.velocity_limit_law, f"velocity_limit_law={options.velocity_limit_law!r}."
-
-    def velocity_limit_kernel_law(self) -> str:
-        """The ``velocity_limit_law`` argument of every matrix-free sweep kernel the solver builds."""
-        return self.velocity_limit_sweep_law()[0] or "stateless"

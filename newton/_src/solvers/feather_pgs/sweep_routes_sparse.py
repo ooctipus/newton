@@ -60,7 +60,6 @@ from .sweep import (
     row_visit,
     velocity_limit_pass,
 )
-from .velocity_limit_law import check_velocity_limit_law
 
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
 REGISTER_BLOCKS = 16
@@ -122,8 +121,7 @@ class SparseSweep:
     """A sparse sweep's configuration, as the factory's options resolve.
 
     Contact triplets need the support table, three rows, and the active-row scan or linked rows; linked rows
-    take part only in an active-row scan or a contact unit; only a sweep with velocity-limit rows has a
-    velocity-limit law to choose.
+    take part only in an active-row scan or a contact unit.
     """
 
     rows: int
@@ -135,7 +133,6 @@ class SparseSweep:
     triplets: bool
     linked: bool
     velocity_limits: bool
-    accumulated: bool
     local: bool
     warm_start: bool
     policy: SolvePolicy
@@ -153,7 +150,6 @@ class SparseSweep:
         suffix += "_contact_triplets" if self.triplets else ""
         suffix += "_linked" if self.linked else ""
         suffix += "_velocity_limits" if self.velocity_limits else ""
-        suffix += "_vacc" if self.accumulated else ""
         suffix += f"_lanes{self.lanes}" if self.lanes != 32 else ""
         suffix += "_local_factors" if self.local else ""
         suffix += "_warm_start" if self.warm_start else ""
@@ -175,7 +171,6 @@ def _resolve(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
-    velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> SparseSweep:
     """Validate the factory's options and resolve the sweep they configure."""
@@ -195,7 +190,6 @@ def _resolve(
         raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
     if local_factors and (D > 16 or M > 64 or active_rows or contact_triplets):
         raise ValueError("local factor storage requires a small complete articulated sweep")
-    accumulated = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits)
     active = bool(active_rows)
     triplets = bool(contact_triplets) and (active or bool(linked_rows)) and bool(use_support_table) and M >= 3
     linked = bool(linked_rows) and (active or triplets)
@@ -209,7 +203,6 @@ def _resolve(
         triplets=triplets,
         linked=linked,
         velocity_limits=bool(velocity_limits),
-        accumulated=accumulated,
         local=bool(local_factors),
         warm_start=bool(warm_start),
         policy=solve_policy,
@@ -694,11 +687,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     lanes = Lanes(L)
     rows = SparseRows(M, lanes)
     op = factor_operator(sweep)
-    laws = RowLaws(
-        velocity_limit_law="accumulated" if sweep.accumulated else "stateless",
-        regularize=False,
-        policy=sweep.policy,
-    )
+    laws = RowLaws(regularize=False, policy=sweep.policy)
     staging = _staging(sweep, rows, op)
 
     setup = []
@@ -785,7 +774,6 @@ def sparse_source(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
-    velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
 ) -> tuple[str, Staging]:
     """The native body of the sparse sweep and its staging."""
@@ -804,7 +792,6 @@ def sparse_source(
             local_factors=local_factors,
             warm_start=warm_start,
             linked_rows=linked_rows,
-            velocity_limit_law=velocity_limit_law,
             solve_policy=solve_policy,
         )
     )
@@ -826,7 +813,6 @@ def sparse_kernel(
     local_factors: bool = False,
     warm_start: bool = False,
     linked_rows: bool = False,
-    velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     device_arch=None,
 ) -> wp.Kernel:
@@ -850,7 +836,6 @@ def sparse_kernel(
         local_factors=local_factors,
         warm_start=warm_start,
         linked_rows=linked_rows,
-        velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
     )
     snippet, staging = _source(sweep)

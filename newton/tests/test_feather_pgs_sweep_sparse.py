@@ -38,14 +38,6 @@ _SMALL = {"lanes_per_world": 8, "local_factors": True}
 CONFIGURATIONS = (
     # The conformance routes.
     ("sparse_velocity_limits", 32, 2, 2, {**_TABLE, **_LIMITS, **_SMALL}, None),
-    (
-        "sparse_velocity_limits_accumulated",
-        32,
-        2,
-        2,
-        {**_TABLE, **_LIMITS, **_SMALL, "velocity_limit_law": "accumulated"},
-        None,
-    ),
     ("sparse_velocity_mimic", 32, 2, 2, {**_LIMITS, **_SMALL}, None),
     ("sparse_point", 64, 14, 10, _ACTIVE, None),
     ("sparse_triplets", 64, 14, 10, _TRIPLETS, None),
@@ -141,7 +133,6 @@ class TestSparseSweepConfiguration(unittest.TestCase):
                 "velocity_limits": limits,
                 "lanes_per_world": lanes,
                 "local_factors": local,
-                "velocity_limit_law": "accumulated" if limits and local else "stateless",
                 "warm_start": active and local,
             }
             for M, D, S in ((64, 8, 6), (2, 8, 6), (192, 18, 12)):
@@ -155,7 +146,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         self.assertGreater(checked, 50)
 
     def test_rejects_invalid_options(self):
-        """Reject invalid capacities, lanes, layouts, laws and free-body rows."""
+        """Reject invalid capacities, lanes, layouts and free-body rows."""
         cases = (
             ((16, 6, 4), {"mf_max_constraints": 1}),
             ((16, 6, 4), {"free_row_dofs": 6}),
@@ -167,7 +158,6 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             ((16, 18, 4), {"lanes_per_world": 16}),
             ((16, 6, 4), {"lanes_per_world": 8, "active_rows": True}),
             ((96, 6, 4), {"local_factors": True}),
-            ((16, 6, 4), {"velocity_limit_law": "clamped"}),
         )
         for args, options in cases:
             with self.subTest(args=args, options=options), self.assertRaises(ValueError):
@@ -220,7 +210,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             "sparse_point",
             "patch_units_256",
             "sparse_patch_small_world",
-            "sparse_velocity_limits_accumulated",
+            "sparse_velocity_limits",
         ):
             _, M, D, S, kwargs, policy = next(entry for entry in CONFIGURATIONS if entry[0] == label)
             with self.subTest(label):

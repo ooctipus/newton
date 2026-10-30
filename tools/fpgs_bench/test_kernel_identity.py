@@ -186,25 +186,10 @@ class TestKernelIdentity(unittest.TestCase):
         skipped, _ = identity.census(("sweep_routes_local.paired_factor_kernel",), skip=rows.keys())
         self.assertEqual(skipped, {})
 
-    def test_census_crosses_the_velocity_limit_laws(self):
-        """Cross every factory that takes a velocity-limit law with both laws, and the sweep with resident metadata.
-
-        The laws rewrite the velocity-limit visits and the matrix-free sweep's resident row metadata
-        its row loads, so a refactor can be exact under the default and change the other variant.
-        Labels omit a keyword at its default, so the default variants keep their labels.
-        """
-        factories = ("sweep_routes_sparse.sparse_kernel",)
-        rows, _ = identity.census(factories)
-        for factory in factories:
-            with self.subTest(factory=factory):
-                labels = [key for key in rows if factory in key]
-                accumulated = [key for key in labels if "velocity_limit_law='accumulated'" in key]
-                self.assertTrue(accumulated)
-                self.assertEqual(2 * len(accumulated), len(labels))
-                self.assertFalse([key for key in labels if "velocity_limit_law='stateless'" in key])
+    def test_census_crosses_resident_row_metadata(self):
+        """Cross the matrix-free sweep with resident row metadata, which rewrites its row loads."""
         calls = [kwargs for name, _, _, kwargs in identity.census_calls() if name.endswith("sweep_routes.mf_gs_kernel")]
         self.assertTrue(any(kwargs["resident_row_metadata"] and not kwargs["shared_metadata"] for kwargs in calls))
-        self.assertEqual({kwargs["velocity_limit_law"] for kwargs in calls}, {"stateless", "accumulated"})
 
     def test_scalar_branch_kernels_are_recorded_with_the_pins(self):
         """Record every kernel of the held-tree owner's scalar-branch group in the pins family.

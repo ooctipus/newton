@@ -1637,9 +1637,10 @@ def allocate_joint_velocity_limit_slots(
     * ``sign = -1`` — upper-limit violation (``qdot_i > +qdot_max``). The row
       pushes velocity back down (``J = -e_i``, ``target_vel = -qdot_max``).
 
-    The matrix-free solver treats these rows as stateless PhysX-style clamp
-    rows: satisfied sides apply no impulse, and a violated side applies only
-    the current velocity overshoot correction.
+    The sweeps project these rows as unilateral rows with a non-negative
+    total (:func:`.projection_laws.velocity_limit_update`): a violated side
+    accumulates the impulse that holds it on its limit, and a satisfied side
+    releases its impulse.
 
     ``velocity_limit_activation_fraction`` proximity-gates the allocation:
     with a positive fraction the lower/upper pair is reserved only when
@@ -3533,8 +3534,8 @@ def classify_local_solve_worlds(
             local_mf = False
         if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
             local_mf = False
-        # Free-body velocity-limit rows follow the general owner's stateless unilateral law, which the
-        # residual local loop does not implement: keep such worlds on the general owner.
+        # Free-body velocity-limit rows are speed rows (projection_laws.speed_row), which the residual local loop
+        # does not implement: keep such worlds on the general owner.
         if mf.row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             local_mf = False
         mf_row += 1

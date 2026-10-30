@@ -675,9 +675,9 @@ if (friction && {sweep.kind} == {CONTACT}) {{
 
 
 def _speed_rows(sweep: LoopSweep, pad: str, laws: RowLaws) -> str:
-    """A free body's speed row (a velocity-limit row), in row order: the stateless clamp of its linear (axis
+    """A free body's speed row (a velocity-limit row), in row order: the velocity-limit law on its linear (axis
     ``e_0``) or angular (axis ``e_3``) speed along the velocity (:func:`.sweep.speed_row`); the row keeps its
-    correction."""
+    total."""
     rows, op = sweep.rows, sweep.operator
     speed = speed_row_update(
         op,

@@ -15,9 +15,8 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   tangent pair on its disk, composed of :func:`friction_pair_metric` and
   :func:`friction_pair_from_metric` for sweeps that keep a pair's block across
   iterations;
-* velocity limits: :func:`velocity_limit_update` (the stateless PhysX clamp or
-  the accumulated unilateral law, :mod:`.velocity_limit_law`) and its free-body
-  speed form :func:`speed_row`.
+* velocity limits: :func:`velocity_limit_update`, the unrelaxed unilateral law
+  of a velocity-limit row, and its free-body speed form :func:`speed_row`.
 """
 
 import warp as wp
@@ -69,7 +68,7 @@ def friction_gate(kind: int, iteration: int, start_iteration: int) -> bool:
 
 @PROJECTION_LAW.law
 def unilateral(impulse: float) -> float:
-    """Project an impulse onto ``impulse >= 0`` (contact normals, position and accumulated velocity limits).
+    """Project an impulse onto ``impulse >= 0`` (contact normals, position and velocity limits).
 
     Selected, not branched, as the sweeps' own clamps compiled.
     """
@@ -237,25 +236,22 @@ def friction_pair(
 
 
 @PROJECTION_LAW.law
-def velocity_limit_update(old: float, residual: float, step: float, accumulated: int) -> tuple[float, float]:
+def velocity_limit_update(old: float, step: float) -> tuple[float, float]:
     """Return a velocity-limit row's new impulse and the impulse change to apply: ``(new, delta)``.
 
-    The row is unilateral, ``r = J v + b >= 0``, and ``step = r / d`` its unrelaxed
-    step. The accumulated law keeps a total, ``max(old - step, 0)``, and converges
-    to the complementarity solution. The stateless law (PhysX's clamp) applies only
-    the correction of the current overshoot, ``-step`` while ``r < 0``, and stores
-    that correction instead of a total.
+    The row is unilateral, ``r = J v + b >= 0`` with ``J`` signed by the side of the
+    limit it bounds, and ``step = r / d`` its unrelaxed step. The row keeps a total,
+    ``max(old - step, 0)``, like a contact normal or a position limit, so sweeps
+    converge to the complementarity solution, which is independent of the row order
+    and is the fixed point of the parallel tiers. From a zero impulse the update is
+    the push of a violated row onto its limit, ``-step`` while ``r < 0``.
     """
-    if accumulated != 0:
-        new = wp.max(old - step, 0.0)
-        return new, new - old
-    if residual < 0.0:
-        return -step, -step
-    return 0.0, 0.0
+    new = wp.max(old - step, 0.0)
+    return new, new - old
 
 
 @PROJECTION_LAW.law
-def speed_row(speed: float, limit: float, effective_mass: float, old: float, accumulated: int) -> wp.vec3:
+def speed_row(speed: float, limit: float, effective_mass: float, old: float) -> wp.vec3:
     """Project a free body's speed row, ``|v| <= limit``, along its current velocity.
 
     The row's residual is ``limit - |v|`` and its step ``residual * effective_mass``
@@ -267,7 +263,7 @@ def speed_row(speed: float, limit: float, effective_mass: float, old: float, acc
         velocity change per unit velocity, ``v += scale v`` (0 without a change).
     """
     residual = limit - speed
-    new, delta = velocity_limit_update(old, residual, residual * effective_mass, accumulated)
+    new, delta = velocity_limit_update(old, residual * effective_mass)
     scale = float(0.0)
     if delta != 0.0 and speed > 0.0:
         scale = -(delta / effective_mass) / speed

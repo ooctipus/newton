@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hold the CPU's split-mode free rigid bodies to the stateless speed law.
+"""Hold the CPU's split-mode free rigid bodies to the speed law.
 
 Split mode (the CPU's route) sweeps free-body rows after the dense rows in ``sweep_routes_split.mf_loop_kernel()``.
 Each finite speed limit of a body owns a speed row at
 the tail of its world's rows: it bounds the magnitude of the body's linear or angular velocity, as PhysX's
 ``maxLinearVelocity`` and ``maxAngularVelocity`` do, with ``J = e_0`` or ``e_3`` naming which and
-``rhs = limit``. The stateless law pushes a row only while its speed exceeds the limit, along the velocity,
-by the whole correction whatever ``pgs_omega`` relaxes, and keeps that correction rather than an accumulated
-impulse: a body past its limit keeps its direction and ends on the limit. Per-axis rows would let a diagonal
+``rhs = limit``. A row keeps a non-negative total, the velocity-limit law of every sweep: it pushes while its
+speed exceeds the limit, along the velocity, by the whole correction whatever ``pgs_omega`` relaxes, and
+releases its total while the speed is within the limit: a body past its limit keeps its direction and ends on
+the limit. Per-axis rows would let a diagonal
 velocity reach ``sqrt(3)`` times the limit; a sweep that relaxed the rows as bilateral rows would accelerate a
 body that moves below its limit.
 
@@ -347,7 +348,7 @@ class _SplitVelocityLimitChecks:
                             rtol=0.0,
                             atol=1.0e-6,
                         )
-                    # Each row stores the stateless correction it applied from the starting velocity.
+                    # From a zero total, each row stores the correction it applied to the starting velocity.
                     speed = np.take_along_axis(speeds, rows.axis // 3, axis=1)
                     correction = np.where(speed > rows.rhs, (speed - rows.rhs) * rows.eff_mass_inv, 0.0)
                     np.testing.assert_allclose(swept.impulses, correction, rtol=RTOL, atol=0.0)
@@ -355,12 +356,15 @@ class _SplitVelocityLimitChecks:
                     # The diagonal world: every component within the limit, both speeds past it.
                     self.assertTrue(np.all(np.abs(swept.start[2]) < LIMITS) and not np.any(inside[2]))
 
-    def test_sweep_keeps_corrections_not_accumulated_impulses(self):
-        """Converge onto the limits and store each row's last correction, not the impulse it accumulated."""
+    def test_sweep_keeps_totals(self):
+        """Converge onto the limits and keep each row's total: the first sweep's correction, which no later one
+        changes once the speeds sit on their limits."""
+        first = _sweep(self.device, iterations=1)
         swept = _sweep(self.device, iterations=12)
         _assert_on_limit_scale(swept.velocity, _clamped_magnitudes(swept.start))
-        # The first sweep applied up to MASS * 5 m/s; the last finds the limits satisfied to cfm rounding.
-        self.assertLess(np.abs(swept.impulses).max(), 1.0e-4)
+        # The first sweep applied up to MASS * 5 m/s.
+        self.assertGreater(np.abs(swept.impulses).max(), 0.5)
+        np.testing.assert_allclose(swept.impulses, first.impulses, rtol=RTOL, atol=1.0e-6)
 
     def test_step_keeps_speeds_below_the_limits(self):
         """Keep the velocity of a free body that moves below its limits and feels no other force.
@@ -386,9 +390,8 @@ class _SplitVelocityLimitChecks:
     def test_step_clamps_speeds_past_the_limits(self):
         """Hold a free body launched or pushed past its limits on them, along its own direction.
 
-        The speed rows scale the predicted velocity onto the limits in the sweep's first iteration and find
-        them satisfied in its last, which keeps a zero correction; the root clamp after the sweep finds the
-        speeds on their limits.
+        The speed rows scale the predicted velocity onto the limits in the sweep's first iteration and keep that
+        total; the root clamp after the sweep finds the speeds on their limits.
         """
         worlds = [(linear, angular) for linear, angular, _, _ in PAST]
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
@@ -404,7 +407,10 @@ class _SplitVelocityLimitChecks:
                     (np.linalg.norm(velocity[:, :3], axis=1), np.linalg.norm(velocity[:, 3:], axis=1)), axis=1
                 )
                 np.testing.assert_allclose(speeds, [[LINEAR_LIMIT, ANGULAR_LIMIT]] * len(PAST), rtol=RTOL)
-                np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
+                rows = _free_body_rows(run)
+                speed = np.take_along_axis(_speeds(predicted), rows.axis // 3, axis=1)
+                total = np.maximum(speed - rows.rhs, 0.0) * rows.eff_mass_inv
+                np.testing.assert_allclose(_velocity_limit_impulses(run), total, rtol=1.0e-4, atol=1.0e-6)
 
     def test_step_holds_a_pushed_box_on_the_limit(self):
         """Hold a box that a force pushes along frictionless ground on its speed limit, along the push.
@@ -432,12 +438,12 @@ class _SplitVelocityLimitChecks:
         np.testing.assert_allclose(velocity[1, 0], velocity[1, 1], rtol=1.0e-4)
 
     def test_step_holds_a_contact_push_on_the_limit(self):
-        """End a step on the limit that a contact row pushed a free body past, keeping only the last correction.
+        """End a step on the limit that a contact row pushed a free body past.
 
         A sphere pressed into the ground leaves it at the Baumgarte speed ``-rhs`` of its contact row, which
-        the predicted velocity does not hold. In every iteration the contact row pushes the sphere
-        to that speed and the linear speed row behind it takes the overshoot back, so the step ends on the
-        limit and the row keeps the overshoot of the last iteration, not the sum over all iterations.
+        the predicted velocity does not hold. Past the limit the two rows' targets conflict: in every iteration
+        the contact row pushes the sphere to that speed and the linear speed row behind it takes the overshoot
+        back, so the step ends on the limit and the row's total grows by the overshoot each iteration.
         """
         for articulated in (False, True):
             with self.subTest(articulated=articulated):
@@ -456,71 +462,11 @@ class _SplitVelocityLimitChecks:
                 _assert_on_limit_scale(velocity, expected, CONTACT_LIMITS)
                 linear = limit & (rows.axis == 0)
                 overshoot = np.maximum(push - CONTACT_LIMIT, 0.0)[:, None]
-                correction = np.where(linear, overshoot * rows.eff_mass_inv, 0.0)
+                sweeps = run.solver.options.pgs_iterations
+                total = np.where(linear, sweeps * overshoot * rows.eff_mass_inv, 0.0)
                 np.testing.assert_allclose(
-                    np.where(limit, rows.impulses, 0.0), correction, rtol=0.0, atol=RTOL * CONTACT_LIMIT * MASS
+                    np.where(limit, rows.impulses, 0.0), total, rtol=0.0, atol=sweeps * RTOL * CONTACT_LIMIT * MASS
                 )
-
-    def test_velocity_limit_law_leaves_the_free_body_sweep(self):
-        """Keep the stateless free-body sweep under either ``velocity_limit_law``, which split mode does not apply.
-
-        ``velocity_limit_law`` selects the law of the matrix-free sweeps. Split mode has no joint velocity-limit
-        rows, and its free-body sweep applies the stateless law that ``free_body_sweep_law`` records, so an
-        accumulated request changes no kernel, impulse or velocity, and the record says which law applies. Where
-        no free-body velocity-limit row can exist (no free body, or an infinite activation fraction),
-        ``free_body_sweep_law`` is None and the law reason claims no free-body law either.
-        """
-        runs = {law: _pressed_spheres(self.device, velocity_limit_law=law) for law in ("stateless", "accumulated")}
-        velocities = {law: _step(run) for law, run in runs.items()}
-        np.testing.assert_array_equal(velocities["accumulated"], velocities["stateless"])
-        np.testing.assert_array_equal(
-            _velocity_limit_impulses(runs["accumulated"]), _velocity_limit_impulses(runs["stateless"])
-        )
-        selected = {law: run.solver.get_path_selection() for law, run in runs.items()}
-        sweeps = {law: record["routes"]["sweep"]["free_body_matrix_free"] for law, record in selected.items()}
-        self.assertEqual(sweeps["accumulated"], sweeps["stateless"])
-        for law, record in selected.items():
-            with self.subTest(law=law):
-                self.assertEqual(record["options"]["velocity_limit_law"]["requested"], law)
-                self.assertIsNone(record["options"]["velocity_limit_law"]["applied"])
-                limits = record["routes"]["velocity_limits"]
-                self.assertIsNone(limits["law"])
-                self.assertIn("free_body_sweep_law", limits["law_reason"])
-                self.assertIn("stateless where free-body velocity-limit rows can exist", limits["law_reason"])
-                self.assertEqual(limits["free_body_sweep_law"], "stateless")
-                self.assertIn("velocity_limit_law", limits["free_body_sweep_law_reason"])
-        builder = _begin_model(None)
-        _add_arm(builder)
-        without_free_bodies = SolverFeatherPGS(builder.finalize(device=self.device))
-        never_activated = _free_boxes(self.device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))], fraction=float("inf"))
-        for name, solver, words in (
-            ("without_free_bodies", without_free_bodies, "No split free-body sweep"),
-            ("never_activated", never_activated.solver, "fraction=inf"),
-        ):
-            with self.subTest(name):
-                limits = solver.get_path_selection()["routes"]["velocity_limits"]
-                self.assertIsNone(limits["law"])
-                self.assertIsNone(limits["free_body_sweep_law"])
-                self.assertIn(words, limits["free_body_sweep_law_reason"])
-                # The law reason defers to free_body_sweep_law instead of claiming a stateless free-body law.
-                self.assertIn("free_body_sweep_law records the law of its free-body sweep", limits["law_reason"])
-                self.assertNotIn("records the stateless law", limits["law_reason"])
-
-    def test_route_records_the_velocity_limit_sweep(self):
-        """Record the stateless free-body law of the loop sweep wherever limit rows can exist."""
-        world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
-        for name, options, law, words in (
-            ("limits", {}, "stateless", "unrelaxed correction"),
-            ("infinite_limits", {"limits": INFINITE_LIMITS}, "stateless", "unrelaxed correction"),
-            ("unregistered", {"limits": None}, None, "not registered"),
-            ("never_activated", {"fraction": float("inf")}, None, "fraction=inf"),
-        ):
-            with self.subTest(name):
-                solver = _free_boxes(self.device, world, **options).solver
-                routes = solver.get_path_selection()["routes"]
-                self.assertEqual(routes["velocity_limits"]["free_body_sweep_law"], law)
-                self.assertIn(words, routes["velocity_limits"]["free_body_sweep_law_reason"])
-                self.assertEqual(routes["sweep"]["free_body_matrix_free"], "sweep_mf_loop")
 
 
 class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCase):
@@ -542,6 +488,9 @@ class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCa
             with self.subTest(name):
                 run = _free_boxes(self.device, world, **options)
                 self.assertEqual(run.solver._has_free_body_velocity_limit_rows, selected)
+                self.assertEqual(
+                    run.solver.get_path_selection()["routes"]["sweep"]["free_body_matrix_free"], "sweep_mf_loop"
+                )
                 _step(run)
                 self.assertEqual(int(run.solver.mf_constraint_count.numpy().sum()) > 0, built)
 

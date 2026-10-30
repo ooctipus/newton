@@ -311,7 +311,6 @@ class SweepTier:
         kinetic_rows: It reads the keyed rows' operands after those.
         linked_rows: It projects each friction pair on its patch ring's pooled normal load.
         velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.
-        velocity_limit_law: The law it gives joint velocity-limit rows.
         sweeps: Its sweep budget (0 for an incremental tier).
         colored_worlds: It reads each world's mapping before ``v_out`` and leaves the colored worlds
             (:data:`.sweep_routes.COLORED_WORLDS_ABI`).
@@ -324,6 +323,5 @@ class SweepTier:
     kinetic_rows: bool = False
     linked_rows: bool = False
     velocity_limit_pass: bool = False
-    velocity_limit_law: str | None = None
     sweeps: int = 0
     colored_worlds: bool = False

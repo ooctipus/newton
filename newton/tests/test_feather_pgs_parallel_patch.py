@@ -21,7 +21,7 @@ import math
 import os
 import unittest
 from fractions import Fraction
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -42,7 +42,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prescale_joint_velocity_limits,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
+from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -1019,59 +1019,9 @@ class TestPatchParallelAdmission(unittest.TestCase):
         self.assertFalse(admitted)
         self.assertIn("torsion", reason)
 
-    def test_admission_says_where_the_tiers_share_the_serial_fixed_point(self):
-        """Claim the serial sweep's fixed point for patch tiers only where both accumulate velocity-limit rows.
-
-        The tiers project joint velocity-limit rows as accumulated unilateral rows. The
-        serial sweeps do so only under ``velocity_limit_law="accumulated"`` and outside
-        the PhysX grasp schedule; under the stateless clamp the two converge to
-        different velocities wherever a limit binds, so the reason must not claim a
-        shared fixed point there. Wherever limit rows exist the reason says that the
-        worlds the tiers decline keep the serial sweep, and under which law. The
-        switch is unset: patch friction is admitted by default.
-        """
-        for limits, fraction, law, shared in (
-            (False, 0.0, "stateless", True),
-            (True, float("inf"), "stateless", True),  # the limits never activate
-            (True, 0.0, "accumulated", True),
-            (True, 0.0, "stateless", False),
-        ):
-            options = SimpleNamespace(
-                enable_joint_velocity_limits=limits,
-                velocity_limit_activation_fraction=fraction,
-                velocity_limit_law=law,
-            )
-            laws = SimpleNamespace(
-                set=plain_laws(contact="patch", velocity_limits=limits),
-                matrix_free=True,
-                has_rigid_body_velocity_limits=False,
-                options=options,
-                forest=SimpleNamespace(free_rigid_body_count=0),
-            )
-            laws.velocity_limit_sweep_law = MethodType(RowLaws.velocity_limit_sweep_law, laws)
-            probe = SimpleNamespace(_matrix_free=True, laws=laws, options=options)
-            probe._parallel_velocity_limit_agreement = MethodType(
-                SolverFeatherPGS._parallel_velocity_limit_agreement, probe
-            )
-            with self.subTest(limits=limits, fraction=fraction, law=law):
-                admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
-                self.assertTrue(admitted)
-                self.assertIn("one isotropic step per pair", reason)
-                self.assertEqual("share the serial sweep's fixed point" in reason, shared, reason)
-                self.assertEqual("fixed points differ wherever a limit binds" in reason, not shared, reason)
-                rows = limits and math.isfinite(fraction)
-                self.assertEqual("the worlds they decline keep" in reason, rows, reason)
-                self.assertEqual("clamps them statelessly" in reason, rows and not shared, reason)
-
     def test_route_record_reads_the_built_tiers(self):
-        """Record the tiers' ring-pooled projection, sweep budgets and limit law from the kernels built, not the law.
-
-        The parallel tiers accumulate joint velocity-limit rows whatever ``velocity_limit_law``
-        gives the serial sweeps, so the record names the accumulated law wherever such rows
-        can exist (``enable_joint_velocity_limits`` with a finite activation fraction) and
-        ``None`` elsewhere.
-        """
-        for anchors, linked, limits in itertools.product((False, True), repeat=3):
+        """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
+        for anchors, linked in itertools.product((False, True), repeat=2):
             options = {"inkernel_response": (_DOFS, 0, 0, 0), "linked_rows": linked}
             kernels = [
                 sweep_routes_tiers.parallel_kernel(
@@ -1089,9 +1039,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _ink_reason="The parallel tiers form the response of sizes [12] in-kernel.",
                 _keyed_rows=None,
                 laws=SimpleNamespace(friction_anchors_enabled=anchors),
-                options=SimpleNamespace(enable_joint_velocity_limits=limits, velocity_limit_activation_fraction=0.0),
             )
-            with self.subTest(anchors=anchors, linked=linked, limits=limits):
+            with self.subTest(anchors=anchors, linked=linked):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
                 self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked"), linked)
@@ -1099,10 +1048,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertNotIn("pair_step", tiers)
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], [24, 34])
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (34, "auto"))
-                self.assertEqual(tiers["velocity_limit_law"], "accumulated" if limits else None)
-                # An infinite activation fraction reserves no velocity-limit row.
-                probe.options.velocity_limit_activation_fraction = float("inf")
-                self.assertIsNone(path_selection._tiers(probe)["velocity_limit_law"])
 
 
 class TestTierSweeps(unittest.TestCase):
@@ -2008,49 +1953,32 @@ class TestPatchParallelPhysics(unittest.TestCase):
         self.assertLess(speeds["serial"], 1.0 - 0.01)
         self.assertAlmostEqual(speeds["tier"], speeds["serial"], delta=1.0e-5)
 
-    def test_declined_world_keeps_the_serial_sweep_and_its_law(self):
-        """Sweep a world the linked tiers decline serially, under the solver's stateless velocity-limit law.
+    def test_declined_world_keeps_the_serial_sweep(self):
+        """Sweep a world the linked tiers decline serially, at the tiers' fixed point.
 
         Patch friction runs the linked tiers by default. A palm and three two-link
         fingers, every joint velocity-limited (fourteen limit rows, no contacts), is
-        too large for an 8-row tier, so its world keeps the serial sweep and the
-        solver's ``velocity_limit_law``, stateless by default: it lands where the
-        serial route (no tier requested) lands, to float order.
-        The tiers accumulate velocity-limit rows, as the accumulated serial sweep
-        does; on this step that law converges more than 1e-4 away (1.1e-3 in a
-        float64 reference), and a 32-row tier that owns the world lands there. The
-        route record names that law (``routes.sweep.tiers.velocity_limit_law``) beside
-        the serial sweeps' (``routes.velocity_limits.law``). Converged settings (2000
-        iterations and sweeps) make the law, not the budget, decide.
+        too large for an 8-row tier, so its world keeps the serial sweep: it lands
+        where the serial route (no tier requested) lands, to float order. Both sweeps
+        accumulate velocity-limit rows, so a 32-row tier that owns the world lands
+        there too. Converged settings (2000 iterations and sweeps) make the law, not
+        the budget, decide.
         """
         model = _limited_hand("cuda:0")
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
-        # As test_accumulated_serial_sweep_converges_to_the_parallel_tier builds its routes on this hand.
+        # As test_serial_sweep_converges_to_the_parallel_tier builds its routes on this hand.
         converged = {"enable_joint_velocity_limits": True, "pins": _ORDINARY, "pgs_iterations": 2000, "sweeps": 2000}
         arms = {
             "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged),
             "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
             "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, **converged),
-            "accumulated": _matrix_free_solver(
-                model, beta=0.2, parallel_rows=0, velocity_limit_law="accumulated", **converged
-            ),
         }
-        for name, rows in (("declined", 8), ("owned", 32), ("serial", 0), ("accumulated", 0)):
+        for name, rows in (("declined", 8), ("owned", 32), ("serial", 0)):
             self.assertEqual(arms[name]._ink_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name]._mf_gs_tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             # Linked tiers with joint velocity limits take the last word.
             self.assertTrue(all(key.endswith("_linked_lw") for key in keys), keys)
-        routes = arms["declined"].get_path_selection()["routes"]
-        self.assertEqual(routes["velocity_limits"]["law"], "stateless")
-        # Beside the serial sweeps' stateless law the record names the law of the tier-owned worlds.
-        for name in ("declined", "owned"):
-            tiers = arms[name].get_path_selection()["routes"]["sweep"]["tiers"]
-            self.assertEqual(tiers["velocity_limit_law"], "accumulated", name)
-        self.assertNotIn("_vacc", routes["sweep"]["mf_gs"])
-        self.assertIn("_vacc", arms["accumulated"].get_path_selection()["routes"]["sweep"]["mf_gs"])
-        reason = routes["friction"]["parallel_rows"]["reason"]
-        self.assertIn("the worlds they decline keep the serial sweep, which clamps them statelessly", reason)
         velocities = {}
         for name, solver in arms.items():
             state, out, control = model.state(), model.state(), model.control()
@@ -2061,12 +1989,10 @@ class TestPatchParallelPhysics(unittest.TestCase):
         self.assertGreater(int(arms["declined"].constraint_count.numpy()[0]), 8)
         self.assertEqual(int(arms["declined"].mf_constraint_count.numpy()[0]), 0)
         _assert_tier_owned(self, arms["owned"], 32)
-        limited = np.abs(velocities["accumulated"])
+        limited = np.abs(velocities["serial"])
         self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")
-        law_gap = float(np.max(np.abs(velocities["serial"] - velocities["accumulated"])))
-        self.assertGreater(law_gap, 1.0e-4, "the step must tell the two laws apart")
         np.testing.assert_allclose(velocities["declined"], velocities["serial"], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(velocities["owned"], velocities["accumulated"], rtol=0.0, atol=1.0e-5)
+        np.testing.assert_allclose(velocities["owned"], velocities["serial"], rtol=0.0, atol=1.0e-5)
 
 
 if __name__ == "__main__":

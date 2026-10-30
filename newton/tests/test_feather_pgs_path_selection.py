@@ -753,8 +753,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertTrue(limits["rigid_body_limits"])
         self.assertIsNotNone(solver.rigid_velocity_limit_slot)
         self.assertTrue(limits["free_body_rows"])
-        # Its free-body sweep clamps them statelessly (test_feather_pgs_split_velocity_limits).
-        self.assertEqual(limits["free_body_sweep_law"], "stateless")
         # Split mode keeps the direct root clamp of the free box beside the rows.
         self.assertTrue(limits["root_clamp"])
 

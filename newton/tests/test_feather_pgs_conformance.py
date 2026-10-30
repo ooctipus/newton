@@ -1537,12 +1537,7 @@ def cuda_groups() -> list:
         # A one-coordinate arm is diagonal-mass, which the held tree declines.
         Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_GENERAL,)),
         Group(
-            _physics(scenes.pushed_arm(), None, 16, "stateless", **vlimits),
-            ref,
-            (MF_HELD, SPARSE.but("sparse_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True})),
-        ),
-        Group(
-            _physics(scenes.pushed_arm(), None, 16, "accumulated", velocity_limit_law="accumulated", **vlimits),
+            _physics(scenes.pushed_arm(), None, 16, "velocity_limits", **vlimits),
             ref,
             (
                 MF_HELD,

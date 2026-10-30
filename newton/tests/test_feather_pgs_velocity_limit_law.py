@@ -1,46 +1,37 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Project velocity-limit rows with the stateless or the accumulated law.
+"""Project velocity-limit rows with their law: a non-negative total.
 
-A velocity-limit row is unilateral, ``r = J v + b >= 0``. The stateless law is
-PhysX's clamp: each visit applies only the impulse that removes the current
-overshoot and stores that correction, so an impulse that later rows made
-unnecessary is never released. The accumulated law keeps a non-negative total,
-``max(old - r / d, 0)``, and converges to the complementarity solution, which
-is independent of the row order and is the fixed point of the parallel tiers.
+A velocity-limit row is unilateral, ``r = J v + b >= 0``. It keeps a
+non-negative total, ``max(old - r / d, 0)``, like a contact normal or a
+position limit, and converges to the complementarity solution, which is
+independent of the row order and is the fixed point of the parallel tiers.
 
-The CPU tests check the generated sources: the stateless law keeps them (the
-point-stream pins hold every family's stateless text), and the accumulated law
-reaches every visit of a velocity-limit row in every serial sweep generator.
-The CUDA tests run the kernels against a float64 reference and roll out solvers.
+The CPU tests check that the law reaches every visit of a velocity-limit row in
+every serial sweep generator. The CUDA tests run the kernels against a float64
+reference and roll out solvers.
 """
 
-import ast
 import inspect
-import itertools
-import re
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.rows import RowLaws
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_rows
 
-# Every serial sweep generator with velocity-limit rows: (factory, arguments, options, accumulated sites).
+# Every serial sweep generator with velocity-limit rows: (factory, arguments, options, law sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
-# its free-body form speed_row, whose last argument selects the accumulated total).
-_DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, residual_vlim / denom, 1)"
-_SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim, 1)"
+# its free-body form speed_row), from the row's total.
+_DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / denom)"
+_SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim)"
 _GENERATORS = {
     "mf_gs": (
         sweep_routes.mf_gs_kernel.__wrapped__,
@@ -71,12 +62,9 @@ _GENERATORS = {
         sparse_kernel.__wrapped__,
         (48, 18, 12),
         {"velocity_limits": True},
-        ("ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, residual_vlim / denom, 1)",),
+        (_DENSE_PASS,),
     ),
 }
-
-# The stateless law at a visit: a law call that selects it; none may survive in an accumulated kernel.
-_STATELESS_CALL = re.compile(r"(velocity_limit_update|speed_row)\([^;]*, 0\);")
 
 
 def _native_sources(factory, *args, **kwargs):
@@ -94,35 +82,14 @@ def _native_sources(factory, *args, **kwargs):
 
 
 class TestVelocityLimitLawSources(unittest.TestCase):
-    def test_stateless_law_keeps_the_generated_sources(self):
-        """Build every generator's stateless kernel from exactly the source and name it had without the law.
-
-        The point-stream pins hold these sources against the code before the law existed.
-        """
-        for name, (factory, args, options, _) in _GENERATORS.items():
-            with self.subTest(generator=name):
-                kernel, sources = _native_sources(factory, *args, **options)
-                stateless, stateless_sources = _native_sources(
-                    factory, *args, velocity_limit_law="stateless", **options
-                )
-                self.assertEqual(stateless.key, kernel.key)
-                self.assertEqual(stateless_sources, sources)
-                self.assertNotIn("_vacc", kernel.key)
-        self.assertEqual(
-            sweep_routes.mf_gs_source(64, 32, 12, velocity_limit_law="stateless"),
-            sweep_routes.mf_gs_source(64, 32, 12),
-        )
-
-    def test_accumulated_law_reaches_every_velocity_limit_visit(self):
-        """Project every visit of a velocity-limit row with the accumulated law and name the kernel for it."""
+    def test_law_reaches_every_velocity_limit_visit(self):
+        """Project every visit of a velocity-limit row with the law, from the row's total."""
         for name, (factory, args, options, sites) in _GENERATORS.items():
             with self.subTest(generator=name):
-                kernel, sources = _native_sources(factory, *args, velocity_limit_law="accumulated", **options)
+                _, sources = _native_sources(factory, *args, **options)
                 text = "\n".join(sources)
-                self.assertIn("_vacc", kernel.key)
                 for site in sites:
                     self.assertEqual(text.count(site), 1, site)
-                self.assertIsNone(_STATELESS_CALL.search(text))
 
     def test_streamed_impulses_read_the_total_once(self):
         """Read a streamed free-body total through one lane-0 broadcast, never a broadcast inside a broadcast."""
@@ -133,193 +100,48 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             12,
             "120",
             stream_mf_impulses=True,
-            velocity_limit_law="accumulated",
         )
         text = "\n".join(sources)
         self.assertIn("const float old_mf_vlim = READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0);", text)
         self.assertNotIn("lane == 0 ? READ", text)
 
-    def test_sparse_sweeps_without_limit_rows_ignore_the_law(self):
-        """Fold the law away where a sparse sweep holds no velocity-limit row."""
-        factory = sparse_kernel.__wrapped__
-        kernel, sources = _native_sources(factory, 48, 18, 12)
-        accumulated, accumulated_sources = _native_sources(factory, 48, 18, 12, velocity_limit_law="accumulated")
-        self.assertEqual(accumulated.key, kernel.key)
-        self.assertEqual(accumulated_sources, sources)
 
-    def test_solver_passes_its_law_to_every_sweep_it_builds(self):
-        """Pass ``velocity_limit_law`` at every call of a sweep factory that takes one in the solver module.
-
-        The solver builds each matrix-free sweep with ``laws.velocity_limit_kernel_law()``, so its kernels apply the
-        law that ``routes.velocity_limits.law`` reports. A call that omits the argument builds the stateless law
-        under either option. A sweep built through ``_sweep_kernel(route, factory, ...)``, which applies the solve
-        policy, is a call of its factory.
-        """
-        factories = set()
-        for module_name, module in vars(solver_source).items():
-            if not inspect.ismodule(module) or not module_name.startswith("sweep_routes"):
-                continue
-            for name, value in vars(module).items():
-                if inspect.isfunction(getattr(value, "__wrapped__", value)) and "velocity_limit_law" in (
-                    inspect.signature(value).parameters
-                ):
-                    factories.add(f"{module_name}.{name}")
-        self.assertLessEqual(
-            {"sweep_routes.mf_gs_kernel", "sweep_routes_sparse.sparse_kernel"},
-            factories,
-        )
-
-        def dotted(node):
-            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                return f"{node.value.id}.{node.attr}"
-            return node.id if isinstance(node, ast.Name) else None
-
-        calls, missing = 0, []
-        for node in ast.walk(ast.parse(inspect.getsource(solver_source))):
-            if not isinstance(node, ast.Call):
-                continue
-            name = dotted(node.func)
-            if name == "self._sweep_kernel" and len(node.args) > 1:
-                # _sweep_kernel(route, factory, *args, **kwargs) calls the factory under the solve policy.
-                name = dotted(node.args[1])
-            if name not in factories:
-                continue
-            calls += 1
-            if "velocity_limit_law" not in {keyword.arg for keyword in node.keywords}:
-                missing.append(f"{name} at line {node.lineno}")
-        self.assertGreaterEqual(calls, 3)
-        self.assertEqual(missing, [])
-
-    def test_unknown_laws_are_rejected(self):
-        """Reject a law that is neither stateless nor accumulated in every generator and the solver."""
-        for name, (factory, args, options, _) in _GENERATORS.items():
-            with self.subTest(generator=name), self.assertRaisesRegex(ValueError, "velocity_limit_law"):
-                factory(*args, velocity_limit_law="clamped", **options)
-        with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
-            sweep_routes.mf_gs_source(64, 32, 12, velocity_limit_law="clamped")
-
-
-def _cpu_arm():
-    builder = newton.ModelBuilder()
-    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
-    builder.add_articulation([builder.add_joint_revolute(-1, body)])
-    return builder.finalize(device="cpu")
-
-
-def _law_probe(**changes):
-    """A stand-in for the row laws the sweep-law decision reads: a matrix-free solver's, with joint limits."""
-    options = {
-        "enable_joint_velocity_limits": True,
-        "velocity_limit_activation_fraction": 0.0,
-        "velocity_limit_law": "accumulated",
-    }
-    laws = {"matrix_free": True, "has_rigid_body_velocity_limits": False}
-    forest = {"free_rigid_body_count": 0}
-    for name, value in changes.items():
-        (options if name in options else forest if name in forest else laws)[name] = value
-    return SimpleNamespace(**laws, options=SimpleNamespace(**options), forest=SimpleNamespace(**forest))
-
-
-class TestVelocityLimitLawOption(unittest.TestCase):
-    def test_sweep_law_follows_the_rows(self):
-        """Build the requested law where velocity-limit rows exist."""
-        decide = RowLaws.velocity_limit_sweep_law
-        for changes, law, words in (
-            ({}, "accumulated", "velocity_limit_law='accumulated'"),
-            ({"velocity_limit_law": "stateless"}, "stateless", "velocity_limit_law='stateless'"),
-            ({"enable_joint_velocity_limits": False}, "stateless", "No velocity-limit rows"),
-            # Free-body velocity limits are rows of their own.
-            (
-                {
-                    "enable_joint_velocity_limits": False,
-                    "has_rigid_body_velocity_limits": True,
-                    "free_rigid_body_count": 1,
-                },
-                "accumulated",
-                "velocity_limit_law=",
-            ),
-            ({"velocity_limit_activation_fraction": float("inf")}, "stateless", "No velocity-limit rows"),
-            ({"matrix_free": False}, None, "CPU's split sweeps"),
-        ):
-            with self.subTest(**{key: str(value) for key, value in changes.items()}):
-                probe = _law_probe(**changes)
-                selected, reason = decide(probe)
-                self.assertEqual(selected, law)
-                self.assertIn(words, reason)
-
-    def test_option_records_the_requested_and_the_applied_law(self):
-        """Default to the stateless law, record the request, and apply none on the CPU.
-
-        The applied option and ``routes.velocity_limits.law`` agree: the CPU's split mode builds
-        no matrix-free sweep, so it applies neither law.
-        """
-        model = _cpu_arm()
-        default = SolverFeatherPGS(model)
-        accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
-        self.assertEqual(default.options.velocity_limit_law, "stateless")
-        self.assertEqual(accumulated.options.velocity_limit_law, "accumulated")
-        for solver, requested in ((default, "stateless"), (accumulated, "accumulated")):
-            selected = solver.get_path_selection()
-            self.assertEqual(
-                selected["options"]["velocity_limit_law"],
-                {
-                    "applied": None,
-                    "requested": requested,
-                    "default": "stateless",
-                    "source": "default" if requested == "stateless" else "argument",
-                },
-            )
-            limits = selected["routes"]["velocity_limits"]
-            self.assertIsNone(limits["law"])
-            self.assertIn("CPU's split sweeps", limits["law_reason"])
-        with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
-            SolverFeatherPGS(model, velocity_limit_law="clamped")
-
-
-def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, law, iterations):
-    """Sweep velocity-limit rows in row order with one law in float64; return the velocity and the impulses."""
+def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, iterations):
+    """Sweep velocity-limit rows in row order with their law in float64; return the velocity and the impulses."""
     response = np.linalg.solve(mass, jacobian.T).T
     diagonal = np.einsum("ij,ij->i", jacobian, response)
     velocity, impulses = np.array(velocity, np.float64), np.zeros(len(jacobian))
     for _ in range(iterations):
         for row in range(len(jacobian)):
             residual = jacobian[row] @ velocity + bias[row]
-            if law == "accumulated":
-                new = max(impulses[row] - residual / diagonal[row], 0.0)
-                change = new - impulses[row]
-            else:
-                new = change = max(-residual / diagonal[row], 0.0)
+            new = max(impulses[row] - residual / diagonal[row], 0.0)
+            change = new - impulses[row]
             impulses[row] = new
             velocity += response[row] * change
     return velocity, impulses
 
 
 # A two-link chain whose elbow limit slows the shoulder: braking the elbow (row 1) brings the shoulder inside
-# its own limit, so the shoulder row (row 0) carries no impulse at the complementarity solution. The stateless
-# law applies the shoulder correction first when row 0 leads and can never release it.
+# its own limit, so the shoulder row (row 0) carries no impulse at the complementarity solution. When row 0 leads,
+# its first visit brakes the shoulder, and the row releases that impulse once the elbow row brakes.
 _CHAIN_MASS = np.array([[3.0, -1.4], [-1.4, 1.0]])
 _CHAIN_VELOCITY = np.array([1.2, 3.0])
 _CHAIN_JACOBIAN = np.array([[-1.0, 0.0], [0.0, -1.0]])  # upper limits: limit - qd >= 0
 _CHAIN_BIAS = np.array([1.0, 1.0])
 _CHAIN_SOLUTION = np.array([1.2 - 1.4 * 2.0 / 3.0, 1.0])  # elbow at its limit, shoulder 0.2667 inside its own
-_CHAIN_OVERBRAKED = np.array([0.1973333333, 1.0])  # stateless, shoulder row first
 
 
 class TestVelocityLimitLawReference(unittest.TestCase):
-    def test_accumulated_rows_reach_the_order_free_solution(self):
-        """Reach the complementarity solution in either row order, where the stateless law over-brakes."""
-        results = {}
-        for law, order in itertools.product(("stateless", "accumulated"), ((0, 1), (1, 0))):
-            rows = list(order)
-            velocity, impulses = serial_velocity_limit_reference(
-                _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[rows], _CHAIN_BIAS[rows], law=law, iterations=64
-            )
-            results[law, order] = velocity
-            if law == "accumulated":
+    def test_rows_reach_the_order_free_solution(self):
+        """Reach the complementarity solution in either row order, releasing the shoulder's first impulse."""
+        for order in ((0, 1), (1, 0)):
+            with self.subTest(order=order):
+                rows = list(order)
+                velocity, impulses = serial_velocity_limit_reference(
+                    _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[rows], _CHAIN_BIAS[rows], iterations=64
+                )
                 np.testing.assert_allclose(velocity, _CHAIN_SOLUTION, atol=1.0e-12)
                 np.testing.assert_allclose(impulses[rows.index(0)], 0.0, atol=1.0e-12)
-        np.testing.assert_allclose(results["stateless", (0, 1)], _CHAIN_OVERBRAKED, atol=1.0e-9)
-        np.testing.assert_allclose(results["stateless", (1, 0)], _CHAIN_SOLUTION, atol=1.0e-12)
 
 
 def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MASS):
@@ -397,48 +219,27 @@ def _launch_inputs(kernel, values):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free sweep kernels require CUDA")
 class TestVelocityLimitLawKernels(unittest.TestCase):
-    def _check_chain(self, values, velocities, *, order, law, first_row=0, **labels):
-        """Compare one launch on the chain with the float64 reference sweep and keep its velocity."""
-        velocities[order] = values["v_out"].numpy().astype(np.float64)
-        expected, impulses = serial_velocity_limit_reference(
-            _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[list(order)], _CHAIN_BIAS[list(order)], law=law, iterations=64
-        )
-        chain = values["world_impulses"].numpy()[0, first_row : first_row + 2]
-        with self.subTest(law=law, order=order, **labels):
-            np.testing.assert_allclose(velocities[order], expected, atol=2.0e-6)
-            np.testing.assert_allclose(chain, impulses, atol=2.0e-6)
-
-    def _check_order_move(self, velocities, *, law, **labels):
-        """Hold the accumulated result in either row order; record the stateless law's order dependence."""
-        move = float(np.max(np.abs(velocities[(0, 1)] - velocities[(1, 0)])))
-        with self.subTest(law=law, **labels):
-            if law == "accumulated":
-                self.assertLessEqual(move, 1.0e-6)
-                np.testing.assert_allclose(velocities[(0, 1)], _CHAIN_SOLUTION, atol=2.0e-6)
-            else:
-                # The stateless law brakes the shoulder to 0.197 instead of 0.267 when its row leads.
-                self.assertGreater(move, 0.05)
-
-    def test_serial_sweeps_follow_the_reference_in_either_row_order(self):
+    def test_serial_sweep_follows_the_reference_in_either_row_order(self):
         """Run the chain's rows through the serial sweep in both orders.
 
-        The sweep visits velocity-limit rows in the end-of-iteration pass. Reversing the row
-        order moves the accumulated result by at most 1e-6; the stateless law's move documents
-        the order-dependent over-braking the accumulated law removes.
+        The sweep visits velocity-limit rows in the end-of-iteration pass. Each order follows the float64
+        reference, and reversing the row order moves the result by at most 1e-6.
         """
         device = wp.get_device("cuda:0")
-        arch = str(device.arch)
-        factories = {
-            "mf_gs": lambda law: sweep_routes.mf_gs_kernel(4, 1, 2, arch, velocity_limit_law=law),
-        }
-        for (name, factory), law in itertools.product(factories.items(), ("stateless", "accumulated")):
-            kernel = factory(law)
-            velocities = {}
-            for order in ((0, 1), (1, 0)):
-                values = _dense_row_values(device, order=order, iterations=64)
-                wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
-                self._check_chain(values, velocities, order=order, law=law, kernel=name)
-            self._check_order_move(velocities, law=law, kernel=name)
+        kernel = sweep_routes.mf_gs_kernel(4, 1, 2, str(device.arch))
+        velocities = {}
+        for order in ((0, 1), (1, 0)):
+            values = _dense_row_values(device, order=order, iterations=64)
+            wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
+            velocities[order] = values["v_out"].numpy().astype(np.float64)
+            expected, impulses = serial_velocity_limit_reference(
+                _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[list(order)], _CHAIN_BIAS[list(order)], iterations=64
+            )
+            with self.subTest(order=order):
+                np.testing.assert_allclose(velocities[order], expected, atol=2.0e-6)
+                np.testing.assert_allclose(values["world_impulses"].numpy()[0, :2], impulses, atol=2.0e-6)
+        self.assertLessEqual(float(np.max(np.abs(velocities[(0, 1)] - velocities[(1, 0)]))), 1.0e-6)
+        np.testing.assert_allclose(velocities[(0, 1)], _CHAIN_SOLUTION, atol=2.0e-6)
 
 
 def _pushed_arm(device, limit):
@@ -451,14 +252,13 @@ def _pushed_arm(device, limit):
     return model
 
 
-def _matrix_free_solver(model, law, *, pins=None, **options):
+def _matrix_free_solver(model, *, pins=None, **options):
     settings = {
         "enable_joint_velocity_limits": True,
         "friction_anchor_beta": 0.0,
         "pgs_iterations": 8,
         "dense_max_constraints": 32,
         "mf_max_constraints": 32,
-        "velocity_limit_law": law,
     }
     settings.update(options)
     with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary", **(pins or {})}):
@@ -468,57 +268,40 @@ def _matrix_free_solver(model, law, *, pins=None, **options):
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free FPGS requires CUDA")
 class TestVelocityLimitLawRollouts(unittest.TestCase):
     def test_constant_torque_never_pushes_past_the_limit(self):
-        """Hold a revolute DOF that a constant torque pushes past its limit at the limit under either law.
-
-        The matrix-free GS kernel of the route is built with the requested law.
-        """
+        """Hold a revolute DOF that a constant torque pushes past its limit at the limit (the matrix-free GS route)."""
         limit, dt = 1.0, 1.0 / 240.0
         model = _pushed_arm("cuda:0", limit)
-        for law in ("stateless", "accumulated"):
-            with self.subTest(law=law):
-                solver = _matrix_free_solver(model, law)
-                routes = solver.get_path_selection()["routes"]
-                self.assertEqual(routes["velocity_limits"]["law"], law)
-                self.assertIsNone(routes["sweep"]["tiers"])
-                key = routes["sweep"]["mf_gs"]
-                self.assertEqual("_vacc" in key, law == "accumulated", key)
-                state, out, control = model.state(), model.state(), model.control()
-                control.joint_f.assign(np.array([120.0], np.float32))  # 0.5 rad/s per step
-                speeds = []
-                for _ in range(8):
-                    solver.step(state, out, control, None, dt)
-                    state, out = out, state
-                    speeds.append(float(abs(state.joint_qd.numpy()[0])))
-                self.assertGreater(max(speeds), 0.99 * limit, speeds)
-                self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
+        solver = _matrix_free_solver(model)
+        self.assertIsNone(solver.get_path_selection()["routes"]["sweep"]["tiers"])
+        state, out, control = model.state(), model.state(), model.control()
+        control.joint_f.assign(np.array([120.0], np.float32))  # 0.5 rad/s per step
+        speeds = []
+        for _ in range(8):
+            solver.step(state, out, control, None, dt)
+            state, out = out, state
+            speeds.append(float(abs(state.joint_qd.numpy()[0])))
+        self.assertGreater(max(speeds), 0.99 * limit, speeds)
+        self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
 
-    def test_accumulated_serial_sweep_converges_to_the_parallel_tier(self):
-        """Converge every serial sweep route under the accumulated law to the parallel tier's fixed point.
+    def test_serial_sweep_converges_to_the_parallel_tier(self):
+        """Converge the serial sweep to the parallel tier's fixed point.
 
         A palm joint carries three two-link fingers, every joint velocity-limited.
         One step from rest with torques that push some joints past their limits and
         leave others inside couples the limit rows through the hand's mass matrix.
         The parallel tier (a test pin: 2000 sweeps) solves the complementarity
-        problem; at 2000 iterations the matrix-free GS kernel matches it to 1e-5
-        under the accumulated law. The stateless serial sweep converges more than
-        1e-4 away (1.1e-3 in a float64 reference), so a route built with the
-        stateless law cannot pass.
+        problem; at 2000 iterations the matrix-free GS kernel matches it to 1e-5.
+        PhysX's clamp, which keeps each visit's correction instead of a total,
+        converged 1.1e-3 away in a float64 reference.
         """
         model = _limited_hand("cuda:0")
         # Unconstrained step velocities (0.05, 0.33, -1.42, -0.45, 2.07, -0.46, 0.62) rad/s: three limits bind at
         # the solution, and the coupling keeps four joints inside theirs.
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
         velocities = {}
-        for name, law, pins in (
-            ("serial_stateless", "stateless", {}),
-            ("serial", "accumulated", {}),
-            ("tier", "accumulated", {"tiers": 32, "tier_sweeps": 2000}),
-        ):
-            solver = _matrix_free_solver(model, law, pins=pins, pgs_iterations=2000)
+        for name, pins in (("serial", {}), ("tier", {"tiers": 32, "tier_sweeps": 2000})):
+            solver = _matrix_free_solver(model, pins=pins, pgs_iterations=2000)
             self.assertEqual(solver._ink_rows, 32 if name == "tier" else 0)
-            # Each serial route sweeps the hand's rows with a kernel of the requested law.
-            kernel = solver._pgs_solve_mf_gs_kernel
-            self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
             state, out, control = model.state(), model.state(), model.control()
             control.joint_f.assign(torques)
             solver.step(state, out, control, None, 1.0 / 240.0)
@@ -528,15 +311,7 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         limited = np.abs(velocities["serial"])
         self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")
         self.assertTrue(np.any(limited <= 0.9 * _HAND_LIMIT), "every limit binds")
-        stateless_gap = float(np.max(np.abs(velocities["serial_stateless"] - velocities["tier"])))
-        # The comparison below discriminates the laws only while the stateless law lands elsewhere.
-        self.assertGreater(stateless_gap, 1.0e-4)
-        np.testing.assert_allclose(
-            velocities["serial"],
-            velocities["tier"],
-            atol=1.0e-5,
-            err_msg=f"the stateless serial sweep lies {stateless_gap:.3e} from the tier",
-        )
+        np.testing.assert_allclose(velocities["serial"], velocities["tier"], atol=1.0e-5)
 
 
 _HAND_LIMIT = 0.5

@@ -10,7 +10,6 @@ from typing import Any
 
 from .contact_unit import check_contact_update
 from .solve_policy import SOLVE_READOUTS
-from .velocity_limit_law import check_velocity_limit_law
 
 MAX_CONTACT_REGULARIZATION = 1.0e6
 """The largest ``pgs_contact_regularization``: larger values are not numerically useful in the float32 solve."""
@@ -112,7 +111,6 @@ class Options:
     warn_constraint_overflow: bool
     friction_anchor_beta: Any
     pgs_solve_readout: str
-    velocity_limit_law: str
     contact_update: str
     bilateral_preelimination_include_mimics: bool
     contact_torsion_radius: Any
@@ -151,7 +149,6 @@ def check_options(options: Mapping[str, Any]) -> Options:
         )
     checked.update({name: bool(options[name]) for name in _BOOLEANS})
     checked["mf_max_constraints"] = int(options["mf_max_constraints"])
-    checked["velocity_limit_law"] = check_velocity_limit_law(options["velocity_limit_law"])
     checked["contact_update"] = check_contact_update(options["contact_update"])
     return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})
 

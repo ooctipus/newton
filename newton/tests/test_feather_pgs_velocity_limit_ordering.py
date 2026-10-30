@@ -69,12 +69,7 @@ def _build_arm_and_box_model(device) -> newton.Model:
 
 
 class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
-    def _max_arm_speed_over_impact(
-        self,
-        velocity_limit_law: str = "stateless",
-        routes: list | None = None,
-        velocity_limits: bool = True,
-    ) -> float:
+    def _max_arm_speed_over_impact(self, velocity_limits: bool = True) -> float:
         model = _build_arm_and_box_model(device="cuda:0")
 
         n = model.joint_dof_count
@@ -99,10 +94,7 @@ class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
             pgs_iterations=8,
             dense_max_constraints=32,
             mf_max_constraints=32,
-            velocity_limit_law=velocity_limit_law,
         )
-        if routes is not None:
-            routes.append(solver.get_path_selection()["routes"])
 
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -138,19 +130,6 @@ class TestFeatherPGSVelocityLimitOrdering(unittest.TestCase):
         # phase of every iteration and hold the limit through the impact.
         speed = self._max_arm_speed_over_impact()
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
-    def test_accumulated_rows_hold_limit_through_impact(self):
-        """Hold the limit through the impact with accumulated dedicated rows.
-
-        The accumulated law keeps the end-of-iteration position: the final pass of
-        the matrix-free sweep.
-        """
-        routes = []
-        speed = self._max_arm_speed_over_impact(velocity_limit_law="accumulated", routes=routes)
-        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-        self.assertEqual(routes[0]["velocity_limits"]["law"], "accumulated")
-        self.assertIn("_vacc", routes[0]["sweep"]["mf_gs"])
 
 
 if __name__ == "__main__":

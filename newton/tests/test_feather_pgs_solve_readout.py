@@ -14,8 +14,8 @@ counts against that rule; the solver tests check that every route's readout
 leaves the trajectory bitwise unchanged and counts each world-solve once: in
 the slot of the sweep that solved it, or, for a world without rows that the
 matrix-free sweeps do not enter, as skipped. The parallel tiers count their own
-worlds, against their own sweep budget. Velocity-limit rows bind under the
-accumulated law on a route of their own.
+worlds, against their own sweep budget. Velocity-limit rows bind on a route of
+their own.
 """
 
 import unittest
@@ -457,12 +457,12 @@ def _dense_route():
 
 
 def _velocity_limit_route():
-    """The dense route's tripods with velocity-limited legs under the accumulated velocity-limit law.
+    """The dense route's tripods with velocity-limited legs.
 
     Each leg joint is limited to 1 rad/s and starts at 2 rad/s, so the velocity-limit rows bind
-    from the first step, and the accumulated law keeps each row's total across sweeps, which the
-    votes measure as the change of that total. The rows start from half the limit and add at most
-    two per leg to a world's rows.
+    from the first step, and each row keeps its total across sweeps, which the votes measure as
+    the change of that total. The rows start from half the limit and add at most two per leg to a
+    world's rows.
     """
     route = _dense_route()
     model = route["model"]
@@ -481,7 +481,6 @@ def _velocity_limit_route():
         **route["options"],
         "enable_joint_velocity_limits": True,
         "velocity_limit_activation_fraction": 0.5,
-        "velocity_limit_law": "accumulated",
     }
     route.update(
         name="velocity_limits",
@@ -533,7 +532,7 @@ def _paired_route():
 def _policy_routes():
     """The routes whose local, paired and matrix-free sweeps compile the velocity law and trace.
 
-    The last one binds velocity-limit rows under the accumulated velocity-limit law.
+    The last one binds velocity-limit rows.
     """
     return (_local_route(), _paired_route(), _matrix_free_route(), _dense_route(), _velocity_limit_route())
 
@@ -694,18 +693,14 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertLessEqual(skipped["worlds"], model.world_count)
 
     def test_velocity_limit_route_counts_without_changing_results(self):
-        """Count the sweeps of binding velocity-limit rows under the accumulated law, every world-solve once.
+        """Count the sweeps of binding velocity-limit rows, every world-solve once.
 
-        Under ``velocity_limit_law="accumulated"`` a velocity-limit row keeps its total across sweeps,
-        and the counted sweeps carry that law. The route's first step holds velocity-limit rows with
-        positive totals; the readout changes no result and counts every world-solve once.
+        A velocity-limit row keeps its total across sweeps. The route's first step holds velocity-limit
+        rows with positive totals; the readout changes no result and counts every world-solve once.
         """
         route = _velocity_limit_route()
         (probe,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
-        self.assertEqual(probe.get_path_selection()["routes"]["velocity_limits"]["law"], "accumulated")
         self.assertTrue(probe._solve_readout.kernels)
-        for key in probe._solve_readout.kernels:
-            self.assertIn("_vacc", key)
         for _ in self._steps(route, [probe], 1):
             counts = probe.constraint_count.numpy()
             types = probe.row_type.numpy() & _DENSE_META_ROW_TYPE_MASK

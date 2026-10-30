@@ -156,7 +156,7 @@ def parallel_source(
     NT = 32 * ((AM + 31) // 32)
     lanes = Lanes(NT)
     velocity_limit_pass = bool(velocity_limit_pass)
-    laws = RowLaws(velocity_limit_law="accumulated", regularize=False, policy=solve_policy)
+    laws = RowLaws(regularize=False, policy=solve_policy)
     store = JacobiRows(AM, NT, limits=velocity_limit_pass, types=solve_policy.traces)
     whitened = WhitenedRows(
         NA,
@@ -190,13 +190,13 @@ def parallel_source(
         metadata = {name: getattr(operands, name) for name in metadata}
     loads = store.loads(
         **metadata,
-        unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT) if laws.accumulated else (CONTACT, JOINT_LIMIT),
+        unilateral=(CONTACT, JOINT_LIMIT, VELOCITY_LIMIT),
     )
 
     def scale(aii, bound, pad):
         return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)
 
-    last_word = jacobi_limit_pass(store, op, laws) if velocity_limit_pass else ""
+    last_word = jacobi_limit_pass(store, op) if velocity_limit_pass else ""
     body = f"""    const int lane = LANE;
 {dense_tier_world(AM, int(min_rows), D, M_D, rows="n_rows", support=D)}
 
@@ -252,9 +252,8 @@ def parallel_kernel(
 
     A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
-    carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as accumulated
-    unilateral rows whatever the serial sweeps' law. Its worlds' packed rows (:mod:`.packed_rows`) lie at their
-    coordinates, ``max_world_dofs`` entries a row.
+    carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
+    rows. Its worlds' packed rows (:mod:`.packed_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
     """
     options = {
         "rows": rows,
@@ -298,6 +297,5 @@ def parallel_kernel(
         kinetic_rows=row_inputs is not None,
         linked_rows=bool(linked_rows),
         velocity_limit_pass=bool(velocity_limit_pass),
-        velocity_limit_law="accumulated",
         sweeps=int(sweeps),
     )

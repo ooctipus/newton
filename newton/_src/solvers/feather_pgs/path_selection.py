@@ -90,9 +90,6 @@ def _is_default(value, default) -> bool:
 
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
-    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in the CPU's split mode,
-    # which builds no matrix-free sweep and applies no law.
-    "velocity_limit_law": lambda solver: solver.laws.velocity_limit_sweep_law()[0],
     # A readout applies only where a sweep kernel carries its counters.
     "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver._solve_readout.kernels else "off",
     # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
@@ -716,9 +713,6 @@ def _tiers(solver) -> dict | None:
         "linked_rows": all(tier.linked_rows for tier in tiers),
         # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
         "velocity_limit_pass": all(tier.velocity_limit_pass for tier in tiers),
-        # The tiers accumulate joint velocity-limit rows whatever the serial sweeps' law
-        # (routes.velocity_limits.law), so the two can differ in the worlds the tiers own.
-        "velocity_limit_law": _tier_velocity_limit_law(solver, tiers),
         # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
         "sweeps": max(tier.sweeps for tier in tiers),
         "sweeps_rule": solver._par_sweeps_rule,
@@ -733,14 +727,6 @@ def _tiers(solver) -> dict | None:
             for (rows, min_rows), tier in zip(solver._par_tiers, tiers, strict=True)
         ],
     }
-
-
-def _tier_velocity_limit_law(solver, tiers) -> str | None:
-    # The law the built tier kernels give joint velocity-limit rows; one construction call builds every tier with
-    # it. None where no such row can exist. The tiers serve dense rows only, so free-body limits never reach them.
-    if not solver.options.enable_joint_velocity_limits or np.isinf(solver.options.velocity_limit_activation_fraction):
-        return None
-    return tiers[0].velocity_limit_law
 
 
 def _resolved_worlds(solver) -> dict:
@@ -780,18 +766,13 @@ def _velocity_limits(solver) -> dict:
         joint, reason = "sparse_factor_rows", "Native sparse factors solve velocity-limit rows in factor coordinates."
     else:
         joint, reason = "rows", "Dedicated velocity-limit rows."
-    free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     limits = bool(solver.laws.has_rigid_body_velocity_limits)
     matrix_free = solver._matrix_free
     model = solver.model
     prescale = solver.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
-    # The law the matrix-free sweep kernels were built with.
-    law, law_reason = solver.laws.velocity_limit_sweep_law()
     return {
         "joint": joint,
         "reason": reason,
-        "law": law,
-        "law_reason": law_reason,
         # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
         "prescale_lanes": int(solver.laws.velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.options.velocity_limit_activation_fraction),
@@ -799,28 +780,9 @@ def _velocity_limits(solver) -> dict:
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
-        # The law of split mode's free-body sweep (sweep.free_body_matrix_free) for these rows.
-        "free_body_sweep_law": free_body_law,
-        "free_body_sweep_law_reason": free_body_law_reason,
         # Split mode's clamp of the solved velocity of free roots (_stage6_clamp_rigid_velocity_limits).
         "root_clamp": bool(limits and solver.forest.has_root_free and not matrix_free),
     }
-
-
-def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
-    # Mirrors the free_body_matrix_free sweep of _sweep and the kernel selection of _init_tiled_kernels.
-    if solver._matrix_free or not solver.forest.has_free_rigid_bodies:
-        return None, "No split free-body sweep: CUDA solves the rows matrix-free, or there are no free rigid bodies."
-    if solver._has_free_body_velocity_limit_rows:
-        return "stateless", (
-            "A free body's speed row bounds the magnitude of its linear or angular velocity: past the limit it "
-            "pushes, along the velocity, by its whole unrelaxed correction and keeps that correction instead of "
-            "an accumulated impulse; the rows end every iteration. The CPU's free-body loop applies this law; "
-            "velocity_limit_law selects the law of the matrix-free sweeps and does not apply here."
-        )
-    if solver.laws.has_rigid_body_velocity_limits:
-        return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
-    return None, "No free-body velocity-limit rows: the rigid-body speed attributes are not registered."
 
 
 def _free_rigid_bodies(solver) -> dict:

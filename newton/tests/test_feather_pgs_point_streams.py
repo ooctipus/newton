@@ -304,22 +304,6 @@ def _sparse_sweep_calls():
             yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
 
 
-def _accumulated_sparse_calls():
-    """Native sparse sweeps whose velocity-limit rows accumulate (``velocity_limit_law="accumulated"``)."""
-    from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
-
-    factory = sparse_kernel.__wrapped__
-    # The final pass of articulated limits; the pins name the free-body capacities, always zero.
-    for size in ((32, 8, 8), (48, 18, 12)):
-        kwargs = {
-            "mf_max_constraints": 0,
-            "free_row_dofs": 0,
-            "velocity_limits": True,
-            "velocity_limit_law": "accumulated",
-        }
-        yield "sweep_routes_sparse.sparse_kernel", factory, size, kwargs
-
-
 def _linked_sweep_calls():
     """Patch-only native sparse sweeps over linked rows (sweep_routes_sparse.py)."""
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
@@ -438,22 +422,6 @@ def _solver_factory_calls():
             "resident_row_metadata": True,
             "has_dense_velocity_limit_rows": limits,
             "skip_tier_rows": 0 if limits else 32,
-        }
-        factory = sweep_routes.mf_gs_kernel.__wrapped__
-        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    # The accumulated velocity-limit law of the serial sweeps; the stateless law keeps the pins above.
-    for skip_rows in (0, 32):
-        kwargs = {"skip_tier_rows": skip_rows, "velocity_limit_law": "accumulated"}
-        factory = sweep_routes.mf_gs_kernel.__wrapped__
-        yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    # The resident row metadata cases above, under the accumulated law.
-    for limits in (False, True):
-        kwargs = {
-            "shared_metadata": False,
-            "resident_row_metadata": True,
-            "has_dense_velocity_limit_rows": limits,
-            "skip_tier_rows": 0 if limits else 32,
-            "velocity_limit_law": "accumulated",
         }
         factory = sweep_routes.mf_gs_kernel.__wrapped__
         yield "sweep_routes.mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
@@ -596,7 +564,6 @@ def _factory_kernels():
     kernels = {}
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
-        _accumulated_sparse_calls(),
         _linked_sweep_calls(),
         _sparse_contact_calls(),
         _dense_build_calls(),
@@ -767,18 +734,8 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
-        # Every serial sweep family with velocity-limit rows is pinned under the accumulated law too.
-        accumulated = {name.split("(", 1)[0] for name in self.current if "velocity_limit_law='accumulated'" in name}
-        self.assertEqual(
-            accumulated,
-            {
-                "sweep_routes_sparse.sparse_kernel",
-                "sweep_routes.mf_gs_kernel",
-            },
-        )
-        # The MF-GS kernels that keep row metadata resident are pinned under both laws.
-        resident = [name for name in self.current if "resident_row_metadata=True" in name]
-        self.assertEqual({"velocity_limit_law='accumulated'" in name for name in resident}, {False, True})
+        # The MF-GS kernels that keep row metadata resident are pinned.
+        self.assertTrue([name for name in self.current if "resident_row_metadata=True" in name])
         # The patch-only linked tiers are pinned beside the point tiers they extend.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)

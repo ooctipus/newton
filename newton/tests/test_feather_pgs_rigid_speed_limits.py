@@ -82,18 +82,15 @@ def _step_boxes(device, **options):
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free FeatherPGS requires CUDA")
 class TestFeatherPGSRigidSpeedLimits(unittest.TestCase):
     def test_step_ends_on_the_speed_limits(self):
-        """End a step past the limits on them, along the launch direction, under either law and activation gate."""
+        """End a step past the limits on them, along the launch direction, under either activation gate."""
         expected = _clamped(np.array([np.concatenate(launch) for launch in LAUNCHES]))
         limits = np.array([LINEAR_LIMIT] * 3 + [ANGULAR_LIMIT] * 3)
-        for law in ("stateless", "accumulated"):
-            for fraction in (0.0, 0.7):
-                with self.subTest(law=law, fraction=fraction):
-                    solver, velocity = _step_boxes(
-                        "cuda:0", velocity_limit_law=law, velocity_limit_activation_fraction=fraction
-                    )
-                    np.testing.assert_allclose(velocity / limits, expected / limits, rtol=0.0, atol=RTOL)
-                    routes = solver.get_path_selection()["routes"]
-                    self.assertTrue(routes["velocity_limits"]["free_body_rows"])
+        for fraction in (0.0, 0.7):
+            with self.subTest(fraction=fraction):
+                solver, velocity = _step_boxes("cuda:0", velocity_limit_activation_fraction=fraction)
+                np.testing.assert_allclose(velocity / limits, expected / limits, rtol=0.0, atol=RTOL)
+                routes = solver.get_path_selection()["routes"]
+                self.assertTrue(routes["velocity_limits"]["free_body_rows"])
 
     def test_speed_rows_bound_whole_velocities(self):
         """Allocate one speed row per finite limit of each box past its limits: linear (axis 0) and angular (axis 3).

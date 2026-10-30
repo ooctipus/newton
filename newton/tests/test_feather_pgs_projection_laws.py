@@ -153,14 +153,14 @@ def _scalar_laws(
     out[i, 1] = laws.regularized_diagonal(diagonal[i], w[i])
     out[i, 2] = laws.unilateral(old[i])
     out[i, 3] = laws.box(old[i], -bound[i], bound[i])
-    accumulated_new, accumulated_delta = laws.velocity_limit_update(old[i], residual[i], residual[i] / diagonal[i], 1)
-    stateless_new, stateless_delta = laws.velocity_limit_update(old[i], residual[i], residual[i] / diagonal[i], 0)
-    out[i, 4] = accumulated_new
-    out[i, 5] = accumulated_delta
-    out[i, 6] = stateless_new
-    out[i, 7] = stateless_delta
+    new, delta = laws.velocity_limit_update(old[i], residual[i] / diagonal[i])
+    push_new, push_delta = laws.velocity_limit_update(0.0, residual[i] / diagonal[i])
+    out[i, 4] = new
+    out[i, 5] = delta
+    out[i, 6] = push_new
+    out[i, 7] = push_delta
     out[i, 8] = float(laws.friction_gate(kind[i], iteration[i], 3))
-    row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0, 0)
+    row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0)
     out[i, 9] = row[2]
 
 
@@ -199,9 +199,10 @@ def test_scalar_laws(test, device):
     np.testing.assert_array_equal(out[:, 3], np.clip(old, -bound, bound))
     np.testing.assert_allclose(out[:, 4], np.maximum(o - r / d, 0.0), rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(out[:, 5], out[:, 4] - old, rtol=1e-6, atol=1e-6)
-    stateless = np.where(r < 0.0, -r / d, 0.0)
-    np.testing.assert_allclose(out[:, 6], stateless, rtol=1e-6, atol=1e-7)
-    np.testing.assert_allclose(out[:, 7], stateless, rtol=1e-6, atol=1e-7)
+    # From a zero total the update pushes a violated row onto its limit (the tiers' last word).
+    push = np.where(r < 0.0, -r / d, 0.0)
+    np.testing.assert_allclose(out[:, 6], push, rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(out[:, 7], push, rtol=1e-6, atol=1e-7)
     np.testing.assert_array_equal(out[:, 8], (kind == ROW_FRICTION) & (iteration < 3))
     # A free body over its speed limit keeps its direction and ends on the limit.
     speed = np.abs(r) * 3.0

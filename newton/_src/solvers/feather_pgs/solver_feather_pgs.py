@@ -739,7 +739,6 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
-        velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
         contact_update: Literal["sequential", "unit"] = "sequential",
         bilateral_preelimination_include_mimics: bool = True,
         contact_torsion_radius: float = 0.0,
@@ -947,7 +946,9 @@ class SolverFeatherPGS(SolverBase):
                 bilateral box ``[-qdot_max_i, +qdot_max_i]`` through the articulated-body
                 response ``J M^-1 J^T + cfm``, so momentum redistributes correctly across
                 the articulation (rather than a naive joint-space clip which breaks
-                multi-body Newton's third law). No Baumgarte bias.
+                multi-body Newton's third law). No Baumgarte bias. Each row keeps a
+                non-negative impulse total, like a contact normal, so the sweeps converge
+                to the complementarity solution, independent of the row order.
 
                 Only supported on CUDA; CPU construction with
                 ``enable_joint_velocity_limits=True`` raises :class:`NotImplementedError`.
@@ -961,24 +962,6 @@ class SolverFeatherPGS(SolverBase):
                 be exact no-op clamps. Because the gate samples the pre-solve velocity, a DOF
                 crossing the threshold between steps is clamped one step late. Must be non-negative
                 and not NaN. Defaults to ``0.0``.
-            velocity_limit_law (str, optional): How the matrix-free sweeps project the dedicated
-                joint and free-body velocity-limit rows, which keep the last word at the end of
-                every iteration either way. A free body's row bounds the magnitude of its linear or
-                angular velocity (a speed row: residual ``limit - |v|``, correction along ``v``).
-                ``"stateless"`` is PhysX's clamp: each visit applies
-                only the impulse that removes the current overshoot and stores that correction,
-                so an impulse that later rows made unnecessary is never released and the
-                converged velocity depends on the row order. ``"accumulated"`` treats the row like
-                a contact normal or a position limit, with a non-negative accumulated impulse
-                ``max(old - r / d, 0)``; the sweeps then converge to the complementarity solution,
-                independent of the row order, which the parallel matrix-free tiers also solve. Split mode, which has
-                no joint velocity-limit rows, applies neither law: where its free-body sweep has
-                velocity-limit rows it keeps the stateless clamp that ``get_path_selection()``
-                reports under ``routes.velocity_limits.free_body_sweep_law``.
-                ``get_path_selection()`` reports the law the serial sweeps apply under
-                ``routes.velocity_limits.law``, and the parallel tiers' law, accumulated under either
-                argument, under ``routes.sweep.tiers.velocity_limit_law``. Experimental. Defaults to
-                ``"stateless"``.
             contact_update (str, optional): How a Gauss-Seidel sweep updates a contact. ``"sequential"``
                 steps a contact's normal row against the friction of its previous update, then solves its
                 friction pair at the held normal load. ``"unit"`` solves each contact unit exactly against its
@@ -2922,7 +2905,6 @@ class SolverFeatherPGS(SolverBase):
             velocity_limits=self._sparse_velocity_limits,
             warm_start=self.options.pgs_warmstart,
             linked_rows=self.laws.friction_anchors_enabled,
-            velocity_limit_law=self.laws.velocity_limit_kernel_law(),
             device_arch=model.device.arch,
         )
 
@@ -3761,7 +3743,6 @@ class SolverFeatherPGS(SolverBase):
                 "mf_gs",
                 sweep_routes.mf_gs_kernel,
                 *mf_gs_shape,
-                velocity_limit_law=self.laws.velocity_limit_kernel_law(),
                 **mf_gs_options,
             )
             if colored:
@@ -3778,7 +3759,6 @@ class SolverFeatherPGS(SolverBase):
                     sweep_routes.mf_gs_kernel,
                     *mf_gs_shape,
                     mapping="colored",
-                    velocity_limit_law=self.laws.velocity_limit_kernel_law(),
                     **mf_gs_options,
                 )
             if parallel_rows > 0:
@@ -7320,9 +7300,9 @@ class SolverFeatherPGS(SolverBase):
 
         The tiers serve the dense rows of a tree beside a free body where no other placement claims the class: not
         packed factors or the sparse diagonal (no matrix-free sweep then), the local owners (case K3) or factor
-        coordinates (case K5), nor the fused velocity clamp of drive rows. They form each world's response in the
-        kernel, which bounds the class (:meth:`_build_inkernel_response_meta`: one articulation of each of one or two
-        sizes per world, at most ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement
+        coordinates (case K5). They form each world's response in the kernel, which bounds the class
+        (:meth:`_build_inkernel_response_meta`: one articulation of each of one or two sizes per world, at most
+        ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement
         (:meth:`_admit_parallel_contact_paths`). Their row bound is the dense row capacity, at most
         :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
         response they form. ``_ink_rows`` is 0 without tiers and ``_ink_reason`` says why or why not
@@ -7414,11 +7394,10 @@ class SolverFeatherPGS(SolverBase):
         dissipation under either law; with per-row steps it did not, which moved
         body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction workloads, and
         converged point tiers sat 3.9 times the serial sweep's p90 error away from its
-        fixed point on anymal-D's 33-48-row worlds. Whether the tiers then
-        share the serial sweep's whole fixed point depends on the joint velocity
-        limits, and the worlds the tiers decline keep the serial sweep and its law
-        (:meth:`_parallel_velocity_limit_agreement`). Torsion and compliance keep
-        ordinary rows. So does contact regularization, under either law: the tiers
+        fixed point on anymal-D's 33-48-row worlds. Both project joint velocity-limit
+        rows by one unilateral law, so the tiers share the serial sweep's fixed point
+        there too. Torsion and compliance keep ordinary rows. So does contact
+        regularization, under either law: the tiers
         solve the unregularized law, so the worlds they own would drop
         ``pgs_contact_regularization`` while the serial sweeps apply it.
         """
@@ -7435,32 +7414,7 @@ class SolverFeatherPGS(SolverBase):
         return True, (
             "Patch friction: parallel tiers and keyed rows serve it. In the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
-            "one isotropic step per pair, the serial pair solve's friction law. "
-            f"{self._parallel_velocity_limit_agreement()}"
-        )
-
-    def _parallel_velocity_limit_agreement(self) -> str:
-        """Say whether the parallel tiers share the serial sweep's fixed point at the joint velocity limits.
-
-        Recorded in ``routes.friction.parallel_rows``. The tiers project joint
-        velocity-limit rows as accumulated unilateral rows. The worlds they decline
-        (more dense rows than the largest tier's, or free-body rows) keep the serial
-        sweep, which does so only under the accumulated law
-        (``routes.velocity_limits.law``). Under PhysX's stateless clamp, the default,
-        tier and serial worlds converge to different velocities wherever a limit
-        binds. The tiers serve dense rows only, so free-body limits do not enter.
-        """
-        if not self.options.enable_joint_velocity_limits or np.isinf(self.options.velocity_limit_activation_fraction):
-            return "Without joint velocity-limit rows the tiers share the serial sweep's fixed point."
-        if self.laws.velocity_limit_sweep_law()[0] == "accumulated":
-            return (
-                "Both accumulate joint velocity-limit rows, so the tiers share the serial sweep's fixed point; the "
-                "worlds they decline keep that sweep."
-            )
-        return (
-            "The tiers accumulate joint velocity-limit rows; the worlds they decline keep the serial sweep, which "
-            "clamps them statelessly (routes.velocity_limits.law), so the two fixed points differ wherever a limit "
-            "binds."
+            "one isotropic step per pair, the serial pair solve's friction law."
         )
 
     def _parallel_velocity_limit_pass(self) -> bool:

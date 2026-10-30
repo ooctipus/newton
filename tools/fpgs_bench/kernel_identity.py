@@ -465,8 +465,7 @@ def census_calls():
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
     local owners plain and over packet rows, sparse diagonal, parallel and
-    keyed parallel tiers. Every factory that takes a velocity-limit
-    law is crossed with both laws, and the matrix-free Gauss-Seidel sweep with
+    keyed parallel tiers. The matrix-free Gauss-Seidel sweep is crossed with
     resident row metadata.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
@@ -479,9 +478,7 @@ def census_calls():
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS  # noqa: PLC0415
 
-    laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     mf_gs = (
         _axis("shared_metadata", (True, False)),
         _axis("stream_mf_impulses"),
@@ -492,7 +489,6 @@ def census_calls():
         _axis("skip_tier_rows", (0, 32)),
         _axis("independent_components"),
         _axis("resident_row_metadata"),
-        laws,
     )
     local = (
         _axis("paired_dof_count", (0, 6)),
@@ -523,7 +519,6 @@ def census_calls():
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
-                laws,
             ),
         ),
         (
