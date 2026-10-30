@@ -59,6 +59,18 @@ def vert_a(vert: Vert) -> wp.vec3:
     return vert.B + vert.BtoA
 
 
+@wp.func
+def portal_sliver(a: wp.vec3, b: wp.vec3, c: wp.vec3, extend: float) -> bool:
+    """Whether the portal ``(a, b, c)`` (Minkowski points) is a sliver: its height, twice its area over its longest
+    edge, within the support points' own spread (the inflate ``extend`` on either side) and the float32 rounding of
+    its longest edge (:data:`PORTAL_HEIGHT_RTOL`)."""
+    ab = b - a
+    ac = c - a
+    longest_sq = wp.max(wp.length_sq(ab), wp.max(wp.length_sq(ac), wp.length_sq(c - b)))
+    height = 2.0 * extend + PORTAL_HEIGHT_RTOL * wp.sqrt(longest_sq)
+    return wp.length_sq(wp.cross(ab, ac)) < height * height * longest_sq
+
+
 def create_support_map_function(support_func: Any, use_precomputed_center: bool = False):
     """
     Factory function to create support mapping functions for MPR algorithm.
@@ -338,14 +350,16 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
         # Phase Two: Refine the portal. A portal whose height (twice its area over its longest edge) is within the
         # support points' own spread, the inflate on either side and float32 rounding, is a sliver: its vertices lie
-        # on one edge of the Minkowski difference, which they do not orient. The refinement never ends on one; it
-        # returns its last well-formed portal instead, which still holds the origin's ray.
+        # on one edge of the Minkowski difference, which they do not orient. The refinement never ends on one: where
+        # it steps from a well-formed portal that holds the origin's ray into a sliver, it keeps that portal's result
+        # (normal, depth and witnesses, not its vertices) and returns it if it ends on a sliver.
         v4 = Vert()
-        good1 = v1
-        good2 = v2
-        good3 = v3
-        good_penetration = float(0.0)
-        have_good = bool(False)
+        sliver = portal_sliver(v1.BtoA, v2.BtoA, v3.BtoA, extend)
+        kept = bool(False)
+        kept_normal = wp.vec3(0.0)
+        kept_point_a = wp.vec3(0.0)
+        kept_point_b = wp.vec3(0.0)
+        kept_penetration = float(0.0)
         while True:
             phase2 += 1
 
@@ -360,10 +374,6 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             if normal_sq < NUMERIC_EPSILON * NUMERIC_EPSILON:
                 return False, point_a, point_b, normal, penetration
 
-            longest_sq = wp.max(wp.length_sq(temp1), wp.max(wp.length_sq(temp2), wp.length_sq(v3.BtoA - v2.BtoA)))
-            height = 2.0 * extend + PORTAL_HEIGHT_RTOL * wp.sqrt(longest_sq)
-            sliver = normal_sq < height * height * longest_sq
-
             if not hit:
                 # Compute distance from origin to wedge face
                 d = wp.dot(normal, v1.BtoA)
@@ -376,21 +386,34 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             delta = wp.dot(temp3, normal)
             penetration = wp.dot(v4.BtoA, normal)
 
-            # If the origin is on the surface of the wedge, return a hit
-            if (
+            # Determine what region of the wedge the origin is in: the vertex v4 replaces, and whether the portal
+            # it makes is a sliver.
+            side = wp.cross(v4.BtoA, v0.BtoA)
+            replace = int(1)
+            if wp.dot(side, v1.BtoA) >= 0.0:
+                # Origin is outside of (v4.V(),v0.V(),v1.V())
+                if wp.dot(side, v2.BtoA) < 0.0:
+                    replace = 3
+            elif wp.dot(side, v3.BtoA) >= 0.0:
+                # Origin is outside of (v4.V(),v0.V(),v2.V())
+                replace = 2
+            next_sliver = portal_sliver(
+                wp.where(replace == 1, v4.BtoA, v1.BtoA),
+                wp.where(replace == 2, v4.BtoA, v2.BtoA),
+                wp.where(replace == 3, v4.BtoA, v3.BtoA),
+                extend,
+            )
+
+            # If the origin is on the surface of the wedge, return a hit; one that ends on a sliver returns the result
+            # kept from the last well-formed portal.
+            ends = (
                 delta * delta <= COLLIDE_EPSILON * COLLIDE_EPSILON * normal_sq
                 or penetration <= 0.0
                 or phase2 > MAX_ITER
-            ):
-                if sliver and have_good:
-                    v1 = good1
-                    v2 = good2
-                    v3 = good3
-                    temp1 = v2.BtoA - v1.BtoA
-                    temp2 = v3.BtoA - v1.BtoA
-                    normal = wp.cross(temp1, temp2)
-                    normal_sq = wp.length_sq(normal)
-                    penetration = good_penetration
+            )
+            if ends and sliver and kept:
+                return True, kept_point_a, kept_point_b, kept_normal, kept_penetration
+            if ends or (hit and next_sliver and not sliver):
                 if hit:
                     inv_normal = 1.0 / wp.sqrt(normal_sq)
                     penetration *= inv_normal
@@ -406,33 +429,22 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     point_a = alpha * vert_a(v1) + beta * vert_a(v2) + gamma * vert_a(v3)
                     point_b = alpha * v1.B + beta * v2.B + gamma * v3.B
 
-                return hit, point_a, point_b, normal, penetration
+                if ends:
+                    return hit, point_a, point_b, normal, penetration
+                # The step into a sliver: keep this portal's result and refine on.
+                kept = True
+                kept_normal = normal
+                kept_point_a = point_a
+                kept_point_b = point_b
+                kept_penetration = penetration
 
-            if hit and not sliver:
-                good1 = v1
-                good2 = v2
-                good3 = v3
-                good_penetration = penetration
-                have_good = True
-
-            # Determine what region of the wedge the origin is in
-            temp1 = wp.cross(v4.BtoA, v0.BtoA)
-            dot = wp.dot(temp1, v1.BtoA)
-
-            if dot >= 0.0:
-                # Origin is outside of (v4.V(),v0.V(),v1.V())
-                dot = wp.dot(temp1, v2.BtoA)
-                if dot >= 0.0:
-                    v1 = v4
-                else:
-                    v3 = v4
+            if replace == 1:
+                v1 = v4
+            elif replace == 2:
+                v2 = v4
             else:
-                # Origin is outside of (v4.V(),v0.V(),v2.V())
-                dot = wp.dot(temp1, v3.BtoA)
-                if dot >= 0.0:
-                    v2 = v4
-                else:
-                    v1 = v4
+                v3 = v4
+            sliver = next_sliver
 
     @wp.func
     def solve_mpr(

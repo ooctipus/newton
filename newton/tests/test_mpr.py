@@ -266,6 +266,79 @@ class TestMPRPortalSliver(unittest.TestCase):
         self.assertAlmostEqual(float(penetrations[0]), 2.1e-4, delta=5.0e-5)
 
 
+def _box_overlap(positions, orientations, half_extent):
+    """The exact overlap of two cubes of ``half_extent`` (B at ``positions``, ``orientations`` in A's frame) in
+    float64: per pose the smallest overlap over the 15 separating axes and its unit axis, from A towards B."""
+    x, y, z, w = (orientations[:, k].astype(np.float64) for k in range(4))
+    rotation = np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=1),
+            np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=1),
+            np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=1),
+        ],
+        axis=1,
+    )
+    positions = positions.astype(np.float64)
+    count = len(positions)
+    faces = [np.tile(np.eye(3)[i], (count, 1)) for i in range(3)]
+    axes = faces + [rotation[:, :, j] for j in range(3)]
+    axes += [np.cross(faces[i], rotation[:, :, j]) for i in range(3) for j in range(3)]
+    depth, normal = np.full(count, np.inf), np.zeros((count, 3))
+    for axis in axes:
+        length = np.linalg.norm(axis, axis=1)
+        valid = length > 1.0e-6
+        unit = axis / np.where(valid, length, 1.0)[:, None]
+        center = np.einsum("ni,ni->n", unit, positions)
+        radii = np.abs(unit).sum(axis=1) + np.abs(np.einsum("ni,nij->nj", unit, rotation)).sum(axis=1)
+        overlap = half_extent * radii - np.abs(center)
+        smaller = valid & (overlap < depth)
+        depth = np.where(smaller, overlap, depth)
+        normal = np.where(smaller[:, None], unit * np.where(center < 0.0, -1.0, 1.0)[:, None], normal)
+    return depth, normal
+
+
+class TestMPRStackedCubes(unittest.TestCase):
+    """MPR on stacked, nearly aligned cubes, inflated as the narrow phase inflates them, against their exact overlap."""
+
+    def test_nearly_aligned_stacks_hold_the_face_normal(self):
+        """Stack two 0.1 m cubes on a random face of the lower one, nearly centred (lateral offsets 1e-9..1e-6 m) and
+        turned 1e-7..1e-5 rad about random axes, 0..1.5e-4 m into each other, inflated by 1e-4 m: the regime where the
+        support points of one corner differ by the inflate and the portal can collapse onto an edge. Each contact holds
+        the exact face normal within 0.1 degree and the exact overlap plus the inflate within the inflate; a sliver
+        portal tilted the normal 18 degrees with a 0.031 m depth in 12 of these 40000 poses."""
+        rng = np.random.default_rng(3)
+        count, half_extent, inflate = 40000, 0.05, 1.0e-4
+        axis = rng.normal(size=(count, 3))
+        axis /= np.linalg.norm(axis, axis=1, keepdims=True)
+        angle = 10.0 ** rng.uniform(-7.0, -5.0, count)
+        orientations = np.column_stack([axis * np.sin(0.5 * angle)[:, None], np.cos(0.5 * angle)])
+        stacked = np.column_stack(
+            [
+                10.0 ** rng.uniform(-9.0, -6.0, (count, 2)) * np.where(rng.random((count, 2)) < 0.5, -1.0, 1.0),
+                2.0 * half_extent - rng.uniform(0.0, 1.5e-4, count),
+            ]
+        )
+        # Onto a random face of the lower cube: the stacking axis and its sign.
+        face = rng.integers(0, 6, count)
+        positions = np.zeros_like(stacked)
+        for k in range(count):
+            stack_axis = face[k] // 2
+            positions[k, [(stack_axis + 1) % 3, (stack_axis + 2) % 3, stack_axis]] = stacked[k]
+            positions[k, stack_axis] *= 1.0 if face[k] % 2 == 0 else -1.0
+
+        collision, _points_a, _points_b, normals, penetrations = _run_box_mpr(
+            positions, orientations, half_extent=half_extent, extend=inflate
+        )
+        depth, normal = _box_overlap(positions.astype(np.float32), orientations.astype(np.float32), half_extent)
+
+        np.testing.assert_array_equal(collision, np.ones(count, dtype=np.int32))
+        cosine = np.einsum("ni,ni->n", normals.astype(np.float64), normal)
+        self.assertGreater(float(cosine.min()), np.cos(np.radians(0.1)), f"pose {int(np.argmin(cosine))}")
+        excess = penetrations - (depth + inflate)
+        self.assertLess(float(excess.max()), inflate, f"pose {int(np.argmax(excess))}")
+        self.assertGreater(float(excess.min()), -1.0e-6, f"pose {int(np.argmin(excess))}")
+
+
 class TestMPRTriangleInitialization(unittest.TestCase):
     """Cover triangle MPR initialization across disparate geometry scales."""
 
