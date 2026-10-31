@@ -7,6 +7,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
+from newton.tests.feather_pgs_law_harness import row_velocity
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "contact batch screening requires CUDA")
@@ -70,11 +71,12 @@ class TestWideContactBatches(unittest.TestCase):
         limit_active = np.zeros((worlds, dofs), np.int32)
         limit_active[-1, width] = 1
         lower_rhs = np.zeros((worlds, dofs), np.float32)
-        lower_rhs[-1, width] = -0.05
+        lower_rhs[-1, width] = -0.05 + velocity[-1, width]
         host = [
             row_counts,
             np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs),
             rhs,
+            row_velocity(jacobian, velocity),
             diagonal,
             impulses,
             types,
@@ -114,8 +116,8 @@ class TestWideContactBatches(unittest.TestCase):
             kernel = sparse_diagonal_kernel(
                 capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
             )
-            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:26], outputs=arrays[26:], block_dim=32, device=device)
-            results.append([arrays[i].numpy() for i in (4, 26, 27, 28)])
+            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:27], outputs=arrays[27:], block_dim=32, device=device)
+            results.append([arrays[i].numpy() for i in (5, 27, 28, 29)])
         for reference, candidate in zip(*results, strict=True):
             np.testing.assert_allclose(candidate, reference, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_array_equal(results[1][0][0, : row_counts[0]], 0.0)

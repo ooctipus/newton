@@ -357,8 +357,6 @@ def _dense_build_calls():
     # and the bilateral projection.
     for sizes in ((6,), (6, 9), (18,), (6, 106)):
         yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
-    yield "packed_rows.apply_kernel", packed_rows.apply_kernel.__wrapped__, (), {}
-    yield "packed_rows.project_kernel", packed_rows.project_kernel.__wrapped__, (8,), {}
     from newton._src.solvers.feather_pgs import response_builds_rows  # noqa: PLC0415
 
     # The bilateral elimination of blocks of up to eight rows: its setup, correction and projection weights.

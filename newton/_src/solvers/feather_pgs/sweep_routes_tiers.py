@@ -220,7 +220,7 @@ def parallel_source(
 {jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows))}
 
 {last_word}
-{op.publish(indent="    ", applied=lambda row: f"s_x[{row}] - s_lam0[{row}]")}
+{op.publish(indent="    ", applied=lambda row: f"s_x[{row}]")}
 {store.stores()}
     // The world queue's next world restages the shared rows: every lane has read this world's.
     SYNC();

@@ -4,13 +4,12 @@
 """Build the row responses of the free-body and factor-row representations, and publish their velocities.
 
 A :class:`.response_operator.ResponseOperator` owns the arithmetic a sweep runs on a row's response. Its *build*
-forms that response from the row's Jacobian and the mass operator, and its *publication* turns the impulses a solve
-applied into velocities outside the sweeps. This module holds the builds and publications of four representations:
+forms that response from the row's Jacobian and the mass operator. This module holds the builds of four
+representations, and the publication of the one whose sweep leaves its velocity change outside the kernel:
 
 - :class:`.response_operator.FreeBodyZ` (rows over at most two free bodies): each row whitened per body, ``Z =
-  L^-1 J^T`` through the body's held factor, and ``1 / A_ii``, the rows' body coordinates in each addressing a
-  mapping reads (a world's local body slots, world and global coordinates, the packed row word), and the
-  publication ``v += L^-T sum Z lambda`` of a world's impulses;
+  L^-1 J^T`` through the body's held factor, and ``1 / A_ii``, and the rows' body coordinates in each addressing a
+  mapping reads (a world's local body slots, world and global coordinates, the packed row word);
 - :class:`.response_operator.SparsePairZ` (a compact dense articulation plus two scalar coordinates): a row's dense
   part whitened through the compact factor, its two sparse slots ``J / sqrt(m)`` merged when they share a coordinate,
   and its diagonal ``|Z|^2 + cfm``;
@@ -74,7 +73,6 @@ from .kernels import (
     BodyFactors,
     block_kit,
     dense_index,
-    factor_leave,
     factor_whiten,
     free_body_factor,
     pivoted_cholesky,
@@ -107,7 +105,7 @@ from .sparse_row_projection import _sparse_contact_projection_source
 # entries each. A free body is a one-node tree whose mass matrix ``H = L L^T`` the dynamics factor (its held factor,
 # armature included: :class:`.kernels.BodyFactors`), and its rows are whitened: the writers store each side's ``J``
 # and the build replaces it with ``Z = L^-1 J^T``, so ``A_ii = cfm + |Z_a|^2 + |Z_b|^2`` and the sweeps hold the
-# bodies' velocities in factor coordinates ``u = L^T v``. A body's six velocity coordinates start at its
+# change of the bodies' velocities in factor coordinates ``u = L^T dv``. A body's six velocity coordinates start at its
 # articulation's first coordinate, in the addressing the mapping reads: global (``articulation_dof_start``) or world
 # (``articulation_world_dof_offset``).
 
@@ -236,41 +234,6 @@ def free_body_row_rhs(
     return rhs, row_w
 
 
-@wp.func
-def free_body_publish(
-    world: int,
-    body: int,
-    count: int,
-    body_a: wp.array2d[int],
-    body_b: wp.array2d[int],
-    Z_a: wp.array3d[float],
-    Z_b: wp.array3d[float],
-    row_type: wp.array2d[int],
-    impulses: wp.array2d[float],
-):
-    """``sum_i Z_i lambda_i`` on ``body`` in factor coordinates, and whether any of the world's rows holds the body: the
-    rows in order, each nonzero impulse times the row's entries on that body (side ``a``, then ``b``), from zero. Speed
-    rows carry no ``Z``."""
-    delta = wp.spatial_vector()
-    held = bool(False)
-    for i in range(count):
-        on_a = body_a[world, i] == body
-        on_b = body_b[world, i] == body
-        if not (on_a or on_b):
-            continue
-        held = True
-        impulse = impulses[world, i]
-        if impulse == 0.0 or row_type[world, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-            continue
-        if on_a:
-            for k in range(6):
-                delta[k] += Z_a[world, i, k] * impulse
-        if on_b:
-            for k in range(6):
-                delta[k] += Z_b[world, i, k] * impulse
-    return delta, held
-
-
 @wp.kernel(enable_backward=False)
 def free_body_rows_kernel(
     mf: MfRows,
@@ -294,9 +257,10 @@ def free_body_rows_kernel(
 ):
     """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
 
-    One thread per row slot (``world * mf_max_constraints + row``). A restitutive contact first stores its incident
-    velocity ``J v_hat`` from the writers' ``J``. ``weighted`` rows store their relative regularization weight; a
-    material contact (``material``: its writer stored its rhs and compliance ``eps``) keeps its rhs.
+    One thread per row slot (``world * mf_max_constraints + row``). A row first stores its incident velocity
+    ``J v_hat`` from the writers' ``J`` (a speed row, which carries no ``J``, zero). ``weighted`` rows store their
+    relative regularization weight; a material contact (``material``: its writer stored its rhs and compliance
+    ``eps``) keeps its rhs.
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
@@ -308,7 +272,7 @@ def free_body_rows_kernel(
     row_type = mf.row_type[world, i]
     restitution = mf.restitution[world, i]
     incident = float(0.0)
-    if row_type == PGS_CONSTRAINT_TYPE_CONTACT and restitution > 0.0:
+    if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         incident = free_body_jacobian_velocity(
             mf.Z_a,
             mf.Z_b,
@@ -320,7 +284,7 @@ def free_body_rows_kernel(
             factors.dof_start,
             incident_velocity,
         )
-        mf.incident[world, i] = incident
+    mf.incident[world, i] = incident
     mf_eff_mass_inv[world, i] = free_body_response(mf.Z_a, mf.Z_b, world, i, body_a, body_b, row_type, factors, pgs_cfm)
     if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         if mf.eps[world, i] > 0.0:
@@ -370,59 +334,13 @@ def free_body_coordinates_kernel(
     mf_dof_b[world, c] = body_coordinate(mf_body_b[world, c], body_to_articulation, articulation_world_dof_offset)
 
 
-@wp.kernel(enable_backward=False)
-def free_body_publish_kernel(
-    publish_body: wp.array[int],
-    publish_world: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_constraint_count: wp.array[int],
-    mf_Z_a: wp.array3d[float],
-    mf_Z_b: wp.array3d[float],
-    mf_row_type: wp.array2d[int],
-    mf_impulses: wp.array2d[float],
-    factors: BodyFactors,
-    # in/out
-    velocity: wp.array[float],
-):
-    """Publish the velocity change of a world's impulses onto ``velocity``: ``v += L^-T sum_i Z_i lambda_i`` per body
-    (:func:`free_body_publish`, then the body's factor).
-
-    One thread per free rigid body of the model (``publish_body``, in its world ``publish_world``), so every body a
-    world's rows hold is published, however many there are. The change is added to the velocity: a warm start installs
-    its impulses' velocity so the velocity and the impulses share one state. A body no row holds is left untouched.
-    """
-    tid = wp.tid()
-    body = publish_body[tid]
-    world = publish_world[tid]
-    if world < 0:
-        return
-    sums, held = free_body_publish(
-        world,
-        body,
-        mf_constraint_count[world],
-        mf_body_a,
-        mf_body_b,
-        mf_Z_a,
-        mf_Z_b,
-        mf_row_type,
-        mf_impulses,
-    )
-    if not held:
-        return
-    first = body_coordinate(body, factors.body_to_articulation, factors.dof_start)
-    delta = factor_leave(factors.L, free_body_factor(body, factors), sums)
-    for k in range(6):
-        velocity[first + k] += delta[k]
-
-
 @cache
 def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kernel:
     """Pack each world's free-body rows into the 128-bit word the matrix-free sweeps load (:meth:`.FreeBodyZ.pack`).
 
     A warp per world (``wp.launch_tiled`` over the worlds, 32 threads; one thread on the CPU), a lane per row; the
-    word holds the rows' world coordinates, stored inverse diagonal, right-hand side, type and parent. ``device_arch``
-    keys the variant.
+    word holds the rows' world coordinates, stored inverse diagonal, right-hand side (the law's plus the row's incident
+    velocity: its residual at ``du = 0``), type and parent. ``device_arch`` keys the variant.
     """
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
@@ -434,7 +352,7 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
         int da = mf_dof_a.data[off_mf + i];
         int db = mf_dof_b.data[off_mf + i];
         float diag = mf_eff_mass_inv.data[off_mf + i];
-        float rhs_val = mf_rhs.data[off_mf + i];
+        float rhs_val = mf_rhs.data[off_mf + i] + mf_row_incident.data[off_mf + i];
         int rt = mf_row_type.data[off_mf + i];
         int par = mf_row_parent.data[off_mf + i];
 
@@ -450,6 +368,7 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
             ("mf_dof_b", wp.array2d[int]),
             ("mf_eff_mass_inv", wp.array2d[float]),
             ("mf_rhs", wp.array2d[float]),
+            ("mf_row_incident", wp.array2d[float]),
             ("mf_row_type", wp.array2d[int]),
             ("mf_row_parent", wp.array2d[int]),
             ("mf_meta", wp.array2d[int]),
@@ -463,27 +382,22 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
 
 @dataclasses.dataclass(frozen=True)
 class FreeBodyZBuild:
-    """The build and publication of free-body rows (:class:`.response_operator.FreeBodyZ`).
+    """The build of free-body rows (:class:`.response_operator.FreeBodyZ`).
 
     Attributes:
         rows: Each row's whitened entries, stored inverse diagonal, incident velocity and ``rhs``
             (:func:`free_body_rows_kernel`).
         coordinates: Each row's bodies' first world coordinates (:func:`free_body_coordinates_kernel`).
         meta: The factory of the row-word pack (:func:`free_body_meta_kernel`).
-        publish: The velocity change of a world's impulses (:func:`free_body_publish_kernel`).
     """
 
     rows: wp.Kernel
     coordinates: wp.Kernel
     meta: Callable[[int, str], wp.Kernel]
-    publish: wp.Kernel
 
 
 FREE_BODY_Z = FreeBodyZBuild(
-    rows=free_body_rows_kernel,
-    coordinates=free_body_coordinates_kernel,
-    meta=free_body_meta_kernel,
-    publish=free_body_publish_kernel,
+    rows=free_body_rows_kernel, coordinates=free_body_coordinates_kernel, meta=free_body_meta_kernel
 )
 """The free-body rows' build (:meth:`.FreeBodyZ.build`)."""
 
@@ -910,10 +824,12 @@ SPARSE_PAIR = SparsePairBuild(
 # - correct: every other row's side on the articulation becomes ``Pi Z_i = Z_i - Z_B y_i`` (``y_i = G^-1 Z_B^T Z_i``),
 #   its diagonal ``|Pi Z_i|^2 + cfm`` (the closed-loop effective mass); its right-hand side takes back
 #   ``y_i^T b_B``;
-# - project: the velocity, once, ``v -= P^T L^-T Z_B G^-1 (J_B v + b_B)``, after every warm-start install.
+# - project: the velocity change starts at ``du = -Z_B y`` with ``y = G^-1 (J_B v_hat + b_B)``, the block rows' impulses
+#   at ``-y`` (the sweeps' seed, :func:`.sweep.impulse_seed`).
 #
-# Then ``Z_B^T u = -b_B`` and a sweep's impulse, ``u += Pi Z_i delta``, keeps it, so a corrected row reads ``(Pi
-# Z_i)^T u = J_i v + y_i^T b_B``, which its folded right-hand side takes back. ``Pi`` is idempotent, so the contacts
+# Then ``Z_B^T (u_hat + du) = -b_B`` and a sweep's impulse, ``du += Pi Z_i delta``, keeps it. A corrected row's residual
+# at zero change is ``(Pi Z_i)^T u_hat`` and its right-hand side, which the transform folds: its ``J_i v_hat + b_i``
+# less ``y_i^T (J_B v_hat + b_B)``. ``Pi`` is idempotent, so the contacts
 # solve on the closed-loop Delassus ``Z^T Pi Z`` exactly (no compliance). The block's rows keep their entries and stay
 # in the sweep: they hold in exact arithmetic, and their visits absorb the corrected rows' float32 leakage, without
 # which collinear contact rows of a jammed loop drift in their null space and never meet the exit law.
@@ -995,8 +911,7 @@ class BilateralElimination:
         rows: The block capacity: the model's largest block (an articulation's mimic rows plus three per closure).
         setup: Select, form and factor each articulation's block with pivoting.
         correct: Correct the other rows and their right-hand sides and diagonals, once the right-hand sides are final.
-        weights: The projection's block weights, once the velocity holds the predictor and every warm start;
-            :func:`.packed_rows.project_kernel` applies them.
+        weights: The projection: the block rows' impulses ``-y``, which the sweep seeds.
     """
 
     rows: int
@@ -1098,13 +1013,15 @@ def elimination(rows: int) -> BilateralElimination:
         constraint_count: wp.array[int],
         local_solve_owner: wp.array[int],
         world_row_cfm: wp.array2d[float],
+        world_incident: wp.array2d[float],
         # outputs
         packed_Z: wp.array3d[float],
         world_rhs: wp.array2d[float],
         world_diag: wp.array2d[float],
     ):
         # Correct every other row's sides on the blocks' articulations, Pi Z_i = Z_i - Z_B y_i with
-        # y_i = G^-1 Z_B^T Z_i, take y_i^T b_B back from its right-hand side and store its diagonal |Pi Z_i|^2 + cfm
+        # y_i = G^-1 Z_B^T Z_i, take y_i^T (J_B v_hat + b_B) back from its right-hand side and store its diagonal
+        # |Pi Z_i|^2 + cfm
         # (the squares summed in entry order, the padding's zeros included; in the worlds the general solver owns).
         # One thread per world row, after the right-hand sides are final. A side the block does not see
         # (Z_B^T Z_i exactly zero) keeps its entries; the block's rows, kept or dropped, keep theirs.
@@ -1149,7 +1066,8 @@ def elimination(rows: int) -> BilateralElimination:
                 packed_Z[world, row, first + e] -= acc
             fold = float(0.0)
             for p in range(m):
-                fold += y[p] * world_rhs[world, preelim.slots[base + p]]
+                block_row = preelim.slots[base + p]
+                fold += y[p] * (world_rhs[world, block_row] + world_incident[world, block_row])
             world_rhs[world, row] -= fold
             corrected = 1
         if corrected != 0 and local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
@@ -1163,16 +1081,13 @@ def elimination(rows: int) -> BilateralElimination:
         preelim: Preelim,
         group_to_art: wp.array[int],
         art_to_world: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        dense: int,
-        packed_J: wp.array3d[float],
         world_rhs: wp.array2d[float],
-        velocity: wp.array[float],
-        n_dofs: int,
+        world_incident: wp.array2d[float],
+        # outputs
+        world_impulses: wp.array2d[float],
     ):
-        # The projection's block weights y = G^-1 (J_B v + b_B) over the kept rows (preelim.weight), one thread per
-        # articulation of the size group; packed_rows.project_kernel then applies -Z_B y.
+        # The projection's block weights y = G^-1 (J_B v_hat + b_B) over the kept rows, one thread per articulation of
+        # the size group, as the block rows' impulses -y.
         group = wp.tid()
         art = group_to_art[group]
         pe = preelim.art_to_preelim[art]
@@ -1183,18 +1098,13 @@ def elimination(rows: int) -> BilateralElimination:
             return
         base = pe * wp.static(rows)
         world = art_to_world[art]
-        start = articulation_dof_start[art]
-        first = wp.where(dense != 0, articulation_world_dof_offset[art], 0)
         r = vec()
         for p in range(m):
             slot = preelim.slots[base + p]
-            acc = world_rhs[world, slot]
-            for e in range(n_dofs):
-                acc += packed_J[world, slot, first + e] * velocity[start + e]
-            r[p] = acc
+            r[p] = world_rhs[world, slot] + world_incident[world, slot]
         y = block_solve(m, preelim.LS, pe * wp.static(rows * rows), r)
         for p in range(m):
-            preelim.weight[base + p] = y[p]
+            world_impulses[world, preelim.slots[base + p]] = -y[p]
 
     return BilateralElimination(
         rows,

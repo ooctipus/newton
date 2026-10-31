@@ -7,12 +7,12 @@ Every kernel's working set fits the static budget of the device it is built for 
 
 - :func:`local_owned_kernel`: one lane group (8, 16 or 32 lanes) per candidate articulation, or articulation and
   free body, with several groups per block. The group stages the factors and rows, whitens each row in the kernel
-  and solves the rows over the packed Gram block ``A = Z^T Z`` (:class:`.response_operator.LocalBlock`) in factor
-  coordinates, its residuals maintained and the velocity committed after the sweeps. The residual owner's free-body
-  rows follow the dense rows in the block.
+  and solves the rows over the packed Gram block ``A = Z^T Z`` (:class:`.response_operator.LocalBlock`), its residuals
+  maintained and the velocity change committed after the sweeps. The residual owner's free-body rows follow the dense
+  rows in the block.
 - :func:`paired_factor_kernel`: one warp per world of an articulation and a free body, rows in factor coordinates
-  (:class:`.response_operator.FactorRows`), the velocity mapped in and out per component, under one of three
-  schedules: row by row, contact triples after a prefix, or contact units.
+  (:class:`.response_operator.FactorRows`) on the velocity change from the predictor, which leaves per component,
+  under one of three schedules: row by row, contact triples after a prefix, or contact units.
 """
 
 from __future__ import annotations
@@ -180,12 +180,12 @@ def local_owned_source(
     for the residual owner, its free-body rows) over the response block the lane group builds in the kernel. Under
     ``torsion`` a friction pair solves with its contact's spin row (the friction triple).
 
-    The group stages the factors, the rows' impulses, right-hand sides and metadata and the velocity, which enters
-    factor coordinates; whitens each row, ``Z = L^-1 P J^T``, from its Jacobian (``row_inputs``' packets, or the
-    group's ``J``); stores the effective diagonal ``|Z|^2 + cfm`` back to ``world_diag`` and stages its inverse;
-    builds the Gram block and the residuals (:class:`.LocalBlock`); then runs the sweeps with the shared row law, the
-    dense rows in slot order and then the free-body rows, commits the velocity, which leaves factor coordinates, and
-    the impulses of the rows with a Jacobian.
+    The group stages the factors, the rows' impulses, right-hand sides and metadata and the predictor; takes each
+    row's incident velocity ``J v_hat`` into its right-hand side and whitens it, ``Z = L^-1 P J^T``, from its Jacobian
+    (``row_inputs``' packets, or the world's packed rows); stores the effective diagonal ``|Z|^2 + cfm`` back to
+    ``world_diag`` and stages its inverse; builds the Gram block and the residuals (:class:`.LocalBlock`); then runs
+    the sweeps with the shared row law, the dense rows in slot order and then the free-body rows, commits the velocity
+    change, which leaves factor coordinates and adds to the predictor, and the impulses of the rows with a Jacobian.
 
     Returns the body and its staging.
     """
@@ -294,13 +294,12 @@ def local_owned_source(
         s_v[d] = v_out.data[dof];
     }}
     SYNC();
-    // The velocity enters factor coordinates, u = L^T P v, a lane per coordinate.
-{op.enter("    ")}
-    SYNC();
 
-    // Each row whitened, Z = L^-1 P J^T, its effective diagonal |Z|^2 + cfm (stored back) and its inverse.
+    // Each row's incident velocity and whitened row, Z = L^-1 P J^T, its effective diagonal |Z|^2 + cfm (stored back)
+    // and its inverse.
     for (int row = lane; row < row_count; row += {L}) {{
 {sides}{op.respond(reads, "        ")}
+        s_rhs[row] += incident;
         s_active[row] = active;
         const float effective_diagonal = row_diagonal + world_diag.data[world_row_base + row];
         s_inv_diag[row] = effective_diagonal > 0.0f ? 1.0f / effective_diagonal : 0.0f;
@@ -314,12 +313,12 @@ def local_owned_source(
 
 {op.commit("    ")}
     SYNC();
-    // The velocity leaves factor coordinates, v = P^T L^-T u, block by block.
+    // The velocity change leaves factor coordinates, dv = P^T L^-T u, block by block.
 {op.leave("    ")}
     SYNC();
     for (int d = lane; d < {T}; d += {L}) {{
         const int dof = {dof};
-        v_out.data[dof] = s_v[d];
+        v_out.data[dof] += s_v[d];
     }}
     for (int row = lane; row < row_count; row += {L}) {{
         if (s_active[row] != 0) world_impulses.data[world_row_base + row] = s_lam[row];
@@ -506,6 +505,7 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("dense_phase_bounds", wp.array2d[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
+    ("row_incident", wp.array2d[float]),
     ("world_diag", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
     ("factor_rows", wp.array3d[float]),
@@ -543,7 +543,8 @@ def paired_factor_source(
     material: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
-    free body (:class:`.FactorRows`), a warp per world, the factor velocity ``u = L^T v`` in a register per lane.
+    free body (:class:`.FactorRows`), a warp per world, the velocity change from the predictor, ``u = L^T dv``, from
+    zero in a register per lane.
     Under ``torsion`` every friction pair has its contact's spin row after it: a contact is four rows, and its unit
     solves the pair and the spin row as the friction triple.
 
@@ -614,13 +615,12 @@ def paired_factor_source(
         schedule = general
 
     world_rows = "if (m == 0 || world_mf_constraint_count.data[world] != 0) return;"
-    read = write = "global_dof >= 0"
+    write = "global_dof >= 0"
     if independent_components:
         world_rows = (
             "if (m == 0 || world_mf_constraint_count.data[world] > 0) return;\n"
             "    const bool split_component = world_mf_constraint_count.data[world] < 0;"
         )
-        read += f" && (!split_component || (lane >= primary_offset && lane < primary_offset + {P}))"
         write += f" && (!split_component || (primary_lane >= 0 && primary_lane < {P}))"
     layout = mu_load = ""
     if contact_triples:
@@ -656,14 +656,14 @@ def paired_factor_source(
 
     for (int i = lane; i < m; i += 32) {{
         s_lam[i] = world_impulses.data[off + i];
-        s_rhs[i] = rhs_bias.data[off + i];
+        s_rhs[i] = rhs_bias.data[off + i] + row_incident.data[off + i];
         s_diag[i] = world_diag.data[off + i];
         s_type[i] = static_cast<unsigned char>(world_row_type.data[off + i]);
     }}{mu_load}
-    // The velocity in factor coordinates, u = L^T v per component, coordinate LANE in this lane's register.
+    // The velocity change in factor coordinates per component, coordinate LANE in this lane's register.
     const int global_dof = lane < {D} ? world_dof_indices.data[dof_map_base + lane] : -1;
-    const float physical_velocity = {read} ? v_out.data[global_dof] : 0.0f;
-{op.enter("physical_velocity", "    ")}
+{chr(10).join(op.lanes_of("    "))}
+    float {op.velocity} = 0.0f;
     SYNC();
 
     for (int iter = 0; iter < iterations; ++iter) {{
@@ -671,9 +671,9 @@ def paired_factor_source(
 {indent(schedule, "        ")}
 {end_sweep(solve_policy, iteration="iter")}    }}
 
-    // Back to physical coordinates, v = L^-T u per component.
+    // Back to physical coordinates, dv = L^-T u per component.
 {op.leave("physical_output", "    ")}
-    if ({write}) v_out.data[global_dof] = physical_output;
+    if ({write}) v_out.data[global_dof] += physical_output;
     for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 {staging.undefine()}
 #endif

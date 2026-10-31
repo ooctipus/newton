@@ -138,8 +138,7 @@ MF_RECORDS = (
 )
 """Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
 by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity
-(``J v_hat`` of a restitutive contact, stored by the build), rhs, target and material compliance, by world and
-row."""
+(``J v_hat``, stored by the build), rhs, target and material compliance, by world and row."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 

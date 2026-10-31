@@ -75,8 +75,9 @@ class WorldRows:
     """A world's dense rows (``world_*`` arrays, ``capacity`` slots per world at ``off_dense``).
 
     Impulses are staged in ``s_lam_dense`` and owned by the row's first lane.
-    With ``shared_metadata`` the right-hand side, diagonal and friction
-    coefficient are staged too; otherwise
+    With ``shared_metadata`` the right-hand side (the law's bias plus the
+    row's incident velocity ``row_incident``: the row's residual at ``du = 0``),
+    diagonal and friction coefficient are staged too; otherwise
     they stream from their global arrays. ``packed_types`` keeps the row types
     and parents resident as one packed word per row (``s_meta_dense``: the type
     in the low bits, the parent plus one above); the end-of-sweep scans
@@ -100,11 +101,14 @@ class WorldRows:
         source = self.STAGED[name]
         return self.rhs if source == "rhs" else source
 
+    def _stored(self, name: str, row: str) -> str:
+        """Row ``row``'s value of the staged array ``name`` where it is stored."""
+        value = f"{self._source(name)}.data[off_dense + ({row})]"
+        return f"({value} + row_incident.data[off_dense + ({row})])" if name == "s_rhs_dense" else value
+
     def staged(self, name: str, row: str) -> str:
         """Row ``row``'s value of the staged array ``name`` (staged or streamed)."""
-        if self.shared_metadata:
-            return f"{name}[{row}]"
-        return f"{self._source(name)}.data[off_dense + ({row})]"
+        return f"{name}[{row}]" if self.shared_metadata else self._stored(name, row)
 
     def rhs_of(self, row: str) -> str:
         return self.staged("s_rhs_dense", row)
@@ -169,7 +173,7 @@ class WorldRows:
     def loads(self, row: str = "i") -> str:
         head, tail = self.staged_names()
         lines = [f"s_lam_dense[{row}] = world_impulses.data[off_dense + {row}];"]
-        lines += [f"{name}[{row}] = {self._source(name)}.data[off_dense + {row}];" for name in head]
+        lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in head]
         if self.packed_types:
             lines += [
                 f"int row_type = world_row_type.data[off_dense + {row}];",
@@ -177,7 +181,7 @@ class WorldRows:
                 f"s_meta_dense[{row}] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
                 f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
             ]
-        lines += [f"{name}[{row}] = {self._source(name)}.data[off_dense + {row}];" for name in tail]
+        lines += [f"{name}[{row}] = {self._stored(name, row)};" for name in tail]
         return "\n".join(lines)
 
 
@@ -1105,6 +1109,36 @@ def free_body_rows_block(
     )
 
 
+def impulse_seed(
+    count: str, impulse: str, kind: str, apply: str, sync: str, *, declare: tuple[str, ...] = (), pad: str = "    "
+) -> str:
+    """Give the velocity change the response of the impulses a sweep starts from, ``du = sum_i Z_i lambda_i``, row by
+    row in order, before the first sweep: the warm start's and the closed loop's. A velocity-limit row carries no
+    impulse into a sweep (and a free body's speed row no ``Z``). A row's lanes' updates never collide; ``sync``
+    serializes the rows.
+
+    Args:
+        count: The rows.
+        impulse: Row ``i``'s impulse.
+        kind: Row ``i``'s type.
+        apply: ``du += Z_i seed`` (the operator's ``apply_row``, indented for this block).
+        sync: The lanes' barrier after a row.
+        declare: Statements row ``i``'s ``apply`` needs.
+        pad: Indentation of the emitted statements.
+    """
+    lines = [
+        f"for (int i = 0; i < {count}; ++i) {{",
+        *(f"    {line}" for line in declare),
+        f"    const float seed = {impulse};",
+        f"    if (seed != 0.0f && {kind} != {VELOCITY_LIMIT}) {{",
+        apply,
+        "    }",
+        f"    {sync}",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # End-of-sweep passes: rows whose law gives them the last word of every sweep
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1277,7 +1311,7 @@ class JacobiRows:
     lanes, at most ``capacity`` rows).
 
     Staged per row: its impulse ``s_x``; the extrapolated impulse the next step
-    reads, ``s_y``; its warm start ``s_lam0``; its right-hand side ``s_rhs``
+    reads, ``s_y``; its right-hand side ``s_rhs``
     (once the operator has staged, the residual at zero impulse); its scaled
     step ``s_step``; its friction coefficient and parent; and its kind
     ``s_kind`` (:data:`JACOBI_UNILATERAL` and the others). ``s_x`` and ``s_y``
@@ -1309,7 +1343,7 @@ class JacobiRows:
         """The rows' state and metadata."""
         AM = self.capacity
         state = (Buffer("s_x", "float", AM, align=16), Buffer("s_y", "float", AM, align=16))
-        floats = (Buffer(name, "float", AM) for name in ("s_lam0", "s_rhs", "s_step", "s_mu"))
+        floats = (Buffer(name, "float", AM) for name in ("s_rhs", "s_step", "s_mu"))
         ints = ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ()), *(("s_type",) if self.types else ()))
         return (*state, *floats, *(Buffer(name, "int", AM) for name in ints))
 
@@ -1335,7 +1369,7 @@ class JacobiRows:
         lines = [
             f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{",
             "    const float l0 = world_impulses.data[off_dense + i];",
-            "    s_lam0[i] = l0; s_x[i] = l0; s_y[i] = l0;",
+            "    s_x[i] = l0; s_y[i] = l0;",
             f"    s_rhs[i] = {rhs};",
             f"    const int row_type = {row_type} & {_DENSE_META_ROW_TYPE_MASK};",
             f"    s_parent[i] = {parent};",

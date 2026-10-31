@@ -392,12 +392,14 @@ def prepare_fused_diagonal_joint_limits(
     activation_gap: float,
     pgs_beta: float,
     dt: float,
+    v_hat: wp.array[float],
     # outputs
     active_sides: wp.array2d[int],
     lower_rhs: wp.array2d[float],
     upper_rhs: wp.array2d[float],
 ):
-    """Prepare independent diagonal-articulation limit projections per world coordinate."""
+    """Prepare independent diagonal-articulation limit projections per world coordinate: each active side's
+    right-hand side and its incident velocity, ``+v_hat`` for the lower side's row and ``-v_hat`` for the upper's."""
     element = wp.tid()
     world = element // max_world_dofs
     local_dof = element - world * max_world_dofs
@@ -415,11 +417,11 @@ def prepare_fused_diagonal_joint_limits(
             inv_dt = 1.0 / dt
             lower_active, lower_phi, _lower_sign = joint_limit_side(q, lower, upper, 0, activation_gap)
             if lower_active:
-                rhs_lower = limit_rhs(lower_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0)
+                rhs_lower = limit_rhs(lower_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0) + v_hat[global_dof]
                 active |= 1
             upper_active, upper_phi, _upper_sign = joint_limit_side(q, lower, upper, 1, activation_gap)
             if upper_active:
-                rhs_upper = limit_rhs(upper_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0)
+                rhs_upper = limit_rhs(upper_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0) - v_hat[global_dof]
                 active |= 2
 
     active_sides[world, local_dof] = active
@@ -2293,9 +2295,9 @@ def clear_sparse_diagonal_response_prefix(
 # A free body is a one-node tree: its six velocity coordinates (its center-of-mass velocity, then its angular
 # velocity) have the 6x6 mass matrix ``H`` the dynamics factor leaf-first, ``P H P^T = L L^T`` with ``P`` the
 # coordinates reversed, armature included (``L_by_size[6]`` at its articulation's group index, lower, row-major). A
-# free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps hold the body's velocity in factor
-# coordinates ``u = L^T P v``: a row's velocity term is ``Z^T u``, its update ``u += Z dlambda``, and ``v = P^T L^-T
-# u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
+# free-body row is whitened, ``Z = L^-1 P J^T`` per body, and the sweeps hold the change of the body's velocity in
+# factor coordinates ``u = L^T P dv``: a row's velocity term is ``Z^T u``, its update ``u += Z dlambda``, and ``dv = P^T
+# L^-T u`` leaves them. Factor coordinate ``i`` of ``Z`` and ``u`` sits at position ``5 - i``, the physical coordinate it
 # reverses (:func:`.response_operator.leaf_first`). The factor's two actions below take
 # :class:`.response_operator.CholeskySolve`'s orders and its zero-diagonal convention (a zero pivot gives zero),
 # which the native sweeps emit.

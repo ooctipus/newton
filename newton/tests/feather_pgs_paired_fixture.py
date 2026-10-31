@@ -147,6 +147,7 @@ def solve_fixture(device):
         "dense_phase_bounds": array(np.array([[1, 1]] * 4 + [[0, 0]], np.int32)),
         "local_solve_owner": array(np.zeros(5, np.int32)),
         "world_dof_indices": array(np.arange(145, dtype=np.int32).reshape(5, 29)),
+        "row_incident": array(rng.normal(0, 0.2, (5, 8)).astype(np.float32)),
         "world_impulses": array(np.full((5, 8), 0.01, np.float32)),
         "mf_impulses": array(np.full((5, 6), 0.02, np.float32)),
         "world_row_w": array(np.ones((5, 8), np.float32)),

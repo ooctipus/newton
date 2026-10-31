@@ -128,8 +128,8 @@ CAPABILITIES = {
     "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits"),
     # Its runtime claim: independent articulation and free-body components per world.
     "components": ("cuda", "plain", "no_mimic", "no_connect"),
-    # The Jacobi tiers of dense trees beside a free body (case K4).
-    "tiers": ("cuda",),
+    # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
+    "tiers": ("cuda", "iterations"),
     # The keyed in-kernel row producer of the tiers.
     "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
     # The colored mapping of the free-body rows' contact units.

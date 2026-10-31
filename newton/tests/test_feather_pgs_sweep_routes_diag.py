@@ -70,8 +70,8 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
                 # The coupled rows: every lane stores what it computes; the warp synchronizes after the apply only.
                 self.assertIn("s_lam_dense[i] = new_impulse;", text)
                 self.assertNotIn("if (lane == 0) s_lam_dense", text)
-                # The dense articulation enters factor coordinates a lane per coordinate.
-                self.assertIn(f"if (lane < {dense}) s_v[dense_offset + ({dense}-1-(lane))] = entered_0;", text)
+                # The sweep runs on the velocity change from the predictor, and nothing enters factor coordinates.
+                self.assertIn(f"for (int d = lane; d < {dofs}; d += 32) s_v[d] = 0.0f;", text)
 
     def test_sparse_diagonal_schedules(self):
         triples, _ = routes.sparse_diagonal_source(32, 14, 6, contact_triples=True, speculative_contact_batches=True)
@@ -125,14 +125,13 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         # schedule solves the same rows by the same law (the CUDA twins compare the schedules bit for bit).
         marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
         self.assertLess(plain.index(marked), plain.index(loaded))
-        # The rows act in factor coordinates: the dense articulation enters (u = L^T P v) once after the velocity is
-        # staged and leaves once before it is written back; a diagonal coordinate scales by its m^-1/2.
+        # The rows act in factor coordinates on the velocity change: it leaves once before it adds to the predictor,
+        # a diagonal coordinate scaled by its m^-1/2.
         for text in (plain, triples, units):
-            self.assertIn("s_v[d] = diagonal_scale > 0.0f ? velocity / diagonal_scale : velocity;", text)
-            self.assertIn("v_out.data[global_dof] = diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
+            self.assertIn("rhs_bias.data[off_dense + (i)] + row_incident.data[off_dense + (i)]", text)
+            self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
             self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
-            self.assertLess(text.index("u = L^T P v"), text.index("for (int iteration = 0;"))
-            self.assertLess(text.index("for (int iteration = 0;"), text.index("v = P^T L^-T u"))
+            self.assertLess(text.index("for (int iteration = 0;"), text.index("dv = P^T L^-T u"))
 
 
 class TestSweepRoutesDiagOperators(unittest.TestCase):

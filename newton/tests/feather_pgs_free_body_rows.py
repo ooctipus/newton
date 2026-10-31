@@ -58,8 +58,8 @@ def sweep_free_body_rows(
 
     The body has a unit mass factor, so its rows' whitened entries ``Z`` (``[row, 6]``) act on its velocity directly
     and the rows' Delassus block is ``Z Z^T``; each row stores the inverse of its diagonal ``|Z_i|^2`` (zero for an
-    empty row). The sweep starts from ``impulses`` (zero by default) with the velocity ``Z^T impulses`` they publish,
-    so a row's residual is ``(Z Z^T impulses)_i + rhs_i``. ``weights`` are the rows' regularization weights
+    empty row). The sweep starts from ``impulses`` (zero by default), seeded with their velocity change ``Z^T
+    impulses``, so a row's residual is ``(Z Z^T impulses)_i + rhs_i``. ``weights`` are the rows' regularization weights
     (``regularize``). Contact rows have no parent; a friction row's parent is its normal row.
     """
     Z = np.asarray(Z, np.float32)
@@ -104,10 +104,16 @@ def sweep_free_body_rows(
         "iterations": int(iterations),
         "omega": 1.0,
         "regularize": int(regularize),
-        "v_out": wp.array(Z.astype(np.float64).T @ impulses.astype(np.float64), dtype=wp.float32, device=device),
+        "v_out": wp.zeros(6, dtype=wp.float32, device=device),
     }
     kernel = sweep_routes.mf_gs_kernel(
-        8, capacity, 6, str(wp.get_device(device).arch), has_dense_velocity_limit_rows=False, shared_metadata=False
+        8,
+        capacity,
+        6,
+        str(wp.get_device(device).arch),
+        has_dense_velocity_limit_rows=False,
+        shared_metadata=False,
+        seeded=True,
     )
     arguments = {arg.label: arg for arg in kernel.adj.args}
     inputs = []

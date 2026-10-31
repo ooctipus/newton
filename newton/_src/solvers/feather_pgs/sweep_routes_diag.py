@@ -4,9 +4,9 @@
 """The sparse-diagonal sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
 :func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
-(:class:`.SparsePairZ`), one warp per world, in factor coordinates: ``u = L^T P v`` on the dense articulation and
-``u = sqrt(m) v`` on a diagonal coordinate, entered once after the velocity is staged and left once before it is written
-back. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
+(:class:`.SparsePairZ`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
+``du = L^T P dv`` on the dense articulation and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the
+predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.staging.arch_budget`).
@@ -55,6 +55,7 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
+    ("row_incident", wp.array2d[float]),
     ("world_diag", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
     ("world_row_type", wp.array2d[int]),
@@ -89,7 +90,8 @@ def _diagonal_limits(dofs: int, dense_dofs: int, laws: RowLaws) -> tuple[str, st
     """The fused joint limits of a world's diagonal-mass coordinates: declarations, loads, the pass and the stores.
 
     Coordinate ``d`` has a lower and an upper unilateral row (``J = +1``, ``-1``), unstored whitened rows on the
-    coordinate: ``Z = +-s`` with ``s = m^-1/2`` (``limit_scale``), so ``J v = +-s u``, ``A = s^2 + cfm`` (the step
+    coordinate: ``Z = +-s`` with ``s = m^-1/2`` (``limit_scale``), their right-hand sides holding their incident
+    velocities ``+-v_hat`` (:func:`.kernels.prepare_fused_diagonal_joint_limits`), so ``J dv = +-s u``, ``A = s^2 + cfm`` (the step
     divides by it) and ``u += +-s delta``. The lane that owns ``d = lane + 32 k`` keeps both impulses in registers for
     the launch; they start at zero and are written back at the end. The dense articulation's ``dense_dofs``
     coordinates (from ``dense_offset``) hold no fused limit.
@@ -231,8 +233,8 @@ def sparse_diagonal_source(
     Every sweep runs the world's fused diagonal joint limits (one lane per coordinate), then its independent scalar
     contacts (one lane per chain: a contact whose coordinate no coupled row touches commutes with the coupled rows,
     and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
-    :class:`.SparsePairZ`'s warp layout, all in factor coordinates (entered once after the velocity is staged, left
-    once before it is written back). ``contact_triples`` schedules point contacts (a normal and two tangent
+    :class:`.SparsePairZ`'s warp layout, all on the velocity change in factor coordinates, from zero (left once before
+    it is added to the predictor). ``contact_triples`` schedules point contacts (a normal and two tangent
     rows each), ``contact_units`` patch contacts (a normal, and its tangent pair only when it owns an anchor); both
     skip an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
     one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
@@ -544,8 +546,6 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     def dense_velocity(position):
         return f"s_v[dense_offset + {position}]"
 
-    dense_enter = dense_solve.enter_lanes(dense_velocity, dense_velocity, "lane", 32, "entered")
-
     sweep_end = end_sweep(solve_policy, iteration="iteration")
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
@@ -566,19 +566,8 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     for (int i = lane; i < row_count; i += 32) {{
 {indent(rows.loads("i"), "        ")}
     }}
-    for (int d = lane; d < {D}; d += 32) {{
-        const int global_dof = world_dof_indices.data[dof_map_base + d];
-        float velocity = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
-{indent(diagonal_scale, "        ")}
-        s_v[d] = diagonal_scale > 0.0f ? velocity / diagonal_scale : velocity;
-    }}
+    for (int d = lane; d < {D}; d += 32) s_v[d] = 0.0f;
 {limit_loads}
-    SYNC();
-    // The dense articulation enters factor coordinates, u = L^T P v, a lane per coordinate.
-    const float* dense_factor = &dense_L.data[(size_t)dense_group * {P * P}];
-{indent(dense_enter[0], "    ")}
-    SYNC();
-{indent(dense_enter[1], "    ")}
     SYNC();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
@@ -593,7 +582,8 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 
     for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
-    // Leave factor coordinates: v = P^T L^-T u on the dense articulation, v = u / sqrt(m) on a diagonal coordinate.
+    // Leave factor coordinates: dv = P^T L^-T u on the dense articulation, dv = u / sqrt(m) on a diagonal coordinate.
+    const float* dense_factor = &dense_L.data[(size_t)dense_group * {P * P}];
     if (lane == 0) {{
 {indent(dense_solve.leave(dense_velocity, dense_velocity), "        ")}
     }}
@@ -601,7 +591,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     for (int d = lane; d < {D}; d += 32) {{
         const int global_dof = world_dof_indices.data[dof_map_base + d];
 {indent(diagonal_scale, "        ")}
-        if (global_dof >= 0) v_out.data[global_dof] = diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];
+        if (global_dof >= 0) v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];
     }}
 {limit_stores}
 #endif

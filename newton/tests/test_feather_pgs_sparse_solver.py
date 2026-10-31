@@ -372,10 +372,11 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             "phi",
             "target_velocity",
             "row_restitution",
+            "row_incident",
         ]
         # The dense route's rows are packed (packed_rows): they move with their row slots.
         packed = ["packed_J", "packed_Z", "row_sides"]
-        names += ["sparse_row_dof", "sparse_row_factor", "row_incident"] if sparse else packed
+        names += ["sparse_row_dof", "sparse_row_factor"] if sparse else packed
         arrays = {name: getattr(solver.placement, name).numpy() for name in names}
         dense_jacobian = None if sparse else unpacked_rows(solver)[0]
         worlds, slots, needed = (

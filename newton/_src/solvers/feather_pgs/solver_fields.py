@@ -197,8 +197,6 @@ PREELIMINATION = FieldGroup(
     Field("_preelim_nB", wp.int32, ("preelim",)),
     Field("_preelim_S", wp.float32, ("preelim_block",)),
     Field("_preelim_LS", wp.float32, ("preelim_block",)),
-    # A projection's block weights (the predictor's, then the leave's).
-    Field("_preelim_weight", wp.float32, ("preelim_row",)),
 )
 """Bilateral elimination buffers: per eliminating articulation, the model's largest block of rows and its square."""
 
@@ -213,14 +211,13 @@ Preelim = field_group.struct(
                 "_preelim_nB",
                 "_preelim_S",
                 "_preelim_LS",
-                "_preelim_weight",
             )
         ),
     ),
     __name__,
 )
 """The bilateral elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows (kept, then
-dropped) and its kept count, its Gram block and pivoted factor, and a projection's weights."""
+dropped) and its kept count, and its Gram block and pivoted factor."""
 
 SPARSE_FACTOR = FieldGroup(
     Field("sparse_Linv", wp.float32, ("group", "nonzero"), owner="factor"),
@@ -272,8 +269,8 @@ MF_ROWS = FieldGroup(
 )
 """Every world's matrix-free (free-body) rows. Each side's six entries hold the row's Jacobian ``J`` as the writers
 store it and its whitened form ``Z = L^-1 J^T`` once the rows' build has run (``L`` the body's held factor); a
-restitutive contact keeps its incident velocity ``J v_hat``. Packed metadata: four ints per row (dof pair, inverse
-effective mass, rhs, type and parent)."""
+row keeps its incident velocity ``J v_hat``. Packed metadata: four ints per row (dof pair, inverse effective mass, the
+residual at zero velocity change, type and parent)."""
 
 MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0, owner="placement"))
 

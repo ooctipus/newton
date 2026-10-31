@@ -1268,7 +1268,10 @@ def _launch_parallel(tier, case, *, device):
         "world_row_cfm": rows(np.full(count, case["cfm"])),
         "iterations": 1,
         "omega": 1.0,
-        "v_out": wp.array(case["velocity"].astype(np.float32), dtype=wp.float32, device=device),
+        # The predictor: the case's velocity less the response of its starting impulses, which the tier applies.
+        "v_out": wp.array(
+            (case["velocity"] - case["impulses"] @ case["Y"]).astype(np.float32), dtype=wp.float32, device=device
+        ),
     }
     values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
     values["ink_L_a"] = wp.array(case["L"].astype(np.float32)[None], dtype=wp.float32, device=device)

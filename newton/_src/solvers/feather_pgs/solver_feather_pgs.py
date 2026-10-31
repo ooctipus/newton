@@ -1537,8 +1537,8 @@ class SolverFeatherPGS(SolverBase):
         """Eliminate the bilateral blocks on the packed rows (:func:`.response_builds_rows.elimination`).
 
         Form each articulation's block ``G = Z_B^T Z_B`` and its pivoted factor, then correct every other row, its
-        right-hand side and its diagonal. Runs once the right-hand sides are final (bias and restitution) and
-        before the warm start, whose impulses the corrected rows then carry.
+        right-hand side and its diagonal, and give the block rows the projection's impulses. Runs once the right-hand
+        sides are final (bias and restitution).
         """
         dense = int(self.placement.packed_dense)
         for size in self.forest.size_groups:
@@ -1578,10 +1578,26 @@ class SolverFeatherPGS(SolverBase):
                 self.placement.constraint_count,
                 self.placement.local_solve_owner,
                 self.placement.row_cfm,
+                self.placement.row_incident,
             ],
             outputs=[self.placement.packed_Z, self.placement.rhs, self.placement.diag],
             device=self.model.device,
         )
+        # The projection: the block rows' impulses, which the sweep seeds with the warm start's.
+        for size in self.forest.size_groups:
+            wp.launch(
+                self._elimination.weights,
+                dim=self.forest.n_arts_by_size[size],
+                inputs=[
+                    field_group.bind(Preelim, solver=self),
+                    self.forest.group_to_art[size],
+                    self.forest.art_to_world,
+                    self.placement.rhs,
+                    self.placement.row_incident,
+                ],
+                outputs=[self.placement.impulses],
+                device=self.model.device,
+            )
 
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -2352,6 +2368,8 @@ class SolverFeatherPGS(SolverBase):
             # The grouped response solve (Placement._response_grouped), for the sizes StepPlan gives it from the data.
             self._grouped_response = True
             self.placement.grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
+        # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
+        self._seeded_sweep = bool(self.options.pgs_warmstart or self._preelim_active)
         if self.placement.mf_sweeps:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
@@ -2401,6 +2419,7 @@ class SolverFeatherPGS(SolverBase):
                 "independent_components": self._paired_components is not None,
                 "colored_worlds": colored,
                 "max_row_dofs": self.placement.packed_support,
+                "seeded": self._seeded_sweep,
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,
@@ -2714,7 +2733,7 @@ class SolverFeatherPGS(SolverBase):
         iterations: int,
         omega: float,
     ) -> None:
-        if iterations <= 0:
+        if iterations <= 0 and not self._seeded_sweep:
             return
         route = self._plan.solve.route.name
         if route == "sparse_pgs":
@@ -2762,7 +2781,6 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             self.factor.leave(
-                "sparse",
                 self.v_out,
                 size=self.placement.sparse_mass_matrix_size,
                 indices=self.factor.sparse_mass_matrix_indices,
@@ -2783,6 +2801,7 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.constraint_count,
                     self.forest.world_dof_indices,
                     dense_rhs,
+                    self.placement.row_incident,
                     self.placement.diag,
                     self.placement.impulses,
                     self.placement.row_type,
@@ -2889,6 +2908,7 @@ class SolverFeatherPGS(SolverBase):
                             self.placement.dense_phase_bounds,
                             self.forest.world_dof_indices,
                             dense_rhs,
+                            self.placement.row_incident,
                             self.placement.diag,
                             self.placement.impulses,
                             # The factor rows: the packed rows at their world coordinates.
@@ -2930,6 +2950,7 @@ class SolverFeatherPGS(SolverBase):
                 self.placement.local_solve_owner if components is None else components.selector,
                 self.forest.world_dof_indices,
                 dense_rhs,
+                self.placement.row_incident,
                 self.placement.diag,
                 self.placement.row_w,
                 self.placement.impulses,
@@ -3250,56 +3271,8 @@ class SolverFeatherPGS(SolverBase):
                 # and diagonals (the rows' closed-loop inertia).
                 self._stage4_bilateral_preelim()
 
-            # Initialize v_out = v_hat before GS loop
-            self.factor.enter(self.v_hat, self.v_out)
-            if self.options.pgs_warmstart and self.placement.sparse_mass_matrix_size is None:
-                # Matrix-free GS updates velocity from impulse deltas, so
-                # cached dense lambdas must be represented in v_out before
-                # the first delta is computed: v += P^T L^-T Z lambda from the
-                # packed rows. Native sparse factors seed their sweep's factor
-                # delta from the carried impulses instead.
-                self.factor.leave(
-                    "packed",
-                    self.v_out,
-                    base=self.v_hat,
-                    Z=self.placement.packed_Z,
-                    dense=self.placement.packed_dense,
-                    sides=self.placement.row_sides,
-                    counts=self.placement.constraint_count,
-                    impulses=self.placement.impulses,
-                )
-            if self.options.pgs_warmstart and self.forest.has_free_rigid_bodies:
-                # The carried free-body impulses' velocity, on every free rigid body the rows hold.
-                self.factor.leave(
-                    "bodies",
-                    self.v_out,
-                    body_a=self.placement.mf_body_a,
-                    body_b=self.placement.mf_body_b,
-                    counts=self.placement.mf_constraint_count,
-                    Z_a=self.placement.mf_Z_a,
-                    Z_b=self.placement.mf_Z_b,
-                    row_type=self.placement.mf_row_type,
-                    impulses=self.placement.mf_impulses,
-                )
-            if self._preelim_active:
-                # One-shot bilateral projection: J_B v_out = -b_B, preserved by
-                # every sweep impulse through the corrected columns. Keep
-                # this after every warm-start velocity install so a carried
-                # contact cannot reopen the projected closure.
-                self.factor.leave(
-                    "bilateral",
-                    self.v_out,
-                    elimination=self._elimination,
-                    block=field_group.bind(Preelim, solver=self),
-                    Z=self.placement.packed_Z,
-                    J=self.placement.packed_J,
-                    dense=self.placement.packed_dense,
-                    rhs=self.placement.rhs,
-                    art_to_block=self._preelim_art_to_idx,
-                    slots=self._preelim_slots,
-                    block_rows=self._preelim_nB,
-                    weight=self._preelim_weight,
-                )
+            # The sweeps add their velocity change to the predictor; a world without rows keeps it.
+            wp.copy(self.v_out, self.v_hat)
 
             # Pack MF metadata into int4 structs for coalesced 128-bit loads
             self.placement.pack_free_body_meta(self.placement.mf_rhs)
@@ -3870,6 +3843,7 @@ class SolverFeatherPGS(SolverBase):
                     self.options.joint_limit_activation_gap,
                     self.options.pgs_beta,
                     dt,
+                    self.v_hat,
                 ],
                 outputs=[
                     self.placement.fused_diagonal_limit_active,

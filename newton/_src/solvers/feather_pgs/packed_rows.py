@@ -18,8 +18,8 @@ sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Ea
 
 Whitening keeps a side's support: ``J`` vanishes off the ancestors of the row's bodies, a set closed under ancestors,
 so ``Z`` does too and the solve reads ``L`` only there. A row's diagonal is ``A_ii = |Z|^2``, its entries' squares
-summed in entry order (the row law adds ``cfm``), and its velocity term ``J_i v = Z_i^T u`` with ``u = L^T P v`` on
-each side: the sweeps hold every articulation they touch in factor coordinates
+summed in entry order (the row law adds ``cfm``), and its velocity term at ``v = v_hat + P^T L^-T du`` is
+``J_i v_hat + Z_i^T du``: the sweeps hold the velocity change ``du`` on every articulation they touch
 (:class:`.sweep_routes.FactorCoordinates`).
 
 The rows' width ``S`` (``support``) comes from the data: the most coordinates two articulations of one world hold
@@ -29,9 +29,8 @@ zero (coordinate -1), so a row is also its dense row over the world, the form th
 coordinates on lanes read. The producers write each row's sides whole, zeros included, and record its sides: the
 rows are never cleared. The build (:func:`pack_kernel`, one launch) whitens the rows the routes read, zeroes their
 entries past the sides and forms their diagonals (the parallel tiers whiten their worlds' rows in the kernel from
-the rows' sides: the build leaves them without a warm start). The
-warm start applies the rows' impulses through them (:func:`apply_kernel`), and bilateral pre-elimination corrects
-them (:func:`.response_builds_rows.elimination`) and projects the velocity onto its blocks (:func:`project_kernel`).
+the rows' sides: the build leaves them). Bilateral pre-elimination corrects them
+(:func:`.response_builds_rows.elimination`).
 """
 
 from __future__ import annotations
@@ -46,9 +45,9 @@ from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup
 from .kernel_template import THREADS, KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from .response_operator import CholeskySolve, Reversed
+from .response_operator import CholeskySolve
 
-__all__ = ["PACKED_ROWS", "PACKED_SIDES", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
+__all__ = ["PACKED_ROWS", "PACKED_SIDES", "pack_kernel", "support_width"]
 
 PACKED_ROWS = FieldGroup(
     Field("packed_J", wp.float32, ("world", "row", "support"), owner="placement"),
@@ -135,8 +134,7 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
 def _skipped(world: str) -> str:
     """The worlds whose rows another sweep forms: the parallel tiers' (at most ``skip_rows_le`` rows and no free-body
     rows; ``skip_rows_le`` 0: none), which whiten them in the kernel, and with ``skip_local`` (the row packets) the
-    local owners', which solve their own rows. The packing leaves them, unless a warm start applies their rows'
-    impulses through the packed rows (then both are 0)."""
+    local owners', which solve their own rows. The packing leaves them."""
     count = f"world_constraint_count.data[{world}]"
     tier = f"(skip_rows_le > 0 && {count} <= skip_rows_le && mf_constraint_count.data[{world}] == 0)"
     local = f"(skip_local != 0 && local_solve_owner.data[{world}] != {PGS_LOCAL_SOLVE_OWNER_GENERAL})"
@@ -229,131 +227,4 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     name = "pack_dense_rows" + "".join(f"_{n}" for n in sizes)
     return KernelTemplate(
         name, _pack_abi(sizes), body, dispatch=THREADS, dual=True, native_name=f"{name}_native"
-    ).kernel()
-
-
-_APPLY_ABI = kernel_template.params(
-    ("L_group", wp.array3d[float]),
-    ("group_to_art", wp.array[int]),
-    ("art_to_world", wp.array[int]),
-    ("art_dof_start", wp.array[int]),
-    ("response_dofs", wp.array[int]),
-    ("n_dofs", int),
-    ("row_sides", wp.array2d[wp.vec2i]),
-    ("world_constraint_count", wp.array[int]),
-    ("articulation_world_dof_offset", wp.array[int]),
-    ("dense", int),
-    ("packed_Z", wp.array3d[float]),
-    ("world_impulses", wp.array2d[float]),
-    ("v_hat", wp.array[float]),
-    ("v_out", wp.array[float]),
-)
-"""A size group's velocity of the impulses: its factors, articulations, the rows' sides and whitened entries, the
-impulses and the velocities."""
-
-
-@functools.cache
-def apply_kernel() -> wp.Kernel:
-    """The velocity of the impulses, one thread per articulation of the size group (``dim = articulations``): ``u =
-    sum_r Z_r lambda_r`` over its world's rows in row order (the rows it is a side of, zero impulses included), then
-    ``v_out = v_hat + P^T L^-T u`` (Z0), built in place in ``v_out``."""
-
-    def L(row, col):
-        return f"L_group.data[((size_t)group * n_dofs + ({row})) * n_dofs + ({col})]"
-
-    solve = CholeskySolve("n_dofs", L)
-    velocity = Reversed(lambda k: f"v_last[-{k}]")
-    body = f"""    const int group = tid;
-    if (group >= group_to_art.shape[0]) return;
-    const int art = group_to_art.data[group];
-    const int world = art_to_world.data[art];
-    const int start = art_dof_start.data[art];
-    const int capacity = row_sides.shape[1];
-    const int support = packed_Z.shape[2];
-    const int rows = world_constraint_count.data[world];
-    const int count = rows < capacity ? rows : capacity;
-    for (int e = 0; e < n_dofs; ++e) v_out.data[start + e] = 0.0f;
-    for (int r = 0; r < count; ++r) {{
-        const wp::vec2i sides = row_sides.data[world * capacity + r];
-        int first = -1;
-        if (sides[0] == art) first = 0;
-        else if (sides[1] == art) first = response_dofs.data[sides[0]];
-        if (first < 0) continue;
-        if (dense != 0) first = articulation_world_dof_offset.data[art];
-        const float impulse = world_impulses.data[world * world_impulses.shape[1] + r];
-        const float* z = &packed_Z.data[((size_t)world * capacity + r) * support + first];
-        for (int e = 0; e < n_dofs; ++e) v_out.data[start + e] += z[e] * impulse;
-    }}
-    float* v_last = &v_out.data[start + n_dofs - 1];
-{solve.leave(velocity, velocity)}
-    for (int e = 0; e < n_dofs; ++e) v_out.data[start + e] += v_hat.data[start + e];
-"""
-    return KernelTemplate(
-        "apply_dense_rows", _APPLY_ABI, body, dispatch=THREADS, dual=True, native_name="apply_dense_rows_native"
-    ).kernel()
-
-
-_PROJECT_ABI = kernel_template.params(
-    ("L_group", wp.array3d[float]),
-    ("group_to_art", wp.array[int]),
-    ("art_to_world", wp.array[int]),
-    ("art_dof_start", wp.array[int]),
-    ("articulation_world_dof_offset", wp.array[int]),
-    ("n_dofs", int),
-    ("dense", int),
-    ("art_to_preelim", wp.array[int]),
-    ("preelim_slots", wp.array[int]),
-    ("preelim_nB", wp.array[int]),
-    ("preelim_weight", wp.array[float]),
-    ("packed_Z", wp.array3d[float]),
-    ("v_out", wp.array[float]),
-)
-"""A size group's bilateral projection: its factors and articulations, the blocks' rows and weights
-(:func:`.response_builds_rows.elimination`), the packed rows and the velocity."""
-
-
-@functools.cache
-def project_kernel(rows: int) -> wp.Kernel:
-    """Project the velocity onto each articulation's bilateral block of up to ``rows`` rows, ``v -= P^T L^-T Z_B y``
-    with the block's weights ``y`` (:func:`.response_builds_rows.elimination`), one thread per articulation of the
-    size group (``dim = articulations``): enter ``u = L^T P v``, subtract ``Z_B y`` in block order, leave (Z0), in
-    place in ``v_out``."""
-
-    def L(row, col):
-        return f"L_group.data[((size_t)group * n_dofs + ({row})) * n_dofs + ({col})]"
-
-    solve = CholeskySolve("n_dofs", L)
-    velocity = Reversed(lambda k: f"v_last[-{k}]")
-    body = f"""    const int group = tid;
-    if (group >= group_to_art.shape[0]) return;
-    const int art = group_to_art.data[group];
-    const int pe = art_to_preelim.data[art];
-    if (pe < 0) return;
-    const int m = preelim_nB.data[pe];
-    if (m == 0) return;
-    const int world = art_to_world.data[art];
-    const int start = art_dof_start.data[art];
-    const int first = dense != 0 ? articulation_world_dof_offset.data[art] : 0;
-    const int capacity = packed_Z.shape[1];
-    const int support = packed_Z.shape[2];
-    const int base = pe * {int(rows)};
-    float* v_last = &v_out.data[start + n_dofs - 1];
-{solve.enter(velocity, velocity)}
-    for (int e = 0; e < n_dofs; ++e) {{
-        float acc = 0.0f;
-        for (int p = 0; p < m; ++p) {{
-            const size_t row = (size_t)world * capacity + preelim_slots.data[base + p];
-            acc += packed_Z.data[row * support + first + e] * preelim_weight.data[base + p];
-        }}
-        v_out.data[start + e] -= acc;
-    }}
-{solve.leave(velocity, velocity)}
-"""
-    return KernelTemplate(
-        f"project_dense_rows_{int(rows)}",
-        _PROJECT_ABI,
-        body,
-        dispatch=THREADS,
-        dual=True,
-        native_name="project_dense_rows_native",
     ).kernel()

@@ -16,8 +16,8 @@ velocities (BACKBONE §2).
 Its evaluator is the held tree (:mod:`.held_tree`) where that admits the solver, else the ordinary stages
 (:mod:`.tree_ordinary`) behind the same calls, until D. A step calls :meth:`TreeFactor.factor` (FK/ID, the drives'
 K and u0, the mass-update mask, the factor refresh), :meth:`TreeFactor.predict` (``v_hat``),
-:meth:`TreeFactor.enter` (``v_out = v_hat``), :meth:`TreeFactor.leave` (``v += P^T L^-T z``, by the storage of
-``z``) and :meth:`TreeFactor.finish` (``qdd``, integrate, publish).
+:meth:`TreeFactor.leave` (``v = v_hat + P^T L^-T du``, where the sweep stores ``du``) and
+:meth:`TreeFactor.finish` (``qdd``, integrate, publish).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import BodyFlags, JointType, ModelFlags
-from . import field_group, host_index, packed_rows, response_builds_rows
+from . import field_group, host_index, response_builds_rows
 from .conditioning import ArmatureFloor, conditioning_armature
 from .field_group import SolverArrays
 from .joint_table import JointTable
@@ -902,134 +902,30 @@ class TreeFactor:
                 device=model.device,
             )
 
-    def enter(self, v_hat: wp.array, v_out: wp.array) -> None:
-        """Start the sweep's iterate in physical coordinates: ``v_out = v_hat``."""
-        wp.copy(v_out, v_hat)
+    def leave(self, velocity: wp.array, *, size: int, indices, Linv: wp.array, delta: wp.array, base: wp.array) -> None:
+        """``v = base + P^T L^-T du`` through the native sparse factor (:func:`.response_builds_rows.factor_publish_kernel`).
 
-    def leave(self, storage: str, velocity: wp.array, **rows) -> None:
-        """``v += P^T L^-T z``: map factor-coordinate impulses back to ``velocity``, by the storage ``z`` lives in.
-
-        Storages and their ``rows`` operands:
-
-        - ``"packed"``: ``v = base + P^T L^-T sum_r Z_r lambda_r`` of every articulation with a dense factor, from the
-          packed rows (:func:`.packed_rows.apply_kernel`, a launch per size group): ``base``, ``Z``, ``dense``,
-          ``sides``, ``counts``, ``impulses``;
-        - ``"sparse"``: ``v = base + P^T L^-T du`` through the native sparse factor
-          (:func:`.response_builds_rows.factor_publish_kernel`): ``size``, ``indices``, ``Linv``, ``delta``,
-          ``base``;
-        - ``"bodies"``: each free body's rows' ``L^-T Z lambda`` through its 6x6 factor
-          (:func:`.response_builds_rows.free_body_publish_kernel`): ``body_a``, ``body_b``, ``counts``, ``Z_a``,
-          ``Z_b``, ``row_type``, ``impulses``;
-        - ``"bilateral"``: ``v -= P^T L^-T Z_B y`` of each articulation's bilateral block, its weights ``y`` first
-          (:func:`.packed_rows.project_kernel`, per size group): ``elimination``, ``block``, ``Z``, ``J``,
-          ``dense``, ``rhs``, ``art_to_block``, ``slots``, ``block_rows``, ``weight``.
+        A sweep that keeps ``du`` in shared memory leaves in its kernel, with the same text: this is the publication of
+        the one that stores it.
         """
-        model, forest = self.model, self.forest
-        if storage == "packed":
-            for size in forest.size_groups:
-                if self.L_by_size[size].shape[1] != size:
-                    continue  # A compact or sparse size keeps a placeholder: its rows have no dense factor.
-                wp.launch(
-                    packed_rows.apply_kernel(),
-                    dim=forest.n_arts_by_size[size],
-                    inputs=[
-                        self.L_by_size[size],
-                        forest.group_to_art[size],
-                        forest.art_to_world,
-                        forest.articulation_dof_start,
-                        forest.articulation_response_dof_count,
-                        size,
-                        rows["sides"],
-                        rows["counts"],
-                        forest.articulation_world_dof_offset,
-                        int(rows["dense"]),
-                        rows["Z"],
-                        rows["impulses"],
-                        rows["base"],
-                    ],
-                    outputs=[velocity],
-                    device=model.device,
-                )
-        elif storage == "sparse":
-            size, indices = rows["size"], rows["indices"]
-            wp.launch(
-                response_builds_rows.factor_publish_kernel,
-                dim=(forest.n_arts_by_size[size], size),
-                inputs=[
-                    forest.group_to_art[size],
-                    forest.art_to_world,
-                    forest.articulation_world_dof_offset,
-                    forest.articulation_dof_start,
-                    indices.permutation,
-                    indices.lookup,
-                    rows["Linv"],
-                    rows["delta"],
-                    rows["base"],
-                ],
-                outputs=[velocity],
-                device=model.device,
-            )
-        elif storage == "bodies":
-            wp.launch(
-                response_builds_rows.free_body_publish_kernel,
-                dim=forest.free_rigid_body_count,
-                inputs=[
-                    forest.free_rigid_body_indices,
-                    forest.free_rigid_body_world,
-                    rows["body_a"],
-                    rows["body_b"],
-                    rows["counts"],
-                    rows["Z_a"],
-                    rows["Z_b"],
-                    rows["row_type"],
-                    rows["impulses"],
-                    self.body_factors,
-                ],
-                outputs=[velocity],
-                device=model.device,
-            )
-        elif storage == "bilateral":
-            elimination, dense = rows["elimination"], int(rows["dense"])
-            for size in forest.size_groups:
-                wp.launch(
-                    elimination.weights,
-                    dim=forest.n_arts_by_size[size],
-                    inputs=[
-                        rows["block"],
-                        forest.group_to_art[size],
-                        forest.art_to_world,
-                        forest.articulation_dof_start,
-                        forest.articulation_world_dof_offset,
-                        dense,
-                        rows["J"],
-                        rows["rhs"],
-                        velocity,
-                        size,
-                    ],
-                    device=model.device,
-                )
-                wp.launch(
-                    packed_rows.project_kernel(elimination.rows),
-                    dim=forest.n_arts_by_size[size],
-                    inputs=[
-                        self.L_by_size[size],
-                        forest.group_to_art[size],
-                        forest.art_to_world,
-                        forest.articulation_dof_start,
-                        forest.articulation_world_dof_offset,
-                        size,
-                        dense,
-                        rows["art_to_block"],
-                        rows["slots"],
-                        rows["block_rows"],
-                        rows["weight"],
-                        rows["Z"],
-                    ],
-                    outputs=[velocity],
-                    device=model.device,
-                )
-        else:
-            raise ValueError(f"Unknown factor storage {storage!r}.")
+        forest = self.forest
+        wp.launch(
+            response_builds_rows.factor_publish_kernel,
+            dim=(forest.n_arts_by_size[size], size),
+            inputs=[
+                forest.group_to_art[size],
+                forest.art_to_world,
+                forest.articulation_world_dof_offset,
+                forest.articulation_dof_start,
+                indices.permutation,
+                indices.lookup,
+                Linv,
+                delta,
+                base,
+            ],
+            outputs=[velocity],
+            device=self.model.device,
+        )
 
     def finish(self, state_in, state_out, dt: float, step: int) -> None:
         """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state."""

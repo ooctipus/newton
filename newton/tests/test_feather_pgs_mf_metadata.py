@@ -98,6 +98,7 @@ def _pack_state(has_free_rigid_bodies):
         "mf_dof_a",
         "mf_dof_b",
         "mf_eff_mass_inv",
+        "mf_row_incident",
         "mf_row_type",
         "mf_row_parent",
         "mf_meta_packed",
@@ -287,7 +288,8 @@ def _solve_parent_rows(device, parents):
             metadata[world, 4 * row : 4 * row + 4] = (
                 65535,
                 np.float32(1).view(np.int32),
-                np.float32(-(1 + 0.1 * world) if axis == 0 else 0).view(np.int32),
+                # The word's right-hand side holds the row's incident velocity: its unit Jacobian on the body.
+                np.float32((-(1 + 0.1 * world) if axis == 0 else 0) + velocity[world, axis]).view(np.int32),
                 packed_parent,
             )
             jacobian[world, row, axis] = 1.0

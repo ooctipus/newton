@@ -183,7 +183,7 @@ class TestPairedComponents(unittest.TestCase):
             self.assertNotIn("split_component", sources[index])
             self.assertIn("split_component", sources[index + 2])
             begin = "for (int iter = 0; iter < iterations;"
-            end = "if (global_dof >= 0) v_out.data[global_dof] ="
+            end = "if (global_dof >= 0) v_out.data[global_dof] +="
             original_sweep = sources[index][sources[index].index(begin) : sources[index].index(end)]
             changed_sweep = sources[index + 2][sources[index + 2].index(begin) :]
             self.assertTrue(changed_sweep.startswith(original_sweep))

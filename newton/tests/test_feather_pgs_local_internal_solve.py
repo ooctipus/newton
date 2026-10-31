@@ -413,7 +413,8 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             packed_meta[0, row * 4 : row * 4 + 4] = [
                 packed_dofs,
                 float_bits(1.0),
-                float_bits(mf_rhs[row]),
+                # The word's right-hand side holds the row's incident velocity: its unit Jacobian on the body.
+                float_bits(mf_rhs[row] + initial_velocity[primary_dofs + row]),
                 int(mf_types[row]) | (0 << 16),
             ]
 

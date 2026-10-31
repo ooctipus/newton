@@ -1253,11 +1253,9 @@ class Placement:
         if not self.mf_sweeps:
             return
         # The parallel tiers whiten their worlds' rows in the kernel, and under the row packets the local owners
-        # solve their own and the packet producer applies restitution: the build leaves both, as main's response did,
-        # unless the warm start applies their impulses through the packed rows. Elsewhere the local owners' worlds
-        # are packed: restitution and the drive descriptor read their J v there.
-        skip = 0 if self.options.pgs_warmstart else int(self.ink_skip_rows())
-        skip_local = int(self.row_packets is not None and not self.options.pgs_warmstart)
+        # solve their own and the packet producer applies restitution: the build leaves both. Elsewhere the local
+        # owners' worlds are packed: restitution reads their J v there.
+        skip, skip_local = int(self.ink_skip_rows()), int(self.row_packets is not None)
         # A compact or sparse size keeps a placeholder factor: its rows have no dense factor.
         sizes = tuple(sorted(size for size in self.forest.size_groups if self.factor.L_by_size[size].shape[1] == size))
         wp.launch(
@@ -1466,6 +1464,7 @@ class Placement:
                 self.mf_dof_b,
                 self.mf_eff_mass_inv,
                 mf_rhs,
+                self.mf_row_incident,
                 self.mf_row_type,
                 self.mf_row_parent,
             ],

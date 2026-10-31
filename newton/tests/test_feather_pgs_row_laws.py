@@ -403,6 +403,7 @@ def _law_fused_limits(
     activation_gap: float,
     pgs_beta: float,
     dt: float,
+    v_hat: wp.array[float],
     active_sides: wp.array2d[int],
     lower_rhs: wp.array2d[float],
     upper_rhs: wp.array2d[float],
@@ -421,7 +422,9 @@ def _law_fused_limits(
                     joint_q[q_index], joint_limit_lower[global_dof], joint_limit_upper[global_dof], side, activation_gap
                 )
                 if on:
-                    rhs[side] = row_laws.limit_rhs(phi, pgs_beta, 0.0, 1.0 / dt, 1.0, 1.0)
+                    # The row's incident velocity is its J = +1 or -1 on the predictor.
+                    incident = wp.where(side == 0, v_hat[global_dof], -v_hat[global_dof])
+                    rhs[side] = row_laws.limit_rhs(phi, pgs_beta, 0.0, 1.0 / dt, 1.0, 1.0) + incident
                     active |= 1 << side
     active_sides[world, local_dof] = active
     lower_rhs[world, local_dof] = rhs[0]
@@ -449,6 +452,7 @@ def test_limit_laws_match_fused_diagonal_limits(test, device):
         "activation_gap": 0.05,
         "pgs_beta": 0.25,
         "dt": 1.0 / 60.0,
+        "v_hat": scalars(rng, count, 1.0),
         "active_sides": np.zeros((worlds, dofs), dtype=np.int32),
         "lower_rhs": np.zeros((worlds, dofs), dtype=np.float32),
         "upper_rhs": np.zeros((worlds, dofs), dtype=np.float32),

@@ -42,6 +42,7 @@ from .sweep import (
     dense_rows_block,
     end_sweep,
     free_body_rows_block,
+    impulse_seed,
     indent,
     material_arguments,
     speed_rows_pass,
@@ -59,6 +60,7 @@ MF_GS_ABI = kernel_template.params(
     ("local_solve_owner", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
+    ("row_incident", wp.array2d[float]),
     ("world_diag", wp.array2d[float]),
     ("world_row_w", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
@@ -88,13 +90,14 @@ MF_GS_ABI = kernel_template.params(
 
 
 class FactorCoordinates:
-    """The articulations a matrix-free sweep holds in factor coordinates, and their conversions (native).
+    """The articulations a matrix-free sweep's velocity change touches, and their way back (native).
 
-    The articulations the launch's rows touch are marked at their first world coordinate in a bitmap
+    A sweep runs on the velocity change from the predictor in factor coordinates, ``du`` (``s_v``, from zero): a row's
+    residual is its right-hand side, which holds its incident velocity ``J v_hat``, plus ``Z^T du``, and its update
+    ``du += Z delta``. The articulations the launch's rows touch are marked at their first world coordinate in a bitmap
     (``s_factor_marks``): each free body of its free-body rows and each side of its dense rows
-    (:func:`.dense_rows.row_sides`). Each enters factor coordinates ``u = L^T P v`` once the velocity is staged and
-    leaves them, ``v = P^T L^-T u``, before it is written back (:class:`.CholeskySolve`'s ``enter`` and ``leave``), so
-    every row the sweep visits reads and updates ``u``: ``Z^T u`` and ``u += Z delta``. An articulation's factor is
+    (:func:`.dense_rows.row_sides`). Each leaves factor coordinates once, ``dv = P^T L^-T du``
+    (:class:`.CholeskySolve`'s ``leave``), and adds to the predictor. An articulation's factor is
     found from its first global coordinate (:class:`.kernels.BodyFactors`' ``first_art``, ``size`` and ``address``); a
     free body's six coordinates take the unrolled solves.
     """
@@ -139,16 +142,9 @@ class FactorCoordinates:
     }}
 }}"""
 
-    def convert_all(self, dofs: int, thread: str, threads: str, sync: str, *, enter: bool) -> str:
-        """Every marked articulation enters (or leaves) factor coordinates in place, a thread per bitmap word."""
+    def leave_all(self, dofs: int, thread: str, threads: str, sync: str) -> str:
+        """Every marked articulation leaves factor coordinates in place, a thread per bitmap word."""
         factors = self.op.factors
-        action = "enter" if enter else "leave"
-
-        def solve(size):
-            if size == 6:
-                return getattr(CholeskySolve(6, "factor", unroll=True), action)
-            return getattr(CholeskySolve("size", "factor"), action)
-
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
         return f"""for (int w = {thread}; w < {self.words(dofs)}; w += {threads}) {{
     unsigned bits = s_factor_marks[w];
@@ -159,9 +155,9 @@ class FactorCoordinates:
         const int size = {factors}.size.data[art];
         const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
         if (size == 6) {{
-{indent(solve(6)(coordinates, coordinates), "            ")}
+{indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
         }} else {{
-{indent(solve(0)(coordinates, coordinates), "            ")}
+{indent(CholeskySolve("size", "factor").leave(coordinates, coordinates), "            ")}
         }}
     }}
 }}
@@ -169,13 +165,13 @@ class FactorCoordinates:
 
 
 FACTOR_COORDINATES = FactorCoordinates()
-"""Where a matrix-free sweep keeps its articulations' coordinates (:class:`FactorCoordinates`)."""
+"""The marks and the way back of a matrix-free sweep's velocity change (:class:`FactorCoordinates`)."""
 
 
 def packed_operator(support: int, lanes: Lanes) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
     world coordinates from their sides (``PACKED_COORDINATE``) and values from the world's first row
-    (``packed_base``), over the factor velocity the sweep stages (``s_v``)."""
+    (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
 
     def coordinate(row, entry):
         return f"PACKED_COORDINATE(row_sides.data[off_dense + ({row})], {entry})"
@@ -606,11 +602,13 @@ def mf_gs_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     lanes: int = 32,
     material: bool = False,
+    seeded: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
-    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity in factor coordinates
-    (:class:`FactorCoordinates`).
+    (:class:`.FreeBodyZ`), then its end-of-sweep passes, on the world's velocity change from the predictor in factor
+    coordinates (:class:`FactorCoordinates`), from zero, or with ``seeded`` from the response of the impulses the
+    rows carry (:func:`.sweep.impulse_seed`). The launch publishes it onto ``v_out``, which holds the predictor.
 
     ``mapping`` places the free-body rows on threads (:data:`MAPPINGS`): ``"warp"``, the world's warp visits them in
     row order; ``"colored"``, a block of :data:`COLORED_THREADS` visits their colors in order and a color's units at
@@ -726,11 +724,29 @@ def mf_gs_source(
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
     sync = "__syncthreads();" if colored else "SYNC();"
     metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF), torsion=contact_torsion) if colored else ""
-    # The launch's prologue after the marks: the marked articulations entering factor coordinates, and the colored
-    # units' pair metrics.
-    prologue = "\n".join(
-        part for part in (bodies.convert_all(D, thread, threads, sync, enter=True), metric_build) if part
-    )
+    seed = ""
+    if seeded:
+        seeds = (
+            impulse_seed(
+                "m_dense",
+                dense.peek("i"),
+                f"({dense.kind('i', scan=True)})",
+                dense_op.apply_row("i", "seed", "        "),
+                row_lanes.sync(),
+            ),
+            impulse_seed(
+                "m_mf",
+                free.load("i"),
+                "(mf_meta.data[off_meta + i * 4 + 3] & 0xFFFF)",
+                free_op.apply_row("i", "seed", "        "),
+                row_lanes.sync(),
+                declare=(
+                    "const int packed_dofs = mf_meta.data[off_meta + i * 4];",
+                    "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+                ),
+            ),
+        )
+        seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
     body = f"""{head}
 
     {dense_count}
@@ -758,17 +774,14 @@ def mf_gs_source(
     for (int i = lane; i < m_mf; i += STRIDE) {{
         {mf_load}
     }}
-    for (int d = lane; d < {D}; d += STRIDE) {{
-        int global_dof = world_dof_indices.data[dof_map_base + d];
-        s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
-    }}
+    for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
 {indent(bodies.clear(D, "lane"), "    ")}
 {end_first_warp}    {barrier}
     // The articulations this launch's rows touch: the bodies of its free-body rows, the sides of every dense row.
 {indent(bodies.mark("0", "m_mf", thread, threads), "    ")}
 {indent(bodies.mark_sides("m_dense", thread, threads), "    ")}
     {barrier}
-{prologue}
+{seed}{metric_build}
 
     for (int iter = 0; iter < iterations; iter++) {{
         int iteration_changed = 0;
@@ -781,10 +794,10 @@ def mf_gs_source(
 {end_first_warp}{sweep_end}    }}
 
     {barrier}
-{indent(bodies.convert_all(D, thread, threads, sync, enter=False), "    ")}
+{indent(bodies.leave_all(D, thread, threads, sync), "    ")}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];
+        if (global_dof >= 0{owned}) v_out.data[global_dof] += s_v[d];
     }}
     for (int i = lane; i < m_dense; i += STRIDE) {{
         world_impulses.data[off_dense + i] = s_lam_dense[i];
@@ -828,6 +841,7 @@ def mf_gs_kernel(
     independent_components: bool = False,
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
+    seeded: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -853,6 +867,7 @@ def mf_gs_kernel(
         solve_policy=solve_policy,
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
         material=material,
+        seeded=seeded,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -870,6 +885,7 @@ def mf_gs_kernel(
         + ("_components" if independent_components else "")
         + ("_cw" if colored_worlds and not colored else "")
         + ("_material" if material else "")
+        + ("_seeded" if seeded else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(

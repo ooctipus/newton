@@ -162,6 +162,8 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
     diagonal[0, chain] = np.einsum("ij,ij->i", whitened[0, chain], whitened[0, chain])
     bias = np.zeros((1, capacity), np.float32)
     bias[0, chain] = _CHAIN_BIAS[rows]
+    incident = np.zeros((1, capacity), np.float32)
+    incident[0, chain] = _CHAIN_JACOBIAN[rows] @ _CHAIN_VELOCITY
     row_type = np.full((1, capacity), VELOCITY_LIMIT, np.int32)
 
     def array(value, dtype=wp.float32):
@@ -180,6 +182,7 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "local_solve_owner": zero_int,
         "world_dof_indices": array([[0, 1]], wp.int32),
         "rhs_bias": array(bias),
+        "row_incident": array(incident),
         "world_diag": array(diagonal),
         "world_row_w": array(np.ones((1, capacity), np.float32)),
         "world_impulses": array(np.zeros((1, capacity), np.float32)),

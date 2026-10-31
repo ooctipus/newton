@@ -59,6 +59,7 @@ from .sweep import (
     cached_pair_law,
     contact_unit,
     end_sweep,
+    impulse_seed,
     indent,
     material_arguments,
     row_visit,
@@ -437,19 +438,11 @@ const bool sweep_violation_any = BALLOT(sweep_violation_loud != 0) != 0u;"""
 
 
 def warm_start_seed(op: SparseFactor, pad: str) -> str:
-    """Give the delta the response of the impulses the row buffer carries, before the first sweep, as the
-    ordinary route installs them in the velocity; velocity-limit rows are seeded none. A row's coordinates are
-    distinct, so its lanes' updates never collide; rows are serialized by the barrier."""
-    lines = [
-        "for (int i = 0; i < count; ++i) {",
-        "    const float seed = s_impulse[i];",
-        f"    if (seed != 0.0f && s_type[i] != {VELOCITY_LIMIT}) {{",
-        op.apply_row("i", "seed", "        "),
-        "    }",
-        f"    {op.lanes.sync()}",
-        "}",
-    ]
-    return indent("\n".join(lines), pad)
+    """Give the delta the response of the impulses the row buffer carries, before the first sweep
+    (:func:`.sweep.impulse_seed`)."""
+    return impulse_seed(
+        "count", "s_impulse[i]", "s_type[i]", op.apply_row("i", "seed", "        "), op.lanes.sync(), pad=pad
+    )
 
 
 def ordinary_rows(rows: SparseRows, op: SparseFactor, laws: RowLaws, *, skip_velocity_limits: bool, pad: str) -> str:

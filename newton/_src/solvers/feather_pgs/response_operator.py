@@ -253,19 +253,6 @@ class CholeskySolve:
             {self._at(output, "row")}=value;
         }}"""
 
-    def enter_lanes(self, rhs: Vector, output: Vector, lane: str, width: int, name: str) -> tuple[str, str]:
-        """Enter factor coordinates with the lanes: lane ``l`` forms coordinates ``l``, ``l + width``... of ``x = L^T P
-        rhs`` in registers (``name_t``) with :meth:`enter`'s arithmetic. The caller synchronizes the lanes between the
-        two returned statement lists, forming and storing (the output may then alias the input)."""
-        n, w = int(self.size), int(width)
-        form, store = [], []
-        for t in range((n + w - 1) // w):
-            row = f"({lane} + {t * w})" if t else lane
-            form += [f"float {name}_{t} = 0.0f;", f"if ({row} < {n}) {{"]
-            form += [f"    {self._coordinate(rhs, row, '    ', False)}", f"    {name}_{t} = value;", "}"]
-            store.append(f"if ({row} < {n}) {self._at(output, row)} = {name}_{t};")
-        return "\n".join(form), "\n".join(store)
-
     def stage_inverse(self, lane: str) -> str:
         """Stage the reciprocal diagonal of :attr:`inverse`, one row per lane (the lanes cover the rows)."""
         n = self.size
@@ -677,8 +664,8 @@ class FreeBodyZ(ResponseOperator):
     """Rows over at most two free bodies, whitened: ``Z_a, Z_b = L^-1 J^T`` of 6 coordinates each.
 
     A free body is a one-node tree; ``L`` is its held factor (``H = L L^T``,
-    armature included), and the sweep holds the body's six velocity
-    coordinates in factor coordinates ``u = L^T v`` between :meth:`enter` and
+    armature included), and the sweep holds the change of the body's six
+    velocity coordinates in factor coordinates, ``u = L^T dv``, until
     :meth:`leave`: a row's velocity term is ``Z^T u``, its update ``u += Z
     delta``. Row ``i``'s entries are at ``[base + i * 6 + k]``; its bodies'
     first velocity coordinates are ``dof_a``/``dof_b`` (negative for no body).
@@ -747,10 +734,6 @@ class FreeBodyZ(ResponseOperator):
     def lower(self, factor: str) -> str:
         """The native pointer of factor ``factor``'s ``L`` (row-major, lower)."""
         return f"({self.factors}.L.data + ({factor}) * 36)"
-
-    def enter(self, velocity: Vector, factor: str) -> str:
-        """Map a body's six coordinates ``velocity`` into factor coordinates in place, ``u = L^T v`` (one thread)."""
-        return CholeskySolve(6, self.lower(factor), unroll=True).enter(velocity, velocity)
 
     def leave(self, velocity: Vector, factor: str) -> str:
         """Map a body's six coordinates ``velocity`` back in place, ``v = L^-T u`` (one thread)."""
@@ -938,14 +921,15 @@ class FreeBodyZ(ResponseOperator):
         """``const float out``: the magnitude of the body's physical velocity coordinates ``[axis, axis + 3)``.
 
         The body's coordinates from ``body`` hold ``u``; every lane forms its physical velocity ``speed_v = L^-T u``
-        (:meth:`leave`) and the magnitude, the squares added in coordinate order. The lanes then synchronize, so
-        :meth:`scale_speed` may write ``u``.
+        (:meth:`leave`) on the predictor, which ``v_out`` holds through the sweep, and the magnitude, the squares added
+        in coordinate order. The lanes then synchronize, so :meth:`scale_speed` may write ``u``.
         """
         factor = self.factor(body)
         lines = [
             "float speed_v[6];",
             "for (int k = 0; k < 6; ++k) speed_v[k] = " + self._v(body, "k") + ";",
             self.leave(lambda k: f"speed_v[{k}]", factor),
+            f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
             f"const float {out} = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
             f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
         ]
@@ -1342,11 +1326,9 @@ class TransposedResponse(ResponseOperator):
         return f"{indent}float Jr[{D}];\n{indent}#pragma unroll\n{indent}for (int d = 0; d < {D}; ++d) Jr[d] = 0.0f;"
 
     def jacobi_stage(self, padding: str, scale: Callable[[str, str, str], str], indent: str) -> str:
-        """Whiten and stage the rows, start every row's residual at zero impulse and set each step scale.
-
-        ``w_0 = -Z lambda_0`` (``Z_i v`` was folded in at staging) is summed per coordinate in row order, then
-        ``s_rhs[i]`` becomes ``b'_i = rhs_i + Z_i w_0``; ``padding`` pads the rows' impulses. ``scale(aii, bound,
-        indent)`` sets an admitted row's step.
+        """Whiten and stage the rows and set each step scale: ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the
+        row's residual ``b'_i`` at zero impulse; ``padding`` pads the rows' impulses. ``scale(aii, bound, indent)`` sets
+        an admitted row's step.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
         stage = [self.whitened.stage("s_Yt", publish=False, indent=indent)]
@@ -1358,22 +1340,14 @@ class TransposedResponse(ResponseOperator):
             "}",
             "SYNC();",
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
-            "    float acc = 0.0f, csum = 0.0f;",
-            f"    for (int j = 0; j < {rows}; ++j) {{",
-            f"        const float yv = {self._yt('j', 'd')};",
-            "        acc += yv * s_lam0[j];",
-            "        if (s_kind[j] >= 0) csum += fabsf(yv);",
-            "    }",
-            "    s_dv[d] = 0.0f - acc;",
+            "    float csum = 0.0f;",
+            f"    for (int j = 0; j < {rows}; ++j)",
+            f"        if (s_kind[j] >= 0) csum += fabsf({self._yt('j', 'd')});",
             "    s_colsum[d] = csum;",
             "}",
             "SYNC();",
             f"for (int i = {lane}; i < {rows}; i += {width}) {{",
             "    const float* Ji = Jr;",
-            "    float b = s_rhs[i];",
-            "    #pragma unroll",
-            f"    for (int d = 0; d < {D}; ++d) b += Ji[d] * s_dv[d];",
-            "    s_rhs[i] = b;",
             "    if (s_kind[i] >= 0) {",
             "        float aii = 0.0f, bound = 0.0f;",
             "        #pragma unroll",
@@ -1438,7 +1412,7 @@ class TransposedResponse(ResponseOperator):
         return _lines(lines, indent)
 
     def publish(self, indent: str = "    ", *, applied: Callable[[str], str]) -> str:
-        """``v = v_in + P^T L^-T sum_i Z_i applied_i`` in row order from the staged block."""
+        """``v = v_hat + P^T L^-T sum_i Z_i applied_i`` in row order from the staged block."""
         return self.whitened.publish(lambda row: self._yt(row, "d"), applied, indent)
 
     def push_prologue(self, indent: str) -> str:
@@ -1463,9 +1437,9 @@ class SparsePairZ(ResponseOperator):
     """Whitened rows over a world's dense group of ``dofs`` coordinates plus two scalar sparse coordinates.
 
     The sparse-diagonal rows: a world pairs one compact dense articulation (its group ``group``, first coordinate
-    ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity in factor coordinates: ``u = L^T P v``
-    on the dense articulation (``L`` its leaf-first factor) and ``u = sqrt(m) v`` on a diagonal coordinate (a star's
-    factor is diagonal). Row ``i``'s dense part is ``Z = L^-1 P J^T`` at ``Z[(group * rows + i) * dofs + l]`` on
+    ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity change in factor coordinates: ``u =
+    L^T P dv`` on the dense articulation (``L`` its leaf-first factor) and ``u = sqrt(m) dv`` on a diagonal coordinate
+    (a star's factor is diagonal). Row ``i``'s dense part is ``Z = L^-1 P J^T`` at ``Z[(group * rows + i) * dofs + l]`` on
     coordinate ``offset + l`` (factor coordinates at the leaf-first positions of ``J``); its sparse part is two slots
     ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link)
     and ``Z_s = J_s / sqrt(m_s)`` at ``sparse_z[(base + i) * 2 + s]``. A row's velocity term is ``Z^T u``, its update
@@ -1687,10 +1661,8 @@ class LocalBlock(ResidualBlock):
     The owner's ``dense`` rows act on its ``dofs`` coordinates: one
     articulation's, then a paired free body's, each a diagonal block of ``H``
     with its staged factor (``factors``, in coordinate order). The block holds
-    the velocity in factor coordinates, block by block ``u = L^T P v``
-    (:meth:`enter` and :meth:`leave`), and each row whitened, ``Z = L^-1 P J^T``
-    block by block, staged in ``s_Z`` (row ``r`` from ``r * dofs``,
-    :meth:`respond`). With ``free``, the world's free-body rows (``free_count``,
+    each row whitened, ``Z = L^-1 P J^T`` block by block, staged in ``s_Z``
+    (row ``r`` from ``r * dofs``, :meth:`respond`). With ``free``, the world's free-body rows (``free_count``,
     :class:`FreeBodyZ` entries read in place, their ``mf_meta`` words from
     ``off_meta``) follow the dense rows in the block: they act on the paired
     free body, whose factor coordinates are the last block's, so a free row's
@@ -1700,10 +1672,11 @@ class LocalBlock(ResidualBlock):
     ``A[hi][lo] = Z_hi Z_lo`` (``hi >= lo``) at ``hi (hi + 1) / 2 + lo``, built
     lane-strided over the packed entries, each a sum in coordinate order from
     zero (:meth:`assemble`); either row of an entry reads it. The residuals
-    start at ``rhs + Z^T u``. The velocity is committed once after the sweeps,
-    ``u += sum_r Z_r applied_r`` over every row of the block in row order
-    (:meth:`commit`), then leaves factor coordinates. A view of the free-body
-    rows addresses them from block row ``first``.
+    start at the rows' right-hand sides, their incident velocities included.
+    The velocity change is committed once after the sweeps, ``u = sum_r Z_r
+    applied_r`` over every row of the block in row order (:meth:`commit`), then
+    leaves factor coordinates (:meth:`leave`). A view of the free-body rows
+    addresses them from block row ``first``.
     """
 
     dofs: int
@@ -1744,21 +1717,8 @@ class LocalBlock(ResidualBlock):
 
         return velocity
 
-    def enter(self, indent: str) -> str:
-        """The staged velocity enters factor coordinates, ``u = L^T P v`` block by block, a lane per coordinate
-        (:meth:`.CholeskySolve.enter_lanes`): every block's coordinates are formed, the lanes synchronize, then
-        stored in place."""
-        forms, stores = [], []
-        for block, (solve, offset) in enumerate(self._blocks()):
-            velocity = self._velocity(offset)
-            form, store = solve.enter_lanes(velocity, velocity, self.lanes.lane, self.lanes.width, f"entered_{block}")
-            forms.append(form)
-            stores.append(store)
-        lines = [*forms, self.lanes.sync(), *stores]
-        return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
-
     def leave(self, indent: str) -> str:
-        """The committed velocity leaves factor coordinates, ``v = P^T L^-T u`` in place, block ``b``'s back
+        """The committed velocity change leaves factor coordinates, ``dv = P^T L^-T u`` in place, block ``b``'s back
         substitution on lane ``b``."""
         lane, lines = self.lanes.lane, []
         for block, (solve, offset) in enumerate(self._blocks()):
@@ -1772,11 +1732,16 @@ class LocalBlock(ResidualBlock):
         ``reads[b]`` is coordinate ``i`` of the row's ``J`` on factor block
         ``b`` (native, in ``row`` and ``i``), whitened in registers by the
         block's forward solve and stored once. Declares ``active`` (some entry
-        of ``J`` is nonzero) and ``row_diagonal`` (``|Z|^2``, summed block by
-        block in coordinate order). The solves' loop variable shadows ``row``,
-        so the row's staged offset is bound first.
+        of ``J`` is nonzero), ``incident`` (``J v`` over the staged velocity,
+        summed block by block in coordinate order) and ``row_diagonal``
+        (``|Z|^2``, likewise). The solves' loop variable shadows ``row``, so
+        the row's staged offset is bound first.
         """
-        lines = [f"const int staged = row * {self.dofs};", "int active = 0;", "float row_diagonal = 0.0f;"]
+        lines = [
+            f"const int staged = row * {self.dofs};",
+            "int active = 0;",
+            "float row_diagonal = 0.0f, incident = 0.0f;",
+        ]
         blocks = list(self._blocks())
         if len(blocks) != len(reads):
             raise ValueError("one Jacobian read per factor block")
@@ -1792,6 +1757,7 @@ class LocalBlock(ResidualBlock):
                 f"    const float jacobian = {read};",
                 f"    {whitened('i')} = jacobian;",
                 "    if (jacobian != 0.0f) active = 1;",
+                f"    incident += jacobian * {self._velocity(offset)('i')};",
                 "}",
                 solve.whiten(whitened, whitened),
                 f"for (int i = 0; i < {solve.size}; ++i) {{",
@@ -1837,12 +1803,12 @@ class LocalBlock(ResidualBlock):
         return "\n".join(indent + line for line in "\n".join(lines).split("\n"))
 
     def assemble(self, rhs: Vector, indent: str) -> str:
-        """Start every row's residual at ``rhs + Z^T u`` (``s_res``, ``s_app`` cleared) and build ``A = Z^T Z``'s
+        """Start every row's residual at its right-hand side (``s_res``, ``s_app`` cleared) and build ``A = Z^T Z``'s
         lower triangle.
 
-        A dense row's terms run over the block's coordinates, a free-body row's over its bodies' six (:meth:`_free_terms`),
-        body ``a``'s side and then ``b``'s; a free-body row's response to a free-body column sums the column's
-        bodies acting on the row's body, ``Z`` against ``Z``.
+        A dense row's products run over the block's coordinates, a free-body row's over its bodies' six
+        (:meth:`_free_terms`), body ``a``'s side and then ``b``'s; a free-body row's response to a free-body column sums
+        the column's bodies acting on the row's body, ``Z`` against ``Z``.
         """
         lane, width, T, free = self.lanes.lane, self.lanes.width, self.dofs, self.free
         p = indent
@@ -1850,22 +1816,12 @@ class LocalBlock(ResidualBlock):
         lines = [f"{p}{{", f"{p}    const int block_rows = {self.rows};"]
         lines.append(f"{p}    for (int r = {lane}; r < block_rows; r += {width}) {{")
         if free is None:
-            lines += [
-                f"{p}        float residual = {dense_residual};",
-                f"{p}        for (int d = 0; d < {T}; ++d) residual += s_Z[r * {T} + d] * s_v[d];",
-            ]
+            lines.append(f"{p}        const float residual = {dense_residual};")
         else:
-            lines += [
-                f"{p}        float residual;",
-                f"{p}        if (r < {self.dense}) {{",
-                f"{p}            residual = {dense_residual};",
-                f"{p}            for (int d = 0; d < {T}; ++d) residual += s_Z[r * {T} + d] * s_v[d];",
-                f"{p}        }} else {{",
-                self._free_row(f"r - {self.dense}", "row", p + "            ", word=True),
-                f"{p}            residual = __int_as_float(row_meta.z);",
-                self._free_terms("residual", lambda side, d: f"s_v[{side} + {d}]", p + "            "),
-                f"{p}        }}",
-            ]
+            free_word = f"mf_meta.data[off_meta + (r - {self.dense}) * 4 + 2]"
+            lines.append(
+                f"{p}        const float residual = r < {self.dense} ? {dense_residual} : __int_as_float({free_word});"
+            )
         lines += [
             f"{p}        s_res[r] = residual;",
             f"{p}        s_app[r] = 0.0f;",
@@ -1916,13 +1872,13 @@ class LocalBlock(ResidualBlock):
         return "\n".join(lines)
 
     def commit(self, indent: str) -> str:
-        """``u += sum_r Z_r applied_r`` over every row of the block, in row order (zero terms included), the free rows'
+        """``u = sum_r Z_r applied_r`` over every row of the block, in row order (zero terms included), the free rows'
         on their body after the dense rows'; the caller then leaves factor coordinates (:meth:`leave`)."""
         lane, width, T, free = self.lanes.lane, self.lanes.width, self.dofs, self.free
         p = indent
         lines = [
             f"{p}for (int d = {lane}; d < {T}; d += {width}) {{",
-            f"{p}    float u = s_v[d];",
+            f"{p}    float u = 0.0f;",
             f"{p}    for (int r = 0; r < {self.dense}; ++r) u += s_Z[r * {T} + d] * s_app[r];",
         ]
         if free is not None:
@@ -1965,8 +1921,8 @@ class FactorComponent:
 class FactorRows(ResponseOperator):
     """Rows in factor coordinates: ``Z = L^-1 J^T`` over ``dofs`` coordinates (at most a warp), one lane each.
 
-    With ``H = L L^T`` and the factor velocity ``u = L^T v``, a row's velocity
-    term is ``J_i v = Z_i u`` and its response ``u += Z_i delta``: one row array
+    With ``H = L L^T`` and the velocity change ``u = L^T dv``, a row's velocity
+    term is ``J_i dv = Z_i u`` and its response ``u += Z_i delta``: one row array
     (``rows``, row ``i`` from ``base + i * dofs``) is both. Lane ``l`` holds
     coordinate ``l`` of ``u`` in the register ``velocity``, and of the rows it
     acts on in registers: the current row's (``current``), its friction
@@ -1975,8 +1931,8 @@ class FactorRows(ResponseOperator):
     :meth:`prefetch` and :meth:`consume`). A sum is one product per
     lane (zero past ``dofs``) reduced with ``SUM``; a pair's sums reduce in one
     ladder (:meth:`pair_terms`). The builder stores ``A_ii``; the step divides
-    by it. ``components``, the diagonal blocks of ``L``, map the velocity into
-    factor coordinates and back (:meth:`enter`, :meth:`leave`).
+    by it. ``components``, the diagonal blocks of ``L``, map the velocity
+    change back out of factor coordinates (:meth:`leave`).
     """
 
     dofs: int
@@ -2081,44 +2037,9 @@ class FactorRows(ResponseOperator):
         register = self.spin if row == "spin" else self.sibling
         return f"\n{indent}{self.velocity} += {register} * {delta};"
 
-    def _factor_product(self, source: str, out: str, indent: str, *, transposed: bool, declare: bool) -> str:
-        """``out = L source`` or ``L^T source`` per component in leaf-first positions (factor coordinate ``i`` on
-        lane ``size - 1 - i``), lane ``l`` summing its terms in increasing lane ``k``."""
-        lines = [f"{indent}float {out} = 0.0f;"] if declare else []
-        for component in self.components:
-            size, lane = component.size, component.lane
-            row, col = leaf_first(size, lane), leaf_first(size, "k")
-            if transposed:
-                terms, entry = f"k <= {lane}", component.element(col, row)
-            else:
-                terms, entry = f"{lane} <= k", component.element(row, col)
-            lines += [
-                "#pragma unroll",
-                f"{indent}for (int k = 0; k < {size}; ++k) {{",
-                f"{indent}    const float xk = READ({source}, {component.offset} + k);",
-                f"{indent}    if ({lane} >= 0 && {terms} && {lane} < {size})",
-                f"{indent}        {out} += {entry} * xk;",
-                f"{indent}}}",
-            ]
-        return "\n".join(lines)
-
-    def transposed(self, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = L^T P source`` per component (leaf-first positions): lane ``l`` adds the terms of the lanes ``k <=
-        l`` in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
-        return self._factor_product(source, out, indent, transposed=True, declare=declare)
-
-    def forward(self, source: str, out: str, indent: str, *, declare: bool = True) -> str:
-        """``out = L source`` per component (leaf-first positions): lane ``l`` adds the terms of the lanes ``k >= l``
-        in increasing order, each ``x_k`` read from its lane; ``out`` is declared zero (``declare``) or given so."""
-        return self._factor_product(source, out, indent, transposed=False, declare=declare)
-
     def lanes_of(self, indent: str) -> list[str]:
         """Lines declaring each component's lane (``LANE - offset``)."""
         return [f"{indent}const int {c.lane} = {self.lanes.lane} - {c.offset};" for c in self.components]
-
-    def enter(self, physical: str, indent: str) -> str:
-        """Declare each component's lane and ``velocity = L^T P physical`` (the factor velocity)."""
-        return "\n".join([*self.lanes_of(indent), self.transposed(physical, self.velocity, indent)])
 
     def leave(self, out: str, indent: str) -> str:
         """Declare ``out = P^T L^-T velocity`` (this lane's physical velocity): the components' back substitutions

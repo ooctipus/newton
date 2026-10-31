@@ -468,6 +468,7 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, velocit
         "world_row_parent": np.full((w_count, capacity), -1, np.int32),
         "world_row_mu": np.zeros((w_count, capacity), np.float32),
         "rhs_bias": np.zeros((w_count, capacity), np.float32),
+        "row_incident": rng.uniform(-0.1, 0.1, (w_count, capacity)).astype(np.float32),
         "world_diag": np.zeros((w_count, capacity), np.float32),
         "world_row_w": rng.uniform(0.6, 1.0, (w_count, capacity)).astype(np.float32),
         "world_impulses": np.zeros((w_count, capacity), np.float32),
@@ -775,6 +776,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         host["packed_Z"][:] = 0.0
         host["rhs_bias"][:] = 0.0
         host["rhs_bias"][:, 0] = 1.0e-6
+        host["row_incident"][:] = 0.0
         host["world_impulses"][:] = 0.0
         host["world_impulses"][:, 0] = 4.0
         host["mf_constraint_count"][:] = 0

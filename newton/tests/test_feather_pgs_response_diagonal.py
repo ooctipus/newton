@@ -30,6 +30,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import row_velocity
 
 
 def _build_mixed_response_model(
@@ -413,6 +414,15 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
     inverse = rows["inverse_mass"].reshape(worlds, dofs)
     rows["dense_L"] = np.stack([_diagonal_factor(inverse[w, diagonal:]) for w in range(worlds)])
     rows["dense_Z"] = (rows["dense_J"] * np.sqrt(inverse[:, None, diagonal:])).astype(np.float32)
+    # Each row's incident velocity J v over the fixture's velocity, and the limits' on their coordinates.
+    velocity = rows["velocity"].reshape(worlds, dofs)
+    incident = np.zeros((worlds, capacity))
+    for w in range(worlds):
+        offset = rows["dense_offsets"][w]
+        incident[w] = rows["dense_J"][w] @ velocity[w, offset : offset + dense].astype(np.float64)
+        for row, slot in np.argwhere(rows["sparse_dof"][w] >= 0):
+            incident[w, row] += rows["sparse_jy"][w, row, 2 * slot] * velocity[w, rows["sparse_dof"][w, row, slot]]
+    rows["row_incident"] = incident.astype(np.float32)
     rows["sparse_z"] = np.stack(
         [
             np.stack(
@@ -725,6 +735,7 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
             array(rows["bounds"], wp.int32),
             array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), wp.int32),
             array(rows["rhs"], wp.float32),
+            array(rng.normal(0.0, 0.3, rows["rhs"].shape).astype(np.float32), wp.float32),
             array(rows["diag"], wp.float32),
             impulses,
             array(rows["factor_rows"], wp.float32),
@@ -921,6 +932,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array((3,), dtype=wp.int32, device=device),
                 wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
                 wp.array(rhs, device=device),
+                wp.array(np.pad(row_velocity(jacobian[None], initial_velocity), ((0, 0), (0, 5))), device=device),
                 wp.array(diag, device=device),
                 impulses,
                 wp.array(row_type, device=device),
@@ -943,7 +955,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     device=device,
                 ),
                 wp.array(limit_active, device=device),
-                wp.array(limit_lower_rhs, device=device),
+                wp.array(limit_lower_rhs + initial_velocity[None], device=device),
                 wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
                 wp.array(inverse_mass, device=device),
                 cfm,
@@ -1023,6 +1035,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
                 wp.array(rhs, device=device),
+                wp.array(row_velocity(jacobian[None], initial_velocity), device=device),
                 wp.array(diag, device=device),
                 impulses,
                 wp.array(row_type, device=device),
@@ -1310,6 +1323,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(rows["row_count"], device=device),
                             wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device=device),
                             wp.array(rows["rhs"], device=device),
+                            wp.array(rows["row_incident"], device=device),
                             wp.array(rows["diag"], device=device),
                             impulses,
                             wp.array(rows["row_type"], device=device),
@@ -1327,8 +1341,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(schedule["sparse_row_dof"], device=device),
                             wp.array(rows["sparse_z"], device=device),
                             wp.array(rows["limit_active"], device=device),
-                            wp.array(rows["limit_lower_rhs"], device=device),
-                            wp.array(rows["limit_upper_rhs"], device=device),
+                            wp.array(rows["limit_lower_rhs"] + rows["velocity"].reshape(worlds, dofs), device=device),
+                            wp.array(rows["limit_upper_rhs"] - rows["velocity"].reshape(worlds, dofs), device=device),
                             wp.array(rows["inverse_mass"], device=device),
                             rows["cfm"],
                             iterations,
