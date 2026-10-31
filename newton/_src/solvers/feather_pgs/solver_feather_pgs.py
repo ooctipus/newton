@@ -2783,7 +2783,7 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.impulses,
                     self.placement.sparse_row_dof,
                     self.placement.sparse_row_factor,
-                    self.placement.sparse_row_incident,
+                    self.placement.row_incident,
                     self.placement.row_type,
                     self.placement.row_parent,
                     self.placement.row_mu,
@@ -3230,8 +3230,8 @@ class SolverFeatherPGS(SolverBase):
             for size, ctx in self.factor.for_sizes():
                 with ctx:
                     self.placement.response(size, self._plan.response[size].name)
-            packed_diag = self.placement.diagonals()
-            self.placement.pack_rows(write_diag=packed_diag)
+            packed_diag = self.placement.diagonals(self.v_hat)
+            self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
             self.placement.add_cfm()
             self._stage4_compute_rhs_world(dt)
 
@@ -3929,7 +3929,7 @@ class SolverFeatherPGS(SolverBase):
                             dense_rows,
                             self.placement.sparse_row_dof,
                             self.placement.sparse_row_factor,
-                            self.placement.sparse_row_incident,
+                            self.placement.row_incident,
                         ],
                         block_dim=128,
                         device=model.device,
@@ -4063,7 +4063,7 @@ class SolverFeatherPGS(SolverBase):
                         outputs=[
                             self.placement.sparse_row_dof,
                             self.placement.sparse_row_factor,
-                            self.placement.sparse_row_incident,
+                            self.placement.row_incident,
                             self.placement.sparse_row_support,
                         ],
                         block_dim=128,
@@ -4206,7 +4206,7 @@ class SolverFeatherPGS(SolverBase):
                             dense_rows,
                             self.placement.sparse_row_dof,
                             self.placement.sparse_row_factor,
-                            self.placement.sparse_row_incident,
+                            self.placement.row_incident,
                             self.placement.sparse_row_support,
                         ],
                         block_dim=128,
@@ -4349,7 +4349,7 @@ class SolverFeatherPGS(SolverBase):
                                 self._sparse_row_free_response
                                 if self.placement.sparse_contact_records is None
                                 else self.placement.sparse_contact_records,
-                                self.placement.sparse_row_incident,
+                                self.placement.row_incident,
                                 self.placement.sparse_row_support,
                             ],
                             extent=count,
@@ -4834,28 +4834,14 @@ class SolverFeatherPGS(SolverBase):
             return  # The sparse contact producer uses its projected incident velocity.
         if self.placement.row_packets is not None or self.placement.keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
-        sparse = self.placement.sparse_diagonal_contact_solve
-        dense_size = self.placement.sparse_diagonal_dense_size if sparse else 0
         wp.launch(
             apply_world_contact_restitution_matrix_free,
             dim=self.forest.world_count * self.placement.dense_max_constraints,
             inputs=[
                 bind_dense_rows(self.placement),
+                self.placement.row_incident,
                 self.placement.constraint_count,
                 self.placement.dense_max_constraints,
-                self.v_hat,
-                self.forest.world_dof_indices,
-                self.placement.row_support(),
-                self.placement.packed_J,
-                int(sparse),
-                self.placement.sparse_diagonal_dense_offsets,
-                self.placement.sparse_diagonal_dense_groups,
-                dense_size,
-                self.factor.L_by_size[dense_size] if sparse else self.placement.dummy_world_J,
-                self.placement.J_by_size[dense_size] if sparse else self.placement.dummy_world_J,
-                self.placement.sparse_diagonal_row_dof,
-                self.placement.sparse_diagonal_row_z,
-                self.factor.diagonal_inverse_mass,
                 dt,
                 self.laws.effective_restitution_velocity_threshold,
                 int(self.laws.set.weighted),

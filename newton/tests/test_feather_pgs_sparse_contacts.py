@@ -28,7 +28,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import group_rows, row_velocity
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -540,12 +540,9 @@ class TestSparseContacts(unittest.TestCase):
                         dim=9,
                         inputs=[
                             reference_rows,
+                            array(row_velocity(dense.numpy(), f["velocity"].numpy())),
                             count,
                             9,
-                            f["velocity"],
-                            array([np.arange(6)], int),
-                            *packed_world_rows(dense.numpy(), device),
-                            *world_restitution_layout(device),
                             0.01,
                             law["restitution_threshold"],
                             0,
@@ -900,12 +897,9 @@ class TestSparseContacts(unittest.TestCase):
                     rhs=rhs,
                     row_w=_full((1, row_count), 1.0),
                 ),
+                incident,
                 count,
                 row_count,
-                _array(incident.numpy()[0]),
-                _array([np.arange(row_count)], int),
-                *packed_world_rows(np.eye(row_count)[None], "cpu"),
-                *world_restitution_layout("cpu"),
                 0.01,
                 0.1,
                 0,

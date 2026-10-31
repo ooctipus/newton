@@ -15,7 +15,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import dense_rows, field_group, kernels, response_builds_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton.tests.feather_pgs_law_harness import contact_input, packed_world_rows
+from newton.tests.feather_pgs_law_harness import contact_input
 from newton.tests.feather_pgs_patch_parity import row_law
 
 
@@ -176,10 +176,9 @@ def _expected(values, active_count):
 
 
 class TestSparseDiagonalWhitenedRows(unittest.TestCase):
-    def test_restitution_reads_jv_through_the_whitened_rows(self):
-        """The invariant |J v - Z^T u|: restitution's incident velocity of a sparse-diagonal row, read from the whitened
-        rows with the velocity entered (``u = L^T P v`` on the dense part, ``sqrt(m) v`` on a slot), is the one the
-        physical Jacobian gives."""
+    def test_incident_velocity_is_the_jacobian_s(self):
+        """The rows' build forms each row's incident velocity ``J v``, its dense part's ``J`` while in hand and its
+        slots' ``Z_s (v / s)``, the one the physical Jacobian gives, and restitution bounces from it."""
         rng = np.random.default_rng(7)
         worlds, rows, dense, diagonal = 3, 5, 4, 3
         dofs = dense + diagonal
@@ -187,28 +186,53 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
         inverse = rng.uniform(0.3, 2.0, worlds * dofs).astype(np.float32)
         velocity = rng.normal(size=worlds * dofs).astype(np.float32)
         factors = np.zeros((worlds, dense, dense), np.float32)
-        Z = np.zeros((worlds, rows, dense), np.float32)
+        jacobian = np.zeros((worlds, rows, dense), np.float32)
         sparse_dof = np.full((worlds, rows, 2), -1, np.int32)
         sparse_z = np.zeros((worlds, rows, 2), np.float32)
         jv = np.zeros((worlds, rows))
         for w in range(worlds):
             a = rng.normal(size=(dense, dense))
             mass = a @ a.T + dense * np.eye(dense)
-            L = np.linalg.cholesky(mass[::-1, ::-1])  # the leaf-first factor: P H P^T = L L^T
-            factors[w] = L
+            factors[w] = np.linalg.cholesky(mass[::-1, ::-1])  # the leaf-first factor: P H P^T = L L^T
             block = [offsets[w] + k for k in range(dense)]
             others = [d for d in range(dofs) if d not in block]
             v = velocity[w * dofs : (w + 1) * dofs].astype(np.float64)
             for r in range(rows):
-                J = rng.normal(size=dense)
-                Z[w, r] = np.linalg.solve(L, J[::-1])[::-1]
-                jv[w, r] = J @ v[block]
+                jacobian[w, r] = rng.normal(size=dense)
+                jv[w, r] = jacobian[w, r] @ v[block]
                 for slot, coordinate in enumerate(rng.choice(others, size=2, replace=False)[: 1 + r % 2]):
                     value = rng.normal()
                     sparse_dof[w, r, slot] = coordinate
                     sparse_z[w, r, slot] = value * np.sqrt(inverse[w * dofs + coordinate])
                     jv[w, r] += value * v[coordinate]
         rhs = np.full((worlds, rows), -7.0, np.float32)
+        counts = wp.full(worlds, rows, dtype=wp.int32, device="cpu")
+        Z = wp.array(jacobian, device="cpu")
+        incident = wp.zeros((worlds, rows), dtype=wp.float32, device="cpu")
+        wp.launch(
+            response_builds_rows.sparse_pair_whiten_kernel(),
+            dim=worlds * rows,
+            inputs=[
+                wp.array(factors, device="cpu"),
+                wp.array(np.arange(worlds, dtype=np.int32), device="cpu"),
+                wp.array(offsets, device="cpu"),
+                wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device="cpu"),
+                counts,
+                wp.zeros((worlds, 2), dtype=wp.int32, device="cpu"),
+                0,
+                rows,
+                rows,
+                dense,
+                wp.array(sparse_dof, device="cpu"),
+                wp.array(sparse_z, device="cpu"),
+                wp.zeros((worlds, rows), dtype=wp.float32, device="cpu"),
+                wp.array(inverse, device="cpu"),
+                wp.array(velocity, dtype=wp.float32, device="cpu"),
+            ],
+            outputs=[Z, wp.zeros((worlds, rows), dtype=wp.float32, device="cpu"), incident],
+            device="cpu",
+        )
+        np.testing.assert_allclose(incident.numpy(), jv, rtol=2e-5, atol=2e-6)
         records = field_group.upload(
             dense_rows.DenseRows,
             "cpu",
@@ -222,26 +246,7 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
         wp.launch(
             kernels.apply_world_contact_restitution_matrix_free,
             dim=worlds * rows,
-            inputs=[
-                records,
-                wp.full(worlds, rows, dtype=wp.int32, device="cpu"),
-                rows,
-                wp.array(velocity, dtype=wp.float32, device="cpu"),
-                wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device="cpu"),
-                *packed_world_rows(np.zeros((1, 1, 1)), "cpu"),
-                1,
-                wp.array(offsets, device="cpu"),
-                wp.array(np.arange(worlds, dtype=np.int32), device="cpu"),
-                dense,
-                wp.array(factors, device="cpu"),
-                wp.array(Z, device="cpu"),
-                wp.array(sparse_dof, device="cpu"),
-                wp.array(sparse_z, device="cpu"),
-                wp.array(inverse, device="cpu"),
-                0.01,
-                0.0,
-                0,
-            ],
+            inputs=[records, incident, counts, rows, 0.01, 0.0, 0],
             device="cpu",
         )
         # A restitutive impact: rhs = e * J v (target 0, the threshold 0 admits every approaching row).

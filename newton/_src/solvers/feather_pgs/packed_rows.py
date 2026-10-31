@@ -10,8 +10,8 @@ entries ascend with the world's coordinates. An entry's world coordinate is not 
 sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
 
 * the row's Jacobian ``J`` (``packed_J``), which the row producers write at the row's sides
-  (:func:`.dense_rows.jacobian_row`) and the velocity terms outside the sweeps read with the physical velocity
-  (:func:`.kernels.world_contact_row_dot`);
+  (:func:`.dense_rows.jacobian_row`), the build reads for the row's incident velocity ``J v_hat`` (``row_incident``)
+  and the diagnostics read with the physical velocity (:func:`.kernels.world_contact_row_dot`);
 * its whitened form ``Z = L^-1 P J^T`` (``packed_Z``) through the side's leaf-first factor ``L``, in the kit's
   positions: factor coordinate ``i`` of a side at its entry ``n - 1 - i``
   (:class:`.response_operator.CholeskySolve`).
@@ -105,8 +105,8 @@ def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_cou
 
 def _pack_abi(sizes: tuple[int, ...]) -> tuple:
     """The rows' build: each side size's factors (``L_<n>``), every row's sides and the articulations' sizes, group
-    indices and first world coordinates, the rows per world and their owners (the worlds other sweeps own skipped:
-    :func:`_skipped`), the rows' ``cfm``, the packed rows and the diagonal."""
+    indices and first coordinates, the rows per world and their owners (the worlds other sweeps own skipped:
+    :func:`_skipped`), the rows' ``cfm``, the predictor, the packed rows, the diagonal and the incident velocity."""
     factors = [(f"L_{n}", wp.array3d[float]) for n in sizes]
     return kernel_template.params(
         *factors,
@@ -114,17 +114,21 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
         ("response_dofs", wp.array[int]),
         ("art_group", wp.array[int]),
         ("articulation_world_dof_offset", wp.array[int]),
+        ("articulation_dof_start", wp.array[int]),
         ("world_constraint_count", wp.array[int]),
         ("mf_constraint_count", wp.array[int]),
         ("skip_rows_le", int),
         ("local_solve_owner", wp.array[int]),
         ("skip_local", int),
+        ("rows_elsewhere", int),
         ("world_row_cfm", wp.array2d[float]),
         ("dense", int),
         ("write_diag", int),
+        ("v_hat", wp.array[float]),
         ("packed_J", wp.array3d[float]),
         ("packed_Z", wp.array3d[float]),
         ("world_diag", wp.array2d[float]),
+        ("row_incident", wp.array2d[float]),
     )
 
 
@@ -145,9 +149,9 @@ thread-local row."""
 
 
 def _side(n: int) -> str:
-    """A side of ``n`` coordinates on its row's thread: load its Jacobian, whiten it in registers
-    (:class:`.CholeskySolve`, Z0: a zero diagonal gives zero), store it and add its squares to ``norm`` in entry
-    order."""
+    """A side of ``n`` coordinates on its row's thread: load its Jacobian and add ``J v_hat`` to ``incident`` in entry
+    order, then, unless the row's world ``keeps`` it, whiten it in registers (:class:`.CholeskySolve`, Z0: a zero
+    diagonal gives zero), store it and add its squares to ``norm`` in entry order."""
 
     def L(row, col):
         return f"L_{n}.data[((size_t)group * {n} + ({row})) * {n} + ({col})]"
@@ -158,23 +162,30 @@ def _side(n: int) -> str:
     return f"""        if (n == {n}) {{
             float z[{n}];
             {pragma}
-            for (int e = 0; e < {n}; ++e) z[e] = packed_J.data[base + e];
-{solve.whiten(lambda i: f"z[{i}]", lambda i: f"z[{i}]")}
-            {pragma}
             for (int e = 0; e < {n}; ++e) {{
-                packed_Z.data[base + e] = z[e];
-                norm += z[e] * z[e];
+                z[e] = packed_J.data[base + e];
+                incident += z[e] * v_hat.data[start + e];
+            }}
+            if (!keeps) {{
+{solve.whiten(lambda i: f"z[{i}]", lambda i: f"z[{i}]")}
+                {pragma}
+                for (int e = 0; e < {n}; ++e) {{
+                    packed_Z.data[base + e] = z[e];
+                    norm += z[e] * z[e];
+                }}
             }}
         }}"""
 
 
 @functools.cache
 def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
-    """Whiten every world's rows, one thread per world row (``dim = worlds * rows``): each side's Jacobian, which its
-    producer wrote packed, whitened on the thread (Z0: a zero diagonal gives zero) and stored, each entry once; pad
-    the row past its sides (zero values); and, in the worlds the general solver owns, store its diagonal by
-    ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner adds ``cfm`` after), 2 ``|Z|^2 + cfm``, the squares summed
-    in entry order.
+    """The rows' pass, one thread per world row (``dim = worlds * rows``): each side's Jacobian, which its producer
+    wrote packed, gives the row's incident velocity ``J v_hat`` in entry order and is whitened on the thread (Z0: a
+    zero diagonal gives zero) and stored, each entry once; pad the row past its sides (zero values); and, in the worlds
+    the general solver owns, store its diagonal by ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner adds ``cfm``
+    after), 2 ``|Z|^2 + cfm``, the squares summed in entry order. A world another sweep whitens in the kernel
+    (:func:`_skipped`) keeps its rows and gets their incident velocity alone; with ``rows_elsewhere`` (keyed rows, row
+    packets) its rows are not here at all.
 
     ``sizes`` are the side sizes with a dense factor (each a ``L_<n>``); a side of another size is left as it is.
     Consecutive threads hold one world's rows, so a side's factor reads are the same address across a warp.
@@ -186,23 +197,27 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     const int world = tid / capacity;
     const int slot = tid - world * capacity;
     if (world >= world_constraint_count.shape[0] || slot >= world_constraint_count.data[world]) return;
-    if ({_skipped("world")}) return;
+    const bool keeps = {_skipped("world")};
+    if (keeps && rows_elsewhere != 0) return;
     const wp::vec2i sides = row_sides.data[tid];
     const int support = packed_Z.shape[2];
     // Each side's entries [first, first + n): after the previous side's, or at its coordinates (dense).
     int first[2] = {{0, 0}}, count[2] = {{0, 0}};
-    float norm = 0.0f;
+    float norm = 0.0f, incident = 0.0f;
     for (int side = 0; side < 2; ++side) {{
         const int art = sides[side];
         if (art < 0) continue;
         const int n = response_dofs.data[art];
         const int group = art_group.data[art];
         const int offset = articulation_world_dof_offset.data[art];
+        const int start = articulation_dof_start.data[art];
         count[side] = n;
         first[side] = dense != 0 ? offset : side == 0 ? 0 : count[0];
         const size_t base = (size_t)tid * support + first[side];
 {sides}
     }}
+    row_incident.data[tid] = incident;
+    if (keeps) return;
     for (int e = 0; e < support; ++e) {{
         if ((e >= first[0] && e < first[0] + count[0]) || (e >= first[1] && e < first[1] + count[1])) continue;
         packed_J.data[(size_t)tid * support + e] = 0.0f;

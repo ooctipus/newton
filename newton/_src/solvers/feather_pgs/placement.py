@@ -1247,7 +1247,7 @@ class Placement:
             device=self.model.device,
         )
 
-    def pack_rows(self, *, write_diag: int) -> None:
+    def pack_rows(self, v_hat: wp.array, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
         (:func:`.packed_rows.pack_kernel`, one launch; :meth:`diagonals`)."""
         if not self.mf_sweeps:
@@ -1269,20 +1269,23 @@ class Placement:
                 self.forest.articulation_response_dof_count,
                 self.forest.art_group_idx,
                 self.forest.articulation_world_dof_offset,
+                self.forest.articulation_dof_start,
                 self.constraint_count,
                 self.mf_count_or_dummy(),
                 skip,
                 self.local_solve_owner,
                 skip_local,
+                int(self.row_packets is not None or self.keyed_rows is not None),
                 self.row_cfm,
                 int(self.packed_dense),
                 write_diag,
+                v_hat,
             ],
-            outputs=[self.packed_J, self.packed_Z, self.diag],
+            outputs=[self.packed_J, self.packed_Z, self.diag, self.row_incident],
             device=self.model.device,
         )
 
-    def diagonals(self) -> int:
+    def diagonals(self, v_hat: wp.array) -> int:
         """The dense rows' diagonals of the matrix-free route, by their owner; what the packed rows' build owes
         (:meth:`pack_rows`, :func:`.packed_rows.pack_kernel`'s ``write_diag``): 0 nothing, 1 ``|Z|^2``, 2
         ``|Z|^2 + cfm``."""
@@ -1303,6 +1306,8 @@ class Placement:
                 inputs=[
                     self.factor.L_by_size[size],
                     self.sparse_diagonal_dense_groups,
+                    self.sparse_diagonal_dense_offsets,
+                    self.forest.world_dof_indices,
                     self.constraint_count,
                     self.dense_phase_bounds,
                     int(self.compact_contact_boundary),
@@ -1312,8 +1317,10 @@ class Placement:
                     self.sparse_diagonal_row_dof,
                     self.sparse_diagonal_row_z,
                     self.row_cfm,
+                    self.factor.diagonal_inverse_mass,
+                    v_hat,
                 ],
-                outputs=[self.J_by_size[size], self.diag],
+                outputs=[self.J_by_size[size], self.diag, self.row_incident],
                 device=self.model.device,
             )
             return 0

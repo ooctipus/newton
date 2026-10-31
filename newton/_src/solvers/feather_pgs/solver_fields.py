@@ -120,6 +120,7 @@ instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) placeholder."""
 
 DENSE_ROWS = FieldGroup(
     Field("rhs", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_incident", wp.float32, ("world", "row"), owner="placement"),
     Field("impulses", wp.float32, ("world", "row"), owner="placement"),
     Field("diag", wp.float32, ("world", "row"), owner="placement"),
     Field("row_type", wp.int32, ("world", "row"), owner="placement"),
@@ -133,7 +134,9 @@ DENSE_ROWS = FieldGroup(
     Field("constraint_count", wp.int32, ("world",), owner="placement"),
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
-"""Every world's dense rows: the system and the row records (with each row's sides)."""
+"""Every world's dense rows: the system and the row records (with each row's sides). ``row_incident`` is each row's
+incident velocity ``J v_hat``, written where its ``J`` is in registers: its producer, or the rows' pass
+(:func:`.packed_rows.pack_kernel`)."""
 
 DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
 """Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
@@ -228,11 +231,10 @@ SPARSE_FACTOR = FieldGroup(
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
     Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),
-    Field("sparse_row_incident", wp.float32, ("world", "row"), fill=None, owner="placement"),
     Field("sparse_factor_velocity_delta", wp.float32, ("world", "world_dof"), fill=None, owner="placement"),
 )
-"""Each sparse row's factor coordinates (unless the support table holds them), factor entries and incident
-velocity, and each world's factor velocity change."""
+"""Each sparse row's factor coordinates (unless the support table holds them) and factor entries, and each world's
+factor velocity change."""
 
 SPARSE_CONTACT_RECORDS = FieldGroup(
     Field("sparse_contact_records", wp.float32, ("world", "triplet", "record"), owner="placement")

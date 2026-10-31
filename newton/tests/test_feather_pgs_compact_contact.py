@@ -59,6 +59,7 @@ OUTPUTS = (
     "sparse_dof",
     "sparse_z",
     "diag",
+    "row_incident",
 )
 
 
@@ -125,6 +126,7 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), rows=(3,) * 8):
     data.material_restitution = array(np.linspace(0, 0.7, 12, dtype=np.float32), float)
     data.max_depenetration_velocity = array(np.full(data.body_q.shape[0], np.inf, dtype=np.float32), float)
     data.inverse_mass = array(np.linspace(0.1, 0.9, 240, dtype=np.float32), float)
+    data.incident = array(rng.normal(size=240).astype(np.float32), float)
     data.dense_group = array([1, 0], int)
     factor = np.tril(rng.normal(0, 0.1, (2, 6, 6))).astype(np.float32)
     for group in range(2):
@@ -143,9 +145,36 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), rows=(3,) * 8):
         setattr(data, name, wp.full(shape, -777 if dtype is int else float("nan"), dtype=dtype, device=device))
     # The general producers record each row's sides (the packed placement's).
     data.sides = wp.zeros((2, 40), dtype=wp.vec2i, device=device)
+    # Each world's coordinates: its dense six, then its star (data.dof_offset), from its first global coordinate.
+    data.world_dof_indices = array(np.arange(114, dtype=np.int32) + 120 * np.arange(2, dtype=np.int32)[:, None], int)
     counts = array([prefix[w] + int(np.sum(rows[: kept[w]])) for w in range(2)], int)
     bounds = array([[p, p] for p in prefix], int)
     return data, SimpleNamespace(counts=counts, bounds=bounds, device=device)
+
+
+def whiten_inputs(data, aux, *, prefix_only=1, rows=12):
+    """The operands of :func:`.response_builds_rows.sparse_pair_whiten_kernel` over the fixture's rows, then its
+    outputs."""
+    return [
+        data.factor,
+        data.dense_group,
+        wp.zeros(2, dtype=int, device=aux.device),
+        data.world_dof_indices,
+        aux.counts,
+        aux.bounds,
+        prefix_only,
+        rows,
+        40,
+        6,
+        data.sparse_dof,
+        data.sparse_z,
+        data.row_cfm,
+        data.inverse_mass,
+        data.incident,
+        data.Z,
+        data.diag,
+        data.row_incident,
+    ]
 
 
 def install_prefix(data, aux):
@@ -246,15 +275,6 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "sparse_row_z": data.sparse_z,
         "world_constraint_count": aux.counts,
         "max_constraints": 40,
-        "rows": 40,
-        "L_group": data.factor,
-        "dense_groups": data.dense_group,
-        "dense_phase_bounds": aux.bounds,
-        "prefix_only": 0,
-        "n_dofs": 6,
-        "row_cfm": data.row_cfm,
-        "Z_group": data.Z,
-        "world_diag": data.diag,
     }
 
     values["support"] = group_rows(aux.device)
@@ -267,7 +287,12 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
     launch(kernels.populate_world_J_for_compact_size, (16, 32))
     values["target_size"] = 108
     launch(response_builds_rows.sparse_pair_contact_rows_kernel, 16)
-    launch(response_builds_rows.sparse_pair_whiten_kernel(), 80)
+    wp.launch(
+        response_builds_rows.sparse_pair_whiten_kernel(),
+        dim=80,
+        inputs=whiten_inputs(data, aux, prefix_only=0, rows=40),
+        device=aux.device,
+    )
 
 
 def run_candidate(data, aux, law=None):
@@ -288,23 +313,7 @@ def run_candidate(data, aux, law=None):
     # One thread per row: three per contact.
     wp.launch(compact.produce_contacts, dim=(16, 3), inputs=[*structs(data), law], device=aux.device)
     wp.launch(
-        response_builds_rows.sparse_pair_whiten_kernel(),
-        dim=2 * 12,
-        inputs=[
-            data.factor,
-            data.dense_group,
-            aux.counts,
-            aux.bounds,
-            1,
-            12,
-            40,
-            6,
-            data.sparse_dof,
-            data.sparse_z,
-            data.row_cfm,
-        ],
-        outputs=[data.Z, data.diag],
-        device=aux.device,
+        response_builds_rows.sparse_pair_whiten_kernel(), dim=2 * 12, inputs=whiten_inputs(data, aux), device=aux.device
     )
 
 
@@ -1103,20 +1112,7 @@ class TestCompactContact(unittest.TestCase):
                     wp.launch(
                         response_builds_rows.sparse_pair_whiten_kernel(),
                         dim=2 * 12,
-                        inputs=[
-                            candidate.factor,
-                            candidate.dense_group,
-                            aux.counts,
-                            aux.bounds,
-                            1,
-                            12,
-                            40,
-                            6,
-                            candidate.sparse_dof,
-                            candidate.sparse_z,
-                            candidate.row_cfm,
-                        ],
-                        outputs=[candidate.Z, candidate.diag],
+                        inputs=whiten_inputs(candidate, aux),
                         device=device,
                     )
                 graphs.append(capture.graph)

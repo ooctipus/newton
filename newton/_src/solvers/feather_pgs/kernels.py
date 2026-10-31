@@ -2288,46 +2288,6 @@ def clear_sparse_diagonal_response_prefix(
 
 
 @wp.func
-def sparse_diagonal_row_dot(
-    world: int,
-    row: int,
-    velocity: wp.array[float],
-    world_dof_indices: wp.array2d[int],
-    dense_offsets: wp.array[int],
-    dense_groups: wp.array[int],
-    dense_dofs: int,
-    dense_L: wp.array3d[float],
-    dense_Z: wp.array3d[float],
-    sparse_row_dof: wp.array3d[int],
-    sparse_row_z: wp.array3d[float],
-    diagonal_inverse_mass: wp.array[float],
-):
-    """``J v`` of one sparse-diagonal row with a global velocity state, from its whitened entries: ``Z^T u``, the
-    velocity entered on the fly, ``u = L^T P v`` on the compact dense part (factor coordinate ``k`` at position
-    ``dense_dofs - 1 - k``, each coordinate's terms from zero, ascending) and ``u = v / s`` on a slot's coordinate
-    (``s = m^-1/2``)."""
-    out = float(0.0)
-    dense_offset = dense_offsets[world]
-    group = dense_groups[world]
-    for k in range(dense_dofs):
-        u = float(0.0)
-        for j in range(k, dense_dofs):
-            global_dof = world_dof_indices[world, dense_offset + dense_dofs - 1 - j]
-            if global_dof >= 0:
-                u += dense_L[group, j, k] * velocity[global_dof]
-        out += dense_Z[group, row, dense_dofs - 1 - k] * u
-    for sparse_slot in range(2):
-        world_dof = sparse_row_dof[world, row, sparse_slot]
-        if world_dof >= 0:
-            global_dof = world_dof_indices[world, world_dof]
-            if global_dof >= 0:
-                scale = wp.sqrt(diagonal_inverse_mass[global_dof])
-                if scale > 0.0:
-                    out += sparse_row_z[world, row, sparse_slot] * (velocity[global_dof] / scale)
-    return out
-
-
-@wp.func
 def world_contact_row_dot(
     world_dof_indices: wp.array2d[int],
     support: RowSupport,
@@ -2738,30 +2698,16 @@ def compute_world_contact_bias(
 @wp.kernel
 def apply_world_contact_restitution_matrix_free(
     rows: DenseRows,
+    row_incident: wp.array2d[float],
     world_constraint_count: wp.array[int],
     max_constraints: int,
-    world_incident_velocity: wp.array[float],
-    world_dof_indices: wp.array2d[int],
-    row_support: RowSupport,
-    packed_J: wp.array3d[float],
-    sparse_diagonal: int,
-    dense_offsets: wp.array[int],
-    dense_groups: wp.array[int],
-    dense_dofs: int,
-    dense_L: wp.array3d[float],
-    dense_Z: wp.array3d[float],
-    sparse_row_dof: wp.array3d[int],
-    sparse_row_z: wp.array3d[float],
-    diagonal_inverse_mass: wp.array[float],
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
 ):
-    """Replace a matrix-free contact bias with a one-shot restitution target.
+    """Replace a matrix-free contact bias with a one-shot restitution target from the row's incident velocity.
 
-    The row's incident velocity is its packed Jacobian row's (:func:`world_contact_row_dot`), or under the
-    ``sparse_diagonal`` owner its whitened row's against the entered velocity (:func:`sparse_diagonal_row_dot`). Matrix-free GS adds live J*v itself, so the row stores only
-    ``-target + e*u_incident``.
+    Matrix-free GS adds live J*v itself, so the row stores only ``-target + e*u_incident``.
     """
     tid = wp.tid()
     world = tid // max_constraints
@@ -2771,28 +2717,8 @@ def apply_world_contact_restitution_matrix_free(
     restitution = rows.restitution[world, i]
     if restitution <= 0.0:
         return
-    relative_incident = float(0.0)
-    if sparse_diagonal != 0:
-        relative_incident = sparse_diagonal_row_dot(
-            world,
-            i,
-            world_incident_velocity,
-            world_dof_indices,
-            dense_offsets,
-            dense_groups,
-            dense_dofs,
-            dense_L,
-            dense_Z,
-            sparse_row_dof,
-            sparse_row_z,
-            diagonal_inverse_mass,
-        )
-    else:
-        relative_incident = world_contact_row_dot(
-            world_dof_indices, row_support, packed_J, world_incident_velocity, world, i
-        )
     target_vel = rows.target[world, i]
-    relative_incident -= target_vel
+    relative_incident = row_incident[world, i] - target_vel
     fires, bounce = contact_restitution_rhs(
         rows.phi[world, i], relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
     )

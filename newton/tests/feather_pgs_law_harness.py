@@ -699,23 +699,15 @@ def local_packed_rows(device, art_world, rows_by_art) -> list:
     ]
 
 
-def world_row_support(worlds: int, rows: int, coordinates: int, device) -> RowSupport:
-    """Every row on its world's one articulation of ``coordinates`` coordinates, laid out dense: entry ``e`` at
-    coordinate ``e`` (the packed rows of a dense world-layout Jacobian)."""
-    sides = np.full((worlds, rows, 2), -1, dtype=np.int32)
-    sides[..., 0] = np.arange(worlds, dtype=np.int32)[:, None]
-    return row_support(sides, [coordinates] * worlds, [0] * worlds, 1, device, worlds=np.arange(worlds))
-
-
-def packed_world_rows(world_jacobian, device) -> list:
-    """Packed rows (:mod:`.packed_rows`) of a dense world-layout Jacobian ``[world, row, coordinate]``: every entry at its
-    own coordinate, as ``(row_support, packed_J)``."""
-    world_jacobian = np.asarray(world_jacobian, dtype=np.float32)
-    worlds, rows, coordinates = world_jacobian.shape
-    return [
-        world_row_support(worlds, rows, coordinates, device),
-        wp.array(world_jacobian, dtype=wp.float32, device=device),
-    ]
+def row_velocity(jacobian, velocity) -> np.ndarray:
+    """``J v`` of rows ``[world, row, coordinate]`` over a velocity by global coordinate (each world's coordinates in
+    turn), float32, summed in entry order from zero: the rows' incident velocity as their pass forms it."""
+    jacobian = np.asarray(jacobian, dtype=np.float32)
+    velocity = np.asarray(velocity, dtype=np.float32).reshape(jacobian.shape[0], jacobian.shape[2])
+    out = np.zeros(jacobian.shape[:2], dtype=np.float32)
+    for coordinate in range(jacobian.shape[2]):
+        out += jacobian[:, :, coordinate] * velocity[:, coordinate, None]
+    return out
 
 
 _FACTOR_STORAGE = []
@@ -795,22 +787,6 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
                 # Leaf-first positions: factor coordinate i is the side's coordinate n - 1 - i.
                 response[world, row, coordinates] = np.linalg.solve(L.T, Z[world, row, held][::-1])[::-1]
     return jacobian, response
-
-
-def world_restitution_layout(device) -> list:
-    """The sparse-diagonal operands of ``kernels.apply_world_contact_restitution_matrix_free`` after ``packed_J``,
-    for a packed row (``sparse_diagonal`` 0): never read."""
-    return [
-        0,
-        wp.zeros(1, dtype=wp.int32, device=device),
-        wp.zeros(1, dtype=wp.int32, device=device),
-        0,
-        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
-        wp.zeros((1, 1, 1), dtype=wp.float32, device=device),
-        wp.full((1, 1, 2), -1, dtype=wp.int32, device=device),
-        wp.zeros((1, 1, 2), dtype=wp.float32, device=device),
-        wp.zeros(1, dtype=wp.float32, device=device),
-    ]
 
 
 def call(kernel, dim, device, **values):

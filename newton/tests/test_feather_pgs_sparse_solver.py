@@ -305,7 +305,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for name in STATE_FIELDS:
             self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
         counts, impulses = solver.placement.constraint_count.numpy(), solver.placement.impulses.numpy()
-        incidence, rhs = solver.placement.sparse_row_incident.numpy(), solver.placement.rhs.numpy()
+        incidence, rhs = solver.placement.row_incident.numpy(), solver.placement.rhs.numpy()
         v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
         for world in range(solver.forest.world_count):
             count = int(counts[world])
@@ -375,7 +375,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         ]
         # The dense route's rows are packed (packed_rows): they move with their row slots.
         packed = ["packed_J", "packed_Z", "row_sides"]
-        names += ["sparse_row_dof", "sparse_row_factor", "sparse_row_incident"] if sparse else packed
+        names += ["sparse_row_dof", "sparse_row_factor", "row_incident"] if sparse else packed
         arrays = {name: getattr(solver.placement, name).numpy() for name in names}
         dense_jacobian = None if sparse else unpacked_rows(solver)[0]
         worlds, slots, needed = (

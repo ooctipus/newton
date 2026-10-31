@@ -108,7 +108,7 @@ class RowOrder:
             "row_restitution",
             "sparse_row_dof",
             "sparse_row_factor",
-            "sparse_row_incident",
+            "row_incident",
         )
         self.arrays = [
             (getattr(solver.placement, name), wp.empty_like(getattr(solver.placement, name))) for name in names

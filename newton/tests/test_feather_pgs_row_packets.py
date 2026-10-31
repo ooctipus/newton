@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, packed_world_rows, world_restitution_layout
+from newton.tests.feather_pgs_law_harness import group_rows, row_velocity
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -242,11 +242,9 @@ def _run_general(data, layout, beta):
         kernels.apply_world_contact_restitution_matrix_free,
         dim=WORLDS * ROWS,
         inputs=[
-            *(records, layout.counts, ROWS),
-            data.incident,
-            wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
-            *packed_world_rows(world_jacobian, device),
-            *world_restitution_layout(device),
+            records,
+            wp.array(row_velocity(world_jacobian, data.incident.numpy()), dtype=float, device=device),
+            *(layout.counts, ROWS),
             *(data.dt, data.restitution_threshold, 0),
         ],
         device=device,

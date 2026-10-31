@@ -27,6 +27,7 @@ from newton.tests.test_feather_pgs_compact_contact import (
     install_prefix,
     run_original,
     structs,
+    whiten_inputs,
 )
 
 
@@ -53,23 +54,7 @@ def publish(data, aux):
     clear(data, aux)
     produce(data, aux)
     wp.launch(
-        response_builds_rows.sparse_pair_whiten_kernel(),
-        dim=2 * 12,
-        inputs=[
-            data.factor,
-            data.dense_group,
-            aux.counts,
-            aux.bounds,
-            1,
-            12,
-            40,
-            6,
-            data.sparse_dof,
-            data.sparse_z,
-            data.row_cfm,
-        ],
-        outputs=[data.Z, data.diag],
-        device=aux.device,
+        response_builds_rows.sparse_pair_whiten_kernel(), dim=2 * 12, inputs=whiten_inputs(data, aux), device=aux.device
     )
 
 

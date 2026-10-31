@@ -510,9 +510,10 @@ COMPACT_BOUNDARY = (
     Field("Z", wp.float32, ("group", "row", 6), owner="six"),
     Field("sparse_dof", wp.int32, ("world", "row", 2), attr="sparse_diagonal_row_dof", owner="placement"),
     Field("sparse_z", wp.float32, ("world", "row", 2), attr="sparse_diagonal_row_z", owner="placement"),
+    Field("row_incident", wp.float32, ("world", "row"), owner="placement"),
 )
 """What the compact boundary producer writes besides the contact input's row records: each row's whitened dense-six
-part (by the six-DOF size group's factor) and its two whitened sparse slots."""
+part (by the six-DOF size group's factor), its two whitened sparse slots and its incident velocity."""
 
 CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name__)
 
@@ -695,6 +696,25 @@ def sparse_pair_contact_rows_kernel(
 
 
 @wp.func
+def sparse_pair_slot_velocity(
+    coordinate: int,
+    value: float,
+    body: int,
+    single_dof: wp.array[int],
+    inverse_mass: wp.array[float],
+    velocity: wp.array[float],
+):
+    """A slot's term of a row's ``J v``, ``Z_s (v / s)`` on its body's coordinate; zero for an empty slot."""
+    term = float(0.0)
+    if coordinate >= 0:
+        dof = single_dof[body]
+        scale = wp.sqrt(inverse_mass[dof])
+        if scale > 0.0:
+            term = value * (velocity[dof] / scale)
+    return term
+
+
+@wp.func
 def sparse_pair_row_response(
     data: ContactInput,
     boundary: CompactBoundary,
@@ -710,13 +730,14 @@ def sparse_pair_row_response(
     direction: wp.vec3,
     point: wp.vec3,
 ):
-    """Write contact row ``row`` of the compact boundary whitened: its dense-six part, its sparse slots and its
-    diagonal ``(|Z|^2 + sum_s Z_s^2) + cfm`` (:func:`.contact_laws.contact_row_entry`).
+    """Write contact row ``row`` of the compact boundary whitened: its dense-six part, its sparse slots, its diagonal
+    ``(|Z|^2 + sum_s Z_s^2) + cfm`` (:func:`.contact_laws.contact_row_entry`) and its incident velocity ``J v_hat``.
 
     The dense Jacobian sums both endpoints' entries per coordinate of the six-coordinate articulation (each where
     the body's coordinate mask holds the coordinate), then is whitened in registers.
     """
     diagonal = float(0.0)
+    incident = float(0.0)
     if has_dense:
         jacobian = _Vec6()
         for dof in range(6):
@@ -728,11 +749,13 @@ def sparse_pair_row_response(
                     value0 = contact_row_entry(
                         row, data.motion[data.dof_start[art0] + dof], direction, point, data.origin[art0]
                     )
+                    incident += value0 * data.incident[data.dof_start[art0] + dof]
             if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
                     value1 = -contact_row_entry(
                         row, data.motion[data.dof_start[art1] + dof], direction, point, data.origin[art1]
                     )
+                    incident += value1 * data.incident[data.dof_start[art1] + dof]
             jacobian[dof] = value0 + value1
         whitened, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
         for dof in range(6):
@@ -760,6 +783,10 @@ def sparse_pair_row_response(
     boundary.sparse_z[world, output_row, 1] = value1
     sparse = sparse_pair_diagonal(coord0, value0, coord1, value1)
     data.diag[world, output_row] = (diagonal + sparse) + data.cfm
+    single_dof, inverse_mass = boundary.body_single_dof, boundary.inverse_mass
+    incident += sparse_pair_slot_velocity(coord0, value0, body0, single_dof, inverse_mass, data.incident)
+    incident += sparse_pair_slot_velocity(coord1, value1, body1, single_dof, inverse_mass, data.incident)
+    boundary.row_incident[world, output_row] = incident
 
 
 @cache
@@ -769,8 +796,9 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
 
     The dense part, ``Z = L^-1 P J^T`` through the world's compact dense factor (:class:`.CholeskySolve`'s forward
     solve at the leaf-first positions, Z0), overwrites the producers' ``J``; ``A_ii = (|Z|^2 + sum_s Z_s^2) + cfm``
-    adds the row's whitened slots. Every row below the world's count, or with ``prefix_only`` below its limit prefix's
-    bound (the compact boundary whitens its contact rows as it writes them).
+    adds the row's whitened slots; the row's incident velocity ``J v_hat`` sums the dense part's terms while ``J`` is
+    in hand, then the slots' ``Z_s (v / s)``. Every row below the world's count, or with ``prefix_only`` below its
+    limit prefix's bound (the compact boundary whitens its contact rows as it writes them).
     """
     from .response_builds_dense import _element  # noqa: PLC0415
     from .response_operator import CholeskySolve, Reversed  # noqa: PLC0415
@@ -786,6 +814,12 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
     if (sparse_row >= end) return;
     const int group = dense_groups.data[world];
     float* whitened_row = &{_element("Z_group", "group", "sparse_row", "n_dofs - 1")};
+    float incident = 0.0f;
+    const int dense_first = world * world_dof_indices.shape[1] + dense_offsets.data[world];
+    for (int i = 0; i < n_dofs; ++i) {{
+        const int global_dof = world_dof_indices.data[dense_first + i];
+        if (global_dof >= 0) incident += {_element("Z_group", "group", "sparse_row", "i")} * v_hat.data[global_dof];
+    }}
     {{
 {_indent(solve.whiten(entries, entries), "        ")}
     }}
@@ -795,18 +829,27 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
         diagonal += z * z;
     }}
     for (int slot = 0; slot < 2; ++slot) {{
-        if ({_element("sparse_row_dof", "world", "sparse_row", "slot")} >= 0) {{
+        const int world_dof = {_element("sparse_row_dof", "world", "sparse_row", "slot")};
+        if (world_dof >= 0) {{
             const float z = {_element("sparse_row_z", "world", "sparse_row", "slot")};
             diagonal += z * z;
+            const int global_dof = world_dof_indices.data[world * world_dof_indices.shape[1] + world_dof];
+            if (global_dof >= 0) {{
+                const float scale = wp::sqrt(diagonal_inverse_mass.data[global_dof]);
+                if (scale > 0.0f) incident += z * (v_hat.data[global_dof] / scale);
+            }}
         }}
     }}
     {_element("world_diag", "world", "sparse_row")} = diagonal + {_element("row_cfm", "world", "sparse_row")};
+    {_element("row_incident", "world", "sparse_row")} = incident;
 """
     return KernelTemplate(
         "sparse_pair_whiten",
         kernel_template.params(
             ("L_group", wp.array3d[float]),
             ("dense_groups", wp.array[int]),
+            ("dense_offsets", wp.array[int]),
+            ("world_dof_indices", wp.array2d[int]),
             ("world_constraint_count", wp.array[int]),
             ("dense_phase_bounds", wp.array2d[int]),
             ("prefix_only", int),
@@ -816,8 +859,11 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
             ("sparse_row_dof", wp.array3d[int]),
             ("sparse_row_z", wp.array3d[float]),
             ("row_cfm", wp.array2d[float]),
+            ("diagonal_inverse_mass", wp.array[float]),
+            ("v_hat", wp.array[float]),
             ("Z_group", wp.array3d[float]),
             ("world_diag", wp.array2d[float]),
+            ("row_incident", wp.array2d[float]),
         ),
         dual_native(body, preludes=()),
         kernel_template.THREADS,

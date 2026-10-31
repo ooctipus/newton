@@ -95,7 +95,7 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
     )
     arrays = route_arrays(solver, route)
     if incident and route == 0 and solver.placement.sparse_mass_matrix_size is not None:
-        arrays["rhs"] = arrays["rhs"] + solver.placement.sparse_row_incident.numpy()
+        arrays["rhs"] = arrays["rhs"] + solver.placement.row_incident.numpy()
     patches = solver.laws.friction_patches
     view = patches.view if patches is not None and patches.view.weight.shape[0] else None
     routed = [c for c in range(count) if path[c] == route and slot[c] >= 0 and needed[c] > 0]
@@ -714,7 +714,7 @@ def assert_sparse_rows_consistent(solver):
     from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
     recover = TestFeatherPGSSparseSolver()._sparse_rows_physical
-    impulses, incident = solver.placement.impulses.numpy(), solver.placement.sparse_row_incident.numpy()
+    impulses, incident = solver.placement.impulses.numpy(), solver.placement.row_incident.numpy()
     delta, dofs = solver.placement.sparse_factor_velocity_delta.numpy(), solver.forest.world_dof_indices.numpy()
     v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
     checked = 0

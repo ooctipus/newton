@@ -21,7 +21,6 @@ from newton.tests.feather_pgs_law_harness import (
     register_device_tests,
     scalars,
     unified,
-    world_row_support,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -321,25 +320,13 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     test.assertFalse(mismatches(reference_rhs.ravel()[untouched, None], law_rhs.ravel()[untouched, None]).any())
 
 
-def _dense_layout(rng, worlds, rows, dofs, device):
-    """Packed rows (:mod:`.packed_rows`) over every world coordinate."""
-    return {
-        "world_dof_indices": (dofs * np.arange(worlds)[:, None] + np.arange(dofs)[None, :]).astype(np.int32),
-        "row_support": world_row_support(worlds, rows, dofs, device),
-        "packed_J": rng.normal(size=(worlds, rows, dofs)).astype(np.float32),
-    }
-
-
 @wp.kernel
 def _law_restitution_matrix_free(
-    world_dof_indices: wp.array2d[int],
-    row_support: kernels.RowSupport,
-    packed_J: wp.array3d[float],
     world_phi: wp.array2d[float],
     world_row_type: wp.array2d[int],
     world_target_velocity: wp.array2d[float],
     world_row_restitution: wp.array2d[float],
-    world_incident_velocity: wp.array[float],
+    row_incident: wp.array2d[float],
     dt: float,
     restitution_velocity_threshold: float,
     rhs: wp.array2d[float],
@@ -349,10 +336,7 @@ def _law_restitution_matrix_free(
     if world_row_type[world, i] != row_laws.ROW_CONTACT:
         return
     target = world_target_velocity[world, i]
-    relative_incident = (
-        kernels.world_contact_row_dot(world_dof_indices, row_support, packed_J, world_incident_velocity, world, i)
-        - target
-    )
+    relative_incident = row_incident[world, i] - target
     fires, bounce = row_laws.contact_restitution_rhs(
         world_phi[world, i],
         relative_incident,
@@ -369,16 +353,15 @@ def _law_restitution_matrix_free(
 def test_restitution_matches_matrix_free_restitution(test, device):
     """Replace exactly the rows ``apply_world_contact_restitution_matrix_free`` replaces, with the same rhs bits."""
     rng = np.random.default_rng(16)
-    worlds, rows, dofs = 8, 32, 12
+    worlds, rows = 8, 32
     phi, kind, _, target = _rows(rng, worlds, rows)
     rhs0 = rng.normal(size=(worlds, rows)).astype(np.float32)
     common = {
-        **_dense_layout(rng, worlds, rows, dofs, device),
         "world_phi": phi,
         "world_row_type": kind,
         "world_target_velocity": target,
         "world_row_restitution": rng.choice(np.array([0.0, 0.5, 1.0], dtype=np.float32), (worlds, rows)),
-        "world_incident_velocity": rng.normal(size=dofs * worlds).astype(np.float32),
+        "row_incident": rng.normal(size=(worlds, rows)).astype(np.float32),
         "dt": 1.0 / 60.0,
         "restitution_velocity_threshold": 0.2,
     }
@@ -389,15 +372,6 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
         write_row_w=1,
-        sparse_diagonal=0,
-        dense_offsets=np.zeros(worlds, dtype=np.int32),
-        dense_groups=np.zeros(worlds, dtype=np.int32),
-        dense_dofs=0,
-        dense_L=np.zeros((1, 1, 1), dtype=np.float32),
-        dense_Z=np.zeros((1, 1, 1), dtype=np.float32),
-        sparse_row_dof=np.full((1, 1, 2), -1, dtype=np.int32),
-        sparse_row_z=np.zeros((1, 1, 2), dtype=np.float32),
-        diagonal_inverse_mass=np.zeros(1, dtype=np.float32),
         mf_constraint_count=np.zeros(worlds, dtype=np.int32),
         owned_rows_le=0,
         world_rhs=rhs0.copy(),
