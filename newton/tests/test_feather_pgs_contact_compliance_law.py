@@ -54,7 +54,7 @@ def _support(
     diagonal = 1.0 / MASS
     for step in range(trajectory.shape[0]):
         free = v - GRAVITY * dt
-        rigid, _w = contact_rhs(x, 0.05, 0.0, 1.0 / dt, 1.0, 1.0, 1.0, 0.0)
+        rigid, _w = contact_rhs(x, 0.05, 0.0, 1.0 / dt, 1.0, 1.0, 1.0)
         material, eps = contact_material_rhs(x, 0.0, STIFFNESS, damping, dt)
         rhs = rigid
         weight = float(1.0)

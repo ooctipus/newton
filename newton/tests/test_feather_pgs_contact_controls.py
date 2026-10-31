@@ -358,6 +358,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             prescribed=prescribed,
             material_mu=material_mu,
             material_restitution=material_restitution,
+            max_depenetration_velocity=wp.full(body_q.shape[0], np.inf, dtype=float, device=device),
             friction_shared_anchor=1,
             friction_scale=1.0,
             shared_anchor=0,

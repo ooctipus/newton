@@ -217,7 +217,8 @@ def _law_mf_position_rhs(
     w = float(1.0)
     if kind == row_laws.ROW_CONTACT:
         cap = row_laws.contact_depenetration_cap(ba, bb, rigid_body_max_depenetration_velocity)
-        value, w = row_laws.contact_rhs(phi, pgs_beta, target, inv_dt, 1.0, contact_speculative_scale, contact_w, cap)
+        beta = row_laws.contact_capped_beta(phi, pgs_beta, cap, dt)
+        value, w = row_laws.contact_rhs(phi, beta, target, inv_dt, 1.0, contact_speculative_scale, contact_w)
         restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = float(0.0)

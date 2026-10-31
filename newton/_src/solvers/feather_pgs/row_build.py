@@ -41,6 +41,8 @@ from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
     ROW_TORSION,
+    contact_capped_beta,
+    contact_depenetration_cap,
     contact_material_rhs,
     contact_restitution_rhs,
     contact_rhs,
@@ -342,6 +344,20 @@ def contact_torsion_mu(data: ContactInput, c: int) -> float:
 
 
 @wp.func
+def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, phi: float) -> float:
+    """Contact ``c``'s normal row ``beta`` (:func:`.row_laws.contact_capped_beta`): the depenetration cap of the bodies
+    that respond (:func:`.row_laws.contact_depenetration_cap`). Zero-coordinate articulations stand as ground."""
+    art_a = data.art0[c]
+    art_b = data.art1[c]
+    if art_a < 0 or data.response_dofs[art_a] <= 0:
+        body_a = -1
+    if art_b < 0 or data.response_dofs[art_b] <= 0:
+        body_b = -1
+    cap = contact_depenetration_cap(body_a, body_b, data.max_depenetration_velocity)
+    return contact_capped_beta(phi, data.beta, cap, data.dt)
+
+
+@wp.func
 def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, with_rhs: bool):
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion)
     at ``slot + row`` from its front end
@@ -351,7 +367,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
     the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
     gap, the law's beta and the undivided coefficient ``mu * friction_scale``. A normal row's rhs is
-    :func:`.row_laws.contact_rhs`, and a bouncing one's the restitution target from its incident velocity summed per
+    :func:`.row_laws.contact_rhs` at its capped beta (:func:`contact_normal_beta`), and a bouncing one's the restitution target from its incident velocity summed per
     body (:func:`incident_projection`). A spin row (:data:`.contact_laws.CONTACT_SPIN_ROW`) turns about the normal:
     its coefficient is :func:`contact_torsion_mu`, its target the prescribed bodies' spin
     (:func:`.contact_laws.prescribed_spin_target`) and its rhs ``-target``.
@@ -383,6 +399,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     if row == CONTACT_SPIN_ROW:
         target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
     r = slot + row
+    normal_beta = float(0.0)
     if row == CONTACT_SPIN_ROW:
         data.row_type[world, r] = ROW_TORSION
         data.row_parent[world, r] = slot
@@ -391,10 +408,11 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         data.phi[world, r] = 0.0
         data.restitution[world, r] = 0.0
     elif row == 0:
+        normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
         data.row_type[world, r] = ROW_CONTACT
         data.row_parent[world, r] = -1
         data.row_mu[world, r] = mu
-        data.row_beta[world, r] = data.beta
+        data.row_beta[world, r] = normal_beta
         data.phi[world, r] = phi
         data.restitution[world, r] = restitution
     else:
@@ -424,7 +442,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
             rhs = data.rhs[world, r]
         elif row == 0:
             rhs, weight = contact_rhs(
-                phi, data.beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0
+                phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w
             )
             if restitution > 0.0:
                 relative = incident_projection(data, body_a, art_a, p0, direction)

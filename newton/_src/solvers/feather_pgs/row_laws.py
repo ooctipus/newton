@@ -12,8 +12,8 @@ target and its stabilization. Every row builder and sweep that forms a row's
   ``inv_dt = 1 / dt``, the bias scaled by ``bias_scale``, a contact row's
   regularization weight ``contact_w`` on Baumgarte rows only;
 * :func:`contact_rhs` is a contact normal row's law: Baumgarte correction of a
-  penetrating row, capped by its bodies' depenetration speed where the route
-  applies the cap, and the speculative bias of a separated row;
+  penetrating row and the speculative bias of a separated row, at a ``beta``
+  :func:`contact_capped_beta` holds to its bodies' depenetration speed;
 * :func:`contact_material_rhs` is a material (compliant) contact normal's law:
   its spring-dashpot bias and its compliance ``eps``;
 * :func:`contact_restitution_rhs` replaces a closing row's bias by the
@@ -83,23 +83,18 @@ def contact_rhs(
     bias_scale: float,
     speculative_scale: float,
     contact_w: float,
-    max_depenetration: float,
 ) -> tuple[float, float]:
     """Return a contact normal row's ``rhs`` and its regularization weight.
 
     A penetrating row (``phi <= 0``) takes the Baumgarte bias
-    ``bias_scale * beta * phi / dt``, never below ``-max_depenetration`` when
-    that is positive and finite (0 applies no cap), and the weight ``contact_w``.
+    ``bias_scale * beta * phi / dt`` and the weight ``contact_w``.
     A separated row may close its gap during the step: it takes
     ``speculative_scale * phi / dt``. Separated rows stay rigid.
     """
     rhs = -target
     row_w = float(1.0)
     if phi <= 0.0:
-        if max_depenetration > 0.0 and wp.isfinite(max_depenetration):
-            rhs += wp.max(bias_scale * beta * phi * inv_dt, -max_depenetration)
-        else:
-            rhs += bias_scale * beta * phi * inv_dt
+        rhs += bias_scale * beta * phi * inv_dt
         row_w = contact_w
     else:
         rhs += speculative_scale * phi * inv_dt
@@ -120,11 +115,22 @@ def contact_material_rhs(phi: float, target: float, stiffness: float, damping: f
 
 
 @ROW_LAW.law
+def contact_capped_beta(phi: float, beta: float, cap: float, dt: float) -> float:
+    """Return a contact normal row's ``beta`` under the depenetration speed ``cap`` [m/s]: the largest value up to
+    ``beta`` whose Baumgarte speed ``beta |phi| / dt`` stays within ``cap``. The cap lives in the row's ``beta``, so
+    every row store's rhs reads it. A separated row, and a cap that is not positive and finite, keep ``beta``.
+    """
+    if phi < 0.0 and cap > 0.0 and wp.isfinite(cap):
+        return wp.min(beta, -cap * dt / phi)
+    return beta
+
+
+@ROW_LAW.law
 def contact_depenetration_cap(body_a: int, body_b: int, max_depenetration_velocity: wp.array[float]) -> float:
     """Return the depenetration speed cap of a contact from its responding bodies (-1: none on that side).
 
     Body A's cap stands unless body B's is positive, finite and smaller; a cap that
-    is not positive and finite applies none (:func:`contact_rhs`). Without a
+    is not positive and finite applies none (:func:`contact_capped_beta`). Without a
     responding body the cap is ``1e20``.
     """
     cap = float(1.0e20)
@@ -169,7 +175,7 @@ def row_rhs(
 ) -> tuple[float, float]:
     """Return a row's position-level ``rhs`` and regularization weight, by row kind.
 
-    * contact: :func:`contact_rhs` without a depenetration cap;
+    * contact: :func:`contact_rhs`, its ``beta`` already capped (:func:`contact_capped_beta`);
     * friction (the anchor's tangential displacement), mimic and connect
       (bilateral equalities): Baumgarte from both sides, ``bias_scale * beta * phi / dt``;
     * joint limit: :func:`limit_rhs`;
@@ -178,7 +184,7 @@ def row_rhs(
     rhs = -target
     row_w = float(1.0)
     if kind == ROW_CONTACT:
-        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, bias_scale, contact_speculative_scale, contact_w, 0.0)
+        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, bias_scale, contact_speculative_scale, contact_w)
     elif kind == ROW_FRICTION or kind == ROW_MIMIC or kind == ROW_CONNECT:
         rhs += bias_scale * beta * phi * inv_dt
     elif kind == ROW_JOINT_LIMIT:

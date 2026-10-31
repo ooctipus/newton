@@ -398,6 +398,13 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "articulation_origin": rng.normal(size=(4, 3)).astype(np.float32),
             "body_v_s": rng.normal(size=(8, 6)).astype(np.float32),
         }
+    if name == "contact_capped_beta":
+        return {
+            "phi": scalars(rng, n, 0.05),
+            "beta": rng.uniform(0.0, 1.0, n).astype(np.float32),
+            "cap": rng.choice(np.array([0.5, 2.0, 0.0, -1.0, np.inf, 1.0e30], dtype=np.float32), n),
+            "dt": np.full(n, 1.0 / 240.0, dtype=np.float32),
+        }
     if name == "contact_depenetration_cap":
         caps = np.array([2.0, 0.0, np.inf, 0.5, -1.0, 1.0e30, 3.0, 0.25], dtype=np.float32)
         return {**common, "max_depenetration_velocity": caps}
@@ -565,6 +572,7 @@ CONTACT_ARGUMENTS = {
     "prescribed": "prescribed_articulation",
     "material_mu": "shape_material_mu",
     "material_restitution": "shape_material_restitution",
+    "max_depenetration_velocity": "rigid_body_max_depenetration_velocity",
     "incident": "v_hat",
     "shared_anchor": "contact_shared_anchor",
     "friction_shared_anchor": "contact_friction_shared_anchor",
@@ -643,8 +651,9 @@ def bind_struct(struct_type, values, device):
 
 
 def contact_input(values, device):
-    """The :data:`ContactInput` of a scene's values (:func:`bind_struct`)."""
-    return bind_struct(ContactInput, values, device)
+    """The :data:`ContactInput` of a scene's values (:func:`bind_struct`), its bodies uncapped unless they say."""
+    uncapped = np.full(len(values["body_q"]), np.inf, dtype=np.float32)
+    return bind_struct(ContactInput, {"rigid_body_max_depenetration_velocity": uncapped, **values}, device)
 
 
 def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:

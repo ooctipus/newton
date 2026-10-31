@@ -123,6 +123,7 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
     data.prescribed = array([0, 0, 1, 0, 0, 1], int)
     data.material_mu = array(np.linspace(0.2, 0.8, 12, dtype=np.float32), float)
     data.material_restitution = array(np.linspace(0, 0.7, 12, dtype=np.float32), float)
+    data.max_depenetration_velocity = array(np.full(data.body_q.shape[0], np.inf, dtype=np.float32), float)
     data.inverse_mass = array(np.linspace(0.1, 0.9, 240, dtype=np.float32), float)
     data.dense_group = array([1, 0], int)
     factor = np.tril(rng.normal(0, 0.1, (2, 6, 6))).astype(np.float32)

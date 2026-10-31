@@ -48,6 +48,9 @@ CONTACT_INPUT = (
     Field("material_mu", wp.float32, ("shape",), owner="laws", attr="shape_material_mu"),
     Field("material_restitution", wp.float32, ("shape",), owner="laws", attr="shape_material_restitution"),
     Field("material_mu_torsional", wp.float32, ("shape",), owner="laws", attr="shape_material_mu_torsional"),
+    Field(
+        "max_depenetration_velocity", wp.float32, ("body",), owner="laws", attr="rigid_body_max_depenetration_velocity"
+    ),
     Field("incident", wp.float32, ("dof",), attr="v_hat"),
     # The row law.
     Field("shared_anchor", wp.int32, owner="options", attr="contact_shared_anchor"),

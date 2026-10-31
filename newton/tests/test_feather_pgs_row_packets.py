@@ -162,6 +162,7 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
     data.material_mu = array(rng.uniform(0.2, 1.2, 4 * WORLDS).astype(np.float32), float)
     data.material_restitution = array([0.8 if s == 2 else 0.0 for s in range(4 * WORLDS)], float)
     data.incident = array(rng.normal(0.0, 3.0, 9 * WORLDS).astype(np.float32), float)
+    data.max_depenetration_velocity = array(np.full(3 * WORLDS, np.inf, dtype=np.float32), float)
     data.shared_anchor, data.friction_shared_anchor = shared, friction_shared
     data.friction_scale, data.beta, data.cfm, data.dt = 0.85, 0.23, 2.0e-4, 1.0 / 240.0
     data.bias_scale, data.speculative_scale, data.restitution_threshold, data.contact_w = 1.0, 0.6, 0.05, 1.0

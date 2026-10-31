@@ -84,9 +84,10 @@ from .prefix_rows import PrefixLaw, limits, prefix_rows
 from .projection_laws import BILATERAL_PIVOT, PROJECTION_LAW
 from .response_builds_dense import _indent, _Vec6, whiten_six
 from .response_operator import FreeBodyZ
-from .row_build import contact_torsion_mu
+from .row_build import contact_normal_beta, contact_torsion_mu
 from .row_laws import (
     ROW_LAW,
+    contact_capped_beta,
     contact_depenetration_cap,
     contact_material_rhs,
     contact_restitution_rhs,
@@ -206,7 +207,7 @@ def free_body_row_rhs(
 ):
     """A free-body row's position-pass ``rhs`` and regularization weight, by the row laws (:mod:`.row_laws`).
 
-    A contact takes :func:`.row_laws.contact_rhs` with its bodies' depenetration cap, and, when restitutive, the
+    A contact takes :func:`.row_laws.contact_rhs` at its bodies' capped beta, and, when restitutive, the
     rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity ``J v_hat`` less its target
     (weight 1); a friction row its anchor law (the row builder folded the anchor gain into ``phi``); a speed row
     ``phi - target`` (its limit); any other row ``-target``. The sweeps recompute ``J v``: ``rhs`` holds the bias
@@ -217,7 +218,9 @@ def free_body_row_rhs(
     row_w = float(1.0)
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         cap = contact_depenetration_cap(body_a, body_b, max_depenetration_velocity)
-        rhs, row_w = contact_rhs(phi, beta, target, inv_dt, 1.0, speculative_scale, contact_w, cap)
+        rhs, row_w = contact_rhs(
+            phi, contact_capped_beta(phi, beta, cap, dt), target, inv_dt, 1.0, speculative_scale, contact_w
+        )
         if restitution > 0.0:
             fires, bounce = contact_restitution_rhs(
                 phi, incident - target, target, restitution, dt, restitution_threshold
@@ -2062,6 +2065,7 @@ def factor_contact_rows_kernel(
                     if data.material != 0:
                         stiffness = data.stiffness[c]
                     if lane == 0:
+                        beta = contact_normal_beta(data, c, body_a, body_b, phi)
                         if stiffness <= 0.0:
                             restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
                     else:

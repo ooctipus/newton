@@ -64,6 +64,7 @@ def _contact_scene(rng, contacts, *, worlds=4, shapes=12, bodies=8, arts=4, fric
         "articulation_origin": rng.normal(size=(arts, 3)).astype(np.float32),
         "shape_material_mu": rng.uniform(0.0, 1.2, shapes).astype(np.float32),
         "shape_material_restitution": restitution,
+        "rigid_body_max_depenetration_velocity": np.full(bodies, np.inf, dtype=np.float32),
         "body_to_articulation": body_to_art,
         "art_to_world": art_to_world,
     }

@@ -64,6 +64,7 @@ def _contact_input(f, device="cpu", **fields):
         "shape_body": f["shape_body"],
         "body_q": f["body_q"],
         "incident": f["velocity"],
+        "max_depenetration_velocity": wp.full(f["body_q"].shape[0], np.inf, dtype=float, device=device),
         # The rigid law's contact weight: no regularization, so the producers write no row weight.
         "contact_w": 1.0,
     }

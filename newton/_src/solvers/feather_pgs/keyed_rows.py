@@ -188,7 +188,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         if torsion:
             tangent_phi = f"(r == 3 ? 0.0f : {tangent_phi})"
         tangent_beta = "patch_law.beta"
-        row_law = "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n"
+        row_law = "        c.row_beta.data[at] = r == 0 ? normal_beta : patch_law.beta;\n"
     else:
         friction_location = "const auto [fa, fb] = ContactLaw::contact_friction_points(pa, pb, c.shared_anchor, c.friction_shared_anchor);"
         tangent_phi = "0.0f"
@@ -197,11 +197,11 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
             f"        c.row_type.data[at] = {kind};\n"
             "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
             "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
-            "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n"
+            "        c.row_beta.data[at] = r == 0 ? normal_beta : 0.0f;\n"
         )
     materials = """        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
         const float friction = mu * c.friction_scale;"""
-    rhs = """        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
+    rhs = """        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? normal_beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
                                     c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;"""
     bounce, weight = "if (bounce.v0) rhs = bounce.v1;", ""
     if weighted:
@@ -211,7 +211,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         const float restitution = stiffness > 0.0f ? 0.0f : rigid_restitution;
         const float friction = mu * c.friction_scale
             * (stiffness > 0.0f && c.friction_weight.data[contact] > 0.0f ? c.friction_weight.data[contact] : 1.0f);"""
-        rhs = """        const auto row_law = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target,
+        rhs = """        const auto row_law = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? normal_beta : ${TANGENT_BETA}, target,
                                              1.0f / c.dt, c.bias_scale, c.speculative_scale, 0.0f, c.contact_w);
         float rhs = row_law.v0, weight = row_law.v1;"""
         bounce = "if (bounce.v0) { rhs = bounce.v1; weight = 1.0f; }"
@@ -264,6 +264,9 @@ ${PREFIX}
 ${MATERIALS}
 ${PROJECTION}
         const float phi = r == 0 ? separation : ${TANGENT_PHI};
+        const float normal_beta = r == 0 ? RowLaw::contact_capped_beta(phi, c.beta, RowLaw::contact_depenetration_cap(
+            aa >= 0 && c.response_dofs.data[aa] > 0 ? ba : -1, ab >= 0 && c.response_dofs.data[ab] > 0 ? bb : -1,
+            c.max_depenetration_velocity), c.dt) : 0.0f;
 ${RHS}
         if (r == 0 && restitution > 0.0f) {
             float relative = -target;
