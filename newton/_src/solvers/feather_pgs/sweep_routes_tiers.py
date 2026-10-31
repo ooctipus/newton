@@ -29,7 +29,7 @@ from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import Lanes, TransposedResponse, WhitenedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
-from .staging import Buffer, Staging, arch_budget
+from .staging import Buffer, Staging, arch_budget, resident_blocks
 from .sweep import (
     CONTACT,
     JOINT_LIMIT,
@@ -74,6 +74,10 @@ TIER_SWEEPS_CAP = 128
 """The largest tier budget."""
 TIER_MAX_ROWS = 128
 """The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
+REGISTER_WARPS = 24
+"""The most warps an SM keeps resident above the 72 registers a tier compiles to unbounded: 6 warps of 80 registers in
+each of the register file's 4 sub-partitions of 16K (``cuda_occupancy.h``). It is also the block limit of sm_120, above
+which ptxas drops a launch bound and takes all the registers it can."""
 
 
 def tier_sweeps(rows: int, iterations: int) -> int:
@@ -89,6 +93,16 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
     return max(1, min(raw, TIER_SWEEPS_CAP))
+
+
+def launch_bounds(staging: Staging, device_arch=None) -> tuple[int, int] | None:
+    """A tier's launch bounds where the blocks shared memory keeps on ``device_arch``
+    (:func:`.staging.resident_blocks`) leave registers to spare: its threads and those blocks. ptxas then spends the
+    spare registers on the sweep's load schedule, and the SM keeps the blocks. ``None`` where they leave none, as the
+    register file limits the blocks there: a bound could only take registers from the sweep.
+    """
+    blocks = resident_blocks(staging.bytes, device_arch)
+    return (staging.threads, blocks) if blocks * (staging.threads // 32) <= REGISTER_WARPS else None
 
 
 def _operands(
@@ -309,6 +323,7 @@ def parallel_kernel(
         ),
         composed=True,
         native_name="sweep_parallel_native",
+        launch_bounds=launch_bounds(staging, device_arch),
     ).kernel()
     return SweepTier(
         kernel,

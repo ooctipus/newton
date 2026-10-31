@@ -22,6 +22,7 @@ from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
 from newton._src.solvers.feather_pgs.response_operator import CholeskySolve, Lanes, TransposedResponse, WhitenedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
+from newton._src.solvers.feather_pgs.staging import Buffer, Staging
 from newton._src.solvers.feather_pgs.sweep import (
     JacobiRows,
     RowLaws,
@@ -229,6 +230,18 @@ def _kernel_sass():
 @unittest.skipIf(_kernel_sass() is None, "the CUDA toolkit (ptxas, cuobjdump) is not on PATH")
 class TestOfflineCompile(unittest.TestCase):
     """The tiers compile for the RTX PRO 6000 (sm_120) without stack or local memory."""
+
+    def test_a_tier_states_the_blocks_shared_memory_keeps(self):
+        """Bound each tier by the blocks its shared memory keeps; a staging that leaves no registers to spare has none."""
+        for label, args, kwargs in CALLS:
+            with self.subTest(tier=label):
+                threads, blocks = _tier(_TIER, args, kwargs).kernel.launch_bounds
+                self.assertEqual(threads, 32 * ((kwargs["rows"] + 31) // 32))
+                self.assertLessEqual(blocks * threads // 32, sweep_routes_tiers.REGISTER_WARPS)
+        staged = Staging((Buffer("s_x", "float", 4400),), threads=128)
+        self.assertEqual(sweep_routes_tiers.launch_bounds(staged), (128, 5))
+        # 25 blocks of a warp: past sm_120's limit, where ptxas would drop the bound and take 120 registers.
+        self.assertIsNone(sweep_routes_tiers.launch_bounds(Staging((Buffer("s_x", "float", 736),), threads=32)))
 
     def test_tiers_compile(self):
         sass = _kernel_sass()
