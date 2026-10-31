@@ -35,8 +35,6 @@ class Laws:
     """Joint velocity limits take rows (``enable_joint_velocity_limits``)."""
     warm_start: bool
     """Contact impulses carry from the previous step."""
-    debug_rows: bool
-    """``pgs_debug`` keeps row snapshots and a host-driven sweep."""
     preelimination: bool
     """Bilateral rows are pre-eliminated through a Schur complement."""
     mimic: bool
@@ -50,12 +48,12 @@ class Laws:
     cuda: bool
     """The device is CUDA, which runs the native bodies written for CUDA only (``cuda_native``)."""
 
-    PLAIN = "no warm start, debug rows or bilateral pre-elimination"
+    PLAIN = "no warm start or bilateral pre-elimination"
 
     @property
     def plain(self) -> bool:
         """The sweep policy the specialized placements assume (:attr:`PLAIN`)."""
-        return not (self.warm_start or self.debug_rows or self.preelimination)
+        return not (self.warm_start or self.preelimination)
 
     @property
     def weighted(self) -> bool:
@@ -85,7 +83,6 @@ class Laws:
             limits=bool(options.enable_joint_limits),
             velocity_limits=bool(options.enable_joint_velocity_limits),
             warm_start=bool(options.pgs_warmstart),
-            debug_rows=bool(options.pgs_debug),
             preelimination=bool(preelimination),
             mimic=bool(laws.mimic_count),
             connect=bool(laws.connect_count),
@@ -109,7 +106,6 @@ _REQUIREMENTS = {
     "no_connect": (lambda laws: not laws.connect, "no connect rows"),
     "no_loops": (lambda laws: not laws.loops, "no loop-closing joints"),
     "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
-    "no_debug_rows": (lambda laws: not laws.debug_rows, "no debug row snapshots"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
 }
 
@@ -120,7 +116,6 @@ CAPABILITIES = {
     "packed": (
         "cuda",
         "iterations",
-        "no_debug_rows",
         "no_preelimination",
         "no_connect",
         "no_loops",

@@ -10,8 +10,8 @@ entries ascend with the world's coordinates. An entry's world coordinate is not 
 sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
 
 * the row's Jacobian ``J`` (``packed_J``), which the row producers write at the row's sides
-  (:func:`.dense_rows.jacobian_row`), the build reads for the row's incident velocity ``J v_hat`` (``row_incident``)
-  and the diagnostics read with the physical velocity (:func:`.kernels.world_contact_row_dot`);
+  (:func:`.dense_rows.jacobian_row`) and the build reads for the row's incident velocity ``J v_hat``
+  (``row_incident``);
 * its whitened form ``Z = L^-1 P J^T`` (``packed_Z``) through the side's leaf-first factor ``L``, in the kit's
   positions: factor coordinate ``i`` of a side at its entry ``n - 1 - i``
   (:class:`.response_operator.CholeskySolve`).

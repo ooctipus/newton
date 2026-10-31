@@ -310,15 +310,6 @@ ROW_WATERMARKS = FieldGroup(
 )
 """Whole-run row high-water telemetry for explicit readback (``row_watermark``)."""
 
-PGS_DIAGNOSTICS = FieldGroup(
-    Field("_diag_metrics", wp.float32, ("world", 4)),
-    Field("_diag_ncp_metrics", wp.float32, ("world", 6)),
-    Field("_diag_prev_impulses", wp.float32, ("world", "row")),
-)
-"""PGS convergence diagnostics (``pgs_debug``); the NCP/MDP residuals hold six per world."""
-
-PGS_MF_DIAGNOSTICS = FieldGroup(Field("_diag_prev_mf_impulses", wp.float32, ("world", "mf_row")))
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Construction plans uploaded once
 # ---------------------------------------------------------------------------------------------------------------------

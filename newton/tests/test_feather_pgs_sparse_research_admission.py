@@ -42,7 +42,6 @@ class _LawsProbe(SimpleNamespace):
             limits=True,
             velocity_limits=options.enable_joint_velocity_limits,
             warm_start=options.pgs_warmstart,
-            debug_rows=options.pgs_debug,
             preelimination=False,
             mimic=bool(self.mimic_count),
             connect=bool(self.connect_count),
@@ -64,7 +63,6 @@ def _eligible_solver():
         pgs_iterations=8,
         enable_joint_velocity_limits=False,
         pgs_warmstart=False,
-        pgs_debug=False,
         contact_compliance=False,
     )
     return _AdmissionProbe(

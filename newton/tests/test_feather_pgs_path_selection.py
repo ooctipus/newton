@@ -391,7 +391,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["sweep"]["route"], "matrix_free_gs")
         # The arm and the free box share a world, which one sweep of the general row solves.
         self.assertTrue(routes["free_rigid_bodies"]["mixed_worlds"])
-        self.assertEqual(routes["sweep"]["driver"], "direct")
         self.assertEqual(routes["sweep"]["mf_meta_pack"]["kernel"], "free_body_meta_512")
         # The CPU's one thread keeps the impulses and streams the metadata: no shared memory to stage them in.
         storage = routes["sweep"]["mf_gs_storage"]
@@ -432,10 +431,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["measurements"], {})
         separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
         self.assertFalse(separate["free_rigid_bodies"]["mixed_worlds"])
-        self.assertEqual(separate["sweep"]["driver"], "direct")
-        self.assertIn("one dispatch", separate["sweep"]["driver_reason"])
+        # Debug options read no route (BACKBONE rule 2).
         debug = SolverFeatherPGS(_cpu_model(), pgs_debug=True).get_path_selection()["routes"]
-        self.assertEqual(debug["sweep"]["driver"], "debug_loop")
+        plain = SolverFeatherPGS(_cpu_model()).get_path_selection()["routes"]
+        self.assertEqual(debug["row"], plain["row"])
 
     def test_cpu_patch_record_names_the_point_only_owners(self):
         """Name the owners patch friction cannot use, and route the masked rows and the classifier to the patch law.
@@ -503,7 +502,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 sweep = routes["sweep"]
                 keys = _launched_kernel_keys(model, solver)
                 # The general row sweeps every iteration of a world's dense and free-body rows in one launch.
-                self.assertEqual(sweep["driver"], "direct")
                 self.assertEqual([key for key in keys if key.startswith("sweep_")], [sweep["mf_gs"]])
                 methods = routes["contact_rows"]["general_method_by_dof"]
                 self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))

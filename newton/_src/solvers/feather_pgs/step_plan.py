@@ -83,12 +83,10 @@ class Route:
 
 @dataclass(frozen=True)
 class SolveRoute:
-    """Stages 5 and 6: the rows the sweep solves and what drives the sweep."""
+    """Stages 5 and 6: the rows the sweep solves, all iterations in one dispatch."""
 
     route: Route
     """The rows the sweep solves: ``sparse_pgs``, ``sparse_diagonal`` or ``matrix_free_gs``."""
-    driver: Route
-    """What drives the route's sweep each solve: ``direct`` or ``debug_loop``."""
 
 
 @dataclass(frozen=True)
@@ -254,10 +252,4 @@ def _solve(row: RouteRow) -> SolveRoute:
         route = Route(
             "matrix_free_gs", "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
         )
-    if row.laws.debug_rows:
-        driver = Route(
-            "debug_loop", "pgs_debug launches the position solve one iteration per dispatch with host reads."
-        )
-    else:
-        driver = Route("direct", "The route sweeps all iterations in one dispatch.")
-    return SolveRoute(route=route, driver=driver)
+    return SolveRoute(route=route)

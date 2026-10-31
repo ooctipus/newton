@@ -20,7 +20,6 @@ import math
 import os
 import sys
 import time
-import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
 from functools import cache
@@ -104,8 +103,6 @@ from .kernels import (
     gather_mf_warmstart,
     local_solve_launch_gate,
     pack_contact_linear_force_as_spatial,
-    pgs_convergence_diagnostic_velocity,
-    pgs_ncp_residuals_diagnostic_velocity,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
@@ -131,8 +128,6 @@ from .rows import JOINT_LIMIT_WARPS_PER_BLOCK, RowLaws
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
     DOF_WORK,
-    PGS_DIAGNOSTICS,
-    PGS_MF_DIAGNOSTICS,
     PREELIMINATION,
     SIZE_MASS,
     SPARSE_CONTACT_RECORDS,
@@ -678,20 +673,11 @@ class SolverFeatherPGS(SolverBase):
         self._nvtx = nvtx
         self._debug_buffers_enabled = bool(pgs_debug)
         # External NaN dumpers read the stage-3 snapshots; nothing in the solver
-        # does. They cost three copies per substep, so they are opt-in, and
-        # pgs_debug, which keeps the solver's other diagnostics, keeps them too.
+        # does. They cost three copies per substep, so they are opt-in.
         self._debug_stage3_snapshot_flag = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
         self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
         # The solver's device fields (solver_fields), on the model's device.
         self._arrays = SolverArrays(self, model.device)
-        self._pgs_convergence_log: list[np.ndarray] = []
-        # Per-step, per-iteration NCP / MDP residual log for the matrix_free
-        # debug path. Each entry is an ndarray of shape
-        # ``[pgs_iterations, world_count, 6]`` holding
-        # ``(r_compl, r_cone, r_gap, r_ds_compl, r_ds_dual, r_mdp_dir)``
-        # per world per iteration. Populated only when ``pgs_debug`` is
-        # ``True`` on CUDA.
-        self._pgs_ncp_residual_log: list[np.ndarray] = []
 
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
@@ -1126,7 +1112,6 @@ class SolverFeatherPGS(SolverBase):
             if self.forest.has_prescribed_response
             else self._arrays.placeholder(wp.float32, (1, 1))
         )
-        self._allocate_debug_buffers(model)
         self.factor.scatter_armature()
         self._plan_tier_rows()
         self.placement.allocate_packed_rows()
@@ -1613,7 +1598,6 @@ class SolverFeatherPGS(SolverBase):
             and not self.options.pgs_warmstart
             and not self._preelim_active
             and not self.forest.has_free_rigid_bodies
-            and not self._debug_buffers_enabled
             and self.laws.mimic_count == 0
             and self.laws.connect_count == 0
         )
@@ -2193,21 +2177,6 @@ class SolverFeatherPGS(SolverBase):
 
         self.placement.allocate_contact_rows(model)
 
-    def _allocate_debug_buffers(self, model):
-        """Allocate buffers for PGS convergence diagnostics."""
-        if not self.options.pgs_debug:
-            return
-        sizes = {
-            "world": self.forest.world_count,
-            "row": self.placement.dense_max_constraints,
-            "mf_row": self.placement.mf_max_constraints,
-        }
-        self._arrays.allocate(PGS_DIAGNOSTICS, **sizes)
-        if hasattr(self.placement, "mf_impulses"):
-            self._arrays.allocate(PGS_MF_DIAGNOSTICS, **sizes)
-        else:
-            self._diag_prev_mf_impulses = None
-
     def _init_tiled_kernels(self, model):
         """Build the paired response and the sweeps.
 
@@ -2616,28 +2585,6 @@ class SolverFeatherPGS(SolverBase):
         """
         if self._memset_done_event[slot] is not None and not self._memset_done_seeded[slot]:
             stream.wait_event(self._memset_done_event[slot])
-
-    def reset_diagnostic_logs(self) -> None:
-        """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
-
-        Deprecated: no Newton code calls it, and it will be removed in a future release.
-
-        :attr:`_pgs_convergence_log` and :attr:`_pgs_ncp_residual_log` are
-        append-only across :meth:`step` calls so one solver instance can
-        accumulate a trace across many frames.  A replay / sweep harness
-        that reuses a single solver to scan ``pgs_iterations`` over a
-        snapshot needs the logs reset between sweeps so each entry
-        corresponds to exactly one replayed step.  ``pgs_warmstart``
-        impulses and all device-side solver buffers are left untouched.
-        """
-        warnings.warn(
-            "SolverFeatherPGS.reset_diagnostic_logs() is deprecated and will be removed in a future release; "
-            "the pgs_debug logs it clears are private.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._pgs_convergence_log = []
-        self._pgs_ncp_residual_log = []
 
     def _launch_local_internal_solve(
         self,
@@ -3370,93 +3317,9 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         with wp.ScopedTimer("S6_PGS_Solve", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self.options.pgs_debug:
-                self._pgs_convergence_log.append([])
-                self._pgs_ncp_residual_log.append([])
-                for _pgs_dbg_iter in range(self.options.pgs_iterations):
-                    # Snapshot impulses before this iteration
-                    wp.copy(self._diag_prev_impulses, self.placement.impulses)
-                    if self._diag_prev_mf_impulses is not None:
-                        wp.copy(self._diag_prev_mf_impulses, self.placement.mf_impulses)
-
-                    # Run 1 diagnostic iteration. For the experimental split
-                    # schedule this is one contact phase followed by one
-                    # internal phase per diagnostic sample.
-                    self._launch_matrix_free_position_solve(
-                        iterations=1,
-                    )
-
-                    # Diagnostic kernel
-                    wp.launch(
-                        pgs_convergence_diagnostic_velocity,
-                        dim=self.forest.world_count,
-                        inputs=[
-                            bind_dense_rows(self.placement),
-                            bind_mf_rows(self.placement),
-                            self.placement.constraint_count,
-                            self.forest.world_dof_indices,
-                            self.placement.impulses,
-                            self._diag_prev_impulses,
-                            self.placement.row_support(),
-                            self.placement.packed_J,
-                            self.placement.dense_max_constraints,
-                            self.placement.mf_constraint_count,
-                            self.placement.mf_impulses,
-                            self._diag_prev_mf_impulses,
-                            self.placement.mf_max_constraints,
-                            self.factor.view(),
-                            self.v_out,
-                        ],
-                        outputs=[self._diag_metrics],
-                        device=self.model.device,
-                    )
-
-                    # Sync and reduce across worlds
-                    metrics_np = self._diag_metrics.numpy()
-                    row = np.array(
-                        [
-                            np.max(metrics_np[:, 0]),  # max|delta_lambda|
-                            np.sum(metrics_np[:, 1]),  # complementarity gap
-                            np.sum(metrics_np[:, 2]),  # tangent residual
-                            np.sum(metrics_np[:, 3]),  # FB merit
-                        ]
-                    )
-                    self._pgs_convergence_log[-1].append(row)
-
-                    # NCP / MDP residual diagnostic ([world, 6]):
-                    # (r_compl, r_cone, r_gap, r_ds_compl, r_ds_dual, r_mdp_dir)
-                    wp.launch(
-                        pgs_ncp_residuals_diagnostic_velocity,
-                        dim=self.forest.world_count,
-                        inputs=[
-                            bind_dense_rows(self.placement),
-                            bind_mf_rows(self.placement),
-                            self.placement.constraint_count,
-                            self.forest.world_dof_indices,
-                            self.placement.impulses,
-                            self.placement.row_support(),
-                            self.placement.packed_J,
-                            self.placement.dense_max_constraints,
-                            self.placement.mf_constraint_count,
-                            self.placement.mf_impulses,
-                            self.placement.mf_max_constraints,
-                            self.factor.view(),
-                            self.v_out,
-                        ],
-                        outputs=[self._diag_ncp_metrics],
-                        device=self.model.device,
-                    )
-                    ncp_np = self._diag_ncp_metrics.numpy().copy()
-                    self._pgs_ncp_residual_log[-1].append(ncp_np)
-
-                self._pgs_convergence_log[-1] = np.array(self._pgs_convergence_log[-1])
-                # Stack per-iter [world, 6] arrays into [iters, world, 6].
-                self._pgs_ncp_residual_log[-1] = np.stack(self._pgs_ncp_residual_log[-1], axis=0)
-
-            else:
-                self._launch_matrix_free_position_solve(
-                    iterations=self.options.pgs_iterations,
-                )
+            self._launch_matrix_free_position_solve(
+                iterations=self.options.pgs_iterations,
+            )
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate

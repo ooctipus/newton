@@ -745,7 +745,7 @@ def _sweep_record(**fields):
             "local",
         )
     )
-    record.update(route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel")
+    record.update(route="matrix_free_gs", mf_gs="mf_gs_kernel")
     record.update(fields)
     return record
 
@@ -763,23 +763,16 @@ def _policy_solver(*, readout="sweeps", skipped=True, **attributes):
 class TestSweepPolicyRecords(unittest.TestCase):
     """The readout and exit-law records of a route's sweeps."""
 
-    def test_every_driver_records_the_one_law(self):
-        """Record the same exit law under every driver: a launch of part of a solve stops under it too."""
-        for driver in ("direct", "debug_loop", "contact_compliance"):
-            with self.subTest(driver=driver):
-                solver, record = _policy_solver(), _sweep_record(driver=driver)
-                sweep = {
-                    "readout": path_selection._readout(solver, record),
-                    "exit_law": path_selection._exit_law(solver, record),
-                }
-                self.assertEqual(sweep["exit_law"]["law"], "rounding_floor")
-                json.dumps(sweep, allow_nan=False)
-
-    def test_partial_launches_count_once_each(self):
-        """Say that a direct solve counts once per solve, and a driver that launches part of one once per launch."""
-        self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
-        reason = path_selection._readout(_policy_solver(), _sweep_record(driver="debug_loop"))["reason"]
-        self.assertIn("counts are per launch", reason)
+    def test_a_sweep_records_the_one_law(self):
+        """Record the exit law, and that a launch solves its worlds, so a solve counts once."""
+        solver, record = _policy_solver(), _sweep_record()
+        sweep = {
+            "readout": path_selection._readout(solver, record),
+            "exit_law": path_selection._exit_law(solver, record),
+        }
+        self.assertEqual(sweep["exit_law"]["law"], "rounding_floor")
+        self.assertIn("solves its worlds", sweep["readout"]["reason"])
+        json.dumps(sweep, allow_nan=False)
 
     def test_records_say_whether_skipped_solves_count(self):
         """Say whether the solves of worlds without rows count as skipped, and not without counted sweeps."""

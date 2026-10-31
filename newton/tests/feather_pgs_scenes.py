@@ -72,7 +72,6 @@ def plain_laws(**changes) -> Laws:
         "limits": True,
         "velocity_limits": False,
         "warm_start": False,
-        "debug_rows": False,
         "preelimination": False,
         "mimic": False,
         "connect": False,

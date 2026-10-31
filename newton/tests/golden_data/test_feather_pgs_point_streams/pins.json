@@ -46,8 +46,6 @@
   "kernels.invalidate_fk_id_cache_for_articulations": "c0ebe2995dae14bfe3961c646b3270e90e63bcc228ae8e43696890f495e2ad8a",
   "kernels.local_solve_launch_gate": "3be6b64143363647b763663a044e855c94e7f66432c808edbc3cc58bf5753ecf",
   "kernels.pack_contact_linear_force_as_spatial": "83049a594301a794bcc2eed47f4dc6d61fc50578279e1cea7af7ef222ef5a08f",
-  "kernels.pgs_convergence_diagnostic_velocity": "e97ad684228d6b83089e44591b5bf8276cf62beeca9f9d5219076bf520c181db",
-  "kernels.pgs_ncp_residuals_diagnostic_velocity": "915c6029278cb96bff8ece2d2ab3a4cbd10279eb41bf885aff84ac234bd29c5a",
   "kernels.place_world_contact_runs": "2f1eb952f1ace085d8547c829731e2bfc84961bfe3f55abcda9590ee02f92d5c",
   "kernels.populate_connect_J_for_size": "df87cdbcc6fd12e06d9d022aa41b1fb6b7a1d5eab6e0810c801d2b5e431fe34d",
   "kernels.populate_joint_velocity_limit_J_for_size": "c2434fc2402e764a091f97d5450bda8f7a5d4f079587f6bd68b6807dfcf85803",

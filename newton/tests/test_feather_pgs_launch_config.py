@@ -712,14 +712,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertFalse(large)
         self.assertFalse(overcommitted)
 
-    def test_reset_diagnostic_logs_is_deprecated(self):
-        """Warn that reset_diagnostic_logs() will be removed, and still clear the pgs_debug logs."""
-        solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
-        solver._pgs_convergence_log.append([1.0])
-        with self.assertWarnsRegex(DeprecationWarning, "reset_diagnostic_logs"):
-            solver.reset_diagnostic_logs()
-        self.assertEqual((solver._pgs_convergence_log, solver._pgs_ncp_residual_log), ([], []))
-
     def test_serial_passes_launch_at_the_serial_block_size(self):
         """A step of ordinary dynamics (pinned) launches every one-articulation-per-thread pass (FK/ID, the joint forces
         and drives, the composite inertia) in blocks of ``tree_passes.SERIAL_BLOCK_DIM`` threads."""

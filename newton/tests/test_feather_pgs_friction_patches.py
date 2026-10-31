@@ -17,18 +17,10 @@ from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
-    contact_friction_residuals,
 )
 from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
-
-
-@wp.kernel(enable_backward=False)
-def _friction_residual_probe(result: wp.array[wp.vec4]):
-    result[0] = contact_friction_residuals(0.0, 4.0, 0.25, 0.0, wp.vec2(-1.0, 0.0), wp.vec2(1.0, 0.0))
-    result[1] = contact_friction_residuals(0.0, 4.0, 0.25, 0.0, wp.vec2(-1.0, 0.0), wp.vec2(2.5, 0.0))
-    result[2] = contact_friction_residuals(2.0, 2.0, 0.5, -0.1, wp.vec2(0.0), wp.vec2(0.0))
 
 
 @wp.kernel(enable_backward=False)
@@ -464,12 +456,6 @@ class TestFrictionPatchHistory(unittest.TestCase):
         patches.build(model, state, contacts)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 2)
         np.testing.assert_allclose(patches.view.weight.numpy()[:2], [1, 1])
-
-    def test_residuals_use_patch_support_and_keep_normal_terms_local(self):
-        """Distinguish supported friction, a cone violation, and normal error in the residual diagnostics."""
-        residuals = wp.zeros(3, dtype=wp.vec4, device="cpu")
-        wp.launch(_friction_residual_probe, dim=1, inputs=[residuals], device="cpu")
-        np.testing.assert_allclose(residuals.numpy(), [[0, 0, 0, 0], [1.5, 1.5, 0, 1.5], [0, 0.2, 0.1, 0]], atol=1e-7)
 
     def test_reversed_contact_orientation_uses_same_patch(self):
         """Give a body pair one identity regardless of collision shape ordering."""

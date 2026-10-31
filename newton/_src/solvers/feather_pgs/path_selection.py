@@ -523,7 +523,7 @@ def _sparse_mass_matrix(solver) -> dict:
 def _sweep(solver) -> dict:
     row = solver.routes.row
     solve = solver._plan.solve
-    route, driver = solve.route.name, solve.driver.name
+    route = solve.route.name
     # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
     packed = solver.placement.pack_mf_meta_kernel is not None
     mf_meta_pack = {
@@ -544,8 +544,6 @@ def _sweep(solver) -> dict:
     record = {
         "route": route,
         "reason": solve.route.reason,
-        "driver": driver,
-        "driver_reason": solve.driver.reason,
         "iterations": int(solver.options.pgs_iterations),
         "mf_meta_pack": mf_meta_pack,
         "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
@@ -594,10 +592,8 @@ def _readout(solver, record) -> dict:
     counted = solver._solve_readout.kernels
     if solver.options.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
-    elif record["driver"] == "direct":
-        reason = "Each launch of a counted kernel solves its worlds."
     else:
-        reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
+        reason = "Each launch of a counted kernel solves its worlds."
     return {
         "mode": solver.options.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
