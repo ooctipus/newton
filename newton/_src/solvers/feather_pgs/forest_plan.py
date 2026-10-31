@@ -12,8 +12,8 @@
 - the prescribed free bodies the matrix-free formulation elides, and so each articulation's response coordinates;
 - the size groups (articulations by response coordinate count) and the world mapping;
 - the body maps (each body's tree joint, articulation and response support);
-- per size group, the mass matrix's coordinate-to-joint map and whether its fill-free factor pattern is diagonal
-  (a star);
+- the coordinate trees, the vertices of the rows' graph, each body's among them and each world's;
+- per size group, the mass matrix's coordinate-to-joint map and whether every tree has one coordinate (a star);
 - with the matrix-free formulation, the compact per-world response mapping.
 
 Host arrays end in ``_host`` where a device array of the same name exists. The plan is frozen: notifications that
@@ -114,6 +114,19 @@ class ForestPlan:
     free_rigid_per_world: np.ndarray
     """Responding free rigid bodies per world (at least one entry)."""
 
+    # Coordinate trees (host), ascending by root joint.
+    tree_first: np.ndarray
+    """Each tree's first coordinate. A tree's coordinates need not be a range: breadth-first joints interleave trees."""
+    tree_size: np.ndarray
+    """Each tree's coordinates."""
+    tree_articulation: np.ndarray
+    """Each tree's articulation."""
+    world_tree_start: np.ndarray
+    world_trees: np.ndarray
+    """Each world's trees: ``world_trees[world_tree_start[w] : world_tree_start[w + 1]]``."""
+    body_tree: np.ndarray
+    """Each body's tree, ``-1`` where no solved coordinate moves it."""
+
     # Size groups.
     size_groups: list
     """Response coordinate counts, descending."""
@@ -134,7 +147,7 @@ class ForestPlan:
     crba_dof_joint_offset_by_size: dict
     """Per topology-compatible size group, each coordinate's joint as an offset from the articulation's first."""
     diagonal_mass_sizes: frozenset
-    """Size groups whose fill-free factor pattern is diagonal (stars)."""
+    """Size groups whose every tree has one coordinate (stars): their fill-free factor pattern is diagonal."""
     direct_diagonal_inertia_sizes: frozenset
     """Star size groups whose every coordinate's child body has it as its only response coordinate."""
 
@@ -183,6 +196,7 @@ class ForestPlan:
         _world_mapping(plan, model)
         _body_maps(plan, model)
         _free_bodies(plan, model)
+        _coordinate_trees(plan, model)
         _mass_schedules(plan, model)
         _world_size_groups(plan, model)
         # Loop-closing joints are excluded from the tree and enforced as connect rows.
@@ -531,6 +545,46 @@ def _free_bodies(plan, model):
     )
 
 
+def _coordinate_trees(plan, model):
+    """The coordinate trees: each articulation's joints once a joint without coordinates is contracted, so a root without
+    coordinates is no node and each joint below it roots a tree. Only a common tree couples two coordinates in the mass
+    matrix, so a tree is a vertex of the rows' graph (rows are its edges). The mass matrix stops at an articulation, and
+    so does a tree, whatever the ancestry says. A prescribed articulation responds with nothing and holds none."""
+    forest = plan.joint_forest
+    joint_articulation = model.joint_articulation.numpy()
+    joint_qd_start = model.joint_qd_start.numpy()
+    member = joint_articulation >= 0
+    dofs = np.zeros(forest.count, dtype=np.int32)
+    dofs[member] = np.where(plan.response_dof_count[joint_articulation[member]] > 0, np.diff(joint_qd_start)[member], 0)
+
+    def rooted_above(above, joint):
+        return np.where((dofs[above] > 0) & (joint_articulation[above] == joint_articulation[joint]), above, joint)
+
+    # Each joint's topmost ancestor with coordinates, or itself: a tree's root, or a joint above every coordinate.
+    joints = np.arange(forest.count)
+    root = forest.scan_down(joints, rooted_above)
+    roots = np.flatnonzero((root == joints) & (dofs > 0))
+    joint_tree = np.where(dofs[root] > 0, np.searchsorted(roots, root), -1)
+    solved = dofs > 0
+    tree_articulation = joint_articulation[roots].astype(np.int32)
+    world_tree_start, world_trees = host_index.group_by(plan.articulation_world[tree_articulation], plan.world_count)
+    joint_child = model.joint_child.numpy()
+    body_tree = np.full(model.body_count, -1, dtype=np.int32)
+    owned = member & (joint_child >= 0)
+    body_tree[joint_child[owned]] = joint_tree[owned]
+    arrays = {
+        "tree_first": joint_qd_start[roots].astype(np.int32),
+        "tree_size": np.bincount(joint_tree[solved], dofs[solved], roots.size).astype(np.int32),
+        "tree_articulation": tree_articulation,
+        "world_tree_start": world_tree_start.astype(np.int32),
+        "world_trees": world_trees.astype(np.int32),
+        "body_tree": body_tree,
+    }
+    for name, array in arrays.items():
+        array.setflags(write=False)
+        setattr(plan, name, array)
+
+
 def _mass_schedules(plan, model):
     """Per topology-homogeneous size group: the coordinate-to-joint map and the star test."""
     plan.crba_dof_joint_offset_by_size = {}
@@ -577,11 +631,8 @@ def _mass_schedules(plan, model):
 
         if compatible:
             reference_offsets = offsets[0]
-            # A star: the fill-free factor pattern of the group's coordinates on their joints is diagonal (no
-            # coordinate has another on its joint or an ancestor's), so each entry of the mass matrix is a
-            # coordinate's own.
-            joint_dofs = np.bincount(reference_offsets, minlength=parents[0].size)
-            if TreePlan.build(parents[0], joint_dofs).nonzero_count == int(size):
+            # A star: every tree of the group has one coordinate, so each entry of the mass matrix is a coordinate's own.
+            if np.all(plan.tree_size[response_dof_count[plan.tree_articulation] == size] == 1):
                 diagonal_mass_sizes.add(int(size))
                 # Direct when each DOF's child body has that DOF as its single
                 # response DOF, and no other body does.

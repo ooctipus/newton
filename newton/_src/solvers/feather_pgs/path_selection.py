@@ -800,6 +800,8 @@ def _dynamics(solver) -> dict:
     return {
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver.forest.diagonal_mass_sizes),
+        # The rows' graph's vertices: how many coordinate trees hold each number of coordinates.
+        "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(solver.forest.tree_size)) if n},
         # Response layout: whether J/Y are gathered per world or already world-indexed.
         "jy_world_aliased": bool(solver.placement.jy_world_aliased),
         "hinv_jt_writes_world": bool(solver.placement.hinv_jt_writes_world),
