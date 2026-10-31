@@ -1099,8 +1099,9 @@ class WhitenedRows:
     (``ink_L_a``, ``ink_L_b``; the world's group indices in ``ink_meta``),
     staged with their reciprocal diagonals. ``A = Z^T Z``, so ``Z`` serves as
     both ``J^T`` and ``Y``. Each lane whitens its row of ``rows``: it stages
-    the row's physical Jacobian, the world's packed rows ``packed_J``
-    (``capacity`` rows a world) or the statements ``read`` (which write
+    the row's physical Jacobian, the world's packed rows, which the build
+    leaves as Jacobians in these worlds (``packed_Z``,
+    ``capacity`` rows a world), or the statements ``read`` (which write
     coordinate ``q`` to ``Zi[q * ZS]``), folds ``J_i v`` into the row's
     right-hand side, solves ``L Z_i = J_i^T`` in place per articulation
     (:class:`CholeskySolve`, masked) and keeps ``Z_i`` in its registers
@@ -1154,7 +1155,7 @@ class WhitenedRows:
             "const wp::vec2i sides_i = row_sides.data[(size_t)world * row_sides.shape[1] + i];",
             "const int first_0 = sides_i[0] >= 0 ? articulation_world_dof_offset.data[sides_i[0]] : -1;",
             "const int first_1 = sides_i[1] >= 0 ? articulation_world_dof_offset.data[sides_i[1]] : -1;",
-            f"const float* J_row = &packed_J.data[((size_t)world * {self.capacity} + i) * packed_J.shape[2]];",
+            f"const float* J_row = &packed_Z.data[((size_t)world * {self.capacity} + i) * packed_Z.shape[2]];",
         ]
         for art in self.articulations:
             read = [
@@ -1166,13 +1167,8 @@ class WhitenedRows:
             lines.append(art.guarded("\n".join(read)))
         return _lines(lines, "        ")
 
-    def stage(self, target: str, *, publish: bool, indent: str) -> str:
-        """Stage the factors, then whiten each lane's row into ``target`` (``Zi = &target[i]``) and its registers.
-
-        With ``publish`` the rows are also written to the world's packed rows (:mod:`.packed_rows`, at their
-        coordinates: the packed build's rows, now in the tier's own rounding), where the response block's build and the
-        publication read them.
-        """
+    def stage(self, target: str, *, indent: str) -> str:
+        """Stage the factors, then whiten each lane's row into ``target`` (``Zi = &target[i]``) and its registers."""
         if self.staged is not None:
             return self.staged
         lane, width, D = self.lanes.lane, self.lanes.width, self.dofs
@@ -1212,13 +1208,7 @@ class WhitenedRows:
                 return f"(Zi + {art.offset_name} * ZS)[{index} * ZS]"
 
             row.append(_lines([art.guarded(art.factor.whiten(z, z))], "    "))
-        row += ["    #pragma unroll", f"    for (int d = 0; d < {D}; ++d) Jr[d] = Zi[d * ZS];"]
-        if publish:
-            row += [
-                "    #pragma unroll",
-                f"    for (int d = 0; d < {D}; ++d) packed_Z.data[packed_base + (size_t)i * {D} + d] = Jr[d];",
-            ]
-        row.append("}")
+        row += ["    #pragma unroll", f"    for (int d = 0; d < {D}; ++d) Jr[d] = Zi[d * ZS];", "}"]
         return _lines([*lines, *row], indent)
 
     def publish(self, z: Callable[[str], str], applied: Callable[[str], str], indent: str) -> str:
@@ -1331,7 +1321,7 @@ class TransposedResponse(ResponseOperator):
         an admitted row's step.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
-        stage = [self.whitened.stage("s_Yt", publish=False, indent=indent)]
+        stage = [self.whitened.stage("s_Yt", indent=indent)]
         lines = [
             f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
             "    const int d = e >> 2;",

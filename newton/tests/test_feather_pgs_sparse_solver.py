@@ -375,7 +375,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             "row_incident",
         ]
         # The dense route's rows are packed (packed_rows): they move with their row slots.
-        packed = ["packed_J", "packed_Z", "row_sides"]
+        packed = ["packed_Z", "row_sides"]
         names += ["sparse_row_dof", "sparse_row_factor"] if sparse else packed
         arrays = {name: getattr(solver.placement, name).numpy() for name in names}
         dense_jacobian = None if sparse else unpacked_rows(solver)[0]
@@ -533,7 +533,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 self.assertIsNone(solver.placement.sparse_mass_matrix_size)
                 # The existing path: the matrix-free sweeps, whose producers write the packed rows.
                 self.assertTrue(solver.placement.mf_sweeps)
-                self.assertGreater(solver.placement.packed_J.size, 1)
+                self.assertGreater(solver.placement.packed_Z.size, 1)
 
     def test_warm_start_is_admitted(self):
         """Warm start seeds the sparse sweeps from carried impulses on models without free rigid bodies."""

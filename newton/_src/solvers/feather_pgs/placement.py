@@ -1074,7 +1074,7 @@ class Placement:
     def jacobian_rows(self, size: int) -> wp.array:
         """The Jacobian rows the producers of a size's rows write (:func:`.dense_rows.jacobian_row`): the packed rows
         (:mod:`.packed_rows`) under the matrix-free sweeps, else the size group's rows."""
-        return self.packed_J if self.mf_sweeps else self.J_by_size[size]
+        return self.packed_Z if self.mf_sweeps else self.J_by_size[size]
 
     def mf_count_or_dummy(self):
         """Matrix-free row counts, or a one-element dummy when the model has no contact rows (never indexed then)."""
@@ -1087,11 +1087,10 @@ class Placement:
 
     def inkernel_response_inputs(self) -> list:
         """The parallel tiers' in-kernel response operands: the worlds' group indices, the primary and secondary
-        groups' factors (the primary's for a model without a secondary), the packed rows' Jacobian and the rows'
-        cfm."""
+        groups' factors (the primary's for a model without a secondary) and the rows' cfm."""
         na, nb = self.ink_sizes[0], self.ink_sizes[1]
         L_b = self.factor.L_by_size[nb] if nb else self.factor.L_by_size[na]
-        return [self.ink_meta, self.factor.L_by_size[na], L_b, self.packed_J, self.row_cfm]
+        return [self.ink_meta, self.factor.L_by_size[na], L_b, self.row_cfm]
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the response, the whitening and the diagonals
@@ -1252,10 +1251,8 @@ class Placement:
         (:func:`.packed_rows.pack_kernel`, one launch; :meth:`diagonals`)."""
         if not self.mf_sweeps:
             return
-        # The parallel tiers whiten their worlds' rows in the kernel, and under the row packets the local owners
-        # solve their own and the packet producer applies restitution: the build leaves both. Elsewhere the local
-        # owners' worlds are packed: restitution reads their J v there.
-        skip, skip_local = int(self.ink_skip_rows()), int(self.row_packets is not None)
+        # The parallel tiers and the local owners whiten their worlds' rows in the kernel: the build leaves them, and
+        # keyed rows and the row packets keep them out of the store.
         # A compact or sparse size keeps a placeholder factor: its rows have no dense factor.
         sizes = tuple(sorted(size for size in self.forest.size_groups if self.factor.L_by_size[size].shape[1] == size))
         wp.launch(
@@ -1270,16 +1267,15 @@ class Placement:
                 self.forest.articulation_dof_start,
                 self.constraint_count,
                 self.mf_count_or_dummy(),
-                skip,
+                int(self.ink_skip_rows()),
                 self.local_solve_owner,
-                skip_local,
                 int(self.row_packets is not None or self.keyed_rows is not None),
                 self.row_cfm,
                 int(self.packed_dense),
                 write_diag,
                 v_hat,
             ],
-            outputs=[self.packed_J, self.packed_Z, self.diag, self.row_incident],
+            outputs=[self.packed_Z, self.diag, self.row_incident],
             device=self.model.device,
         )
 

@@ -97,11 +97,9 @@ def _components_data(P, rng, *, qualified=True):
     """Paired component inputs of two worlds: the first qualifies (valid rows on their own components), the second
     has a dense row on the free body's coordinates."""
     M, F, W = 6, 3, P + 6
-    J = np.zeros((2, M, W), np.float32)
     Y = np.zeros((2, M, W), np.float32)
-    J[:, :, :P] = rng.normal(size=(2, M, P))
     Y[:, :, :P] = rng.normal(size=(2, M, P))
-    J[1, 1, P + 2] = 1.0  # couples the components: the world falls back
+    Y[1, 1, P + 2] = 1.0  # couples the components: the world falls back
     row_type = np.array([[0, 2, 2, 3, 0, 3]] * 2, np.int32)
     row_parent = np.array([[-1, 0, 0, -1, -1, -1]] * 2, np.int32)
     meta = np.zeros((2, F * 4), np.int32)
@@ -123,7 +121,6 @@ def _components_data(P, rng, *, qualified=True):
         secondary_offset=np.full(2, P, np.int32),
         primary_group=np.array([0, 1], np.int32),
         selector=np.full(2, 7, np.int32),
-        J=J,
         Y=Y,
         L=L,
         rhs=rng.normal(size=(2, M)).astype(np.float32),

@@ -1260,8 +1260,8 @@ def _launch_parallel(tier, case, *, device):
         "rhs_bias": rows(case["rhs"]),
         "world_diag": rows(case["diag"]),
         "world_impulses": rows(case["impulses"]),
-        # The response block's scratch: the world's packed rows at their coordinates.
-        "packed_Z": wp.zeros((1, _CAPACITY, _DOFS), dtype=wp.float32, device=device),
+        # The world's packed rows (dense): every row on articulation 0, its coordinates from 0.
+        "packed_Z": wp.array(J, dtype=wp.float32, device=device),
         "world_row_type": rows(case["types"], wp.int32),
         "world_row_parent": rows(case["parents"], wp.int32),
         "world_row_mu": rows(case["mu"]),
@@ -1275,8 +1275,6 @@ def _launch_parallel(tier, case, *, device):
     }
     values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
     values["ink_L_a"] = wp.array(case["L"].astype(np.float32)[None], dtype=wp.float32, device=device)
-    # The world's packed rows (dense): every row on articulation 0, its coordinates from 0.
-    values["packed_J"] = wp.array(J, dtype=wp.float32, device=device)
     values["row_sides"] = wp.array(np.tile([0, -1], (1, _CAPACITY, 1)).astype(np.int32), dtype=wp.vec2i, device=device)
     values["response_dofs"] = wp.array([_DOFS], dtype=wp.int32, device=device)
     values["articulation_world_dof_offset"] = wp.zeros(1, dtype=wp.int32, device=device)

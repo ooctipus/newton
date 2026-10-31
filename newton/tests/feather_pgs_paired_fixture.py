@@ -86,7 +86,9 @@ def bind_components(host, device="cpu"):
     data = components.PairedComponentData()
     data.world_count = len(host["counts"])
     for name, value in host.items():
-        setattr(data, name, wp.array(value, dtype=wp.int32 if value.dtype == np.int32 else wp.float32, device=device))
+        if name != "J":  # Only the whitened rows are stored.
+            dtype = wp.int32 if value.dtype == np.int32 else wp.float32
+            setattr(data, name, wp.array(value, dtype=dtype, device=device))
     return data
 
 

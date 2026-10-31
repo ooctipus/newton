@@ -57,7 +57,7 @@ def _arrays(solver):
         {f"J_by_size[{size}]": solver.placement.J_by_size[size].numpy().copy() for size in solver.forest.size_groups}
     )
     # The matrix-free sweeps' producers write the packed rows (a placeholder otherwise).
-    arrays["_packed_J"] = solver.placement.packed_J.numpy().copy()
+    arrays["packed_Z"] = solver.placement.packed_Z.numpy().copy()
     return arrays
 
 

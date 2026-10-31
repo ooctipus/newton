@@ -72,7 +72,7 @@ LOCAL_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
     ("L_group", wp.array3d[float]),
     ("secondary_L_group", wp.array3d[float]),
-    ("packed_J", wp.array3d[float]),
+    ("packed_Z", wp.array3d[float]),
     ("row_sides", wp.array2d[wp.vec2i]),
     ("response_dofs", wp.array[int]),
     ("articulation_world_dof_offset", wp.array[int]),
@@ -220,7 +220,8 @@ def local_owned_source(
         local_mf_max_constraints=MFR,
     )
 
-    # The rows' Jacobians: the producers' packed rows (packed_rows), each articulation's entries where it is a side.
+    # The rows' Jacobians: the producers' packed rows, which the build leaves in these worlds (packed_rows), each
+    # articulation's entries where it is a side.
     sides = ""
     primary_read = "(first_p >= 0 ? J_row[first_p + i] : 0.0f)"
     secondary_read = "(first_s >= 0 ? J_row[first_s + i] : 0.0f)"
@@ -229,7 +230,7 @@ def local_owned_source(
     else:
         sides = (
             "        const wp::vec2i sides_r = row_sides.data[world_row_base + row];\n"
-            "        const float* J_row = &packed_J.data[(size_t)(world_row_base + row) * packed_J.shape[2]];\n"
+            "        const float* J_row = &packed_Z.data[(size_t)(world_row_base + row) * packed_Z.shape[2]];\n"
             "        const int first_p = PACKED_FIRST(sides_r, art);\n"
             + ("        const int first_s = PACKED_FIRST(sides_r, secondary_art);\n" if S else "")
         )

@@ -7,14 +7,12 @@ A dense row touches at most two articulations, its sides (:func:`.dense_rows.row
 the second or none. Packed, a row holds its sides' coordinates in order, the first side's, then the second's: entry
 ``e`` of a side of ``n`` coordinates is the side's coordinate ``e``, world coordinate ``offset + e``, so a row's
 entries ascend with the world's coordinates. An entry's world coordinate is not stored: it follows from the row's
-sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
-
-* the row's Jacobian ``J`` (``packed_J``), which the row producers write at the row's sides
-  (:func:`.dense_rows.jacobian_row`) and the build reads for the row's incident velocity ``J v_hat``
-  (``row_incident``);
-* its whitened form ``Z = L^-1 P J^T`` (``packed_Z``) through the side's leaf-first factor ``L``, in the kit's
-  positions: factor coordinate ``i`` of a side at its entry ``n - 1 - i``
-  (:class:`.response_operator.CholeskySolve`).
+sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). A row holds one array of entries,
+``packed_Z``: the row producers write its Jacobian ``J`` at the row's sides (:func:`.dense_rows.jacobian_row`), and the
+build, which takes the row's incident velocity ``J v_hat`` (``row_incident``) from it, replaces it with its whitened form
+``Z = L^-1 P J^T`` through the side's leaf-first factor ``L``, in the kit's positions: factor coordinate ``i`` of a side
+at its entry ``n - 1 - i`` (:class:`.response_operator.CholeskySolve`). The worlds a sweep whitens in the kernel keep
+``J``.
 
 Whitening keeps a side's support: ``J`` vanishes off the ancestors of the row's bodies, a set closed under ancestors,
 so ``Z`` does too and the solve reads ``L`` only there. A row's diagonal is ``A_ii = |Z|^2``, its entries' squares
@@ -49,11 +47,8 @@ from .response_operator import CholeskySolve
 
 __all__ = ["PACKED_ROWS", "PACKED_SIDES", "pack_kernel", "support_width"]
 
-PACKED_ROWS = FieldGroup(
-    Field("packed_J", wp.float32, ("world", "row", "support"), owner="placement"),
-    Field("packed_Z", wp.float32, ("world", "row", "support"), owner="placement"),
-)
-"""Each dense row's packed entries: world coordinate, Jacobian and whitened value."""
+PACKED_ROWS = FieldGroup(Field("packed_Z", wp.float32, ("world", "row", "support"), owner="placement"))
+"""Each dense row's packed entries: its Jacobian, then its whitened value."""
 
 
 _PACKED_SIDES = """    // A packed row's entries (packed_rows): PACKED_COORDINATE(sides, e) is the world coordinate of entry e of the
@@ -105,7 +100,7 @@ def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_cou
 def _pack_abi(sizes: tuple[int, ...]) -> tuple:
     """The rows' build: each side size's factors (``L_<n>``), every row's sides and the articulations' sizes, group
     indices and first coordinates, the rows per world and their owners (the worlds other sweeps own skipped:
-    :func:`_skipped`), the rows' ``cfm``, the predictor, the packed rows, the diagonal and the incident velocity."""
+    :func:`_kept`), the rows' ``cfm``, the predictor, the packed rows, the diagonal and the incident velocity."""
     factors = [(f"L_{n}", wp.array3d[float]) for n in sizes]
     return kernel_template.params(
         *factors,
@@ -118,27 +113,23 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
         ("mf_constraint_count", wp.array[int]),
         ("skip_rows_le", int),
         ("local_solve_owner", wp.array[int]),
-        ("skip_local", int),
         ("rows_elsewhere", int),
         ("world_row_cfm", wp.array2d[float]),
         ("dense", int),
         ("write_diag", int),
         ("v_hat", wp.array[float]),
-        ("packed_J", wp.array3d[float]),
         ("packed_Z", wp.array3d[float]),
         ("world_diag", wp.array2d[float]),
         ("row_incident", wp.array2d[float]),
     )
 
 
-def _skipped(world: str) -> str:
-    """The worlds whose rows another sweep forms: the parallel tiers' (at most ``skip_rows_le`` rows and no free-body
-    rows; ``skip_rows_le`` 0: none), which whiten them in the kernel, and with ``skip_local`` (the row packets) the
-    local owners', which solve their own rows. The packing leaves them."""
+def _kept(world: str) -> str:
+    """The worlds whose rows a sweep whitens in the kernel: the parallel tiers' (at most ``skip_rows_le`` rows and no
+    free-body rows; ``skip_rows_le`` 0: none) and the local owners'. Their rows stay Jacobians."""
     count = f"world_constraint_count.data[{world}]"
     tier = f"(skip_rows_le > 0 && {count} <= skip_rows_le && mf_constraint_count.data[{world}] == 0)"
-    local = f"(skip_local != 0 && local_solve_owner.data[{world}] != {PGS_LOCAL_SOLVE_OWNER_GENERAL})"
-    return f"{tier} || {local}"
+    return f"{tier} || local_solve_owner.data[{world}] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}"
 
 
 _UNROLLED_SIDE = 32
@@ -161,7 +152,7 @@ def _side(n: int) -> str:
             float z[{n}];
             {pragma}
             for (int e = 0; e < {n}; ++e) {{
-                z[e] = packed_J.data[base + e];
+                z[e] = packed_Z.data[base + e];
                 incident += z[e] * v_hat.data[start + e];
             }}
             if (!keeps) {{
@@ -179,11 +170,11 @@ def _side(n: int) -> str:
 def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     """The rows' pass, one thread per world row (``dim = worlds * rows``): each side's Jacobian, which its producer
     wrote packed, gives the row's incident velocity ``J v_hat`` in entry order and is whitened on the thread (Z0: a
-    zero diagonal gives zero) and stored, each entry once; pad the row past its sides (zero values); and, in the worlds
-    the general solver owns, store its diagonal by ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner adds ``cfm``
-    after), 2 ``|Z|^2 + cfm``, the squares summed in entry order. A world another sweep whitens in the kernel
-    (:func:`_skipped`) keeps its rows and gets their incident velocity alone; with ``rows_elsewhere`` (keyed rows, row
-    packets) its rows are not here at all.
+    zero diagonal gives zero) and stored in its place, each entry once; pad the row past its sides (zero values); and,
+    in the worlds the general solver owns, store its diagonal by ``write_diag``: 0 none, 1 ``A_ii = |Z|^2`` (an owner
+    adds ``cfm`` after), 2 ``|Z|^2 + cfm``, the squares summed in entry order. A world another sweep whitens in the
+    kernel (:func:`_kept`) keeps its rows and gets their incident velocity alone; with ``rows_elsewhere`` (keyed rows,
+    row packets) its rows are not here at all.
 
     ``sizes`` are the side sizes with a dense factor (each a ``L_<n>``); a side of another size is left as it is.
     Consecutive threads hold one world's rows, so a side's factor reads are the same address across a warp.
@@ -195,7 +186,7 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     const int world = tid / capacity;
     const int slot = tid - world * capacity;
     if (world >= world_constraint_count.shape[0] || slot >= world_constraint_count.data[world]) return;
-    const bool keeps = {_skipped("world")};
+    const bool keeps = {_kept("world")};
     if (keeps && rows_elsewhere != 0) return;
     const wp::vec2i sides = row_sides.data[tid];
     const int support = packed_Z.shape[2];
@@ -218,7 +209,6 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     if (keeps) return;
     for (int e = 0; e < support; ++e) {{
         if ((e >= first[0] && e < first[0] + count[0]) || (e >= first[1] && e < first[1] + count[1])) continue;
-        packed_J.data[(size_t)tid * support + e] = 0.0f;
         packed_Z.data[(size_t)tid * support + e] = 0.0f;
     }}
     if (write_diag != 0 && local_solve_owner.data[world] == {PGS_LOCAL_SOLVE_OWNER_GENERAL})

@@ -868,7 +868,7 @@ def bilateral_rows(
     connect_slot: wp.array[int],
     connect_art: wp.array[int],
     n_connect: int,
-    packed_J: wp.array3d[float],
+    packed_Z: wp.array3d[float],
     world: int,
     first: int,
     n_dofs: int,
@@ -877,7 +877,7 @@ def bilateral_rows(
     """Select the articulation's block rows into ``preelim_slots[base:]`` and return their count.
 
     The articulation's mimic rows, then its connect rows (three per closure), from the rows' own ownership tables
-    (not the world's row types, which would admit other articulations' zero rows); a row with ``|J|^2 <= 1e-10``
+    (not the world's row types, which would admit other articulations' zero rows); a row with ``|Z|^2 <= 1e-10``
     (a degenerate connect axis) is dropped; unused entries up to ``capacity`` (the model's largest block) are -1.
     """
     n = int(0)
@@ -895,7 +895,7 @@ def bilateral_rows(
     count = int(0)
     for p in range(n):
         s = preelim_slots[base + p]
-        if packed_product(packed_J, world, s, first, s, first, n_dofs) > 1.0e-10:
+        if packed_product(packed_Z, world, s, first, s, first, n_dofs) > 1.0e-10:
             preelim_slots[base + count] = s
             count += 1
     for p in range(count, capacity):
@@ -938,7 +938,6 @@ def elimination(rows: int) -> BilateralElimination:
         connect_slot: wp.array[int],
         connect_art: wp.array[int],
         n_connect: int,
-        packed_J: wp.array3d[float],
         packed_Z: wp.array3d[float],
         n_dofs: int,
     ):
@@ -965,7 +964,7 @@ def elimination(rows: int) -> BilateralElimination:
             connect_slot,
             connect_art,
             n_connect,
-            packed_J,
+            packed_Z,
             world,
             first,
             n_dofs,
@@ -2333,7 +2332,7 @@ _PAIRED_COMPONENTS = r"""
 #if !defined(__CUDA_ARCH__)
     if (logical_lane != 0) return;
 #endif
-    const int M = data.J.shape[1];
+    const int M = data.Y.shape[1];
     const int F = data.mf_meta.shape[1] / 4;
     for (int world = worker; world < data.world_count; world += workers) {
         const int m = data.counts.data[world];
@@ -2370,9 +2369,9 @@ _PAIRED_COMPONENTS = r"""
                 }
             }
             for (int d = 0; d < $WORLD; ++d) {
-                const float j = data.J.data[r * $WORLD + d], y = data.Y.data[r * $WORLD + d];
-                valid &= wp::isfinite(j) && wp::isfinite(y) && wp::abs(y) <= 1.0e15f;
-                if (d >= so && d < so + $SECONDARY) valid &= j == 0.0f && y == 0.0f;
+                const float y = data.Y.data[r * $WORLD + d];
+                valid &= wp::isfinite(y) && wp::abs(y) <= 1.0e15f;
+                if (d >= so && d < so + $SECONDARY) valid &= y == 0.0f;
             }
         }
         for (int row = LANE; row < mf; row += STRIDE) {

@@ -33,7 +33,6 @@ PAIRED_COMPONENTS = (
     Field("secondary_offset", wp.int32, ("world",), attr="_paired_factor_secondary_offsets_by_world"),
     Field("primary_group", wp.int32, ("world",), attr="_paired_factor_primary_groups_by_world"),
     Field("selector", wp.int32, ("world",), owner="components"),
-    Field("J", wp.float32, ("world", "row", "world_dof"), attr="packed_J", owner="placement"),
     Field("Y", wp.float32, ("world", "row", "world_dof"), attr="packed_Z", owner="placement"),
     Field("L", wp.float32, ("art", "size", "size"), owner="step"),
     Field("rhs", wp.float32, ("world", "row"), owner="step"),
@@ -46,8 +45,8 @@ PAIRED_COMPONENTS = (
     Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
     Field("mf_mu", wp.float32, ("world", "mf_row"), attr="mf_row_mu", owner="placement"),
 )
-"""The component classifier's inputs: the dense rows (packed at their world coordinates: their Jacobian and whitened
-rows, :mod:`.packed_rows`) and the matrix-free rows, the pair layout and its own selector."""
+"""The component classifier's inputs: the dense rows (packed and whitened at their world coordinates,
+:mod:`.packed_rows`) and the matrix-free rows, the pair layout and its own selector."""
 
 PairedComponentData = field_group.struct("PairedComponentData", PAIRED_COMPONENTS, __name__)
 

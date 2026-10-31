@@ -47,7 +47,7 @@ class TestPairedComponents(unittest.TestCase):
         """Prepare all 517 worlds with permuted groups and both physical block orders."""
         host = component_fixture(517)
         host["mf_counts"][1] = 0
-        host["J"][2, 2, host["secondary_offset"][2]] = np.float32(1e-30)
+        host["Y"][2, 2, host["secondary_offset"][2]] = np.float32(1e-30)
         data = bind_components(host)
         launch_components(data)
         expected_selector = np.full(517, -1, np.int32)
@@ -55,15 +55,13 @@ class TestPairedComponents(unittest.TestCase):
         np.testing.assert_array_equal(data.selector.numpy(), expected_selector)
         # The rows are already whitened (packed at their world coordinates): the qualification reads them only.
         for name, before in host.items():
-            if name != "selector":
+            if name not in ("selector", "J"):
                 np.testing.assert_array_equal(getattr(data, name).numpy(), before, err_msg=name)
 
     def test_reject_current_coupling_metadata_and_nonfinite(self):
         """Retain the complete mixed sweep on each independent rejection reason."""
         cases = (
-            "secondary_j",
             "secondary_y",
-            "nan_j",
             "nan_y",
             "nan_factor",
             "large_factor",
@@ -91,10 +89,10 @@ class TestPairedComponents(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 host = component_fixture(1)
-                if case in ("secondary_j", "secondary_y"):
-                    host["J" if case.endswith("j") else "Y"][0, 2, 23] = np.float32(1e-30)
-                elif case in ("nan_j", "nan_y"):
-                    host[case[-1].upper()][0, 1, 2] = np.nan
+                if case == "secondary_y":
+                    host["Y"][0, 2, 23] = np.float32(1e-30)
+                elif case == "nan_y":
+                    host["Y"][0, 1, 2] = np.nan
                 elif case in ("nan_factor", "large_factor"):
                     host["L"][0, 1, 1] = np.nan if case.startswith("nan") else 1e20
                 elif case == "large_y":
@@ -251,7 +249,7 @@ class TestPairedComponentsCUDA(unittest.TestCase):
             with self.subTest(iterations=iterations):
                 baseline, old = solve_fixture(device)
                 candidate, new = solve_fixture(device)
-                immutable = {name: getattr(candidate, name).numpy() for name in ("counts", "mf_counts", "J", "mf_meta")}
+                immutable = {name: getattr(candidate, name).numpy() for name in ("counts", "mf_counts", "Y", "mf_meta")}
                 launch_solve_pair(baseline, old, enabled=False, device=device, iterations=iterations)
                 launch_solve_pair(candidate, new, enabled=True, device=device, iterations=iterations)
                 np.testing.assert_array_equal(candidate.selector.numpy(), [-1, -1, 3, 0, -1])

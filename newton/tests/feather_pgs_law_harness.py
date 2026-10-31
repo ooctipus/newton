@@ -672,7 +672,7 @@ def group_rows(device) -> RowSupport:
 
 
 def local_packed_rows(device, art_world, rows_by_art) -> list:
-    """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_J``, ``row_sides``,
+    """The local owners' row operands (:data:`.sweep_routes_local.LOCAL_ABI`): ``packed_Z``, ``row_sides``,
     ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense`` (1). ``rows_by_art[a]`` is articulation
     ``a``'s Jacobian rows ``[rows, n]`` (its size group's); each world's rows hold its articulations' coordinates in
     articulation order (dense), every row on every articulation of its world, so a row's entries are the group rows'."""
@@ -697,6 +697,38 @@ def local_packed_rows(device, art_world, rows_by_art) -> list:
         wp.array(offsets, dtype=wp.int32, device=device),
         1,
     ]
+
+
+def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
+    six coordinates, ``u_hat = L^T P v_hat`` through the body's factor, and its terms' magnitude."""
+    v_hat = solver.v_hat.numpy().astype(np.float64)
+    incident = solver.placement.mf_row_incident.numpy().astype(np.float64)
+    Z_a, Z_b = solver.placement.mf_Z_a.numpy().astype(np.float64), solver.placement.mf_Z_b.numpy().astype(np.float64)
+    bodies_a, bodies_b, kinds = (
+        solver.placement.mf_body_a.numpy(),
+        solver.placement.mf_body_b.numpy(),
+        solver.placement.mf_row_type.numpy(),
+    )
+    body_art = solver.forest.body_to_articulation.numpy()
+    starts, groups = solver.forest.articulation_dof_start.numpy(), solver.forest.art_group_idx.numpy()
+    factors = solver.factor.L_by_size[6].numpy().astype(np.float64) if 6 in solver.factor.L_by_size else None
+    gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
+    for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
+        for row in range(int(count)):
+            if kinds[world, row] == kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                continue  # A speed row carries no Z.
+            term = np.zeros(0)
+            for body, Z in ((bodies_a[world, row], Z_a), (bodies_b[world, row], Z_b)):
+                if body < 0:
+                    continue
+                art = body_art[body]
+                L = np.tril(factors[groups[art]])
+                u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + 6][::-1]
+                term = np.concatenate((term, Z[world, row][::-1] * u_hat))
+            gaps[world, row] = abs(incident[world, row] - term.sum())
+            terms[world, row] = np.abs(term).sum()
+    return gaps, terms
 
 
 def row_velocity(jacobian, velocity) -> np.ndarray:
@@ -763,10 +795,10 @@ def packed_coordinates(solver) -> np.ndarray:
 
 def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     """The matrix-free sweeps' dense rows over their worlds' coordinates, from the packed rows (:mod:`.packed_rows`),
-    float64 ``[world, row, coordinate]``: the Jacobian ``J`` and the response ``H^-1 J^T`` (``P^T L^-T z`` on each
-    side, the side's entries found by their coordinates)."""
+    float64 ``[world, row, coordinate]``: the Jacobian ``J`` (``P^T L z`` on each side, the side's entries found by
+    their coordinates) and the response ``H^-1 J^T`` (``P^T L^-T z``)."""
     dof = packed_coordinates(solver)
-    J, Z = solver.placement.packed_J.numpy().astype(np.float64), solver.placement.packed_Z.numpy().astype(np.float64)
+    Z = solver.placement.packed_Z.numpy().astype(np.float64)
     sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
     factors = {}
@@ -780,13 +812,41 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
                 n, first = int(sizes[art]), int(offsets[art])
                 held = (dof[world, row] >= first) & (dof[world, row] < first + n)
                 coordinates = dof[world, row, held]
-                jacobian[world, row, coordinates] = J[world, row, held]
                 if n not in factors:
                     factors[n] = solver.factor.L_by_size[n].numpy().astype(np.float64)
                 L = np.tril(factors[n][groups[art]])
                 # Leaf-first positions: factor coordinate i is the side's coordinate n - 1 - i.
+                jacobian[world, row, coordinates] = (L @ Z[world, row, held][::-1])[::-1]
                 response[world, row, coordinates] = np.linalg.solve(L.T, Z[world, row, held][::-1])[::-1]
     return jacobian, response
+
+
+def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
+    """BACKBONE's placement invariant ``|J v - Z^T u|`` at the predictor, over the matrix-free sweeps' dense rows:
+    each row's ``|row_incident - Z^T u_hat|`` with ``u_hat = L^T P v_hat`` on each side, and the magnitude of the
+    sum's terms it rounds against (:mod:`.solve_policy`), float64 ``[world, row]``, zero past a world's rows."""
+    dof = packed_coordinates(solver)
+    Z = solver.placement.packed_Z.numpy().astype(np.float64)
+    v_hat = solver.v_hat.numpy().astype(np.float64)
+    incident = solver.placement.row_incident.numpy().astype(np.float64)
+    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
+    starts = solver.forest.articulation_dof_start.numpy()
+    gaps, terms = np.zeros(dof.shape[:2]), np.zeros(dof.shape[:2])
+    for world, count in enumerate(solver.placement.constraint_count.numpy()):
+        for row in range(min(int(count), dof.shape[1])):
+            term = np.zeros(0)
+            for art in sides[world, row]:
+                if art < 0:
+                    continue
+                n, first = int(sizes[art]), int(offsets[art])
+                held = (dof[world, row] >= first) & (dof[world, row] < first + n)
+                L = np.tril(solver.factor.L_by_size[n].numpy().astype(np.float64)[groups[art]])
+                u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + n][::-1]
+                term = np.concatenate((term, Z[world, row, held][::-1] * u_hat))
+            gaps[world, row] = abs(incident[world, row] - term.sum())
+            terms[world, row] = np.abs(term).sum()
+    return gaps, terms
 
 
 def call(kernel, dim, device, **values):
