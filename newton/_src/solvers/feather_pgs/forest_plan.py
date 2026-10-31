@@ -31,6 +31,7 @@ import warp as wp
 from ...sim import Model
 from ...sim.enums import JointType
 from . import host_index
+from .body_cut import BodyCut
 from .body_mapping import build_body_maps
 from .field_group import SolverArrays
 from .solver_fields import BODY_MAPS
@@ -55,6 +56,8 @@ def joint_forest(model: Model) -> TreePlan:
 class ForestPlan:
     """The model's articulation forest: topology, groups, root kinds, world mapping and body maps (frozen)."""
 
+    cut: BodyCut
+    """The cut that made the model a forest, and its links (:mod:`.body_cut`)."""
     joint_forest: TreePlan
     """The model's joint forest (:func:`joint_forest`)."""
     world_count: int
@@ -171,15 +174,16 @@ class ForestPlan:
     body_single_response_dof_host: np.ndarray | None
 
     @classmethod
-    def build(cls, model: Model, joint_forest: TreePlan, kinematic_dof_mask: np.ndarray) -> ForestPlan:
-        """Build the plan from the model's topology.
+    def build(cls, cut: BodyCut, joint_forest: TreePlan, kinematic_dof_mask: np.ndarray) -> ForestPlan:
+        """Build the plan from the forest model's topology.
 
         Args:
-            model: The model.
+            cut: The body cut, whose :attr:`~.body_cut.BodyCut.model` is the model.
             joint_forest: The model's joint forest (:func:`joint_forest`).
             kinematic_dof_mask: Each coordinate the body flags make kinematic, at construction.
         """
-        plan = SimpleNamespace(joint_forest=joint_forest)
+        model = cut.model
+        plan = SimpleNamespace(cut=cut, joint_forest=joint_forest)
         free_root = None
         if model.joint_count:
             # The one root rule: a FREE or DISTANCE joint without a parent roots a free tree.
@@ -187,7 +191,7 @@ class ForestPlan:
             free_root = ((joint_type == JointType.FREE) | (joint_type == JointType.DISTANCE)) & (
                 model.joint_parent.numpy() < 0
             )
-        _articulations(plan, model, kinematic_dof_mask, free_root)
+        _articulations(plan, model, kinematic_dof_mask, free_root, cut.linked)
         plan.prescribed_articulation = wp.array(plan.prescribed_articulation_host, dtype=wp.int32, device=model.device)
         plan.has_prescribed_response = bool(np.any(plan.prescribed_articulation_host != 0))
         _coordinates(plan, model)
@@ -205,8 +209,10 @@ class ForestPlan:
         return cls(**vars(plan))
 
 
-def _articulations(plan, model, kinematic_dof_mask, free_root):
-    """Each articulation's tree joints, coordinates, world, free body and prescribed response."""
+def _articulations(plan, model, kinematic_dof_mask, free_root, linked):
+    """Each articulation's tree joints, coordinates, world, free body and prescribed response. A linked tree's rows are
+    the bilateral block's, so a body on one is neither free nor prescribed: its rows and its kinematic armature stay in
+    the block's reach."""
     articulation_count = model.articulation_count
     articulation_dof_count = np.zeros(articulation_count, dtype=np.int32)
     articulation_dof_start = np.zeros(articulation_count, dtype=np.int32)
@@ -306,7 +312,7 @@ def _articulations(plan, model, kinematic_dof_mask, free_root):
         single = np.flatnonzero(articulation_joint_end - first_joint == 1)
         root = first_joint[single]
         # A free rigid body: one tree joint, a FREE joint that roots a free tree.
-        free = single[free_root[root] & (joint_type[root] == int(JointType.FREE))]
+        free = single[free_root[root] & (joint_type[root] == int(JointType.FREE)) & ~linked[single]]
         is_free_rigid[free] = 1
         free_rigid_body_indices = joint_child[first_joint[free]]
 

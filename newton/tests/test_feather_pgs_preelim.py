@@ -19,10 +19,12 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.test_feather_pgs_connect import (
+    _LOOP_FRAMES,
     _REL_P,
     _anchor_gaps,
     _build_carried_load,
     _build_four_bar,
+    _four_bar_bars,
     _loop_anchor_gap,
     _prescribe_carrier,
 )
@@ -49,9 +51,8 @@ class TestPreeliminationSignature(unittest.TestCase):
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):
     """Drive the connect-test four-bar and track the worst loop-anchor gap.
 
-    Deliberately runs at a LOW iteration count: with iterative closure rows the
-    anchor gap is convergence-limited (measured ~0.5 mm at 2 iterations), while
-    pre-elimination enforces the closure independently of the sweep budget.
+    Deliberately runs at a LOW iteration count: the elimination enforces the
+    closure independently of the sweep budget.
     """
     model = _build_four_bar().finalize()
     solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=pgs_iterations, pgs_beta=0.1, **solver_kwargs)
@@ -69,16 +70,14 @@ def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: i
     return solver, model, state_0, gap_max
 
 
-def _run_scene(scene: scenes.Scene, iterations: int, eliminate: bool = True):
-    """Step a catalogue scene with the bilateral elimination (or the iterative closure rows); return the solver, every
-    step's body positions and the largest contact impulse."""
+def _run_scene(scene: scenes.Scene, iterations: int):
+    """Step a catalogue scene; return the solver, every step's body positions and the largest contact impulse."""
     model = scene.build(wp.get_device())
     solver = newton.solvers.SolverFeatherPGS(
         model,
         pgs_iterations=iterations,
         pgs_beta=0.1,
         dense_max_constraints=128,
-        enable_bilateral_preelimination=eliminate,
     )
     pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
     contacts = pipeline.contacts()
@@ -127,21 +126,21 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, None, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
-        self.assertTrue(solver._preelim_active)
-        count = int(solver._preelim_nB.numpy()[0])
-        slots = solver._preelim_slots.numpy()[:count]
+        self.assertTrue(solver.factor.eliminates)
+        count = int(solver.factor._preelim_nB.numpy()[0])
+        slots = solver.factor._preelim_slots.numpy()[:count]
         selected_types = solver.placement.row_type.numpy()[0, slots]
         self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
         self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
     def test_blocks_are_sized_from_the_model(self):
-        """A block takes every bilateral row of its articulation, however many: three connect rows and six mimics
-        (nine rows, past the former capacity of eight) are eliminated, and the pivot keeps one of the six identical
-        mimics, which depend on each other."""
+        """A block takes every bilateral row of its trees, however many: a link's six rows and six mimics (twelve
+        rows, past the former capacity of eight) are eliminated, and the pivot keeps one of the six identical mimics,
+        which depend on each other."""
         model = _build_overcapacity_mixed_bilateral_model()
-        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, enable_bilateral_preelimination=True)
-        self.assertTrue(solver._preelim_active)
-        self.assertEqual(solver._elimination.rows, 9)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
+        self.assertTrue(solver.factor.eliminates)
+        self.assertEqual(solver.factor.elimination.rows, 12)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
         for _ in range(16):
@@ -149,8 +148,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, None, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
-        count = int(solver._preelim_nB.numpy()[0])
-        kept = solver.placement.row_type.numpy()[0, solver._preelim_slots.numpy()[:count]]
+        count = int(solver.factor._preelim_nB.numpy()[0])
+        kept = solver.placement.row_type.numpy()[0, solver.factor._preelim_slots.numpy()[:count]]
         self.assertEqual(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
         self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
@@ -162,7 +161,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(
             model, pgs_iterations=16, pgs_beta=0.2, enable_bilateral_preelimination=True
         )
-        self.assertTrue(solver._preelim_active)
+        self.assertTrue(solver.factor.eliminates)
         articulation = wp.array([int(solver.forest.body_to_articulation.numpy()[carrier])], dtype=wp.int32)
         state_0, state_1 = model.state(), model.state()
         control = model.control()
@@ -185,24 +184,13 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             self.assertLess(gap, 3.0e-3)
 
     def test_closure_exact_at_low_iterations(self):
-        """Pre-elimination makes the loop closure iteration-independent.
-
-        At 2 PGS iterations the iterative CONNECT rows cannot converge (the
-        anchor gap plateaus near half a millimetre); the pre-eliminated solve
-        must hold the closure 100x tighter through the same driven stroke.
-        This is the regression-first differential: without the feature the
-        ratio is 1 and the assertions below fail.
-        """
-        solver_off, _, _state_off, gap_off = _run_four_bar()
-        self.assertFalse(solver_off._preelim_active)
-        solver_on, _, state_on, gap_on = _run_four_bar(enable_bilateral_preelimination=True)
-        self.assertTrue(solver_on._preelim_active)
-        self.assertEqual(solver_on._preelim_count, 1)
-
-        self.assertTrue(np.isfinite(state_on.body_q.numpy()).all())
-        self.assertGreater(gap_off, 1.0e-4, "iterative baseline unexpectedly tight; differential is meaningless")
-        self.assertLess(gap_on, 2.0e-5, f"pre-eliminated closure gap {gap_on:.2e} m not exact")
-        self.assertLess(gap_on, 0.01 * gap_off, f"expected >100x tightening, got {gap_off / max(gap_on, 1e-12):.1f}x")
+        """The elimination makes the loop closure independent of the sweeps: at 2 sweeps, where iterative closure rows
+        plateau near half a millimetre, the anchors hold at float32's floor through the driven stroke."""
+        solver, _, state, gap = _run_four_bar()
+        self.assertTrue(solver.factor.eliminates)
+        self.assertEqual(solver.factor.block_count, 1)
+        self.assertTrue(np.isfinite(state.body_q.numpy()).all())
+        self.assertLess(gap, 2.0e-5, f"closure gap {gap:.2e} m not exact")
 
     @unittest.skip(
         "Obsolete drive-only fixture: dense non-contact rows deliberately cold-start; "
@@ -259,7 +247,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         gap = _loop_anchor_gap(model, state_1)
-        self.assertTrue(solver._preelim_active)
+        self.assertTrue(solver.factor.eliminates)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
         self.assertGreater(np.max(solver.placement.impulses.numpy()), 1.0e-4)
         self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
@@ -303,7 +291,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
             if contact_rows.any():
                 loaded = max(loaded, float(np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])))
-        self.assertTrue(solver._preelim_active)
+        self.assertTrue(solver.factor.eliminates)
         self.assertGreater(loaded, 0.1, "the contacts carried no load")
         self.assertLess(worst, 1.0e-5, f"loaded contacts opened the closure by {worst:.2e} m")
 
@@ -312,11 +300,10 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         at the contacts' own rate, where closure rows in the sweep converge at the closure's coupling to them.
 
         The five-bar leg stands on its foot, which sits on the loop, and the Stewart platform's five closures
-        (fifteen rows in one block) press it onto a table: 16 sweeps reach the converged trajectory (512 sweeps)
-        within 1e-6 m (measured 0 and 1.5e-8 m; iterative closure rows 1.2e-3 and 7.3e-3 m). The four-bar is stopped
-        at its rocker, so the crank's drive load (about 30 N m) crosses the closure into a four-point face contact
-        whose split is statically indeterminate: that contact problem sets its 16-sweep error (3.1e-6 m, the same with
-        the closure exact or regularized), 2000 times below the iterative closure rows' (7.3e-3 m). LC design §3.
+        (thirty link rows in one block) press it onto a table: 16 sweeps reach the converged trajectory (512 sweeps)
+        within 1e-6 m. The four-bar is stopped at its rocker, so the crank's drive load (about 30 N m) crosses the
+        closure into a four-point face contact whose split is statically indeterminate: that contact problem sets its
+        16-sweep error, about 3e-6 m, with the closure exact or regularized. LC design §3.
         """
         for scene, bound in (
             (scenes.five_bar_leg(), 1.0e-6),
@@ -326,24 +313,93 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             with self.subTest(scene=scene.name):
                 solver, fast, loaded = _run_scene(scene, 16)
                 _, converged, _ = _run_scene(scene, 512)
-                _, rows, _ = _run_scene(scene, 16, eliminate=False)
-                self.assertTrue(solver._preelim_active)
+                self.assertTrue(solver.factor.eliminates)
                 self.assertGreater(loaded, 1.0e-3, "the contact carried no load")
                 error = float(np.abs(fast - converged).max())
-                rows_error = float(np.abs(rows - converged).max())
                 self.assertLess(error, bound, f"{scene.name}: 16 sweeps miss the converged trajectory by {error:.2e} m")
-                self.assertGreater(rows_error, 100.0 * max(error, 1.0e-9), f"{scene.name}: rows {rows_error:.2e} m")
+
+    def test_the_block_is_orthonormal_and_the_rows_are_clear_of_it(self):
+        """The Stewart's link rows leave the elimination orthonormal, and every other row orthogonal to them, so each
+        absorbs float32's leakage in one visit: a block of thirty coupled rows would pass it among them."""
+        solver, _, _ = _run_scene(scenes.stewart_platform(), 16)
+        kept = solver.factor._preelim_slots.numpy()
+        kept = kept[kept >= 0]
+        count = int(solver.placement.constraint_count.numpy()[0])
+        rows = solver.placement.packed_Z.numpy()[0, :count].astype(np.float64)
+        Q = rows[kept]
+        self.assertGreater(kept.size, 12)
+        np.testing.assert_allclose(Q @ Q.T, np.eye(kept.size), atol=1.0e-4)
+        others = np.setdiff1d(np.arange(count), kept)
+        self.assertLess(float(np.abs(Q @ rows[others].T).max()), 1.0e-4)
+
+    def test_a_rows_scale_does_not_decide_its_rank(self):
+        """Rank is each row's own remainder: on a rocker of 1e-7 kg m^2, whose angular rows are a thousand times its
+        linear ones, the link keeps all five independent rows and the anchors hold at 2 sweeps. Measured against the
+        block's largest row the same model keeps three, and leaves the closure to iterate at 3.5e-4 m."""
+        builder, coupler, rocker = _four_bar_bars()
+        builder.body_inertia[rocker] = wp.mat33(1.0e-7 * np.eye(3))
+        builder.add_joint_ball(parent=coupler, child=rocker, **_LOOP_FRAMES)
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=2, pgs_beta=0.1)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.3
+        control.joint_target_q.assign(targets)
+        worst = 0.0
+        for _ in range(240):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+            worst = max(worst, _loop_anchor_gap(model, state_0))
+        self.assertEqual(solver.factor._preelim_nB.numpy().tolist(), [5])
+        self.assertLess(worst, 1.0e-6)
+
+    def _jammed_sweeps(self, *, warm: bool) -> float:
+        """Sweeps per solve of the four-bar jammed at its crank, on a budget of 256."""
+        builder = _build_four_bar()
+        builder.joint_effort_limit[0] = float("inf")
+        builder.add_shape_box(
+            -1, xform=wp.transform(wp.vec3(-0.04, 0.0, 0.5), wp.quat_identity()), hx=0.02, hy=0.1, hz=0.1
+        )
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_iterations=256,
+            pgs_beta=0.1,
+            dense_max_constraints=128,
+            pgs_solve_readout="sweeps",
+            pgs_warmstart=warm,
+        )
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        targets = model.joint_target_q.numpy().copy()
+        targets[0] = 0.6
+        control.joint_target_q.assign(targets)
+        for _ in range(120):
+            pipeline.collide(state_0, contacts)
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        return solver.get_path_selection()["measurements"]["solve_readout"]["slots"][0]["mean_sweeps"]
+
+    def test_a_jammed_loop_exits(self):
+        """The collinear rows of a jammed loop trade impulses forever with no effect on the velocity, each loud alone,
+        so a wide sweep also ends on a velocity that stood still: the solves stop, cold and warm, far short of the
+        budget."""
+        self.assertLessEqual(self._jammed_sweeps(warm=False), 6.0)
+        self.assertLessEqual(self._jammed_sweeps(warm=True), 12.0)
 
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""
-        _, _, state, _ = _run_four_bar(enable_bilateral_preelimination=True, pgs_iterations=16)
+        _, _, state, _ = _run_four_bar(pgs_iterations=16)
         q = state.joint_q.numpy()
         self.assertAlmostEqual(q[2], q[0], delta=0.08)
         self.assertGreater(abs(q[2]), 0.3, "rocker did not move — loop not transmitting")
 
     def test_rows_remain_allocated(self):
         """B rows keep their dense slots (layout/warm-start stability); they are neutralized, not removed."""
-        solver, _, _, _ = _run_four_bar(steps=60, enable_bilateral_preelimination=True)
+        solver, _, _, _ = _run_four_bar(steps=60)
         counts = solver.placement.constraint_count.numpy()
         rows = solver.placement.row_type.numpy()
         seen = set()
@@ -353,6 +409,30 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
 
 
 class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
+    def test_a_coordinate_near_zero_ends_its_solves(self):
+        """A coordinate the impulses cancel to zero keeps their rounding, far above its own magnitude. Its floor is the
+        magnitude it entered the solve with, so no solve of these scenes runs out of a budget it does not need."""
+        for scene in (scenes.five_bar_leg(), scenes.stewart_platform()):
+            with self.subTest(scene=scene.name), wp.ScopedDevice("cpu"):
+                model = scene.build(wp.get_device("cpu"))
+                solver = newton.solvers.SolverFeatherPGS(
+                    model, pgs_iterations=256, dense_max_constraints=128, pgs_solve_readout="sweeps"
+                )
+                pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+                contacts = pipeline.contacts()
+                state_0, state_1, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+                for step in range(scene.steps):
+                    pipeline.collide(state_0, contacts)
+                    state_0.clear_forces()
+                    if scene.control is not None:
+                        scene.control(model, control, state_0, step)
+                    solver.step(state_0, state_1, control, contacts, scene.dt)
+                    state_0, state_1 = state_1, state_0
+                slot = solver.get_path_selection()["measurements"]["solve_readout"]["slots"][0]
+                self.assertEqual(slot["exhausted"], 0)
+                self.assertLess(slot["mean_sweeps"], 16.0)
+
     def test_cpu_pre_eliminates_the_closure(self):
         """Pre-eliminate the four-bar's closure on the CPU, whose matrix-free sweeps carry it as CUDA's do.
 
@@ -362,11 +442,11 @@ class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
         model = _build_four_bar().finalize(device="cpu")
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, enable_bilateral_preelimination=True)
-        self.assertTrue(solver._preelim_active)
+            solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16)
+        self.assertTrue(solver.factor.eliminates)
         self.assertFalse([w for w in caught if "requires CUDA" in str(w.message)])
         with wp.ScopedDevice("cpu"):
-            _, _, _, gap = _run_four_bar(steps=240, enable_bilateral_preelimination=True)
+            _, _, _, gap = _run_four_bar(steps=240)
         self.assertLess(gap, 1.0e-5)
 
 

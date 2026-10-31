@@ -24,7 +24,9 @@ The rows' width ``S`` (``support``) comes from the data: the most coordinates tw
 (:func:`support_width`). Where that is every coordinate of the widest world (worlds of one or two articulations), the
 rows are laid out ``dense``: entry ``e`` is world coordinate ``e`` and the coordinates outside the row's sides hold
 zero (coordinate -1), so a row is also its dense row over the world, the form the routes that hold a world's
-coordinates on lanes read. The producers write each row's sides whole, zeros included, and record its sides: the
+coordinates on lanes read. Bilateral elimination widens them (:data:`WIDE`): a corrected row reaches every tree of its
+block, past its two sides, so the layout is dense and the sides no longer bound a row's coordinates. The producers
+write each row's sides whole, zeros included, and record its sides: the
 rows are never cleared. The build (:func:`pack_kernel`, one launch) whitens the rows the routes read, zeroes their
 entries past the sides and forms their diagonals (the parallel tiers whiten their worlds' rows in the kernel from
 the rows' sides: the build leaves them). Bilateral pre-elimination corrects them
@@ -45,7 +47,11 @@ from .kernel_template import THREADS, KernelTemplate
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskySolve
 
-__all__ = ["PACKED_ROWS", "PACKED_SIDES", "pack_kernel", "support_width"]
+__all__ = ["PACKED_ROWS", "PACKED_SIDES", "WIDE", "pack_kernel", "support_width"]
+
+WIDE = 2
+"""The ``dense`` layout of rows that bilateral elimination corrected: every entry is a world coordinate's, sides or
+not."""
 
 PACKED_ROWS = FieldGroup(Field("packed_Z", wp.float32, ("world", "row", "support"), owner="placement"))
 """Each dense row's packed entries: its Jacobian, then its whitened value."""

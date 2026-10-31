@@ -685,7 +685,7 @@ def decline(solver) -> str | None:
                 and not laws.regularized
                 and not laws.velocity_limits
                 and solver.routes.case not in ("K1", "K2")
-                and solver._preelim_count == 0
+                and solver.factor.block_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False
                 and solver.placement.row_watermark is False

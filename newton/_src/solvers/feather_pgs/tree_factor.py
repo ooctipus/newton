@@ -44,16 +44,20 @@ from .kernels import (
     invalidate_fk_id_cache_for_articulations,
     prescale_joint_velocity_limits,
 )
+from .row_laws import LINK_ROWS
 from .solver_fields import (
     ARTICULATION_ORIGIN,
     ARTICULATION_WORK,
     AUGMENTED_DRIVE_ROWS,
     BODY_INERTIA,
     JOINT_FOREST,
+    PREELIMINATION,
+    PREELIMINATION_PLAN,
     SIZE_FACTORS,
     SIZE_GROUPED_SOLVE,
     SPARSE_FACTOR,
     STATE_AUX,
+    Preelim,
 )
 from .sparse_mass_matrix import factor_indices
 from .spatial_laws import drive_force, drive_stiffness
@@ -154,6 +158,9 @@ class TreeFactor:
         self.qdd_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
         self.body_factors = None
+        self.eliminates = False
+        self.elimination = None
+        self.block_count = 0
         self.held = None
         self.held_reason = None
         self.ordinary = None
@@ -301,6 +308,80 @@ class TreeFactor:
             self.passive_joint_damping = _zeros()
         else:
             self.passive_joint_damping = damping
+
+    def plan_blocks(self, forest, laws) -> None:
+        """The bilateral blocks' tables (:func:`.response_builds_rows.elimination`).
+
+        A block holds a linked component's constraints: its trees' mimics and its links' six rows each. Its buffers
+        are sized once from the model's largest block (CUDA-graph-safe); its slots and its factor are rebuilt every
+        step on the device, since the rows' slots and ``J_B`` depend on the state.
+        """
+        cut = forest.cut
+        links = int(cut.primary.size)
+        if not links and not (self.options.enable_bilateral_preelimination and laws.mimic_count):
+            return
+        model, arts = self.model, self.model.articulation_count
+        component = np.arange(arts) if cut.component is None else cut.component
+        mimic_art, mimics = np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+        if laws.mimic_count:
+            mimic_art, _ = host_index.expand(np.diff(laws.mimic_art_start_np))
+            mimics = laws._mimic_art_list.numpy().astype(np.int64)
+        owner = np.concatenate((component[mimic_art], component[cut.tree_shadow]))
+        if not owner.size:
+            return
+        entries = np.concatenate((mimics, -np.arange(links, dtype=np.int64) - 1))
+        rows = np.concatenate((np.ones(mimics.size, dtype=np.int64), np.full(links, LINK_ROWS, dtype=np.int64)))
+        heads, block = np.unique(owner, return_inverse=True)
+        bounds, order = host_index.group_by(block, heads.size)
+        capacity = int(np.bincount(block, weights=rows).max())
+        self.block_count = n = int(heads.size)
+        self.eliminates = True
+        self.elimination = response_builds_rows.elimination(capacity)
+        art_to_block = np.full(arts, -1, dtype=np.int32)
+        held = np.isin(component, heads)
+        art_to_block[held] = np.searchsorted(heads, component[held])
+        self._preelim_art_to_idx = wp.array(art_to_block, dtype=wp.int32, device=model.device)
+        self._arrays.allocate(PREELIMINATION, preelim=n, preelim_row=n * capacity)
+        self._arrays.upload(
+            PREELIMINATION_PLAN,
+            _preelim_world=forest.articulation_world[heads],
+            _preelim_start=bounds,
+            _preelim_entry=entries[order],
+        )
+        self._no_slots = self._arrays.placeholder(wp.int32)
+
+    def eliminate(self, *, Z, sides, counts, owners, cfm, rhs, incident, diag, impulses) -> None:
+        """Make each block's rows orthonormal, then correct every other row, its right-hand side and its diagonal, and
+        give the block's rows the projection's impulses, which the sweep seeds
+        (:func:`.response_builds_rows.elimination`). Runs once the right-hand sides are final (bias and restitution)."""
+        block = field_group.bind(Preelim, factor=self)
+        wp.launch(
+            self.elimination.setup,
+            dim=self.block_count,
+            inputs=[
+                block,
+                self._no_slots if self.laws.mimic_slot is None else self.laws.mimic_slot,
+                self._no_slots if self.laws.link_slot is None else self.laws.link_slot,
+                owners,
+                cfm,
+            ],
+            outputs=[Z, rhs, incident, diag],
+            device=self.model.device,
+        )
+        wp.launch(
+            self.elimination.correct,
+            dim=sides.shape[0] * sides.shape[1],
+            inputs=[block, sides, counts, owners, cfm],
+            outputs=[Z, rhs, diag],
+            device=self.model.device,
+        )
+        wp.launch(
+            self.elimination.weights,
+            dim=self.block_count,
+            inputs=[block, rhs],
+            outputs=[impulses],
+            device=self.model.device,
+        )
 
     def setup_drives(self, eligible: bool) -> None:
         """Allocate the augmented drive rows and separate immutable per-coordinate row ownership from per-step

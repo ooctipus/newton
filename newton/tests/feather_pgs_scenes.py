@@ -462,9 +462,9 @@ def chain(*, links: int = 3) -> Scene:
     )
 
 
-def _four_bar_builder() -> newton.ModelBuilder:
+def _four_bar_builder(*, loop: str = "ball") -> newton.ModelBuilder:
     """The four-bar of :func:`four_bar`: crank and rocker hang 0.2 m from pivots at ``x = 0`` and ``0.4`` (``z0 = 0.6``),
-    the coupler joins the crank's tip to the rocker's through a ball loop joint; only the crank is driven."""
+    the coupler joins the crank's tip to the rocker's through a ``loop`` joint; only the crank is driven."""
     builder = _builder()
     base, root = _fixed_base(builder)
     z0 = 0.6
@@ -495,27 +495,30 @@ def _four_bar_builder() -> newton.ModelBuilder:
         child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.1)),
     )
     builder.add_articulation([root, j_crank, j_coupler, j_rocker])
-    builder.add_joint_ball(
-        coupler,
-        rocker,
-        parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0)),
-        child_xform=wp.transform(wp.vec3(0.0, 0.0, -0.1)),
-    )
+    frames = {
+        "parent_xform": wp.transform(wp.vec3(0.2, 0.0, 0.0)),
+        "child_xform": wp.transform(wp.vec3(0.0, 0.0, -0.1)),
+    }
+    if loop == "ball":
+        builder.add_joint_ball(coupler, rocker, **frames)
+    else:
+        builder.add_joint_revolute(coupler, rocker, axis=newton.Axis.Y, **frames)
     return builder
 
 
-def four_bar(*, crank_target: float = 0.6) -> Scene:
-    """A planar four-bar: two grounded revolute links closed by a ball loop joint, only the crank driven."""
+def four_bar(*, crank_target: float = 0.6, loop: str = "ball") -> Scene:
+    """A planar four-bar: two grounded revolute links closed by a ball or a revolute loop joint, only the crank
+    driven."""
 
     def build(device):
-        return _finalize(_four_bar_builder(), device)
+        return _finalize(_four_bar_builder(loop=loop), device)
 
     def control(model, control, state, step):
         if step == 0:
             _set_targets(model, control, {1: crank_target})
 
     return Scene(
-        "four_bar",
+        "four_bar" if loop == "ball" else f"four_bar_{loop}",
         build,
         dt=1.0 / 240.0,
         steps=240,
@@ -626,7 +629,7 @@ def five_bar_leg(*, trunk_mass: float = 2.0, radius: float = 0.01) -> Scene:
 def stewart_platform(*, platform_mass: float = 2.0, push: float = 0.03) -> Scene:
     """A 6-UPS Stewart platform pressed onto a table: six legs (a universal joint at the base, a driven prismatic
     actuator, a ball joint at the platform); the platform rides on leg 0, legs 1-5 close on it through ball loop
-    joints (fifteen connect rows on one articulation). The actuators retract by ``push``, driving the platform into
+    joints (thirty link rows on one tree). The actuators retract by ``push``, driving the platform into
     the table, so every closure carries the contact load (LC design §3.2)."""
 
     def build(device):

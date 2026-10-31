@@ -193,31 +193,32 @@ VELOCITY_LIMIT_SLOTS = FieldGroup(
 """Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
 
 PREELIMINATION = FieldGroup(
-    Field("_preelim_slots", wp.int32, ("preelim_row",), fill=-1),
-    Field("_preelim_nB", wp.int32, ("preelim",)),
-    Field("_preelim_S", wp.float32, ("preelim_block",)),
-    Field("_preelim_LS", wp.float32, ("preelim_block",)),
+    Field("_preelim_slots", wp.int32, ("preelim_row",), fill=-1, owner="factor"),
+    Field("_preelim_nB", wp.int32, ("preelim",), owner="factor"),
 )
-"""Bilateral elimination buffers: per eliminating articulation, the model's largest block of rows and its square."""
+"""The tree factor's bilateral blocks: per block, the model's largest block of rows."""
+
+PREELIMINATION_PLAN = FieldGroup(
+    Field("_preelim_world", wp.int32, ("preelim",), owner="factor"),
+    Field("_preelim_start", wp.int32, ("preelim_bound",), owner="factor"),
+    Field("_preelim_entry", wp.int32, ("preelim_entry",), owner="factor"),
+)
+"""Each block's world and constraints (CSR): a mimic ``m`` as ``m``, a link ``k`` as ``-k - 1``."""
 
 Preelim = field_group.struct(
     "Preelim",
     (
-        Field("art_to_preelim", wp.int32, ("articulation",), attr="_preelim_art_to_idx"),
+        Field("art_to_preelim", wp.int32, ("articulation",), owner="factor", attr="_preelim_art_to_idx"),
         *(
-            dataclasses.replace(PREELIMINATION[attr], name=attr.removeprefix("_preelim_"), attr=attr)
-            for attr in (
-                "_preelim_slots",
-                "_preelim_nB",
-                "_preelim_S",
-                "_preelim_LS",
-            )
+            dataclasses.replace(field, name=field.name.removeprefix("_preelim_"), attr=field.name)
+            for group in (PREELIMINATION, PREELIMINATION_PLAN)
+            for field in group
         ),
     ),
     __name__,
 )
-"""The bilateral elimination of :data:`PREELIMINATION`: each articulation's block index, the block's rows (kept, then
-dropped) and its kept count, and its Gram block and pivoted factor."""
+"""The bilateral elimination of :data:`PREELIMINATION` and :data:`PREELIMINATION_PLAN`: each articulation's block
+index, the block's kept rows and their count, and the block's world and constraints."""
 
 SPARSE_FACTOR = FieldGroup(
     Field("sparse_Linv", wp.float32, ("group", "nonzero"), owner="factor"),
@@ -334,6 +335,16 @@ MIMIC_PLAN = FieldGroup(
 
 MIMIC_SLOTS = FieldGroup(Field("mimic_slot", wp.int32, ("mimic",), fill=-1, owner="laws"))
 
+LINK_PLAN = FieldGroup(
+    Field("_link_primary", wp.int32, ("link",), owner="laws"),
+    Field("_link_shadow", wp.int32, ("link",), owner="laws"),
+    Field("_link_world", wp.int32, ("link",), owner="laws"),
+    Field("_link_enabled", wp.int32, ("link",), owner="laws"),
+)
+"""Each link's two pieces (:mod:`.body_cut`), world and enable bit."""
+
+LINK_SLOTS = FieldGroup(Field("link_slot", wp.int32, ("link",), fill=-1, owner="laws"))
+
 CONNECT_PLAN = FieldGroup(
     Field("_connect_art", wp.int32, ("closure",), owner="laws"),
     Field("_connect_body_p", wp.int32, ("closure",), owner="laws"),
@@ -348,6 +359,16 @@ CONNECT_PLAN = FieldGroup(
 """The static per-closure lookup tables of the enforced loop closures."""
 
 CONNECT_SLOTS = FieldGroup(Field("connect_slot", wp.int32, ("closure",), fill=-1, owner="laws"))
+
+Links = field_group.struct(
+    "Links",
+    (
+        dataclasses.replace(LINK_SLOTS["link_slot"], name="slot", attr="link_slot"),
+        *(dataclasses.replace(field, name=field.name.removeprefix("_link_"), attr=field.name) for field in LINK_PLAN),
+    ),
+    __name__,
+)
+"""The links' tables (:data:`LINK_PLAN`) and their dense slots."""
 
 Mimics = field_group.struct(
     "Mimics",

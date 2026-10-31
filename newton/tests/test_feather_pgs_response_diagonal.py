@@ -1417,8 +1417,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     )
 
                     self.assertEqual(reference_solver.placement.hinv_jt_diag_sizes, frozenset())
-                    self.assertEqual(reference_solver._preelim_active, preelimination)
-                    self.assertEqual(tiled_solver._preelim_active, preelimination)
+                    self.assertEqual(reference_solver.factor.eliminates, preelimination)
+                    self.assertEqual(tiled_solver.factor.eliminates, preelimination)
                     # The packed rows' build forms every diagonal (packed_rows): no response size reduces its own.
                     self.assertEqual(tiled_solver.placement.hinv_jt_diag_sizes, frozenset())
                     self.assertEqual(len(reference), len(tiled))

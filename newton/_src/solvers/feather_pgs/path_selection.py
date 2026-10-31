@@ -28,7 +28,6 @@ from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 # Options whose applied value lives under another attribute of the solver after construction.
 _APPLIED_ATTRIBUTES = {
     "nvtx": "_nvtx",
-    "enable_bilateral_preelimination": "_preelim_active",
 }
 # Those it lives under on the placement.
 _APPLIED_PLACEMENT = {"row_watermark": "row_watermark"}
@@ -41,6 +40,8 @@ def _applied(solver, name, requested):
         return solver.laws.friction_anchor_beta
     if name in _APPLIED_PLACEMENT:
         return getattr(solver.placement, _APPLIED_PLACEMENT[name])
+    if name == "enable_bilateral_preelimination":
+        return solver.factor.eliminates
     attribute = _APPLIED_ATTRIBUTES.get(name, name)
     if hasattr(solver, attribute):
         return getattr(solver, attribute)
@@ -822,7 +823,7 @@ def _dynamics(solver) -> dict:
         if solver._memset_stream is None
         else sorted(int(size) for size in solver.forest.size_groups if size not in solver._plan.unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver.factor.size_streams.values()),
-        "preelimination": bool(solver._preelim_active),
+        "preelimination": bool(solver.factor.eliminates),
         "mimic_rows": int(solver.laws.mimic_count or 0),
         "connect_rows": int(solver.laws.connect_count or 0),
         "loop_joints": bool(solver.forest.has_loop_joints),

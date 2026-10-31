@@ -522,7 +522,7 @@ class TestResolvedWorlds(unittest.TestCase):
 def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     return SimpleNamespace(
-        _preelim_count=0,
+        factor=SimpleNamespace(block_count=0),
         placement=SimpleNamespace(keyed_rows=None, row_watermark=False),
         routes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),

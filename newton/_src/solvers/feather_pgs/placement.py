@@ -35,6 +35,7 @@ from .dense_rows import RowSupport
 from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import SolverArrays
 from .kernels import (
+    LINK_ROWS,
     RIGID_SPEED_ROWS,
     clear_local_solve_diag,
     place_world_contact_runs,
@@ -242,7 +243,8 @@ class Placement:
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
-        self.dense_max_constraints = options.dense_max_constraints
+        # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
+        self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
         self.mf_max_constraints = options.mf_max_constraints
         _validate_mf_metadata_encoding(self.mf_max_constraints)
         # The carry's tables, allocated with their rows only when enabled.
@@ -280,7 +282,13 @@ class Placement:
         )
         has_mimic_rows = self.laws.mimic_count > 0
         has_connect_rows = self.laws.connect_count > 0
-        if not (has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or has_connect_rows):
+        if not (
+            has_position_limit_rows
+            or has_velocity_limit_rows
+            or has_mimic_rows
+            or has_connect_rows
+            or self.laws.link_count
+        ):
             return 0
 
         art_to_world = self.forest.art_to_world.numpy().astype(np.int32, copy=False)
@@ -290,6 +298,8 @@ class Placement:
             valid_worlds = self.laws.mimic_world_np[self.laws.mimic_valid_np != 0]
             in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
             np.add.at(per_world, in_range, 1)
+        if self.laws.link_count:
+            np.add.at(per_world, self.laws.link_world_np[self.forest.cut.enabled != 0], LINK_ROWS)
         if has_connect_rows and self.laws.connect_world_np is not None:
             valid_worlds = self.laws.connect_world_np[self.laws.connect_valid_np != 0]
             in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
@@ -353,7 +363,7 @@ class Placement:
         # Every per-contact buffer holds the ready rows of the model's contact pool, which its
         # collision pipelines share: they are sized with the pipeline's measured demand before a graph
         # is captured, and grow with any other contact stream the solver consumes (see follow_contacts).
-        self.contact_pool = model_contact_pool(model, device)
+        self.contact_pool = model_contact_pool(self.forest.cut.source, device)
         contact_fields = [
             ContactField(name, wp.int32)
             for name in (
@@ -634,7 +644,10 @@ class Placement:
                 raise RuntimeError("Packed rows need each world's coordinates in articulation order")
             self.packed_support = packed_rows.support_width(sizes, worlds, self.forest.world_count)
             # Two articulations hold every coordinate of the widest world: the rows are laid out at their coordinates.
-            self.packed_dense = self.packed_support == self.forest.max_world_dofs
+            self.packed_dense = int(self.packed_support == self.forest.max_world_dofs)
+            if self.factor.eliminates:
+                # A corrected row reaches every tree of its block.
+                self.packed_support, self.packed_dense = self.forest.max_world_dofs, packed_rows.WIDE
             if self.ink_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
             sizes = {
@@ -643,7 +656,7 @@ class Placement:
                 "support": self.packed_support,
             }
         else:
-            self.packed_support, self.packed_dense = 1, False
+            self.packed_support, self.packed_dense = 1, 0
             sizes = {"world": 1, "row": 1, "support": 1}
         self.arrays.allocate(packed_rows.PACKED_ROWS, **sizes)
 

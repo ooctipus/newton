@@ -4,11 +4,13 @@
 """Tests of the body cut: the solver's own model is a pure forest, and a step crosses to it and back unchanged."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import body_cut
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
 from newton.tests import feather_pgs_scenes as scenes
 
@@ -527,6 +529,54 @@ class TestLoopJointApi(unittest.TestCase):
         np.testing.assert_allclose(child, [0.4, 0.5, 0.6])
         np.testing.assert_allclose(cut.model.joint_X_p.numpy()[1, :3], [0.1, 0.2, 0.3])
         np.testing.assert_allclose(cut.model.joint_X_c.numpy()[1, :3], [0.4, 0.5, 0.6])
+
+
+class TestEveryLiveArrayIsListed(unittest.TestCase):
+    def test_a_step_reads_only_gathered_shared_or_topology_arrays(self):
+        """Run the live census on cut scenes: an array of the forest's own that a step's kernel takes and the gather
+        does not refresh would go stale on a write the caller need not notify."""
+        allowed = set(body_cut._LIVE) | set(body_cut._TOPOLOGY) | {"body_world"}
+        real = wp.launch
+        read: set[str] = set()
+
+        def walk(value, seen, depth=0):
+            if isinstance(value, wp.array):
+                seen.add(value.ptr)
+            elif hasattr(getattr(value, "_cls", None), "vars") and depth < 4:
+                for name in value._cls.vars:
+                    walk(getattr(value, name, None), seen, depth + 1)
+
+        def census(kernel, dim, inputs=None, outputs=None, **kw):
+            seen: set[int] = set()
+            for value in (*(inputs or ()), *(outputs or ())):
+                walk(value, seen)
+            read.update(names[ptr] for ptr in seen if ptr in names)
+            return real(kernel, dim, inputs=inputs or [], outputs=outputs or [], **kw)
+
+        for scene, options in (
+            (scenes.loaded_four_bar(), {"pgs_warmstart": True}),
+            (scenes.five_bar_leg(), {"enable_joint_velocity_limits": True}),
+            (scenes.stewart_platform(), {"contact_torsion": True}),
+        ):
+            with self.subTest(scene=scene.name), wp.ScopedDevice("cpu"):
+                model = scene.build(wp.get_device("cpu"))
+                solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=2, dense_max_constraints=64, **options)
+                forest = solver.model
+                # Only the forest's own arrays: a shared array is the caller's, live by being the same one.
+                names = {
+                    value.ptr: name
+                    for name, value in vars(forest).items()
+                    if isinstance(value, wp.array) and value.ptr and getattr(model, name, None) is not value
+                }
+                pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+                contacts = pipeline.contacts()
+                state_0, state_1, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+                pipeline.collide(state_0, contacts)
+                with mock.patch.object(wp, "launch", census):
+                    solver.step(state_0, state_1, control, contacts, scene.dt)
+        self.assertFalse(read - allowed, "arrays a step reads that no gather refreshes")
+        self.assertTrue(read & {"joint_target_ke", "joint_X_p", "body_mass"}, "the census saw nothing")
 
 
 if __name__ == "__main__":

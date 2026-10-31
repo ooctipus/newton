@@ -24,7 +24,7 @@ from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
 from .row_metadata import _validate_dense_metadata_encoding
-from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax, sweep_exit
+from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
 from .sweep import (
     CONTACT,
@@ -168,12 +168,14 @@ FACTOR_COORDINATES = FactorCoordinates()
 """The marks and the way back of a matrix-free sweep's velocity change (:class:`FactorCoordinates`)."""
 
 
-def packed_operator(support: int, lanes: Lanes) -> SparseFactor:
+def packed_operator(support: int, lanes: Lanes, *, wide: bool = False) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
-    world coordinates from their sides (``PACKED_COORDINATE``) and values from the world's first row
-    (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
+    world coordinates from their sides (``PACKED_COORDINATE``), or with ``wide`` rows every coordinate of the world, and
+    values from the world's first row (``packed_base``), over the factor velocity change the sweep stages (``s_v``)."""
 
     def coordinate(row, entry):
+        if wide:
+            return f"(world_dof_indices.data[dof_map_base + ({entry})] >= 0 ? ({entry}) : -1)"
         return f"PACKED_COORDINATE(row_sides.data[off_dense + ({row})], {entry})"
 
     def value(row, entry):
@@ -556,6 +558,7 @@ def mf_gs_staging(
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
     traces: bool = False,
+    wide_rows: bool = False,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
     velocity, its dense rows' impulses and staged metadata, the free-body impulses unless they stream, and the colored
@@ -573,6 +576,7 @@ def mf_gs_staging(
     return Staging(
         (
             Buffer("s_v", "float", max_world_dofs),
+            *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
             *FACTOR_COORDINATES.buffers(max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
@@ -603,6 +607,7 @@ def mf_gs_source(
     lanes: int = 32,
     material: bool = False,
     seeded: bool = False,
+    wide_rows: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -642,7 +647,7 @@ def mf_gs_source(
         M_D, shared_metadata=shared_metadata, packed_types=shared_metadata or resident_row_metadata, lanes=row_lanes
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=row_lanes)
-    dense_op = packed_operator(max_row_dofs, row_lanes)
+    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
     bodies = FACTOR_COORDINATES
     free_op = FreeBodyZ(row_lanes, factor=bodies.factor)
     staging = mf_gs_staging(
@@ -654,6 +659,7 @@ def mf_gs_source(
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
         traces=solve_policy.traces,
+        wide_rows=wide_rows,
     )
 
     # Ownership: the paired owner's signed selector arrives in local_solve_owner under independent components.
@@ -747,6 +753,26 @@ def mf_gs_source(
             ),
         )
         seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
+    # Wide rows, which the bilateral block corrected, can be collinear (a jammed loop), and collinear rows can trade
+    # impulses forever with no effect on the velocity, each loud alone. The velocity is the solve's answer, so a wide
+    # sweep also ends when no coordinate moved past the exit law's floor of the largest one: factor coordinates share
+    # the kinetic energy's metric, and a coordinate the rows cancel to zero keeps their rounding, far above its own size.
+    sweep_vote = ""
+    if wide_rows:
+        metric_build += f"""
+    for (int d = {thread}; d < {D}; d += {threads}) s_sweep_v[d] = s_v[d];"""
+        sweep_vote = f"""        {barrier}
+        int velocity_moved = 0;
+        float velocity_floor = 0.0f;
+        for (int d = 0; d < {D}; ++d) velocity_floor = fmaxf(velocity_floor, fabsf(s_v[d]));
+        velocity_floor *= {QUIET_LITERAL};
+        for (int d = {thread}; d < {D}; d += {threads}) {{
+            const float now = s_v[d];
+            if (!(fabsf(now - s_sweep_v[d]) <= velocity_floor)) velocity_moved = 1;
+            s_sweep_v[d] = now;
+        }}
+        if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
+"""
     body = f"""{head}
 
     {dense_count}
@@ -791,7 +817,7 @@ def mf_gs_source(
 {indent(free_phase, "    ")}
 
 {first_warp}{chr(10).join(passes)}
-{end_first_warp}{sweep_end}    }}
+{end_first_warp}{sweep_vote}{sweep_end}    }}
 
     {barrier}
 {indent(bodies.leave_all(D, thread, threads, sync), "    ")}
@@ -842,6 +868,7 @@ def mf_gs_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     material: bool = False,
     seeded: bool = False,
+    wide_rows: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -868,6 +895,7 @@ def mf_gs_kernel(
         lanes=32 if mapping == "colored" else device_lanes(device_arch),
         material=material,
         seeded=seeded,
+        wide_rows=wide_rows,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -886,6 +914,7 @@ def mf_gs_kernel(
         + ("_cw" if colored_worlds and not colored else "")
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
+        + ("_wide" if wide_rows else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(

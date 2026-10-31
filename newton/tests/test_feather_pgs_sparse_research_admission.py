@@ -67,8 +67,7 @@ def _eligible_solver():
     )
     return _AdmissionProbe(
         _route_pins={},
-        factor=SimpleNamespace(parallel_drives=True),
-        _preelim_active=False,
+        factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         placement=SimpleNamespace(),
         routes=RouteTable({}),
         forest=forest,

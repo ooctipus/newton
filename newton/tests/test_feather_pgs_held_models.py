@@ -198,15 +198,26 @@ class TestHeldModels(unittest.TestCase):
                     newton.eval_fk(model, rest.joint_q, rest.joint_qd, rest)
                     np.testing.assert_allclose(state.body_q.numpy(), rest.body_q.numpy(), atol=1e-5)
 
-    def test_a_second_root_in_one_articulation_is_not_held(self):
-        """Decline a second root in one articulation: the free-root transport follows the first root."""
+    def test_a_second_root_in_one_articulation_is_its_own_tree(self):
+        """The forest splits an articulation of two free roots into two trees, so the second root's body coasts
+        where the articulation's one origin would carry it away (a free body at 0.5 m/s once ended at x = 5.85 m)."""
         builder = newton.ModelBuilder(gravity=0.0)
         first = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(0.0, 0.0, 1.0)))
         second = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(1.0, 0.0, 1.0)))
-        builder.add_articulation([builder.add_joint_free(first), builder.add_joint_free(second)])
-        solver = SolverFeatherPGS(builder.finalize(device="cpu"))
-        self.assertIsNone(solver.factor.held)
-        self.assertIn("one uniform parent-first topology", solver.factor.held_reason)
+        joints = [builder.add_joint_free(first), builder.add_joint_free(second)]
+        builder.add_articulation(joints)
+        builder.joint_qd[6] = 0.5
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model)
+        self.assertIsNotNone(solver.factor.held)
+        self.assertEqual(solver.model.articulation_count, 2)
+        state_0, state_1 = model.state(), model.state()
+        for _ in range(240):
+            solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        body_q = state_0.body_q.numpy()
+        np.testing.assert_allclose(body_q[first, :3], (0.0, 0.0, 1.0), atol=1.0e-6)
+        np.testing.assert_allclose(body_q[second, :3], (1.5, 0.0, 1.0), atol=1.0e-5)
 
 
 if __name__ == "__main__":

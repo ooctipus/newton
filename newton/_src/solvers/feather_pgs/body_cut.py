@@ -654,6 +654,12 @@ class BodyCut:
             wp.copy(state.body_q, mirror.body_q, count=count)
             wp.copy(state.body_qd, mirror.body_qd, count=count)
         # A caller may copy its output over its input and step that: the shadows' poses then follow the bodies'.
-        shadows = self.shadow.size
-        wp.copy(forest_in.body_q, forest_out.body_q, dest_offset=count, src_offset=count, count=shadows)
-        wp.copy(forest_in.body_qd, forest_out.body_qd, dest_offset=count, src_offset=count, count=shadows)
+        if self.shadow.size:
+            for name in ("body_q", "body_qd"):
+                wp.copy(
+                    getattr(forest_in, name),
+                    getattr(forest_out, name),
+                    dest_offset=count,
+                    src_offset=count,
+                    count=self.shadow.size,
+                )

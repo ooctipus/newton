@@ -1169,7 +1169,7 @@ class TestTierRule(unittest.TestCase):
     def _probe(**changes):
         """A solver's tier inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows)."""
         probe = SimpleNamespace(
-            _preelim_active=False,
+            factor=SimpleNamespace(eliminates=False),
             placement=SimpleNamespace(
                 mf_sweeps=changes.pop("mf_sweeps", True),
                 dense_max_constraints=changes.pop("dense_max_constraints", 192),
@@ -1203,7 +1203,7 @@ class TestTierRule(unittest.TestCase):
         for changes, reason in (
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
             ({"mf_sweeps": False}, "No matrix-free sweep"),
-            ({"_preelim_active": True}, "pre-elimination"),
+            ({"factor": SimpleNamespace(eliminates=True)}, "pre-elimination"),
             ({"routes": _routes("K3")}, "case K3"),
             ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),

@@ -14,8 +14,6 @@
 # limitations under the License.
 
 
-import functools
-
 import warp as wp
 
 from ...sim import BodyFlags, JointType
@@ -63,6 +61,7 @@ from .projection_laws import (
 )
 from .row_build import contact_torsion_mu, write_contact_row
 from .row_laws import (
+    LINK_ROWS,
     contact_material_rhs,
     contact_restitution_rhs,
     joint_limit_side,
@@ -71,7 +70,7 @@ from .row_laws import (
     row_rhs,
     velocity_limit_active,
 )
-from .solver_fields import Connects, LocalOwners, Mimics
+from .solver_fields import Connects, Links, LocalOwners, Mimics
 from .spatial_laws import drive_force, drive_stiffness, free_root_transport, point_velocity
 from .tree_passes import (
     DynamicsData,
@@ -374,11 +373,6 @@ def jcalc_integrate(
             joint_q_new[coord_start + i] = q_new
 
         return
-
-
-@wp.func
-def dense_index(stride: int, i: int, j: int):
-    return i * stride + j
 
 
 @wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
@@ -1331,6 +1325,163 @@ def invalidate_fk_id_cache_for_articulations(
         fk_id_cache_valid[art] = 0
 
 
+# =============================================================================
+# Link rows
+# =============================================================================
+# A link ties a body's primary piece to a shadow (:mod:`.body_cut`): six bilateral rows, one law for every joint the
+# body was cut at. The pieces share their center of mass, so the rows read ``twist(primary) - twist(shadow)`` there,
+# three linear and three angular, with their pose error ``phi``. No row is scaled: the block's pivot decides rank.
+
+
+@wp.func
+def rotation_log(primary: wp.quat, shadow: wp.quat) -> wp.vec3:
+    """``log(R_primary R_shadow^T)`` [rad], the rotation that takes the shadow to the primary, the short way round."""
+    error = primary * wp.quat_inverse(shadow)
+    v = wp.vec3(error[0], error[1], error[2])
+    if error[3] < 0.0:
+        return -2.0 * wp.atan2(wp.length(v), -error[3]) * wp.normalize(v)
+    return 2.0 * wp.atan2(wp.length(v), error[3]) * wp.normalize(v)
+
+
+@wp.func
+def link_side(
+    joints: JointTable,
+    support: RowSupport,
+    body: int,
+    art: int,
+    sign: float,
+    point: wp.vec3,
+    direction: wp.vec3,
+    angular: bool,
+    sides: wp.vec2i,
+    body_to_joint: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    articulation_origin: wp.array[wp.vec3],
+    row: int,
+    J: wp.array3d[float],
+):
+    """Accumulate one piece's twist into link row ``row``; a piece on no response coordinates adds nothing."""
+    if support.dofs[art] > 0:
+        accumulate_jacobian_row_world(
+            body,
+            sign,
+            point,
+            articulation_origin[art],
+            direction,
+            angular,
+            body_to_joint,
+            joint_ancestor,
+            joints.joint_qd_start,
+            joint_S_s,
+            joints.articulation_dof_start[art],
+            support.dofs[art],
+            jacobian_row(support, 0, art, sides),
+            row,
+            J,
+        )
+
+
+@wp.kernel
+def allocate_link_slots(
+    links: Links,
+    max_constraints: int,
+    # outputs
+    world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
+):
+    """Reserve each enabled link's rows, whole or not at all."""
+    k = wp.tid()
+    links.slot[k] = -1
+    if links.enabled[k] != 0:
+        links.slot[k] = reserve(world_slot_counter, links.world[k], LINK_ROWS, max_constraints, first_rejected_slot)
+
+
+@wp.kernel
+def write_link_rows(
+    joints: JointTable,
+    links: Links,
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_to_joint: wp.array[int],
+    body_to_articulation: wp.array[int],
+    joint_ancestor: wp.array[int],
+    joint_S_s: wp.array[wp.spatial_vector],
+    articulation_origin: wp.array[wp.vec3],
+    pgs_beta: float,
+    pgs_cfm: float,
+    support: RowSupport,
+    # outputs
+    J: wp.array3d[float],
+    rows: DenseRows,
+):
+    """Write each link's rows, on the sides of its two pieces' trees (:func:`.dense_rows.row_sides`), which may be one
+    tree. The rows cover the sides whole, zeros included: the walks accumulate, so shared ancestors cancel."""
+    k = wp.tid()
+    base = links.slot[k]
+    if base < 0:
+        return
+    primary, shadow = links.primary[k], links.shadow[k]
+    point_p = wp.transform_point(body_q[primary], body_com[primary])
+    point_s = wp.transform_point(body_q[shadow], body_com[shadow])
+    gap = point_p - point_s
+    turn = rotation_log(wp.transform_get_rotation(body_q[primary]), wp.transform_get_rotation(body_q[shadow]))
+    art_p, art_s = body_to_articulation[primary], body_to_articulation[shadow]
+    sides = row_sides(art_p, art_s, support.dofs)
+    world = links.world[k]
+    for row in range(LINK_ROWS):
+        slot = base + row
+        for side in range(2):
+            if sides[side] >= 0:
+                clear_side(support, J, jacobian_row(support, 0, sides[side], sides), slot, sides[side])
+        axis = row % 3
+        angular = row >= 3
+        direction = wp.vec3(0.0, 0.0, 0.0)
+        direction[axis] = 1.0
+        link_side(
+            joints,
+            support,
+            primary,
+            art_p,
+            1.0,
+            point_p,
+            direction,
+            angular,
+            sides,
+            body_to_joint,
+            joint_ancestor,
+            joint_S_s,
+            articulation_origin,
+            slot,
+            J,
+        )
+        link_side(
+            joints,
+            support,
+            shadow,
+            art_s,
+            -1.0,
+            point_s,
+            direction,
+            angular,
+            sides,
+            body_to_joint,
+            joint_ancestor,
+            joint_S_s,
+            articulation_origin,
+            slot,
+            J,
+        )
+        rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
+        rows.sides[world, slot] = sides
+        rows.row_parent[world, slot] = -1
+        rows.row_mu[world, slot] = 0.0
+        rows.row_beta[world, slot] = pgs_beta
+        rows.row_cfm[world, slot] = pgs_cfm
+        rows.phi[world, slot] = turn[axis] if angular else gap[axis]
+        rows.target[world, slot] = 0.0
+
+
 @wp.kernel
 def allocate_connect_slots(
     connects: Connects,
@@ -1497,66 +1648,6 @@ def populate_connect_J_for_size(
             rows.row_cfm[world, slot] = pgs_cfm
             rows.phi[world, slot] = phi_axis
             rows.target[world, slot] = target
-
-
-# =============================================================================
-# Bilateral elimination: the block kit
-# =============================================================================
-# The factor and register types of response_builds_rows.elimination, which
-# eliminates each articulation's bilateral rows (MIMIC and CONNECT) from the
-# response operator, sized by the model's largest block.
-
-
-@wp.func
-def pivoted_cholesky(n: int, A: wp.array[float], A_start: int, floor: float, L: wp.array[float]) -> int:
-    """Factor the ``n x n`` block ``A`` (row-major at ``A_start``) in row order, dropping each row whose pivot falls to
-    ``floor`` or below: such a row depends on the rows kept before it. ``L`` (the same layout) holds the factor over
-    the kept rows; a dropped row's column, its diagonal included, is zero. Returns the kept count."""
-    kept = int(0)
-    for j in range(n):
-        s = A[A_start + dense_index(n, j, j)]
-        for k in range(j):
-            r = L[A_start + dense_index(n, j, k)]
-            s -= r * r
-        if s > floor:
-            d = wp.sqrt(s)
-            L[A_start + dense_index(n, j, j)] = d
-            for i in range(j + 1, n):
-                acc = A[A_start + dense_index(n, i, j)]
-                for k in range(j):
-                    acc -= L[A_start + dense_index(n, i, k)] * L[A_start + dense_index(n, j, k)]
-                L[A_start + dense_index(n, i, j)] = acc / d
-            kept += 1
-        else:
-            for i in range(j, n):
-                L[A_start + dense_index(n, i, j)] = 0.0
-    return kept
-
-
-@functools.cache
-def block_kit(rows: int):
-    """The register types of a bilateral block of up to ``rows`` rows, its values and its row indices, and the solve
-    ``(L L^T) x = b`` of its kept factor (row-major, stride ``n``) with the right-hand side in registers."""
-    vec = wp.types.vector(length=rows, dtype=wp.float32)
-    ivec = wp.types.vector(length=rows, dtype=wp.int32)
-
-    def solve(n: int, L: wp.array[float], L_start: int, b: vec) -> vec:
-        x = vec()
-        for i in range(n):
-            s = b[i]
-            for j in range(i):
-                s -= L[L_start + dense_index(n, i, j)] * x[j]
-            x[i] = s / L[L_start + dense_index(n, i, i)]
-        for ii in range(n):
-            i = n - 1 - ii
-            s = x[i]
-            for j in range(i + 1, n):
-                s -= L[L_start + dense_index(n, j, i)] * x[j]
-            x[i] = s / L[L_start + dense_index(n, i, i)]
-        return x
-
-    solve.__name__ = solve.__qualname__ = f"block_solve_{rows}"
-    return vec, ivec, wp.func(solve)
 
 
 # =============================================================================

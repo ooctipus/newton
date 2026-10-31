@@ -38,8 +38,16 @@ from .forest_plan import ForestPlan
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .kernel_template import KernelTemplate, params
 from .route_table import Laws
-from .row_laws import ROW_LAW
-from .solver_fields import CONNECT_PLAN, CONNECT_SLOTS, MIMIC_PLAN, MIMIC_SLOTS, VELOCITY_LIMIT_SLOTS
+from .row_laws import LINK_ROWS, ROW_LAW
+from .solver_fields import (
+    CONNECT_PLAN,
+    CONNECT_SLOTS,
+    LINK_PLAN,
+    LINK_SLOTS,
+    MIMIC_PLAN,
+    MIMIC_SLOTS,
+    VELOCITY_LIMIT_SLOTS,
+)
 
 __all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_prescale_launch"]
 
@@ -208,6 +216,7 @@ class RowLaws:
         # counts their rows (see Placement.internal_rows_per_world).
         laws._mimic_plan(model)
         laws._connect_plan(model)
+        laws._link_plan()
         laws._contact_torsion(model, options)
 
         # Shape materials.
@@ -391,6 +400,31 @@ class RowLaws:
         )
         self._arrays.allocate(MIMIC_SLOTS, mimic=n)
         self.mimic_count = n
+
+    def _link_plan(self) -> None:
+        """The links' rows (:mod:`.body_cut`): six bilateral rows per enabled link, whatever joint made them. Their
+        tables are uploaded once (CUDA-graph-safe); a link's enable bit stays live."""
+        cut = self.forest.cut
+        self.link_count = n = int(cut.primary.size)
+        self.link_slot = None
+        self.link_world_np = None
+        self.link_rows_per_world = 0
+        if n == 0:
+            return
+        self.link_world_np = self.forest.articulation_world[cut.tree_shadow].astype(np.int32)
+        self.link_rows_per_world = int(LINK_ROWS * np.bincount(self.link_world_np).max())
+        self._arrays.upload(
+            LINK_PLAN,
+            _link_primary=cut.primary,
+            _link_shadow=cut.shadow,
+            _link_world=self.link_world_np,
+            _link_enabled=cut.enabled,
+        )
+        self._arrays.allocate(LINK_SLOTS, link=n)
+
+    def set_links_enabled(self) -> None:
+        """Publish the links' enable bits (:meth:`.body_cut.BodyCut.set_enabled`); the next step reserves their rows."""
+        self._link_enabled.assign(self.forest.cut.enabled)
 
     def _connect_plan(self, model) -> None:
         """Precompute the static per-closure lookup tables for the CONNECT row family.

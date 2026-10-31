@@ -41,6 +41,9 @@ ROW_MIMIC = wp.constant(5)
 ROW_CONNECT = wp.constant(6)
 ROW_TORSION = wp.constant(7)
 
+LINK_ROWS = wp.constant(6)
+"""A link's rows: three linear and three angular, whatever joint made it."""
+
 CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 """Gap within which a contact counts as reached: absorbs float32 residuals of rows that land exactly at contact."""
 

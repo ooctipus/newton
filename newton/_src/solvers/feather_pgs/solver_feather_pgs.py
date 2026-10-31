@@ -49,6 +49,7 @@ from . import (
     field_group,
     host_index,
     kernel_template,
+    packed_rows,
     prefix_rows,
     response_builds_rows,
     sweep_routes,
@@ -86,6 +87,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
+    allocate_link_slots,
     allocate_mimic_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
@@ -114,6 +116,7 @@ from .kernels import (
     reset_world_warmstart_buffers,
     snapshot_contact_warmstart,
     snapshot_dense_phase_bound,
+    write_link_rows,
 )
 from .path_selection import (
     applied_options,
@@ -128,15 +131,14 @@ from .rows import JOINT_LIMIT_WARPS_PER_BLOCK, RowLaws
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
     DOF_WORK,
-    PREELIMINATION,
     SIZE_MASS,
     SPARSE_CONTACT_RECORDS,
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
     Connects,
+    Links,
     LocalOwners,
     Mimics,
-    Preelim,
 )
 from .sparse_contact import (
     CONTACT_RECORD_FLOATS,
@@ -293,7 +295,9 @@ class SolverFeatherPGS(SolverBase):
     below ``4 n u`` of its diagonal (``n`` coordinates, ``u = 2^-24``) at the
     model's configuration, the solver adds the least joint armature that lifts
     it there, warns, and reports it under ``routes.dynamics.armature_floor`` of
-    :meth:`get_path_selection`. Give such joints armature to choose it yourself.
+    :meth:`get_path_selection`. Every tree likewise takes the least armature that keeps a rotation about a thin body's
+    own axis, far from the articulation's origin, above what float32 assembles (:func:`.conditioning.assembly_floor`).
+    Give such joints armature to choose it yourself.
 
     Single-body FREE-joint articulations use an energy-preserving local
     gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
@@ -655,7 +659,7 @@ class SolverFeatherPGS(SolverBase):
         # The test pins in force at construction, which every admission reads and the route record lists.
         self._route_pins = dict(type(self)._route_pins)
         # The solver's own model, a pure forest (:mod:`.body_cut`): everything below reads it.
-        self.cut = BodyCut(model)
+        self.cut = BodyCut.of(model)
         model = self.cut.model
         super().__init__(model)
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
@@ -705,7 +709,7 @@ class SolverFeatherPGS(SolverBase):
         self.factor.apply_kinematic_state(self.factor.kinematic_state(forest))
         # The forest plan: topology, groups, root kinds, world mapping, body maps. The matrix-free formulation
         # elides fully-kinematic free bases from the compact response mapping of its rows.
-        self.forest = ForestPlan.build(model, forest, self.factor.kinematic_dof_mask_host)
+        self.forest = ForestPlan.build(self.cut, forest, self.factor.kinematic_dof_mask_host)
         self._compact_contact_jacobian = bool(
             model.device.is_cuda
             and self.forest.body_response_dof_mask is not None
@@ -717,9 +721,9 @@ class SolverFeatherPGS(SolverBase):
         self.laws = RowLaws.build(model, self.forest, options)
         # The placement: where the rows live, their capacities and status.
         self.placement = Placement(model, options, self.forest, self.laws, self.factor)
-        self._build_preelimination_plan(model)
+        self.factor.plan_blocks(self.forest, self.laws)
         # Axis 2 of the route table, the row laws, which every owner's admission reads (route_table.capable).
-        self.laws.decide(preelimination=self._preelim_active)
+        self.laws.decide(preelimination=self.factor.eliminates)
         laws = self.laws.set
         # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
         self.factor.plan(self.forest, self.laws)
@@ -801,7 +805,7 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
-        self.placement.hinv_jt_computes_diag = not self._preelim_active
+        self.placement.hinv_jt_computes_diag = not self.factor.eliminates
         self._execution_plan = _FeatherPGSExecutionPlan.build(
             self.forest.size_groups,
             max_constraints=self.placement.dense_max_constraints,
@@ -826,7 +830,7 @@ class SolverFeatherPGS(SolverBase):
             size
             for size in self.forest.size_groups
             if model.device.is_cuda
-            and not self._preelim_active
+            and not self.factor.eliminates
             and size >= _PERSISTENT_HINV_JT_MIN_DOF
             and size + 6 <= 32
             and self._execution_plan.use_tiled_hinv_jt(size)
@@ -1036,7 +1040,7 @@ class SolverFeatherPGS(SolverBase):
         # Bilateral pre-elimination corrects the grouped response after H^-1 J^T,
         # so that path must retain the existing post-correction world gather.
         self.placement.hinv_jt_writes_world = (
-            not self.placement.jy_world_aliased and not self._preelim_active and self.routes.case not in ("K1", "K2")
+            not self.placement.jy_world_aliased and not self.factor.eliminates and self.routes.case not in ("K1", "K2")
         )
         self.placement.hinv_jt_tiled_writes_group = (
             not self.placement.hinv_jt_writes_world or self.options.pgs_warmstart
@@ -1463,7 +1467,9 @@ class SolverFeatherPGS(SolverBase):
             joint: Model joint index of a loop-closing BALL joint.
             enabled: ``True`` to enforce the closure, ``False`` to release it.
         """
-        self.laws.set_loop_joint_enabled(joint, enabled)
+        self.cut.set_enabled(joint, enabled)
+        self.laws.set_links_enabled()
+        self.notify_model_changed(ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES)
 
     def set_loop_joint_anchors(self, joint: int, parent_anchor, child_anchor) -> None:
         """Move the anchors of a loop-closing BALL joint at runtime.
@@ -1477,11 +1483,12 @@ class SolverFeatherPGS(SolverBase):
             parent_anchor: Anchor in the parent body frame [m].
             child_anchor: Anchor in the child body frame [m].
         """
-        self.laws.set_loop_joint_anchors(joint, parent_anchor, child_anchor)
+        self.cut.set_anchors(joint, parent_anchor, child_anchor)
+        self.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
 
     def loop_joint_anchors(self, joint: int) -> tuple[np.ndarray, np.ndarray]:
         """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
-        return self.laws.loop_joint_anchors(joint)
+        return self.cut.anchors(joint)
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
@@ -1498,110 +1505,6 @@ class SolverFeatherPGS(SolverBase):
         """
         self.factor.notify_state_changed(self.cut.trees(articulations))
 
-    def _build_preelimination_plan(self, model) -> None:
-        """The bilateral elimination's tables (:func:`.response_builds_rows.elimination`).
-
-        Per articulation that owns mimic or connect rows: an index into the elimination's buffers, which hold up to
-        the model's largest block (an articulation's mimic rows plus three per closure; a closure to a prescribed
-        parent carries the parent's velocity in its right-hand side). The buffers are allocated once here
-        (CUDA-graph-safe); the slot lists and the factor are rebuilt every step on device, since the rows' slots and
-        ``J_B`` depend on the state.
-        """
-        self._preelim_count = 0
-        self._preelim_active = False
-        self._elimination = None
-        if not self.options.enable_bilateral_preelimination or not (self.laws.connect_count or self.laws.mimic_count):
-            return
-        # Per-articulation block rows (upper bound: every valid constraint).
-        counts = np.zeros(model.articulation_count, dtype=np.int64)
-        if self.laws.mimic_count:
-            counts += np.diff(self.laws.mimic_art_start_np)
-        if self.laws.connect_count:
-            counts += 3 * np.bincount(self.laws._connect_art.numpy(), minlength=model.articulation_count)
-        arts = np.flatnonzero(counts)
-        if not arts.size:
-            return
-        rows = int(counts.max())
-        self._elimination = response_builds_rows.elimination(rows)
-        device = model.device
-        n_pe = len(arts)
-        art_to_idx = np.full(model.articulation_count, -1, dtype=np.int32)
-        art_to_idx[arts] = np.arange(n_pe)
-        self._preelim_art_to_idx = wp.array(art_to_idx, dtype=wp.int32, device=device)
-        self._arrays.allocate(
-            PREELIMINATION,
-            preelim=n_pe,
-            preelim_row=n_pe * rows,
-            preelim_block=n_pe * rows * rows,
-        )
-        self._preelim_count = n_pe
-        self._preelim_active = True
-
-    def _stage4_bilateral_preelim(self) -> None:
-        """Eliminate the bilateral blocks on the packed rows (:func:`.response_builds_rows.elimination`).
-
-        Form each articulation's block ``G = Z_B^T Z_B`` and its pivoted factor, then correct every other row, its
-        right-hand side and its diagonal, and give the block rows the projection's impulses. Runs once the right-hand
-        sides are final (bias and restitution).
-        """
-        dense = int(self.placement.packed_dense)
-        for size in self.forest.size_groups:
-            wp.launch(
-                self._elimination.setup,
-                dim=self.forest.n_arts_by_size[size],
-                inputs=[
-                    field_group.bind(Preelim, solver=self),
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.forest.articulation_world_dof_offset,
-                    dense,
-                    self.laws.mimic_slot if self.laws.mimic_slot is not None else self.placement.dummy_is_free_rigid,
-                    self.laws._mimic_art_start if self.laws.mimic_count else self.placement.dummy_is_free_rigid,
-                    self.laws._mimic_art_list if self.laws.mimic_count else self.placement.dummy_is_free_rigid,
-                    int(self.laws.mimic_count or 0),
-                    self.laws.connect_slot
-                    if self.laws.connect_slot is not None
-                    else self.placement.dummy_is_free_rigid,
-                    self.laws._connect_art if self.laws.connect_count else self.placement.dummy_is_free_rigid,
-                    int(self.laws.connect_count or 0),
-                    self.placement.packed_Z,
-                    size,
-                ],
-                device=self.model.device,
-            )
-        wp.launch(
-            self._elimination.correct,
-            dim=self.forest.world_count * self.placement.dense_max_constraints,
-            inputs=[
-                field_group.bind(Preelim, solver=self),
-                self.placement.row_sides,
-                self.forest.articulation_response_dof_count,
-                self.forest.articulation_world_dof_offset,
-                dense,
-                self.placement.constraint_count,
-                self.placement.local_solve_owner,
-                self.placement.row_cfm,
-                self.placement.row_incident,
-            ],
-            outputs=[self.placement.packed_Z, self.placement.rhs, self.placement.diag],
-            device=self.model.device,
-        )
-        # The projection: the block rows' impulses, which the sweep seeds with the warm start's.
-        for size in self.forest.size_groups:
-            wp.launch(
-                self._elimination.weights,
-                dim=self.forest.n_arts_by_size[size],
-                inputs=[
-                    field_group.bind(Preelim, solver=self),
-                    self.forest.group_to_art[size],
-                    self.forest.art_to_world,
-                    self.placement.rhs,
-                    self.placement.row_incident,
-                ],
-                outputs=[self.placement.impulses],
-                device=self.model.device,
-            )
-
     def _setup_fused_diagonal_joint_limits(self, model) -> None:
         """Select independent position limits that can remain outside the dense row system."""
         self.placement.fused_diagonal_joint_limits = False
@@ -1615,7 +1518,7 @@ class SolverFeatherPGS(SolverBase):
             and not self.options.enable_joint_velocity_limits
             and not self.options.pgs_warmstart
             and not self.options.pgs_warmstart
-            and not self._preelim_active
+            and not self.factor.eliminates
             and not self.forest.has_free_rigid_bodies
             and self.laws.mimic_count == 0
             and self.laws.connect_count == 0
@@ -2372,7 +2275,7 @@ class SolverFeatherPGS(SolverBase):
             self._grouped_response = True
             self.placement.grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
-        self._seeded_sweep = bool(self.options.pgs_warmstart or self._preelim_active)
+        self._seeded_sweep = bool(self.options.pgs_warmstart or self.factor.eliminates)
         if self.placement.mf_sweeps:
             # A test pin streams the impulses (storage is part of the kernel specialization key); the selection
             # sizes the resident row metadata with its choice.
@@ -2423,6 +2326,7 @@ class SolverFeatherPGS(SolverBase):
                 "colored_worlds": colored,
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self._seeded_sweep,
+                "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,
@@ -3277,10 +3181,20 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
-            if self._preelim_active:
+            if self.factor.eliminates:
                 # Bilateral elimination: the other rows take the closed-loop response, their right-hand sides
                 # and diagonals (the rows' closed-loop inertia).
-                self._stage4_bilateral_preelim()
+                self.factor.eliminate(
+                    Z=self.placement.packed_Z,
+                    sides=self.placement.row_sides,
+                    counts=self.placement.constraint_count,
+                    owners=self.placement.local_solve_owner,
+                    cfm=self.placement.row_cfm,
+                    rhs=self.placement.rhs,
+                    incident=self.placement.row_incident,
+                    diag=self.placement.diag,
+                    impulses=self.placement.impulses,
+                )
 
             # The sweeps add their velocity change to the predictor; a world without rows keeps it.
             wp.copy(self.v_out, self.v_hat)
@@ -3796,6 +3710,37 @@ class SolverFeatherPGS(SolverBase):
                     outputs=[self.placement.jacobian_rows(size), dense_rows],
                     device=model.device,
                 )
+
+        # The links' rows: static per model, their sides the trees of the link's two pieces.
+        if self.laws.link_count > 0:
+            links = field_group.bind(Links, laws=self.laws)
+            wp.launch(
+                allocate_link_slots,
+                dim=self.laws.link_count,
+                inputs=[links, max_constraints],
+                outputs=[self.placement.slot_counter, self.placement.dense_first_rejected_slot],
+                device=model.device,
+            )
+            wp.launch(
+                write_link_rows,
+                dim=self.laws.link_count,
+                inputs=[
+                    joints,
+                    links,
+                    state_in.body_q,
+                    model.body_com,
+                    self.forest.body_to_joint,
+                    self.forest.body_to_articulation,
+                    model.joint_ancestor,
+                    state_aug.joint_S_s,
+                    self.factor.articulation_origin,
+                    self.options.pgs_beta,
+                    self.options.pgs_cfm,
+                    support,
+                ],
+                outputs=[self.placement.packed_Z, dense_rows],
+                device=model.device,
+            )
 
         # Connect (loop-closure) equality rows — static count per model.
         if self.laws.connect_count > 0:
@@ -4577,7 +4522,7 @@ class SolverFeatherPGS(SolverBase):
                     (self.placement.mf_sweeps, "No matrix-free sweep runs whose dense rows the tiers could take."),
                     (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
                     (
-                        not self._preelim_active,
+                        not self.factor.eliminates,
                         "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew.",
                     ),
                     (
