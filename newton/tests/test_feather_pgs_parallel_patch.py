@@ -847,6 +847,7 @@ def _general_bias(solver, rows, dt):
         row_beta=rows["row_beta"],
         row_type=rows["row_type"],
         target=rows["target_velocity"],
+        restitution=wp.zeros_like(rhs),
         rhs=rhs,
         row_w=wp.zeros_like(rhs),
     )
@@ -855,11 +856,13 @@ def _general_bias(solver, rows, dt):
         dim=rhs.shape[0] * rhs.shape[1],
         inputs=[
             records,
+            wp.zeros_like(rhs),
             count,
             rhs.shape[1],
             dt,
             solver.options.contact_speculative_scale,
             1.0,
+            0.0,
             0,
             0,
         ],

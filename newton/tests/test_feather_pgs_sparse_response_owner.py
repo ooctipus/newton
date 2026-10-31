@@ -238,15 +238,16 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
             "cpu",
             row_type=np.zeros((worlds, rows), np.int32),
             phi=np.full((worlds, rows), -0.01, np.float32),
+            row_beta=np.zeros((worlds, rows), np.float32),
             target=np.zeros((worlds, rows), np.float32),
             restitution=np.full((worlds, rows), 0.5, np.float32),
             rhs=rhs,
             row_w=np.ones((worlds, rows), np.float32),
         )
         wp.launch(
-            kernels.apply_world_contact_restitution_matrix_free,
+            kernels.compute_world_contact_bias,
             dim=worlds * rows,
-            inputs=[records, incident, counts, rows, 0.01, 0.0, 0],
+            inputs=[records, incident, counts, rows, 0.01, 1.0, 1.0, 0.0, 0, 0],
             device="cpu",
         )
         # A restitutive impact: rhs = e * J v (target 0, the threshold 0 admits every approaching row).

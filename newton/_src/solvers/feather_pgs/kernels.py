@@ -2570,18 +2570,21 @@ def update_body_qd_from_featherstone(
 @wp.kernel
 def compute_world_contact_bias(
     rows: DenseRows,
+    row_incident: wp.array2d[float],
     world_constraint_count: wp.array[int],
     max_constraints: int,
     dt: float,
     contact_speculative_scale: float,
     contact_w: float,
+    restitution_velocity_threshold: float,
     weighted: int,
     material: int,
 ):
     """Compute each world row's RHS bias by its row law (:func:`.row_laws.row_rhs`); ``J*v`` is added later.
 
     The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's Baumgarte term
-    ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS.
+    ``beta * phi / dt`` is negative and leads to positive impulses when resolved by PGS. A restitutive contact that
+    fires takes the rebound of :func:`.row_laws.contact_restitution_rhs` from its incident velocity instead (weight 1).
 
     ``weighted`` rows store their relative regularization weight. A material contact (``material``: its writer stored
     its rhs and compliance ``eps``, from which the sweeps form its weight, :func:`.sweep.row_weight`) keeps
@@ -2605,42 +2608,18 @@ def compute_world_contact_bias(
     rhs, row_w = row_rhs(
         kind, phi, rows.row_beta[world, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
     )
+    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        restitution = rows.restitution[world, i]
+        if restitution > 0.0:
+            fires, bounce = contact_restitution_rhs(
+                phi, row_incident[world, i] - target, target, restitution, dt, restitution_velocity_threshold
+            )
+            if fires:
+                rhs = bounce
+                row_w = 1.0
     rows.rhs[world, i] = rhs
     if weighted != 0:
         rows.row_w[world, i] = row_w
-
-
-@wp.kernel
-def apply_world_contact_restitution_matrix_free(
-    rows: DenseRows,
-    row_incident: wp.array2d[float],
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    dt: float,
-    restitution_velocity_threshold: float,
-    write_row_w: int,
-):
-    """Replace a matrix-free contact bias with a one-shot restitution target from the row's incident velocity.
-
-    Matrix-free GS adds live J*v itself, so the row stores only ``-target + e*u_incident``.
-    """
-    tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world] or rows.row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-    restitution = rows.restitution[world, i]
-    if restitution <= 0.0:
-        return
-    target_vel = rows.target[world, i]
-    relative_incident = row_incident[world, i] - target_vel
-    fires, bounce = contact_restitution_rhs(
-        rows.phi[world, i], relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
-    )
-    if fires:
-        rows.rhs[world, i] = bounce
-        if write_row_w != 0:
-            rows.row_w[world, i] = 1.0
 
 
 @wp.kernel

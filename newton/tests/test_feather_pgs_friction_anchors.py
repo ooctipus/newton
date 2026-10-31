@@ -354,10 +354,12 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
             row_beta=[list(row_beta)],
             row_type=row_type,
             target=zeros3(),
+            restitution=zeros3(),
             rhs=rhs,
             row_w=zeros3(),
         )
-        wp.launch(compute_world_contact_bias, dim=3, inputs=[rows, count, 3, dt, 1.0, 1.0, 0, 0], device=device)
+        inputs = [rows, zeros3(), count, 3, dt, 1.0, 1.0, 0.0, 0, 0]
+        wp.launch(compute_world_contact_bias, dim=3, inputs=inputs, device=device)
     elif family == "mf_setup":
         wp.launch(
             response_builds_rows.free_body_rows_kernel,

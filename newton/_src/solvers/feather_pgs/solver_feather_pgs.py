@@ -88,7 +88,6 @@ from .kernels import (
     allocate_mimic_slots,
     allocate_rigid_velocity_limit_slots,
     allocate_world_contact_slots,
-    apply_world_contact_restitution_matrix_free,
     build_joint_limit_rows_for_size,
     build_mf_contact_rows,
     classify_local_solve_worlds,
@@ -3264,7 +3263,6 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         with wp.ScopedTimer("S5_GatherJY", print=False, use_nvtx=self._nvtx, synchronize=False):
-            self._stage4_apply_world_contact_restitution(dt)
             if self._preelim_active:
                 # Bilateral elimination: the other rows take the closed-loop response, their right-hand sides
                 # and diagonals (the rows' closed-loop inertia).
@@ -4641,7 +4639,7 @@ class SolverFeatherPGS(SolverBase):
         return [sweep_routes_tiers.tier_sweeps(rows, self.options.pgs_iterations) for rows, _ in tiers], "auto", reason
 
     def _stage4_compute_rhs_world(self, dt: float):
-        """Each dense row's rhs bias (``compute_world_contact_bias``)."""
+        """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``)."""
         if (
             self.placement.sparse_prepare_contacts
             or self.placement.row_packets is not None
@@ -4653,34 +4651,15 @@ class SolverFeatherPGS(SolverBase):
             dim=self.forest.world_count * self.placement.dense_max_constraints,
             inputs=[
                 bind_dense_rows(self.placement),
+                self.placement.row_incident,
                 self.placement.constraint_count,
                 self.placement.dense_max_constraints,
                 dt,
                 self.options.contact_speculative_scale,
                 self.laws.contact_w,
-                int(self.laws.set.weighted),
-                int(self.options.contact_compliance),
-            ],
-            device=self.model.device,
-        )
-
-    def _stage4_apply_world_contact_restitution(self, dt: float) -> None:
-        """Replace geometric contact bias for impacts selected from ``v_hat``."""
-        if self.placement.sparse_prepare_contacts:
-            return  # The sparse contact producer uses its projected incident velocity.
-        if self.placement.row_packets is not None or self.placement.keyed_rows is not None:
-            return  # The current packet producer applies the same incident-velocity law.
-        wp.launch(
-            apply_world_contact_restitution_matrix_free,
-            dim=self.forest.world_count * self.placement.dense_max_constraints,
-            inputs=[
-                bind_dense_rows(self.placement),
-                self.placement.row_incident,
-                self.placement.constraint_count,
-                self.placement.dense_max_constraints,
-                dt,
                 self.laws.effective_restitution_velocity_threshold,
                 int(self.laws.set.weighted),
+                int(self.options.contact_compliance),
             ],
             device=self.model.device,
         )

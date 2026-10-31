@@ -85,9 +85,12 @@ def test_row_rhs_matches_world_contact_bias(test, device):
                 world_row_beta=beta,
                 world_row_type=kind,
                 world_target_velocity=target,
+                world_row_restitution=np.zeros((worlds, rows), dtype=np.float32),
+                row_incident=np.zeros((worlds, rows), dtype=np.float32),
                 dt=dt,
                 contact_speculative_scale=contact_spec,
                 contact_w=contact_w,
+                restitution_velocity_threshold=0.0,
                 weighted=int(contact_w < 1.0),
                 material=0,
                 mf_constraint_count=np.zeros(worlds, dtype=np.int32),
@@ -351,11 +354,10 @@ def _law_restitution_matrix_free(
 
 
 def test_restitution_matches_matrix_free_restitution(test, device):
-    """Replace exactly the rows ``apply_world_contact_restitution_matrix_free`` replaces, with the same rhs bits."""
+    """Rebound exactly the rows the restitution law selects, with the same rhs bits, and leave the rest their bias."""
     rng = np.random.default_rng(16)
     worlds, rows = 8, 32
-    phi, kind, _, target = _rows(rng, worlds, rows)
-    rhs0 = rng.normal(size=(worlds, rows)).astype(np.float32)
+    phi, kind, beta, target = _rows(rng, worlds, rows)
     common = {
         "world_phi": phi,
         "world_row_type": kind,
@@ -366,26 +368,39 @@ def test_restitution_matches_matrix_free_restitution(test, device):
         "restitution_velocity_threshold": 0.2,
     }
     out = call(
-        kernels.apply_world_contact_restitution_matrix_free,
+        kernels.compute_world_contact_bias,
         worlds * rows,
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
-        write_row_w=1,
+        world_row_beta=beta,
+        contact_speculative_scale=1.0,
+        contact_w=0.5,
+        weighted=1,
+        material=0,
         mf_constraint_count=np.zeros(worlds, dtype=np.int32),
         owned_rows_le=0,
-        world_rhs=rhs0.copy(),
-        world_row_w=np.full((worlds, rows), 0.5, dtype=np.float32),
+        world_rhs=np.zeros((worlds, rows), dtype=np.float32),
+        world_row_w=np.zeros((worlds, rows), dtype=np.float32),
         **common,
     )
-    law = call(
-        _law_restitution_matrix_free,
+    bias = call(
+        _law_world_bias,
         (worlds, rows),
         device,
-        rhs=rhs0.copy(),
-        row_w=np.full((worlds, rows), 0.5, dtype=np.float32),
-        **common,
+        phi=phi,
+        beta=beta,
+        kind=kind,
+        target=target,
+        dt=common["dt"],
+        bias_scale=1.0,
+        contact_speculative_scale=1.0,
+        limit_speculative_scale=1.0,
+        contact_w=0.5,
+        rhs=np.zeros((worlds, rows), dtype=np.float32),
+        row_w=np.zeros((worlds, rows), dtype=np.float32),
     )
+    law = call(_law_restitution_matrix_free, (worlds, rows), device, rhs=bias["rhs"], row_w=bias["row_w"], **common)
     test.assertFalse(mismatches(out["world_rhs"].numpy(), law["rhs"].numpy()).any())
     test.assertFalse(mismatches(out["world_row_w"].numpy(), law["row_w"].numpy()).any())
     test.assertTrue((out["world_row_w"].numpy() == 1.0).any())

@@ -323,6 +323,7 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             row_beta=[[0.2]],
             row_type=[[PGS_CONSTRAINT_TYPE_CONTACT]],
             target=[[0.0]],
+            restitution=[[0.0]],
             rhs=[[0.0]],
             row_w=row_w,
         )
@@ -331,11 +332,13 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             dim=1,
             inputs=[
                 rows,
+                wp.zeros_like(row_w),
                 wp.array([1], dtype=wp.int32, device=device),
                 1,
                 DT,
                 1.0,
                 0.5,
+                0.0,
                 1,
                 0,
             ],

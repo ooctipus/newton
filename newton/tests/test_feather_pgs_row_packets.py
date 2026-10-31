@@ -195,9 +195,8 @@ def _run_general(data, layout, beta):
     """Run the general patch route's row chain on the fixture's inputs, into fresh outputs.
 
     As Franka's compact-Jacobian route: prepare_world_contact_rows writes the metadata,
-    populate_world_J_for_compact_size each size's Jacobian, compute_world_contact_bias the bias and
-    apply_world_contact_restitution_matrix_free the bounces. Returns the rows, the Jacobians by size
-    and the right-hand sides before the bounces.
+    populate_world_J_for_compact_size each size's Jacobian, compute_world_contact_bias the bias and the
+    bounces. Returns the rows, the Jacobians by size and the right-hand sides before the bounces.
     """
     device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
     # The general route records each row's sides (the packed placement's).
@@ -222,33 +221,31 @@ def _run_general(data, layout, beta):
         world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
         world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
     records = field_group.upload(DenseRows, device, **vars(rows), sides=sides)
-    wp.launch(
-        kernels.compute_world_contact_bias,
-        dim=WORLDS * ROWS,
-        inputs=[
-            records,
-            layout.counts,
-            ROWS,
-            data.dt,
-            data.speculative_scale,
-            data.contact_w,
-            int(data.contact_w < 1.0),
-            0,
-        ],
-        device=device,
-    )
+    incident = wp.array(row_velocity(world_jacobian, data.incident.numpy()), dtype=float, device=device)
+
+    def right_hand_sides(threshold):
+        wp.launch(
+            kernels.compute_world_contact_bias,
+            dim=WORLDS * ROWS,
+            inputs=[
+                records,
+                incident,
+                layout.counts,
+                ROWS,
+                data.dt,
+                data.speculative_scale,
+                data.contact_w,
+                threshold,
+                int(data.contact_w < 1.0),
+                0,
+            ],
+            device=device,
+        )
+
+    # No contact closes faster than the largest threshold: the bias alone.
+    right_hand_sides(float(np.finfo(np.float32).max))
     bias = rows.rhs.numpy().copy()
-    wp.launch(
-        kernels.apply_world_contact_restitution_matrix_free,
-        dim=WORLDS * ROWS,
-        inputs=[
-            records,
-            wp.array(row_velocity(world_jacobian, data.incident.numpy()), dtype=float, device=device),
-            *(layout.counts, ROWS),
-            *(data.dt, data.restitution_threshold, 0),
-        ],
-        device=device,
-    )
+    right_hand_sides(data.restitution_threshold)
     return rows, jacobians, bias
 
 

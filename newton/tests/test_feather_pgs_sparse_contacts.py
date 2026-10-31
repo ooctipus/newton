@@ -13,7 +13,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
-    apply_world_contact_restitution_matrix_free,
     compute_world_contact_bias,
     populate_world_J_for_compact_size,
     prepare_world_contact_rows,
@@ -528,27 +527,31 @@ class TestSparseContacts(unittest.TestCase):
                         rhs=reference_rhs,
                         row_w=full((1, 9), -9.0),
                     )
-                    wp.launch(
-                        compute_world_contact_bias,
-                        dim=9,
-                        inputs=[reference_rows, count, 9, 0.01, law["speculative_scale"], 1.0, 0, 0],
-                        device=device,
-                    )
+                    incident = array(row_velocity(dense.numpy(), f["velocity"].numpy()))
+
+                    def contact_bias(threshold):
+                        wp.launch(
+                            compute_world_contact_bias,
+                            dim=9,
+                            inputs=[
+                                reference_rows,
+                                incident,
+                                count,
+                                9,
+                                0.01,
+                                law["speculative_scale"],
+                                1.0,
+                                threshold,
+                                0,
+                                0,
+                            ],
+                            device=device,
+                        )
+
+                    # No contact closes faster than the largest threshold: the bias alone.
+                    contact_bias(float(np.finfo(np.float32).max))
                     geometric_rhs = reference_rhs.numpy().copy()
-                    wp.launch(
-                        apply_world_contact_restitution_matrix_free,
-                        dim=9,
-                        inputs=[
-                            reference_rows,
-                            array(row_velocity(dense.numpy(), f["velocity"].numpy())),
-                            count,
-                            9,
-                            0.01,
-                            law["restitution_threshold"],
-                            0,
-                        ],
-                        device=device,
-                    )
+                    contact_bias(law["restitution_threshold"])
                     self.assertNotAlmostEqual(float(geometric_rhs[0, 0]), float(reference_rhs.numpy()[0, 0]))
                     self.assertGreater(float(reference[5].numpy()[0, 6]), 0.0)
                     self.assertNotEqual(float(reference[6].numpy()[0, 0]), 0.0)
@@ -641,11 +644,13 @@ class TestSparseContacts(unittest.TestCase):
             dim=18,
             inputs=[
                 field_group.replace(rows, rhs=reference_rhs, row_w=array(np.full(shape, -9.0))),
+                array(np.zeros(shape)),
                 prefix_count,
                 6,
                 0.0123,
                 1.0,
                 1.0,
+                0.0,
                 0,
                 0,
             ],
@@ -880,33 +885,43 @@ class TestSparseContacts(unittest.TestCase):
         phi = _array([[-0.01, 0.01, 0.5, -0.01, -0.01, -0.01, -0.01]])
         incident = _array([[-2.0, -2.0, -2.0, -0.05, 0.5, -3.0, -4.0]])
         target = _array([[0.0, 0.2, 0.0, 0.0, 1.0, 0.0, 0.0]])
-        restitution = _array([[0.4] * row_count])
         count = _array([6], int)
-        rhs = _full((1, row_count), -7.0)
-        wp.launch(
-            apply_world_contact_restitution_matrix_free,
-            dim=row_count,
-            inputs=[
-                field_group.upload(
-                    dense_rows.DenseRows,
-                    "cpu",
-                    row_type=kinds,
-                    phi=phi,
-                    target=target,
-                    restitution=restitution,
-                    rhs=rhs,
-                    row_w=_full((1, row_count), 1.0),
-                ),
-                incident,
-                count,
-                row_count,
-                0.01,
-                0.1,
-                0,
-            ],
-            device="cpu",
-        )
-        np.testing.assert_allclose(rhs.numpy()[0], [-0.8, -1.08, -7.0, -7.0, -1.2, -7.0, -7.0], atol=1.0e-6)
+
+        def right_hand_sides(coefficient):
+            rhs = _full((1, row_count), -7.0)
+            wp.launch(
+                compute_world_contact_bias,
+                dim=row_count,
+                inputs=[
+                    field_group.upload(
+                        dense_rows.DenseRows,
+                        "cpu",
+                        row_type=kinds,
+                        phi=phi,
+                        row_beta=_full((1, row_count), 0.0),
+                        target=target,
+                        restitution=_array([[coefficient] * row_count]),
+                        rhs=rhs,
+                        row_w=_full((1, row_count), 1.0),
+                    ),
+                    incident,
+                    count,
+                    row_count,
+                    0.01,
+                    1.0,
+                    1.0,
+                    0.1,
+                    0,
+                    0,
+                ],
+                device="cpu",
+            )
+            return rhs.numpy()[0]
+
+        bias, bounced = right_hand_sides(0.0), right_hand_sides(0.4)
+        np.testing.assert_allclose(bounced[[0, 1, 4]], [-0.8, -1.08, -1.2], atol=1.0e-6)
+        np.testing.assert_array_equal(bounced[[2, 3, 5]], bias[[2, 3, 5]])
+        self.assertEqual(bounced[6], -7.0)
 
     def test_decode_factor_velocity(self):
         """Decode accumulated factor impulses into the original physical DOF order."""
