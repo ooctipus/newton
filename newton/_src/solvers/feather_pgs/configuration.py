@@ -53,9 +53,7 @@ _CHOICE_RULES = (("pgs_solve_readout", SOLVE_READOUTS),)
 
 # The switches the solver applies as booleans.
 _BOOLEANS = (
-    "contact_friction_shared_anchor",
     "contact_friction_articulation_pairs_only",
-    "contact_shared_anchor",
     "enable_bilateral_preelimination",
     "enable_restitution",
     "warn_constraint_overflow",
@@ -80,9 +78,7 @@ class Options:
     enable_contact_friction: Any
     contact_friction_gap_threshold: Any
     contact_friction_position_iterations: int
-    contact_friction_shared_anchor: bool
     contact_friction_scale: float
-    contact_shared_anchor: bool
     enable_joint_limits: Any
     enable_bilateral_preelimination: bool
     joint_limit_activation_gap: float

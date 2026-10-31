@@ -980,7 +980,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
         for written in ("c.row_parent.data", "c.row_mu.data", "c.row_type.data", "built_parent", "built_mu"):
             self.assertNotIn(written, text)
-        self.assertIn("patch_law.patches.point_a.data[contact]", text)
+        self.assertIn("patch_law.patches.point.data[contact]", text)
         self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
         for golden in _tier_texts(32)[1:]:
             self.assertEqual(text.count(golden), 1, golden)

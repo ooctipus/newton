@@ -100,6 +100,73 @@ class TestDepenetrationCap(unittest.TestCase):
                 self.assertAlmostEqual(speed, self.uncapped, delta=5.0e-3 * self.uncapped)
 
 
+def _pressed_pair(store: str, overlap: float, *, device="cpu"):
+    """Two 8 kg boxes overlapping by ``overlap`` along z, sliding oppositely along x, no gravity, on row store ``store``.
+
+    Returns the model and the state's initial ``joint_qd``. The boxes' witness points sit ``overlap`` apart along the
+    normal, so a tangent impulse applied at each would put the couple ``overlap * f`` on the pair.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.8, gap=0.02)
+    roots = []
+    for height in (0.0, 2.0 * HALF - overlap):
+        pose = wp.transform((0.0, 0.0, height), wp.quat_identity())
+        if store == "free":
+            body = builder.add_body(xform=pose)
+            builder.add_shape_box(body, hx=HALF, hy=HALF, hz=HALF, cfg=cfg)
+        else:
+            body = builder.add_link(xform=pose)
+            builder.add_shape_box(body, hx=HALF, hy=HALF, hz=HALF, cfg=cfg)
+            tail = builder.add_link(xform=pose, mass=1.0e-3, inertia=wp.mat33(np.eye(3) * 1.0e-6))
+            root = builder.add_joint_free(body)
+            hinge = builder.add_joint_revolute(parent=body, child=tail, axis=(0.0, 0.0, 1.0))
+            builder.add_articulation([root, hinge])
+        roots.append(body)
+    return builder.finalize(device=device)
+
+
+def _momenta(model, state) -> tuple[np.ndarray, np.ndarray]:
+    """The system's linear and angular momentum about the world origin."""
+    q, qd = state.body_q.numpy(), state.body_qd.numpy()
+    mass, inertia = model.body_mass.numpy(), model.body_inertia.numpy()
+    linear, angular = np.zeros(3), np.zeros(3)
+    for body in range(model.body_count):
+        rotation = np.array(wp.quat_to_matrix(wp.quat(*q[body, 3:]))).reshape(3, 3)
+        linear += mass[body] * qd[body, :3]
+        angular += np.cross(q[body, :3], mass[body] * qd[body, :3])
+        angular += rotation @ np.asarray(inertia[body]) @ rotation.T @ qd[body, 3:]
+    return linear, angular
+
+
+class TestOneContactPoint(unittest.TestCase):
+    """PH1b: a contact's rows act at one point, so its impulses are a pure force pair and conserve angular momentum."""
+
+    def _change(self, store: str, overlap: float) -> tuple[float, float]:
+        model = _pressed_pair(store, overlap)
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0, angular_damping=0.0, pgs_iterations=64)
+        state, out = model.state(), model.state()
+        velocity = state.joint_qd.numpy()
+        half = model.joint_dof_count // 2
+        velocity[0], velocity[half] = 1.0, -1.0
+        state.joint_qd.assign(velocity)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        before = _momenta(model, state)
+        pipeline.collide(state, contacts)
+        self.assertGreater(contacts.rigid_contact_count.numpy()[0], 0)
+        solver.step(state, out, model.control(), contacts, H)
+        after = _momenta(model, out)
+        return float(np.linalg.norm(after[0] - before[0])), float(np.linalg.norm(after[1] - before[1]))
+
+    def test_friction_conserves_angular_momentum(self):
+        for store in ("free", "tree"):
+            with self.subTest(store=store):
+                linear, angular = self._change(store, 0.01)
+                self.assertLess(linear, 1.0e-3)
+                self.assertLess(angular, 2.0e-5)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the specialized row stores run on CUDA")
 class TestDepenetrationCapOnRoutes(unittest.TestCase):
     """PH1a on each contact-row producer: the normal law at the capped bias, from the public contact record."""

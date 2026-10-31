@@ -295,7 +295,6 @@ def spd3(rng, n):
 def twin_inputs(name: str, rng, n: int, device) -> dict:
     """Inputs for the twin comparison of law ``name``."""
     ints = lambda lo, hi: rng.integers(lo, hi, n).astype(np.int32)  # noqa: E731
-    flags = lambda: rng.integers(0, 2, n).astype(np.int32)  # noqa: E731
     vec = lambda scale=1.0: rng.normal(scale=scale, size=(n, 3)).astype(np.float32)  # noqa: E731
     shape_body = np.array([-1, 0, 1, 2, 3, 4, 5, 6], dtype=np.int32)
     body_to_art = np.array([0, 0, 1, -1, 2, 3, 3], dtype=np.int32)
@@ -354,19 +353,16 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         return {**common, "shape_mu": rng.uniform(0, 1.5, 8).astype(np.float32), "shape_restitution": values}
     if name == "contact_tangent_basis":
         return {"n": unit_vectors(rng, n)}
-    if name == "contact_friction_points":
-        return {"point_a": vec(), "point_b": vec(), "shared_anchor": flags(), "friction_shared_anchor": flags()}
+    if name == "contact_point":
+        return {"point_a": vec(), "point_b": vec()}
     if name == "contact_row_frame":
         return {
             "row": ints(0, 4),
-            "shared_anchor": flags(),
             "normal": unit_vectors(rng, n),
             "tangent0": unit_vectors(rng, n),
             "tangent1": unit_vectors(rng, n),
-            "point_a": vec(),
-            "point_b": vec(),
-            "friction_a": vec(),
-            "friction_b": vec(),
+            "point": vec(),
+            "friction_point": vec(),
         }
     if name == "jacobian_entry":
         return {
@@ -391,8 +387,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
     if name == "prescribed_target":
         return {
             **common,
-            "point_a": vec(),
-            "point_b": vec(),
+            "point": vec(),
             "direction": unit_vectors(rng, n),
             "prescribed_articulation": np.array([1, 0, 1, 1], dtype=np.int32),
             "articulation_origin": rng.normal(size=(4, 3)).astype(np.float32),
@@ -574,8 +569,6 @@ CONTACT_ARGUMENTS = {
     "material_restitution": "shape_material_restitution",
     "max_depenetration_velocity": "rigid_body_max_depenetration_velocity",
     "incident": "v_hat",
-    "shared_anchor": "contact_shared_anchor",
-    "friction_shared_anchor": "contact_friction_shared_anchor",
     "friction_scale": "contact_friction_scale",
     "beta": "pgs_beta",
     "cfm": "pgs_cfm",

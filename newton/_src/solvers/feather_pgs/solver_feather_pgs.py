@@ -414,9 +414,7 @@ class SolverFeatherPGS(SolverBase):
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
-        contact_friction_shared_anchor: bool = False,
         contact_friction_scale: float = 1.0,
-        contact_shared_anchor: bool = False,
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
         joint_limit_activation_gap: float = float("inf"),
@@ -493,12 +491,6 @@ class SolverFeatherPGS(SolverBase):
                 behavior by solving friction in every position iteration; ``0`` skips position-pass
                 friction entirely; ``N > 0`` solves friction only in the final ``N`` position
                 iterations. Defaults to ``-1``.
-            contact_friction_shared_anchor (bool, optional): If true, friction rows use the midpoint
-                between the two contact witness points as the Jacobian point on both bodies. Normal
-                rows keep their original witness points. This avoids a tangential force couple when
-                the witnesses are separated along the contact normal. Applies to velocity-only point
-                friction (``friction_anchor_beta=0``); patch friction warns and uses its persistent
-                material anchors instead. Defaults to False.
             contact_friction_articulation_pairs_only (bool, optional): Apply
                 ``contact_friction_gap_threshold`` only when
                 both contact bodies belong to non-free articulations. Contacts involving ground or a
@@ -534,8 +526,6 @@ class SolverFeatherPGS(SolverBase):
                 regions discard history. Regions with no friction rows for a step (gap filters or
                 row capacity) retain supported history. Patch reduction approximates the friction
                 wrench with two locations; faceted wheels still experience facet-impact losses.
-                Patch locations define the friction row points, so ``contact_shared_anchor`` and
-                ``contact_friction_shared_anchor`` apply only to normal rows and velocity-only friction.
                 Explicit positive gains with an incompatible point algorithm raise an error.
                 Each step sorts its patch contact pairs, except a step captured in a CUDA graph
                 right after another captured step of the same graph over the same contact stream
@@ -577,11 +567,6 @@ class SolverFeatherPGS(SolverBase):
                 distance. Contacts involving ground or a free rigid body retain the full
                 predictive horizon. A value of 0.0 disables the scoped gate. Must be finite
                 and non-negative. Defaults to 0.0.
-            contact_shared_anchor (bool, optional): If true, all contact rows use the midpoint between
-                the two witness points as the Jacobian point on both bodies, matching PhysX contact
-                prep's single ``contact.point`` lever arm. ``phi`` is still computed from the original
-                witness points. With patch friction, only normal rows use this midpoint; a warning
-                explains how to select point friction for the original all-row behavior. Defaults to False.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
             enable_bilateral_preelimination (bool, optional): Eliminate each articulation's mimic and

@@ -133,7 +133,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             with self.subTest(seed=seed):
                 order = np.random.default_rng(seed).permutation(len(points))
                 _, _, _, patches = _patch_fixture(points[order], device=device)
-                locations = patches.view.point_a.numpy()[patches.view.weight.numpy() > 0.0]
+                locations = patches.view.point.numpy()[patches.view.weight.numpy() > 0.0]
                 locations = locations[np.argsort(locations[:, 1])]
                 np.testing.assert_array_equal(locations, expected)
 
@@ -147,7 +147,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             with self.subTest(angle=angle):
                 _, _, _, patches = _patch_fixture(points, device=device)
                 active = patches.view.weight.numpy() > 0.0
-                locations = patches.view.point_a.numpy()[active]
+                locations = patches.view.point.numpy()[active]
                 self.assertEqual(len(locations), 2)
                 np.testing.assert_allclose(locations @ across, 0.0, atol=1.0e-7)
                 np.testing.assert_allclose(np.sort(locations @ axis), [-0.025, 0.025], atol=1.0e-7)
@@ -180,7 +180,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         pairs.add(tuple(held))
                         with self.subTest(footprint=name, yaw=yaw, offset=offset, corner=corner, step=step):
                             # Isotropic anchors sit on their carriers' contact centres.
-                            np.testing.assert_array_equal(patches.view.point_a.numpy()[held], moved[held])
+                            np.testing.assert_array_equal(patches.view.point.numpy()[held], moved[held])
                 with self.subTest(footprint=name, yaw=yaw, offset=offset):
                     self.assertEqual(pairs, {expected})
 
@@ -216,7 +216,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                         edge = next(edge for edge in edges if carrier in edge)
                         midpoint = moved[list(edge)].astype(np.float64).mean(axis=0).astype(np.float32)
                         with self.subTest(hx=hx, yaw=yaw, offset=offset, move=move, carrier=carrier):
-                            np.testing.assert_array_equal(patches.view.point_a.numpy()[carrier], midpoint)
+                            np.testing.assert_array_equal(patches.view.point.numpy()[carrier], midpoint)
                 with self.subTest(hx=hx, yaw=yaw, offset=offset):
                     self.assertEqual(carriers, {(2, 3)})
 
@@ -542,8 +542,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         state.body_q.assign([wp.transform(wp.vec3(0.001, 0, 0), wp.quat_identity()), wp.transform_identity()])
         patches.build(model, state, contacts)
         active = patches.current.valid.numpy() != 0
-        np.testing.assert_allclose(patches.view.point_a.numpy()[active], patches.current.center.numpy()[active])
-        np.testing.assert_allclose(patches.view.point_b.numpy()[active], patches.current.center.numpy()[active])
+        np.testing.assert_allclose(patches.view.point.numpy()[active], patches.current.center.numpy()[active])
         np.testing.assert_allclose(np.linalg.norm(patches.view.phi.numpy()[active], axis=1), 0.001, atol=1.0e-7)
         self.assertTrue(np.all(patches.current.source.numpy()[active] >= 0))
 
@@ -759,8 +758,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for enabled in (False, True):
                     model, jaws, obj = _build_v_jaws(5.0, geometry)
                     kwargs = dict(_SQUEEZE_SOLVER)
-                    kwargs.pop("contact_shared_anchor")
-                    kwargs.pop("contact_friction_shared_anchor")
                     if not model.device.is_cuda:
                         kwargs.update(enable_bilateral_preelimination=False)
                     if not enabled:
@@ -1146,13 +1143,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         solver.reset(s0, wp.array([True, False], dtype=bool, device=device))
         valid = patches.previous.valid.numpy()[:2]
         np.testing.assert_array_equal(valid, (worlds != 0).astype(np.int32))
-
-    def test_shared_point_flags_warn_with_patch_friction(self):
-        """Explain when patch anchors override an explicitly requested shared friction point."""
-        model = newton.ModelBuilder().finalize(device="cpu")
-        for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
-            with self.subTest(flag=flag), self.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
-                newton.solvers.SolverFeatherPGS(model, **{flag: True})
 
     def test_anchor_selection_respects_contact_gap_filters(self):
         """Keep filtered extreme points from removing friction from a loaded middle contact."""

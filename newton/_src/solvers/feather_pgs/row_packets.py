@@ -33,7 +33,7 @@ from .contact_input import ContactInput
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_bodies,
-    contact_friction_points,
+    contact_point,
     contact_points,
     contact_row_frame,
     contact_tangent_basis,
@@ -376,12 +376,11 @@ def produce_contacts(
         art1 = data.art1[contact]
         body0, body1 = contact_bodies(data.shape0[contact], data.shape1[contact], data.shape_body)
         normal = wp.vec3()
-        point0 = wp.vec3()
-        point1 = wp.vec3()
+        point = wp.vec3()
         tangent0 = wp.vec3()
         tangent1 = wp.vec3()
         if lane == 0:
-            normal, point0, point1, _phi = contact_points(
+            normal, point_a, point_b, _phi = contact_points(
                 data.normal[contact],
                 data.point0[contact],
                 data.point1[contact],
@@ -391,15 +390,15 @@ def produce_contacts(
                 body1,
                 data.body_q,
             )
+            point = contact_point(point_a, point_b)
             tangent0, tangent1 = contact_tangent_basis(normal)
         normal = warp_broadcast(normal)
-        point0 = warp_broadcast(point0)
-        point1 = warp_broadcast(point1)
+        point = warp_broadcast(point)
         tangent0 = warp_broadcast(tangent0)
         tangent1 = warp_broadcast(tangent1)
-        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
+        friction_point = point
         if law.patches.enabled != 0:
-            friction0, friction1 = patch_friction_location(law.patches, contact)
+            friction_point = patch_friction_location(law.patches, contact)
         for coefficient in range(lane, rows * width, stride):
             row = coefficient // width
             coordinate = coefficient % width
@@ -410,11 +409,9 @@ def produce_contacts(
                 if coordinate >= primary:
                     size = secondary
                     dof -= primary
-                direction, p0, p1 = contact_row_frame(
-                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
-                )
-                value = endpoint_projection(data, body0, art0, size, dof, row, p0, direction)
-                value -= endpoint_projection(data, body1, art1, size, dof, row, p1, direction)
+                direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+                value = endpoint_projection(data, body0, art0, size, dof, row, row_point, direction)
+                value -= endpoint_projection(data, body1, art1, size, dof, row, row_point, direction)
                 packet.jacobian[world, output_row, coordinate] = value
         warp_sync()
         # A lane per row writes its records and rhs with the row law the owners share.

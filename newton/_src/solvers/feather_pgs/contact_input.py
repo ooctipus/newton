@@ -14,7 +14,7 @@ law with beta 0 and a disabled view). Its rows' records come from :func:`.row_bu
 import warp as wp
 
 from . import dense_rows, field_group
-from .contact_laws import contact_friction_points, contact_geometry, contact_tangent_basis
+from .contact_laws import contact_geometry, contact_point, contact_tangent_basis
 from .field_group import Field, FieldGroup
 from .friction_patches import PatchRowLaw, patch_friction_location
 
@@ -53,8 +53,6 @@ CONTACT_INPUT = (
     ),
     Field("incident", wp.float32, ("dof",), attr="v_hat"),
     # The row law.
-    Field("shared_anchor", wp.int32, owner="options", attr="contact_shared_anchor"),
-    Field("friction_shared_anchor", wp.int32, owner="options", attr="contact_friction_shared_anchor"),
     Field("friction_scale", wp.float32, owner="options", attr="contact_friction_scale"),
     Field("beta", wp.float32, owner="options", attr="pgs_beta"),
     Field("cfm", wp.float32, owner="options", attr="pgs_cfm"),
@@ -85,11 +83,11 @@ ContactRoutes = field_group.struct(
 
 @wp.func
 def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
-    """Return contact ``c``'s front end: ``(body_a, body_b, normal, p_a, p_b, phi, tangent0, tangent1, f_a, f_b)``.
+    """Return contact ``c``'s front end: ``(body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point)``.
 
-    The bodies, normal, surface points and gap of :func:`.contact_laws.contact_geometry`, the tangent basis
-    and the friction location on each side: the patch friction location under persistent patches, else the
-    contact's friction points (:func:`.contact_laws.contact_friction_points`).
+    The bodies, normal and gap of :func:`.contact_laws.contact_geometry`, the one point the contact's rows act at
+    (:func:`.contact_laws.contact_point`), the tangent basis and the friction location: the patch's under persistent
+    patches, else that point.
     """
     body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
         c,
@@ -104,10 +102,11 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
         data.body_q,
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
-    friction_a, friction_b = contact_friction_points(point_a, point_b, data.shared_anchor, data.friction_shared_anchor)
+    point = contact_point(point_a, point_b)
+    friction_point = point
     if law.patches.enabled != 0:
-        friction_a, friction_b = patch_friction_location(law.patches, c)
-    return body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b
+        friction_point = patch_friction_location(law.patches, c)
+    return body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point
 
 
 def bind_routes(solver, contacts):

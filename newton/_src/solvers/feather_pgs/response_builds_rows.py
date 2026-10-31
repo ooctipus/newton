@@ -559,10 +559,9 @@ def sparse_pair_slots(
     row: int,
     art_a: int,
     body_a: int,
-    point_a: wp.vec3,
     art_b: int,
     body_b: int,
-    point_b: wp.vec3,
+    point: wp.vec3,
     direction: wp.vec3,
     size: int,
     response_dofs: wp.array[int],
@@ -589,7 +588,7 @@ def sparse_pair_slots(
         motion,
         origin,
         direction,
-        point_a,
+        point,
     )
     coord_b, value_b = sparse_pair_slot(
         row,
@@ -605,7 +604,7 @@ def sparse_pair_slots(
         motion,
         origin,
         direction,
-        point_b,
+        point,
     )
     if coord_a >= 0 and coord_a == coord_b:
         value_a += value_b
@@ -661,9 +660,7 @@ def sparse_pair_contact_rows_kernel(
         slot = data.slot[c]
         if data.path[c] != 0 or slot < 0:
             continue
-        body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-            data, law, c
-        )
+        body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
         world = data.world[c]
         art_a = data.art0[c]
         art_b = data.art1[c]
@@ -672,17 +669,14 @@ def sparse_pair_contact_rows_kernel(
         for row in range(4):
             if row >= rows:
                 continue
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
+            direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
             coord_a, value_a, coord_b, value_b = sparse_pair_slots(
                 row,
                 art_a,
                 body_a,
-                p0,
                 art_b,
                 body_b,
-                p1,
+                row_point,
                 direction,
                 target_size,
                 data.response_dofs,
@@ -714,8 +708,7 @@ def sparse_pair_row_response(
     art1: int,
     body1: int,
     direction: wp.vec3,
-    p0: wp.vec3,
-    p1: wp.vec3,
+    point: wp.vec3,
 ):
     """Write contact row ``row`` of the compact boundary whitened: its dense-six part, its sparse slots and its
     diagonal ``(|Z|^2 + sum_s Z_s^2) + cfm`` (:func:`.contact_laws.contact_row_entry`).
@@ -733,12 +726,12 @@ def sparse_pair_row_response(
             if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
                 if (data.body_mask[body0] & bit) != wp.uint32(0):
                     value0 = contact_row_entry(
-                        row, data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0]
+                        row, data.motion[data.dof_start[art0] + dof], direction, point, data.origin[art0]
                     )
             if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
                     value1 = -contact_row_entry(
-                        row, data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
+                        row, data.motion[data.dof_start[art1] + dof], direction, point, data.origin[art1]
                     )
             jacobian[dof] = value0 + value1
         whitened, diagonal = sparse_pair_dense(boundary.factor, group, jacobian)
@@ -748,10 +741,9 @@ def sparse_pair_row_response(
         row,
         art0,
         body0,
-        p0,
         art1,
         body1,
-        p1,
+        point,
         direction,
         boundary.sparse_size,
         data.response_dofs,
@@ -2001,55 +1993,21 @@ def factor_contact_rows_kernel(
                 continue
             art_a = data.art0[c]
             art_b = data.art1[c]
-            (
-                body_a,
-                body_b,
-                normal,
-                surface_a,
-                surface_b,
-                gap,
-                tangent0,
-                tangent1,
-                friction_point_a,
-                friction_point_b,
-            ) = contact_frame(data, law, c)
+            body_a, body_b, normal, point, gap, tangent0, tangent1, friction_point = contact_frame(data, law, c)
             cfm = float(0.0)
             if wp.static(prepare_rows):
                 cfm = data.cfm
-            # The normal row's endpoints.
-            _normal, point_a, point_b = contact_row_frame(
-                0,
-                data.shared_anchor,
-                normal,
-                tangent0,
-                tangent1,
-                surface_a,
-                surface_b,
-                friction_point_a,
-                friction_point_b,
-            )
             if wp.static(prepare_rows):
                 if lane < row_count:
                     world = data.world[c]
                     slot = data.slot[c] + lane
-                    direction, anchor_a, anchor_b = contact_row_frame(
-                        lane,
-                        data.shared_anchor,
-                        normal,
-                        tangent0,
-                        tangent1,
-                        surface_a,
-                        surface_b,
-                        friction_point_a,
-                        friction_point_b,
-                    )
+                    direction, row_point = contact_row_frame(lane, normal, tangent0, tangent1, point, friction_point)
                     target = prescribed_target(
                         body_a,
                         art_a,
                         body_b,
                         art_b,
-                        anchor_a,
-                        anchor_b,
+                        row_point,
                         direction,
                         data.prescribed,
                         data.origin,
@@ -2127,16 +2085,16 @@ def factor_contact_rows_kernel(
                 # Jacobian [d, (p - o) x d], whose product with a motion column is that column's Jacobian entry.
                 if art_a >= 0 and data.response_dofs[art_a] > 0:
                     origin_a = data.origin[art_a]
-                    normal_a = wp.spatial_bottom(free_body_jacobian(normal, point_a, origin_a))
+                    normal_a = wp.spatial_bottom(free_body_jacobian(normal, point, origin_a))
                     if row_count > 1:
-                        tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_a, origin_a))
-                        tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_a, origin_a))
+                        tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point, origin_a))
+                        tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point, origin_a))
                 if art_b >= 0 and data.response_dofs[art_b] > 0:
                     origin_b = data.origin[art_b]
-                    normal_b = wp.spatial_bottom(free_body_jacobian(normal, point_b, origin_b))
+                    normal_b = wp.spatial_bottom(free_body_jacobian(normal, point, origin_b))
                     if row_count > 1:
-                        tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_b, origin_b))
-                        tangent1_b = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_b, origin_b))
+                        tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point, origin_b))
+                        tangent1_b = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point, origin_b))
                 angular_a = wp.matrix_from_rows(normal_a, tangent0_a, tangent1_a)
                 angular_b = wp.matrix_from_rows(normal_b, tangent0_b, tangent1_b)
                 directions = wp.matrix_from_rows(normal, tangent0, tangent1)

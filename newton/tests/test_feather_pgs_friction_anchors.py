@@ -95,8 +95,6 @@ _SQUEEZE_SOLVER = {
     "pgs_contact_regularization": 0.01,
     "contact_friction_gap_threshold": 0.001,
     "contact_friction_position_iterations": 4,
-    "contact_shared_anchor": True,
-    "contact_friction_shared_anchor": True,
     "enable_bilateral_preelimination": True,
 }
 

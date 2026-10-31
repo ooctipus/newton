@@ -359,9 +359,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             material_mu=material_mu,
             material_restitution=material_restitution,
             max_depenetration_velocity=wp.full(body_q.shape[0], np.inf, dtype=float, device=device),
-            friction_shared_anchor=1,
             friction_scale=1.0,
-            shared_anchor=0,
             beta=0.05,
             cfm=1.0e-6,
             row_type=rows["row_type"],
@@ -502,7 +500,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         """Append new controls without shifting established positional arguments."""
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         for sequence in (
-            ("contact_friction_scale", "contact_shared_anchor"),
             ("row_watermark", "restitution_velocity_threshold", "contact_speculative_scale", "contact_gap_gate"),
         ):
             start = parameters.index(sequence[0])

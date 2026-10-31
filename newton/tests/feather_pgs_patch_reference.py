@@ -558,12 +558,8 @@ def _build(
             if carry_only != 0:
                 patches.weight[c] = 0.0
             if frame.flipped[c] != 0:
-                temp = pa
-                pa = pb
-                pb = temp
                 n = -n
-            patches.point_a[c] = pa
-            patches.point_b[c] = pb
+            patches.point[c] = pa
             t0, t1 = contact_tangent_basis(n)
             if frame.flipped[c] != 0:
                 error = -error
@@ -824,8 +820,7 @@ class ReferencePatches:
         device = model.device
         self.view.weight = wp.zeros(capacity, dtype=float, device=device)
         self.view.next_contact = wp.full(capacity, -1, dtype=int, device=device)
-        self.view.point_a = wp.zeros(capacity, dtype=wp.vec3, device=device)
-        self.view.point_b = wp.zeros(capacity, dtype=wp.vec3, device=device)
+        self.view.point = wp.zeros(capacity, dtype=wp.vec3, device=device)
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         self.update_geometry(model)

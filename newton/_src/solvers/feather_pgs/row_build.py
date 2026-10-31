@@ -13,7 +13,7 @@ articulation, summed in the same order).
 
 Both passes take the friction row law (:class:`PatchRowLaw`): the allocation's extent decides which contacts own
 tangent rows, and those rows follow the patch row law, as the generic per-contact builder writes them. Point friction is
-the patch law with beta 0, a disabled view and a zero phi: its tangent rows act at the contact's friction points.
+the patch law with beta 0, a disabled view and a zero phi: its tangent rows act at the contact's point.
 
 The row owners that write rows elsewhere (local row packets, keyed rows) share the contact row's law
 (:func:`write_contact_row`: its records and position-pass rhs) and its Jacobian entries (:func:`endpoint_projection`).
@@ -171,9 +171,7 @@ def populate_contact_J(
     """Write coordinate ``lane`` of contact ``c``'s rows when its flags mark it active (:func:`contact_row_prelude`)."""
     if (flags & 1) == 0:
         return
-    body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-        data, law, c
-    )
+    body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
     _write_contact_jacobian_lane(
         lane,
         flags,
@@ -185,10 +183,8 @@ def populate_contact_J(
         normal,
         tangent0,
         tangent1,
-        point_a,
-        point_b,
-        friction_a,
-        friction_b,
+        point,
+        friction_point,
         data,
         size_a,
         art_group_idx,
@@ -210,10 +206,8 @@ def _write_contact_jacobian_lane(
     normal: wp.vec3,
     tangent0: wp.vec3,
     tangent1: wp.vec3,
-    point_a: wp.vec3,
-    point_b: wp.vec3,
-    friction_a: wp.vec3,
-    friction_b: wp.vec3,
+    point: wp.vec3,
+    friction_point: wp.vec3,
     data: ContactInput,
     size_a: int,
     art_group_idx: wp.array[int],
@@ -234,15 +228,9 @@ def _write_contact_jacobian_lane(
     friction = (flags & 2) != 0
     spin = (flags & 16) != 0
     bit = wp.uint32(1 << lane)
-    d0, a0, b0 = contact_row_frame(
-        0, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
-    d1, a1, b1 = contact_row_frame(
-        1, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
-    d2, a2, b2 = contact_row_frame(
-        2, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
+    d0, p0 = contact_row_frame(0, normal, tangent0, tangent1, point, friction_point)
+    d1, p1 = contact_row_frame(1, normal, tangent0, tangent1, point, friction_point)
+    d2, p2 = contact_row_frame(2, normal, tangent0, tangent1, point, friction_point)
     sides = row_sides(art_a, art_b, data.response_dofs)
     if a_in and lane < data.response_dofs[art_a]:
         at = jacobian_row(support, art_group_idx[art_a], art_a, sides)
@@ -253,15 +241,15 @@ def _write_contact_jacobian_lane(
         jt1 = float(0.0)
         js = float(0.0)
         if body_a >= 0 and (data.body_mask[body_a] & bit) != wp.uint32(0):
-            jn += jacobian_entry(S, d0, a0, origin)
-            jt0 += jacobian_entry(S, d1, a1, origin)
-            jt1 += jacobian_entry(S, d2, a2, origin)
+            jn += jacobian_entry(S, d0, p0, origin)
+            jt0 += jacobian_entry(S, d1, p1, origin)
+            jt1 += jacobian_entry(S, d2, p2, origin)
             if spin:
                 js += spin_entry(S, normal)
         if b_in and art_b == art_a and body_b >= 0 and (data.body_mask[body_b] & bit) != wp.uint32(0):
-            jn += -jacobian_entry(S, d0, b0, origin)
-            jt0 += -jacobian_entry(S, d1, b1, origin)
-            jt1 += -jacobian_entry(S, d2, b2, origin)
+            jn += -jacobian_entry(S, d0, p0, origin)
+            jt0 += -jacobian_entry(S, d1, p1, origin)
+            jt1 += -jacobian_entry(S, d2, p2, origin)
             if spin:
                 js += -spin_entry(S, normal)
         if data.response_dofs[art_a] == size_a:
@@ -287,9 +275,9 @@ def _write_contact_jacobian_lane(
         jt1 = float(0.0)
         js = float(0.0)
         if body_b >= 0 and (data.body_mask[body_b] & bit) != wp.uint32(0):
-            jn = -jacobian_entry(S, d0, b0, origin)
-            jt0 = -jacobian_entry(S, d1, b1, origin)
-            jt1 = -jacobian_entry(S, d2, b2, origin)
+            jn = -jacobian_entry(S, d0, p0, origin)
+            jt0 = -jacobian_entry(S, d1, p1, origin)
+            jt1 = -jacobian_entry(S, d2, p2, origin)
             if spin:
                 js = -spin_entry(S, normal)
         if data.response_dofs[art_b] == size_a:
@@ -362,7 +350,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion)
     at ``slot + row`` from its front end
     (:func:`.contact_input.contact_frame`): its dense records and, ``with_rhs``, its position-pass ``rhs`` and the CFM
-    seed of its diagonal; return its bodies and frame ``(body_a, body_b, direction, p0, p1)``.
+    seed of its diagonal; return its bodies and frame ``(body_a, body_b, direction, row_point)``.
 
     Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
     the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
@@ -377,9 +365,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     whether or not ``with_rhs``, it takes no restitution, and its tangents' coefficient takes the contact's friction
     scale (zero meaning one).
     """
-    body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-        data, law, c
-    )
+    body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
     art_a = data.art0[c]
     art_b = data.art1[c]
     world = data.world[c]
@@ -390,11 +376,9 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         stiffness = data.stiffness[c]
     if stiffness > 0.0:
         restitution = 0.0
-    direction, p0, p1 = contact_row_frame(
-        row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
+    direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
     target = prescribed_target(
-        body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
+        body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
     )
     if row == CONTACT_SPIN_ROW:
         target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
@@ -445,8 +429,8 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
                 phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w
             )
             if restitution > 0.0:
-                relative = incident_projection(data, body_a, art_a, p0, direction)
-                relative -= incident_projection(data, body_b, art_b, p1, direction)
+                relative = incident_projection(data, body_a, art_a, row_point, direction)
+                relative -= incident_projection(data, body_b, art_b, row_point, direction)
                 relative -= target
                 fires, bounce = contact_restitution_rhs(
                     phi, relative, target, restitution, data.dt, data.restitution_threshold
@@ -463,4 +447,4 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         data.diag[world, slot + row] = data.cfm
         if data.contact_w < 1.0:
             data.row_w[world, slot + row] = weight
-    return body_a, body_b, direction, p0, p1
+    return body_a, body_b, direction, row_point

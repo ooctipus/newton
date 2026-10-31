@@ -16,9 +16,9 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 * materials: :func:`contact_materials`, the friction coefficient
   (:func:`contact_friction`, also the torsional one's combination) and the
   restitution (:func:`contact_restitution`) averaged over the present shapes;
-* row frame: :func:`contact_tangent_basis`, :func:`contact_friction_points` (the
-  point law's friction location) and :func:`contact_row_frame`, each row's
-  direction and endpoints under the point or patch law (``patch_row_frame``);
+* row frame: :func:`contact_tangent_basis`, :func:`contact_point` (the one point
+  a contact's rows act at) and :func:`contact_row_frame`, each row's direction and
+  point under the point or patch law;
 * :func:`prescribed_target`, the row target that prescribed bodies' motion
   imposes, and the spin row's, :func:`prescribed_spin_target`;
 * :func:`jacobian_entry`, ``J = d . (S_lin + S_ang x (p - o))`` for one motion
@@ -263,50 +263,36 @@ def contact_tangent_basis(n: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
 
 
 @CONTACT_LAW.law
-def contact_friction_points(
-    point_a: wp.vec3, point_b: wp.vec3, shared_anchor: int, friction_shared_anchor: int
-) -> tuple[wp.vec3, wp.vec3]:
-    """Return the point law's friction location on each side: the contact points or their shared midpoint."""
-    if shared_anchor != 0 or friction_shared_anchor != 0:
-        anchor = 0.5 * (point_a + point_b)
-        return anchor, anchor
-    return point_a, point_b
+def contact_point(point_a: wp.vec3, point_b: wp.vec3) -> wp.vec3:
+    """Return the one point a contact's rows act at: the midpoint of its surface points. Equal and opposite impulses
+    at one point put no torque on the pair, so a contact conserves angular momentum."""
+    return 0.5 * (point_a + point_b)
 
 
 @CONTACT_LAW.law
 def contact_row_frame(
     row: int,
-    shared_anchor: int,
     normal: wp.vec3,
     tangent0: wp.vec3,
     tangent1: wp.vec3,
-    point_a: wp.vec3,
-    point_b: wp.vec3,
-    friction_a: wp.vec3,
-    friction_b: wp.vec3,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    """Return contact row ``row``'s direction and its endpoints on each side.
+    point: wp.vec3,
+    friction_point: wp.vec3,
+) -> tuple[wp.vec3, wp.vec3]:
+    """Return contact row ``row``'s direction and point.
 
-    The normal row (row 0) acts at the contact points, or at their midpoint with
-    ``shared_anchor``. Tangent rows 1 and 2 act along ``tangent0`` and ``tangent1``
-    at the friction location: :func:`contact_friction_points` under the point law,
-    the patch's friction location under the patch law. The spin row
-    (:data:`CONTACT_SPIN_ROW`) turns about the normal, wherever its bodies are.
+    The normal row (row 0) acts at the contact's ``point``. Tangent rows 1 and 2 act
+    along ``tangent0`` and ``tangent1`` at the friction location: ``point`` under the
+    point law, the patch's under the patch law. The spin row (:data:`CONTACT_SPIN_ROW`)
+    turns about the normal, wherever its bodies are.
     """
     direction = normal
-    p0 = point_a
-    p1 = point_b
-    if row == 0:
-        if shared_anchor != 0:
-            p0 = 0.5 * (point_a + point_b)
-            p1 = p0
-    elif row != CONTACT_SPIN_ROW:
+    row_point = point
+    if row != 0 and row != CONTACT_SPIN_ROW:
         direction = tangent0
         if row == 2:
             direction = tangent1
-        p0 = friction_a
-        p1 = friction_b
-    return direction, p0, p1
+        row_point = friction_point
+    return direction, row_point
 
 
 @CONTACT_LAW.law
@@ -342,7 +328,7 @@ def free_body_spin_jacobian(normal: wp.vec3) -> wp.spatial_vector:
 @wp.func
 def contact_row_entry(row: int, motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3, origin: wp.vec3):
     """Return contact row ``row``'s entry for the motion column ``motion`` (:func:`contact_row_frame`'s ``direction``
-    and endpoint ``point``): the spin row's :func:`spin_entry` about the normal, any other row's
+    and ``point``): the spin row's :func:`spin_entry` about the normal, any other row's
     :func:`jacobian_entry`."""
     if row == CONTACT_SPIN_ROW:
         return spin_entry(motion, direction)
@@ -355,8 +341,7 @@ def prescribed_target(
     art_a: int,
     body_b: int,
     art_b: int,
-    point_a: wp.vec3,
-    point_b: wp.vec3,
+    point: wp.vec3,
     direction: wp.vec3,
     prescribed_articulation: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
@@ -371,10 +356,10 @@ def prescribed_target(
     known = float(0.0)
     if body_a >= 0 and art_a >= 0:
         if prescribed_articulation[art_a] != 0:
-            known = jacobian_entry(body_v_s[body_a], direction, point_a, articulation_origin[art_a])
+            known = jacobian_entry(body_v_s[body_a], direction, point, articulation_origin[art_a])
     if body_b >= 0 and art_b >= 0:
         if prescribed_articulation[art_b] != 0:
-            known -= jacobian_entry(body_v_s[body_b], direction, point_b, articulation_origin[art_b])
+            known -= jacobian_entry(body_v_s[body_b], direction, point, articulation_origin[art_b])
     return -known
 
 

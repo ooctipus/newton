@@ -447,7 +447,7 @@ def assert_same_patches(patches, reference, live, context="", twin=None):
             getattr(patches.view, name).numpy(), getattr(reference.view, name).numpy(), f"{context} view.{name}"
         )
     # Friction locations are world coordinates; phi projects carried displacements.
-    for name, kind in (("phi", "field"), ("point_a", "own"), ("point_b", "own")):
+    for name, kind in (("phi", "field"), ("point", "own")):
         theirs = getattr(reference.view, name).numpy()
         _assert_payload_equal(
             getattr(patches.view, name).numpy(), theirs, f"{context} view.{name}", cuda, _scale(kind, theirs, None)
@@ -545,7 +545,7 @@ def assert_same_state(twin, patches, context="", records=True):
                 getattr(getattr(patches, frame), name).numpy(),
                 f"{context} {frame}.{name}",
             )
-    for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+    for name in ("weight", "next_contact", "point", "phi"):
         np.testing.assert_array_equal(
             getattr(twin.view, name).numpy(), getattr(patches.view, name).numpy(), f"{context} view.{name}"
         )
@@ -1790,8 +1790,7 @@ def _ring_case(device, seed, *, contacts=600, worlds=3):
     view.enabled = 1
     view.weight = wp.array(weight, dtype=float, device=device)
     view.next_contact = wp.array(next_contact, dtype=int, device=device)
-    view.point_a = wp.zeros(contacts, dtype=wp.vec3, device=device)
-    view.point_b = wp.zeros(contacts, dtype=wp.vec3, device=device)
+    view.point = wp.zeros(contacts, dtype=wp.vec3, device=device)
     view.phi = wp.zeros(contacts, dtype=wp.vec2, device=device)
     maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in (world, slot, path, needed)]
     single = (next_contact == np.arange(contacts)) & (slot >= 0)

@@ -93,9 +93,7 @@ def _ring_members(parents, normal):
 class TestContactRecordBuilder(unittest.TestCase):
     """The sparse contact builder writes each contact triplet's block record beside its rows."""
 
-    def _build(
-        self, device, records, shared, friction_shared, patch, *, lanes=8, workers=1, width=CONTACT_RECORD_FLOATS
-    ):
+    def _build(self, device, records, patch, *, lanes=8, workers=1, width=CONTACT_RECORD_FLOATS):
         """Run the prepared support-table builder on the two-branch fixture; return its outputs.
 
         ``lanes`` per contact and ``workers`` lane groups share the three contacts; ``width`` is
@@ -144,8 +142,6 @@ class TestContactRecordBuilder(unittest.TestCase):
             device,
             response_dofs=response_dofs,
             body_mask=f["physical_mask"],
-            shared_anchor=shared,
-            friction_shared_anchor=friction_shared,
         )
         wp.launch(
             populate_world_J_for_compact_size,
@@ -167,8 +163,6 @@ class TestContactRecordBuilder(unittest.TestCase):
             f,
             device,
             response_dofs=response_dofs,
-            shared_anchor=shared,
-            friction_shared_anchor=friction_shared,
             diag=outputs["diagonal"],
             **law,
         )
@@ -206,15 +200,12 @@ class TestContactRecordBuilder(unittest.TestCase):
 
     def _check_records(self, device, *, lanes=8, workers=1):
         """Check the records of the two full triplets against NumPy blocks, and the rows against the plain builder."""
-        cases = ((0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1))
         widths = (CONTACT_RECORD_FLOATS, CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS)
-        for (shared, friction_shared, patch), width in product(cases, widths):
-            with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch, width=width):
+        for patch, width in product((0, 1), widths):
+            with self.subTest(patch=patch, width=width):
                 options = {"lanes": lanes, "workers": workers}
-                results, record, expected, cfm = self._build(
-                    device, True, shared, friction_shared, patch, width=width, **options
-                )
-                plain, _, _, _ = self._build(device, False, shared, friction_shared, patch, **options)
+                results, record, expected, cfm = self._build(device, True, patch, width=width, **options)
+                plain, _, _, _ = self._build(device, False, patch, **options)
                 for name, value in results.items():
                     np.testing.assert_array_equal(value, plain[name], err_msg=name)
                 for triplet, row in ((0, 0), (1, 3)):

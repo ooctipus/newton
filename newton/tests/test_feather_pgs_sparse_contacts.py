@@ -93,8 +93,7 @@ def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     patches.enabled = 0
     patches.weight = array([1.0, 1.0, 0.0])
     patches.next_contact = array([-1, -1, -1], int)
-    patches.point_a = array(rng.normal(size=(3, 3)), wp.vec3)
-    patches.point_b = array(rng.normal(size=(3, 3)), wp.vec3)
+    patches.point = array(rng.normal(size=(3, 3)), wp.vec3)
     patches.phi = array(np.zeros((3, 2)), wp.vec2)
     normals = rng.normal(size=(3, 3))
     normals /= np.linalg.norm(normals, axis=1)[:, None]
@@ -224,8 +223,6 @@ class TestSparseContacts(unittest.TestCase):
             motion=array(motion, wp.spatial_vector),
             shape_body=array([*range(len(transforms)), -1], int),
             body_q=array(transforms, wp.transform),
-            shared_anchor=0,
-            friction_shared_anchor=0,
             incident=array(velocity),
             dt=0.01,
             diag=diagonal,
@@ -266,13 +263,15 @@ class TestSparseContacts(unittest.TestCase):
             free_coordinates[block] = not is_articulated
         jacobian = np.zeros((contact_count, world_dofs))
         for row in range(contact_count):
-            for body, art, point, sign in (
-                (body_a[row], art_a[row], point_a[row], 1.0),
-                (body_b[row], art_b[row], point_b[row], -1.0),
-            ):
+            # The row acts at one point: the midpoint of the world surface points, a static side's already in world.
+            ends = (
+                np.asarray(wp.transform_point(transforms[body], wp.vec3(*point))) if body >= 0 else np.asarray(point)
+                for body, point in ((body_a[row], point_a[row]), (body_b[row], point_b[row]))
+            )
+            position = 0.5 * sum(ends)
+            for body, art, sign in ((body_a[row], art_a[row], 1.0), (body_b[row], art_b[row], -1.0)):
                 if body < 0:
                     continue
-                position = np.asarray(wp.transform_point(transforms[body], wp.vec3(*point)))
                 permutation = p.permutation if articulated[art] else np.arange(6)
                 for node, physical in enumerate(permutation):
                     if not (int(masks[body]) & (1 << node)):
@@ -377,8 +376,8 @@ class TestSparseContacts(unittest.TestCase):
                 points[contact] = np.asarray(point_b)
             f["point1"] = array(points, wp.vec3)
         response_dofs = array([6, 0] if prepare_rows else [6], int)
-        for shared, friction_shared, patch in [(0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1)]:
-            with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch):
+        for patch in (0, 1):
+            with self.subTest(patch=patch):
                 f["patches"].enabled = patch
                 dense = full((1, 9, 6), 0.0)
                 row_dof = full((1, 1, 1) if use_support_table else (1, 9, 6), -9, int)
@@ -418,8 +417,6 @@ class TestSparseContacts(unittest.TestCase):
                     device,
                     response_dofs=response_dofs,
                     body_mask=f["physical_mask"],
-                    shared_anchor=shared,
-                    friction_shared_anchor=friction_shared,
                 )
                 wp.launch(
                     populate_world_J_for_compact_size,
@@ -435,8 +432,6 @@ class TestSparseContacts(unittest.TestCase):
                     f,
                     device,
                     response_dofs=response_dofs,
-                    shared_anchor=shared,
-                    friction_shared_anchor=friction_shared,
                     dt=0.01,
                     diag=diagonal,
                     **law,
@@ -497,8 +492,6 @@ class TestSparseContacts(unittest.TestCase):
                         f,
                         device,
                         response_dofs=response_dofs,
-                        shared_anchor=shared,
-                        friction_shared_anchor=friction_shared,
                         **{
                             **law,
                             **dict(
@@ -591,8 +584,6 @@ class TestSparseContacts(unittest.TestCase):
             prescribed=_array([0], int),
             material_mu=_array([0.8] * 4),
             material_restitution=_array([0.4] * 4),
-            shared_anchor=0,
-            friction_shared_anchor=0,
             friction_scale=1.0,
             beta=0.05,
             cfm=1.0e-6,

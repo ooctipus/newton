@@ -131,9 +131,9 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
     shapes' torsional friction, its rhs minus the prescribed spin.
     """
     dofs, output = layout.dofs, "Zi[q * ZS]"
-    entry = "ContactLaw::jacobian_entry(S, direction, point, c.origin.data[art])"
+    entry = "ContactLaw::jacobian_entry(S, direction, row_point, c.origin.data[art])"
     kind = "r == 0 ? 0 : 2"
-    target = "ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v)"
+    target = "ContactLaw::prescribed_target(ba, aa, bb, ab, row_point, direction, c.prescribed, c.origin, c.body_v)"
     if torsion:
         entry = f"(r == 3 ? ContactLaw::spin_entry(S, direction) : {entry})"
         kind = f"r == 0 ? 0 : (r == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
@@ -166,7 +166,6 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
                 const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
                 if (body < 0 || art < 0) continue;
                 const float sign = side == 0 ? 1.0f : -1.0f;
-                const wp::vec3 point = side == 0 ? p0 : p1;
                 $PROJECT
             }
             $OUTPUT = value;
@@ -181,16 +180,14 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         f" + {layout.local('q')}];"
     )
     if patch:
-        friction_location = (
-            "const wp::vec3 fa = patch_law.patches.point_a.data[contact], fb = patch_law.patches.point_b.data[contact];"
-        )
+        friction_location = "const wp::vec3 friction_point = patch_law.patches.point.data[contact];"
         tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
         if torsion:
             tangent_phi = f"(r == 3 ? 0.0f : {tangent_phi})"
         tangent_beta = "patch_law.beta"
         row_law = "        c.row_beta.data[at] = r == 0 ? normal_beta : patch_law.beta;\n"
     else:
-        friction_location = "const auto [fa, fb] = ContactLaw::contact_friction_points(pa, pb, c.shared_anchor, c.friction_shared_anchor);"
+        friction_location = "const wp::vec3 friction_point = point;"
         tangent_phi = "0.0f"
         tangent_beta = "0.0f"
         row_law = (
@@ -258,8 +255,9 @@ ${PREFIX}
             t0 = basis.v0;
             t1 = basis.v1;
         }
+        const wp::vec3 point = ContactLaw::contact_point(pa, pb);
         ${FRICTION_LOCATION}
-        const auto [direction, p0, p1] = ContactLaw::contact_row_frame(r, c.shared_anchor, normal, t0, t1, pa, pb, fa, fb);
+        const auto [direction, row_point] = ContactLaw::contact_row_frame(r, normal, t0, t1, point, friction_point);
         const float target = ${TARGET};
 ${MATERIALS}
 ${PROJECTION}
@@ -341,14 +339,10 @@ def materialize_general_rows(
                 data.sides[world, row] = wp.vec2i(z.maps.arts[world, wp.where(size == primary, 0, 1)], -1)
         else:
             c, r = key // 4, key % 4
-            body_a, body_b, normal, point_a, point_b, _phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-                data, law, c
-            )
-            direction, p0, p1 = contact_row_frame(
-                r, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
-            value = endpoint_projection(data, body_a, data.art0[c], size, local, r, p0, direction)
-            value -= endpoint_projection(data, body_b, data.art1[c], size, local, r, p1, direction)
+            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+            value = endpoint_projection(data, body_a, data.art0[c], size, local, r, row_point, direction)
+            value -= endpoint_projection(data, body_b, data.art1[c], size, local, r, row_point, direction)
             if q == 0:
                 write_contact_row(data, law, c, r, True)
         side = wp.where(size == primary, 0, 1)

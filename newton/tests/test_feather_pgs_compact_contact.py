@@ -62,7 +62,7 @@ OUTPUTS = (
 )
 
 
-def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shared=1, rows=(3,) * 8):
+def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), rows=(3,) * 8):
     """Include coupled/same-art/same-coordinate/static/prescribed contacts and permuted groups.
 
     ``rows`` gives each world's contacts their reserved rows: 3 for a normal and two tangents, or 1
@@ -131,8 +131,6 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
         factor[group, np.arange(6), np.arange(6)] = np.linspace(0.8, 1.7, 6)
     data.factor = array(factor, float)
     data.sparse_size = 108
-    data.shared_anchor = shared
-    data.friction_shared_anchor = friction_shared
     data.friction_scale = 0.73
     data.beta = 0.17
     data.cfm = 0.001
@@ -177,8 +175,7 @@ def patch_view(device, count=16, *, seed=29):
     patches.enabled = 1
     patches.weight = wp.array(rng.uniform(0.0, 1.0, count).astype(np.float32), dtype=float, device=device)
     patches.next_contact = wp.full(count, -1, dtype=int, device=device)
-    patches.point_a = wp.array(rng.normal(0, 0.2, (count, 3)).astype(np.float32), dtype=wp.vec3, device=device)
-    patches.point_b = wp.array(rng.normal(0, 0.2, (count, 3)).astype(np.float32), dtype=wp.vec3, device=device)
+    patches.point = wp.array(rng.normal(0, 0.2, (count, 3)).astype(np.float32), dtype=wp.vec3, device=device)
     patches.phi = wp.array(rng.normal(0, 0.01, (count, 2)).astype(np.float32), dtype=wp.vec2, device=device)
     return patches
 
@@ -221,14 +218,12 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "shape_material_restitution": data.material_restitution,
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
-        "contact_friction_shared_anchor": data.friction_shared_anchor,
         "friction_patches": patches,
         "friction_anchor_beta": friction_anchor_beta,
         "law": row_law(patches, friction_anchor_beta),
         "contact_friction_articulation_pairs_only": 0,
         "is_free_rigid": wp.zeros(6, dtype=int, device=aux.device),
         "contact_friction_scale": data.friction_scale,
-        "contact_shared_anchor": data.shared_anchor,
         "pgs_beta": data.beta,
         "pgs_cfm": data.cfm,
         "world_row_type": data.row_type,
@@ -416,8 +411,7 @@ def geometry_reference(data):
         second = np.cross(n, tangent)
         second /= np.linalg.norm(second)
         for row, direction in enumerate((n, tangent, second)):
-            anchor = data.shared_anchor or (row > 0 and data.friction_shared_anchor)
-            used_points = [0.5 * (points[0] + points[1])] * 2 if anchor else points
+            used_points = [0.5 * (points[0] + points[1])] * 2
             dense = np.zeros(6)
             sparse = np.zeros(114)
             target = 0.0
@@ -697,54 +691,52 @@ class TestCompactContact(unittest.TestCase):
 
     def test_complete_original_chain_and_prescribed_geometry(self):
         """Match same-art, sparse cancellation, prescribed and static laws with both anchor choices."""
-        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
-            original, aux = fixture(shared=shared, friction_shared=friction_shared)
-            candidate, _ = fixture(shared=shared, friction_shared=friction_shared)
-            before = candidate.factor.numpy().copy()
-            run_original(original, aux)
-            run_candidate(candidate, aux)
-            self.compare(original, candidate, aux)
-            np.testing.assert_array_equal(candidate.factor.numpy(), before)
-            # The prescribed body has genuine nonzero velocity, not a zero-target fixture.
-            self.assertGreater(np.max(np.abs(candidate.target.numpy()[:, 14:20])), 0.01)
+        original, aux = fixture()
+        candidate, _ = fixture()
+        before = candidate.factor.numpy().copy()
+        run_original(original, aux)
+        run_candidate(candidate, aux)
+        self.compare(original, candidate, aux)
+        np.testing.assert_array_equal(candidate.factor.numpy(), before)
+        # The prescribed body has genuine nonzero velocity, not a zero-target fixture.
+        self.assertGreater(np.max(np.abs(candidate.target.numpy()[:, 14:20])), 0.01)
 
     def test_patch_rows_match_original_chain(self):
         """Write patch rows of mixed units as the original producers do, at the patch friction location."""
         # The prescribed contacts (4 and 5) own anchors; the last allocated contact is normal-only.
         units = (3, 1, 1, 3, 3, 3, 1, 3)
         beta = 0.35
-        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
-            original, aux = fixture(shared=shared, friction_shared=friction_shared, rows=units)
-            candidate, _ = fixture(shared=shared, friction_shared=friction_shared, rows=units)
-            point, _ = fixture(shared=shared, friction_shared=friction_shared, rows=units)
-            patches = patch_view(aux.device)
-            law = compact.PatchRowLaw()
-            law.patches = patches
-            law.beta = beta
-            run_original(original, aux, patches=patches, friction_anchor_beta=beta)
-            run_candidate(candidate, aux, law=law)
-            self.compare(original, candidate, aux)
-            run_candidate(point, aux)
-            # Tangent rows carry the anchor's phi and beta and the undivided coefficient, and they act
-            # at the patch location: the point producer's tangent rows differ.
-            phi = patches.phi.numpy()
-            for contact, (world, slot) in enumerate(zip(candidate.world.numpy(), candidate.slot.numpy(), strict=True)):
-                if slot < 0 or candidate.slots_needed.numpy()[contact] != 3:
-                    continue
-                tangents = slice(slot + 1, slot + 3)
-                np.testing.assert_array_equal(candidate.row_type.numpy()[world, tangents], 2)
-                np.testing.assert_array_equal(candidate.row_parent.numpy()[world, tangents], slot)
-                np.testing.assert_array_equal(candidate.phi.numpy()[world, tangents], phi[contact])
-                np.testing.assert_array_equal(candidate.row_beta.numpy()[world, tangents], np.float32(beta))
-                np.testing.assert_array_equal(
-                    candidate.row_mu.numpy()[world, tangents], point.row_mu.numpy()[world, tangents]
-                )
-            friction = candidate.row_type.numpy() == 2
-            self.assertGreater(np.max(np.abs(candidate.target.numpy() - point.target.numpy())[friction]), 1.0e-3)
-            self.assertGreater(np.max(np.abs(candidate.sparse_z.numpy() - point.sparse_z.numpy())[friction]), 1.0e-3)
-            # Normal-only units hold one row; normal rows match the point producer.
-            normal = candidate.row_type.numpy() == 0
-            np.testing.assert_array_equal(candidate.diag.numpy()[normal], point.diag.numpy()[normal])
+        original, aux = fixture(rows=units)
+        candidate, _ = fixture(rows=units)
+        point, _ = fixture(rows=units)
+        patches = patch_view(aux.device)
+        law = compact.PatchRowLaw()
+        law.patches = patches
+        law.beta = beta
+        run_original(original, aux, patches=patches, friction_anchor_beta=beta)
+        run_candidate(candidate, aux, law=law)
+        self.compare(original, candidate, aux)
+        run_candidate(point, aux)
+        # Tangent rows carry the anchor's phi and beta and the undivided coefficient, and they act
+        # at the patch location: the point producer's tangent rows differ.
+        phi = patches.phi.numpy()
+        for contact, (world, slot) in enumerate(zip(candidate.world.numpy(), candidate.slot.numpy(), strict=True)):
+            if slot < 0 or candidate.slots_needed.numpy()[contact] != 3:
+                continue
+            tangents = slice(slot + 1, slot + 3)
+            np.testing.assert_array_equal(candidate.row_type.numpy()[world, tangents], 2)
+            np.testing.assert_array_equal(candidate.row_parent.numpy()[world, tangents], slot)
+            np.testing.assert_array_equal(candidate.phi.numpy()[world, tangents], phi[contact])
+            np.testing.assert_array_equal(candidate.row_beta.numpy()[world, tangents], np.float32(beta))
+            np.testing.assert_array_equal(
+                candidate.row_mu.numpy()[world, tangents], point.row_mu.numpy()[world, tangents]
+            )
+        friction = candidate.row_type.numpy() == 2
+        self.assertGreater(np.max(np.abs(candidate.target.numpy() - point.target.numpy())[friction]), 1.0e-3)
+        self.assertGreater(np.max(np.abs(candidate.sparse_z.numpy() - point.sparse_z.numpy())[friction]), 1.0e-3)
+        # Normal-only units hold one row; normal rows match the point producer.
+        normal = candidate.row_type.numpy() == 0
+        np.testing.assert_array_equal(candidate.diag.numpy()[normal], point.diag.numpy()[normal])
 
     def test_launch_binds_the_friction_law_of_the_solver(self):
         """Launch the patch producer exactly when anchors are on, with the solver's patch view and beta.
@@ -787,7 +779,7 @@ class TestCompactContact(unittest.TestCase):
                 law, view = inputs[2], solver.laws.friction_patches.view
                 self.assertEqual(law.beta, 0.375 if anchors else 0.0)
                 self.assertEqual(law.patches.enabled, int(anchors))
-                for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
+                for name in ("weight", "next_contact", "point", "phi"):
                     self.assertIs(getattr(law.patches, name), getattr(view, name), name)
 
     def test_empty_and_growing_prefix_with_poison(self):
@@ -810,65 +802,63 @@ class TestCompactContact(unittest.TestCase):
     def test_held_factor_whitening_against_float64(self):
         """Check the whitened rows and their diagonals against an independent double-precision whitening of the
         geometry's Jacobian: ``Z = L^-1 P J^T`` on the dense part, ``J_s / sqrt(m_s)`` on a slot."""
-        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
-            data, aux = fixture(shared=shared, friction_shared=friction_shared)
-            reference = geometry_reference(data)
-            run_candidate(data, aux)
-            inverse = data.inverse_mass.numpy().astype(np.float64)
-            dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
-            rows = {(world, row): (dense, sparse) for world, row, dense, sparse, _target, _phi in reference}
-            for world, count in enumerate(aux.counts.numpy()):
-                group = data.dense_group.numpy()[world]
-                L = data.factor.numpy()[group].astype(np.float64)
-                for row in range(count):
-                    if row < aux.bounds.numpy()[world, 1]:
-                        dense, sparse = np.zeros(6), np.zeros(114)
-                        dense[row % 6] = 1.0 if row < 6 else -1.0
-                    else:
-                        dense, sparse = rows[(world, row)]
-                    # Factor coordinate k sits at position 5 - k: whiten the reversed row, store it reversed back.
-                    whitened = np.linalg.solve(L, dense[::-1])[::-1]
-                    np.testing.assert_allclose(data.Z.numpy()[group, row], whitened, rtol=5e-6, atol=3e-6)
-                    expected = np.dot(whitened, whitened)
-                    for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
-                        if coordinate < 0:
-                            continue
-                        # The world's 108-coordinate articulation (1 or 4) holds the slot's coordinate.
-                        art = (1, 4)[world]
-                        dof = dof_start[art] + coordinate - dof_offset[art]
-                        z = sparse[coordinate] * np.sqrt(inverse[dof])
-                        np.testing.assert_allclose(data.sparse_z.numpy()[world, row, slot], z, rtol=5e-6, atol=3e-6)
-                        expected += z * z
-                    expected += data.row_cfm.numpy()[world, row]
-                    np.testing.assert_allclose(data.diag.numpy()[world, row], expected, rtol=5e-6, atol=3e-6)
+        data, aux = fixture()
+        reference = geometry_reference(data)
+        run_candidate(data, aux)
+        inverse = data.inverse_mass.numpy().astype(np.float64)
+        dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
+        rows = {(world, row): (dense, sparse) for world, row, dense, sparse, _target, _phi in reference}
+        for world, count in enumerate(aux.counts.numpy()):
+            group = data.dense_group.numpy()[world]
+            L = data.factor.numpy()[group].astype(np.float64)
+            for row in range(count):
+                if row < aux.bounds.numpy()[world, 1]:
+                    dense, sparse = np.zeros(6), np.zeros(114)
+                    dense[row % 6] = 1.0 if row < 6 else -1.0
+                else:
+                    dense, sparse = rows[(world, row)]
+                # Factor coordinate k sits at position 5 - k: whiten the reversed row, store it reversed back.
+                whitened = np.linalg.solve(L, dense[::-1])[::-1]
+                np.testing.assert_allclose(data.Z.numpy()[group, row], whitened, rtol=5e-6, atol=3e-6)
+                expected = np.dot(whitened, whitened)
+                for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
+                    if coordinate < 0:
+                        continue
+                    # The world's 108-coordinate articulation (1 or 4) holds the slot's coordinate.
+                    art = (1, 4)[world]
+                    dof = dof_start[art] + coordinate - dof_offset[art]
+                    z = sparse[coordinate] * np.sqrt(inverse[dof])
+                    np.testing.assert_allclose(data.sparse_z.numpy()[world, row, slot], z, rtol=5e-6, atol=3e-6)
+                    expected += z * z
+                expected += data.row_cfm.numpy()[world, row]
+                np.testing.assert_allclose(data.diag.numpy()[world, row], expected, rtol=5e-6, atol=3e-6)
 
     def test_independent_geometry_action_and_prescribed_targets(self):
         """Compare J v through the whitened rows (``Z^T u`` with ``u = L^T P v`` on the dense part and ``u = sqrt(m) v``
         on a slot: the invariant |J v - Z^T u| at rounding level) and the prescribed targets, not row counts alone."""
         rng = np.random.default_rng(443)
-        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
-            data, aux = fixture(shared=shared, friction_shared=friction_shared)
-            reference = geometry_reference(data)
-            run_candidate(data, aux)
-            velocity = rng.normal(size=(2, 114))
-            inverse = data.inverse_mass.numpy().astype(np.float64)
-            dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
-            for world, row, dense, sparse, target, phi in reference:
-                group = data.dense_group.numpy()[world]
-                self.assertAlmostEqual(data.target.numpy()[world, row], target, delta=3e-6)
-                self.assertAlmostEqual(data.phi.numpy()[world, row], phi, delta=3e-6)
-                factor = data.factor.numpy()[group].astype(np.float64)
-                # u = L^T P v on the dense part, at the same reversed positions as Z.
-                u = (factor.T @ velocity[world, :6][::-1])[::-1]
-                actual = data.Z.numpy()[group, row].astype(np.float64) @ u
-                art = (1, 4)[world]
-                for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
-                    if coordinate >= 0:
-                        dof = dof_start[art] + coordinate - dof_offset[art]
-                        u_slot = velocity[world, coordinate] / np.sqrt(inverse[dof])
-                        actual += data.sparse_z.numpy()[world, row, slot] * u_slot
-                expected = dense @ velocity[world, :6] + sparse @ velocity[world]
-                self.assertAlmostEqual(actual, expected, delta=1e-5)
+        data, aux = fixture()
+        reference = geometry_reference(data)
+        run_candidate(data, aux)
+        velocity = rng.normal(size=(2, 114))
+        inverse = data.inverse_mass.numpy().astype(np.float64)
+        dof_start, dof_offset = data.dof_start.numpy(), data.dof_offset.numpy()
+        for world, row, dense, sparse, target, phi in reference:
+            group = data.dense_group.numpy()[world]
+            self.assertAlmostEqual(data.target.numpy()[world, row], target, delta=3e-6)
+            self.assertAlmostEqual(data.phi.numpy()[world, row], phi, delta=3e-6)
+            factor = data.factor.numpy()[group].astype(np.float64)
+            # u = L^T P v on the dense part, at the same reversed positions as Z.
+            u = (factor.T @ velocity[world, :6][::-1])[::-1]
+            actual = data.Z.numpy()[group, row].astype(np.float64) @ u
+            art = (1, 4)[world]
+            for slot, coordinate in enumerate(data.sparse_dof.numpy()[world, row]):
+                if coordinate >= 0:
+                    dof = dof_start[art] + coordinate - dof_offset[art]
+                    u_slot = velocity[world, coordinate] / np.sqrt(inverse[dof])
+                    actual += data.sparse_z.numpy()[world, row, slot] * u_slot
+            expected = dense @ velocity[world, :6] + sparse @ velocity[world]
+            self.assertAlmostEqual(actual, expected, delta=1e-5)
 
     def test_exact_mode_admission(self):
         """Reject incomplete mode compositions before any contact ownership changes.

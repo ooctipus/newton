@@ -24,9 +24,9 @@ from .contact_input import ContactInput, ContactRoutes, contact_frame
 from .contact_laws import (
     CONTACT_SPIN_ROW,
     contact_endpoints,
-    contact_friction_points,
     contact_geometry,
     contact_materials,
+    contact_point,
     contact_points,
     contact_responds,
     contact_row_frame,
@@ -2221,14 +2221,11 @@ def populate_world_J_for_compact_size(
         tangent1 = wp.vec3(0.0)
         if row > 0:
             tangent0, tangent1 = contact_tangent_basis(normal)
-        friction_a, friction_b = contact_friction_points(
-            point_a, point_b, data.shared_anchor, data.friction_shared_anchor
-        )
+        point = contact_point(point_a, point_b)
+        friction_point = point
         if law.patches.enabled != 0:
-            friction_a, friction_b = patch_friction_location(law.patches, c)
-        direction, p0, p1 = contact_row_frame(
-            row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-        )
+            friction_point = patch_friction_location(law.patches, c)
+        direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
 
         art_a = data.art0[c]
         art_b = data.art1[c]
@@ -2244,14 +2241,14 @@ def populate_world_J_for_compact_size(
             group_a = art_group_idx[art_a]
             if body_a >= 0 and (data.body_mask[body_a] & bit) != wp.uint32(0):
                 motion_a = data.motion[data.dof_start[art_a] + local_dof]
-                value_a = jacobian_entry(motion_a, direction, p0, data.origin[art_a])
+                value_a = jacobian_entry(motion_a, direction, row_point, data.origin[art_a])
                 if spin:
                     spin_a = spin_entry(motion_a, normal)
         if art_b >= 0 and data.response_dofs[art_b] == target_size:
             group_b = art_group_idx[art_b]
             if body_b >= 0 and (data.body_mask[body_b] & bit) != wp.uint32(0):
                 motion_b = data.motion[data.dof_start[art_b] + local_dof]
-                value_b = -jacobian_entry(motion_b, direction, p1, data.origin[art_b])
+                value_b = -jacobian_entry(motion_b, direction, row_point, data.origin[art_b])
                 if spin:
                     spin_b = -spin_entry(motion_b, normal)
 
@@ -2532,7 +2529,7 @@ def populate_world_J_for_size(
             at_b = jacobian_row(support, art_group_idx[art_b], art_b, sides)
         for row in range(rows):
             # The row metadata, from the size group of either endpoint, and the row's frame.
-            body_a, body_b, direction, p0, p1 = write_contact_row(data, law, c, row, False)
+            body_a, body_b, direction, row_point = write_contact_row(data, law, c, row, False)
             if a_matches:
                 clear_side(support, J_group, at_a, slot + row, art_a)
             if b_matches and not (a_matches and art_b == art_a):
@@ -2541,7 +2538,7 @@ def populate_world_J_for_size(
                 accumulate_jacobian_row_world(
                     body_a,
                     1.0,
-                    p0,
+                    row_point,
                     data.origin[art_a],
                     direction,
                     row == CONTACT_SPIN_ROW,
@@ -2559,7 +2556,7 @@ def populate_world_J_for_size(
                 accumulate_jacobian_row_world(
                     body_b,
                     -1.0,
-                    p1,
+                    row_point,
                     data.origin[art_b],
                     direction,
                     row == CONTACT_SPIN_ROW,
@@ -2912,9 +2909,7 @@ def build_mf_contact_rows(
         world = data.world[c]
         art_a = data.art0[c]
         art_b = data.art1[c]
-        body_a, body_b, normal, point_a, point_b, phi, tangent0, tangent1, friction_a, friction_b = contact_frame(
-            data, law, c
-        )
+        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
         # Zero-DOF articulations contribute collision geometry but own no
         # generalized response: their rows treat them like ground.
         response_body_a = -1
@@ -2936,20 +2931,18 @@ def build_mf_contact_rows(
             rows = data.slots_needed[c]
         for row in range(rows):
             row_idx = slot + row
-            direction, p0, p1 = contact_row_frame(
-                row, data.shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
+            direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
             spin = row == CONTACT_SPIN_ROW
             # A free body's row about its articulation origin: J = [d, r x d], opposite on body B; a spin row's
             # [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
             if response_body_a >= 0:
-                J_a = free_body_jacobian(direction, p0, data.origin[art_a])
+                J_a = free_body_jacobian(direction, row_point, data.origin[art_a])
                 if spin:
                     J_a = free_body_spin_jacobian(normal)
                 for k in range(6):
                     mf.Z_a[world, row_idx, k] = J_a[k]
             if response_body_b >= 0:
-                J_b = free_body_jacobian(direction, p1, data.origin[art_b])
+                J_b = free_body_jacobian(direction, row_point, data.origin[art_b])
                 if spin:
                     J_b = free_body_spin_jacobian(normal)
                 for k in range(6):
@@ -2980,7 +2973,7 @@ def build_mf_contact_rows(
             target = float(0.0)
             if has_target_velocity != 0:
                 target = prescribed_target(
-                    body_a, art_a, body_b, art_b, p0, p1, direction, data.prescribed, data.origin, data.body_v
+                    body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
                 )
                 if spin:
                     target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)

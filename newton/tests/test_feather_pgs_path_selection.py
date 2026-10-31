@@ -335,16 +335,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 34 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 35th
+        declaration order, so a positional call over the 32 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 33rd
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:35]}
-        self.assertEqual((parameters[1].name, parameters[34].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:33]}
+        self.assertEqual((parameters[1].name, parameters[32].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -370,18 +370,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[35].name, "pgs_solve_readout")
-        with self.assertRaisesRegex(TypeError, r"takes at most 36 positional arguments but 37 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[35].default)
+        self.assertEqual(parameters[33].name, "pgs_solve_readout")
+        with self.assertRaisesRegex(TypeError, r"takes at most 34 positional arguments but 35 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[33].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
         model = _cpu_model()
         with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
-            SolverFeatherPGS(model, 0.05, contact_shared_anchor=True)
+            SolverFeatherPGS(model, 0.05)
         messages = {str(item.message).split(" ")[0]: os.path.basename(item.filename) for item in recorded}
-        self.assertEqual(messages, dict.fromkeys(("Passing", "Patch"), os.path.basename(__file__)))
+        self.assertEqual(messages, {"Passing": os.path.basename(__file__)})
 
     def test_cpu_route_record_reports_known_selections(self):
         """Report the CPU's matrix-free sweep, its free-body rows and the declined owners with their reasons."""

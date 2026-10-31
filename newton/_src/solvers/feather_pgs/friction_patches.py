@@ -116,8 +116,7 @@ class FrictionPatches:
     enabled: int
     weight: wp.array[float]
     next_contact: wp.array[int]
-    point_a: wp.array[wp.vec3]
-    point_b: wp.array[wp.vec3]
+    point: wp.array[wp.vec3]
     phi: wp.array[wp.vec2]
 
 
@@ -132,7 +131,7 @@ PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
 Under persistent patches a tangent row acts at its patch's friction location, carries the
 anchor's tangential displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``).
 Point friction is the same law with beta 0 and a disabled view (a zero phi): its tangent rows act
-at the contact's friction points. Producers write the undivided friction coefficient; the patch
+at the contact's point. Producers write the undivided friction coefficient; the patch
 link (``_FrictionPatchState.link``, which launches ``link_patch_routes``) divides it and links the
 ring. The Warp producers apply the law through :func:`.contact_input.contact_frame` and
 :func:`patch_tangent_row`; keyed rows write it in their native row source (``keyed_rows._row_source``).
@@ -143,7 +142,7 @@ def patch_row_law(solver) -> "PatchRowLaw":
     """The solver's patch row law for this step.
 
     Point friction is the patch law with beta 0: its view is disabled, with a zero phi, and the producers take
-    the contact's friction points instead of a patch friction location. Bound every step: contact-pool growth
+    the contact's point instead of a patch friction location. Bound every step: contact-pool growth
     replaces the patch view.
     """
     return field_group.bind(PatchRowLaw, laws=solver.laws, friction_patches=solver.laws.friction_patches)
@@ -151,8 +150,8 @@ def patch_row_law(solver) -> "PatchRowLaw":
 
 @wp.func
 def patch_friction_location(patches: FrictionPatches, c: int):
-    """Return contact ``c``'s friction location on each side, in world coordinates."""
-    return patches.point_a[c], patches.point_b[c]
+    """Return contact ``c``'s friction location, in world coordinates."""
+    return patches.point[c]
 
 
 @wp.func
@@ -838,9 +837,8 @@ def _build_pair(
                     chosen = p
                     nearest = distance
             pa = location
-            pb = pa
             anchor_a = _local_point(q, a, pa)
-            anchor_b = _local_point(q, b, pb)
+            anchor_b = _local_point(q, b, pa)
             carried_impulse = wp.vec3(0.0)
             error = wp.vec3(0.0)
             if chosen >= 0:
@@ -904,12 +902,8 @@ def _build_pair(
             if carry_only != 0:
                 patches.weight[c] = 0.0
             if frame.flipped[c] != 0:
-                temp = pa
-                pa = pb
-                pb = temp
                 n = -n
-            patches.point_a[c] = pa
-            patches.point_b[c] = pb
+            patches.point[c] = pa
             t0, t1 = contact_tangent_basis(n)
             if frame.flipped[c] != 0:
                 error = -error
@@ -1086,8 +1080,7 @@ class _FrictionPatchState:
         if not enabled:
             self.view.weight = wp.zeros(0, dtype=float, device=device)
             self.view.next_contact = wp.zeros(0, dtype=int, device=device)
-            self.view.point_a = wp.zeros(0, dtype=wp.vec3, device=device)
-            self.view.point_b = wp.zeros(0, dtype=wp.vec3, device=device)
+            self.view.point = wp.zeros(0, dtype=wp.vec3, device=device)
             return
         self.device = device
         # The pair sort skips the key bits no pair key can set.
@@ -1113,8 +1106,7 @@ class _FrictionPatchState:
             (
                 ContactField("weight", wp.float32),
                 ContactField("next_contact", wp.int32, -1),
-                ContactField("point_a", wp.vec3),
-                ContactField("point_b", wp.vec3),
+                ContactField("point", wp.vec3),
             ),
             on_rows=self._on_view_rows,
         )

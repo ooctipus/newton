@@ -180,14 +180,6 @@ class RowLaws:
         if not np.isfinite(laws.friction_anchor_beta) or laws.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")
         laws.friction_anchors_enabled = laws.friction_anchor_beta > 0.0
-        if laws.friction_anchors_enabled and (options.contact_shared_anchor or options.contact_friction_shared_anchor):
-            warnings.warn(
-                "Patch friction selects its own friction locations and carries tangential displacement. "
-                "contact_shared_anchor still applies to normal rows; set friction_anchor_beta=0 "
-                "to apply shared-anchor flags to point friction rows as well.",
-                UserWarning,
-                stacklevel=_CALLER,
-            )
         # Kernels consume the float32 weight w = 1/(1+g). Values too small to
         # change w are the exact hard update and stay on the zero-cost path.
         laws.contact_w = float(np.float32(1.0 / (1.0 + options.pgs_contact_regularization)))

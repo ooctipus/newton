@@ -122,7 +122,7 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
         }
         if view is not None:
             record["patch"] = np.concatenate(
-                ([view.weight.numpy()[c]], view.phi.numpy()[c], view.point_a.numpy()[c])
+                ([view.weight.numpy()[c]], view.phi.numpy()[c], view.point.numpy()[c])
             ).astype(np.float64)
         if jacobian:
             if w not in jacobians:
@@ -299,7 +299,7 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
     owner = patches.current.owner.numpy()[:count]
     weight = patches.view.weight.numpy()[:count]
-    location = patches.view.point_a.numpy()[:count].astype(np.float64)
+    location = patches.view.point.numpy()[:count].astype(np.float64)
     tangent_phi = patches.view.phi.numpy()[:count].astype(np.float64)
     normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
 

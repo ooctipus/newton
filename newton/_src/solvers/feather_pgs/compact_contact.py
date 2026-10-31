@@ -93,7 +93,7 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
     world = data.world[contact]
     art0 = data.art0[contact]
     art1 = data.art1[contact]
-    body0, body1, direction, p0, p1 = write_contact_row(data, law, contact, row, False)
+    body0, body1, direction, row_point = write_contact_row(data, law, contact, row, False)
     has_dense = False
     if art0 >= 0 and body0 >= 0:
         has_dense = data.response_dofs[art0] == 6
@@ -101,7 +101,7 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
         has_dense = has_dense or data.response_dofs[art1] == 6
     group = boundary.dense_group[world]
     sparse_pair_row_response(
-        data, boundary, world, row, slot + row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
+        data, boundary, world, row, slot + row, group, has_dense, art0, body0, art1, body1, direction, row_point
     )
 
 

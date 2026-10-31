@@ -690,8 +690,8 @@ def momentum_balance(run: Run, data: ModelData, *, torque: bool, skip: int = 0) 
     (``"free"``) and up to ``O(dt^2)`` for a jointed tree (``"articulated"``),
     whose momentum also moves with its pose. The angular balance about the
     centre of mass (``"angular"``) is checked for free rigid bodies when
-    ``torque`` is set, against the witness points the rows act at (point
-    friction; patch friction acts at its anchors). Residuals are relative to the
+    ``torque`` is set, against the point the rows act at (point friction; patch
+    friction acts at its anchors). Residuals are relative to the
     weight impulse ``m g dt`` (and to ``m g dt`` times the body's radius of
     gyration for the angular one); ``None`` where no such body exists.
     """
@@ -729,9 +729,10 @@ def momentum_balance(run: Run, data: ModelData, *, torque: bool, skip: int = 0) 
             com = _transform_point(pose, data.body_com[body])
             moment = np.zeros(3)
             if frame is not None:
-                for side, points, sign in ((frame.body0, frame.point0, 1.0), (frame.body1, frame.point1, -1.0)):
+                point = 0.5 * (frame.point0 + frame.point1)
+                for side, sign in ((frame.body0, 1.0), (frame.body1, -1.0)):
                     mask = side == body
-                    moment += sign * np.cross(points[mask] - com, frame.force[mask]).sum(axis=0)
+                    moment += sign * np.cross(point[mask] - com, frame.force[mask]).sum(axis=0)
             if external is not None:
                 moment += external[body, 3:6]
             rotation = pose[3:7]

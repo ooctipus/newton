@@ -94,7 +94,7 @@ class TestCoalescedContact(unittest.TestCase):
 
     def test_raw_key_only_owner_does_not_publish_dense_zeros(self):
         """Leave key-only rows to the preceding clear while dense endpoints still own all coefficients."""
-        data, aux = fixture(shared=1)
+        data, aux = fixture()
         data.Z.fill_(713.0)
         produce(data, aux)
         response_dofs = data.response_dofs.numpy()
@@ -131,18 +131,17 @@ class TestCoalescedContact(unittest.TestCase):
     def test_complete_clear_and_producer_match_original_chain(self):
         """Compare every active canonical field against the unchanged seven-kernel control."""
         compare = baseline.TestCompactContact().compare
-        for shared, friction_shared in ((0, 0), (0, 1), (1, 0)):
-            original, aux = fixture(shared=shared, friction_shared=friction_shared)
-            data, _ = fixture(shared=shared, friction_shared=friction_shared)
-            run_original(original, aux)
-            install_prefix(data, aux)
-            publish(data, aux)
-            compare(original, data, aux)
+        original, aux = fixture()
+        data, _ = fixture()
+        run_original(original, aux)
+        install_prefix(data, aux)
+        publish(data, aux)
+        compare(original, data, aux)
 
     def test_dense_tail_and_cancelling_dense_endpoint(self):
         """Retain complete dense ownership for a contiguous tail, including exactly cancelling endpoints."""
-        original, aux = fixture(shared=1)
-        data, _ = fixture(shared=1)
+        original, aux = fixture()
+        data, _ = fixture()
         response = original.response_dofs.numpy()
         art0, art1 = original.art0.numpy(), original.art1.numpy()
         dense = ((art0 >= 0) & (response[np.maximum(art0, 0)] == 6)) | (

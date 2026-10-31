@@ -72,7 +72,6 @@ RESOLVED_WORLD_INPUT = (
     Field("speculative_scale", wp.float32, owner="options", attr="contact_speculative_scale"),
     Field("activation_gap", wp.float32, owner="options", attr="joint_limit_activation_gap"),
     Field("restitution_threshold", wp.float32, owner="laws", attr="effective_restitution_velocity_threshold"),
-    Field("shared_anchor", wp.int32, owner="options", attr="contact_shared_anchor"),
     Field("absolute_margin", wp.float32, owner="classifier"),
     Field("relative_margin", wp.float32, owner="classifier"),
 )
@@ -478,9 +477,8 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
         lever_a += translation_a - data.articulation_origin[art_a]
     if art_b >= 0:
         lever_b += translation_b - data.articulation_origin[art_b]
-    if data.shared_anchor != 0:
-        lever_a -= 0.5 * separation
-        lever_b += 0.5 * separation
+    lever_a -= 0.5 * separation
+    lever_b += 0.5 * separation
     compatible_a = not dofs_a
     compatible_b = not dofs_b
     if art_a >= 0:

@@ -83,9 +83,7 @@ def _term_scales(scene, patches=None):
         + np.abs(scene["articulation_origin"]).sum(axis=1).max()
     )
     if patches is not None and patches.enabled:
-        length += max(
-            np.abs(patches.point_a.numpy()).sum(axis=1).max(), np.abs(patches.point_b.numpy()).sum(axis=1).max()
-        )
+        length += np.abs(patches.point.numpy()).sum(axis=1).max()
     speed = 2.0 * np.abs(scene["body_v_s"]).sum(axis=1).max() * (1.0 + length)
     return 2.0 * length, speed
 
@@ -95,8 +93,7 @@ def _patches(rng, contacts, device, enabled):
     patches.enabled = int(enabled)
     patches.weight = wp.array(rng.uniform(0.0, 1.0, contacts).astype(np.float32), device=device)
     patches.next_contact = wp.full(contacts, -1, dtype=int, device=device)
-    patches.point_a = wp.array(rng.normal(size=(contacts, 3)).astype(np.float32), dtype=wp.vec3, device=device)
-    patches.point_b = wp.array(rng.normal(size=(contacts, 3)).astype(np.float32), dtype=wp.vec3, device=device)
+    patches.point = wp.array(rng.normal(size=(contacts, 3)).astype(np.float32), dtype=wp.vec3, device=device)
     patches.phi = wp.array(rng.normal(scale=0.01, size=(contacts, 2)).astype(np.float32), dtype=wp.vec2, device=device)
     return patches
 
@@ -119,9 +116,7 @@ def _law_contact_rows(
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    contact_friction_shared_anchor: int,
     contact_friction_scale: float,
-    contact_shared_anchor: int,
     friction_patches: kernels.FrictionPatches,
     phi_out: wp.array[float],
     mu_out: wp.array[wp.vec2],
@@ -145,24 +140,19 @@ def _law_contact_rows(
         contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    friction_a, friction_b = contact_laws.contact_friction_points(
-        point_a, point_b, contact_shared_anchor, contact_friction_shared_anchor
-    )
+    point = contact_laws.contact_point(point_a, point_b)
+    friction_point = point
     if friction_patches.enabled != 0:
-        friction_a = friction_patches.point_a[c]
-        friction_b = friction_patches.point_b[c]
+        friction_point = friction_patches.point[c]
     targets = wp.vec3(0.0)
     for row in range(3):
-        direction, p0, p1 = contact_laws.contact_row_frame(
-            row, contact_shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-        )
+        direction, row_point = contact_laws.contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
         targets[row] = contact_laws.prescribed_target(
             body_a,
             contact_art_a[c],
             body_b,
             contact_art_b[c],
-            p0,
-            p1,
+            row_point,
             direction,
             prescribed_articulation,
             articulation_origin,
@@ -185,8 +175,8 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
     scene = _contact_scene(rng, contacts)
     slots = (3 * np.arange(contacts)).astype(np.int32)
     rows = 3 * contacts
-    for shared, friction_shared, patched in ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)):
-        with test.subTest(shared_anchor=shared, friction_shared_anchor=friction_shared, patches=patched):
+    for patched in (0, 1):
+        with test.subTest(patches=patched):
             patches = _patches(rng, contacts, device, patched)
             out = call(
                 kernels.prepare_world_contact_rows,
@@ -197,9 +187,7 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
                 contact_world=np.zeros(contacts, dtype=np.int32),
                 contact_path=np.zeros(contacts, dtype=np.int32),
                 articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
-                contact_friction_shared_anchor=friction_shared,
                 contact_friction_scale=0.8,
-                contact_shared_anchor=shared,
                 pgs_beta=0.2,
                 pgs_cfm=1.0e-6,
                 friction_patches=patches,
@@ -220,9 +208,7 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
                 _law_contact_rows,
                 contacts,
                 device,
-                contact_friction_shared_anchor=friction_shared,
                 contact_friction_scale=0.8,
-                contact_shared_anchor=shared,
                 friction_patches=patches,
                 phi_out=np.zeros(contacts, dtype=np.float32),
                 mu_out=np.zeros((contacts, 2), dtype=np.float32),
@@ -266,80 +252,72 @@ def test_contact_front_end_matches_masked_row_prelude(test, device):
     scene = _contact_scene(rng, contacts)
     slots = (3 * np.arange(contacts)).astype(np.int32)
     rows = 3 * contacts
-    for shared, friction_shared in ((0, 0), (1, 0), (0, 1)):
-        with test.subTest(shared_anchor=shared, friction_shared_anchor=friction_shared):
-            out = call(
-                row_build.contact_row_prelude,
-                3 * contacts,
-                device,
-                total_threads=3 * contacts,
-                world_constraint_count=np.full(1, rows, dtype=np.int32),
-                mf_constraint_count=np.zeros(1, dtype=np.int32),
-                owned_rows_le=0,
-                contact_slot=slots,
-                contact_world=np.zeros(contacts, dtype=np.int32),
-                contact_path=np.zeros(contacts, dtype=np.int32),
-                size_a=6,
-                size_b=6,
-                law=point_row_law(device, contacts),
-                articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
-                contact_friction_shared_anchor=friction_shared,
-                contact_friction_articulation_pairs_only=0,
-                is_free_rigid=np.zeros(4, dtype=np.int32),
-                contact_friction_scale=0.8,
-                contact_shared_anchor=shared,
-                pgs_beta=0.2,
-                pgs_cfm=1.0e-6,
-                pre_flags=np.zeros(contacts, dtype=np.int32),
-                world_row_type=np.zeros((1, rows), dtype=np.int32),
-                world_row_parent=np.zeros((1, rows), dtype=np.int32),
-                world_row_mu=np.zeros((1, rows), dtype=np.float32),
-                world_row_beta=np.zeros((1, rows), dtype=np.float32),
-                world_row_cfm=np.zeros((1, rows), dtype=np.float32),
-                world_phi=np.zeros((1, rows), dtype=np.float32),
-                world_target_velocity=np.zeros((1, rows), dtype=np.float32),
-                world_row_restitution=np.zeros((1, rows), dtype=np.float32),
-                **{
-                    k: v for k, v in scene.items() if k not in ("body_to_articulation", "art_to_world", "contact_world")
-                },
-            )
-            law = call(
-                _law_contact_rows,
-                contacts,
-                device,
-                contact_friction_shared_anchor=friction_shared,
-                contact_friction_scale=0.8,
-                contact_shared_anchor=shared,
-                friction_patches=_patches(rng, contacts, device, 0),
-                phi_out=np.zeros(contacts, dtype=np.float32),
-                mu_out=np.zeros((contacts, 2), dtype=np.float32),
-                restitution_out=np.zeros(contacts, dtype=np.float32),
-                target_out=np.zeros((contacts, 3), dtype=np.float32),
-                **{
-                    k: v
-                    for k, v in scene.items()
-                    if k.startswith(("contact_", "shape_", "body_", "prescribed", "articulation"))
-                    and k not in ("contact_count", "contact_world", "contact_slots_needed", "body_to_articulation")
-                },
-            )
-            phi = out["world_phi"].numpy().reshape(contacts, 3)
-            mu = out["world_row_mu"].numpy().reshape(contacts, 3)
-            target = out["world_target_velocity"].numpy().reshape(contacts, 3)
-            restitution = out["world_row_restitution"].numpy().reshape(contacts, 3)
-            # The prelude writes the contacts with an endpoint articulation of its sizes (flag bit 0).
-            active = (out["pre_flags"].numpy() & 1) != 0
-            friction = active & (scene["contact_slots_needed"] >= 3)
-            test.assertGreater(active.sum(), contacts // 2)
-            length, speed = _term_scales(scene)
-            mu_law = law["mu_out"].numpy()
-            target_law = law["target_out"].numpy()
-            restitution_law = law["restitution_out"].numpy()
-            assert_reproduces(test, device, phi[active, 0], law["phi_out"].numpy()[active], length, "prelude: phi")
-            assert_reproduces(test, device, mu[active, 0], mu_law[active, 0], name="prelude: mu")
-            assert_reproduces(test, device, mu[friction, 1], mu_law[friction, 1], name="prelude: friction mu")
-            assert_reproduces(test, device, restitution[active, 0], restitution_law[active], name="prelude: e")
-            assert_reproduces(test, device, target[active, 0], target_law[active, 0], speed, "prelude: normal target")
-            assert_reproduces(test, device, target[friction, 1:], target_law[friction, 1:], speed, "prelude: targets")
+    out = call(
+        row_build.contact_row_prelude,
+        3 * contacts,
+        device,
+        total_threads=3 * contacts,
+        world_constraint_count=np.full(1, rows, dtype=np.int32),
+        mf_constraint_count=np.zeros(1, dtype=np.int32),
+        owned_rows_le=0,
+        contact_slot=slots,
+        contact_world=np.zeros(contacts, dtype=np.int32),
+        contact_path=np.zeros(contacts, dtype=np.int32),
+        size_a=6,
+        size_b=6,
+        law=point_row_law(device, contacts),
+        articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
+        contact_friction_articulation_pairs_only=0,
+        is_free_rigid=np.zeros(4, dtype=np.int32),
+        contact_friction_scale=0.8,
+        pgs_beta=0.2,
+        pgs_cfm=1.0e-6,
+        pre_flags=np.zeros(contacts, dtype=np.int32),
+        world_row_type=np.zeros((1, rows), dtype=np.int32),
+        world_row_parent=np.zeros((1, rows), dtype=np.int32),
+        world_row_mu=np.zeros((1, rows), dtype=np.float32),
+        world_row_beta=np.zeros((1, rows), dtype=np.float32),
+        world_row_cfm=np.zeros((1, rows), dtype=np.float32),
+        world_phi=np.zeros((1, rows), dtype=np.float32),
+        world_target_velocity=np.zeros((1, rows), dtype=np.float32),
+        world_row_restitution=np.zeros((1, rows), dtype=np.float32),
+        **{k: v for k, v in scene.items() if k not in ("body_to_articulation", "art_to_world", "contact_world")},
+    )
+    law = call(
+        _law_contact_rows,
+        contacts,
+        device,
+        contact_friction_scale=0.8,
+        friction_patches=_patches(rng, contacts, device, 0),
+        phi_out=np.zeros(contacts, dtype=np.float32),
+        mu_out=np.zeros((contacts, 2), dtype=np.float32),
+        restitution_out=np.zeros(contacts, dtype=np.float32),
+        target_out=np.zeros((contacts, 3), dtype=np.float32),
+        **{
+            k: v
+            for k, v in scene.items()
+            if k.startswith(("contact_", "shape_", "body_", "prescribed", "articulation"))
+            and k not in ("contact_count", "contact_world", "contact_slots_needed", "body_to_articulation")
+        },
+    )
+    phi = out["world_phi"].numpy().reshape(contacts, 3)
+    mu = out["world_row_mu"].numpy().reshape(contacts, 3)
+    target = out["world_target_velocity"].numpy().reshape(contacts, 3)
+    restitution = out["world_row_restitution"].numpy().reshape(contacts, 3)
+    # The prelude writes the contacts with an endpoint articulation of its sizes (flag bit 0).
+    active = (out["pre_flags"].numpy() & 1) != 0
+    friction = active & (scene["contact_slots_needed"] >= 3)
+    test.assertGreater(active.sum(), contacts // 2)
+    length, speed = _term_scales(scene)
+    mu_law = law["mu_out"].numpy()
+    target_law = law["target_out"].numpy()
+    restitution_law = law["restitution_out"].numpy()
+    assert_reproduces(test, device, phi[active, 0], law["phi_out"].numpy()[active], length, "prelude: phi")
+    assert_reproduces(test, device, mu[active, 0], mu_law[active, 0], name="prelude: mu")
+    assert_reproduces(test, device, mu[friction, 1], mu_law[friction, 1], name="prelude: friction mu")
+    assert_reproduces(test, device, restitution[active, 0], restitution_law[active], name="prelude: e")
+    assert_reproduces(test, device, target[active, 0], target_law[active, 0], speed, "prelude: normal target")
+    assert_reproduces(test, device, target[friction, 1:], target_law[friction, 1:], speed, "prelude: targets")
 
 
 @wp.kernel
@@ -364,9 +342,7 @@ def _law_compact_jacobian(
     joint_S_s: wp.array[wp.spatial_vector],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
-    contact_friction_shared_anchor: int,
     friction_patches: kernels.FrictionPatches,
-    contact_shared_anchor: int,
     J_group: wp.array3d[float],
 ):
     c, row, local_dof = wp.tid()
@@ -384,15 +360,11 @@ def _law_compact_jacobian(
         body_q,
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    friction_a, friction_b = contact_laws.contact_friction_points(
-        point_a, point_b, contact_shared_anchor, contact_friction_shared_anchor
-    )
+    point = contact_laws.contact_point(point_a, point_b)
+    friction_point = point
     if friction_patches.enabled != 0:
-        friction_a = friction_patches.point_a[c]
-        friction_b = friction_patches.point_b[c]
-    direction, p0, p1 = contact_laws.contact_row_frame(
-        row, contact_shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
+        friction_point = friction_patches.point[c]
+    direction, row_point = contact_laws.contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
     bit = wp.uint32(1) << wp.uint32(local_dof)
     art_a = contact_art_a[c]
     art_b = contact_art_b[c]
@@ -404,12 +376,12 @@ def _law_compact_jacobian(
         group_a = art_group_idx[art_a]
         if body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0):
             motion = joint_S_s[art_dof_start[art_a] + local_dof]
-            value_a = contact_laws.jacobian_entry(motion, direction, p0, articulation_origin[art_a])
+            value_a = contact_laws.jacobian_entry(motion, direction, row_point, articulation_origin[art_a])
     if art_b >= 0 and articulation_response_dof_count[art_b] == target_size:
         group_b = art_group_idx[art_b]
         if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
             motion = joint_S_s[art_dof_start[art_b] + local_dof]
-            value_b = -contact_laws.jacobian_entry(motion, direction, p1, articulation_origin[art_b])
+            value_b = -contact_laws.jacobian_entry(motion, direction, row_point, articulation_origin[art_b])
     slot = contact_slot[c] + row
     if group_a >= 0:
         if group_b == group_a:
@@ -451,13 +423,11 @@ def test_jacobian_entry_matches_compact_jacobian(test, device):
         "body_q": scene["body_q"],
     }
     rows = 3 * contacts
-    for shared, friction_shared, patched in ((0, 0, 0), (1, 1, 0), (0, 0, 1)):
-        with test.subTest(shared_anchor=shared, friction_shared_anchor=friction_shared, patches=patched):
+    for patched in (0, 1):
+        with test.subTest(patches=patched):
             patches = _patches(rng, contacts, device, patched)
             flags = {
-                "contact_friction_shared_anchor": friction_shared,
                 "friction_patches": patches,
-                "contact_shared_anchor": shared,
             }
             out = call(
                 kernels.populate_world_J_for_compact_size,
@@ -505,9 +475,7 @@ def _law_mf_jacobian(
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    contact_friction_shared_anchor: int,
     contact_friction_scale: float,
-    contact_shared_anchor: int,
     friction_patches: kernels.FrictionPatches,
     friction_anchor_beta: float,
     mf_Z_a: wp.array3d[float],
@@ -535,24 +503,20 @@ def _law_mf_jacobian(
         contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    friction_a, friction_b = contact_laws.contact_friction_points(
-        point_a, point_b, contact_shared_anchor, contact_friction_shared_anchor
-    )
+    point = contact_laws.contact_point(point_a, point_b)
+    friction_point = point
     if friction_patches.enabled != 0:
-        friction_a = friction_patches.point_a[c]
-        friction_b = friction_patches.point_b[c]
-    direction, p0, p1 = contact_laws.contact_row_frame(
-        row, contact_shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-    )
+        friction_point = friction_patches.point[c]
+    direction, row_point = contact_laws.contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
     slot = contact_slot[c] + row
     art_a = contact_art_a[c]
     art_b = contact_art_b[c]
     if body_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
-        J = contact_laws.free_body_jacobian(direction, p0, articulation_origin[art_a])
+        J = contact_laws.free_body_jacobian(direction, row_point, articulation_origin[art_a])
         for k in range(6):
             mf_Z_a[0, slot, k] = J[k]
     if body_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
-        J = contact_laws.free_body_jacobian(direction, p1, articulation_origin[art_b])
+        J = contact_laws.free_body_jacobian(direction, row_point, articulation_origin[art_b])
         for k in range(6):
             mf_Z_b[0, slot, k] = -J[k]
     if row == 0:
@@ -564,7 +528,7 @@ def _law_mf_jacobian(
         mf_row_mu[0, slot] = mu * contact_friction_scale
         mf_row_restitution[0, slot] = 0.0
     mf_target_velocity[0, slot] = contact_laws.prescribed_target(
-        body_a, art_a, body_b, art_b, p0, p1, direction, prescribed_articulation, articulation_origin, body_v_s
+        body_a, art_a, body_b, art_b, row_point, direction, prescribed_articulation, articulation_origin, body_v_s
     )
 
 
@@ -588,12 +552,10 @@ def test_free_body_jacobian_matches_mf_contact_rows(test, device):
         friction_anchor_beta=0.15,
     )
     outputs = ("mf_Z_a", "mf_Z_b", "mf_phi", "mf_row_mu", "mf_target_velocity", "mf_row_restitution")
-    for shared, friction_shared, patched in ((0, 0, 0), (1, 0, 0), (0, 1, 1)):
-        with test.subTest(shared_anchor=shared, friction_shared_anchor=friction_shared, patches=patched):
+    for patched in (0, 1):
+        with test.subTest(patches=patched):
             patches = _patches(rng, contacts, device, patched)
             flags = {
-                "contact_friction_shared_anchor": friction_shared,
-                "contact_shared_anchor": shared,
                 "friction_patches": patches,
             }
             buffers = lambda: {  # noqa: E731

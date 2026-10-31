@@ -56,7 +56,7 @@ def _launch_workers(capacity):
     return values[dimension.id]
 
 
-def _fixture(device, capacity=4353, shared_anchor=0):
+def _fixture(device, capacity=4353):
     """Create unique row slots and mixed endpoint/route ownership above4096 contacts."""
     indices = np.arange(capacity, dtype=np.int32)
     world_count = (capacity + 4) // 5
@@ -104,8 +104,6 @@ def _fixture(device, capacity=4353, shared_anchor=0):
         "joint_S_s": array(motion, wp.spatial_vector),
         "shape_body": array([0, 1, 2], int),
         "body_q": array(body_q, wp.transform),
-        "contact_friction_shared_anchor": 1,
-        "contact_shared_anchor": shared_anchor,
         "friction_patches": FrictionPatches(),
         "sparse_row_dof": wp.full((world_count, 15, 2), -777, dtype=int, device=device),
         "sparse_row_z": wp.full((world_count, 15, 2), np.nan, dtype=float, device=device),
@@ -157,12 +155,9 @@ def _expected(values, active_count):
                 dof = host["body_single_response_dof"][body]
                 if dof < 0:
                     continue
-                point = anchor if host["contact_shared_anchor"] or row > 0 else points[side]
+                point = anchor
                 if row > 0 and values["friction_patches"].enabled:
-                    patch_points = (
-                        values["friction_patches"].point_a if side == 0 else values["friction_patches"].point_b
-                    )
-                    point = patch_points.numpy()[contact].astype(np.float64)
+                    point = values["friction_patches"].point.numpy()[contact].astype(np.float64)
                 motion = host["joint_S_s"][dof].astype(np.float64)
                 velocity = motion[:3] + np.cross(motion[3:], point)
                 coefficients[side] = (
@@ -264,17 +259,16 @@ class TestSparseResponseOwner(unittest.TestCase):
 
     def test_cpu_mixed_complete_prefix(self):
         """Preserve every sparse response and inactive output above the old worker cap."""
-        for shared_anchor in (0, 1):
-            values = _fixture("cpu", shared_anchor=shared_anchor)
-            count = len(values["contact_slot"])
-            expected = _expected(values, count)
-            # The selected workers and the full capacity: the device stride covers either.
-            for workers in (_launch_workers(count), count):
-                values["sparse_row_dof"].fill_(-777)
-                values["sparse_row_z"].fill_(np.nan)
-                _launch(values, workers, "cpu")
-                np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
-                np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
+        values = _fixture("cpu")
+        count = len(values["contact_slot"])
+        expected = _expected(values, count)
+        # The selected workers and the full capacity: the device stride covers either.
+        for workers in (_launch_workers(count), count):
+            values["sparse_row_dof"].fill_(-777)
+            values["sparse_row_z"].fill_(np.nan)
+            _launch(values, workers, "cpu")
+            np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
+            np.testing.assert_allclose(values["sparse_row_z"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
     def test_cpu_empty_and_partial_prefix(self):
         """Respond to empty, partial and full prefixes; a collision pass clamps its count to the rows."""
@@ -296,8 +290,7 @@ class TestSparseResponseOwner(unittest.TestCase):
         values = _fixture("cpu", capacity=73)
         patches = values["friction_patches"]
         patches.enabled = 1
-        patches.point_a = wp.array(np.tile((0.23, -0.17, 0.41), (73, 1)), dtype=wp.vec3, device="cpu")
-        patches.point_b = wp.array(np.tile((-0.12, 0.27, 0.32), (73, 1)), dtype=wp.vec3, device="cpu")
+        patches.point = wp.array(np.tile((0.23, -0.17, 0.41), (73, 1)), dtype=wp.vec3, device="cpu")
         expected = _expected(values, 73)
         _launch(values, _launch_workers(73), "cpu")
         np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])

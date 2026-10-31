@@ -64,7 +64,6 @@ def make_case(*, free=False):
     data.max_depenetration_velocity = a([np.inf, np.inf])
     data.dt, data.beta, data.speculative_scale = 0.1, 0.2, 1.0
     data.activation_gap, data.restitution_threshold = 0.0, 0.5
-    data.shared_anchor = 0
     data.absolute_margin, data.relative_margin = 0.0, 0.0
     raw = rw.RawContacts()
     raw.count = a([1], wp.int32)
@@ -324,15 +323,13 @@ class TestResolvedWorlds(unittest.TestCase):
                 getattr(data, cap).assign([0.8, np.inf])
                 self.assertEqual(evaluate(data, raw, scratch), 0)
 
-    def test_shared_anchor_and_large_world_translation(self):
-        """Use shared normal anchors and stable endpoint-relative geometry."""
+    def test_one_point_and_large_world_translation(self):
+        """Act at the contact's one point, with stable endpoint-relative geometry."""
         data, raw, scratch = make_case()
         data.joint_S_s.assign([[0, 0, 0, 0, 0, 1]])
         data.v_hat.assign([1])
         raw.point0.assign([[0, 1, 0]])
         raw.point1.assign([[0, -1, 0]])
-        self.assertEqual(evaluate(data, raw, scratch), 0)
-        data.shared_anchor = 1
         self.assertEqual(evaluate(data, raw, scratch), 1)
         data.body_q.assign([[1e6, 0, 0, 0, 0, 0, 1]] * 2)
         data.articulation_origin.assign([[1e6, 0, 0]] * 2)

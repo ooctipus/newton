@@ -60,13 +60,11 @@ def metadata_inputs(device, needed, gaps):
         "shape_material_restitution": array([0.2, 0.4], wp.float32),
         "enable_friction": 1,
         "contact_friction_gap_threshold": 0.02,
-        "contact_friction_shared_anchor": 0,
         "friction_patches": patches,
         "friction_anchor_beta": 0.0,
         "contact_friction_articulation_pairs_only": 0,
         "is_free_rigid": array([0]),
         "contact_friction_scale": 1.0,
-        "contact_shared_anchor": 0,
         "pgs_beta": 0.05,
         "pgs_cfm": 1.0e-6,
     }
