@@ -1077,10 +1077,9 @@ def _split_bound(run: Run, cold: float) -> float:
     return 1.0e-4 if run.options.get("pgs_warmstart") else cold
 
 
-def _normal_forces(run: Run) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The last step's contacts: their exported normal force magnitudes and the bodies of their two shapes."""
+def _normal_forces(run: Run, entry: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One step's contacts: their exported normal force magnitudes and the bodies of their two shapes."""
     shape_body = model_data(run.scene)[0].shape_body
-    entry = run.contacts[-1]
     bodies = [np.where(entry[k] >= 0, shape_body[np.maximum(entry[k], 0)], -1) for k in CONTACT_FIELDS[:2]]
     return np.abs(np.einsum("ij,ij->i", entry["force"], entry["rigid_contact_normal"])), *bodies
 
@@ -1108,7 +1107,12 @@ def plate_laws(run: Run) -> list:
 
 def stack_laws(run: Run) -> list:
     """C3: each interface of the stack compresses by its load over its four contacts' stiffness, within 3%, and each
-    of its corner contacts carries a quarter of that load, the unique elastic split, within 3% (1e-4 warm-started)."""
+    of its corner contacts carries a quarter of that load, the unique elastic split, within 3% (1e-4 warm-started).
+
+    A float32 stack at rest can settle, or hunt by an ulp of each height: a box moving one ulp loads its interface about
+    ``k ulp / (1 + h (h k + d) / m)``, 1e-4 of the top box's weight, on that step alone. One step reads a phase of that
+    cycle, so the split is the median of the last steps' worst contact.
+    """
     params = run.scene.params
     count = params["count"]
     expected = refs.stack_compression(count, params["mass"], params["stiffness"])
@@ -1118,9 +1122,12 @@ def stack_laws(run: Run) -> list:
         (f"interface {j} compression error [1]", abs(measured[j] / expected[j] - 1.0), 3.0e-2) for j in range(count)
     ]
     # Box j rests on interface j (the ground's, j = 0), which carries the n - j boxes above it.
-    normal, body0, body1 = _normal_forces(run)
-    corner = (count - np.maximum(body0, body1)) * params["mass"] * scenes.GRAVITY / 4.0
-    laws.append(("corner force error [1]", float(np.abs(normal / corner - 1.0).max()), _split_bound(run, 3.0e-2)))
+    errors = []
+    for entry in run.contacts[-60:]:
+        normal, body0, body1 = _normal_forces(run, entry)
+        corner = (count - np.maximum(body0, body1)) * params["mass"] * scenes.GRAVITY / 4.0
+        errors.append(np.abs(normal / corner - 1.0).max())
+    laws.append(("corner force error [1]", float(np.median(errors)), _split_bound(run, 3.0e-2)))
     return laws
 
 
@@ -1772,7 +1779,7 @@ def cuda_groups() -> list:
         routes = (MF_COMPLIANCE, MF_GENERAL.but("mf_general_compliance", expect={"friction.compliance": True}))
         groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, routes))
     # Material contacts compose with warm start (the cold reference) and patch friction. The stack's corner split
-    # converges at 64 sweeps; at 32 its last step's split sits at the solve's noise floor (the bound's 1e-4).
+    # converges at 64 sweeps.
     for scene, iterations in (
         (scenes.compliant_plate(contact_matching="latest"), 32),
         (scenes.compliant_stack(contact_matching="latest"), 64),
