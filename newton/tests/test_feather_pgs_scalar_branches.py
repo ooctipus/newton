@@ -813,7 +813,6 @@ class _PrismaticRoute:
                 state_in.joint_qd,
                 s.factor.joint_qdd,
                 dt,
-                0.0,
             ],
             outputs=[state_out.joint_q, state_out.joint_qd],
             device=self.device,

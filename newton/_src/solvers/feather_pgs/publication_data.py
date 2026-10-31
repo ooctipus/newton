@@ -47,7 +47,6 @@ PUBLICATION = (
     Field("body_inertia_terms", inertia_record, ("body",), owner="factor"),
     Field("fk_id_cache_valid", wp.int32, ("articulation",), owner="factor"),
     Field("dt", wp.float32, owner="step"),
-    Field("angular_damping", wp.float32, owner="options"),
     # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 placeholder otherwise).
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )

@@ -39,6 +39,7 @@ from .kernels import (
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
+    damp_free_root_spin,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
     prescale_joint_velocity_limits,
@@ -843,7 +844,7 @@ class TreeFactor:
     def correct_free_root_velocity(
         self, state_in, qd: wp.array, dt: float, v_hat: wp.array, *, apply_transport: bool = True
     ) -> None:
-        """Apply canonical gyro physics after either ordinary or held prediction."""
+        """Apply canonical gyro physics and the free roots' spin damping after either ordinary or held prediction."""
         model = self.model
         forest = self.forest
         # Keep v_hat on jcalc_integrate's free-root convention. The compact
@@ -883,6 +884,19 @@ class TreeFactor:
                     self.kinematic_joint_mask,
                     qd,
                     dt,
+                ],
+                outputs=[v_hat],
+                device=model.device,
+            )
+        if self.options.angular_damping != 0.0:
+            wp.launch(
+                damp_free_root_spin,
+                dim=forest.free_root_joint_count,
+                inputs=[
+                    forest.free_root_joint_indices,
+                    model.joint_qd_start,
+                    self.kinematic_joint_mask,
+                    1.0 - self.options.angular_damping * dt,
                 ],
                 outputs=[v_hat],
                 device=model.device,

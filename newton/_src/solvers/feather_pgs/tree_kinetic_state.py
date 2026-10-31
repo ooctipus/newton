@@ -1072,7 +1072,6 @@ def get_state_kernel(
                 data.joint_qd,
                 data.joint_qdd,
                 data.dt,
-                data.angular_damping,
                 data.joint_q_new,
                 data.joint_qd_new,
             )

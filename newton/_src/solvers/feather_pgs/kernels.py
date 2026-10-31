@@ -230,7 +230,6 @@ def jcalc_integrate(
     lin_axis_count: int,
     ang_axis_count: int,
     dt: float,
-    angular_damping: float,
     parent: int,
     # outputs
     joint_q_new: wp.array[float],
@@ -340,9 +339,6 @@ def jcalc_integrate(
             # the moving-parent-frame transport is derived.
             dpdt_s = v_com - wp.cross(w_s_integrate, wp.quat_rotate(r_s, r_ac))
             p_s_new = p_s + dpdt_s * dt
-
-        if parent < 0:
-            w_s = w_s * (1.0 - angular_damping * dt)
 
         # update transform
         joint_q_new[coord_start + 0] = p_s_new[0]
@@ -653,6 +649,24 @@ def apply_free_root_velocity_corrections(
     )
 
 
+@wp.kernel
+def damp_free_root_spin(
+    free_root_joint_indices: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    spin_scale: float,
+    v_hat: wp.array[float],
+):
+    """Scale each active free root's predicted spin by ``1 - angular_damping dt``, before the rows see it: the solved
+    velocity then satisfies its rows at the step's end."""
+    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, wp.tid())
+    if d < 0:
+        return
+    v_hat[d + 3] = v_hat[d + 3] * spin_scale
+    v_hat[d + 4] = v_hat[d + 4] * spin_scale
+    v_hat[d + 5] = v_hat[d + 5] * spin_scale
+
+
 @wp.func
 def _light_remove_free_root_transport_from_qdd(
     root_index: int,
@@ -709,7 +723,6 @@ def _light_integrate_generalized_joints(
     joint_qd: wp.array[float],
     joint_qdd: wp.array[float],
     dt: float,
-    angular_damping: float,
     joint_q_new: wp.array[float],
     joint_qd_new: wp.array[float],
 ):
@@ -739,7 +752,6 @@ def _light_integrate_generalized_joints(
         lin_axis_count,
         ang_axis_count,
         dt,
-        angular_damping,
         parent,
         joint_q_new,
         joint_qd_new,
@@ -761,7 +773,6 @@ def integrate_generalized_joints(
     joint_qd: wp.array[float],
     joint_qdd: wp.array[float],
     dt: float,
-    angular_damping: float,
     joint_q_new: wp.array[float],
     joint_qd_new: wp.array[float],
 ):
@@ -780,7 +791,6 @@ def integrate_generalized_joints(
         joint_qd,
         joint_qdd,
         dt,
-        angular_damping,
         joint_q_new,
         joint_qd_new,
     )

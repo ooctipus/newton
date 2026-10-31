@@ -468,7 +468,6 @@ class OrdinaryTree:
                     state_in.joint_qd,
                     tree.joint_qdd,
                     dt,
-                    self.solver.options.angular_damping,
                 ],
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=model.device,

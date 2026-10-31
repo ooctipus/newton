@@ -271,7 +271,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
                 state.joint_qd,
                 wp.zeros_like(state.joint_qd),  # joint_qdd = 0
                 DT,
-                0.0,
             ],
             outputs=[q_new, qd_new],
             device=device,

@@ -259,6 +259,77 @@ class TestPassiveDamper(unittest.TestCase):
                 np.testing.assert_allclose(measured[-1][0], expected[-1][0], rtol=2.0e-2, atol=2.0e-3)
 
 
+def _rolling_sphere(store: str, *, speed: float, radius: float = 0.1, mu: float = 1.0, device="cpu"):
+    """A solid sphere rolling along +x on the ground, without slip, at ``speed`` [m/s], on row store ``store``."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu, gap=0.01)
+    pose = wp.transform((0.0, 0.0, radius), wp.quat_identity())
+    if store == "free":
+        body = builder.add_body(xform=pose)
+        builder.add_shape_sphere(body, radius=radius, cfg=cfg)
+    else:
+        body = builder.add_link(xform=pose)
+        builder.add_shape_sphere(body, radius=radius, cfg=cfg)
+        tail = builder.add_link(xform=pose, mass=1.0e-3, inertia=wp.mat33(np.eye(3) * 1.0e-6))
+        root = builder.add_joint_free(body)
+        hinge = builder.add_joint_revolute(parent=body, child=tail, axis=(0.0, 1.0, 0.0))
+        builder.add_articulation([root, hinge])
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    state = model.state()
+    velocity = state.joint_qd.numpy()
+    velocity[0], velocity[4] = speed, speed / radius
+    state.joint_qd.assign(velocity)
+    return model, state
+
+
+class TestAngularDampingInThePredictor(unittest.TestCase):
+    """PH1f: angular damping acts before the rows, so a sticking contact holds at the step's end."""
+
+    radius = 0.1
+    damping = 5.0
+
+    def _slip(self, store: str, beta: float) -> float:
+        model, state = _rolling_sphere(store, speed=1.0, radius=self.radius)
+        solver = SolverFeatherPGS(
+            model,
+            angular_damping=self.damping,
+            friction_anchor_beta=beta,
+            pgs_iterations=64,
+            update_mass_matrix_interval=1,
+        )
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        out = model.state()
+        control = model.control()
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        for _ in range(24):
+            pipeline.collide(state, contacts)
+            solver.step(state, out, control, contacts, H)
+            state, out = out, state
+        velocity = state.joint_qd.numpy()
+        return float(velocity[0] - velocity[4] * self.radius)
+
+    def test_rolling_contact_holds_at_the_step_end(self):
+        for store in ("free", "tree"):
+            with self.subTest(store=store):
+                self.assertLess(abs(self._slip(store, 0.0)), 1.0e-3)
+
+    def test_free_spin_keeps_its_decay(self):
+        """Decay a free spin by ``1 - a h`` per step, on a body and a tree root."""
+        scale = 1.0 - self.damping * H
+        for store in ("free", "tree"):
+            with self.subTest(store=store):
+                model, state = _rolling_sphere(store, speed=0.0, radius=self.radius)
+                model.gravity.fill_(wp.vec3(0.0, 0.0, 0.0))
+                velocity = state.joint_qd.numpy()
+                velocity[5] = 3.0
+                history = _free_roll(
+                    model, state.joint_q.numpy(), velocity, 10, angular_damping=self.damping, pgs_iterations=4
+                )
+                self.assertAlmostEqual(float(history[-1][1][5]), 3.0 * scale**10, delta=1.0e-4)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the specialized row stores run on CUDA")
 class TestDepenetrationCapOnRoutes(unittest.TestCase):
     """PH1a on each contact-row producer: the normal law at the capped bias, from the public contact record."""
