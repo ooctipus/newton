@@ -153,7 +153,6 @@ def _allocate(kernel, resolved, patch_friction=False):
         "mf_max_constraints": 32,
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
-        "contact_friction_articulation_pairs_only": 0,
         "row_capacity_telemetry": 0,
         "friction_patches": patches,
         "resolved_worlds": integers(resolved),

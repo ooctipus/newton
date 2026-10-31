@@ -414,7 +414,6 @@ class SolverFeatherPGS(SolverBase):
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
         contact_friction_position_iterations: int = -1,
-        contact_friction_scale: float = 1.0,
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
         joint_limit_activation_gap: float = float("inf"),
@@ -434,7 +433,6 @@ class SolverFeatherPGS(SolverBase):
         restitution_velocity_threshold: float = 0.5,
         contact_speculative_scale: float = 1.0,
         contact_gap_gate: float = 0.0,
-        contact_friction_articulation_pairs_only: bool = False,
         enable_restitution: bool = True,
         same_articulation_contact_gap_gate: float = 0.0,
         articulation_pair_contact_gap_gate: float = 0.0,
@@ -491,14 +489,6 @@ class SolverFeatherPGS(SolverBase):
                 behavior by solving friction in every position iteration; ``0`` skips position-pass
                 friction entirely; ``N > 0`` solves friction only in the final ``N`` position
                 iterations. Defaults to ``-1``.
-            contact_friction_articulation_pairs_only (bool, optional): Apply
-                ``contact_friction_gap_threshold`` only when
-                both contact bodies belong to non-free articulations. Contacts involving ground or a
-                free rigid body retain the legacy unbounded friction-row behavior. Defaults to False.
-            contact_friction_scale (float, optional): Multiplies the effective Coulomb coefficient
-                used by generated friction rows. This is a diagnostic hook for matching solver-prep
-                semantics such as PhysX's per-friction-anchor scaling; it does not affect normal
-                contact rows. Defaults to 1.0.
             friction_anchor_beta (float | None, optional): Set the positional correction strength
                 for persistent patch friction. ``None`` enables it at 0.2 for the default solver;
                 the experimental contact material law instead retains velocity-only point friction and warns.
@@ -3804,7 +3794,6 @@ class SolverFeatherPGS(SolverBase):
                 same_articulation_gap_gate=self.options.same_articulation_contact_gap_gate,
                 articulation_pair_gap_gate=self.options.articulation_pair_contact_gap_gate,
                 friction_gap=self.options.contact_friction_gap_threshold,
-                friction_articulation_pairs_only=self.options.contact_friction_articulation_pairs_only,
             )
 
     @staticmethod
@@ -4338,7 +4327,6 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.mf_max_constraints,
                     enable_friction_flag,
                     self.options.contact_friction_gap_threshold,
-                    1 if self.options.contact_friction_articulation_pairs_only else 0,
                     1,
                     self.laws.friction_patches.view,
                     self._resolved_worlds,

@@ -131,7 +131,6 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), rows=(3,) * 8):
         factor[group, np.arange(6), np.arange(6)] = np.linspace(0.8, 1.7, 6)
     data.factor = array(factor, float)
     data.sparse_size = 108
-    data.friction_scale = 0.73
     data.beta = 0.17
     data.cfm = 0.001
     for name in OUTPUTS:
@@ -221,9 +220,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         "friction_patches": patches,
         "friction_anchor_beta": friction_anchor_beta,
         "law": row_law(patches, friction_anchor_beta),
-        "contact_friction_articulation_pairs_only": 0,
         "is_free_rigid": wp.zeros(6, dtype=int, device=aux.device),
-        "contact_friction_scale": data.friction_scale,
         "pgs_beta": data.beta,
         "pgs_cfm": data.cfm,
         "world_row_type": data.row_type,

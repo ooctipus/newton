@@ -109,7 +109,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             row_capacity,
             1,
             0.0,
-            0,
             1,
             FrictionPatches(),
             wp.empty(0, dtype=wp.int32, device=device),

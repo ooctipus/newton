@@ -91,7 +91,7 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                 z.rowkeys[world, slot + direction] = contact * 4 + direction
             if law.patches.enabled != 0:
                 mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
-                friction = mu * data.friction_scale
+                friction = mu
                 if data.material != 0:
                     if data.stiffness[contact] > 0.0 and data.friction_weight[contact] > 0.0:
                         friction *= data.friction_weight[contact]
@@ -197,7 +197,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
             "        c.row_beta.data[at] = r == 0 ? normal_beta : 0.0f;\n"
         )
     materials = """        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
-        const float friction = mu * c.friction_scale;"""
+        const float friction = mu;"""
     rhs = """        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? normal_beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
                                     c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;"""
     bounce, weight = "if (bounce.v0) rhs = bounce.v1;", ""
@@ -206,7 +206,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
                                                                            c.material_restitution);
         const float stiffness = c.material != 0 ? c.stiffness.data[contact] : 0.0f;
         const float restitution = stiffness > 0.0f ? 0.0f : rigid_restitution;
-        const float friction = mu * c.friction_scale
+        const float friction = mu
             * (stiffness > 0.0f && c.friction_weight.data[contact] > 0.0f ? c.friction_weight.data[contact] : 1.0f);"""
         rhs = """        const auto row_law = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? normal_beta : ${TANGENT_BETA}, target,
                                              1.0f / c.dt, c.bias_scale, c.speculative_scale, 0.0f, c.contact_w);

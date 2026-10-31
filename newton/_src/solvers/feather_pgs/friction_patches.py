@@ -54,7 +54,7 @@ from ...core.contact_pool import ContactField, ContactPool
 from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_sort_extent, slot_keys_fit, sort_grid
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from . import field_group
-from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .contact_filters import contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
 from .field_group import Field
 from .projection_laws import disk
@@ -155,13 +155,10 @@ def patch_friction_location(patches: FrictionPatches, c: int):
 
 
 @wp.func
-def patch_tangent_row(law: PatchRowLaw, c: int, row: int, mu: float, friction_scale: float):
-    """Return contact ``c``'s tangent row ``row`` (1 or 2): its phi, beta and friction coefficient.
-
-    The coefficient is the undivided ``mu * friction_scale``; the patch link divides it among the
-    ring's anchors.
-    """
-    return law.patches.phi[c][row - 1], law.beta, mu * friction_scale
+def patch_tangent_row(law: PatchRowLaw, c: int, row: int):
+    """Return contact ``c``'s tangent row ``row`` (1 or 2): its phi and beta. Its coefficient stays the undivided
+    ``mu``; the patch link divides it among the ring's anchors."""
+    return law.patches.phi[c][row - 1], law.beta
 
 
 @wp.struct
@@ -232,7 +229,6 @@ class _PatchContacts:
     same_articulation_gap_gate: float
     articulation_pair_gap_gate: float
     friction_gap: float
-    friction_articulation_pairs_only: int
     key_stride: int
 
 
@@ -288,9 +284,7 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
         inputs.same_articulation_gap_gate,
     )
     support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
-    eligible = gap <= normal_gap_limit and contact_friction_eligible(
-        gap, a_non_free, b_non_free, inputs.friction_articulation_pairs_only, inputs.friction_gap
-    )
+    eligible = gap <= normal_gap_limit and gap <= inputs.friction_gap
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
     frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
@@ -1305,7 +1299,6 @@ class _FrictionPatchState:
         same_articulation_gap_gate=0.0,
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
-        friction_articulation_pairs_only=False,
     ):
         """Build the current patch frame from ``contacts``.
 
@@ -1332,7 +1325,6 @@ class _FrictionPatchState:
             same_articulation_gap_gate=same_articulation_gap_gate,
             articulation_pair_gap_gate=articulation_pair_gap_gate,
             friction_gap=friction_gap,
-            friction_articulation_pairs_only=friction_articulation_pairs_only,
         )
         generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
         scope = None
@@ -1437,7 +1429,6 @@ class _FrictionPatchState:
         same_articulation_gap_gate=0.0,
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
-        friction_articulation_pairs_only=False,
     ):
         """Return the inputs that :func:`_prepare` and :func:`_prepare_frame` share, with :meth:`build`'s gates."""
         inputs = _PatchContacts()
@@ -1456,7 +1447,6 @@ class _FrictionPatchState:
         inputs.same_articulation_gap_gate = same_articulation_gap_gate
         inputs.articulation_pair_gap_gate = articulation_pair_gap_gate
         inputs.friction_gap = friction_gap
-        inputs.friction_articulation_pairs_only = int(friction_articulation_pairs_only)
         inputs.key_stride = self.key_stride
         return [
             contacts.rigid_contact_count,

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from newton._src.solvers.feather_pgs.contact_filters import contact_normal_gap_limit
 from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
 from newton._src.solvers.feather_pgs.friction_patches import (
     _FOOTPRINT_TOLERANCE,
@@ -91,7 +91,6 @@ def _prepare(
     same_articulation_gap_gate: float,
     articulation_pair_gap_gate: float,
     friction_gap: float,
-    friction_articulation_pairs_only: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
 ):
@@ -149,9 +148,7 @@ def _prepare(
         same_articulation_gap_gate,
     )
     support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
-    eligible = gap <= normal_gap_limit and contact_friction_eligible(
-        gap, a_non_free, b_non_free, friction_articulation_pairs_only, friction_gap
-    )
+    eligible = gap <= normal_gap_limit and gap <= friction_gap
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
     frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
@@ -921,7 +918,6 @@ class ReferencePatches:
         same_articulation_gap_gate=0.0,
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
-        friction_articulation_pairs_only=False,
     ):
         wp.launch(
             _prepare,
@@ -946,7 +942,6 @@ class ReferencePatches:
                 same_articulation_gap_gate,
                 articulation_pair_gap_gate,
                 friction_gap,
-                int(friction_articulation_pairs_only),
                 self.current,
                 self.view,
             ],

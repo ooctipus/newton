@@ -54,7 +54,6 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "mf_max_constraints": capacity,
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
-        "contact_friction_articulation_pairs_only": 0,
         "row_capacity_telemetry": 0,
         "friction_patches": FrictionPatches(),
         "resolved_worlds": wp.empty(0, dtype=wp.int32, device=device),

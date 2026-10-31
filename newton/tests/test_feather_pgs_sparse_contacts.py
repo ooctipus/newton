@@ -404,7 +404,6 @@ class TestSparseContacts(unittest.TestCase):
                         "material_restitution": array([0.4, 0.2, 0.5, 0.8, 0.6]),
                         "beta": 0.05,
                         "cfm": 0.03,
-                        "friction_scale": 0.8,
                         "speculative_scale": 0.65,
                         "restitution_threshold": 0.1,
                     }
@@ -584,7 +583,6 @@ class TestSparseContacts(unittest.TestCase):
             prescribed=_array([0], int),
             material_mu=_array([0.8] * 4),
             material_restitution=_array([0.4] * 4),
-            friction_scale=1.0,
             beta=0.05,
             cfm=1.0e-6,
             row_type=row_type,

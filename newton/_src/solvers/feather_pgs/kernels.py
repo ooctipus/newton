@@ -19,7 +19,7 @@ import functools
 import warp as wp
 
 from ...sim import BodyFlags, JointType
-from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput, ContactRoutes, contact_frame
 from .contact_laws import (
     CONTACT_SPIN_ROW,
@@ -1802,7 +1802,6 @@ def allocate_world_contact_slots(
     mf_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
-    contact_friction_articulation_pairs_only: int,
     row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
     resolved_worlds: wp.array[int],
@@ -1883,9 +1882,6 @@ def allocate_world_contact_slots(
             continue
         a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
         b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
-        a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-        b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-
         # Classify: MF path if both sides are free rigid or ground.
         is_mf = 0
         if has_free_rigid != 0:
@@ -1896,9 +1892,7 @@ def allocate_world_contact_slots(
 
         # Every normal survives; only the selected patch anchors receive tangent rows.
         slots_needed = 1
-        add_friction = enable_friction != 0 and contact_friction_eligible(
-            phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
-        )
+        add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold
         if friction_patches.enabled != 0:
             add_friction = add_friction and friction_patches.weight[c] > 0.0
         if add_friction:
@@ -2971,7 +2965,8 @@ def build_mf_contact_rows(
                 mf.phi[world, row_idx] = 0.0
                 mf.restitution[world, row_idx] = 0.0
             else:
-                tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+                tangent_phi, beta = patch_tangent_row(law, c, row)
+                friction_mu = mu
                 if stiffness > 0.0 and data.friction_weight[c] > 0.0:
                     friction_mu *= data.friction_weight[c]
                 mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION

@@ -24,10 +24,3 @@ def contact_normal_gap_limit(
         if same_articulation and same_articulation_gap > 0.0:
             limit = wp.min(limit, same_articulation_gap)
     return limit
-
-
-@wp.func
-def contact_friction_eligible(
-    gap: float, a_non_free: bool, b_non_free: bool, articulation_pairs_only: int, friction_gap: float
-):
-    return (articulation_pairs_only != 0 and not (a_non_free and b_non_free)) or gap <= friction_gap

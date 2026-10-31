@@ -116,7 +116,6 @@ def _law_contact_rows(
     articulation_origin: wp.array[wp.vec3],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    contact_friction_scale: float,
     friction_patches: kernels.FrictionPatches,
     phi_out: wp.array[float],
     mu_out: wp.array[wp.vec2],
@@ -159,7 +158,7 @@ def _law_contact_rows(
             body_v_s,
         )
     phi_out[c] = phi
-    mu_out[c] = wp.vec2(mu, mu * contact_friction_scale)
+    mu_out[c] = wp.vec2(mu, mu)
     restitution_out[c] = restitution
     target_out[c] = targets
 
@@ -187,7 +186,6 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
                 contact_world=np.zeros(contacts, dtype=np.int32),
                 contact_path=np.zeros(contacts, dtype=np.int32),
                 articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
-                contact_friction_scale=0.8,
                 pgs_beta=0.2,
                 pgs_cfm=1.0e-6,
                 friction_patches=patches,
@@ -208,7 +206,6 @@ def test_contact_front_end_matches_world_contact_rows(test, device):
                 _law_contact_rows,
                 contacts,
                 device,
-                contact_friction_scale=0.8,
                 friction_patches=patches,
                 phi_out=np.zeros(contacts, dtype=np.float32),
                 mu_out=np.zeros((contacts, 2), dtype=np.float32),
@@ -267,9 +264,7 @@ def test_contact_front_end_matches_masked_row_prelude(test, device):
         size_b=6,
         law=point_row_law(device, contacts),
         articulation_response_dof_count=np.full(4, 6, dtype=np.int32),
-        contact_friction_articulation_pairs_only=0,
         is_free_rigid=np.zeros(4, dtype=np.int32),
-        contact_friction_scale=0.8,
         pgs_beta=0.2,
         pgs_cfm=1.0e-6,
         pre_flags=np.zeros(contacts, dtype=np.int32),
@@ -287,7 +282,6 @@ def test_contact_front_end_matches_masked_row_prelude(test, device):
         _law_contact_rows,
         contacts,
         device,
-        contact_friction_scale=0.8,
         friction_patches=_patches(rng, contacts, device, 0),
         phi_out=np.zeros(contacts, dtype=np.float32),
         mu_out=np.zeros((contacts, 2), dtype=np.float32),
@@ -475,7 +469,6 @@ def _law_mf_jacobian(
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    contact_friction_scale: float,
     friction_patches: kernels.FrictionPatches,
     friction_anchor_beta: float,
     mf_Z_a: wp.array3d[float],
@@ -525,7 +518,7 @@ def _law_mf_jacobian(
         mf_row_restitution[0, slot] = restitution
     else:
         mf_phi[0, slot] = friction_anchor_beta * friction_patches.phi[c][row - 1]
-        mf_row_mu[0, slot] = mu * contact_friction_scale
+        mf_row_mu[0, slot] = mu
         mf_row_restitution[0, slot] = 0.0
     mf_target_velocity[0, slot] = contact_laws.prescribed_target(
         body_a, art_a, body_b, art_b, row_point, direction, prescribed_articulation, articulation_origin, body_v_s
@@ -548,7 +541,6 @@ def test_free_body_jacobian_matches_mf_contact_rows(test, device):
     common.update(
         contact_slot=slots,
         articulation_response_dof_count=np.array([6, 6, 0, 6], dtype=np.int32),
-        contact_friction_scale=0.7,
         friction_anchor_beta=0.15,
     )
     outputs = ("mf_Z_a", "mf_Z_b", "mf_phi", "mf_row_mu", "mf_target_velocity", "mf_row_restitution")
@@ -652,7 +644,7 @@ def _law_contact_admission(
     art_a_out[c] = art_a
     art_b_out[c] = art_b
     slots_out[c] = 1
-    if contact_filters.contact_friction_eligible(phi, a_non_free, b_non_free, 0, contact_friction_gap_threshold):
+    if phi <= contact_friction_gap_threshold:
         slots_out[c] = 3
 
 
@@ -698,7 +690,6 @@ def test_contact_endpoints_match_row_allocation(test, device):
         max_constraints=big,
         mf_max_constraints=big,
         enable_friction=1,
-        contact_friction_articulation_pairs_only=0,
         row_capacity_telemetry=0,
         friction_patches=_patches(rng, contacts, device, 0),
         resolved_worlds=np.zeros(0, dtype=np.int32),

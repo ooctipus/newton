@@ -162,7 +162,7 @@ def _patch_fixture(device="cpu"):
     data.material_restitution = array([0.8 if s % 4 == 2 else 0.0 for s in range(4 * WORLDS)], float)
     data.incident = array(rng.normal(0.0, 3.0, 9 * WORLDS).astype(np.float32), float)
     data.max_depenetration_velocity = array(np.full(3 * WORLDS, np.inf, dtype=np.float32), float)
-    data.friction_scale, data.beta, data.cfm, data.dt = 0.85, 0.23, 2.0e-4, 1.0 / 240.0
+    data.beta, data.cfm, data.dt = 0.23, 2.0e-4, 1.0 / 240.0
     data.bias_scale, data.speculative_scale, data.restitution_threshold, data.contact_w = 1.0, 0.6, 0.05, 1.0
     for name, values in _poisoned_rows(device).items():
         setattr(data, name, values)
@@ -845,7 +845,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
 
     def _step_pad_rings(self, plain, packets):
         """Step both routes on the plain route's contacts and compare their patch rings."""
-        scale, poses = plain.solver.options.contact_friction_scale, []
+        poses = []
         for step in range(_PAD_STEPS):
             contacts = _step(plain)
             _step(packets, contacts)
@@ -864,7 +864,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
                     for c in ring.anchors:
                         mu, impulses = records[0][c]["mu"], records[0][c]["impulses"]
                         # The link divides the coefficient between the ring's two anchors.
-                        np.testing.assert_allclose(mu[1:], mu[0] * scale / 2.0, rtol=1.0e-6)
+                        np.testing.assert_allclose(mu[1:], mu[0] / 2.0, rtol=1.0e-6)
                         bound = max(bound, float(np.linalg.norm(impulses[1:])) / (float(mu[1]) * ring.impulses[0]))
                 self.assertGreater(bound, 0.98, "The pads' friction must reach the ring's pooled bound")
                 assert_rows_close(*records, atol=1.0e-6, rtol=1.0e-5)

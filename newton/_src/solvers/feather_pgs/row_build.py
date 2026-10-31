@@ -354,7 +354,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
 
     Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
     the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
-    gap, the law's beta and the undivided coefficient ``mu * friction_scale``. A normal row's rhs is
+    gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
     :func:`.row_laws.contact_rhs` at its capped beta (:func:`contact_normal_beta`), and a bouncing one's the restitution target from its incident velocity summed per
     body (:func:`incident_projection`). A spin row (:data:`.contact_laws.CONTACT_SPIN_ROW`) turns about the normal:
     its coefficient is :func:`contact_torsion_mu`, its target the prescribed bodies' spin
@@ -400,7 +400,8 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         data.phi[world, r] = phi
         data.restitution[world, r] = restitution
     else:
-        tangent_phi, beta, friction_mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+        tangent_phi, beta = patch_tangent_row(law, c, row)
+        friction_mu = mu
         if stiffness > 0.0 and data.friction_weight[c] > 0.0:
             friction_mu *= data.friction_weight[c]
         data.row_type[world, r] = ROW_FRICTION
@@ -441,7 +442,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         elif row == CONTACT_SPIN_ROW:
             rhs, _w = row_rhs(ROW_TORSION, 0.0, 0.0, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
         else:
-            tangent_phi, beta, _mu = patch_tangent_row(law, c, row, mu, data.friction_scale)
+            tangent_phi, beta = patch_tangent_row(law, c, row)
             rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
         data.rhs[world, slot + row] = rhs
         data.diag[world, slot + row] = data.cfm

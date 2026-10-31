@@ -53,7 +53,6 @@ CONTACT_INPUT = (
     ),
     Field("incident", wp.float32, ("dof",), attr="v_hat"),
     # The row law.
-    Field("friction_scale", wp.float32, owner="options", attr="contact_friction_scale"),
     Field("beta", wp.float32, owner="options", attr="pgs_beta"),
     Field("cfm", wp.float32, owner="options", attr="pgs_cfm"),
     Field("dt", wp.float32, owner="step"),  # the step's values, given to bind() directly

@@ -2033,7 +2033,6 @@ def factor_contact_rows_kernel(
                         phi = anchor_phi[0]
                         if lane == 2:
                             phi = anchor_phi[1]
-                        mu *= data.friction_scale
                         if stiffness > 0.0 and data.friction_weight[c] > 0.0:
                             mu *= data.friction_weight[c]
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION

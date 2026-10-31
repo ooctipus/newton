@@ -569,7 +569,6 @@ CONTACT_ARGUMENTS = {
     "material_restitution": "shape_material_restitution",
     "max_depenetration_velocity": "rigid_body_max_depenetration_velocity",
     "incident": "v_hat",
-    "friction_scale": "contact_friction_scale",
     "beta": "pgs_beta",
     "cfm": "pgs_cfm",
     "row_type": "world_row_type",

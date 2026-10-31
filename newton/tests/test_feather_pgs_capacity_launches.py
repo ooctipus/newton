@@ -110,7 +110,6 @@ def _scatter(anchors, device, count, path, max_blocks):
     data.shape0 = wp.array(contact % 5 - 1, dtype=int, device=device)
     data.shape1 = wp.array(contact % 7 - 1, dtype=int, device=device)
     data.material_mu = wp.array(np.linspace(0.2, 1.1, 6, dtype=np.float32), dtype=float, device=device)
-    data.friction_scale = 0.5
     data.row_type = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
     data.row_parent = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
     data.row_mu = wp.full((_SCATTER_WORLDS, rows), -9.0, dtype=float, device=device)

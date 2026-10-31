@@ -27,7 +27,6 @@ _NUMBER_RULES = (
         "must be -1 for all position iterations, or a non-negative last-N iteration count",
         False,
     ),
-    ("contact_friction_scale", float, lambda value: not value < 0.0, "must be non-negative", False),
     ("contact_speculative_scale", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("same_articulation_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
@@ -53,7 +52,6 @@ _CHOICE_RULES = (("pgs_solve_readout", SOLVE_READOUTS),)
 
 # The switches the solver applies as booleans.
 _BOOLEANS = (
-    "contact_friction_articulation_pairs_only",
     "enable_bilateral_preelimination",
     "enable_restitution",
     "warn_constraint_overflow",
@@ -78,7 +76,6 @@ class Options:
     enable_contact_friction: Any
     contact_friction_gap_threshold: Any
     contact_friction_position_iterations: int
-    contact_friction_scale: float
     enable_joint_limits: Any
     enable_bilateral_preelimination: bool
     joint_limit_activation_gap: float
@@ -98,7 +95,6 @@ class Options:
     restitution_velocity_threshold: float
     contact_speculative_scale: float
     contact_gap_gate: float
-    contact_friction_articulation_pairs_only: bool
     enable_restitution: bool
     same_articulation_contact_gap_gate: float
     articulation_pair_contact_gap_gate: float
