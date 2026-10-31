@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The tree kernels' reference, stage-clock and host-scratch switches are factory arguments, set once by the owner."""
+"""The tree kernels' reference and stage-clock switches are factory arguments, set once by the owner."""
 
 import ast
 import os
@@ -234,12 +234,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
                     self.assertIsNot(getattr(clocked, kernel), getattr(default, kernel))
 
     def test_cpu_owner_publishes_forward_kinematics(self):
-        """Repair and finish a CPU owner's trees and publish the poses and twists forward kinematics gives.
-
-        Warp's CPU JIT links no malloc or free, so an owner on the CPU builds its
-        repair and finish kernels with static scratch; the CUDA form stays the
-        factories' default.
-        """
+        """Repair and finish a CPU owner's trees and publish the poses and twists forward kinematics gives."""
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owner = HeldTree(solver)
@@ -281,12 +276,6 @@ class TestTreeKernelSwitches(unittest.TestCase):
         np.testing.assert_allclose(output.body_qd.numpy(), published.body_qd.numpy(), atol=2e-5)
         for group in owner.groups:
             np.testing.assert_array_equal(group.data.status.numpy(), 0)
-            options = {"layout": group.layout, "body_velocity": group._body_velocity, "clocked": group.clocked}
-            repair = tree_kinetic_state.get_state_kernel(
-                False, group.schedules, motion_velocity=group.motion_velocity, **options
-            )
-            self.assertIsNot(group.repair_kernel, repair)
-            self.assertIsNot(group.finish_kernel, tree_kinetic_state.get_state_kernel(True, group.schedules, **options))
 
 
 if __name__ == "__main__":

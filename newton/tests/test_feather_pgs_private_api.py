@@ -11,7 +11,7 @@ _FEATHER_PGS = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
 _KERNEL_FACTORIES = {
     "tree_ordinary.py": ("triangular_solve_kernel",),
     "response_builds_dense.py": (
-        "factor_warps_kernel",
+        "dense_factor_kernel",
         "factor_tiles_kernel",
         "response_warps_kernel",
         "response_tiles_kernel",

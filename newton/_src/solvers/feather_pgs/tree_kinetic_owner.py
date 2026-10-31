@@ -310,6 +310,7 @@ class TreeKineticState:
             free_root_local=free_root_local,
             free_root_dof=free_root_dof,
             dof_passive=dof_passive,
+            scratch=np.zeros(self.group_count * self.layout.total if self.layout.global_block else 1, np.float32),
         )
         groups = self.group_count
         self.data = native.KineticData()
@@ -360,7 +361,6 @@ class TreeKineticState:
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
         layout = self.layout
-        on_cpu = self.solver.model.device.is_cpu
         self.block_dim = layout.block
         self.launch_count = self.group_count // layout.pack
         # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified, and
@@ -378,7 +378,6 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
             clocked=self.clocked,
-            host=on_cpu,
         )
         # A classified repair compares in a pass of its own over the blocks its classification
         # lists for comparison. Otherwise a second one-pass repair kernel compares inside its
@@ -396,7 +395,6 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 bank_coordinates=self.bank_coordinates,
                 clocked=self.clocked,
-                host=on_cpu,
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
@@ -409,7 +407,6 @@ class TreeKineticState:
                 body_velocity=self._body_velocity,
                 listed=True,
                 clocked=self.clocked,
-                host=on_cpu,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -417,7 +414,6 @@ class TreeKineticState:
             layout=layout,
             body_velocity=self._body_velocity,
             clocked=self.clocked,
-            host=on_cpu,
         )
         self.predictor_kernel = native.get_predictor_kernel(
             self.schedules,

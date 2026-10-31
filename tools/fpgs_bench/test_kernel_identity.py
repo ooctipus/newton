@@ -105,20 +105,6 @@ class TestKernelIdentity(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(identity.report(hash_only, hash_only, ("cuda", "cpu")), 0)
 
-    def test_held_factor_calls_index_like_their_owners(self):
-        """Read a tree's own geometry record, and each held forest family's root block of the forest record."""
-        observed = {
-            (
-                args[0],
-                kwargs.get("geometric_stride") or max(args[1].value) + 1,
-                kwargs.get("geometric_group", False),
-            )
-            for _, _, args, kwargs in identity.held_factor_calls()
-        }
-        # Stride: a tree's entry count, or the forest's; a prescribed root holds no factor.
-        expected = {(16, 40, False), (6, 21, False), (9, 86, True), (6, 86, True), (23, 222, True), (6, 222, True)}
-        self.assertEqual(observed, expected)
-
     def test_held_tree_grid_records_the_kernels_as_they_run(self):
         """Record every layout's state kernels with body velocity, which every held-tree operator requires.
 

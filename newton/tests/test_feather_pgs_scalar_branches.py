@@ -1799,13 +1799,11 @@ class TestScalarBranchOwner(unittest.TestCase):
     def test_owner_matches_ordinary_dynamics(self):
         """Own 108-key worlds as scalar branches beside a held arm and track ordinary dynamics.
 
-        The held-tree plan caps a group at 64 bodies, so without scalar branches
-        no owner takes this keyboard-shaped model. Keys and their floor-contact
-        impulses stay within the keys' bound of ordinary dynamics through the
-        mass cadence, an inertial and drive notification, a masked
-        reset after a coordinate write, a root re-pose, a state bank copied back
-        into the input (which every cache must repair) and captured graphs with
-        masked and full resets. The arm moves to the held owner's float order,
+        Keys and their floor-contact impulses stay within the keys' bound of
+        ordinary dynamics through the mass cadence, an inertial and drive
+        notification, a masked reset after a coordinate write, a root re-pose, a
+        state bank copied back into the input (which every cache must repair)
+        and captured graphs with masked and full resets. The arm moves to the held owner's float order,
         within the held-solve floor (``ARM_FLOOR``) plus the twin's spread.
         An eager twin of the scalar route does the captured work step by step:
         each replay must give what it gives. The FK/ID fields that neither the

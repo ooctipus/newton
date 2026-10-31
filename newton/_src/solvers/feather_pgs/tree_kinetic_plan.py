@@ -6,6 +6,7 @@
 import numpy as np
 
 from ...sim import BodyFlags, JointType
+from .staging import static_budget
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
 
@@ -52,14 +53,14 @@ def make_plan(model, operator, *, complete=True):
     else:
         bodies = int(counts_by_art[group[0]])
         root_locals = (0,)
-    if not 1 <= bodies <= 64 or not np.all(counts_by_art[group] == counts_by_art[group[0]]):
-        raise ValueError("Cached tree groups require uniform body counts up to 64")
+    if bodies < 1 or not np.all(counts_by_art[group] == counts_by_art[group[0]]):
+        raise ValueError("Cached tree groups require uniform body counts")
     joints = starts[group, None] + np.arange(bodies)
     qd = model.joint_qd_start.numpy()
     counts = np.diff(qd)[joints]
     dofs = int(counts[0].sum())
-    if not 1 <= dofs <= 64:
-        raise ValueError("Cached trees require at most 64 coordinates")
+    if dofs < 1:
+        raise ValueError("Cached trees require coordinates")
     if art_world.shape != (arts,) or np.any(art_world < 0) or np.any(art_world >= worlds):
         raise ValueError("Cached tree articulations require valid world ownership")
     child = model.joint_child.numpy()
@@ -151,6 +152,7 @@ def make_plan(model, operator, *, complete=True):
         root_offsets=offsets,
         root_families=tuple(int(v) for v in getattr(operator, "root_families", ())) or (dofs,),
         free_roots=tuple(free_roots),
+        shared_budget=static_budget(model.device.arch),
         own_bias=own_bias,
     )
     return layout, parent

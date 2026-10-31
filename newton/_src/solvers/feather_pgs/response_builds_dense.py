@@ -8,8 +8,8 @@ thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the respo
 layout). Each stage's arithmetic comes from one small dense kit:
 
 * :class:`.CholeskyFactor`: the leaf-first factor ``P (H + diag(R)) P^T = L L^T`` (``P`` reverses an
-  articulation's coordinates, :func:`.leaf_first`) by columns on one thread (``factor`` over articulations, and lane
-  0 of the warp-mapped factor that assembles ``H`` from the held tree's geometry);
+  articulation's coordinates, :func:`.leaf_first`) by columns on one thread (``factor`` over articulations);
+  the held tree's geometry takes :func:`dense_factor_kernel`, the same columns level by level over a warp's lanes;
 * :class:`.CholeskySolve`: the triangular solves (physical vectors in, physical vectors out, the reversal bound in
   the kit), with the zero-diagonal conventions as named options: a zero
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
@@ -34,14 +34,17 @@ import dataclasses
 import functools
 from collections.abc import Callable
 
+import numpy as np
 import warp as wp
 
-from . import kernel_template
+from . import field_group, kernel_template
 from .device_preludes import SHARED_STORAGE, lane_group, substitute
+from .field_group import Field
 from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
 from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
 from .staging import Buffer, Staging
+from .tree_plan import level_schedule, offsets
 
 __all__ = [
     "DENSE_JY_BUILDS",
@@ -220,113 +223,159 @@ def factor_coordinates_kernel() -> wp.Kernel:
     return _kernel("dense_factor_coordinates", FACTOR_ABI, body)
 
 
-# A warp per articulation reads its leaf-first H (P H P^T, the coordinates reversed) from the held tree's geometry into
-# shared memory, lane 0 factors it with the kit, and the lanes store the lower triangle, a row each in turn. The
-# diagonal rounds as (S F + R) + K. On the CPU one thread is the warp's every lane.
-_WARP_FACTOR = """
+# The held tree's factor, of any size. A warp per articulation assembles the entries of P H P^T in place in L (the
+# coordinates reversed; geometry, then R, then K of the physical coordinate on the diagonal: S F + R + K in that order)
+# and walks them level by level: each level's pivots, then the entries below them, left-looking, over the lanes. A pivot
+# leaves its reciprocal at the end of its row, in the upper triangle. Up to STAGED_FACTOR_SIZE the working L is in shared
+# memory and only the pattern's entries are published; past it L is factored in place in global memory, and the
+# reciprocals stay above the diagonal, which no reader of L reads. The CPU runs a warp's lanes on its first thread. A
+# structural zero of L stays the array's zero.
+_DENSE_FACTOR = """
     const int group = tid >> 5;
-    if (group >= n_arts) return;
+    if (group >= group_to_art.shape[0]) return;
 #if !defined(__CUDA_ARCH__)
-    // The CPU runs a warp's lanes on its first thread: the launch's other threads of the warp have no work.
     if ((tid & 31) != 0) return;
 #endif
-
     const int articulation = group_to_art.data[group];
     if (mass_update_mask.data[articulation] == 0) return;
-
-$STAGING
+    const int n = plan.size;
     const int dof_start = articulation_dof_start.data[articulation];
-    for (int schedule_index = LANE; schedule_index < $LOWER; schedule_index += STRIDE) {
-        const int element = lower_schedule.data[schedule_index];
-        const int row = element / $DOFS;
-        const int col = element - row * $DOFS;
-        const int geometry_entry = geometry_lookup.data[element];
-        float value = geometry_entry < 0 ? 0.0f : geometric.data[$GEOMETRY_ROW * $GEOMETRY_STRIDE + geometry_entry];
+    const float* mass = geometric.data + geometry_group.data[group] * geometric.shape[1];
+$STAGING
+    for (int entry = LANE; entry < plan.entry_count; entry += STRIDE) {
+        const int row = plan.rows.data[entry], col = plan.columns.data[entry];
+        const int geometry = plan.geometry.data[entry];
+        float value = geometry < 0 ? 0.0f : mass[geometry];
         if (row == col) {
-            const int physical = $DOFS - 1 - row;
-            value += R_group.data[group * $DOFS + physical];
+            const int physical = n - 1 - row;
+            value += R_group.data[group * n + physical];
             const int drive_row = drive_row_by_dof.data[dof_start + physical];
             if (drive_row >= 0) {
                 const float K = row_K.data[drive_row];
                 if (K > 0.0f) value += K;
             }
         }
-        factor[element] = value;
+        L[row * n + col] = value;
     }
     SYNC();
-
-    if (LANE == 0) {
-$FACTOR
+    for (int level = 0; level < plan.level_count; ++level) {
+        const int pivot_end = plan.factor_level_offsets.data[level + 1];
+        for (int pivot = plan.factor_level_offsets.data[level] + LANE; pivot < pivot_end; pivot += STRIDE) {
+            const int col = plan.factor_level_columns.data[pivot];
+            const int prefix = plan.row_offsets.data[col + 1] - 1;
+            float* own = L + col * n;
+            float value = own[col];
+            for (int entry = plan.row_offsets.data[col]; entry < prefix; ++entry) {
+                const float term = own[plan.columns.data[entry]];
+                value -= term * term;
+            }
+            value = sqrtf(value);
+            own[col] = value;
+            if (col + 1 < n) own[n - 1] = 1.0f / value;
+        }
+        SYNC();
+        const int work_end = plan.factor_level_entry_offsets.data[level + 1];
+        for (int work = plan.factor_level_entry_offsets.data[level] + LANE; work < work_end; work += STRIDE) {
+            const int target = plan.factor_level_entries.data[work];
+            const int col = plan.columns.data[target];
+            const int prefix = plan.row_offsets.data[col + 1] - 1;
+            float* below = L + plan.rows.data[target] * n;
+            const float* own = L + col * n;
+            float value = below[col];
+            for (int entry = plan.row_offsets.data[col]; entry < prefix; ++entry) {
+                const int k = plan.columns.data[entry];
+                value -= below[k] * own[k];
+            }
+            below[col] = value * own[n - 1];
+        }
+        SYNC();
     }
-    SYNC();
+$PUBLISH
+"""
 
-    for (int row = LANE; row < $DOFS; row += STRIDE) {
-        const int factor_base = group * $ELEMENTS;
-#pragma unroll
-        for (int col = 0; col <= row; ++col)
-            L_group.data[factor_base + row * $DOFS + col] = factor[row * $DOFS + col];
+_DENSE_FACTOR_PUBLISH = """
+    for (int entry = LANE; entry < plan.entry_count; entry += STRIDE) {
+        const int element = plan.rows.data[entry] * n + plan.columns.data[entry];
+        L_group.data[group * n * n + element] = L[element];
     }
 """
 
-_WARP_FACTOR_INPUTS = (
-    ("n_arts", int),
-    ("articulation_dof_start", wp.array[int]),
-    ("mass_update_mask", wp.array[int]),
-    ("group_to_art", wp.array[int]),
-    ("R_group", wp.array2d[float]),
-    ("lower_schedule", wp.array[int]),
-    ("drive_row_by_dof", wp.array[int]),
-    ("row_K", wp.array[float]),
-    ("geometric", wp.array2d[float]),
-    ("geometry_lookup", wp.array[int]),
+STAGED_FACTOR_SIZE = 32
+"""The largest articulation :func:`dense_factor_kernel` factors in shared memory."""
+
+DENSE_FACTOR_PLAN = (
+    Field("size", wp.int32),
+    Field("entry_count", wp.int32),
+    Field("level_count", wp.int32),
+    Field("rows", wp.int32, ("entry",)),
+    Field("geometry", wp.int32, ("entry",)),
+    Field("row_offsets", wp.int32, ("dof_bound",)),
+    Field("columns", wp.int32, ("entry",)),
+    Field("factor_level_offsets", wp.int32, ("level_bound",)),
+    Field("factor_level_columns", wp.int32, ("dof",)),
+    Field("factor_level_entry_offsets", wp.int32, ("level_bound",)),
+    Field("factor_level_entries", wp.int32, ("entry",)),
 )
+"""The lower pattern of a dense factor in leaf-first coordinates, fill included: each entry's row, column and geometry slot
+(``-1`` on fill), and the level schedule (:func:`.tree_plan.level_schedule`)."""
+
+DenseFactorPlan = field_group.struct("DenseFactorPlan", DENSE_FACTOR_PLAN, __name__)
 
 
-def leaf_index(physical_index) -> tuple[int, ...]:
-    """A symmetric physical ``(row, col)`` index grid (a square array) as the leaf-first factor's, flattened: factor
-    ``(row, col)`` reads physical ``(n - 1 - row, n - 1 - col)``."""
-    return tuple(map(int, physical_index[::-1, ::-1].ravel()))
+def dense_factor_plan(physical_lookup, device) -> DenseFactorPlan:
+    """The dense factor's plan from ``physical_lookup``, a symmetric physical ``(row, col)`` index of the held geometry
+    (``-1`` where structurally zero). The dense response's order reverses the coordinates, which is fill-free only for
+    joints in depth-first order, so the pattern takes its fill here."""
+    index = np.asarray(physical_lookup)[::-1, ::-1]
+    n = index.shape[0]
+    present = np.tril(index >= 0)
+    for col in range(n):
+        below = col + 1 + np.flatnonzero(present[col + 1 :, col])
+        present[np.ix_(below, below)] = True
+    rows, cols = np.nonzero(np.tril(present))
+    schedule = level_schedule(rows, cols, n)
+    return field_group.upload(
+        DenseFactorPlan,
+        device,
+        size=n,
+        entry_count=rows.size,
+        level_count=schedule["factor_level_offsets"].size - 1,
+        rows=rows.astype(np.int32),
+        geometry=index[rows, cols].astype(np.int32),
+        row_offsets=offsets(np.bincount(rows, minlength=n), np.int32),
+        columns=cols.astype(np.int32),
+        **schedule,
+    )
 
 
 @functools.cache
-def factor_warps_kernel(
-    size: int, geometric_index, *, warps_per_block: int = 4, geometric_stride: int = 0, geometric_group: bool = False
-) -> wp.Kernel:
-    """The held tree's leaf-first factor, one warp per articulation (``dim = articulations * 32``): each lower entry
-    of ``P H P^T`` read from the held geometry through ``geometric_index`` (the factor ``(row, col)`` entry's geometry
-    slot, :func:`leaf_index`; ``-1`` where structurally zero; rows of ``geometric_stride``, groups mapped to geometry
-    rows with ``geometric_group``), then ``R`` and the augmented drives' ``K`` of the physical coordinate on the
-    diagonal; lane 0 factors with the kit (:class:`.CholeskyFactor`, unrolled), the lanes store the lower triangle.
-    """
-    size, warps_per_block = int(size), int(warps_per_block)
-    if not 1 <= size <= 32 or not 1 <= warps_per_block <= 32:
-        raise ValueError("Small Cholesky requires 1..32 DOFs and 1..32 warps per block")
-    if len(geometric_index) != size * size or min(geometric_index) < -1:
-        raise ValueError("Geometric factor requires a complete physical matrix index")
-    if geometric_stride and geometric_stride <= max(geometric_index):
-        raise ValueError("Geometry stride must cover every indexed entry")
-    elements = size * size
-    inputs = list(_WARP_FACTOR_INPUTS)
-    row = "group"
-    if geometric_group:
-        inputs.append(("geometry_group", wp.array[int]))
-        row = "geometry_group.data[group]"
-    inputs.append(("L_group", wp.array3d[float]))
-    staging = Staging((Buffer("factor", "float", elements),), groups=warps_per_block, layout="arrays")
-    factor = CholeskyFactor(size, lambda row, col: f"factor[{row} * {size} + {col}]", unroll=True)
+def dense_factor_kernel(size: int) -> wp.Kernel:
+    """The held tree's leaf-first factor, one warp per articulation and four per block (``dim = articulations * 32``):
+    the pattern of ``plan`` (:func:`dense_factor_plan`) with the geometry of each group's ``geometry_group`` row, into
+    ``L_group``. Up to :data:`STAGED_FACTOR_SIZE` the working factor of ``size`` coordinates is in shared memory; past
+    it, or at 0, ``L_group`` holds it in place."""
+    size = int(size) if size <= STAGED_FACTOR_SIZE else 0
+    inputs = (
+        ("articulation_dof_start", wp.array[int]),
+        ("mass_update_mask", wp.array[int]),
+        ("group_to_art", wp.array[int]),
+        ("geometry_group", wp.array[int]),
+        ("plan", DenseFactorPlan),
+        ("R_group", wp.array2d[float]),
+        ("drive_row_by_dof", wp.array[int]),
+        ("row_K", wp.array[float]),
+        ("geometric", wp.array2d[float]),
+        ("L_group", wp.array3d[float]),
+    )
+    staging = Staging((Buffer("L", "float", size * size),), groups=4, layout="arrays").declarations() if size else ""
     snippet = substitute(
-        _WARP_FACTOR,
-        DOFS=size,
-        ELEMENTS=elements,
-        LOWER=size * (size + 1) // 2,
-        STAGING=staging.declarations(),
-        GEOMETRY_ROW=row,
-        GEOMETRY_STRIDE=geometric_stride or max(geometric_index) + 1,
-        FACTOR=_indent(factor.factor(), "        "),
+        _DENSE_FACTOR,
+        STAGING=staging or "    float* L = L_group.data + group * n * n;",
+        PUBLISH=_DENSE_FACTOR_PUBLISH if size else "",
     )
     return KernelTemplate(
-        f"geometric_dense_factor_warps{warps_per_block}_{size}",
-        tuple(inputs),
+        f"dense_factor_{size}",
+        inputs,
         snippet,
         THREADS,
         preludes=(lane_group(32), SHARED_STORAGE),
@@ -861,10 +910,6 @@ def _tile_threads(options) -> int:
     return int(options.get("tile_threads", 64))
 
 
-def _warps(options) -> int:
-    return 32 * int(options.get("warps_per_block", 4))
-
-
 _CFM_WORLDS = _entry("cfm", "worlds", cfm_worlds_kernel, ("worlds",))
 
 DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
@@ -872,7 +917,7 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("factor", "coordinates"): _entry(
         "factor", "coordinates", factor_coordinates_kernel, ("articulations", "coordinates")
     ),
-    ("factor", "warps"): _entry("factor", "warps", factor_warps_kernel, ("articulations", "32 lanes"), _warps),
+    ("factor", "levels"): _entry("factor", "levels", dense_factor_kernel, ("articulations", "32 lanes")),
     ("factor", "tiles"): _entry("factor", "tiles", factor_tiles_kernel, ("articulations",), _tile_threads, tiled=True),
     ("response", "rows"): _entry("response", "rows", response_rows_kernel, ("articulations", "rows")),
     ("response", "lanes"): _entry("response", "lanes", response_lanes_kernel, ("articulations", "32 lanes"), 256),

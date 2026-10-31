@@ -20,10 +20,10 @@ Scenes by topology:
   :func:`gripper` (an articulation holding a free box), :func:`keyboard` (a
   diagonal-mass articulation pressed by a six-coordinate arm) and :func:`hand`
   (a 17-coordinate articulation pressing a free cube);
-- articulations above the held-tree owner's cap of 64 bodies and 64
-  coordinates: :func:`sprawl` (a humanoid-like tree with two hands, 66
-  coordinates) and :func:`long_chain` (a 100-link snake), both resting on the
-  ground through one contact per link;
+- articulations too large for a warp's lanes and the native sparse factor's
+  masks, of more than 64 coordinates: :func:`sprawl` (a humanoid-like tree with
+  two hands, 66 coordinates) and :func:`long_chain` (a 100-link snake), both
+  resting on the ground through one contact per link;
 - contact torsion, each on single-point contacts where point friction has no
   lever arm: :func:`spin_decay` (T1), :func:`twist_threshold` (T2),
   :func:`pinch_twist` (T3, the soft-finger grasp) and :func:`slide_spin`
@@ -1198,7 +1198,7 @@ def hand(*, fingers: int = 4, segments: int = 4, press: float = 0.002, worlds: i
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Large articulations (above the held-tree owner's 64-body, 64-coordinate cap)
+# Large articulations (more than 64 coordinates: depth-level scans and a factor in global memory)
 # ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -1253,14 +1253,13 @@ def _limb(
     return joints, body
 
 
-def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4) -> Scene:
+def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4, worlds: int = 1) -> Scene:
     """A humanoid-like free torso lying on the ground with two hands, two legs and a neck: 66 coordinates.
 
     Arms (4 links) end in ``fingers`` fingers of ``finger_links`` links fanned
     in the ground plane, legs have 5 links and the neck 2. Every link carries a
     3 cm sphere and every joint lies at the spheres' height, so the whole tree
-    rests on the ground through one contact per link plus the torso's box. The
-    tree exceeds the held-tree owner's cap of 64 coordinates.
+    rests on the ground through one contact per link plus the torso's box.
     """
     radius = 0.03
 
@@ -1323,7 +1322,7 @@ def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4) -> Scene
             builder, torso, wp.vec3(0.2, 0.0, 0.0), 0.0, links=2, length=0.08, radius=radius, mass=0.2, mu=mu
         )
         builder.add_articulation(joints + neck)
-        return _finalize(builder, device)
+        return _finalize(_replicate(builder, worlds, None) if worlds > 1 else builder, device)
 
     return Scene(
         "sprawl",
@@ -1346,7 +1345,7 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
     Every link carries a 2 cm sphere, so the chain lands on and rests along
     its whole length; an optional ``pull`` [N] on the head body along ``+x``
     loads friction (the gate leaves it at zero). The chain has ``links + 1``
-    bodies and ``links + 6`` coordinates, above the held-tree owner's caps.
+    bodies and ``links + 6`` coordinates.
     Joint ``armature`` [kg·m²] (a geared joint's rotor inertia) bounds the
     condition number of the generalized mass matrix: a passive 100-link cable
     without it reaches about 4e8, beyond float32, and the solver adds the

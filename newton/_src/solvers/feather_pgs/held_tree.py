@@ -20,7 +20,7 @@ import warp as wp
 from ...sim import JointType
 from . import host_index
 from .device_proof import DeviceProof
-from .response_builds_dense import factor_warps_kernel, leaf_index
+from .response_builds_dense import dense_factor_kernel, dense_factor_plan
 from .response_builds_rows import sparse_factor_kernel
 from .route_table import capable
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
@@ -96,14 +96,6 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
         return "The FK/ID cache is unavailable."
     if not solver.factor.parallel_drives:
         return "The held tree needs the per-coordinate drive preparation (augmented drives, owned drive rows)."
-    if sparse is not None:
-        return None
-    # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32
-    # coordinates) into the solver's dense factor of the same shape, in place of the size's stage-2 factor; the
-    # compact diagonal size keeps its compact inverse.
-    for size in solver.forest.size_groups:
-        if size != compact and size > 32:
-            return f"Size {size} has no held Cholesky family (1 to 32 coordinates)."
     return None
 
 
@@ -299,19 +291,15 @@ class TreeHeldOperator:
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(group), dtype=int, device=device)
         self.data.status = wp.zeros(len(group), dtype=int, device=device)
+        self.geometry_group = wp.array(np.arange(len(group), dtype=np.int32), dtype=int, device=device)
         if self.diagonal:
             self.data.inverse = solver.factor.diagonal_inverse_mass
             self.geometry_index = wp.array(np.diag(physical_index).copy(), dtype=int, device=device)
-            self.geometry_group = wp.array(np.arange(len(group), dtype=np.int32), dtype=int, device=device)
             self.refresh_kernel = _diagonal_geometry
         else:
             self.data.lower = solver.factor.L_by_size[size]
-            index = leaf_index(physical_index)
-            self.geometry_index = wp.array(index, dtype=int, device=device)
-            self.refresh_kernel = factor_warps_kernel(size, index)
-            self.factor_schedule = wp.array(
-                [row * size + col for row in range(size) for col in range(row + 1)], dtype=int, device=device
-            )
+            self.factor_plan = dense_factor_plan(physical_index, device)
+            self.refresh_kernel = dense_factor_kernel(size)
         self.kinetic_state = None
 
     def refresh(self, state_aug):
@@ -341,16 +329,15 @@ class TreeHeldOperator:
                 self.refresh_kernel,
                 dim=solver.forest.n_arts_by_size[size] * 32,
                 inputs=[
-                    solver.forest.n_arts_by_size[size],
                     solver.forest.articulation_dof_start,
                     solver.factor.mass_update_mask,
                     self.plan.group_to_art,
+                    self.geometry_group,
+                    self.factor_plan,
                     solver.factor.R_by_size[size],
-                    self.factor_schedule,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     self.kinetic_state.geometric,
-                    self.geometry_index,
                 ],
                 outputs=[solver.factor.L_by_size[size]],
                 block_dim=128,
@@ -447,7 +434,7 @@ def forest_families(solver):
         return None
     if np.any(counts[per_world] != counts[per_world[0]]) or np.any(prescribed[per_world] != prescribed[per_world[0]]):
         return None
-    # One layout holds a world's trees: at most 64 bodies and coordinates (make_plan).
+    # One group holds a world's trees: at most 64 bodies and coordinates, each family a warp's lanes per row.
     bodies = np.diff(model.articulation_start.numpy())
     if bodies[per_world[0]].sum() > 64 or counts[per_world[0]].sum() > 64:
         return None
@@ -537,20 +524,15 @@ class ForestHeldOperator:
             group = solver.forest.group_to_art[family].numpy()
             position = {int(a): g for g, a in enumerate(group)}
             factor_index[:, r] = [position[int(a)] for a in arts[:, r]]
-            index = leaf_index(physical_index[offset : offset + family, offset : offset + family])
             # The family's factor groups read this root's block of their
             # world's geometry record (one record per forest group).
             self.families.append(
                 (
                     r,
                     family,
-                    factor_warps_kernel(family, index, geometric_stride=self.layout.entries, geometric_group=True),
-                    wp.array(
-                        [row * family + col for row in range(family) for col in range(row + 1)],
-                        dtype=int,
-                        device=device,
-                    ),
-                    wp.array(index, dtype=int, device=device),
+                    dense_factor_kernel(family),
+                    dense_factor_plan(physical_index[offset : offset + family, offset : offset + family], device),
+                    None,
                     wp.array(art_world[group].astype(np.int32), dtype=int, device=device),
                 )
             )
@@ -566,7 +548,7 @@ class ForestHeldOperator:
     def refresh(self, state_aug):
         """Refresh every root family's dense factor from the forest geometry."""
         solver = self.solver
-        for _r, family, kernel, schedule, geometry_index, geometry_group in self.families:
+        for _r, family, kernel, factor_plan, geometry_index, geometry_group in self.families:
             if family < 0:
                 size = -family
                 wp.launch(
@@ -592,17 +574,15 @@ class ForestHeldOperator:
                 kernel,
                 dim=solver.forest.n_arts_by_size[family] * 32,
                 inputs=[
-                    solver.forest.n_arts_by_size[family],
                     solver.forest.articulation_dof_start,
                     solver.factor.mass_update_mask,
                     solver.forest.group_to_art[family],
+                    geometry_group,
+                    factor_plan,
                     solver.factor.R_by_size[family],
-                    schedule,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     self.kinetic_state.geometric,
-                    geometry_index,
-                    geometry_group,
                 ],
                 outputs=[solver.factor.L_by_size[family]],
                 block_dim=128,

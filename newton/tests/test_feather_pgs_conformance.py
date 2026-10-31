@@ -36,9 +36,9 @@ Scenes and features
     loop, a mimic pair, a spring hinge, an arm under joint velocity limits, a
     legged robot standing on a free base, a gripper lifting a box, a
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
-    free cube, two articulations above the held-tree owner's caps (a
-    66-coordinate humanoid-like tree, a 100-link snake with and without joint
-    armature), and the CT benchmark of contact torsion (a decaying spin,
+    free cube, two articulations of more than 64 coordinates (a 66-coordinate
+    humanoid-like tree, a 100-link snake with and without joint armature), and
+    the CT benchmark of contact torsion (a decaying spin,
     articulated and free, a twist threshold, a soft-finger pinch, a sliding
     and spinning sphere) and contact compliance (a drop, a plate's elastic
     split, a stack, a compliant pinch). Articulated contact
@@ -1709,12 +1709,12 @@ def cuda_groups() -> list:
                 (PAIRED.but("paired_torsion", expect={"friction.torsion": True}),),
             ),
             # The tiers form the response in-kernel, which bounds an articulation at 32 coordinates: the sprawl (66)
-            # and the snake (106) take no tier, even pinned.
-            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT,)),
-            Group(_physics(scenes.long_chain(), law, 64), ref, (MF_DEFAULT,)),
+            # and the snake (106) take no tier, even pinned. The held tree's factor runs in global memory.
+            Group(_physics(scenes.sprawl(), law, 64), ref, (MF_HELD,)),
+            Group(_physics(scenes.long_chain(), law, 64), ref, (MF_HELD,)),
             # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
             # armature it needs near the head, the same on every route.
-            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT,)),
+            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_HELD,)),
             Group(_physics(scenes.twist_threshold(), law, 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)),
         ]
     groups += [

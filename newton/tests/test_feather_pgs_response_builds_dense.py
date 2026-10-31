@@ -87,8 +87,8 @@ class TestRegistry(unittest.TestCase):
             n_dofs=18, max_constraints=32, tile_threads=64, compute_diag=True
         )
         self.assertEqual((tiles.block_dim, tiles.tiled, tiles.grid), (64, True, ("articulations", "row chunks")))
-        warps = builds.DENSE_JY_BUILDS["factor", "warps"](size=9, geometric_index=tuple(range(81)), warps_per_block=2)
-        self.assertEqual((warps.block_dim, warps.tiled), (64, False))
+        levels = builds.DENSE_JY_BUILDS["factor", "levels"](size=9)
+        self.assertEqual((levels.kernel, levels.tiled), (builds.dense_factor_kernel(9), False))
         for stage, _mapping in builds.DENSE_JY_BUILDS:
             self.assertIn(stage, builds.STAGES)
 

@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 
 from .device_preludes import dual_native, lane_group, substitute
+from .staging import STATIC_SHARED_BYTES
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,9 @@ class TreeLayout:
     # Threads per tree. Small trees share a 32-thread block (two 16-lane
     # trees, eight 4-lane trees, ...) with warp-level barriers; 64 gives a tree
     # two warps (more than 32 bodies, or heavy chains packed into two warps);
-    # 0 selects one tree per block of the warps its bodies need.
+    # 0 selects one tree per block of the warps its bodies need. A tree of more
+    # than 64 bodies takes 64: every stage strides its bodies over the lanes,
+    # and only the depth-level scans fit it (tree_scan.choose_schedule).
     lanes: int = 0
     # A forest: local body index of every root (one tree: (0,)), each root's
     # coordinate count (0 fixed, 6 free, or a joint's), its coordinate offset
@@ -37,10 +40,13 @@ class TreeLayout:
     # (linear and angular axes, or several angular ones). The motion scan
     # then reads each joint's own bias instead of taking it as zero.
     own_bias: bool = False
+    # Static shared memory a block may declare on the group's device [B]
+    # (:func:`.staging.static_budget`): the state block's placement reads it.
+    shared_budget: int = STATIC_SHARED_BYTES
 
     def __post_init__(self):
-        if not (1 <= self.bodies <= 64 and 1 <= self.dofs <= 64 and 0 <= self.max_depth < self.bodies):
-            raise ValueError("Cached trees require at most 64 bodies and coordinates")
+        if not (self.bodies >= 1 and self.dofs >= 1 and 0 <= self.max_depth < self.bodies):
+            raise ValueError("Cached trees require bodies, coordinates and a depth below the bodies")
         if not self.root_coordinates:
             object.__setattr__(self, "root_coordinates", (self.root_dofs,))
         if not self.root_families:
@@ -62,8 +68,8 @@ class TreeLayout:
             raise ValueError("Cached forest roots start at body 0 and are fixed, free or a joint's coordinates")
         if self.lanes == 0:
             object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
-        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies:
-            raise ValueError("Cached tree lanes must be a power of two covering every body")
+        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < min(self.bodies, 64):
+            raise ValueError("Cached tree lanes must be a power of two covering every body, or 64")
         if self.root_dofs != self.root_coordinates[0] or self.root_dofs > self.dofs:
             raise ValueError("Cached trees require their root's coordinate count")
         if sorted(self.permutation) != list(range(self.dofs)):
@@ -90,6 +96,16 @@ class TreeLayout:
     @property
     def origin_offset(self):
         return self.moment_offset + 13 * self.bodies
+
+    @property
+    def total(self):
+        """Words of a tree's state block."""
+        return self.origin_offset + 6 * len(self.roots)
+
+    @property
+    def global_block(self):
+        """Whether a block of state exceeds the device's shared memory and lives in the plan's global scratch."""
+        return 4 * self.total * self.pack > self.shared_budget
 
     @property
     def rounds(self):
@@ -158,7 +174,7 @@ class TreeLayout:
             "WRENCH": self.wrench_offset,
             "MOMENT": self.moment_offset,
             "ORIGIN": self.origin_offset,
-            "TOTAL": self.origin_offset + 6 * len(self.roots),
+            "TOTAL": self.total,
             "ROOT_COUNT": len(self.roots),
             "FREE_ROOTS": self.free_root_count,
             "WHITE": 6 * self.bodies + self.dofs,

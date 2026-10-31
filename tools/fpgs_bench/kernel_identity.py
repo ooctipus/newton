@@ -143,10 +143,9 @@ def factory_calls():
 
     Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
     hold the suite's shapes); the fallback and linked parallel tiers of a
-    second keyed-row coordinate layout (one articulation, no secondary block),
-    the Cholesky factor families with the held trees' geometric refreshes
-    (:func:`held_factor_calls`) follow. Calls a factory rejects are recorded as
-    rejected.
+    second keyed-row coordinate layout (one articulation, no secondary block)
+    and the Cholesky factor families follow. Calls a factory rejects are
+    recorded as rejected.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_rows,
@@ -188,17 +187,9 @@ def factory_calls():
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
 
     dense = "response_builds_dense."
-    warps = _unwrapped(response_builds_dense.factor_warps_kernel)
     tiles = _unwrapped(response_builds_dense.factor_tiles_kernel)
+    yield dense + "dense_factor_kernel", _unwrapped(response_builds_dense.dense_factor_kernel), (0,), {}
     for size in (6, 9, 16):
-        index = Named(f"range({size * size})", tuple(range(size * size)))
-        yield dense + "factor_warps_kernel", warps, (size, index), {}
-        yield (
-            dense + "factor_warps_kernel",
-            warps,
-            (size, index),
-            {"geometric_stride": size * size + 1, "geometric_group": True},
-        )
         yield dense + "factor_tiles_kernel", tiles, (size,), {}
         yield (
             "tree_ordinary.triangular_solve_kernel",
@@ -206,64 +197,6 @@ def factory_calls():
             (size, ARCH),
             {},
         )
-    yield from held_factor_calls()
-
-
-def held_factor_calls():
-    """Yield the geometric Cholesky refreshes of held trees, indexed as their owners index them.
-
-    A topology lists each joint's parent and coordinate count. Its sparse mass
-    plan numbers the packed physical geometry, and the refresh of a held
-    factor reads that record through a physical (row, col) index, as the tree
-    and forest operators of ``held_tree`` bind it: a tree reads its
-    own record; each held family of a forest reads its root's block of the
-    forest's record, whose stride is the forest's entry count, through a group
-    map. A prescribed root (family 0) holds no factor.
-    """
-    import numpy as np  # noqa: PLC0415
-
-    from newton._src.solvers.feather_pgs import response_builds_dense  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.tree_plan import TreePlan  # noqa: PLC0415
-
-    def chains(count, length, *, base=()):
-        """A fixed root, or ``base``, carrying ``count`` revolute chains of ``length`` joints at its last joint."""
-        joints = list(base) or [(-1, 0)]
-        attach = len(joints) - 1
-        for _ in range(count):
-            parent = attach
-            for _ in range(length):
-                joints.append((parent, 1))
-                parent = len(joints) - 1
-        return joints
-
-    free_body = [(-1, 6)]
-    arm = chains(1, 7)
-    leaves = [*arm, (len(arm) - 1, 1), (len(arm) - 1, 1)]
-    warps = _unwrapped(response_builds_dense.factor_warps_kernel)
-    for name, trees, families in (
-        ("four_chains", (chains(4, 4),), None),
-        ("free_body", (free_body,), None),
-        ("chain_two_leaves+free+prescribed", (leaves, free_body, free_body), (9, 6, 0)),
-        ("chain_four_chains+free+prescribed", (chains(4, 4, base=arm), free_body, free_body), (23, 6, 0)),
-    ):
-        joints = [
-            (parent + sum(map(len, trees[:position])) if parent >= 0 else -1, count)
-            for position, tree in enumerate(trees)
-            for parent, count in tree
-        ]
-        mass = TreePlan.build(*map(np.asarray, zip(*joints, strict=True))).factor
-        physical = mass.physical_lookup
-        if families is None:
-            index = Named(f"{name}.index", tuple(map(int, physical.ravel())))
-            yield "response_builds_dense.factor_warps_kernel", warps, (mass.dof_count, index), {}
-            continue
-        offsets = np.cumsum([0, *(sum(count for _, count in tree) for tree in trees[:-1])])
-        for root, (family, offset) in enumerate(zip(families, offsets, strict=True)):
-            if family:
-                block = physical[offset : offset + family, offset : offset + family]
-                index = Named(f"{name}.index[{root}]", tuple(map(int, block.ravel())))
-                kwargs = {"geometric_stride": mass.nonzero_count, "geometric_group": True}
-                yield "response_builds_dense.factor_warps_kernel", warps, (family, index), kwargs
 
 
 def _schedules(layout, chain, reference=False):

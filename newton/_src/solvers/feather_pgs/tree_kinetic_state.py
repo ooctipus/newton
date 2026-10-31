@@ -49,6 +49,8 @@ HELD_PLAN = (
     Field("free_root_local", wp.int32, ("free_root",), owner="plan"),
     Field("free_root_dof", wp.int32, ("free_root",), owner="plan"),
     Field("dof_passive", wp.int32, ("dof",), owner="plan"),
+    # The trees' state blocks where they exceed shared memory (TreeLayout.global_block): a tree's TOTAL words.
+    Field("scratch", wp.float32, ("scratch",), owner="plan"),
 )
 """A held group's template tree as its kernels read it: the scan plan (:data:`.tree_scan.SCAN_PLAN`) and the
 group's coordinate maps."""
@@ -228,16 +230,6 @@ def _thread_helpers(layout):
 # Unpacked (one tree per block) helpers under their module-level names, for the
 # tools tests that drive the natives directly.
 _lanes, _sync, _sub, _different_motion = _thread_helpers(REFERENCE_LAYOUT)
-
-
-# The default form's release (see _STORAGE_SOURCE): its free never links on
-# the CPU and is kept verbatim for the CUDA tree kernels' content hashes.
-@wp.func_native(r"""
-#if !defined(__CUDA_ARCH__)
-    free(reinterpret_cast<void*>(address));
-#endif
-""")
-def _release(address: wp.uint64): ...
 
 
 @wp.func_native(
@@ -558,8 +550,8 @@ _PREDICT = r"""    $PHYSICAL_TABLE
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
-    __shared__ float s_all[$PRED_SCRATCH*$PACK];__shared__ int nonzero_all[$PACK];
-    float* s=s_all+SUB*$PRED_SCRATCH;int& nonzero=nonzero_all[SUB];
+    $SCRATCH
+    __shared__ int nonzero_all[$PACK];int& nonzero=nonzero_all[SUB];
 #else
     const int lane=0,stride=1;
     float s[$PRED_SCRATCH];int nonzero=0;
@@ -620,47 +612,29 @@ $CLOCK4    // A prescribed (kinematic) free root keeps its given velocity: no tr
     $TRANSPORT_BLOCK
 $TWIST_BLOCK$CLOCK5"""
 
-# The default form, which CUDA owners launch, keeps one tree's state block in
-# shared memory; packed trees take consecutive blocks of one array. Its CPU
-# branch never links: Warp's CPU JIT links only a curated C runtime subset,
-# without malloc and free. That branch and the free in _release stay verbatim
-# because this text is part of every CUDA tree kernel's content hash (its
-# kernel-cache key). An owner on the CPU builds the host=True form below.
+
+def _placed_block(layout: TreeLayout, name: str, words: str) -> str:
+    """Native statements binding ``float* name`` to this tree's block of ``words`` floats, the one placement rule: shared
+    memory, packed trees in consecutive blocks of one array, unless the device has no room for the group's state
+    (:attr:`.TreeLayout.global_block`), then the tree's words of the plan's global scratch. Every barrier the stages
+    take fences global memory too, so no stage reads where its block lies; both hold the same values. ``plan`` and
+    ``group`` are in scope."""
+    if layout.global_block:
+        return f"float* {name}=plan.scratch.data+group*{words};"
+    return f"__shared__ float {name}_all[{words}*$PACK];float* {name}={name}_all+SUB*{words};"
+
+
+# A CPU launch runs its blocks one after another on the launching thread, each done with the block before the next, so
+# its block is static storage. Concurrent CPU launches of one kernel from several threads would share it (the JIT has no
+# thread-local storage); only direct-construction tests build CPU owners.
 _STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    __shared__ float values[$TOTAL*$PACK];
-    return reinterpret_cast<uint64_t>(values+SUB*$TOTAL);
-#else
-    return reinterpret_cast<uint64_t>(malloc($TOTAL*sizeof(float)));
-#endif
-"""
-
-# The host=True form keeps the CPU scratch in static storage: a CPU launch runs
-# its blocks one after another on the launching thread, and each block is done
-# with the scratch before the next. Concurrent CPU launches of one kernel from
-# several threads would share it (the JIT has no thread-local storage); only
-# direct-construction tests build CPU owners.
-_HOST_STORAGE_SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    __shared__ float values[$TOTAL*$PACK];
-    return reinterpret_cast<uint64_t>(values+SUB*$TOTAL);
+    $BLOCK
+    return reinterpret_cast<uint64_t>(values);
 #else
     static float values[$TOTAL];return reinterpret_cast<uint64_t>(values);
 #endif
 """
-
-
-def _host_storage(layout):
-    """Return the scratch of an owner on the CPU, which the kernels release with ``_keep_static``."""
-
-    @wp.func_native(layout.native(_HOST_STORAGE_SOURCE))
-    def _storage() -> wp.uint64: ...
-
-    return _storage
-
-
-@wp.func_native("")
-def _keep_static(address: wp.uint64): ...
 
 
 _STORE_TERMS_SOURCE = r"""
@@ -709,15 +683,12 @@ def get_helpers(
     body_velocity: bool = False,
     *,
     clocked: bool = False,
-    host: bool = False,
 ):
     """Bind one physical tree evaluation to its storage and its scans' schedules.
 
     ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
     term (16-21) counters. Both arguments change the emitted code, so they are
-    arguments (cache-key members), never environment reads. ``host`` keeps
-    the CPU scratch in static storage (see ``_HOST_STORAGE_SOURCE``); the
-    default is the form CUDA owners launch.
+    arguments (cache-key members), never environment reads.
     """
     pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
     motion_source = _down(layout, ts.TWIST if layout.own_bias else _MOTION, schedules.motion, _MOTION_SLOTS)
@@ -732,8 +703,8 @@ def get_helpers(
         **_native_clocks(clocked, "cache", stages=3, column=13),
     )
 
-    @wp.func_native(layout.native(_STORAGE_SOURCE))
-    def _storage() -> wp.uint64: ...
+    @wp.func_native(layout.native(_STORAGE_SOURCE, BLOCK=_placed_block(layout, "values", "$TOTAL")))
+    def _storage(plan: HeldPlan, group: int) -> wp.uint64: ...
 
     @wp.func_native(
         layout.render("float* s=reinterpret_cast<float*>(address)+$MOTION;for(int k=0;k<6;++k)s[6*body+k]=v[k];")
@@ -877,7 +848,7 @@ def get_helpers(
         _load_origin=_load_origin,
         _scan_motion=_scan_motion,
         _scan_poses=_scan_poses,
-        _storage=_host_storage(layout) if host else _storage,
+        _storage=_storage,
         _store_axis=_store_axis,
         _store_bias=_store_bias,
         _store_motion=_store_motion,
@@ -897,7 +868,6 @@ def get_state_kernel(
     listed: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
-    host: bool = False,
 ):
     """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
 
@@ -933,8 +903,7 @@ def get_state_kernel(
     pass of its own would cost a launch. Classified launches compare in
     :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
-    the stages, 22-24 for motion; see :func:`get_helpers`); ``host`` the
-    static CPU scratch of an owner on the CPU.
+    the stages, 22-24 for motion; see :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -944,8 +913,7 @@ def get_state_kernel(
         raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
-    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, host=host)
-    release = _keep_static if host else _release
+    h = get_helpers(layout, schedules, body_velocity, clocked=clocked)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1306,7 +1274,7 @@ def get_state_kernel(
         # publication, collection.
         if wp.static(clocked):
             clock_0 = _clock()
-        g.address = _storage()
+        g.address = _storage(plan, g.group)
         q = data.joint_q
         qd = data.joint_qd
         if wp.static(finish):
@@ -1352,7 +1320,6 @@ def get_state_kernel(
                 data.stage_clocks[g.group, 5] = clock_4 - clock_3
                 data.stage_clocks[g.group, 6] = clock_5 - clock_4
                 data.stage_clocks[g.group, 7] = clock_6 - clock_5
-        release(g.address)
 
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
     if layout.forest:
@@ -1669,7 +1636,11 @@ def get_predictor_kernel(
         raise ValueError("Unknown held tree response representation")
     operations["TWIST_BLOCK"] = _twist_block() if twists else ""
     source = layout.native(
-        _PREDICT, preludes=SPATIAL.preludes(), **operations, **_native_clocks(clocked, "f", stages=5, column=8)
+        _PREDICT,
+        preludes=SPATIAL.preludes(),
+        SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
+        **operations,
+        **_native_clocks(clocked, "f", stages=5, column=8),
     )
 
     _, _, _sub, _ = _thread_helpers(layout)

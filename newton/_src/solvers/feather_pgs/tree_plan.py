@@ -23,9 +23,9 @@ template tree and a whole model alike):
   (:meth:`TreePlan.factor`) and its row support classes
   (:meth:`TreePlan.support_classes`).
 
-Plans of a template tree (at most 64 nodes and coordinates) also carry the
-schedule data the native scans bake in; :func:`local_parents` maps a model's
-global ancestors to template-local parents. The ragged-array steps (CSR bounds,
+Plans of a template tree also carry the schedule data the native scans bake
+in; :func:`local_parents` maps a model's global ancestors to template-local
+parents. The ragged-array steps (CSR bounds,
 grouping by key, ranks within segments) are the host index toolkit's.
 """
 
@@ -135,9 +135,9 @@ class FactorPattern:
     """Packed entry of physical (row, column), symmetric."""
     dof_joint: np.ndarray
     ancestor_mask: np.ndarray
-    """Factor-coordinate support of each physical coordinate's node."""
+    """Factor-coordinate support of each physical coordinate's node (64 coordinates at most, else zero)."""
     joint_ancestor_mask: np.ndarray
-    """Factor-coordinate support of each node (its own and its ancestors' coordinates)."""
+    """Factor-coordinate support of each node, its own and its ancestors' coordinates (as :attr:`ancestor_mask`)."""
     column_offsets: np.ndarray
     column_entries: np.ndarray
     levels: np.ndarray
@@ -158,6 +158,27 @@ class FactorPattern:
     @property
     def factor_level_count(self) -> int:
         return int(self.factor_level_offsets.size - 1)
+
+
+def level_schedule(rows: np.ndarray, cols: np.ndarray, n: int) -> dict:
+    """The dependency schedule of a lower factor of ``n`` coordinates whose entries ``(rows, cols)`` are in row-major
+    order, each row ending in its diagonal: a pivot depends on the earlier columns its row holds, so columns of a level
+    (sibling subtrees) and the entries below them run together. The fields of :class:`FactorPattern`."""
+    row_offsets = offsets(np.bincount(rows, minlength=n), np.int32)
+    levels = np.zeros(n, dtype=np.int32)
+    for col in range(n):
+        previous = cols[row_offsets[col] : row_offsets[col + 1] - 1]
+        levels[col] = 0 if not previous.size else 1 + int(levels[previous].max())
+    level_count = int(levels.max()) + 1
+    off = np.flatnonzero(rows != cols)
+    entries = off[np.lexsort((rows[off], cols[off], levels[cols[off]]))]
+    return {
+        "levels": levels,
+        "factor_level_offsets": offsets(np.bincount(levels, minlength=level_count), np.int32),
+        "factor_level_columns": np.argsort(levels, kind="stable").astype(np.int32),
+        "factor_level_entry_offsets": offsets(np.bincount(levels[cols[entries]], minlength=level_count), np.int32),
+        "factor_level_entries": entries.astype(np.int32),
+    }
 
 
 @dataclass(frozen=True, eq=False)
@@ -487,10 +508,11 @@ class TreePlan:
     # --- the joint-space inertia's factor -------------------------------------------------------------------------
     @functools.cached_property
     def factor(self) -> FactorPattern:
-        """The fill-free factor pattern of the joint-space inertia (64 coordinates at most)."""
+        """The fill-free factor pattern of the joint-space inertia, of any size; its ``uint64`` masks hold at most 64
+        coordinates (zero past that)."""
         n = self.dof_count
-        if not 1 <= n <= 64 or np.any(self.dofs > 64):
-            raise ValueError("Factor patterns cover 1 to 64 coordinates")
+        if n < 1:
+            raise ValueError("Factor patterns cover at least one coordinate")
         start = self.dof_start.astype(np.int64)
         # Leaf-first: the reverse depth-first order of the nodes, each node's coordinates reversed.
         permutation = np.concatenate(
@@ -501,8 +523,10 @@ class TreePlan:
         # Support of each node in factor coordinates: the coordinates of its ancestors and itself.
         support = np.zeros((self.count, n), dtype=bool)
         support[:, inverse] = self.ancestor_matrix()[:, dof_joint]
-        weights = np.left_shift(np.uint64(1), np.arange(n, dtype=np.uint64))
-        joint_masks = np.bitwise_or.reduce(np.where(support, weights, np.uint64(0)), axis=1).astype(np.uint64)
+        joint_masks = np.zeros(self.count, dtype=np.uint64)
+        if n <= 64:
+            weights = np.left_shift(np.uint64(1), np.arange(n, dtype=np.uint64))
+            joint_masks = np.bitwise_or.reduce(np.where(support, weights, np.uint64(0)), axis=1).astype(np.uint64)
         present = np.tril(support[dof_joint[permutation]].T)  # [row, col]: col's node is supported by row
         rows, cols = np.nonzero(present)
         lookup = np.full((n, n), -1, dtype=np.int32)
@@ -513,16 +537,7 @@ class TreePlan:
         physical_lookup = np.full((n, n), -1, dtype=np.int32)
         a, b = permutation[rows], permutation[cols]
         physical_lookup[a, b] = physical_lookup[b, a] = np.arange(rows.size, dtype=np.int32)
-        # A pivot depends on the earlier columns its row holds; sibling subtrees share a level.
-        levels = np.zeros(n, dtype=np.int32)
-        for col in range(n):
-            previous = np.flatnonzero(lookup[col, :col] >= 0)
-            levels[col] = 0 if not previous.size else 1 + int(levels[previous].max())
-        level_count = int(levels.max()) + 1
-        level_offsets = offsets(np.bincount(levels, minlength=level_count), np.int32)
-        off = np.flatnonzero(rows != cols)
-        entries = off[np.lexsort((rows[off], cols[off], levels[cols[off]]))]
-        entry_offsets = offsets(np.bincount(levels[cols[entries]], minlength=level_count), np.int32)
+        schedule = level_schedule(rows, cols, n)
         values = {
             "permutation": permutation,
             "inverse_permutation": inverse,
@@ -536,11 +551,7 @@ class TreePlan:
             "joint_ancestor_mask": joint_masks,
             "column_offsets": column_offsets,
             "column_entries": column_order.astype(np.int32),
-            "levels": levels,
-            "factor_level_offsets": level_offsets,
-            "factor_level_columns": np.argsort(levels, kind="stable").astype(np.int32),
-            "factor_level_entry_offsets": entry_offsets,
-            "factor_level_entries": entries.astype(np.int32),
+            **schedule,
         }
         for value in values.values():
             value.setflags(write=False)

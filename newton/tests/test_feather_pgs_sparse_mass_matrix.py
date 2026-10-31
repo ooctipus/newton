@@ -139,7 +139,6 @@ class TestSparseMassMatrix(unittest.TestCase):
             ([-2], [1]),
             ([-1], [-1]),
             ([-1], [1.5]),
-            ([-1], [65]),
             ([-1], []),
             ([], []),
         ]:
