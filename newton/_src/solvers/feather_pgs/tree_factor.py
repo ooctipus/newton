@@ -73,12 +73,13 @@ def prepare_augmented_drives(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    passive_damping: wp.array[float],
     dt: float,
     row_K: wp.array[float],
     drive_tau: wp.array[float],
 ):
-    """Each coordinate's augmented drive, ``K`` (:func:`.spatial_laws.drive_stiffness`) and ``u0``
-    (:func:`.spatial_laws.drive_force`), from the immutable DOF-to-row topology."""
+    """Each coordinate's augmented drive, ``K`` (:func:`.spatial_laws.drive_stiffness`, its passive damper's with it)
+    and ``u0`` (:func:`.spatial_laws.drive_force`), from the immutable DOF-to-row topology."""
     dof = wp.tid()
     drive_tau[dof] = 0.0
     row = drive_row_by_dof[dof]
@@ -86,7 +87,7 @@ def prepare_augmented_drives(
         return
     ke = joint_target_ke[dof]
     kd = joint_target_kd[dof]
-    K = drive_stiffness(ke, kd, dt)
+    K = drive_stiffness(ke, kd, passive_damping[dof], dt)
     if K <= 0.0:
         row_K[row] = 0.0
         return
@@ -784,6 +785,7 @@ class TreeFactor:
                         control.joint_target_q,
                         control.joint_target_qd,
                         model.joint_effort_limit,
+                        self.passive_joint_damping,
                         dt,
                     ],
                     outputs=[self.aug_row_K, self.joint_tau],

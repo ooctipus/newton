@@ -984,6 +984,7 @@ def prepare_articulation_augmented_drives(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    passive_damping: wp.array[float],
     max_dofs: int,
     dt: float,
     # outputs
@@ -1015,10 +1016,7 @@ def prepare_articulation_augmented_drives(
             dof_index = qd_start + axis
             ke = joint_target_ke[dof_index]
             kd = joint_target_kd[dof_index]
-            if ke <= 0.0 and kd <= 0.0:
-                continue
-
-            K = drive_stiffness(ke, kd, dt)
+            K = drive_stiffness(ke, kd, passive_damping[dof_index], dt)
             if K <= 0.0:
                 continue
 
@@ -1080,6 +1078,7 @@ def eval_rigid_tau_and_augmented_drives(
         joint_target_pos,
         joint_target_vel,
         joint_effort_limit,
+        d.damping,
         max_dofs,
         dt,
         row_counts,

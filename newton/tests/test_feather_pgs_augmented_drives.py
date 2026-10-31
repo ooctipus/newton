@@ -134,6 +134,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                                 state.joint_q,
                                 state.joint_qd,
                                 *gains,
+                                wp.zeros(model.joint_dof_count, dtype=float, device=device),
                                 dt,
                             ],
                             outputs=[row_K, tau],
@@ -300,7 +301,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         np.testing.assert_allclose(combined_tau.numpy(), expected_tau, rtol=0.0, atol=1.0e-6)
         np.testing.assert_array_equal(combined_counts.numpy(), [2])
         np.testing.assert_array_equal(combined_indices.numpy(), [0, 1])
-        np.testing.assert_allclose(combined_stiffness.numpy(), [0.2, 0.4], rtol=0.0, atol=1.0e-7)
+        # The drive's K, ke dt^2 + kd dt, with the passive damper's, c dt.
+        np.testing.assert_allclose(combined_stiffness.numpy(), [0.22, 0.43], rtol=0.0, atol=1.0e-7)
 
         topology_stiffness = wp.zeros_like(combined_stiffness)
         topology_tau = wp.zeros_like(combined_tau)
@@ -310,7 +312,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             wp.launch(
                 prepare_augmented_drives,
                 dim=2,
-                inputs=[rows, rows, rows, joint_q, joint_qd, ke, kd, target_q, target_qd, effort_limit, 0.1],
+                inputs=[rows, rows, rows, joint_q, joint_qd, ke, kd, target_q, target_qd, effort_limit, damping, 0.1],
                 outputs=[stiffness, tau],
                 device=device,
             )
@@ -322,13 +324,13 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         # The combined kernel's force is one fp32 sum of the joint force and the drive force.
         np.testing.assert_array_equal(sequential_tau.numpy() + topology_tau.numpy(), combined_tau.numpy())
 
-        # Without gains neither preparation keeps a drive row or a drive force.
+        # Without gains neither preparation keeps a drive force, and the passive damper keeps its K.
         zero_target_ke = wp.zeros_like(target_ke)
         zero_target_kd = wp.zeros_like(target_kd)
         passive_stiffness = wp.array([7.0, 7.0], dtype=wp.float32, device=device)
         passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
         prepare_by_dof(zero_target_ke, zero_target_kd, passive_stiffness, passive_tau)
-        np.testing.assert_array_equal(passive_stiffness.numpy(), [0.0, 0.0])
+        np.testing.assert_allclose(passive_stiffness.numpy(), [0.02, 0.03], rtol=0.0, atol=1.0e-7)
         np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
 
         passive_counts = wp.array([7], dtype=wp.int32, device=device)
@@ -351,7 +353,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             outputs=[passive_counts, wp.zeros_like(combined_indices)],
             device=device,
         )
-        np.testing.assert_array_equal(passive_counts.numpy(), [0])
+        np.testing.assert_array_equal(passive_counts.numpy(), [2])
         np.testing.assert_array_equal(passive_combined_tau.numpy(), sequential_tau.numpy())
 
 

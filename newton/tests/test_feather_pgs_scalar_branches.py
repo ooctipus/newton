@@ -733,6 +733,7 @@ class _PrismaticRoute:
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                s.factor.passive_joint_damping,
                 dt,
             ],
             outputs=[s.factor.aug_row_K, s.factor.joint_tau],
@@ -1460,6 +1461,7 @@ class TestScalarBranchKernels(unittest.TestCase):
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                head.factor.passive_joint_damping,
                 DT,
             ],
             outputs=[head.factor.aug_row_K, head.factor.joint_tau],
@@ -1517,15 +1519,16 @@ def _normal_impulses(test, solver, count):
 
 
 def _key_inertia(model, leaves, dofs, axes):
-    """A prismatic key's mass along its coordinate [kg]: ``m |S|^2 + armature + ke dt^2 + kd dt``.
+    """A prismatic key's mass along its coordinate [kg]: ``m |S|^2 + armature + ke dt^2 + (kd + damping) dt``.
 
-    ``axes`` are the keys' motion axes ``S`` in float64; the last two terms are the implicit drive's.
+    ``axes`` are the keys' motion axes ``S`` in float64; the last terms are the implicit drive's and passive damper's.
     """
     m = model.body_mass.numpy()[leaves].astype(np.float64)
     ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
     kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
     armature = model.joint_armature.numpy()[dofs].astype(np.float64)
-    return m * np.sum(axes * axes, axis=1) + armature + ke * DT * DT + kd * DT
+    damping = model.joint_damping.numpy()[dofs].astype(np.float64)
+    return m * np.sum(axes * axes, axis=1) + armature + ke * DT * DT + (kd + damping) * DT
 
 
 def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
@@ -1534,7 +1537,7 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     Without contacts or active limits a prismatic key of mass ``m`` and unit
     motion axis ``S`` on a fixed root follows the implicit drive of zero targets
     with its passive spring and damping and gravity along the axis:
-    ``(m |S|^2 + armature + ke dt^2 + kd dt) (qd' - qd) / dt = m S.g + push
+    ``(m |S|^2 + armature + ke dt^2 + (kd + damping) dt) (qd' - qd) / dt = m S.g + push
     + spring (ref - q) - damping qd - (ke (q + dt qd) + kd qd)``, then
     ``q' = q + dt qd'``. ``push(step)`` gives a step's external generalized force.
     """

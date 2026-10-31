@@ -116,16 +116,17 @@ def _drive_terms(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    damping: wp.array[float],
 ):
     """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
-    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): an undriven coordinate and a
+    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row and a
     nonpositive ``K`` contribute neither."""
     u0 = float(0.0)
     stiffness = float(0.0)
     if drive_row_by_dof[dof] >= 0:
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
-        K = drive_stiffness(ke, kd, dt)
+        K = drive_stiffness(ke, kd, damping[dof], dt)
         if K <= 0.0:
             stiffness = 0.0
         else:
@@ -299,6 +300,7 @@ def predict_prismatic_branches(
         joint_target_pos,
         joint_target_vel,
         joint_effort_limit,
+        damping,
     )
     value = _leaf_force(motion, body_force, dof, q, qd, joint_f, spring_stiffness, spring_ref, damping)
     value += u0
@@ -401,6 +403,7 @@ def prepare_listed_augmented_drives(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    damping: wp.array[float],
     dt: float,
     # outputs
     row_K: wp.array[float],
@@ -424,6 +427,7 @@ def prepare_listed_augmented_drives(
         joint_target_pos,
         joint_target_vel,
         joint_effort_limit,
+        damping,
     )
     row_K[row] = stiffness
     drive_tau[dof] = u0
@@ -723,6 +727,7 @@ class ScalarBranchState:
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                solver.factor.passive_joint_damping,
                 dt,
             ],
             outputs=[solver.factor.aug_row_K, state_aug.joint_tau],

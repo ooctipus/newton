@@ -105,9 +105,9 @@ class TestFeatherPGSSprings(unittest.TestCase):
                 np.testing.assert_allclose(state_in.joint_qd.numpy(), [velocity], atol=1e-6)
                 np.testing.assert_allclose(solver.qd_work.numpy(), [min(velocity, 2.0)], atol=1e-6)
                 # Z-axis gravity and centripetal forces exert no hinge torque: the predictor adds the damping's
-                # acceleration, read on the input velocity, to the prescaled velocity.
+                # acceleration, read on the input velocity with its K in the mass, to the prescaled velocity.
                 inertia = model.body_inertia.numpy()[0, 2, 2] + model.body_mass.numpy()[0] * 0.2**2
-                inertia += model.joint_armature.numpy()[0]
+                inertia += model.joint_armature.numpy()[0] + 0.001 * damping
                 np.testing.assert_allclose(
                     solver.v_hat.numpy(), [min(velocity, 2.0) - 0.001 * damping * velocity / inertia], atol=2e-5
                 )

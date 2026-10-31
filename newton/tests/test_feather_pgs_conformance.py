@@ -955,12 +955,12 @@ def joint_speed_limit_laws(run: Run) -> list:
 
 
 def spring_laws(run: Run) -> list:
-    """The hinge follows the discrete oscillator of semi-implicit Euler with an explicit spring and damper."""
+    """The hinge follows the discrete oscillator of semi-implicit Euler, the spring explicit, the damper implicit."""
     params, dt = run.scene.params, run.scene.dt
     q, qd = params["start"], 0.0
     expected = [q]
     for _ in range(run.scene.steps):
-        qd += dt * (-params["stiffness"] * q - params["damping"] * qd) / params["inertia"]
+        qd += dt * (-params["stiffness"] * q - params["damping"] * qd) / (params["inertia"] + dt * params["damping"])
         q += dt * qd
         expected.append(q)
     return [("angle error [rad]", float(np.abs(run.joint_q[:, 0] - np.asarray(expected)).max()), 1.0e-4)]

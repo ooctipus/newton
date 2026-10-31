@@ -523,25 +523,48 @@ def coordinate_force(
     qd: float,
 ) -> float:
     """Return one coordinate's generalized force: ``force - S . wrench`` with its passive spring and damper,
-    ``stiffness (reference - q) - damping qd``, added last."""
+    ``stiffness (reference - q) - damping qd``, added last: :func:`spring_damper_force` at ``theta = 0``, whose
+    ``K = damping dt`` is in the mass (:func:`drive_stiffness`)."""
     passive = stiffness * (reference - q)
     passive -= damping * qd
     return -wp.dot(motion, wrench) + force + passive
 
 
 @wp.func
-def drive_stiffness(ke: float, kd: float, dt: float) -> float:
-    """Return the implicit stiffness ``K = ke dt^2 + kd dt`` an augmented drive adds to its coordinate's mass."""
-    return ke * dt * dt + kd * dt
+def spring_damper_stiffness(stiffness: float, damping: float, theta: float, dt: float) -> float:
+    """Return the ``K = theta k dt^2 + c dt`` a spring and damper add to their coordinate's mass.
+
+    One law holds every joint element: ``(H + K) dv = dt (tau + u0)`` with :func:`spring_damper_force` in ``tau``. The
+    damper is always implicit. ``theta`` is physics: at 1 (a drive) the spring is backward Euler, stable at any gain and
+    damping an undamped spring at ``omega^2 dt / 2`` per second; at 0 (a passive spring) it is symplectic Euler, which
+    keeps the oscillator's energy and is stable to ``omega dt < 2``.
+    """
+    return theta * stiffness * dt * dt + damping * dt
+
+
+@wp.func
+def spring_damper_force(
+    stiffness: float, damping: float, q: float, qd: float, q_target: float, qd_target: float, theta: float, dt: float
+) -> float:
+    """Return a spring and damper's explicit force ``u0 = -(k (q - q_target + theta dt qd) + c (qd - qd_target))``, the
+    force of :func:`spring_damper_stiffness`'s step."""
+    return -(stiffness * (q - q_target + theta * dt * qd) + damping * (qd - qd_target))
+
+
+@wp.func
+def drive_stiffness(ke: float, kd: float, damping: float, dt: float) -> float:
+    """Return the ``K`` of a coordinate: its augmented drive's (``theta = 1``) and its passive damper's (``theta = 0``,
+    :func:`coordinate_force` holds its force)."""
+    return spring_damper_stiffness(ke, kd, 1.0, dt) + spring_damper_stiffness(0.0, damping, 0.0, dt)
 
 
 @wp.func
 def drive_force(
     ke: float, kd: float, q: float, qd: float, q_target: float, qd_target: float, effort_limit: float, dt: float
 ) -> float:
-    """Return an augmented drive's explicit force ``u0 = -(ke (q - q_target + dt qd) + kd (qd - qd_target))``,
-    clamped to a positive effort limit (the actuator's force range)."""
-    u0 = -(ke * (q - q_target + dt * qd) + kd * (qd - qd_target))
+    """Return an augmented drive's explicit force (:func:`spring_damper_force` at ``theta = 1``), clamped to a
+    positive effort limit (the actuator's force range)."""
+    u0 = spring_damper_force(ke, kd, q, qd, q_target, qd_target, 1.0, dt)
     if effort_limit > 0.0:
         u0 = wp.clamp(u0, -effort_limit, effort_limit)
     return u0

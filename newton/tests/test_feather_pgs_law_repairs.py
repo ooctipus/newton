@@ -167,6 +167,98 @@ class TestOneContactPoint(unittest.TestCase):
                 self.assertLess(angular, 2.0e-5)
 
 
+def _hinges(inertias, *, damping=(0.0,), stiffness=(0.0,), device="cpu"):
+    """Coaxial hinges in a chain, no gravity: ``H`` is constant, ``H[i, j] = sum_{k >= max(i, j)} I_k``."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    parent, joints = -1, []
+    for index, inertia in enumerate(inertias):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=(0.0, 0.0, 1.0),
+                damping=damping[index % len(damping)],
+                spring_stiffness=stiffness[index % len(stiffness)],
+                spring_ref=0.0,
+                armature=0.0,
+                limit_lower=-1.0e6,
+                limit_upper=1.0e6,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def _free_roll(model, q0, v0, steps, *, dt=H, **options):
+    """Step ``model`` without contacts from coordinates ``q0`` and velocities ``v0``; return each step's ``(q, v)``."""
+    solver = SolverFeatherPGS(model, **{"angular_damping": 0.0, **options})
+    state, out = model.state(), model.state()
+    state.joint_q.assign(np.asarray(q0, dtype=np.float32))
+    state.joint_qd.assign(np.asarray(v0, dtype=np.float32))
+    control = model.control()
+    history = []
+    for _ in range(steps):
+        solver.step(state, out, control, None, dt)
+        state, out = out, state
+        history.append((state.joint_q.numpy().copy(), state.joint_qd.numpy().copy()))
+    return history
+
+
+def _passive_rollout(mass, damping, stiffness, q0, v0, steps, dt=H):
+    """The passive law in float64: ``(H + dt C) dv = dt (-K q - C v)`` then ``q += dt v``: damper implicit, spring not."""
+    q, v = np.asarray(q0, dtype=np.float64), np.asarray(v0, dtype=np.float64)
+    C, K = np.diag(damping), np.diag(stiffness)
+    history = []
+    for _ in range(steps):
+        v = v + np.linalg.solve(mass + dt * C, dt * (-K @ q - C @ v))
+        q = q + dt * v
+        history.append((q.copy(), v.copy()))
+    return history
+
+
+class TestPassiveDamper(unittest.TestCase):
+    """PH1d: a joint's passive damper is backward Euler in the metric of ``H``, its spring stays symplectic."""
+
+    def test_stiff_damper_is_implicit(self):
+        """Decay by ``1 / (1 + h c / I)`` each step, at any ``h c / I``: explicit damping diverges above 2."""
+        inertia = 0.01
+        for ratio in (0.1, 1.0, 2.5, 4.2, 10.0):
+            with self.subTest(h_c_over_I=ratio):
+                model = _hinges([inertia], damping=(ratio * inertia / H,))
+                history = _free_roll(model, [0.0], [1.0], 8)
+                expected = (1.0 + ratio) ** -np.arange(1, 9)
+                measured = np.array([v[0] for _, v in history])
+                np.testing.assert_allclose(measured, expected, rtol=1.0e-3, atol=1.0e-7)
+
+    def test_coupled_chain_follows_the_passive_law(self):
+        """Damp through the coupled metric ``H + K`` on a dense factor, with a spring on the same coordinates."""
+        inertias = (0.02, 0.01, 0.005)
+        size = len(inertias)
+        mass = np.array([[sum(inertias[max(i, j) :]) for j in range(size)] for i in range(size)])
+        damping, stiffness = (0.0, 2.0, 5.0), (3.0, 0.0, 8.0)
+        model = _hinges(inertias, damping=damping, stiffness=stiffness)
+        v0 = [1.0, -0.5, 2.0]
+        q0 = [0.1, 0.2, -0.1]
+        expected = _passive_rollout(mass, damping, stiffness, q0, v0, 60)
+        for (q, v), (q_ref, v_ref) in zip(_free_roll(model, q0, v0, 60), expected, strict=True):
+            np.testing.assert_allclose(q, q_ref, rtol=2.0e-3, atol=1.0e-4)
+            np.testing.assert_allclose(v, v_ref, rtol=2.0e-3, atol=1.0e-3)
+
+    def test_spring_stays_symplectic(self):
+        """Keep the undamped spring at ``theta = 0``: its energy stays bounded, as symplectic Euler's does."""
+        inertia = 0.01
+        for omega_h in (0.1, 1.0, 1.9):
+            with self.subTest(omega_h=omega_h):
+                stiffness = inertia * (omega_h / H) ** 2
+                model = _hinges([inertia], stiffness=(stiffness,))
+                steps = 400
+                expected = _passive_rollout(np.array([[inertia]]), (0.0,), (stiffness,), [0.1], [0.0], steps)
+                measured = _free_roll(model, [0.1], [0.0], steps)
+                np.testing.assert_allclose(measured[-1][0], expected[-1][0], rtol=2.0e-2, atol=2.0e-3)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the specialized row stores run on CUDA")
 class TestDepenetrationCapOnRoutes(unittest.TestCase):
     """PH1a on each contact-row producer: the normal law at the capped bias, from the public contact record."""
