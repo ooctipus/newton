@@ -60,6 +60,7 @@ from . import (
 )
 from . import route_table as _route_table
 from . import row_metadata as _row_metadata
+from .body_cut import BodyCut
 from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
@@ -653,6 +654,9 @@ class SolverFeatherPGS(SolverBase):
         self._environment_record = _environment_flags.record()
         # The test pins in force at construction, which every admission reads and the route record lists.
         self._route_pins = dict(type(self)._route_pins)
+        # The solver's own model, a pure forest (:mod:`.body_cut`): everything below reads it.
+        self.cut = BodyCut(model)
+        model = self.cut.model
         super().__init__(model)
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
         self.options = options = check_options(requested_options)
@@ -1309,6 +1313,7 @@ class SolverFeatherPGS(SolverBase):
         writing :class:`~newton.State` joint coordinates outside :meth:`step`,
         call :meth:`reset` with a world mask or :meth:`notify_state_changed`.
         """
+        self.cut.refresh()
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
         kinematic = (
@@ -1372,7 +1377,7 @@ class SolverFeatherPGS(SolverBase):
         if self.laws.friction_anchors_enabled:
             # Use the world associated with each stored patch anchor.
             self.laws.friction_patches.reset(world_mask)
-        self.factor.reset_cache(state, world_mask)
+        self.factor.reset_cache(self.cut.mirror(state), world_mask)
         self._clear_warmstart_history(world_mask)
 
     def _clear_warmstart_history(self, world_mask: wp.array | None) -> None:
@@ -1491,7 +1496,7 @@ class SolverFeatherPGS(SolverBase):
             articulations: Optional device array of articulation indices whose joint
                 state changed. ``None`` invalidates every articulation.
         """
-        self.factor.notify_state_changed(articulations)
+        self.factor.notify_state_changed(self.cut.trees(articulations))
 
     def _build_preelimination_plan(self, model) -> None:
         """The bilateral elimination's tables (:func:`.response_builds_rows.elimination`).
@@ -3118,6 +3123,15 @@ class SolverFeatherPGS(SolverBase):
         # The configuration's checks come first; then the states', before any of them is read.
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
+        forest_in, forest_out, forest_control = self.cut.enter(
+            state_in, state_out, control, self.factor.fk_id_cache_valid
+        )
+        self._step_forest(forest_in, forest_out, forest_control, contacts, dt, collide_done_event)
+        self.cut.leave(state_in, state_out)
+        return state_out
+
+    def _step_forest(self, state_in, state_out, control, contacts, dt, collide_done_event) -> None:
+        """One step of the forest (:mod:`.body_cut`)."""
         self._bind_contact_material(contacts)
         if contacts is not None:
             self.placement.follow_contacts(contacts)
@@ -3157,7 +3171,7 @@ class SolverFeatherPGS(SolverBase):
         if not model.articulation_count:
             self.integrate_particles(model, state_in, state_out, dt)
             self._step += 1
-            return state_out
+            return
 
         # Double-buffer: select buffer set and wait for its memset to finish
         if self._memset_stream is not None:
@@ -3397,7 +3411,6 @@ class SolverFeatherPGS(SolverBase):
         self.placement.record_watermarks(contacts)
 
         self._step += 1
-        return state_out
 
     def constraint_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
         """Return sticky capacity-overflow flags without enabling row telemetry.
