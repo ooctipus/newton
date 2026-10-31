@@ -31,7 +31,7 @@ def build_body_maps(
     joint_articulation, _ = host_index.expand(np.diff(articulation_start))
     indices = np.arange(len(joint_child), dtype=np.int32)
     tree = (indices < articulation_joint_end[joint_articulation]) & (joint_child >= 0)
-    # Preserve the last tree owner without allowing a trailing loop joint to steal it.
+    # Preserve the last tree owner.
     np.maximum.at(body_joint, joint_child[tree], indices[tree])
     owned = body_joint >= 0
     body_articulation[owned] = joint_articulation[body_joint[owned]]

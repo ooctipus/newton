@@ -13,8 +13,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
-    PGS_CONSTRAINT_TYPE_CONNECT,
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_LINK,
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
 from newton.tests import feather_pgs_scenes as scenes
@@ -110,7 +110,7 @@ def _build_overcapacity_mixed_bilateral_model():
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
 class TestFeatherPGSPreelimination(unittest.TestCase):
-    def test_mimic_and_connect_rows_share_one_block(self):
+    def test_mimic_and_link_rows_share_one_block(self):
         """An articulation's mimic and connect rows form one block, eliminated together."""
         builder = _build_four_bar()
         builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
@@ -131,7 +131,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         slots = solver.factor._preelim_slots.numpy()[:count]
         selected_types = solver.placement.row_type.numpy()[0, slots]
         self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
-        self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
+        self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_LINK)), 0)
 
     def test_blocks_are_sized_from_the_model(self):
         """A block takes every bilateral row of its trees, however many: a link's six rows and six mimics (twelve
@@ -151,7 +151,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         count = int(solver.factor._preelim_nB.numpy()[0])
         kept = solver.placement.row_type.numpy()[0, solver.factor._preelim_slots.numpy()[:count]]
         self.assertEqual(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
-        self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
+        self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_LINK)), 0)
 
     def test_prescribed_parent_closures_are_eliminated(self):
         """A load pinned to a moving kinematic carrier by three ball closures (nine rows, the carrier's velocity in
@@ -405,7 +405,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         seen = set()
         for w in range(rows.shape[0]):
             seen.update(rows[w, : counts[w]].tolist())
-        self.assertIn(int(PGS_CONSTRAINT_TYPE_CONNECT), seen)
+        self.assertIn(int(PGS_CONSTRAINT_TYPE_LINK), seen)
 
 
 class TestFeatherPGSPreeliminationCPU(unittest.TestCase):

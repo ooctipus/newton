@@ -58,7 +58,7 @@ TRACE_GRID = tuple(10.0 ** (-7.0 + 0.5 * point) for point in range(13))
 TRACE_REASONS = ("stationary", "tolerance", "budget")
 """Exit reasons of a traced solve: no change, changes within the exit law's floor, or the sweep budget ran out."""
 
-TRACE_KINDS = ("contact", "unused", "friction", "joint_limit", "velocity_limit", "mimic", "connect", "torsion", "none")
+TRACE_KINDS = ("contact", "unused", "friction", "joint_limit", "velocity_limit", "mimic", "link", "torsion", "none")
 """Row kinds of the trace's final-sweep change, indexed by constraint type (type 1, the retired PhysX drive row, never
 occurs); ``"none"`` when no row changed."""
 

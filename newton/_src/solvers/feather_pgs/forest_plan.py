@@ -5,8 +5,7 @@
 
 :meth:`ForestPlan.build` derives, from the model's topology alone:
 
-- the joint forest (:func:`joint_forest`) and each articulation's tree joints, coordinates and world, with the
-  loop-closing joints set apart (they become connect rows);
+- the joint forest (:func:`joint_forest`) and each articulation's tree, coordinates and world;
 - one root rule (a FREE or DISTANCE joint without a parent roots a free tree), from which the free rigid bodies, the
   free-rooted articulations and the free-root joints follow;
 - the prescribed free bodies the matrix-free formulation elides, and so each articulation's response coordinates;
@@ -42,7 +41,7 @@ __all__ = ["ForestPlan", "joint_forest", "row_support"]
 
 def joint_forest(model: Model) -> TreePlan:
     """The forest of the model's articulation joints by their ancestry (``Model.joint_ancestor``); a joint
-    outside every articulation, a loop closure, stands alone."""
+    outside every articulation stands alone."""
     if not model.joint_count:
         return TreePlan.build(np.zeros(0, dtype=np.int32))
     member = model.joint_articulation.numpy() >= 0
@@ -71,9 +70,7 @@ class ForestPlan:
     articulation_world: np.ndarray
     """Each articulation's world (a negative model world reads as world 0)."""
     articulation_joint_end_host: np.ndarray
-    """Each articulation's end of its tree joints (loop-closing joints follow it)."""
-    loop_joint_articulation: np.ndarray
-    """Each joint's articulation where it closes a loop, else ``-1``."""
+    """Each articulation's end of its tree joints (a joint outside every tree may follow it)."""
     is_free_rigid_host: np.ndarray
     """Each articulation that is one free body (one FREE joint without a parent)."""
     response_free_rigid_body_indices: np.ndarray
@@ -106,7 +103,6 @@ class ForestPlan:
     articulation_root_dof_start: wp.array | None
     has_root_free: bool
     has_prescribed_response: bool
-    has_loop_joints: bool
 
     # Free bodies.
     free_rigid_body_count: int
@@ -203,8 +199,6 @@ class ForestPlan:
         _coordinate_trees(plan, model)
         _mass_schedules(plan, model)
         _world_size_groups(plan, model)
-        # Loop-closing joints are excluded from the tree and enforced as connect rows.
-        plan.has_loop_joints = bool(np.any(plan.loop_joint_articulation >= 0))
         _world_response_mapping(plan, model)
         return cls(**vars(plan))
 
@@ -228,84 +222,32 @@ def _articulations(plan, model, kinematic_dof_mask, free_root, linked):
             articulation_world[articulation_world < 0] = 0
 
     articulation_joint_end = np.zeros(articulation_count, dtype=np.int32)
-    loop_joint_articulation = np.full(model.joint_count, -1, dtype=np.int32)
     if articulation_count and model.joint_count:
         articulation_start = model.articulation_start.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
         joint_type = model.joint_type.numpy()
         joint_child = model.joint_child.numpy()
 
-        joint_articulation_arr = getattr(model, "joint_articulation", None)
-        joint_articulation = joint_articulation_arr.numpy() if joint_articulation_arr is not None else None
-
         first_joint = articulation_start[:articulation_count]
         last_joint = articulation_start[1 : articulation_count + 1]
 
-        # Loop-closing joints (how the MJCF/USD importers close `connect`/`weld`
-        # equalities) are not part of the kinematic tree. Excluding them here
-        # keeps their DOFs out of the mass matrix (garbage motion subspaces made
-        # H singular -> instant NaN) and out of the FK walk (they would overwrite
-        # their child's tree pose). They are consumed as CONNECT rows instead.
-        if joint_articulation is not None:
-            # An unowned joint is a closure only when its child body already
-            # belongs to an articulation through a different, tree-owned joint.
-            # Standalone world-root joints are also unowned, but their child has
-            # no articulation owner and must remain outside the solver plan.
-            # A body's last owned joint names its articulation.
-            joint_index = np.arange(model.joint_count)
-            owned = (joint_articulation >= 0) & (joint_child >= 0)
-            body_joint = np.full(model.body_count, -1, dtype=np.int64)
-            np.maximum.at(body_joint, joint_child[owned], joint_index[owned])
-            body_articulation = np.full(model.body_count, -1, dtype=np.int32)
-            has_owner = body_joint >= 0
-            body_articulation[has_owner] = joint_articulation[body_joint[has_owner]]
-            closing = (joint_articulation < 0) & (joint_child >= 0)
-            loop_joint_articulation[closing] = body_articulation[joint_child[closing]]
-
-            # Model.joint_articulation identifies the articulation's own contiguous
-            # tree joints; the body-ownership pass above separately distinguishes
-            # closures from other unowned joints. The prefix range derived from
-            # articulation_start may contain foreign entries after the tree — e.g.
-            # multi-source add_builder defers loop joints past a later articulation's
-            # free joint — so never adopt range members by position.
-            range_art, position = host_index.expand(np.maximum(last_joint - first_joint, 0))
-            member = joint_articulation[first_joint[range_art] + position] == range_art
-            member_count = np.bincount(range_art[member], minlength=articulation_count)
-            # Members must open their range: as many members precede each one as joints do.
-            members_before = host_index.segmented_rank(range_art, member)
-            stray = np.flatnonzero(member & (members_before != position))
-            if stray.size:
-                art = int(range_art[stray[0]])
-                j = int(first_joint[art] + position[stray[0]])
-                tree_end = int(first_joint[art] + members_before[stray[0]])
-                raise ValueError(
-                    f"SolverFeatherPGS: articulation {art}'s joints are not "
-                    f"contiguous (joint {j} follows a foreign joint at "
-                    f"{tree_end}). The ModelBuilder guarantees contiguity; "
-                    "this model is malformed."
-                )
-            articulation_joint_end[:] = first_joint + member_count
-        else:
-            for art in range(articulation_count):
-                # Legacy models without joint_articulation: fall back to the
-                # second-inbound-joint heuristic (loop joints must be trailing).
-                seen_children: set[int] = set()
-                tree_end = int(first_joint[art])
-                for j in range(int(first_joint[art]), int(last_joint[art])):
-                    child = int(joint_child[j])
-                    if child in seen_children:
-                        break  # first loop joint; the rest of the range must be loops too
-                    seen_children.add(child)
-                    tree_end = j + 1
-                for j in range(tree_end, int(last_joint[art])):
-                    if int(joint_child[j]) not in seen_children:
-                        raise ValueError(
-                            "SolverFeatherPGS: articulation joint range mixes tree joints "
-                            f"after loop joints (articulation {art}, joint {j}). "
-                            "Loop-closing joints must be trailing."
-                        )
-                    loop_joint_articulation[j] = art
-                articulation_joint_end[art] = tree_end
+        # An articulation's range may hold joints outside every tree behind its own, and only those: its members must
+        # open it, as many preceding each one as joints do.
+        joint_articulation = model.joint_articulation.numpy()
+        range_art, position = host_index.expand(np.maximum(last_joint - first_joint, 0))
+        member = joint_articulation[first_joint[range_art] + position] == range_art
+        member_count = np.bincount(range_art[member], minlength=articulation_count)
+        members_before = host_index.segmented_rank(range_art, member)
+        stray = np.flatnonzero(member & (members_before != position))
+        if stray.size:
+            art = int(range_art[stray[0]])
+            j = int(first_joint[art] + position[stray[0]])
+            tree_end = int(first_joint[art] + members_before[stray[0]])
+            raise ValueError(
+                f"SolverFeatherPGS: articulation {art}'s joints are not contiguous (joint {j} follows a foreign joint "
+                f"at {tree_end}). The ModelBuilder guarantees contiguity; this model is malformed."
+            )
+        articulation_joint_end[:] = first_joint + member_count
 
         articulation_dof_start[:] = joint_qd_start[first_joint]
         articulation_dof_count[:] = joint_qd_start[articulation_joint_end] - articulation_dof_start
@@ -344,7 +286,6 @@ def _articulations(plan, model, kinematic_dof_mask, free_root, linked):
         "prescribed_articulation_host": prescribed,
         "response_dof_count": response_dof_count,
         "articulation_joint_end_host": articulation_joint_end,
-        "loop_joint_articulation": loop_joint_articulation,
     }
     for name, array in arrays.items():
         array.setflags(write=False)
@@ -469,8 +410,6 @@ def _world_mapping(plan, model):
 
     articulation_world = plan.articulation_world
     plan.art_to_world = wp.array(articulation_world, dtype=wp.int32, device=model.device)
-    # Per-articulation end of the kinematic-tree joint prefix: trailing loop-closing
-    # joints (imported `connect`/`weld` equalities) are excluded from FK/ID iteration.
     plan.articulation_joint_end = wp.array(plan.articulation_joint_end_host, dtype=wp.int32, device=model.device)
 
     world_art_counts = np.bincount(articulation_world, minlength=plan.world_count).astype(np.int32)

@@ -468,7 +468,7 @@ def plan(solver):
     secondary = next((size for size in sizes if size != primary), 0)
     if secondary and solver.forest.n_arts_by_size[secondary] != solver.forest.world_count:
         return None
-    if solver.laws.mimic_sizes - {primary} or solver.laws.connect_count:
+    if solver.laws.mimic_sizes - {primary} or solver.laws.link_count:
         return None
     mimics = 0
     if solver.laws._mimic_art_start is not None and solver.laws._mimic_art_list is not None:

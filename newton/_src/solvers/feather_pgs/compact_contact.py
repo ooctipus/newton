@@ -24,7 +24,7 @@ def supported(solver) -> bool:
     """Require the inherited complete sparse contract and its dense-six triple or unit mode.
 
     The sparse-diagonal owner exists only with its fused wide-articulation limits, whose admission already requires
-    augmented drives, no velocity-limit, mimic or connect rows, no debug rows and no pre-elimination: only the dense
+    augmented drives, no velocity-limit, mimic or link rows, no debug rows and no pre-elimination: only the dense
     six position axes keep rows, at most lower + upper for each axis.
     """
     return bool(

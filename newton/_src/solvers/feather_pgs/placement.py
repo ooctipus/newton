@@ -271,7 +271,7 @@ class Placement:
     # ---------------------------------------------------------------------------------------------------------------
 
     def internal_rows_per_world(self, model) -> int:
-        """The most mimic, connect and limit rows any world can hold, from the topology."""
+        """The most mimic, link and limit rows any world can hold, from the topology."""
         if not model.articulation_count or not model.joint_count or self.forest.art_to_world is None:
             return 0
 
@@ -282,14 +282,7 @@ class Placement:
             and not np.isinf(self.options.velocity_limit_activation_fraction)
         )
         has_mimic_rows = self.laws.mimic_count > 0
-        has_connect_rows = self.laws.connect_count > 0
-        if not (
-            has_position_limit_rows
-            or has_velocity_limit_rows
-            or has_mimic_rows
-            or has_connect_rows
-            or self.laws.link_count
-        ):
+        if not (has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or self.laws.link_count):
             return 0
 
         art_to_world = self.forest.art_to_world.numpy().astype(np.int32, copy=False)
@@ -301,10 +294,6 @@ class Placement:
             np.add.at(per_world, in_range, 1)
         if self.laws.link_count:
             np.add.at(per_world, self.laws.link_world_np[self.forest.cut.enabled != 0], LINK_ROWS)
-        if has_connect_rows and self.laws.connect_world_np is not None:
-            valid_worlds = self.laws.connect_world_np[self.laws.connect_valid_np != 0]
-            in_range = valid_worlds[(valid_worlds >= 0) & (valid_worlds < per_world.shape[0])]
-            np.add.at(per_world, in_range, 3)
 
         articulation_start = model.articulation_start.numpy().astype(np.int32, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)

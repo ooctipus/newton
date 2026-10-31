@@ -70,8 +70,8 @@ from .row_laws import (
     row_rhs,
     velocity_limit_active,
 )
-from .solver_fields import Connects, Links, LocalOwners, Mimics
-from .spatial_laws import free_root_transport, point_velocity
+from .solver_fields import Links, LocalOwners, Mimics
+from .spatial_laws import free_root_transport
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # Type 1 was the PhysX drive row; drives fold into the mass matrix.
@@ -88,12 +88,9 @@ PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT = 4
 # entries (+1 on the follower DOF, -coef1 on the leader DOF); lambda is
 # unbounded; drift is removed with the standard Baumgarte ``pgs_beta`` bias.
 PGS_CONSTRAINT_TYPE_MIMIC = 5
-# Connect (loop-closure) row: one axis of the bilateral 3-DoF point-coincidence equality
-# ``p_anchor(parent) - p_anchor(child) = 0`` closing a kinematic loop between two links of
-# the same articulation (imported MJCF ``connect`` equalities become trailing BALL loop
-# joints; see ``forest_plan.ForestPlan.build``). Three rows per closure, world-axis
-# directions, unbounded lambda, Baumgarte drift correction.
-PGS_CONSTRAINT_TYPE_CONNECT = 6
+# Link row: one of the six bilateral rows that tie a body's shadow to its primary piece (:mod:`.body_cut`), unbounded
+# lambda, Baumgarte drift correction.
+PGS_CONSTRAINT_TYPE_LINK = 6
 PGS_CONSTRAINT_TYPE_TORSION = 7
 PGS_CONSTRAINT_TYPE_COUNT = 8
 
@@ -1037,16 +1034,6 @@ def populate_mimic_J_for_size(
         rows.target[world, slot] = 0.0
 
 
-# =============================================================================
-# Connect (Loop-Closure) Constraint Kernels
-# =============================================================================
-# Three bilateral rows per loop closure enforcing point coincidence of the loop
-# joint's parent/child anchors — the FeatherPGS realization of MJCF ``connect``
-# equalities (design: ``reports/vishal/fpgs_connect_design.md`` in the parent
-# repo). The Jacobian per axis is the anchor-point Jacobian difference of the
-# two bodies, built with the same ancestor walk contact rows use.
-
-
 @wp.kernel
 def invalidate_fk_id_cache_for_articulations(
     articulations: wp.array[int],
@@ -1207,7 +1194,7 @@ def write_link_rows(
             slot,
             J,
         )
-        rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
+        rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_LINK
         rows.sides[world, slot] = sides
         rows.row_parent[world, slot] = -1
         rows.row_mu[world, slot] = 0.0
@@ -1215,174 +1202,6 @@ def write_link_rows(
         rows.row_cfm[world, slot] = pgs_cfm
         rows.phi[world, slot] = turn[axis] if angular else gap[axis]
         rows.target[world, slot] = 0.0
-
-
-@wp.kernel
-def allocate_connect_slots(
-    connects: Connects,
-    max_constraints: int,
-    # outputs
-    world_slot_counter: wp.array[int],
-    first_rejected_slot: wp.array[int],
-):
-    """Allocate three consecutive dense slots per enabled, valid loop closure.
-
-    Launched with ``dim = n_connect``. If the buffer cannot hold all three rows the
-    closure is dropped whole (``connect_slot = -1``) rather than partially enforced.
-    """
-    k = wp.tid()
-    connects.slot[k] = -1
-    if connects.valid[k] == 0 or connects.enabled[k] == 0:
-        return
-    connects.slot[k] = reserve(world_slot_counter, connects.world[k], 3, max_constraints, first_rejected_slot)
-
-
-@wp.kernel
-def populate_connect_J_for_size(
-    joints: JointTable,
-    connects: Connects,
-    group_to_art: wp.array[int],
-    n_dofs: int,
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
-    body_com: wp.array[wp.vec3],
-    body_to_joint: wp.array[int],
-    body_to_articulation: wp.array[int],
-    joint_ancestor: wp.array[int],
-    joint_S_s: wp.array[wp.spatial_vector],
-    articulation_origin: wp.array[wp.vec3],
-    pgs_beta: float,
-    pgs_cfm: float,
-    support: RowSupport,
-    # outputs
-    J_group: wp.array3d[float],
-    rows: DenseRows,
-):
-    """Populate Jacobian and metadata for connect (loop-closure) rows.
-
-    Launched once per size group with ``dim = n_arts_of_size``. Each thread scans the
-    (small) closure table and, for closures belonging to its articulation, writes three
-    rows: for world axis ``e_k``, ``phi = (p_A - p_B) . e_k`` and
-    ``J = e_k . (Jpoint(parent, p_A) - Jpoint(child, p_B))`` via the contact ancestor
-    walk. One near-redundant axis on planar linkages is expected; its vanishing Delassus
-    diagonal makes the sweep skip it.
-
-    A closure whose parent is prescribed (``connect_parent_prescribed[k] != 0``: a
-    kinematic body outside the child's articulation, or the world when
-    ``connect_body_p[k] < 0``) contributes no parent DOFs. Its anchor velocity is
-    instead moved to the row target, ``J v = -(e_k . v_A)``, so the child anchor tracks
-    the moving parent anchor exactly as a same-articulation closure would.
-    """
-    group_idx = wp.tid()
-    art = group_to_art[group_idx]
-    world = joints.art_to_world[art]
-    dof_start = joints.articulation_dof_start[art]
-
-    n_connect = connects.art.shape[0]
-    for k in range(n_connect):
-        if connects.art[k] != art:
-            continue
-        base_slot = connects.slot[k]
-        if base_slot < 0:
-            continue
-
-        body_p = connects.body_p[k]
-        body_c = connects.body_c[k]
-        prescribed = connects.parent_prescribed[k] != 0
-        p_a = connects.anchor_p[k]
-        v_a = wp.vec3(0.0, 0.0, 0.0)
-        if body_p >= 0:
-            p_a = wp.transform_point(body_q[body_p], connects.anchor_p[k])
-            if prescribed:
-                # Prescribed parent: the anchor velocity comes from the body twist
-                # (v_com_world, omega_world) rather than from tree DOFs.
-                x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = point_velocity(body_qd[body_p], p_a - x_com)
-        p_b = wp.transform_point(body_q[body_c], connects.anchor_c[k])
-        origin = articulation_origin[art]
-        delta = p_a - p_b
-        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-
-        for axis in range(3):
-            slot = base_slot + axis
-            # The two ancestor walks below ACCUMULATE (shared ancestors partially cancel),
-            # so the row must start from zero regardless of buffer reuse policy.
-            for d in range(n_dofs):
-                J_group[at[0], slot, at[1] + d] = 0.0
-            e = wp.vec3(0.0, 0.0, 0.0)
-            e[axis] = 1.0
-            target = float(0.0)
-
-            # J = e . (Jpoint(parent, p_a) - Jpoint(child, p_b)): ancestor walks with
-            # opposite signs; shared ancestors partially cancel automatically.
-            if prescribed:
-                target = -wp.dot(e, v_a)
-            else:
-                accumulate_jacobian_row_world(
-                    body_p,
-                    1.0,
-                    p_a,
-                    origin,
-                    e,
-                    False,
-                    body_to_joint,
-                    joint_ancestor,
-                    joints.joint_qd_start,
-                    joint_S_s,
-                    dof_start,
-                    n_dofs,
-                    at,
-                    slot,
-                    J_group,
-                )
-            accumulate_jacobian_row_world(
-                body_c,
-                -1.0,
-                p_b,
-                origin,
-                e,
-                False,
-                body_to_joint,
-                joint_ancestor,
-                joints.joint_qd_start,
-                joint_S_s,
-                dof_start,
-                n_dofs,
-                at,
-                slot,
-                J_group,
-            )
-
-            # Normalize the row: on planar linkages one axis is near-redundant with the
-            # tree, leaving ||J|| ~ 1e-4 — its Delassus diagonal collapses to pure CFM
-            # while H^-1 J^T stays large against small link inertias, and PGS then relaxes
-            # a real velocity effect against a near-zero denominator (measured to NaN in
-            # one sweep). Normalizing keeps the identical constraint with a well-scaled
-            # diagonal; truly degenerate rows are left inert (zero J, zero phi).
-            norm_sq = float(0.0)
-            for d in range(n_dofs):
-                norm_sq += J_group[at[0], slot, at[1] + d] * J_group[at[0], slot, at[1] + d]
-            phi_axis = delta[axis]
-            if norm_sq > 1.0e-8:
-                inv_norm = 1.0 / wp.sqrt(norm_sq)
-                for d in range(n_dofs):
-                    J_group[at[0], slot, at[1] + d] *= inv_norm
-                phi_axis *= inv_norm
-                target *= inv_norm
-            else:
-                for d in range(n_dofs):
-                    J_group[at[0], slot, at[1] + d] = 0.0
-                phi_axis = 0.0
-                target = 0.0
-
-            rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONNECT
-            rows.sides[world, slot] = wp.vec2i(art, -1)
-            rows.row_parent[world, slot] = -1
-            rows.row_mu[world, slot] = 0.0
-            rows.row_beta[world, slot] = pgs_beta
-            rows.row_cfm[world, slot] = pgs_cfm
-            rows.phi[world, slot] = phi_axis
-            rows.target[world, slot] = target
 
 
 # =============================================================================
@@ -2399,7 +2218,7 @@ def prepare_world_impulses(
     """Cold-initialize dense rows before identity-gathering contact impulses.
 
     No current non-contact row family has a cross-step identity contract:
-    limits are activation-allocated, while mimic/connect rows can be enabled
+    limits are activation-allocated, while mimic and link rows can be enabled
     dynamically and allocated atomically. Warm start therefore clears the
     full capacity before the contact/friction identity gather; cold solves only
     need to clear the current active prefix.

@@ -38,7 +38,7 @@ ROW_FRICTION = wp.constant(2)
 ROW_JOINT_LIMIT = wp.constant(3)
 ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
 ROW_MIMIC = wp.constant(5)
-ROW_CONNECT = wp.constant(6)
+ROW_LINK = wp.constant(6)
 ROW_TORSION = wp.constant(7)
 
 LINK_ROWS = wp.constant(6)
@@ -179,7 +179,7 @@ def row_rhs(
     """Return a row's position-level ``rhs`` and regularization weight, by row kind.
 
     * contact: :func:`contact_rhs`, its ``beta`` already capped (:func:`contact_capped_beta`);
-    * friction (the anchor's tangential displacement), mimic and connect
+    * friction (the anchor's tangential displacement), mimic and link
       (bilateral equalities): Baumgarte from both sides, ``bias_scale * beta * phi / dt``;
     * joint limit: :func:`limit_rhs`;
     * velocity limit, a contact's spin row (torsion) and other rows: ``-target`` only.
@@ -188,7 +188,7 @@ def row_rhs(
     row_w = float(1.0)
     if kind == ROW_CONTACT:
         rhs, row_w = contact_rhs(phi, beta, target, inv_dt, bias_scale, contact_speculative_scale, contact_w)
-    elif kind == ROW_FRICTION or kind == ROW_MIMIC or kind == ROW_CONNECT:
+    elif kind == ROW_FRICTION or kind == ROW_MIMIC or kind == ROW_LINK:
         rhs += bias_scale * beta * phi * inv_dt
     elif kind == ROW_JOINT_LIMIT:
         rhs = limit_rhs(phi, beta, target, inv_dt, bias_scale, limit_speculative_scale)

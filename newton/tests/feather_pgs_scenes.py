@@ -74,8 +74,6 @@ def plain_laws(**changes) -> Laws:
         "warm_start": False,
         "preelimination": False,
         "mimic": False,
-        "connect": False,
-        "loops": False,
         "iterations": True,
         "cuda": True,
     }

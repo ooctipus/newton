@@ -44,8 +44,6 @@ class _LawsProbe(SimpleNamespace):
             warm_start=options.pgs_warmstart,
             preelimination=False,
             mimic=bool(self.mimic_count),
-            connect=bool(self.connect_count),
-            loops=self.forest.has_loop_joints,
             iterations=options.pgs_iterations > 0,
             cuda=True,
         )
@@ -58,7 +56,7 @@ class _AdmissionProbe(SimpleNamespace):
 
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
-    forest = _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=False)
+    forest = _ForestProbe(has_free_rigid_bodies=False)
     options = SimpleNamespace(
         pgs_iterations=8,
         enable_joint_velocity_limits=False,
@@ -79,7 +77,6 @@ def _eligible_solver():
             contact_torsion_enabled=False,
             friction_anchors_enabled=False,
             mimic_count=0,
-            connect_count=0,
         ),
     )
 

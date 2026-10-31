@@ -70,8 +70,8 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for changes in (
             {"_route_pins": {"storage": "dense"}},
-            {"pgs_warmstart": True, "forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
-            {"forest": _ForestProbe(has_loop_joints=False, has_free_rigid_bodies=True)},
+            {"pgs_warmstart": True, "forest": _ForestProbe(has_free_rigid_bodies=True)},
+            {"forest": _ForestProbe(has_free_rigid_bodies=True)},
         ):
             with self.subTest(changes=changes), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()

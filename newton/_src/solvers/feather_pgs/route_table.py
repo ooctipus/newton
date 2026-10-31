@@ -39,10 +39,6 @@ class Laws:
     """Bilateral rows are pre-eliminated through a Schur complement."""
     mimic: bool
     """The model has mimic rows."""
-    connect: bool
-    """The model has connect rows."""
-    loops: bool
-    """The model has loop-closing joints."""
     iterations: bool
     """The position solve has a positive iteration budget."""
     cuda: bool
@@ -74,7 +70,7 @@ class Laws:
     @classmethod
     def build(cls, laws, options, model, *, preelimination: bool) -> Laws:
         """Read the laws from the row laws' tables (:class:`.rows.RowLaws`: friction, regularization, torsion, mimic
-        and connect plans), the options and the model, with the bilateral pre-elimination decision."""
+        and link plans), the options and the model, with the bilateral pre-elimination decision."""
         return cls(
             contact="patch" if laws.friction_anchors_enabled else "point",
             regularized=bool(laws.regularization_enabled),
@@ -85,8 +81,6 @@ class Laws:
             warm_start=bool(options.pgs_warmstart),
             preelimination=bool(preelimination),
             mimic=bool(laws.mimic_count),
-            connect=bool(laws.connect_count),
-            loops=bool(laws.forest.has_loop_joints),
             iterations=options.pgs_iterations > 0,
             cuda=bool(model.device.is_cuda),
         )
@@ -103,22 +97,16 @@ _REQUIREMENTS = {
     "limits": (lambda laws: laws.limits, "joint-limit rows (enable_joint_limits)"),
     "no_velocity_limits": (lambda laws: not laws.velocity_limits, "no joint velocity-limit rows"),
     "no_mimic": (lambda laws: not laws.mimic, "no mimic rows"),
-    "no_connect": (lambda laws: not laws.connect, "no connect rows"),
-    "no_loops": (lambda laws: not laws.loops, "no loop-closing joints"),
     "iterations": (lambda laws: laws.iterations, "a positive iteration budget"),
     "no_preelimination": (lambda laws: not laws.preelimination, "no bilateral pre-elimination"),
 }
 
 CAPABILITIES = {
-    # The held tree's evaluation of the dynamics, on either device (its topology fit is the held groups' own proof).
-    "held": ("no_connect", "no_loops"),
     # The packed placement of a single tree: native sparse factors and their sweep.
     "packed": (
         "cuda",
         "iterations",
         "no_preelimination",
-        "no_connect",
-        "no_loops",
     ),
     # On-chip blocks of a world's rows (local owners), claimed per world at run time.
     "local": ("cuda", "plain", "no_velocity_limits"),
@@ -127,18 +115,17 @@ CAPABILITIES = {
     # The paired factor's sweep in factor coordinates (one articulation and one free body per world).
     "paired_factor": ("cuda", "plain", "iterations", "no_velocity_limits"),
     # Its runtime claim: independent articulation and free-body components per world.
-    "components": ("cuda", "plain", "no_mimic", "no_connect"),
+    "components": ("cuda", "plain", "no_mimic"),
     # The Jacobi tiers of dense trees beside a free body (case K4), whose sweep budget a build fixes.
     "tiers": ("cuda", "iterations"),
     # The keyed in-kernel row producer of the tiers.
-    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_loops", "no_mimic", "no_connect"),
+    "keyed_rows": ("cuda", "plain", "limits", "iterations", "no_mimic"),
     # The colored mapping of the free-body rows' contact units.
     "colored": ("cuda",),
 }
 """The laws each placement or schedule implements, by owner: what its admission reads through :func:`capable`."""
 
 _LABELS = {
-    "held": "The held tree needs",
     "packed": "Native sparse factors need",
     "local": "Local owners need",
     "row_packets": "Local packets need",

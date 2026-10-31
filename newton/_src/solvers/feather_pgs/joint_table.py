@@ -41,7 +41,7 @@ articulation coordinate starts, coordinate counts and worlds.
 A prescribed coordinate (``prescribed``, the body flags' kinematic coordinate mask) takes no row on it alone: no
 position limit, velocity limit or drive. Its 1e10 armature leaves such a row a response of about 1e-10 against its
 cfm and no fixed point, as its impulse grows with every sweep. Every decision that reads a limit or a drive gain
-skips it; rows that couple it with dynamic coordinates (contacts, mimic, connect) stay."""
+skips it; rows that couple it with dynamic coordinates (contacts, mimic, links) stay."""
 
 JointTable = field_group.struct("JointTable", JOINTS, __name__)
 

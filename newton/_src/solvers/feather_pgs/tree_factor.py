@@ -379,7 +379,7 @@ class TreeFactor:
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
         self.drive_target_index_by_dof = None
-        if not eligible or forest.has_loop_joints or not model.joint_dof_count:
+        if not eligible or not model.joint_dof_count:
             return
 
         dof_count = int(model.joint_dof_count)

@@ -88,7 +88,7 @@ class TestLawSource(unittest.TestCase):
 
     def test_constants_are_the_replaced_codes(self):
         """Keep the row kinds of the kernels' row types."""
-        for name in ("CONTACT", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "CONNECT", "TORSION"):
+        for name in ("CONTACT", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "LINK", "TORSION"):
             self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
 
     def test_cuda_renderings_compile(self):

@@ -815,7 +815,7 @@ def distance(a: Run, b: Run) -> Distance:
 
 
 def loop_gap(run: Run, model_data: dict) -> float | None:
-    """Largest distance between the parent and child anchors of a loop (ball) joint over the run [m]."""
+    """Largest distance between the parent and child anchors of a loop joint over the run [m]."""
     joints = model_data["loop_joints"]
     if not joints:
         return None
@@ -845,15 +845,10 @@ def mimic_error(run: Run, model_data: dict) -> float | None:
 
 def joint_data(model) -> dict:
     """Host copies of the loop joints and mimic constraints the joint laws read."""
-    joint_type = model.joint_type.numpy()
     articulation = model.joint_articulation.numpy()
     parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
     x_p, x_c = model.joint_X_p.numpy().astype(np.float64), model.joint_X_c.numpy().astype(np.float64)
-    loops = [
-        (int(parent[j]), int(child[j]), x_p[j], x_c[j])
-        for j in range(model.joint_count)
-        if joint_type[j] == int(newton.JointType.BALL) and articulation[j] < 0
-    ]
+    loops = [(int(parent[j]), int(child[j]), x_p[j], x_c[j]) for j in range(model.joint_count) if articulation[j] < 0]
     mimics = []
     if getattr(model, "constraint_mimic_count", 0):
         q_start = model.joint_q_start.numpy()

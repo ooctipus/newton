@@ -534,7 +534,7 @@ def _admissible_solver():
             body_response_dof_mask=1,
             body_has_response_dofs=1,
         ),
-        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, connect_count=0, joint_limit_q_index=1),
+        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, link_count=0, joint_limit_q_index=1),
         options=SimpleNamespace(enable_bilateral_preelimination=False),
     )
 

@@ -452,7 +452,7 @@ def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np
     starts = model.articulation_start.numpy().astype(np.int64)
     ends = np.asarray(articulation_joint_end, dtype=np.int64)
     if np.any(ends[articulations] != starts[articulations + 1]):
-        return None, "Loop-closing joints keep their articulations on the tree route."
+        return None, "Joints outside every tree keep their articulations on the tree route."
     joint_counts = starts[articulations + 1] - starts[articulations]
     n = int(joint_counts[0]) - 1
     if n < 1 or np.any(joint_counts != n + 1):

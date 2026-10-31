@@ -324,21 +324,6 @@ LINK_PLAN = FieldGroup(
 
 LINK_SLOTS = FieldGroup(Field("link_slot", wp.int32, ("link",), fill=-1, owner="laws"))
 
-CONNECT_PLAN = FieldGroup(
-    Field("_connect_art", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_body_p", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_body_c", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_anchor_p", wp.vec3, ("closure",), owner="laws"),
-    Field("_connect_anchor_c", wp.vec3, ("closure",), owner="laws"),
-    Field("_connect_parent_prescribed", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_world", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_valid", wp.int32, ("closure",), owner="laws"),
-    Field("_connect_enabled", wp.int32, ("closure",), owner="laws"),
-)
-"""The static per-closure lookup tables of the enforced loop closures."""
-
-CONNECT_SLOTS = FieldGroup(Field("connect_slot", wp.int32, ("closure",), fill=-1, owner="laws"))
-
 Links = field_group.struct(
     "Links",
     (
@@ -361,19 +346,6 @@ Mimics = field_group.struct(
     __name__,
 )
 """The mimic rows' tables (:data:`MIMIC_PLAN`), their dense slots and the model's enable flags and coefficients."""
-
-Connects = field_group.struct(
-    "Connects",
-    (
-        dataclasses.replace(CONNECT_SLOTS["connect_slot"], name="slot", attr="connect_slot"),
-        *(
-            dataclasses.replace(field, name=field.name.removeprefix("_connect_"), attr=field.name)
-            for field in CONNECT_PLAN
-        ),
-    ),
-    __name__,
-)
-"""The enforced loop closures' tables (:data:`CONNECT_PLAN`) and their dense slots."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Sparse-diagonal contact schedule

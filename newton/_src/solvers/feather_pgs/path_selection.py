@@ -808,8 +808,7 @@ def _dynamics(solver) -> dict:
         "parallel_augmented_drive_topology": bool(solver.factor.parallel_drives),
         "preelimination": bool(solver.factor.eliminates),
         "mimic_rows": int(solver.laws.mimic_count or 0),
-        "connect_rows": int(solver.laws.connect_count or 0),
-        "loop_joints": bool(solver.forest.has_loop_joints),
+        "link_rows": int(solver.laws.link_count or 0),
         "prescribed_response": bool(solver.forest.has_prescribed_response),
         "armature_floor": _armature_floor(solver),
     }

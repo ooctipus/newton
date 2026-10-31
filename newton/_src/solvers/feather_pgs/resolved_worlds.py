@@ -659,12 +659,12 @@ def decline(solver) -> str | None:
     predictor residual: contacts, their friction and joint position limits.
     A patch tangent pair projects on its ring's pooled normal load, which is
     zero in a world whose normals all separate. Bilateral rows (mimic,
-    connect, pre-elimination), warm starts, regularization and
+    link, pre-elimination), warm starts, regularization and
     velocity limits keep every world on the complete path.
     """
     laws = solver.laws.set
-    # No mimic or connect rows.
-    laws_exact = {"mimic_count": 0, "connect_count": 0}
+    # No mimic or link rows.
+    laws_exact = {"mimic_count": 0, "link_count": 0}
     required = ("world_dof_indices", "world_dof_count", "body_response_dof_mask", "body_has_response_dofs")
     return first_failed(
         (

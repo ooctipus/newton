@@ -85,7 +85,6 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR,
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
-    allocate_connect_slots,
     allocate_joint_velocity_limit_slots,
     allocate_link_slots,
     allocate_mimic_slots,
@@ -104,7 +103,6 @@ from .kernels import (
     gather_mf_warmstart,
     local_solve_launch_gate,
     pack_contact_linear_force_as_spatial,
-    populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
     populate_rigid_velocity_limit_rows,
@@ -133,7 +131,6 @@ from .solver_fields import (
     SPARSE_CONTACT_RECORDS,
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
-    Connects,
     Links,
     LocalOwners,
     Mimics,
@@ -548,13 +545,11 @@ class SolverFeatherPGS(SolverBase):
                 and non-negative. Defaults to 0.0.
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
-            enable_bilateral_preelimination (bool, optional): Eliminate each articulation's mimic and
-                connect rows exactly (:func:`.response_builds_rows.elimination`): every other row
-                (contacts especially) takes the closed-loop response, ``Z' = (I - Z_B G^-1 Z_B^T) Z``,
-                and the predictor velocity is projected onto the closures once per step. Blocks are
-                sized from the model (an articulation's mimic rows plus three per closure); a row
-                that depends on the others leaves its block. Requires the packed-row (CUDA) routes;
-                the CPU warns and keeps the iterative rows. Defaults to False.
+            enable_bilateral_preelimination (bool, optional): Eliminate mimic rows exactly, as a loop joint's rows
+                always are (:func:`.response_builds_rows.elimination`): every other row (contacts especially) takes
+                the closed-loop response, ``Z' = (I - Q Q^T) Z``, and the predictor velocity is projected onto the
+                closures once per step. Blocks are sized from the model; a row that depends on the others leaves
+                its block. Defaults to False.
             joint_limit_activation_gap (float, optional): Distance from a finite lower or upper
                 position limit at which a joint-limit PGS row becomes active. A lower row is
                 allocated when ``q <= lower + gap``; an upper row is allocated when
@@ -585,7 +580,7 @@ class SolverFeatherPGS(SolverBase):
                 and not NaN. Defaults to ``0.0``.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor for contact, joint-limit,
-                mimic and connect rows. Defaults to 0.2.
+                mimic and loop-closing rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
             pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
@@ -708,7 +703,7 @@ class SolverFeatherPGS(SolverBase):
             and self.forest.size_groups
             and max(self.forest.size_groups) <= _CONTACT_JACOBIAN_MAX_DOF
         )
-        # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and connect plans,
+        # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and link plans,
         # contact torsion and the materials.
         self.laws = RowLaws.build(model, self.forest, options)
         # The placement: where the rows live, their capacities and status.
@@ -1431,14 +1426,13 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
-        """Enable or disable the connect rows of a loop-closing BALL joint at runtime.
+        """Enable or disable the closure of a loop joint, of any type, at runtime.
 
-        The closure keeps its allocated capacity, so toggling is CUDA-graph-safe and
-        takes effect on the next :meth:`step`. Closures disabled through
-        :attr:`~newton.Model.joint_enabled` at construction still count as capacity.
+        The closure keeps its allocated capacity and takes effect on the next :meth:`step`, also in a captured graph.
+        Closures disabled through :attr:`~newton.Model.joint_enabled` at construction still count as capacity.
 
         Args:
-            joint: Model joint index of a loop-closing BALL joint.
+            joint: Model joint index of a loop joint.
             enabled: ``True`` to enforce the closure, ``False`` to release it.
         """
         self.cut.set_enabled(joint, enabled)
@@ -1446,14 +1440,14 @@ class SolverFeatherPGS(SolverBase):
         self.notify_model_changed(ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES)
 
     def set_loop_joint_anchors(self, joint: int, parent_anchor, child_anchor) -> None:
-        """Move the anchors of a loop-closing BALL joint at runtime.
+        """Move the anchors of a loop joint, of any type, at runtime: the origins of its frames on the model.
 
         Both anchors are body-local points [m] (world-frame for a world parent). Use it
         to re-target a closure before enabling it, for example to attach a body to a
         prescribed hand at the relative pose measured at acquisition.
 
         Args:
-            joint: Model joint index of a loop-closing BALL joint.
+            joint: Model joint index of a loop joint.
             parent_anchor: Anchor in the parent body frame [m].
             child_anchor: Anchor in the child body frame [m].
         """
@@ -1461,7 +1455,7 @@ class SolverFeatherPGS(SolverBase):
         self.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
 
     def loop_joint_anchors(self, joint: int) -> tuple[np.ndarray, np.ndarray]:
-        """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
+        """Return the current ``(parent_anchor, child_anchor)`` of a loop joint [m]."""
         return self.cut.anchors(joint)
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
@@ -1495,7 +1489,7 @@ class SolverFeatherPGS(SolverBase):
             and not self.factor.eliminates
             and not self.forest.has_free_rigid_bodies
             and self.laws.mimic_count == 0
-            and self.laws.connect_count == 0
+            and self.laws.link_count == 0
         )
         if not supported:
             return
@@ -3576,44 +3570,6 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.placement.packed_Z, dense_rows],
                 device=model.device,
             )
-
-        # Connect (loop-closure) equality rows — static count per model.
-        if self.laws.connect_count > 0:
-            wp.launch(
-                allocate_connect_slots,
-                dim=self.laws.connect_count,
-                inputs=[field_group.bind(Connects, laws=self.laws), max_constraints],
-                outputs=[
-                    self.placement.slot_counter,
-                    self.placement.dense_first_rejected_slot,
-                ],
-                device=model.device,
-            )
-            for size in self.forest.size_groups:
-                n_arts = self.forest.n_arts_by_size[size]
-                wp.launch(
-                    populate_connect_J_for_size,
-                    dim=n_arts,
-                    inputs=[
-                        joints,
-                        field_group.bind(Connects, laws=self.laws),
-                        self.forest.group_to_art[size],
-                        size,
-                        state_in.body_q,
-                        state_in.body_qd,
-                        model.body_com,
-                        self.forest.body_to_joint,
-                        self.forest.body_to_articulation,
-                        model.joint_ancestor,
-                        state_aug.joint_S_s,
-                        self.factor.articulation_origin,
-                        self.options.pgs_beta,
-                        self.options.pgs_cfm,
-                        support,
-                    ],
-                    outputs=[self.placement.jacobian_rows(size), dense_rows],
-                    device=model.device,
-                )
 
         if self.placement.fused_diagonal_joint_limits:
             wp.launch(

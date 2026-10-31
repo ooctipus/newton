@@ -22,7 +22,6 @@ from . import host_index
 from .device_proof import DeviceProof
 from .response_builds_dense import dense_factor_kernel, dense_factor_plan
 from .response_builds_rows import sparse_factor_kernel
-from .route_table import capable
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
@@ -60,14 +59,11 @@ def _diagonal_geometry(
 def decline(solver, *, sparse: bool | None = None) -> str | None:
     """Why the held tree does not evaluate a representation of the solver's dynamics, or ``None`` when it does.
 
-    The laws it does not hold (loop-closing joints), then the terms of the representation: the native sparse factor's
-    group (``sparse``: whether it carries velocity-limit rows; by default the representation the solver chose, and its
-    admission passes its candidate through :func:`sparse_decline`), then the drive rows every dense group reads. A term
-    is read only once the earlier ones hold.
+    The terms of the representation: the native sparse factor's group (``sparse``: whether it carries velocity-limit
+    rows; by default the representation the solver chose, and its admission passes its candidate through
+    :func:`sparse_decline`), then the drive rows every dense group reads. A term is read only once the earlier ones
+    hold.
     """
-    reason = capable("held", solver.laws.set)
-    if reason is not None:
-        return reason
     if sparse is None and getattr(solver.placement, "sparse_mass_matrix_size", None) is not None:
         sparse = solver._sparse_velocity_limits
     # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the solver

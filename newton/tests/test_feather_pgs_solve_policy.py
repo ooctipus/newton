@@ -672,7 +672,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
             kernels.PGS_CONSTRAINT_TYPE_JOINT_LIMIT: "joint_limit",
             kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: "velocity_limit",
             kernels.PGS_CONSTRAINT_TYPE_MIMIC: "mimic",
-            kernels.PGS_CONSTRAINT_TYPE_CONNECT: "connect",
+            kernels.PGS_CONSTRAINT_TYPE_LINK: "link",
             kernels.PGS_CONSTRAINT_TYPE_TORSION: "torsion",
         }
         self.assertEqual(len(names), kernels.PGS_CONSTRAINT_TYPE_COUNT)

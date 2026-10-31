@@ -9,7 +9,7 @@
   regularization weight, the restitution threshold, the shape materials and contact torsion;
 - the rigid bodies' speed limits;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
-- the mimic and connect plans (the bilateral rows' tables);
+- the mimic and link plans (the bilateral rows' tables);
 - the velocity prescale's launch;
 - :attr:`RowLaws.set`, the route table's laws axis (:class:`.route_table.Laws`), once the bilateral pre-elimination
   is decided.
@@ -28,7 +28,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import Model
-from ...sim.enums import BodyFlags, JointType
+from ...sim.enums import JointType
 from . import host_index, prefix_rows
 from .configuration import Options
 from .dense_rows import RowSupport
@@ -40,8 +40,6 @@ from .kernel_template import KernelTemplate, params
 from .route_table import Laws
 from .row_laws import LINK_ROWS, ROW_LAW
 from .solver_fields import (
-    CONNECT_PLAN,
-    CONNECT_SLOTS,
     LINK_PLAN,
     LINK_SLOTS,
     MIMIC_PLAN,
@@ -144,7 +142,7 @@ class RowLaws:
     """The row laws' tables of one model and its options (:meth:`build`).
 
     The tables keep the names they had on the solver, without the leading underscore, except the tables uploaded by
-    field groups (:data:`.solver_fields.MIMIC_PLAN`, :data:`.solver_fields.CONNECT_PLAN`), which keep their fields'
+    field groups (:data:`.solver_fields.MIMIC_PLAN`, :data:`.solver_fields.LINK_PLAN`), which keep their fields'
     names.
     """
 
@@ -212,10 +210,9 @@ class RowLaws:
         )
 
         laws._joint_limit_tables(model)
-        # Mimic/connect plans must exist before capacity selection so the row census
+        # Mimic and link plans must exist before capacity selection so the row census
         # counts their rows (see Placement.internal_rows_per_world).
         laws._mimic_plan(model)
-        laws._connect_plan(model)
         laws._link_plan()
         laws._contact_torsion(model, options)
 
@@ -425,134 +422,6 @@ class RowLaws:
     def set_links_enabled(self) -> None:
         """Publish the links' enable bits (:meth:`.body_cut.BodyCut.set_enabled`); the next step reserves their rows."""
         self._link_enabled.assign(self.forest.cut.enabled)
-
-    def _connect_plan(self, model) -> None:
-        """Precompute the static per-closure lookup tables for the CONNECT row family.
-
-        Loop-closing BALL joints are excluded from FK/ID by
-        :meth:`.forest_plan.ForestPlan.build` and enforced here as three bilateral rows
-        pinning the joint's parent/child anchors together. Their stored owner comes from
-        the child body's tree articulation, independent of joint ordering. FIXED (weld)
-        loop joints warn and are ignored for now. All buffers are allocated once
-        (CUDA-graph-safe); ``joint_enabled`` is snapshotted at init and may be changed
-        later through :meth:`set_loop_joint_enabled`.
-
-        A closure's parent may live outside the child's articulation when it is
-        prescribed: a kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`) or the world
-        (``parent == -1``). Such closures contribute no parent DOFs; the parent anchor
-        velocity enters the row target instead (a compliant attachment to a driven hand,
-        for example). Dynamic cross-articulation closures still warn and are ignored.
-        """
-        self.connect_count = 0
-        self.connect_slot = None
-        self.connect_joint_to_index: dict[int, int] = {}
-        if not self.forest.has_loop_joints:
-            self.connect_world_np = None
-            return
-        joint_type = model.joint_type.numpy()
-        joint_parent = model.joint_parent.numpy()
-        joint_child = model.joint_child.numpy()
-        joint_X_p = model.joint_X_p.numpy()
-        joint_X_c = model.joint_X_c.numpy()
-        joint_enabled_arr = getattr(model, "joint_enabled", None)
-        joint_enabled = joint_enabled_arr.numpy() if joint_enabled_arr is not None else None
-        articulation_world = self.forest.articulation_world
-        loop_joint_articulation = self.forest.loop_joint_articulation
-        body_articulation = (
-            self.forest.body_to_articulation.numpy() if self.forest.body_to_articulation is not None else None
-        )
-        kinematic_bodies = (model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0
-
-        loops = np.flatnonzero(loop_joint_articulation >= 0)
-        art = loop_joint_articulation[loops]
-        ball = joint_type[loops] == int(JointType.BALL)
-        parent = joint_parent[loops]
-        has_parent = parent >= 0
-        parent_art = np.full(loops.size, -1, dtype=np.int32)
-        if body_articulation is not None:
-            parent_art[has_parent] = body_articulation[parent[has_parent]]
-        # A closure to another articulation is enforced only from a kinematic parent.
-        cross = has_parent & (parent_art != art)
-        dynamic_cross = np.zeros(loops.size, dtype=bool)
-        dynamic_cross[cross] = ~kinematic_bodies[parent[cross]]
-        for i in np.flatnonzero(~ball | dynamic_cross):
-            j = loops[i]
-            if not ball[i]:
-                warnings.warn(
-                    f"SolverFeatherPGS: loop joint {j} has unsupported type "
-                    f"{int(joint_type[j])} (only BALL/connect closures are enforced); ignored.",
-                    stacklevel=2,
-                )
-            else:
-                warnings.warn(
-                    f"SolverFeatherPGS: loop joint {j} closes across articulations ({int(parent_art[i])} vs "
-                    f"{int(art[i])}) and its parent is not kinematic; ignored.",
-                    stacklevel=2,
-                )
-        enforced = ball & ~dynamic_cross
-        joints = loops[enforced]
-
-        n = int(joints.size)
-        if n == 0:
-            self.connect_world_np = None
-            self.connect_joint_to_index = {}
-            return
-        self.connect_joint_to_index = {int(j): index for index, j in enumerate(joints)}
-        art = art[enforced]
-        self.connect_world_np = articulation_world[art].astype(np.int32)
-        self.connect_valid_np = (
-            np.ones(n, dtype=np.int32) if joint_enabled is None else (joint_enabled[joints] != 0).astype(np.int32)
-        )
-        self.connect_parent_prescribed_np = (~has_parent | cross)[enforced].astype(np.int32)
-        self.connect_enabled_np = self.connect_valid_np.copy()
-        self.connect_anchor_p_np = joint_X_p[joints, :3].astype(np.float32)
-        self.connect_anchor_c_np = joint_X_c[joints, :3].astype(np.float32)
-        self._arrays.upload(
-            CONNECT_PLAN,
-            _connect_art=art.astype(np.int32),
-            _connect_body_p=parent[enforced].astype(np.int32),
-            _connect_body_c=joint_child[joints].astype(np.int32),
-            _connect_anchor_p=self.connect_anchor_p_np,
-            _connect_anchor_c=self.connect_anchor_c_np,
-            _connect_parent_prescribed=self.connect_parent_prescribed_np,
-            _connect_world=self.connect_world_np,
-            _connect_valid=np.ones(n, dtype=np.int32),
-            _connect_enabled=self.connect_enabled_np,
-        )
-        self._arrays.allocate(CONNECT_SLOTS, closure=n)
-        self.connect_count = n
-
-    def connect_index(self, joint: int) -> int:
-        """The closure index of an enforced loop-closing BALL joint.
-
-        Raises:
-            ValueError: If ``joint`` is not one.
-        """
-        index = self.connect_joint_to_index.get(int(joint))
-        if index is None:
-            raise ValueError(
-                f"SolverFeatherPGS: joint {joint} is not an enforced loop-closing BALL joint of this solver."
-            )
-        return index
-
-    def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
-        """Enable or disable the connect rows of a loop-closing BALL joint (:meth:`.SolverFeatherPGS.set_loop_joint_enabled`)."""
-        index = self.connect_index(joint)
-        self.connect_enabled_np[index] = 1 if enabled else 0
-        self._connect_enabled.assign(self.connect_enabled_np)
-
-    def set_loop_joint_anchors(self, joint: int, parent_anchor, child_anchor) -> None:
-        """Move the anchors of a loop-closing BALL joint (:meth:`.SolverFeatherPGS.set_loop_joint_anchors`)."""
-        index = self.connect_index(joint)
-        self.connect_anchor_p_np[index] = np.asarray(parent_anchor, dtype=np.float32)
-        self.connect_anchor_c_np[index] = np.asarray(child_anchor, dtype=np.float32)
-        self._connect_anchor_p.assign(self.connect_anchor_p_np)
-        self._connect_anchor_c.assign(self.connect_anchor_c_np)
-
-    def loop_joint_anchors(self, joint: int) -> tuple[np.ndarray, np.ndarray]:
-        """Return the current ``(parent_anchor, child_anchor)`` of a loop-closing BALL joint [m]."""
-        index = self.connect_index(joint)
-        return self.connect_anchor_p_np[index].copy(), self.connect_anchor_c_np[index].copy()
 
     # --- the slots and the friction patches, allocated with the rows ----------------------------------------------
     def allocate(self, model, pool, phi) -> None:
