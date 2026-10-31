@@ -1,5 +1,12 @@
 {
  "kernels": {
+  "audit.audit_world": "d52d2d2b0c19c3524dde21de4075f230b579e8a874cffc7d681fa92998236ca6",
+  "audit.diagonal_rows": "66724d710a105709ca7cd4bb77f7fdca3247c8685edb980a9873385cfa1a3d4b",
+  "audit.enter": "d2a1afe84c86461e8f846d98adce69247fc147207ffb843040166a5ea9358cd0",
+  "audit.free_rows": "0f9386b118808154f79c179bfa21178985768953e64580f67ec35c060789036b",
+  "audit.fused_limits": "3eccd0400c0000c09e1249ec93f7478fc3b01fa2622d9927b255cc20fd2faecd",
+  "audit.packed_rows": "b513b373f388151c95acd68ddc27f428e9c809b41238774474b45d726c214cd1",
+  "audit.sparse_rows": "376b7947f8f9d8653ffe7e264c361d0d7e87502107e866275f94f8102759d8e9",
   "body_cut._gather_bodies": "e29c4665520f38025c77eac40fc28c435a6bc04c9111d8922b3d8ee11247856f",
   "body_cut._gather_frames": "4944e5c3d4ba209bd097198bf598c3cd5aea58f6e52b7ac75dabfb15602ac3b8",
   "body_cut._note_unseated": "e7b78bc678016ff63c0f1e19712a244444eec8cab10e2014ff761d2070ff063a",

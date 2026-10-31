@@ -858,4 +858,8 @@ def _diagnostics(solver) -> dict:
         reason = (
             "Off: FEATHER_PGS_DEBUG_SNAPSHOTS=1 or pgs_debug=True opts in to three stage-3 snapshot copies per substep."
         )
-    return {"stage3_snapshots": {"enabled": snapshots, "reason": reason}}
+    audit = solver._audit
+    return {
+        "stage3_snapshots": {"enabled": snapshots, "reason": reason},
+        "audit": {"enabled": False, "reason": "Off: pgs_audit=True opts in."} if audit is None else audit.record(),
+    }

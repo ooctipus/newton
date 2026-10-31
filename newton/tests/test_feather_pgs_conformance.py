@@ -232,6 +232,7 @@ class Run:
     contacts: list  # per step: dict of contact arrays (pre-step geometry, exported forces)
     capacity: dict
     measurements: dict | None = None  # get_path_selection()["measurements"] after the last step, with a readout
+    audit: dict | None = None  # read_audit() after the last step, under pgs_audit
 
 
 CONTACT_FIELDS = (
@@ -382,6 +383,7 @@ def simulate(
         measurements = None
         if merged.get("pgs_solve_readout", "off") != "off":
             measurements = solver.get_path_selection()["measurements"]
+        audit = solver.read_audit() if merged.get("pgs_audit") else None
     history = recorder.read(steps)
     counts = history["contact_count"].reshape(steps)
     contact_log = []
@@ -408,6 +410,7 @@ def simulate(
         contacts=contact_log,
         capacity=capacity,
         measurements=measurements,
+        audit=audit,
     )
 
 

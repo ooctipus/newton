@@ -61,6 +61,7 @@ from . import (
 )
 from . import route_table as _route_table
 from . import row_metadata as _row_metadata
+from .audit import Audit
 from .body_cut import BodyCut
 from .configuration import check_options, kernel_choices
 from .contact_input import ContactInput
@@ -431,6 +432,7 @@ class SolverFeatherPGS(SolverBase):
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
         pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
+        pgs_audit: bool = False,
         contact_torsion: bool = False,
         contact_compliance: bool = False,
     ):
@@ -583,6 +585,11 @@ class SolverFeatherPGS(SolverBase):
                 mimic and loop-closing rows. Defaults to 0.2.
             pgs_cfm (float, optional): Compliance/regularization added to the Delassus diagonal. Defaults to 1.0e-6.
             pgs_omega (float, optional): Successive over-relaxation factor for the PGS sweep. Defaults to 1.0.
+            pgs_audit (bool, optional): Audit each step after its solve: per world, the energy gap ``G`` [J] the solve
+                failed to account for, the dual violation ``D`` [m/s] and the rows' injected work ``W`` [J]
+                (:mod:`.audit`), read with :meth:`read_audit`. It reads what the step holds, steers no route and
+                changes no computed value. A world whose rows exist only inside its sweep reads NaN
+                (``routes.diagnostics.audit`` says which). Defaults to ``False``.
             pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
                 ``"sweeps"`` counts, per sweep kernel and world, how many sweeps each solve executed
                 and whether it stopped before its budget; ``"trace"`` adds, per
@@ -1147,6 +1154,7 @@ class SolverFeatherPGS(SolverBase):
         self._init_size_group_streams(model)
         self.placement.allocate_placeholders()
 
+        self._audit = Audit(self) if self.options.pgs_audit else None
         self.placement.allocate_status()
 
         # Scalar branches take a diagonal-mass group of world-fixed roots over
@@ -2412,6 +2420,17 @@ class SolverFeatherPGS(SolverBase):
         self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
         self._paired_general_done = wp.Event(model.device) if paired_overlap else None
 
+    def read_audit(self) -> dict:
+        """Return the per-world audit of ``pgs_audit`` by name (:data:`.audit.AUDIT_SLOTS`), each a NumPy array.
+
+        ``gap``, ``violation`` and ``work`` are the last step's ``G``, ``D`` and ``W``, NaN in a world without readable
+        rows; ``gap_sum``, ``violation_max``, ``work_sum`` and ``steps`` cover the steps read since construction,
+        captured graph replays included. This synchronizes with the device.
+        """
+        if self._audit is None:
+            raise RuntimeError("read_audit() needs a solver built with pgs_audit=True.")
+        return self._audit.read()
+
     def _launch_local_internal_solve(
         self,
         dense_rhs: wp.array,
@@ -3108,6 +3127,9 @@ class SolverFeatherPGS(SolverBase):
             self._launch_matrix_free_position_solve(
                 iterations=self.options.pgs_iterations,
             )
+
+        if self._audit is not None:
+            self._audit.launch()
 
         # ══════════════════════════════════════════════════════════════
         # STAGE 7: Update qdd + integrate

@@ -52,6 +52,7 @@ _BOOLEANS = (
     "row_watermark",
     "contact_torsion",
     "contact_compliance",
+    "pgs_audit",
 )
 
 
@@ -94,6 +95,7 @@ class Options:
     warn_constraint_overflow: bool
     friction_anchor_beta: Any
     pgs_solve_readout: str
+    pgs_audit: bool
     contact_torsion: bool
     contact_compliance: bool
 
