@@ -37,6 +37,7 @@ from .field_group import SolverArrays
 from .kernels import (
     LINK_ROWS,
     RIGID_SPEED_ROWS,
+    clear_grouped_jacobian_active_rows,
     clear_local_solve_diag,
     place_world_contact_runs,
     prepare_world_impulses,
@@ -401,17 +402,15 @@ class Placement:
         run_blocks = self.contact_run_lead + 1 + int(model.shape_count) - self.contact_run_trail_start
         arrays.allocate(CONTACT_RUNS, world=self.forest.world_count, run_block=run_blocks)
 
-    def allocate_size_groups(self, *, double_buffered: bool) -> None:
-        """Each size group's response and Jacobian (two sets where the memset stream clears them) and its diagonal."""
+    def allocate_size_groups(self) -> None:
+        """Each size group's response, Jacobian and diagonal."""
         if not self.model.articulation_count:
             self.dummy_hinv_diag = None
-            self.J_bufs = None
             return
 
         device = self.model.device
         arrays = self.arrays
         self.dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device)
-        self.J_bufs = [{}, {}] if double_buffered else None
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
             sparse_response = self.sparse_mass_matrix_size is not None or (
@@ -434,31 +433,22 @@ class Placement:
                 "y_size": y or size,
             }
             self.Y_by_size[size] = arrays.allocate(SIZE_RESPONSE, owner={}, **sizes)["Y"]
-            # Double buffering gives a size group two Jacobians only where the memset stream clears the rows between
-            # uses; else both sets share one.
-            J = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
-            if double_buffered:
-                self.J_bufs[0][size] = J
-                second = self.clears_jacobian(size)
-                self.J_bufs[1][size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"] if second else J
-            else:
-                self.J_by_size[size] = J
+            self.J_by_size[size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
             self.diag_by_size[size] = (
                 wp.zeros((n_arts, self.dense_max_constraints), dtype=wp.float32, device=device)
                 if size in self.hinv_jt_diag_sizes and not sparse_response
                 else self.dummy_hinv_diag
             )
 
-        if self.J_bufs is not None:
-            self.J_by_size = self.J_bufs[0]
-
     def clears_jacobian(self, size: int) -> bool:
-        """Whether the memset stream clears a size group's active Jacobian rows between uses (double-buffered on CUDA):
-        not under the matrix-free sweeps (their producers write the packed rows' sides whole), nor for the
-        sparse-diagonal response size (no dense Jacobian) or the compact boundary's six coordinates (it clears its
-        rows itself); :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a private Jacobian."""
+        """Whether a size group's rows of the last step are cleared before the producers write the next: not under the
+        matrix-free sweeps (their producers write the packed rows' sides whole) or native sparse factors (no dense
+        Jacobian), nor for the sparse-diagonal response size (no dense Jacobian) or the compact boundary's six
+        coordinates (it clears its rows itself); :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a
+        private Jacobian."""
         return not (
             self.mf_sweeps
+            or self.sparse_mass_matrix_size is not None
             or (self.sparse_diagonal_contact_solve and size == self.sparse_diagonal_response_size)
             or (self.compact_contact_boundary and size == 6)
         )
@@ -815,8 +805,27 @@ class Placement:
     # Step: the rows' slots, counts and status
     # ---------------------------------------------------------------------------------------------------------------
 
-    def begin(self):
-        """Clear the rows' allocation state before the row pass writes it."""
+    def begin(self, jacobian_sizes):
+        """Clear the last step's Jacobian rows of ``jacobian_sizes`` and the rows' allocation state before the row pass
+        writes them."""
+        # The last step's rows, while its counts stand: every inactive row is clean by induction, and each step's rows
+        # stay readable until the next.
+        for size in jacobian_sizes:
+            wp.launch(
+                clear_grouped_jacobian_active_rows,
+                dim=self.forest.n_arts_by_size[size] * 32,
+                inputs=[
+                    self.forest.group_to_art[size],
+                    self.forest.art_to_world,
+                    self.constraint_count,
+                    size,
+                    self.dense_max_constraints,
+                ],
+                outputs=[self.J_by_size[size]],
+                block_dim=256,
+                device=self.model.device,
+            )
+
         # One launch clears the world-level allocation state and, with free rigid bodies, the
         # matrix-free counters and impulses (PGS reads mf_impulses before its first write; the
         # warm-start seed pass re-gathers after build_mf_contact_rows). Other row buffers are

@@ -133,13 +133,9 @@ def check_options(options: Mapping[str, Any]) -> Options:
 
 # The kernels the CPU runs, and the choices a test pin may fix on CUDA.
 _CPU_KERNELS = {
-    "cholesky_kernel": "loop",
-    "trisolve_kernel": "loop",
     "hinv_jt_kernel": "par_row",
 }
 _PINNABLE = {
-    "cholesky_kernel": ("tiled", "loop"),
-    "trisolve_kernel": ("tiled", "loop"),
     "hinv_jt_kernel": ("tiled", "par_row"),
 }
 
@@ -147,11 +143,10 @@ _PINNABLE = {
 def kernel_choices(pins: Mapping[str, Any], *, is_cpu: bool):
     """Return each dense kernel's choice and why.
 
-    The CPU runs the loop kernels of the ordinary dynamics' factor, triangular solve and response (fixed). On CUDA
-    the factor, triangular-solve and response kernels are ``"auto"``: the execution plan
-    maps each size by its resource rule. A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where
-    the execution plan maps a size to a dense kernel; it claims no worlds from the other owners (the ``placement``
-    pin does).
+    The CPU runs the row-parallel response (fixed). On CUDA the response kernel is ``"auto"``: the execution plan maps
+    each size by its resource rule. A test pin (``SolverFeatherPGS._route_pins``) fixes a kernel on CUDA where the
+    execution plan maps a size to a dense kernel; it claims no worlds from the other owners (the ``placement`` pin
+    does).
 
     Raises:
         ValueError: for a pin that names no kernel of its stage, or a CUDA kernel on the CPU.

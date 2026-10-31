@@ -198,8 +198,6 @@ def measurement_selection(solver) -> dict:
 
 def _held_tree_groups(solver) -> tuple:
     owner = solver.factor.held
-    if owner is None:
-        return None, []
     groups = list(owner.groups)
     # Scalar branch groups hold no tree layout.
     if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
@@ -212,7 +210,6 @@ def _held_tree(solver) -> dict:
     kind, groups = _held_tree_groups(solver)
     return {
         "owner": kind,
-        "reason": solver.factor.held_reason,
         "layout_reason": getattr(owner, "forest_reason", None),
         # Whether a diagonal-mass group of world-fixed roots over one-coordinate
         # leaves runs as scalar branches.
@@ -682,15 +679,10 @@ def _resolved_worlds(solver) -> dict:
 
 
 def _publication(solver) -> dict:
-    if solver.factor.held is not None:
-        owner, reason = "cached", "The held-tree owner publishes next-step state."
-    else:
-        owner, reason = "ordinary", "Separate launches integrate and publish the next state."
-    cache = "in_place" if solver.factor.fk_id_cache_enabled else "off"
     return {
-        "owner": owner,
-        "reason": reason,
-        "fk_id_cache": cache,
+        "owner": "cached",
+        "reason": "The held-tree owner publishes next-step state.",
+        "fk_id_cache": "in_place",
     }
 
 
@@ -814,15 +806,6 @@ def _dynamics(solver) -> dict:
             "reason": solver.placement.packed_response_reason,
         },
         "parallel_augmented_drive_topology": bool(solver.factor.parallel_drives),
-        "double_buffer": bool(solver._double_buffer),
-        # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset
-        # stream: empty without a double buffer, where the ordinary route's stage 1 clears H before
-        # CRBA. Sizes a held-tree owner factors from its own geometry have no reader
-        # (routes.stages.unread_mass_dofs).
-        "double_buffer_mass_matrix_clear_dofs": []
-        if solver._memset_stream is None
-        else sorted(int(size) for size in solver.forest.size_groups if size not in solver._plan.unread_mass_sizes),
-        "size_group_streams": any(stream is not None for stream in solver.factor.size_streams.values()),
         "preelimination": bool(solver.factor.eliminates),
         "mimic_rows": int(solver.laws.mimic_count or 0),
         "connect_rows": int(solver.laws.connect_count or 0),

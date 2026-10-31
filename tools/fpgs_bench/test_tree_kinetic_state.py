@@ -5,7 +5,6 @@
 
 import contextlib
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -20,7 +19,8 @@ from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests import feather_pgs_sparse_scene as split
-from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
+from newton.tests.feather_pgs_law_harness import recomputing
+from tools.fpgs_bench.public_state_oracle import force_response, physical_mass, public_state
 
 
 @contextlib.contextmanager
@@ -79,9 +79,8 @@ def fixture(floating, device):
     builder.replicate(scene, 2)
     model = builder.finalize(device=device)
     model.rigid_contact_max = 8
-    # Ordinary dynamics: the test installs the held owner itself.
-    with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary", "double_buffer": False}):
-        solver, reference = (SolverFeatherPGS(model, friction_anchor_beta=0.0) for _ in range(2))
+    # The test builds its own owner on the solver.
+    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
@@ -93,7 +92,7 @@ def fixture(floating, device):
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner
-    return model, solver, reference, operator, owner, mass
+    return model, solver, operator, owner, mass
 
 
 class TestTreePhysicalCPU(unittest.TestCase):
@@ -105,7 +104,7 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     self.subTest(floating=floating, chains=chains),
                     _heavy_chains() if chains else contextlib.nullcontext(),
                 ):
-                    model, solver, reference, operator, owner, mass = fixture(floating, device)
+                    model, solver, operator, owner, mass = fixture(floating, device)
                     self.assertNotEqual(tuple(mass.permutation), tuple(range(mass.dof_count - 1, -1, -1)))
                     state, output, control = model.state(), model.state(), model.control()
                     rng = np.random.default_rng(81)
@@ -114,16 +113,9 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     control.joint_f.assign(rng.uniform(-0.1, 0.1, model.joint_dof_count).astype(np.float32))
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                     dt, count = 0.004, mass.dof_count
-                    reference.factor.last_step_dt = dt
-                    reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
-                    reference.factor.ordinary.joint_tau(state, control, dt)
-                    rhs = reference.factor.joint_tau.numpy().reshape(2, count).astype(float)
                     solver.factor.joint_tau.zero_()
                     owner.begin(state, solver.factor, state.joint_qd, dt, True)
                     public_state(self, model, state)
-                    np.testing.assert_allclose(
-                        solver.factor.body_v_s.numpy(), reference.factor.body_v_s.numpy(), atol=2e-6, rtol=2e-5
-                    )
                     physical = physical_mass(model, state)
                     matrices = [physical[i * count : (i + 1) * count, i * count : (i + 1) * count] for i in range(2)]
                     geometry = owner.geometric.numpy()
@@ -132,12 +124,12 @@ class TestTreePhysicalCPU(unittest.TestCase):
                         np.testing.assert_allclose(geometry[group], expected, atol=3e-6, rtol=3e-5)
                     solver.factor.mass_update_mask.fill_(1)
                     operator.refresh(solver.factor)
-                    owner.predict(state, solver.factor, control, state.joint_qd, dt)
+                    response = force_response(owner, solver, state, control, state.joint_qd, dt).reshape(2, count)
+                    forces = control.joint_f.numpy().reshape(2, count).astype(float)
                     for group, matrix in enumerate(matrices):
                         held_matrix = matrix + np.diag(solver.factor.R_by_size[count].numpy()[group])
-                        expected = np.linalg.solve(held_matrix, rhs[group])
-                        actual = solver.factor.joint_qdd.numpy().reshape(2, count)[group]
-                        np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-4)
+                        expected = np.linalg.solve(held_matrix, forces[group])
+                        np.testing.assert_allclose(response[group], expected, atol=3e-5, rtol=3e-4)
                     solver.v_out.assign(solver.v_hat)
                     owner.finish(state, solver.factor, output, dt, False)
                     public_state(self, model, output)
@@ -170,9 +162,6 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         limited = split.make_solver(case[0], True, enable_joint_velocity_limits=True)
         self.assertIsNotNone(limited.factor.held)
         self.assertTrue(limited.factor.held.groups[0].motion_velocity)
-        self.assertTrue(limited.factor.fk_id_cache_enabled)
-        explicit = split.make_solver(case[0], True, pins={"evaluator": "ordinary"})
-        self.assertIsNone(explicit.factor.held)
 
     def test_physical_cache(self):
         """Check non-G1 geometry and force actions on the explicitly leased GPU."""
@@ -189,10 +178,10 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
             cases = []
             for enabled in (False, True):
                 with _heavy_chains():
-                    pins = None if enabled else {"evaluator": "ordinary"}
-                    case = split.make_case(True, pins=pins, floating=floating, branches=3, depth=2, device="cuda:0")
+                    case = split.make_case(True, floating=floating, branches=3, depth=2, device="cuda:0")
                 self.assertIsNotNone(case[1].placement.sparse_mass_matrix_size)
-                self.assertEqual(case[1].factor.held is not None, enabled)
+                if not enabled:
+                    recomputing(case[1])
                 cases.append(case)
             for step in range(12):
                 for case in cases:

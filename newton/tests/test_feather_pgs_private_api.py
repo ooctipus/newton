@@ -9,10 +9,8 @@ _FEATHER_PGS = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
 
 # Kernel factories: cached, so that a variant is built once per process.
 _KERNEL_FACTORIES = {
-    "tree_ordinary.py": ("triangular_solve_kernel",),
     "response_builds_dense.py": (
         "dense_factor_kernel",
-        "factor_tiles_kernel",
         "response_warps_kernel",
         "response_tiles_kernel",
     ),
@@ -86,23 +84,6 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
         self.assertIn("COMPUTE_DIAG", diagonal_names)
         self.assertIn("diag_group", diagonal_parameters)
         self.assertIn("diag_tile", diagonal_names)
-
-    def test_cholesky_and_triangular_kernels_are_not_dense_constraint_gated(self):
-        # The plan's factor and triangular-solve kernels (OrdinaryTree.build_kernels) do not depend on the dense row
-        # capacity.
-        tree = ast.parse((_FEATHER_PGS / "tree_ordinary.py").read_text())
-        ordinary = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "OrdinaryTree")
-        methods = {node.name: node for node in ordinary.body if isinstance(node, ast.FunctionDef)}
-        for helper_name in ("factor_tiles_kernel", "triangular_solve_kernel"):
-            with self.subTest(helper_name=helper_name):
-                node = methods["build_kernels"]
-                call_line = self._first_call_line(node, helper_name)
-                first_dense_continue = self._first_dense_guard_continue_line(node)
-                if first_dense_continue is not None:
-                    self.assertLess(call_line, first_dense_continue)
-                dense_guarded_none_assignments = self._dense_guarded_none_assignments(node)
-                self.assertNotIn("cholesky_kernels_by_size", dense_guarded_none_assignments)
-                self.assertNotIn("triangular_solve_kernels_by_size", dense_guarded_none_assignments)
 
     @staticmethod
     def _references_dense_max_constraints(node):

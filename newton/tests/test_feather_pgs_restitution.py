@@ -1053,8 +1053,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
     graph_model, graph_body, graph_state, graph_contacts, graph_step = make_fixture()
     eager_model, eager_body, eager_state, eager_contacts, eager_step = make_fixture()
 
-    # Warm both fixtures through the same history. Besides compiling kernels,
-    # this keeps the solver's double-buffer phase identical for the comparison.
+    # Warm both fixtures through the same history, which also compiles the kernels.
     _reset_state(graph_model, graph_state, -speed)
     _reset_state(eager_model, eager_state, -speed)
     graph_step()

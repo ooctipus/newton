@@ -46,7 +46,6 @@ class TestFeatherPGSSafety(unittest.TestCase):
                 if wp.get_device(device).is_cuda:
                     first_mask = wp.empty_like(solver.factor.mass_update_mask)
                     with wp.ScopedCapture(device=device) as capture:
-                        solver.seed_double_buffer_events()
                         solver.reset(state, mask)
                         solver.step(state, output, control, None, 0.01)
                         wp.copy(first_mask, solver.factor.mass_update_mask)

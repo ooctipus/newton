@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The conformance reference held to an independent float64 evaluation, on every catalogue model the held tree holds.
+"""The conformance reference held to an independent float64 evaluation, on every catalogue model.
 
 The reference route is the held tree on the general placement (:data:`.test_feather_pgs_conformance.REFERENCE_CUDA`).
 What keeps it honest is outside the solver: after a few steps of each model,
@@ -32,7 +32,7 @@ BOUND = 16.0
 
 
 def _problems() -> list:
-    """Every model of the CUDA catalogue on the held tree once, with its options."""
+    """Every model of the CUDA catalogue once, with its options."""
     seen, problems = set(), []
     for group in conformance.cuda_groups():
         if group.physics.scene.name not in seen:
@@ -181,7 +181,6 @@ class _Invariants(unittest.TestCase):
 
     def check(self, physics):
         evaluated = _run(physics, self.reference_route, self.device)
-        self.assertIsNotNone(evaluated.solver.factor.held, evaluated.solver.factor.held_reason)
         reference = MassReference(evaluated.solver.model)
         check_geometry(self, evaluated, reference)
         check_factor(self, evaluated, reference)

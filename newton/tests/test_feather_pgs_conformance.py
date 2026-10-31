@@ -1404,14 +1404,6 @@ REFERENCE_CUDA = Route(
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 MF_TORSION = MF_DEFAULT.but("mf_torsion", expect={"friction.torsion": True})
 MF_COMPLIANCE = MF_DEFAULT.but("mf_compliance", expect={"friction.compliance": True})
-MF_GENERAL = Route(
-    "mf_general",
-    "cuda",
-    # The clutter scenes' route: the matrix-free sweep over ordinary dynamics.
-    options=_MF,
-    pins={**_DENSE, "evaluator": "ordinary"},
-    expect={"sweep.route": "matrix_free_gs", "sweep.tiers": None, "held_tree.owner": None},
-)
 MF_HELD = Route(
     "mf_held",
     "cuda",
@@ -1513,14 +1505,6 @@ LOCAL_OWNED = Route(
         "contact_rows.producer": "compact_jacobian",
         "held_tree.owner": "mixed",
     },
-)
-LOCAL_ORDINARY = Route(
-    "local_owned_ordinary",
-    "cuda",
-    # The clutter scenes' route: local owners over ordinary dynamics.
-    options=_MF,
-    pins={"producer": "compact_jacobian", "evaluator": "ordinary"},
-    expect={"local_solve.enabled": True, "sweep.local.factory": "local_owned", "held_tree.owner": None},
 )
 PAIRED = Route(
     "paired",
@@ -1656,16 +1640,12 @@ def cuda_groups() -> list:
         # Patch friction keeps the packed full sweep of the legged scene's small worlds: only point friction fuses
         # its contact triplets.
         triplets = [SPARSE_TRIPLETS] if law == "point" else []
-        legged = [SPARSE, *triplets, MF_HELD, MF_GENERAL]
+        legged = [SPARSE, *triplets, MF_HELD]
         legged += [MF_PARALLEL, KEYED_PARALLEL]
         groups += [
-            Group(
-                _physics(scenes.box_drop(), law, 32),
-                ref,
-                (MF_HELD, MF_GENERAL),
-            ),
-            Group(_physics(scenes.box_stack(), law, 32), ref, (MF_HELD, MF_GENERAL)),
-            Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL)),
+            Group(_physics(scenes.box_drop(), law, 32), ref, (MF_HELD,)),
+            Group(_physics(scenes.box_stack(), law, 32), ref, (MF_HELD,)),
+            Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
             # Native sparse factors' spin rows (and their quads where triplets fuse) and the Jacobi tiers' radial
@@ -1683,7 +1663,7 @@ def cuda_groups() -> list:
             Group(
                 _physics(scenes.gripper(), law, 32),
                 ref,
-                (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY),
+                (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED),
             ),
             Group(_physics(scenes.gripper(table=True), law, 32), ref, (LOCAL_KINEMATIC,)),
             # The local owners' rows with spin rows (the grasp: soft fingers), against the general route's.
@@ -1738,9 +1718,9 @@ def cuda_groups() -> list:
             ref,
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
-        Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL)),
+        Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD,)),
-        Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL)),
+        Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_PARALLEL)),
         Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.four_bar(loop="revolute"), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.mimic_pair(), None, 16), ref, (MF_HELD,)),
@@ -1749,8 +1729,8 @@ def cuda_groups() -> list:
             ref,
             (SPARSE.but("sparse_velocity_mimic", expect={"sparse_mass_matrix.velocity_limits": True}),),
         ),
-        # A one-coordinate arm is diagonal-mass, which the held tree declines.
-        Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_GENERAL,)),
+        # A one-coordinate arm is diagonal-mass.
+        Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_DEFAULT,)),
         Group(
             _physics(scenes.pushed_arm(), None, 16, "velocity_limits", **vlimits),
             ref,
@@ -1766,8 +1746,7 @@ def cuda_groups() -> list:
     for scene in _torsion_scenes():
         groups.append(Group(_physics(scene, "point", 32, "torsion", contact_torsion=True), ref, (MF_TORSION,)))
     for scene in COMPLIANT_SCENES():
-        routes = (MF_COMPLIANCE, MF_GENERAL.but("mf_general_compliance", expect={"friction.compliance": True}))
-        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, routes))
+        groups.append(Group(_physics(scene, "point", 32, "compliance", contact_compliance=True), ref, (MF_COMPLIANCE,)))
     # Material contacts compose with warm start (the cold reference) and patch friction. The stack's corner split
     # converges at 64 sweeps.
     for scene, iterations in (
@@ -1788,7 +1767,7 @@ def cuda_groups() -> list:
     # specialized placements' row laws against the reference's).
     for scene, iterations, routes in (
         (scenes.legged(), 32, (SPARSE, SPARSE_TRIPLETS, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
-        (scenes.gripper(), 32, (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED, LOCAL_ORDINARY)),
+        (scenes.gripper(), 32, (LOCAL_PACKETS, LOCAL_FOREST, LOCAL_OWNED)),
         (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE, COMPACT_BOUNDARY)),
         (scenes.hand(), 16, (PAIRED, PAIRED_FOREST)),
     ):

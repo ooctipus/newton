@@ -742,6 +742,19 @@ def row_velocity(jacobian, velocity) -> np.ndarray:
     return out
 
 
+def recomputing(solver):
+    """``solver``, recomputing its held state from every step's input: the reference a cached step must match within
+    rounding (returns the solver)."""
+    step = solver.step
+
+    def recompute_then_step(*args, **kwargs):
+        solver.factor.notify_state_changed()
+        return step(*args, **kwargs)
+
+    solver.step = recompute_then_step
+    return solver
+
+
 _FACTOR_STORAGE = []
 """The factors :func:`articulation_factor` addresses, kept alive while the tests run."""
 

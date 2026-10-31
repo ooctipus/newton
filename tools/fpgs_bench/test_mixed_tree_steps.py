@@ -165,7 +165,6 @@ class TestMixedTreeSteps(unittest.TestCase):
             # Finish asynchronous setup allocations before capturing parallel streams.
             wp.synchronize()
             with wp.ScopedCapture(device=case[0].device) as capture:
-                case[1].seed_double_buffer_events()
                 case[1].reset(case[2], world_mask=mask)
                 for _ in range(4):
                     case = step(case)

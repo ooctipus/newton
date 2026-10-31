@@ -10,13 +10,12 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import execution_plan, sweep_routes, tree_passes
+from newton._src.solvers.feather_pgs import execution_plan, sweep_routes
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
     _DENSE_META_ROW_TYPE_MASK,
-    _estimate_cholesky_shared_memory,
     _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
@@ -230,28 +229,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(plan.methods, {12: "masked_combined"})
                 self.assertEqual(plan.combined, (12,))
 
-    def test_launch_geometry_kernels_use_dedicated_modules(self):
-        """Keep custom-block-dimension kernels out of the general modules, one module per launch block size."""
-        expected_modules = {
-            feather_pgs_kernels: {
-                "eval_rigid_tau_and_augmented_drives": "inverse_dynamics",
-            },
-            tree_passes: {
-                "fk_id": "serial",
-                "inverse_dynamics_tau": "serial",
-                "composite_inertia": "serial",
-                "refresh_body_inertia": "mass_dynamics",
-                "crba_fill": "mass_dynamics",
-            },
-        }
-        for owner, kernels in expected_modules.items():
-            general_module = owner.__name__
-            for kernel_name, module_suffix in kernels.items():
-                with self.subTest(kernel=kernel_name):
-                    kernel_module = getattr(owner, kernel_name).module.name
-                    self.assertNotEqual(kernel_module, general_module)
-                    self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
-
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
@@ -278,7 +255,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [160],
             max_constraints=384,
             max_shared_memory=101376,
-            cholesky_kernel="auto",
             hinv_jt_kernel="auto",
             small_dof_threshold=12,
             tile_threads=64,
@@ -290,7 +266,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             [23],
             max_constraints=0,
             max_shared_memory=101376,
-            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,
@@ -303,7 +278,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 [160],
                 max_constraints=384,
                 max_shared_memory=101376,
-                cholesky_kernel="auto",
                 hinv_jt_kernel="tiled",
                 small_dof_threshold=12,
                 tile_threads=64,
@@ -312,34 +286,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_hinv_estimate_counts_three_response_tiles(self):
         """Count the factor, three response tiles and the Warp scratch of the tiled response."""
         self.assertEqual(_estimate_hinv_jt_shared_memory(27, 32, tile_threads=64), 13552)
-
-    def test_cholesky_execution_plan_respects_shared_memory(self):
-        """Fall back for oversized auto tiles and reject forced invalid launches."""
-        self.assertEqual(_estimate_cholesky_shared_memory(108), 140400)
-        automatic = _FeatherPGSExecutionPlan.build(
-            [23, 108],
-            max_constraints=0,
-            max_shared_memory=101376,
-            cholesky_kernel="auto",
-            hinv_jt_kernel="auto",
-            small_dof_threshold=12,
-            tile_threads=64,
-        )
-        self.assertTrue(automatic.use_tiled_cholesky(23))
-        self.assertFalse(automatic.use_tiled_cholesky(108))
-        self.assertIn("140400", automatic.selection_reasons(108)["cholesky_kernel"])
-        self.assertIn("101376", automatic.selection_reasons(108)["cholesky_kernel"])
-
-        with self.assertRaisesRegex(ValueError, "cholesky_kernel='tiled'.*140400.*101376"):
-            _FeatherPGSExecutionPlan.build(
-                [108],
-                max_constraints=0,
-                max_shared_memory=101376,
-                cholesky_kernel="tiled",
-                hinv_jt_kernel="auto",
-                small_dof_threshold=12,
-                tile_threads=64,
-            )
 
     def test_fixed_base_sibling_branches_detect_diagonal_mass_topology(self):
         """Detect independent fixed-base branches on every supported device."""
@@ -353,14 +299,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         self.assertEqual(optimized.forest.diagonal_mass_sizes, frozenset((16,)))
         self.assertTrue(optimized._execution_plan.use_diagonal_mass(16))
-        # No dense factor or triangular-solve kernel: the held tree factors in stage 1, or the diagonal route.
-        ordinary = optimized.factor.ordinary
-        if ordinary is not None:
-            self.assertIsNone(ordinary.cholesky_kernels_by_size[16])
-            self.assertIsNone(ordinary.triangular_solve_kernels_by_size[16])
         self.assertIsNone(optimized.placement.hinv_jt_kernels_by_size[16])
 
-        forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
+        forced = {"hinv_jt_kernel": "par_row"}
         with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
             reference = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
         self.assertFalse(reference._execution_plan.use_diagonal_mass(16))
@@ -417,7 +358,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(optimized.forest.direct_diagonal_inertia_sizes, frozenset((16,)))
         self.assertEqual(optimized.placement.sparse_diagonal_response_size, 16)
         self.assertEqual(optimized.placement.sparse_diagonal_dense_size, 3)
-        self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
         self.assertEqual(optimized.placement.J_by_size[16].shape, (1, 1, 1))
         self.assertEqual(optimized.placement.J_world.shape, (1, 1, 1))
         self.assertFalse(reference.placement.sparse_diagonal_contact_solve)
@@ -457,11 +397,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 state_in, state_out = state_out, state_in
                 history.append((state_in.joint_q.numpy().copy(), state_in.joint_qd.numpy().copy()))
                 if solver is optimized:
-                    # Order snapshots after maintenance on its owning stream.
-                    with wp.ScopedStream(solver._memset_stream):
-                        for buffers in solver.placement.J_bufs:
-                            np.testing.assert_array_equal(buffers[16].numpy(), np.zeros((1, 1, 1), dtype=np.float32))
-                            self.assertFalse(np.any(buffers[3].numpy()), "Dense Jacobian maintenance was skipped")
+                    np.testing.assert_array_equal(
+                        solver.placement.J_by_size[16].numpy(), np.zeros((1, 1, 1), dtype=np.float32)
+                    )
             trajectories.append(history)
 
         self.assertEqual(cleared_shapes[id(optimized)], [(2, 64, 3)] * 3)
@@ -641,21 +579,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         np.testing.assert_allclose(step(), masked, rtol=1.0e-6, atol=0.0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the CUDA trajectory requires CUDA")
-    def test_cuda_ordinary_mass_pipeline_matches_cpu_trajectory(self):
-        """Run ordinary dynamics' drives and mass pipeline on CUDA as on the CPU (both pinned to ordinary dynamics)."""
+    def test_cuda_mass_pipeline_matches_cpu_trajectory(self):
+        """Run the drives and the mass pipeline on CUDA as on the CPU."""
         model = _build_chain_model(num_links=3, num_worlds=2)
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
-            reference = SolverFeatherPGS(
-                _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
-                enable_joint_limits=False,
-                dense_max_constraints=16,
-            )
-        self.assertIsNone(optimized.factor.held)
+        optimized = SolverFeatherPGS(model, enable_joint_limits=False, dense_max_constraints=16)
+        reference = SolverFeatherPGS(
+            _build_chain_model(num_links=3, num_worlds=2, device="cpu"),
+            enable_joint_limits=False,
+            dense_max_constraints=16,
+        )
         self.assertEqual(optimized._plan.factor[3].name, reference._plan.factor[3].name)
-        # Both evaluate the drives with the joint forces in one pass and add K after the assembly.
-        self.assertFalse(optimized.factor.parallel_drives)
-        self.assertFalse(reference.factor.parallel_drives)
 
         q = np.tile(np.array([0.15, -0.2, 0.3], dtype=np.float32), 2)
         qd = np.tile(np.array([0.1, -0.05, 0.2], dtype=np.float32), 2)
@@ -711,32 +644,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertTrue(compact)
         self.assertFalse(large)
         self.assertFalse(overcommitted)
-
-    def test_serial_passes_launch_at_the_serial_block_size(self):
-        """A step of ordinary dynamics (pinned) launches every one-articulation-per-thread pass (FK/ID, the joint forces
-        and drives, the composite inertia) in blocks of ``tree_passes.SERIAL_BLOCK_DIM`` threads."""
-        model = _build_chain_model()
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=1)
-        state_0, state_1, control = model.state(), model.state(), model.control()
-        serial = {
-            tree_passes.fk_id,
-            tree_passes.inverse_dynamics_tau,
-            tree_passes.composite_inertia,
-            feather_pgs_kernels.eval_rigid_tau_and_augmented_drives,
-        }
-        blocks = {}
-        launch = wp.launch
-
-        def record(kernel, *args, **kwargs):
-            if kernel in serial:
-                blocks.setdefault(kernel.key, set()).add(kwargs.get("block_dim"))
-            return launch(kernel, *args, **kwargs)
-
-        with mock.patch.object(wp, "launch", record):
-            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
-        self.assertIn(tree_passes.fk_id.key, blocks)
-        self.assertEqual(set().union(*blocks.values()), {tree_passes.SERIAL_BLOCK_DIM}, blocks)
 
 
 if __name__ == "__main__":

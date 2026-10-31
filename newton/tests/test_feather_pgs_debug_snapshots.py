@@ -586,7 +586,6 @@ def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
         for order in ((states[0], states[1]), (states[1], states[0])):
             copies.append([])
             with wp.ScopedCapture(device=device) as capture:
-                solver.seed_double_buffer_events()
                 substep(*order)
             graphs.append(capture.graph)
     for step in range(steps):

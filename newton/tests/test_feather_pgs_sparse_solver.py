@@ -289,17 +289,9 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             solver.placement.Y_world,
             solver.placement.J_by_size[size],
             solver.placement.Y_by_size[size],
-            solver.H_by_size[size],
             solver.factor.L_by_size[size],
         ):
             self.assertEqual(array.shape, (1, 1, 1))  # Only argument stand-ins remain.
-        for name in ("tau_by_size", "qdd_by_size"):
-            self.assertNotIn(size, getattr(solver.factor, name))
-        # The held tree factors natively; ordinary stages would build no dense factor or trisolve kernel for it.
-        ordinary = solver.factor.ordinary
-        if ordinary is not None:
-            self.assertIsNone(ordinary.cholesky_kernels_by_size[size])
-            self.assertIsNone(ordinary.triangular_solve_kernels_by_size[size])
         np.testing.assert_array_equal(solver.factor.sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.placement.constraint_overflow.numpy().any())
         for name in STATE_FIELDS:

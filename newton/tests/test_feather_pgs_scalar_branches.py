@@ -4,15 +4,14 @@
 """Scalar branches: world-fixed roots over one-coordinate prismatic leaves (``scalar_branches.py``).
 
 The CPU tests compare the scalar kernels, bound through ``ScalarBranchState``,
-with reference chains launched on the same inputs: the linear-state law of
-one-body prismatic branches, kept here as their oracle (bitwise). Stars with
+with the held star on the same inputs, at rounding level, and their inverse masses
+with the float64 mass matrix (:mod:`.feather_pgs_mass_reference`). Stars with
 revolute leaves run in the held tree's diagonal-mass group. ``TestGripperContactBound``
-checks the CUDA arm-key press bound on ordinary dynamics, the law both CUDA
-routes integrate.
+checks the CUDA arm-key press bound on the held star, the law both CUDA routes
+integrate.
 """
 
 import dataclasses
-import functools
 import json
 import unittest
 from types import SimpleNamespace
@@ -22,16 +21,14 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels as fk
-from newton._src.solvers.feather_pgs import path_selection, tree_factor, tree_passes, tree_scan
+from newton._src.solvers.feather_pgs import path_selection, tree_factor
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
-from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.test_feather_pgs_compact_contact import compact_boundary
-from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
@@ -221,23 +218,41 @@ def build_branch_model(
     return model
 
 
+def _excess(actual, desired, rtol=0.0):
+    """Largest ``|actual - desired| - rtol * |desired|``: within ``atol`` exactly when assert_allclose passes."""
+    actual, desired = np.asarray(actual, np.float64), np.asarray(desired, np.float64)
+    return max(float(np.max(np.abs(actual - desired) - rtol * np.abs(desired))), 0.0)
+
+
+def _assert_switch_within(test, label, switch, again, tolerance):
+    """Bound an A/B difference by the tolerance plus the default arm's own run-to-run (A/A) spread.
+
+    The A/A spread must itself stay within the tolerance: a larger one means the rollout's
+    nondeterminism, not the switch, decides the comparison.
+    """
+    test.assertLessEqual(
+        again,
+        tolerance,
+        f"{label}: the default arm differs from itself by {again:.3g} (> {tolerance:.3g}); "
+        "the rollout cannot resolve the switch",
+    )
+    test.assertLessEqual(
+        switch,
+        tolerance + again,
+        f"{label}: the switch changes it by {switch:.3g}, above {tolerance:.3g} plus the A/A spread {again:.3g}",
+    )
+
+
 def branch_articulations(model):
     """The first articulation of every world: the branch root's."""
     return np.arange(0, model.articulation_count, model.articulation_count // model.world_count)
 
 
 def cpu_solver(model, size):
-    """A CPU solver over ordinary dynamics that carries the CUDA route's drive-row topology and compact diagonal size.
-
-    The test pin keeps ordinary dynamics, which build neither the asynchronous
-    drive rows nor the sparse-diagonal response; give it both so that the
-    scalar kernels and the head kernels bind the arrays the CUDA route binds.
-    """
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-        solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
-    solver.factor.setup_drives(True)
+    """A CPU solver that carries the CUDA route's compact diagonal size, so that the scalar kernels and the head
+    kernels bind the arrays the CUDA route binds."""
+    solver = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
     solver._compact_diagonal_mass_size = size
-    solver.factor.fk_id_cache_enabled = True
     return solver
 
 
@@ -248,9 +263,10 @@ def branch_size(model):
 
 
 def same(test, expected, actual, index, name):
+    """The same law in another float order: within the held-solve floor."""
     expected, actual = expected.numpy()[index], actual.numpy()[index]
     test.assertTrue(np.all(np.isfinite(actual)), name)
-    np.testing.assert_array_equal(actual, expected, err_msg=name)
+    np.testing.assert_allclose(actual, expected, rtol=ARM_FLOOR, atol=2.0e-6, err_msg=name)
 
 
 def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
@@ -270,30 +286,15 @@ def recipe_solver(model, *, scalar, compact=True, pins=None, **options):
         return SolverFeatherPGS(model, **arguments)
 
 
-_ORDINARY = {"evaluator": "ordinary"}
-
-
-def ordinary_head(model, *, rows=64, **options):
-    """The A/B head: the keyboard recipe on ordinary dynamics, which take the dense representations and the
-    general rows, since the compact diagonal and its fused limit rows are the held tree's.
+def dense_head(model, *, rows=64, **options):
+    """The A/B head: the keyboard recipe on the general placement and dense storage, with the star in the held tree.
 
     ``rows`` is its dense row capacity: every key's limit rows are dense rows there. The general rows are inside
     the resolved-world classifier's law, the sparse-diagonal rows of the scalar route are not: the head alone leaves
     a world whose rows all separate without rows (:func:`_normal_impulses`), which changes the rows the arms keep,
     not their physics (the pusher press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
     """
-    return recipe_solver(model, scalar=False, pins=_ORDINARY, dense_max_constraints=rows, **options)
-
-
-def ordinary_inverse_mass(solver, size):
-    """Ordinary dynamics' inverse mass of a diagonal-mass size group, ``1 / L_jj^2`` of its leaf-first diagonal
-    factor (``L_jj = sqrt(H_ii + R_i)``, ``i = n - 1 - j``), for every coordinate (zero outside the group)."""
-    factor = solver.factor.L_by_size[size].numpy().astype(np.float64)
-    starts = solver.forest.articulation_dof_start.numpy()[solver.forest.group_to_art[size].numpy()]
-    inverse = np.zeros(solver.model.joint_dof_count)
-    for group, start in enumerate(starts):
-        inverse[start : start + size] = 1.0 / np.diagonal(factor[group])[::-1] ** 2
-    return wp.array(inverse, dtype=wp.float64, device="cpu")
+    return recipe_solver(model, scalar=False, pins={"placement": "general"}, dense_max_constraints=rows, **options)
 
 
 def install_held_contacts(model, state, contacts, pairs):
@@ -348,524 +349,15 @@ class _Layout:
         self.arm_tips = child[starts[self.arms + 1] - 1]
 
 
-# The linear-state law of one-body prismatic branches: the prismatic kernels of the scalar
-# family follow it operation for operation, so it is their bitwise oracle. The joint passes
-# stop at each branch root; one thread per leaf body publishes the leaf from its coordinate.
-
-
-def _linear_state_plan(solver):
-    """Shorten each branch articulation's joint pass to its root and map every leaf body to its joint."""
-    model = solver.model
-    starts = model.articulation_start.numpy()
-    ends = solver.forest.articulation_joint_end.numpy().copy()
-    body_joint = np.full(model.body_count, -1, dtype=np.int32)
-    for art in solver.forest.group_to_art[solver._compact_diagonal_mass_size].numpy():
-        joints = np.arange(starts[art] + 1, ends[art], dtype=np.int32)
-        body_joint[model.joint_child.numpy()[joints]] = joints
-        ends[art] = starts[art] + 1
-    return wp.array(ends, dtype=int, device=model.device), wp.array(body_joint, dtype=int, device=model.device)
-
-
-# The oracle replays the ordinary route's former FK/ID cache: a refresh skipped for valid articulations, the stage-7
-# kinematics and a per-body publication of the inverse-dynamics terms.
-_ORACLE_TWISTS = tree_scan.serial_scan(tree_scan.TWIST, tree_scan.Direction.DOWN, tree_passes.relative_twist)
-
-
-@wp.kernel(enable_backward=False)
-def _oracle_fk_id(d: tree_passes.DynamicsData, valid: wp.array[int]):
-    """The general route's FK/ID pass, skipped for the articulations ``valid`` marks, which it then marks."""
-    index = wp.tid()
-    if valid[index] != 0:
-        return
-    tree_passes.articulation_poses(index, d)
-    start, end = d.articulation_start[index], d.articulation_joint_end[index]
-    tree_passes._TWISTS_AND_DYNAMICS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
-    valid[index] = 1
-
-
-@wp.kernel(enable_backward=False)
-def _oracle_kinematics(d: tree_passes.DynamicsData, valid: wp.array[int]):
-    """Body poses, COM frames, origins, motion columns, twists and bias accelerations; marks the articulation."""
-    index = wp.tid()
-    tree_passes.articulation_poses(index, d)
-    start, end = d.articulation_start[index], d.articulation_joint_end[index]
-    _ORACLE_TWISTS(start, end, d.joint_parent, d.joint_child, d.body_v_s, d.body_a_s, d)
-    valid[index] = 1
-
-
-@wp.func
-def _oracle_publish_body(body: int, d: tree_passes.DynamicsData):
-    """A body's inertia and inverse-dynamics wrench from its published twist, and its COM twist."""
-    articulation = d.body_to_articulation[body]
-    origin = wp.vec3(0.0)
-    pose_com = wp.transform_identity()
-    acceleration = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
-    free_rigid = int(0)
-    if articulation >= 0:
-        origin = d.articulation_origin[articulation]
-        pose_com = d.body_q_com[body]
-        acceleration = d.body_a_s[body]
-        free_rigid = d.is_free_rigid[articulation]
-    tree_passes.body_dynamics(
-        body,
-        articulation,
-        d.body_q[body],
-        pose_com,
-        origin,
-        d.body_v_s[body],
-        acceleration,
-        d.body_mass[body],
-        d.body_inertia[body],
-        d.body_com[body],
-        d.gravity[0],
-        free_rigid,
-        d.write_inertia_records,
-        1,
-        d.body_I_s,
-        d.body_inertia_terms,
-        d.body_f_s,
-        d.body_qd,
-    )
-
-
-@wp.func
-def _write_linear_body(
-    body: int,
-    joint: int,
-    joint_parent: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    body_X_com: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
-    body_mass: wp.array[float],
-    articulation_origin: wp.array[wp.vec3],
-    gravity: wp.array[wp.vec3],
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    body_f_s: wp.array[wp.spatial_vector],
-):
-    dof = joint_qd_start[joint]
-    X_parent = body_q[joint_parent[joint]]
-    X_wpj = X_parent * joint_X_p[joint]
-    axis = joint_axis[dof]
-    q = joint_q[joint_q_start[joint]]
-    # The pose scan's composition: the parent's pose and the joint's relative pose.
-    X_wc = sb._leaf_pose(X_parent, joint_X_p[joint], False, axis, q, joint_X_c[joint])
-    X_com = X_wc * body_X_com[body]
-    body_q[body] = X_wc
-    body_q_com[body] = X_com
-    motion = sb._leaf_motion(X_wpj, wp.vec3(), False, axis)
-    joint_S_s[dof] = motion
-    body_v_s[body] = motion * joint_qd[dof]
-    body_a_s[body] = wp.spatial_vector()
-    com = wp.transform_get_translation(X_com) - articulation_origin[body_to_articulation[body]]
-    force = body_mass[body] * gravity[0]
-    body_f_s[body] = -wp.spatial_vector(force, wp.cross(com, force))
-
-
-@wp.kernel(module="unique")
-def _direct_branch_tau(
-    group_to_art: wp.array[int], dof_joint_offset: wp.array[int], n_dofs: int, d: tree_passes.DynamicsData
-):
-    """The linear-state oracle's joint forces of one-body branches, one thread per coordinate: each body bears
-    only its own wrench (the serial pass's law for a leaf), added onto the drive force ``tau`` holds."""
-    element = wp.tid()
-    group = element // n_dofs
-    joint = d.articulation_start[group_to_art[group]] + dof_joint_offset[element - group * n_dofs]
-    dof = d.joint_qd_start[joint]
-    drive = d.tau[dof]
-    tree_passes.generalized_force(joint, tree_passes.net_wrench(joint, wp.spatial_vector(), d), d)
-    d.tau[dof] = d.tau[dof] + drive
-
-
-@wp.kernel(enable_backward=False)
-def _apply_inverse_mass(
-    inverse_mass: wp.array[float],
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    joint_tau: wp.array[float],
-    joint_qdd: wp.array[float],
-):
-    """The linear-state oracle's accelerations of one-body branches: ``tau`` times the inverse mass."""
-    element = wp.tid()
-    group = element // n_dofs
-    dof = articulation_dof_start[group_to_art[group]] + element - group * n_dofs
-    joint_qdd[dof] = joint_tau[dof] * inverse_mass[dof]
-
-
-@wp.kernel(enable_backward=False)
-def _repair_linear_state(
-    body_joint: wp.array[int],
-    previous_valid: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    body_X_com: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
-    body_mass: wp.array[float],
-    articulation_origin: wp.array[wp.vec3],
-    gravity: wp.array[wp.vec3],
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    body_f_s: wp.array[wp.spatial_vector],
-):
-    """Repair cold leaves after their roots using pre-launch cache validity."""
-    body = wp.tid()
-    joint = body_joint[body]
-    if joint < 0:
-        return
-    if previous_valid[body_to_articulation[body]] != 0:
-        return
-    _write_linear_body(
-        body,
-        joint,
-        joint_parent,
-        joint_q_start,
-        joint_qd_start,
-        joint_q,
-        joint_qd,
-        joint_X_p,
-        joint_X_c,
-        body_X_com,
-        joint_axis,
-        body_to_articulation,
-        body_mass,
-        articulation_origin,
-        gravity,
-        body_q,
-        body_q_com,
-        joint_S_s,
-        body_v_s,
-        body_a_s,
-        body_f_s,
-    )
-
-
-@wp.kernel(enable_backward=False)
-def _finalize_linear_state(
-    body_joint: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    body_X_com: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_to_articulation: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-    body_mass: wp.array[float],
-    articulation_origin: wp.array[wp.vec3],
-    gravity: wp.array[wp.vec3],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-    body_f_s: wp.array[wp.spatial_vector],
-    body_qd: wp.array[wp.spatial_vector],
-    dynamics: tree_passes.DynamicsData,
-):
-    """Publish admitted linear bodies and retain full dynamics for other bodies."""
-    body = wp.tid()
-    joint = body_joint[body]
-    if joint >= 0:
-        _write_linear_body(
-            body,
-            joint,
-            joint_parent,
-            joint_q_start,
-            joint_qd_start,
-            joint_q,
-            joint_qd,
-            joint_X_p,
-            joint_X_c,
-            body_X_com,
-            joint_axis,
-            body_to_articulation,
-            body_mass,
-            articulation_origin,
-            gravity,
-            body_q,
-            body_q_com,
-            joint_S_s,
-            body_v_s,
-            body_a_s,
-            body_f_s,
-        )
-        body_qd[body] = body_v_s[body]
-    else:
-        _oracle_publish_body(body, dynamics)
-
-
-@functools.cache
-def _linear_inverse_mass_kernel(n_dofs: int) -> wp.Kernel:
-    """The linear state's inverse mass: the direct-mass ABI without the inertia projection."""
-    N = int(n_dofs)
-    if N <= 0:
-        raise ValueError("linear direct inertia requires a positive DOF count")
-
-    def compute_linear_inverse_mass(
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        mass_update_mask: wp.array[int],
-        joint_child: wp.array[int],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_mass: wp.array[float],
-        body_inertia_terms: wp.array[inertia_record],
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        armature: wp.array2d[float],
-        drive_row_by_dof: wp.array[int],
-        drive_row_K: wp.array[float],
-        diagonal_inverse_mass: wp.array[float],
-    ):
-        element = wp.tid()
-        group = element // N
-        dof = element - group * N
-        art = group_to_art[group]
-        if mass_update_mask[art] == 0:
-            return
-        global_dof = articulation_dof_start[art] + dof
-        joint = articulation_start[art] + dof_joint_offset[dof]
-        body = joint_child[joint]
-        linear = wp.spatial_top(joint_S_s[global_dof])
-        mass = body_mass[body] * wp.dot(linear, linear) + armature[group, dof]
-        drive_row = drive_row_by_dof[global_dof]
-        if drive_row >= 0:
-            stiffness = drive_row_K[drive_row]
-            if stiffness > 0.0:
-                mass += stiffness
-        diagonal_inverse_mass[global_dof] = 1.0 / mass
-
-    name = f"compute_prismatic_linear_inverse_mass_{N}"
-    compute_linear_inverse_mass.__name__ = name
-    compute_linear_inverse_mass.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(compute_linear_inverse_mass)
-
-
-class _PrismaticRoute:
-    """The linear-state law of prismatic leaves (the scalar family's oracle), launched on one solver's arrays."""
-
-    def __init__(self, solver):
-        self.solver, model = solver, solver.model
-        self.model, self.device = model, model.device
-        self.size = solver._compact_diagonal_mass_size
-        self.group = solver.forest.group_to_art[self.size]
-        self.offsets = solver.forest.crba_dof_joint_offset_by_size[self.size]
-        self.joint_end, self.body_joint = _linear_state_plan(solver)
-        self.previous = wp.zeros(model.articulation_count, dtype=int, device=self.device)
-        self.inverse_mass = _linear_inverse_mass_kernel(self.size)
-
-    def begin(self, state):
-        s, model = self.solver, self.model
-        wp.copy(self.previous, s.factor.fk_id_cache_valid)
-        wp.launch(
-            _oracle_fk_id,
-            dim=model.articulation_count,
-            inputs=[
-                s.factor.ordinary.dynamics(state, articulation_joint_end=self.joint_end),
-                s.factor.fk_id_cache_valid,
-            ],
-            device=self.device,
-        )
-        wp.launch(
-            _repair_linear_state,
-            dim=model.body_count,
-            inputs=[
-                self.body_joint,
-                self.previous,
-                model.joint_parent,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.factor.body_X_com,
-                model.joint_axis,
-                s.forest.body_to_articulation,
-                model.body_mass,
-                s.factor.articulation_origin,
-                model.gravity,
-            ],
-            outputs=[
-                state.body_q,
-                s.factor.body_q_com,
-                s.factor.joint_S_s,
-                s.factor.body_v_s,
-                s.factor.body_a_s,
-                s.factor.body_f_s,
-            ],
-            device=self.device,
-        )
-
-    def predict(self, state, control, dt):
-        s, model, size = self.solver, self.model, self.size
-        wp.launch(
-            tree_factor.prepare_augmented_drives,
-            dim=model.joint_dof_count,
-            inputs=[
-                s.factor.drive_row_by_dof,
-                s.factor.drive_q_index_by_dof,
-                s.factor.drive_target_index_by_dof,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_target_ke,
-                model.joint_target_kd,
-                control.joint_target_q,
-                control.joint_target_qd,
-                model.joint_effort_limit,
-                s.factor.passive_joint_damping,
-                dt,
-            ],
-            outputs=[s.factor.aug_row_K, s.factor.joint_tau],
-            device=self.device,
-        )
-        count = self.group.shape[0] * size
-        wp.launch(
-            _direct_branch_tau,
-            dim=count,
-            inputs=[self.group, self.offsets, size, s.factor.ordinary.dynamics(state, control)],
-            device=self.device,
-        )
-        wp.launch(
-            self.inverse_mass,
-            dim=count,
-            inputs=[
-                model.articulation_start,
-                s.forest.articulation_dof_start,
-                s.factor.mass_update_mask,
-                model.joint_child,
-                s.factor.joint_S_s,
-                model.body_mass,
-                s.factor.body_inertia_terms,
-                self.group,
-                self.offsets,
-                s.factor.R_by_size[size],
-                s.factor.drive_row_by_dof,
-                s.factor.aug_row_K,
-            ],
-            outputs=[s.factor.diagonal_inverse_mass],
-            device=self.device,
-        )
-        wp.launch(
-            _apply_inverse_mass,
-            dim=count,
-            inputs=[
-                s.factor.diagonal_inverse_mass,
-                self.group,
-                s.forest.articulation_dof_start,
-                size,
-                s.factor.joint_tau,
-            ],
-            outputs=[s.factor.joint_qdd],
-            device=self.device,
-        )
-        wp.launch(
-            fk.compute_velocity_predictor,
-            dim=model.joint_dof_count,
-            inputs=[state.joint_qd, s.factor.kinematic_dof_mask, dt],
-            outputs=[s.factor.joint_qdd, s.v_hat],
-            device=self.device,
-        )
-
-    def finish(self, state_in, state_out, dt):
-        s, model = self.solver, self.model
-        wp.launch(
-            fk.update_qdd_from_velocity,
-            dim=model.joint_dof_count,
-            inputs=[state_in.joint_qd, s.factor.kinematic_dof_mask, 1.0 / dt],
-            outputs=[s.v_out, s.factor.joint_qdd],
-            device=self.device,
-        )
-        wp.launch(
-            fk.integrate_generalized_joints,
-            dim=model.joint_count,
-            inputs=[
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                s.factor.kinematic_joint_mask,
-                model.joint_dof_dim,
-                model.body_com,
-                model.joint_X_c,
-                state_in.joint_q,
-                state_in.joint_qd,
-                s.factor.joint_qdd,
-                dt,
-            ],
-            outputs=[state_out.joint_q, state_out.joint_qd],
-            device=self.device,
-        )
-        wp.launch(
-            _oracle_kinematics,
-            dim=model.articulation_count,
-            inputs=[
-                s.factor.ordinary.dynamics(state_out, articulation_joint_end=self.joint_end),
-                s.factor.fk_id_cache_valid,
-            ],
-            device=self.device,
-        )
-        wp.launch(
-            _finalize_linear_state,
-            dim=model.body_count,
-            inputs=[
-                self.body_joint,
-                model.joint_parent,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_out.joint_q,
-                state_out.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.factor.body_X_com,
-                model.joint_axis,
-                s.factor.joint_S_s,
-                s.forest.body_to_articulation,
-                state_out.body_q,
-                s.factor.body_q_com,
-                model.body_mass,
-                s.factor.articulation_origin,
-                model.gravity,
-                s.factor.body_v_s,
-                s.factor.body_a_s,
-                s.factor.body_f_s,
-                state_out.body_qd,
-                s.factor.ordinary.dynamics(state_out, write_inertia_records=1),
-            ],
-            device=self.device,
-        )
-
-
 class _Pair:
-    """A head-route solver and a scalar-branch solver over one model, each with its own states and inputs."""
+    """A held-star solver and a scalar-branch solver over one model, each with its own states and inputs."""
 
-    def __init__(self, model, route=_PrismaticRoute, *, poison=False):
+    def __init__(self, model, *, poison=False):
         size = branch_size(model)
         self.model = model
-        self.head = cpu_solver(model, size)
+        self.head = SolverFeatherPGS(model, enable_joint_limits=True, update_mass_matrix_interval=2)
         self.mine = cpu_solver(model, size)
-        self.route = route(self.head)
+        self.reference = MassReference(model)
         self.plan, self.reason = sb.plan_scalar_branches(self.mine)
         if self.plan is None:
             raise AssertionError(self.reason)
@@ -904,6 +396,26 @@ class _Pair:
         for solver in (self.head, self.mine):
             solver.factor.mass_update_mask.assign(values)
 
+    def check_inverse_mass(self, test, joint_q, tag):
+        """Hold the scalar inverse masses to the float64 mass matrix, armature and drive stiffness at ``joint_q``."""
+        inverse = self.mine.factor.diagonal_inverse_mass.numpy()
+        # The branches' drives stay inside their kernels: the head prepared the same stiffness.
+        rows = self.head.factor.drive_row_by_dof.numpy()
+        K = self.head.factor.aug_row_K.numpy()
+        armature = self.model.joint_armature.numpy()
+        # A kinematic coordinate's inverse mass is its prescription, not its inertia.
+        kinematic = self.mine.factor.kinematic_dof_mask.numpy()
+        for art in self.arts:
+            start = int(self.mine.forest.articulation_dof_start_host[art])
+            H = self.reference.mass_matrix(joint_q, int(art))
+            for local in range(H.shape[0]):
+                dof = start + local
+                if kinematic[dof]:
+                    continue
+                drive = max(float(K[rows[dof]]), 0.0) if rows[dof] >= 0 else 0.0
+                expected = 1.0 / (H[local, local] + armature[dof] + drive)
+                test.assertAlmostEqual(inverse[dof] / expected, 1.0, delta=2.0e-6, msg=f"{tag} dof {dof}")
+
     def step(self, test):
         """Advance both routes one substep and compare what each phase publishes.
 
@@ -912,50 +424,29 @@ class _Pair:
         """
         head_in, head_out = self.states["head"]
         mine_in, mine_out = self.states["mine"]
+        head, held = self.head.factor, self.head.factor.held
         tag = f"step {self.step_index}"
-        self.route.begin(head_in)
+        held.begin(head_in, head, head_in.joint_qd, DT, True)
         self.state.begin(mine_in, self.mine.factor, mine_in.joint_qd, DT, True)
         same(test, head_in.body_q, mine_in.body_q, self.bodies, f"{tag} input body_q")
-        same(test, self.head.factor.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
-        same(
-            test,
-            self.head.factor.articulation_origin,
-            self.mine.factor.articulation_origin,
-            self.arts,
-            f"{tag} input origin",
-        )
-        self.route.predict(head_in, self.controls["head"], DT)
+        same(test, head.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
+        same(test, head.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} input origin")
+        head.prepare_drives(head_in, self.controls["head"], DT)
+        held.refresh(head)
+        held.predict(head_in, head, self.controls["head"], head_in.joint_qd, DT)
         self.state.predict(mine_in, self.mine.factor, self.controls["mine"], mine_in.joint_qd, DT)
-        same(
-            test,
-            self.head.factor.diagonal_inverse_mass,
-            self.mine.factor.diagonal_inverse_mass,
-            self.dofs,
-            f"{tag} inverse mass",
-        )
-        same(test, self.head.factor.joint_qdd, self.mine.factor.joint_qdd, self.dofs, f"{tag} joint_qdd")
+        self.check_inverse_mass(test, mine_in.joint_q.numpy(), tag)
         same(test, self.head.v_hat, self.mine.v_hat, self.dofs, f"{tag} v_hat")
         solved = self.head.v_hat.numpy() + self.rng.uniform(-0.03, 0.03, self.model.joint_dof_count).astype(np.float32)
         for solver in (self.head, self.mine):
             solver.v_out.assign(solved)
-        self.route.finish(head_in, head_out, DT)
+        held.finish(head_in, head, head_out, DT, False)
         self.state.finish(mine_in, self.mine.factor, mine_out, DT, False)
         for name, index in (("joint_q", self.coordinates), ("joint_qd", self.dofs)):
             same(test, getattr(head_out, name), getattr(mine_out, name), index, f"{tag} {name}")
         for name in ("body_q", "body_qd"):
             same(test, getattr(head_out, name), getattr(mine_out, name), self.bodies, f"{tag} {name}")
-        for name in ("joint_qdd", "joint_S_s"):
-            same(
-                test,
-                getattr(self.head.factor, name),
-                getattr(self.mine.factor, name),
-                self.dofs,
-                f"{tag} finish {name}",
-            )
-        same(test, self.head.v_out, self.mine.v_out, self.dofs, f"{tag} finish v_out")
-        same(
-            test, self.head.factor.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} origin"
-        )
+        same(test, head.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} origin")
         np.testing.assert_array_equal(self.mine.factor.fk_id_cache_valid.numpy()[self.arts], 1)
         self.states["head"].reverse()
         self.states["mine"].reverse()
@@ -1363,13 +854,14 @@ class TestScalarBranchRule(unittest.TestCase):
 
 
 class TestScalarBranchKernels(unittest.TestCase):
-    def test_prismatic_branches_match_the_linear_state_route(self):
-        """Match the prismatic linear state route bitwise over steps, mass cadence, a masked reset and a re-pose.
+    def test_prismatic_branches_match_the_held_star(self):
+        """Match the held star over steps, mass cadence, a masked reset and a re-pose.
 
         Every field the family publishes is compared: input and output poses,
-        coordinates, body velocities, motion axes, accelerations, predictors,
-        inverse masses and the articulation origin. The dropped FK/ID fields of
-        the scalar solver hold NaN throughout, so no scalar kernel reads them.
+        coordinates, body velocities, motion axes, predictors and the articulation
+        origin, and the inverse masses with the float64 mass matrix. The dropped
+        FK/ID fields of the scalar solver hold NaN throughout, so no scalar kernel
+        reads them.
         """
         pair = _Pair(build_branch_model(), poison=True)
         worlds = pair.model.world_count
@@ -1384,9 +876,7 @@ class TestScalarBranchKernels(unittest.TestCase):
                     q = current.joint_q.numpy()
                     q[pair.coordinates[: pair.plan.size]] -= 0.001
                     current.joint_q.assign(q)
-                pair.head.factor.fk_id_cache_valid.assign(
-                    np.where(pair.head.forest.art_to_world.numpy() == 0, 0, 1).astype(np.int32)
-                )
+                pair.head.factor.held.invalidate(mask)
                 pair.state.invalidate(mask)
                 np.testing.assert_array_equal(
                     pair.mine.factor.fk_id_cache_valid.numpy()[pair.arts], [0] + [1] * (worlds - 1)
@@ -1400,19 +890,17 @@ class TestScalarBranchKernels(unittest.TestCase):
                 pair.model.joint_X_p.assign(frames)
                 # The owner's tree groups report the moved frames; the solver then invalidates every cache.
                 pair.state.invalidate()
-                pair.head.factor.fk_id_cache_valid.zero_()
+                pair.head.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
                 np.testing.assert_array_equal(pair.mine.factor.fk_id_cache_valid.numpy()[pair.arts], 0)
             pair.step(self)
 
     def test_kinematic_and_held_mass_steps_match(self):
-        """Match a kinematic leaf (a prescribed coordinate) and held inverse masses bitwise."""
+        """Match a kinematic leaf (a prescribed coordinate) and held inverse masses."""
         model = build_branch_model(worlds=2)
-        pair = _Pair(model)
         flags = model.body_flags.numpy()
-        flags[pair.bodies[3]] |= int(newton.BodyFlags.KINEMATIC)
+        flags[_Pair(model).bodies[3]] |= int(newton.BodyFlags.KINEMATIC)
         model.body_flags.assign(flags)
-        for solver in (pair.head, pair.mine):
-            solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+        pair = _Pair(model)
         kinematic = pair.dofs[np.flatnonzero(pair.mine.factor.kinematic_dof_mask.numpy()[pair.dofs])]
         self.assertEqual(len(kinematic), 1)
         for step in range(4):
@@ -1788,7 +1276,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         the arm's group, which the recipe cannot run (see
         ``test_owner_fixtures_give_the_keys_their_own_group``).
         """
-        self.assertIsNone(head.factor.held)
+        self.assertIsNone(head.factor.held.scalar)
         self.assertIsNone(head._scalar_branches)
         owner = scalar.factor.held
         self.assertIsInstance(owner, HeldTree)
@@ -1820,7 +1308,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         # The head, the scalar route (captured below) and the scalar route's eager twin.
         solvers = [
             # Every key's limit rows are dense rows on the head: with the arm's and the contacts', 240 rows a world.
-            ordinary_head(model, rows=256),
+            dense_head(model, rows=256),
             recipe_solver(model, scalar=True),
             recipe_solver(model, scalar=True),
         ]
@@ -1879,14 +1367,6 @@ class TestScalarBranchOwner(unittest.TestCase):
                     again=getattr(states[2][0], name),
                 )
             _close(self, head.v_hat, scalar.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
-            _close(
-                self,
-                ordinary_inverse_mass(head, KEYBOARD_LEAVES),
-                scalar.factor.diagonal_inverse_mass,
-                layout.key_dofs,
-                f"{tag} minv",
-                **KEY_BOUND,
-            )
             # The floor contacts are key-only rows: their impulses follow the head's within the keys' bound.
             impulses = [_normal_impulses(self, solver, len(floors)) for solver in solvers]
             np.testing.assert_allclose(impulses[1], impulses[0], err_msg=f"{tag} impulses", **IMPULSE_BOUND)
@@ -1956,7 +1436,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         for index, solver in enumerate(solvers[:2]):
             current, following = states[index]
             with wp.ScopedCapture(device=device) as capture:
-                solver.seed_double_buffer_events()
                 solver.reset(current, mask)
                 solver.step(current, following, controls[index], contacts[index], DT)
                 solver.step(following, current, controls[index], contacts[index], DT)
@@ -2030,7 +1509,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_limit_upper.assign(upper)
         model.joint_q.zero_()
         model.joint_qd.zero_()
-        solvers = [recipe_solver(model, scalar=False, pins=_ORDINARY), recipe_solver(model, scalar=True)]
+        solvers = [recipe_solver(model, scalar=False, pins={"placement": "general"}), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2104,7 +1583,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         mu = model.shape_material_mu.numpy()
         mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
         model.shape_material_mu.assign(mu)
-        solvers = [ordinary_head(model), recipe_solver(model, scalar=True)]
+        solvers = [dense_head(model), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2217,12 +1696,13 @@ class TestScalarBranchOwner(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
-        head = recipe_solver(model, scalar=False, pins=_ORDINARY)
+        head = recipe_solver(model, scalar=False, pins={"placement": "general"})
         scalar = recipe_solver(model, scalar=True)
         self._assert_routes(head, scalar)
         # The head route converged: the same solver with many more sweeps.
-        reference = recipe_solver(model, scalar=False, pins=_ORDINARY, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
-        self.assertIsNone(reference.factor.held)
+        reference = recipe_solver(
+            model, scalar=False, pins={"placement": "general"}, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS
+        )
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.options.pgs_beta, dt=DT)
 
@@ -2262,17 +1742,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("star='held'", head["held_tree"]["scalar_branches"]["reason"])
-        # Without the held-tree owner there is no compact diagonal, which only it evaluates, so no group to
-        # branch: every route is the one of the same solver built without the flag.
-        declined = recipe_solver(model, scalar=True, pins=_ORDINARY)
-        self.assertIsNone(declined._scalar_branches)
-        self.assertIsNone(declined._compact_diagonal_mass_size)
-        routes = declined.get_path_selection()["routes"]
-        self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("No diagonal-mass group", routes["held_tree"]["scalar_branches"]["reason"])
-        plain = recipe_solver(model, scalar=False, pins=_ORDINARY).get_path_selection()["routes"]
-        # The plain arm pins the star to the held tree; every route but the pins record matches.
-        self.assertEqual({**routes, "pins": None}, {**plain, "pins": None})
 
 
 if __name__ == "__main__":

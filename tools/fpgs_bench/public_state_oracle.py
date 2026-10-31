@@ -111,3 +111,12 @@ def public_state(test, model, state):
     error = np.linalg.norm(actual - reference, axis=2)
     scale = 1.0 + np.linalg.norm(reference, axis=2)
     test.assertLess(float(np.max(error / scale)), 3e-6, "public linear/angular velocity")
+
+
+def force_response(owner, solver, state, control, velocity, dt) -> np.ndarray:
+    """The joint acceleration ``control.joint_f`` alone causes through the held factor: the difference of the predictor
+    with and without it, which cancels every other term. Solves ``(H + R) x = joint_f`` for an independent ``H``."""
+    owner.predict(state, solver.factor, solver.model.control(), velocity, dt)
+    free = solver.factor.joint_qdd.numpy().astype(float).copy()
+    owner.predict(state, solver.factor, control, velocity, dt)
+    return solver.factor.joint_qdd.numpy().astype(float) - free

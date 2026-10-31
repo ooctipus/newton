@@ -46,23 +46,12 @@ ARTICULATION_WORK = FieldGroup(
 
 BODY_INERTIA = FieldGroup(
     Field("body_X_com", wp.transform, ("body",), fill=None, owner="factor"),
-    Field("body_I_c", inertia_record, ("body",), fill=None, owner="factor"),
     Field("body_inertia_terms", inertia_record, ("body",), fill=None),
 )
 """Body inertia about the articulation origin as inertia records (:data:`.spatial_laws.inertia_record`): each
 body's own (``body_inertia_terms``) and its subtree's composite (``body_I_c``)."""
 
 ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"))
-
-JOINT_FOREST = FieldGroup(
-    Field("_joint_dfs_order", wp.int32, ("joint",), owner="factor"),
-    Field("_joint_dfs_position", wp.int32, ("joint",), owner="factor"),
-    Field("_joint_dfs_end", wp.int32, ("joint",), owner="factor"),
-    Field("_joint_up_flags", wp.int32, ("joint",), owner="factor"),
-)
-"""The articulation joints' forest (:class:`.tree_plan.TreePlan`) on the device: its depth-first order, each
-joint's position and each position's subtree end (the CRBA's ancestor test), and how the up scans meet each
-joint (:attr:`.tree_plan.TreePlan.up_flags`)."""
 
 AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_counts", wp.int32, ("articulation",), owner="factor"),
@@ -82,7 +71,6 @@ STATE_AUX = FieldGroup(
     # Without a memset: the first step may run inside a CUDA graph capture, and a captured memset would erase the
     # cached body forces on every replay while the FK/ID cache stays valid. Stage 1 writes body_f_s before reading it.
     Field("body_f_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
-    Field("body_ft_s", wp.spatial_vector, ("body",), owner="factor"),
 )
 """The augmented state: the step's derived dynamics (maximal coordinates), allocated on the tree factor."""
 
@@ -101,18 +89,9 @@ SIZE_RESPONSE = FieldGroup(Field("Y", wp.float32, ("y_art", "y_row", "y_size")))
 """One size group's response; compact and sparse sizes keep a (1, 1, 1) placeholder, and so do the matrix-free
 sweeps, which read the packed rows."""
 
-SIZE_GROUPED_SOLVE = FieldGroup(
-    Field("tau", wp.float32, ("art", "size", 1)),
-    Field("qdd", wp.float32, ("art", "size", 1)),
-)
-"""Grouped scratch of the dense triangular solve (not of the compact paths)."""
-
-SIZE_MASS = FieldGroup(Field("H", wp.float32, ("factor_art", "factor_size", "factor_size")))
-"""One size group's mass matrix; double-buffered on CUDA streams."""
-
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
-"""One size group's Jacobian; double-buffered on CUDA streams. The matrix-free sweeps' producers write the packed rows
-instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) placeholder."""
+"""One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
+their Jacobian is a (1, 1, 1) placeholder."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Dense rows

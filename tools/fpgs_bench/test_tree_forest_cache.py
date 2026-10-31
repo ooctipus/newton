@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests import test_feather_pgs_sparse_solver as native
-from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
+from tools.fpgs_bench.public_state_oracle import force_response, physical_mass, public_state
 from tools.fpgs_bench.test_tree_locked_root import locked_roots
 
 
@@ -52,9 +52,8 @@ def fixture(floating, device, *, permuted=True, motion=False):
     builder.replicate(scene, 3)
     model = builder.finalize(device=device)
     model.rigid_contact_max = 8
-    # Ordinary dynamics: the test installs the held owner itself.
-    with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary", "double_buffer": False}):
-        solver, reference = (SolverFeatherPGS(model, friction_anchor_beta=0.0) for _ in range(2))
+    # The test builds its own owner on the solver.
+    solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
     arts = model.articulation_count
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
@@ -66,19 +65,17 @@ def fixture(floating, device, *, permuted=True, motion=False):
     solver._sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
-    for item in (solver, reference):
-        item.options = item.laws.options = item.factor.options = item.placement.options = dataclasses.replace(
-            item.options, enable_joint_velocity_limits=motion
-        )
-        item.factor.fk_id_cache_enabled = False
-        item.factor.passive_spring_stiffness.fill_(0.27)
-        item.factor.passive_spring_ref.fill_(-0.1)
-        item.factor.passive_joint_damping.fill_(0.19)
+    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
+        solver.options, enable_joint_velocity_limits=motion
+    )
+    solver.factor.passive_spring_stiffness.fill_(0.27)
+    solver.factor.passive_spring_ref.fill_(-0.1)
+    solver.factor.passive_joint_damping.fill_(0.19)
     model.joint_velocity_limit.fill_(0.25)
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner
-    return model, solver, reference, operator, owner, mass
+    return model, solver, operator, owner, mass
 
 
 def _heavy_chains():
@@ -101,7 +98,7 @@ class TestTreeForestCache(unittest.TestCase):
                 self.subTest(floating=floating, chains=chains, motion=motion),
                 _heavy_chains() if chains else contextlib.nullcontext(),
             ):
-                model, solver, reference, operator, owner, mass = fixture(floating, device, motion=motion)
+                model, solver, operator, owner, mass = fixture(floating, device, motion=motion)
                 count, arts, dt = mass.dof_count, model.articulation_count, native.DT
                 groups = operator.plan.group_to_art.numpy()
                 self.assertEqual(model.world_count, 3)
@@ -116,31 +113,28 @@ class TestTreeForestCache(unittest.TestCase):
                 state.body_f.assign(rng.normal(0, 0.1, (model.body_count, 6)).astype(np.float32))
                 control.joint_f.assign(rng.uniform(-0.2, 0.2, model.joint_dof_count).astype(np.float32))
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                solver.factor.last_step_dt = reference.factor.last_step_dt = dt
-                velocity = reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
-                reference.factor.ordinary.joint_tau(state, control, dt)
-                rhs = reference.factor.joint_tau.numpy().reshape(arts, count).astype(float)
+                solver.factor.last_step_dt = dt
+                velocity = state.joint_qd
+                if motion:
+                    solver.factor.prescale_velocity(state.joint_qd, solver.qd_work)
+                    velocity = solver.qd_work
+                forces = control.joint_f.numpy().reshape(arts, count).astype(float)
                 physical = physical_mass(model, state)
                 solver.factor.joint_tau.zero_()
                 owner.begin(state, solver.factor, velocity, dt, True)
-                np.testing.assert_allclose(
-                    solver.factor.body_v_s.numpy(), reference.factor.body_v_s.numpy(), atol=3e-6, rtol=3e-5
-                )
                 geometry = owner.geometric.numpy()
-                expected = np.empty_like(rhs)
+                expected = np.empty_like(forces)
                 for group, art in enumerate(groups):
                     block = physical[art * count : (art + 1) * count, art * count : (art + 1) * count]
                     packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
                     np.testing.assert_allclose(geometry[group], packed, atol=3e-6, rtol=3e-5)
                     expected[art] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[count].numpy()[group]), rhs[art]
+                        block + np.diag(solver.factor.R_by_size[count].numpy()[group]), forces[art]
                     )
                 solver.factor.mass_update_mask.fill_(1)
                 operator.refresh(solver.factor)
-                owner.predict(state, solver.factor, control, velocity, dt)
-                np.testing.assert_allclose(
-                    solver.factor.joint_qdd.numpy().reshape(arts, count), expected, atol=4e-5, rtol=4e-4
-                )
+                response = force_response(owner, solver, state, control, velocity, dt)
+                np.testing.assert_allclose(response.reshape(arts, count), expected, atol=4e-5, rtol=4e-4)
                 held = operator.data.W.numpy().copy()
                 # A failed last factor must poison only its mapped articulation,
                 # even when the factor-group index exceeds the number of worlds.
@@ -221,7 +215,7 @@ class TestTreeForestCache(unittest.TestCase):
     def test_world_reset_covers_every_mapped_group(self):
         """Invalidate all requested articulations under identity and permuted maps."""
         for permuted in (False, True):
-            model, solver, _, operator, owner, _ = fixture(False, "cpu", permuted=permuted)
+            model, solver, operator, owner, _ = fixture(False, "cpu", permuted=permuted)
             groups = operator.plan.group_to_art.numpy()
             worlds = solver.forest.art_to_world.numpy()
             for values in (
@@ -246,26 +240,24 @@ class TestTreeForestCache(unittest.TestCase):
     def test_locked_roots_publish_complete_forests(self):
         """Preserve zero-coordinate root laws across multiple mapped articulations."""
         with locked_roots():
-            model, solver, reference, operator, owner, mass = fixture(False, "cpu")
+            model, solver, operator, owner, mass = fixture(False, "cpu")
         state, output, control = model.state(), model.state(), model.control()
         state.joint_qd.assign(np.linspace(-0.3, 0.4, model.joint_dof_count, dtype=np.float32))
-        reference.factor.last_step_dt = solver.factor.last_step_dt = native.DT
-        reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
-        reference.factor.ordinary.joint_tau(state, control, native.DT)
-        rhs = reference.factor.joint_tau.numpy().astype(float)
+        solver.factor.last_step_dt = native.DT
+        control.joint_f.assign(np.linspace(-0.2, 0.3, model.joint_dof_count, dtype=np.float32))
         physical = physical_mass(model, state)
         solver.factor.joint_tau.zero_()
         owner.begin(state, solver.factor, state.joint_qd, native.DT, True)
         solver.factor.mass_update_mask.fill_(1)
         operator.refresh(solver.factor)
-        owner.predict(state, solver.factor, control, state.joint_qd, native.DT)
+        response = force_response(owner, solver, state, control, state.joint_qd, native.DT)
         regularization = np.empty(model.joint_dof_count)
         for group, art in enumerate(operator.plan.group_to_art.numpy()):
             regularization[art * mass.dof_count : (art + 1) * mass.dof_count] = solver.factor.R_by_size[
                 mass.dof_count
             ].numpy()[group]
-        expected = np.linalg.solve(physical + np.diag(regularization), rhs)
-        np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected, atol=4e-5, rtol=4e-4)
+        expected = np.linalg.solve(physical + np.diag(regularization), control.joint_f.numpy().astype(float))
+        np.testing.assert_allclose(response, expected, atol=4e-5, rtol=4e-4)
         solver.v_out.assign(solver.v_hat)
         owner.finish(state, solver.factor, output, native.DT, False)
         probe = model.state()
@@ -278,7 +270,7 @@ class TestTreeForestCache(unittest.TestCase):
 
     def test_incomplete_ownership_is_rejected_before_mutation(self):
         """Reject duplicate/missing groups and invalid world IDs before cache writes."""
-        model, _, _, operator, owner, _ = fixture(False, "cpu")
+        model, _, operator, owner, _ = fixture(False, "cpu")
         groups = operator.plan.group_to_art.numpy().copy()
         worlds = operator.plan.art_to_world.numpy().copy()
         owner.data.current_valid.fill_(1)

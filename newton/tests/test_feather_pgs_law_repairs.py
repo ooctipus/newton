@@ -368,7 +368,7 @@ class TestDepenetrationCapOnRoutes(unittest.TestCase):
     def test_every_producer(self):
         cases = (
             (scenes.box_drop(), conformance.MF_HELD, 32),
-            (scenes.legged(), conformance.MF_GENERAL, 32),
+            (scenes.legged(), conformance.MF_HELD, 32),
             (scenes.legged(), conformance.SPARSE, 32),
             (scenes.legged(), conformance.KEYED_PARALLEL, 32),
             (scenes.gripper(), conformance.LOCAL_PACKETS, 32),

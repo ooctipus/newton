@@ -7,17 +7,15 @@ A dense response is built per articulation size group in stages (:data:`STAGES`)
 thread mapping, keyed ``(stage, mapping)`` in :data:`DENSE_JY_BUILDS` (the response by size group and the world
 layout). Each stage's arithmetic comes from one small dense kit:
 
-* :class:`.CholeskyFactor`: the leaf-first factor ``P (H + diag(R)) P^T = L L^T`` (``P`` reverses an
-  articulation's coordinates, :func:`.leaf_first`) by columns on one thread (``factor`` over articulations);
-  the held tree's geometry takes :func:`dense_factor_kernel`, the same columns level by level over a warp's lanes;
+* :func:`dense_factor_kernel`: the leaf-first factor ``P (H + diag(R)) P^T = L L^T`` (``P`` reverses an
+  articulation's coordinates, :func:`.leaf_first`) from the held tree's geometry, level by level over a warp's lanes;
 * :class:`.CholeskySolve`: the triangular solves (physical vectors in, physical vectors out, the reversal bound in
   the kit), with the zero-diagonal conventions as named options: a zero
   diagonal gives zero (Z0: the thread-, lane- and queue-mapped responses, the register response of the six-DOF
   group, the paired response), or the step multiplies by an unguarded staged reciprocal (Zr-inf: the warp-mapped
   response); a diagonal factor divides twice, unguarded (Zdiv, :func:`diagonal_solve`);
 * :func:`dot`: a sum of products in ascending order from zero (every diagonal);
-* the tile primitives (``tile_cholesky``, ``tile_lower_solve``, ``tile_upper_solve``, ``tile_matmul``) for the
-  tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
+* the tile primitives (``tile_lower_solve``, ``tile_upper_solve``, ``tile_matmul``) for the tiled mappings: their rounding is the primitives' (MathDx's where it is on), so nothing
   re-derives it.
 
 Where two mappings of a stage differ in the order they round in, each keeps its own order (the lane layout, a
@@ -42,7 +40,7 @@ from .device_preludes import SHARED_STORAGE, lane_group, substitute
 from .field_group import Field
 from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_LOCAL_SOLVE_OWNER_GENERAL
-from .response_operator import CholeskyFactor, CholeskySolve, Reversed, Vector, leaf_first
+from .response_operator import CholeskySolve, Reversed, Vector, leaf_first
 from .staging import Buffer, Staging
 from .tree_plan import level_schedule, offsets
 
@@ -168,60 +166,6 @@ def _kernel(name: str, params, body: str, *, dual: bool = True, preludes=(), dis
 # ---------------------------------------------------------------------------------------------------------------------
 # Stage "factor": H + diag(R) = L L^T
 # ---------------------------------------------------------------------------------------------------------------------
-
-FACTOR_ABI = kernel_template.params(
-    ("H_group", wp.array3d[float]),
-    ("R_group", wp.array2d[float]),
-    ("group_to_art", wp.array[int]),
-    ("mass_update_mask", wp.array[int]),
-    ("n_dofs", int),
-    ("L_group", wp.array3d[float]),
-)
-"""A size group's factor from its mass matrices (``H_group``) and their regularization (``R_group``), for the
-articulations whose mass changed (``mass_update_mask``)."""
-
-
-def _group_factor() -> CholeskyFactor:
-    """The kit's leaf-first factor of articulation ``group``'s ``H + diag(R)``: ``A = P (H + diag(R)) P^T`` with the
-    coordinates reversed (:func:`.leaf_first`), ``A_jj = H_jj + R_j``, ``H`` with its stiffness folded in already, so
-    the diagonal rounds as ``(S F + K) + R``."""
-
-    def H(row, col):
-        return _element("H_group", "group", leaf_first("n_dofs", row), leaf_first("n_dofs", col))
-
-    def L(row, col):
-        return _element("L_group", "group", row, col)
-
-    def diagonal(col):
-        return f"{H(col, col)} + {_element('R_group', 'group', leaf_first('n_dofs', col))}"
-
-    return CholeskyFactor("n_dofs", L, source=H, diagonal=diagonal)
-
-
-@functools.cache
-def factor_articulations_kernel() -> wp.Kernel:
-    """The factor, one thread per articulation (``dim = articulations``), with the kit's column Cholesky in global
-    memory."""
-    body = (
-        "    const int group = tid;\n"
-        "    if (mass_update_mask.data[group_to_art.data[group]] == 0) return;\n"
-        f"{_indent(_group_factor().factor(), '    ')}\n"
-    )
-    return _kernel("dense_factor_articulations", FACTOR_ABI, body)
-
-
-@functools.cache
-def factor_coordinates_kernel() -> wp.Kernel:
-    """The factor of a structurally diagonal ``H``, one thread per articulation coordinate (``dim = articulations *
-    n_dofs``): the kit's pivot, ``L_jj = sqrt(H_jj + R_j)``."""
-    body = (
-        "    const int group = tid / n_dofs;\n"
-        "    const int dof = tid - group * n_dofs;\n"
-        "    if (mass_update_mask.data[group_to_art.data[group]] != 0)\n"
-        f"        {_group_factor().pivot('dof')}\n"
-    )
-    return _kernel("dense_factor_coordinates", FACTOR_ABI, body)
-
 
 # The held tree's factor, of any size. A warp per articulation assembles the entries of P H P^T in place in L (the
 # coordinates reversed; geometry, then R, then K of the physical coordinate on the diagonal: S F + R + K in that order)
@@ -382,35 +326,6 @@ def dense_factor_kernel(size: int) -> wp.Kernel:
         dual=True,
         native_name="factor_native",
     ).kernel()
-
-
-@functools.cache
-def factor_tiles_kernel(n_dofs: int, tile_threads: int = 64) -> wp.Kernel:
-    """The leaf-first factor, one tile per articulation (``launch_tiled(dim=[articulations], block_dim=tile_threads)``):
-    ``tile_cholesky(tile_diag_add(P H P^T, P R))``, the coordinates reversed by indexed loads, the primitive's
-    rounding."""
-    dofs = wp.constant(int(n_dofs))
-    last = wp.constant(int(n_dofs) - 1)
-
-    def cholesky_tiled_template(
-        H_group: wp.array3d[float],
-        R_group: wp.array2d[float],
-        group_to_art: wp.array[int],
-        mass_update_mask: wp.array[int],
-        L_group: wp.array3d[float],
-    ):
-        idx = wp.tid()
-        art = group_to_art[idx]
-        if mass_update_mask[art] == 0:
-            return
-        reverse = wp.tile_arange(last, -1, -1, dtype=int)
-        H_tile = wp.tile_load_indexed(H_group[idx], indices=reverse, shape=(dofs, dofs), axis=0)[:, reverse]
-        armature = wp.tile_load_indexed(R_group[idx], indices=reverse, shape=(dofs,), axis=0)
-        H_tile = wp.tile_diag_add(H_tile, armature)
-        L_tile = wp.tile_cholesky(H_tile)
-        wp.tile_store(L_group[idx], L_tile)
-
-    return python_kernel(cholesky_tiled_template, f"dense_factor_tiles_{int(n_dofs)}_bd{int(tile_threads)}")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -913,12 +828,7 @@ def _tile_threads(options) -> int:
 _CFM_WORLDS = _entry("cfm", "worlds", cfm_worlds_kernel, ("worlds",))
 
 DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
-    ("factor", "articulations"): _entry("factor", "articulations", factor_articulations_kernel, ("articulations",)),
-    ("factor", "coordinates"): _entry(
-        "factor", "coordinates", factor_coordinates_kernel, ("articulations", "coordinates")
-    ),
     ("factor", "levels"): _entry("factor", "levels", dense_factor_kernel, ("articulations", "32 lanes")),
-    ("factor", "tiles"): _entry("factor", "tiles", factor_tiles_kernel, ("articulations",), _tile_threads, tiled=True),
     ("response", "rows"): _entry("response", "rows", response_rows_kernel, ("articulations", "rows")),
     ("response", "lanes"): _entry("response", "lanes", response_lanes_kernel, ("articulations", "32 lanes"), 256),
     ("response", "diagonal"): _entry("response", "diagonal", response_diagonal_kernel, ("articulations", "rows")),
@@ -931,8 +841,8 @@ DENSE_JY_BUILDS: dict[tuple[str, str], Callable[..., Build]] = {
     ("cfm", "worlds"): _CFM_WORLDS,
 }
 """The builds of the dense response's data, by ``(stage, mapping)``. Each takes its kernel factory's options
-as keywords and returns the :class:`Build`. The mappings: ``articulations``, a thread per articulation; ``coordinates``,
-a thread per articulation (or world row) coordinate; ``rows``, a thread per articulation row; ``lanes``, 32 threads
+as keywords and returns the :class:`Build`. The mappings: ``coordinates``, a thread per world row coordinate;
+``rows``, a thread per articulation row; ``lanes``, 32 threads
 per articulation, rows lane-strided; ``warps``, a warp per articulation, a lane per row (or the lanes assembling and
 lane 0 factoring); ``tiles``, a block per articulation (and row chunk) through the tile primitives; ``queue``, warps
 walking the local owners' general-world queue; ``pairs``, a block per paired world, a thread per row; ``groups``, a

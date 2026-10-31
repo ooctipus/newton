@@ -13,19 +13,16 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field, FieldGroup
-from .tree_passes import DYNAMICS
 
 JOINTS = (
-    *FieldGroup(*DYNAMICS).select(
-        "articulation_start",
-        "joint_type",
-        "joint_child",
-        "joint_q_start",
-        "joint_qd_start",
-        "joint_dof_dim",
-        "body_flags",
-        "articulation_dof_start",
-    ),
+    Field("articulation_start", wp.int32, ("articulation_bound",), owner="model"),
+    Field("joint_type", wp.int32, ("joint",), owner="model"),
+    Field("joint_child", wp.int32, ("joint",), owner="model"),
+    Field("joint_q_start", wp.int32, ("joint_bound",), owner="model"),
+    Field("joint_qd_start", wp.int32, ("joint_bound",), owner="model"),
+    Field("joint_dof_dim", wp.int32, ("joint", 2), owner="model"),
+    Field("body_flags", wp.int32, ("body",), owner="model"),
+    Field("articulation_dof_start", wp.int32, ("articulation",), owner="forest"),
     Field("joint_target_q_start", wp.int32, ("joint_bound",), owner="model"),
     Field("joint_target_ke", wp.float32, ("dof",), owner="model"),
     Field("joint_target_kd", wp.float32, ("dof",), owner="model"),
@@ -56,7 +53,8 @@ def bind(solver, data=None):
 
 FREE_BODIES = (
     Field("free_rigid_body_indices", wp.int32, ("free_body",), owner="forest"),
-    *FieldGroup(*DYNAMICS).select("body_to_articulation", "is_free_rigid"),
+    Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
+    Field("is_free_rigid", wp.int32, ("articulation",), owner="forest"),
     FieldGroup(*JOINTS)["art_to_world"],
     Field("max_linear_velocity", wp.float32, ("body",), owner="laws", attr="rigid_body_max_linear_velocity"),
     Field("max_angular_velocity", wp.float32, ("body",), owner="laws", attr="rigid_body_max_angular_velocity"),

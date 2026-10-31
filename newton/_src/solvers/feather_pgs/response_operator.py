@@ -76,61 +76,6 @@ def _unrolled(head: str, pad: str, unroll: bool) -> str:
 
 
 @dataclass(frozen=True)
-class CholeskyFactor:
-    """Factor ``A = L L^T`` by columns on one thread: the small dense kit's Cholesky.
-
-    Column ``col`` takes the pivot ``s = A_cc - sum_k L_ck^2`` (``k < col``
-    ascending), ``L_cc = sqrt(s)`` and ``r = 1 / L_cc``, then each entry below
-    it ``L_rc = (A_rc - sum_k L_rk L_ck) r``, its terms ascending from ``A_rc``.
-    Nothing guards the pivot: a positive definite ``A`` has a positive one, and
-    a nonpositive pivot publishes NaN, which the factor's consumers detect.
-    ``lower`` addresses ``L``; ``source`` addresses ``A``'s lower triangle
-    (``None``: ``A`` lies in ``lower`` and is factored in place) and
-    ``diagonal`` its regularized diagonal (``None``: ``source``'s). ``unroll``
-    unrolls the loops of a compile-time ``size``.
-    """
-
-    size: int | str
-    lower: Matrix
-    source: Matrix | None = None
-    diagonal: Vector | None = None
-    unroll: bool = False
-
-    def _pivot_source(self) -> Vector:
-        A = self.source or self.lower
-        return self.diagonal or (lambda col: A(col, col))
-
-    def factor(self) -> str:
-        """The factorization's statements, column by column, the pivot's terms first."""
-        n, L, unroll = self.size, self.lower, self.unroll
-        A = self.source or L
-        return "\n".join(
-            (
-                _unrolled(f"for (int col = 0; col < {n}; ++col) {{", "", unroll),
-                f"    float diagonal = {self._pivot_source()('col')};",
-                "    " + _unrolled("for (int k = 0; k < col; ++k) {", "    ", unroll),
-                f"        const float value = {L('col', 'k')};",
-                "        diagonal -= value * value;",
-                "    }",
-                "    diagonal = sqrtf(diagonal);",
-                f"    {L('col', 'col')} = diagonal;",
-                "    const float inverse_diagonal = 1.0f / diagonal;",
-                "    " + _unrolled(f"for (int row = col + 1; row < {n}; ++row) {{", "    ", unroll),
-                f"        float value = {A('row', 'col')};",
-                "        " + _unrolled("for (int k = 0; k < col; ++k)", "        ", unroll),
-                f"            value -= {L('row', 'k')} * {L('col', 'k')};",
-                f"        {L('row', 'col')} = value * inverse_diagonal;",
-                "    }",
-                "}",
-            )
-        )
-
-    def pivot(self, col: str) -> str:
-        """``L_cc = sqrt(A_cc)``: the whole factor of a diagonal ``A``, at column ``col``."""
-        return f"{self.lower(col, col)} = sqrtf({self._pivot_source()(col)});"
-
-
-@dataclass(frozen=True)
 class CholeskySolve:
     """Apply the leaf-first factor's L^-1 and L^-T with the owner's zero-diagonal convention.
 

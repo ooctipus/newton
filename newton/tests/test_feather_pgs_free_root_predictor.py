@@ -25,19 +25,56 @@ child body's origin, ignoring a non-identity ``child_xform``.
 """
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.kernels import (
-    integrate_generalized_joints,
-)
+from newton._src.solvers.feather_pgs.kernels import _light_integrate_generalized_joints
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 200.0
 STEPS = 80
+
+
+@wp.kernel
+def _integrate(
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_com: wp.array[wp.vec3],
+    joint_X_c: wp.array[wp.transform],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_qdd: wp.array[float],
+    dt: float,
+    joint_q_new: wp.array[float],
+    joint_qd_new: wp.array[float],
+):
+    _light_integrate_generalized_joints(
+        wp.tid(),
+        joint_type,
+        joint_parent,
+        joint_child,
+        joint_q_start,
+        joint_qd_start,
+        kinematic_joint_mask,
+        joint_dof_dim,
+        body_com,
+        joint_X_c,
+        joint_q,
+        joint_qd,
+        joint_qdd,
+        dt,
+        joint_q_new,
+        joint_qd_new,
+    )
+
+
 RADIUS = 0.1
 # Spin transverse to the slide so omega x v points along +/-z, straight into
 # the contact normal; spin parallel to the slide cannot excite the term.
@@ -213,7 +250,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
     def test_integrator_transport_identities(self):
         """Pin the integrator's root transport and descendant pass-through directly.
 
-        A single launch of ``integrate_generalized_joints`` with zero
+        The integrator's law (``_light_integrate_generalized_joints``) with zero
         ``joint_qdd`` must realize the two velocity identities: the ROOT free
         joint's linear coordinate gains exactly ``omega x v * dt`` (the
         transport term the predictor and the qdd conversion mirror), and a
@@ -255,7 +292,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         q_new = wp.zeros_like(state.joint_q)
         qd_new = wp.zeros_like(state.joint_qd)
         wp.launch(
-            integrate_generalized_joints,
+            _integrate,
             dim=model.joint_count,
             inputs=[
                 model.joint_type,
@@ -281,40 +318,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         np.testing.assert_allclose(out[3:6], (0.0, 0.0, 3.0), atol=1e-7)
         np.testing.assert_allclose(out[6:9], (0.4, 0.0, 0.0), atol=1e-7, err_msg="descendant gained transport")
         np.testing.assert_allclose(out[9:12], (0.0, 0.0, 3.0), atol=1e-7)
-
-    def test_predictor_and_qdd_transport_identities(self):
-        """Make prediction and solved-velocity conversion match root integration."""
-        device = wp.get_device()
-        model = _build_slider(device)
-        # These are the ordinary split route's stage conversions. On CUDA the held-tree owner admits
-        # this free-rooted body under either friction law and converts, transports and integrates in
-        # its finish kernel instead (_stage6_update_qdd then returns early);
-        # test_frictionless_slide_is_spin_invariant covers that route end to end.
-        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            solver = SolverFeatherPGS(model, angular_damping=0.0)
-        self.assertIsNone(solver.get_path_selection()["cached_prediction"])
-        self.assertEqual(solver.forest.free_root_joint_count, 1)
-        state_in, state_out = model.state(), model.state()
-
-        qd_np = np.array((2.0, 0.0, 0.0, 0.0, 20.0, 0.0), dtype=np.float32)
-        qdd_np = np.array((0.3, -0.4, 0.5, 0.1, -0.2, 0.25), dtype=np.float32)
-        state_in.joint_qd.assign(qd_np)
-        solver.qd_work.assign(qd_np)
-        solver.factor.joint_qdd.assign(qdd_np)
-        solver.factor.ordinary.velocity_predictor(state_in, solver.qd_work, DT)
-        transport = np.cross(qd_np[3:6], qd_np[0:3])
-        expected_v_hat = qd_np + qdd_np * DT
-        expected_v_hat[0:3] += transport * DT
-        np.testing.assert_allclose(solver.v_hat.numpy(), expected_v_hat, rtol=1e-6, atol=1e-7)
-
-        v_out_np = np.array((1.8, 0.1, -0.15, 0.05, 19.5, 0.25), dtype=np.float32)
-        solver.v_out.assign(v_out_np)
-        solver.factor.ordinary.update_qdd(state_in, DT)
-        expected_qdd = (v_out_np - qd_np) / DT
-        expected_qdd[0:3] -= transport
-        np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected_qdd, rtol=1e-6, atol=1e-5)
-        solver.factor.ordinary.integrate(state_in, state_out, DT)
-        np.testing.assert_allclose(state_out.joint_qd.numpy(), v_out_np, rtol=1e-6, atol=1e-6)
 
     def test_compact_root_metadata_includes_standalone_joint(self):
         """Keep every world root, but no descendant, in the compact launch."""

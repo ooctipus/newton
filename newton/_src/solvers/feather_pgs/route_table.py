@@ -227,8 +227,6 @@ class RouteRow:
 
     laws: Laws
     """Axis 2: the row laws."""
-    evaluator: str
-    """Axis 1: ``"held"`` (the held tree evaluates the dynamics) or ``"ordinary"``."""
     case: str
     """Axis 3: the placement case (:data:`CASES`, or ``"K6"`` general)."""
     producer: str

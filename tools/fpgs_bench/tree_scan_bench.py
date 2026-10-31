@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Time the tree scans, the held tree's launch widths and the general route's passes, one launch each.
+"""Time the tree scans and the held tree's launch widths, one launch each.
 
 ``schedules``: every schedule of the pose, motion and subtree scans on every
 shape, generated on the scan plan, for the rule that picks a schedule from the
@@ -14,21 +14,11 @@ every shape at each lane width a tree admits (the scans' schedules chosen at
 that width) and on the heavy chains, for the rule that picks the width from the
 tree's data (``tree_kinetic_state.held_lanes``); ``rule`` marks its pick.
 
-``general``: the general route's passes (``tree_passes``) on a solver's own
-arrays and binding, one thread per articulation (CRBA: per column), at the
-solver's block sizes.
-
-``serial``: the one-articulation-per-thread passes at every block size from 1
-to 256 and each ``--world-counts``, for their fixed block size
-(``tree_passes.SERIAL_BLOCK_DIM``).
-
 Each timing is the median of ``--samples`` CUDA-event-timed launches after a
 warm-up, in microseconds per launch. Run on an otherwise idle GPU::
 
     python tools/fpgs_bench/tree_scan_bench.py schedules --groups 16384 --repeat 8
     python tools/fpgs_bench/tree_scan_bench.py lanes --worlds 4096
-    python tools/fpgs_bench/tree_scan_bench.py general --worlds 4096
-    python tools/fpgs_bench/tree_scan_bench.py serial --world-counts 4096 16384
 """
 
 import argparse
@@ -44,7 +34,7 @@ import warp as wp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state, tree_passes
+from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton.tests import feather_pgs_tree_scan_fixture as fx
@@ -268,51 +258,6 @@ def bench_lanes(args, device):
     return rows
 
 
-def bench_general(args, device):
-    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
-        GENERAL_PASSES,
-        articulated_model,
-        general_route,
-        pass_launch,
-        run_inputs,
-    )
-
-    rows = []
-    for shape in args.shapes or ("anymal13", "humanoid13", "g1_30", "chain64", "random60", "pendulum2"):
-        route = general_route(articulated_model((shape,), args.worlds, device))
-        for name in args.passes or GENERAL_PASSES:
-            run_inputs(route, name)
-            row = {"shape": shape, "articulations": route.model.articulation_count, "pass": name}
-            launch = pass_launch(route, name, block_dim=args.block_dim, write_inertia_records=1)
-            row["time"] = _time(launch, args.samples, device)
-            rows.append(row)
-            print(_format(row), flush=True)
-    return rows
-
-
-def bench_serial(args, device):
-    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
-        articulated_model,
-        general_route,
-        pass_launch,
-        run_inputs,
-    )
-
-    rows = []
-    for worlds in args.world_counts:
-        for shape in args.shapes or ("anymal13", "g1_30", "chain64", "random60", "pendulum2"):
-            route = general_route(articulated_model((shape,), worlds, device))
-            for name in args.passes or ("fk_id", "tau", "composite_inertia"):
-                run_inputs(route, name)
-                row = {"worlds": worlds, "shape": shape, "pass": name, "fixed": tree_passes.SERIAL_BLOCK_DIM}
-                for block in (1, 2, 4, 8, 16, 32, 64, 128, 256):
-                    launch = pass_launch(route, name, block_dim=block, write_inertia_records=1)
-                    row[str(block)] = _time(launch, args.samples, device)
-                rows.append(row)
-                print(_format(row), flush=True)
-    return rows
-
-
 def _format(row):
     parts = []
     for key, value in row.items():
@@ -325,21 +270,19 @@ def _format(row):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=("schedules", "lanes", "general", "serial"))
+    parser.add_argument("mode", choices=("schedules", "lanes"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--groups", type=int, default=16384)
     parser.add_argument("--worlds", type=int, default=4096)
-    parser.add_argument("--world-counts", type=int, nargs="*", default=[4096, 16384], help="serial: the world counts")
     parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--samples", type=int, default=21)
     parser.add_argument("--shapes", nargs="*")
     parser.add_argument("--passes", nargs="*")
-    parser.add_argument("--block-dim", type=int, help="general: one block size for every pass (default: the solver's)")
     parser.add_argument("--json")
     args = parser.parse_args()
     wp.init()
     device = wp.get_device(args.device)
-    modes = {"schedules": bench_schedules, "lanes": bench_lanes, "general": bench_general, "serial": bench_serial}
+    modes = {"schedules": bench_schedules, "lanes": bench_lanes}
     rows = modes[args.mode](args, device)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=1))

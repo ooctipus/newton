@@ -93,7 +93,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
         substep_block()
         wp.synchronize_device(device)
         with wp.ScopedCapture(device=device) as capture:
-            solver.seed_double_buffer_events()
             substep_block()
         digests = []
         for _ in range(replays):

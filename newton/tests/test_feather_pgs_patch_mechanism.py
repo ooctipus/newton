@@ -2704,28 +2704,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                 )
                 self.assertIn(reason, record["reason"])
 
-    def test_memset_waits_skip_seeded_events(self):
-        """Wait for each recorded memset event, never for a seeded one, which another solver's pause can outdate."""
-        log = []
-        main = SimpleNamespace(
-            wait_event=lambda event: log.append(f"wait {event}"),
-            record_event=lambda: log.append("record") or f"seed {len(log)}",
-        )
-        solver = _bare_solver(
-            _memset_stream=object(), _memset_done_event=[None, None], _memset_done_seeded=[False, False]
-        )
-        with mock.patch.object(wp, "get_stream", return_value=main):
-            solver.seed_double_buffer_events()
-        self.assertEqual(solver._memset_done_seeded, [True, True])
-        for slot in (0, 1):
-            solver._wait_memset_done(main, slot)
-        self.assertEqual(log, ["record", "record"], "seeded events order nothing on the main stream")
-        solver._record_memset_done(1, "memset 1")
-        for slot in (0, 1):
-            solver._wait_memset_done(main, slot)
-        self.assertEqual(log[2:], ["wait memset 1"])
-        self.assertEqual(solver._memset_done_seeded, [True, False])
-
     def test_static_reuse_steps_bitwise_as_the_unconditional_chain(self):
         """Keep the sorted pairs on captured substeps without a noted write, bitwise as the always-sort chain.
 
@@ -2812,8 +2790,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         rng = np.random.default_rng(6)
         graph = _graph_twin(jaws=True)
         eager = _SolverTwin("cuda:0", jaws=True)
-        # Each step forks the memset stream that a later step of the graph joins.
-        self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
         for _ in range(3):
             for twin in (graph, eager):
                 twin.pair(collide=True)
@@ -2823,7 +2799,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
         for name, stream, collide in (("collide", 0, True), ("step", 0, False), ("swap", 1, False)):
             with _capture() as capture:
-                graph.solver.seed_double_buffer_events()
                 probe.start()
                 probe.mark()
                 graph.substep(stream, collide)
@@ -2863,7 +2838,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         reused = [_replace_first_stream(twin, order) for twin in (graph, eager)]
         self.assertTrue(reused[0], "the replacement's generation counter must sit at the freed address")
         with _capture() as capture:
-            graph.solver.seed_double_buffer_events()
             graph.pair()
         _poison_sort_scratch(graph)
         wp.capture_launch(capture.graph)
@@ -2888,7 +2862,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         overlapped = wp.zeros(1024, dtype=float, device="cuda:0")
         outcomes = _admitted_modes(graph.patches)
         with wp.ScopedCapture(device="cuda:0") as capture:
-            graph.solver.seed_double_buffer_events()
             main = wp.get_stream("cuda:0")
             side.wait_event(main.record_event())
             with wp.ScopedStream(side, sync_enter=False):
@@ -2905,30 +2878,21 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         _assert_same_twins(graph, eager, "caller fork")
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
-    def test_double_buffered_solvers_share_a_graph(self):
-        """Capture two double-buffered solvers in one graph, seeded together or each before its steps."""
+    def test_two_solvers_share_a_graph(self):
+        """Capture two solvers in one graph."""
         graphs = (_graph_twin(jaws=True), _graph_twin(boxes=True))
         eagers = (_SolverTwin("cuda:0", jaws=True), _SolverTwin("cuda:0", boxes=True))
-        for twin in graphs:
-            self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
         # The boxes land before the captures.
         for _ in range(12):
             for twin in (*graphs, *eagers):
                 twin.pair(collide=True)
         for twin in eagers:
             twin.sort_every_build()
-        captured = []
-        for together in (True, False):
-            with _capture() as capture:
-                for twin in graphs if together else ():
-                    twin.solver.seed_double_buffer_events()
-                for twin in graphs:
-                    if not together:
-                        twin.solver.seed_double_buffer_events()
-                    twin.pair(collide=True)
-            captured.append(capture.graph)
+        with _capture() as capture:
+            for twin in graphs:
+                twin.pair(collide=True)
         for replay in range(4):
-            wp.capture_launch(captured[replay % 2])
+            wp.capture_launch(capture.graph)
             for twin in eagers:
                 twin.pair(collide=True)
             for name, graph, eager in zip(("jaws", "boxes"), graphs, eagers, strict=True):
@@ -2958,7 +2922,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         outcomes = _admitted_modes(graph.patches)
         for collide in (True, False):
             with _capture() as capture:
-                graph.solver.seed_double_buffer_events()
                 graph.pair(collide=collide)
             captured[collide] = capture.graph
         self.assertEqual(outcomes, ["sort", "keep"] * 2)
@@ -3269,7 +3232,6 @@ def run_captured_collision_passes(test, device, replays):
             probe = _SortProbe(graph.patches, 2 * len(passes))
             outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
             with _capture(device) as capture:
-                graph.solver.seed_double_buffer_events()
                 _step_passes(graph, passes, probe)
             test.assertEqual(outcomes, [mode for count in passes for mode in ("sort", *("keep",) * (count - 1))])
             test.assertEqual(len(sorts), len(passes), "the graph records one sort per collision pass")
@@ -3299,7 +3261,6 @@ def run_captured_steps_without_a_collision_pass(test, device, replays):
     eager.sort_every_build()
     outcomes = _admitted_modes(graph.patches)
     with _capture(device) as capture:
-        graph.solver.seed_double_buffer_events()
         graph.pair()
     test.assertEqual(outcomes, ["sort", "keep"])
     for replay in range(replays):
@@ -3364,7 +3325,6 @@ def run_captured_contact_writes(test, device):
 
             outcomes = _admitted_modes(graph.patches)
             with _capture(device) as capture:
-                graph.solver.seed_double_buffer_events()
                 collision_pass(graph)
             test.assertEqual(outcomes, ["sort", "sort" if write == "clear" else "keep"])
             wp.capture_launch(capture.graph)

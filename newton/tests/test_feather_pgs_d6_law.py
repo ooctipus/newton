@@ -7,13 +7,11 @@ A D6 joint is the chain of its axes that its transform composes: the linear axes
 then each angular axis, carried through the rotations before it, turns about the joint origin the linear
 coordinates moved. A body in free flight on a D6 (no gravity, no contacts) therefore keeps its line, speed and spin
 as the same body on a free joint does, and a tumbling one converges to the free body as the step shrinks (its angle
-coordinates integrate at first order). Both evaluators run the law: the held tree by the route's rules, the ordinary
-passes under their test pin.
+coordinates integrate at first order).
 """
 
 import itertools
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -68,7 +66,7 @@ def _floating_model(device, kind, angular=(2,), inertia=_INERTIA):
 
 def _fly(model, velocity, dt, seconds):
     """Step ``model`` from the moving body's coordinates ``velocity`` (linear, then angular); return its final twist
-    (COM velocity, angular velocity), position and kinetic energy before and after, and the evaluator that ran."""
+    (COM velocity, angular velocity), position and kinetic energy before and after."""
     solver = SolverFeatherPGS(model, pgs_iterations=8, angular_damping=0.0)
     state, other, control = model.state(), model.state(), model.control()
     qd = np.zeros(model.joint_dof_count, np.float32)
@@ -89,13 +87,11 @@ def _fly(model, velocity, dt, seconds):
     for _ in range(round(seconds / dt)):
         solver.step(state, other, control, None, dt)
         state, other = other, state
-    evaluator = "held" if solver.factor.held is not None else "ordinary"
     return (
         state.body_qd.numpy()[body].astype(float),
         state.body_q.numpy()[body].astype(float),
         before,
         energy(state),
-        evaluator,
     )
 
 
@@ -103,24 +99,19 @@ class TestFeatherPGSD6Law(unittest.TestCase):
     def test_floating_d6_keeps_its_line_and_spin(self):
         """Slide at 1 m/s along x while spinning at 20 rad/s about z on a D6, as on a free joint, for 0.3 s.
 
-        The body keeps its speed, spin, line and energy on the held tree and on the ordinary passes, on a D6 root and on
-        a D6 below a fixed root, with the yaw axis alone and with all three angular axes.
+        The body keeps its speed, spin, line and energy on a D6 root and on a D6 below a fixed root, with the yaw axis
+        alone and with all three angular axes.
         """
         for device in _devices():
-            for evaluator, kind, angular in itertools.product(
-                ("held", "ordinary"), ("root", "child"), ((2,), (0, 1, 2))
-            ):
-                pins = {"evaluator": "ordinary"} if evaluator == "ordinary" else {}
-                with self.subTest(device=device, evaluator=evaluator, kind=kind, angular=angular):
-                    with mock.patch.object(SolverFeatherPGS, "_route_pins", pins):
-                        model = _floating_model(device, kind, angular)
-                        velocity = [1.0, 0.0, 0.0] + [0.0] * (len(angular) - 1) + [20.0]
-                        twist, pose, before, after, ran = _fly(model, velocity, 1.0 / 240.0, 0.3)
-                        self.assertEqual(ran, evaluator)
-                        np.testing.assert_allclose(twist, (1.0, 0.0, 0.0, 0.0, 0.0, 20.0), atol=1.0e-4)
-                        np.testing.assert_allclose(pose[1:3], (0.0, _HEIGHT), atol=1.0e-5)
-                        self.assertAlmostEqual(pose[0], 0.3, delta=1.0e-4)
-                        self.assertAlmostEqual(after, before, delta=1.0e-5 * before)
+            for kind, angular in itertools.product(("root", "child"), ((2,), (0, 1, 2))):
+                with self.subTest(device=device, kind=kind, angular=angular):
+                    model = _floating_model(device, kind, angular)
+                    velocity = [1.0, 0.0, 0.0] + [0.0] * (len(angular) - 1) + [20.0]
+                    twist, pose, before, after = _fly(model, velocity, 1.0 / 240.0, 0.3)
+                    np.testing.assert_allclose(twist, (1.0, 0.0, 0.0, 0.0, 0.0, 20.0), atol=1.0e-4)
+                    np.testing.assert_allclose(pose[1:3], (0.0, _HEIGHT), atol=1.0e-5)
+                    self.assertAlmostEqual(pose[0], 0.3, delta=1.0e-4)
+                    self.assertAlmostEqual(after, before, delta=1.0e-5 * before)
 
     def test_tumbling_d6_converges_to_the_free_body(self):
         """Tumble an asymmetric body at (5, 7, 20) rad/s on a three-angle D6 root and on a free joint for 0.25 s.
@@ -134,8 +125,8 @@ class TestFeatherPGSD6Law(unittest.TestCase):
         velocity = [1.0, 0.5, 0.0, 5.0, 7.0, 20.0]
         errors = []
         for hz in (480, 1920):
-            free, _, _, _, _ = _fly(_floating_model("cpu", "free", inertia=inertia), velocity, 1.0 / hz, 0.25)
-            d6, _, _, _, _ = _fly(_floating_model("cpu", "root", (0, 1, 2), inertia), velocity, 1.0 / hz, 0.25)
+            free, _, _, _ = _fly(_floating_model("cpu", "free", inertia=inertia), velocity, 1.0 / hz, 0.25)
+            d6, _, _, _ = _fly(_floating_model("cpu", "root", (0, 1, 2), inertia), velocity, 1.0 / hz, 0.25)
             self.assertTrue(np.all(np.isfinite(d6)))
             errors.append(float(np.linalg.norm(d6[3:] - free[3:])))
         self.assertGreater(errors[0], 3.0 * errors[1], errors)

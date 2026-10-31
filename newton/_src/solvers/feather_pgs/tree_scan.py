@@ -39,8 +39,7 @@ arguments; the plan (:class:`.tree_plan.TreePlan`) supplies the rest:
 
     :func:`choose_schedule` picks one from the plan's data (sizes, depth,
     chain packing), never from a timing. The CPU path of every schedule is the
-    serial one: a native scan's ``#else`` branch, and :func:`serial_scan` and
-    :func:`serial_path` for Warp kernels (the general route's passes).
+    serial one: a native scan's ``#else`` branch.
 
 SERIAL and LEVEL compute every node's result from its parent's final one, so
 they agree bit for bit; the jump, chain and interval schedules regroup the same
@@ -58,9 +57,7 @@ Generation is text substitution only (``str.format`` on the fragments below).
 """
 
 import enum
-import functools
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 import warp as wp
@@ -69,8 +66,8 @@ from . import field_group
 from .device_preludes import DevicePrelude, device_branches
 from .field_group import Field
 from .law_source import law_preludes
-from .spatial_laws import SPATIAL, transform_compose, twist_compose
-from .tree_plan import UP_FIRST, UP_SUMS, TreePlan
+from .spatial_laws import SPATIAL
+from .tree_plan import TreePlan
 
 __all__ = [
     "INERTIA",
@@ -91,8 +88,6 @@ __all__ = [
     "scan_arrays",
     "schedule_costs",
     "schedule_features",
-    "serial_path",
-    "serial_scan",
     "tree_scan",
 ]
 
@@ -813,7 +808,7 @@ def _interval_up(c: _Context) -> str:
 
 def _path(c: _Context, visit: str) -> str:
     # The depth-first positions up to the node's, root first: an ancestor's subtree interval holds the node's
-    # position. Independent loads where a parent-pointer walk waits on each, as the Warp walk (serial_path).
+    # position. Independent loads where a parent-pointer walk waits on each.
     return f"""    const int here={c.access.dfs_position.format(node="node")};
     for(int position=0;position<=here;++position) {{
         if(here>={c.access.dfs_end.format(position="position")})continue;
@@ -920,158 +915,3 @@ def tree_scan(
     serial = "{\n" + (_serial_down if direction is Direction.DOWN else _serial_up)(context) + "}\n" if cpu else ""
     preludes = combine.preludes()
     return ScanSource(cuda, serial, preludes, schedule)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Warp serial scans (the general route's fallback: any size)
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-@functools.cache
-def serial_scan(combine: Combine, direction: Direction, own, result=None, *, store_total: bool = False):
-    """Return the Warp serial schedule of ``combine``: one thread visits a joint range once, node by node.
-
-    The scan runs over nodes ``start`` to ``end - 1`` of a parent-first range in place on body-indexed values:
-    ``parent[i]`` is the slot of node ``i``'s parent (``-1`` at a root) and ``slot[i]`` node ``i``'s own. The
-    hooks are ``wp.func``; ``data`` is the struct of arrays they read, passed through.
-
-    ``DOWN`` (:data:`TRANSFORM`, :data:`TWIST`): each node's own value ``own(node, data)`` (a twist hook returns
-    the twist and its own bias acceleration) is composed with its parent's result, stored at its slot and handed
-    to ``result(node, value, data)``. The parent's result comes from registers when it is the previous node
-    (a chain), else from memory: one read of the tree per scan.
-
-    ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent, with each
-    node's :attr:`.tree_plan.TreePlan.up_flags` in ``flags``: a node's value is ``own(node, children, data)``,
-    ``children`` the sum its children left at its slot (zero at a leaf); the first child the walk visits stores
-    its value at its parent's slot and later siblings add theirs; the value is handed to ``result``. With
-    ``store_total`` the node's slot then holds its value, else its children's sum (a leaf stores its zero).
-
-    Each form sets every slot it reads, so it leaves memory as its first run did when run again.
-    """
-    has_result = result is not None
-    if direction is Direction.UP:
-        if not combine.additive:
-            raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
-
-        @wp.func
-        def scan_up(
-            start: int,
-            end: int,
-            parent: wp.array[int],
-            slot: wp.array[int],
-            flags: wp.array[int],
-            values: wp.array[Any],
-            data: Any,
-        ):
-            for offset in range(end - start):
-                node = end - 1 - offset
-                meet = flags[node]
-                children = values.dtype(0.0)
-                if (meet & UP_SUMS) != 0:
-                    children = values[slot[node]]
-                elif wp.static(not store_total):
-                    values[slot[node]] = children
-                value = own(node, children, data)
-                if wp.static(store_total):
-                    values[slot[node]] = value
-                up = parent[node]
-                if up >= 0:
-                    if (meet & UP_FIRST) != 0:
-                        values[up] = value
-                    else:
-                        values[up] = values[up] + value
-                if wp.static(has_result):
-                    result(node, value, data)
-
-        return scan_up
-    if direction is not Direction.DOWN:
-        raise ValueError("Warp scans run DOWN or UP; a path is the caller's loop")
-    if combine.name == "transform":
-
-        @wp.func
-        def scan_transform(
-            start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[wp.transform], data: Any
-        ):
-            last = int(-1)
-            last_value = wp.transform_identity()
-            for node in range(start, end):
-                value = own(node, data)
-                up = parent[node]
-                if up >= 0:
-                    above = last_value
-                    if up != last:
-                        above = values[up]
-                    value = transform_compose(above, value)
-                last = slot[node]
-                last_value = value
-                values[last] = value
-                if wp.static(has_result):
-                    result(node, value, data)
-
-        return scan_transform
-    if combine.name == "twist":
-
-        @wp.func
-        def scan_twist(
-            start: int,
-            end: int,
-            parent: wp.array[int],
-            slot: wp.array[int],
-            velocity: wp.array[wp.spatial_vector],
-            acceleration: wp.array[wp.spatial_vector],
-            data: Any,
-        ):
-            last = int(-1)
-            last_v = wp.spatial_vector()
-            last_a = wp.spatial_vector()
-            for node in range(start, end):
-                v, a = own(node, data)
-                up = parent[node]
-                if up >= 0:
-                    above_v = last_v
-                    above_a = last_a
-                    if up != last:
-                        above_v = velocity[up]
-                        above_a = acceleration[up]
-                    v, a = twist_compose(above_v, above_a, v, a)
-                last = slot[node]
-                last_v = v
-                last_a = a
-                velocity[last] = v
-                acceleration[last] = a
-                if wp.static(has_result):
-                    result(node, v, a, data)
-
-        return scan_twist
-    raise ValueError(f"No serial down scan of {combine.name!r}")
-
-
-@functools.cache
-def serial_path(visit):
-    """Return the Warp walk up a node's root path: ``visit(ancestor, node, value, data, context)`` for every
-    ancestor of ``node`` and itself, root first, in one thread.
-
-    The walk runs over the depth-first positions (:class:`.tree_plan.TreePlan`'s ``dfs_order``,
-    ``dfs_position`` and ``dfs_end``) from the tree's root ``start`` to ``node``'s, visiting each node whose
-    subtree interval holds ``node``'s position, rather than following parent pointers: no state passes between
-    iterations. ``value`` is the walk's own operand (a column's force); ``data`` (the pass's arrays)
-    and ``context`` (the walk's own scalars) pass through.
-    """
-
-    @wp.func
-    def walk(
-        start: int,
-        node: int,
-        value: Any,
-        dfs_order: wp.array[int],
-        dfs_position: wp.array[int],
-        dfs_end: wp.array[int],
-        data: Any,
-        context: Any,
-    ):
-        here = dfs_position[node]
-        for position in range(dfs_position[start], here + 1):
-            if here < dfs_end[position]:
-                visit(dfs_order[position], node, value, data, context)
-
-    return walk

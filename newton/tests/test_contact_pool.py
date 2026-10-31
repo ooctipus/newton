@@ -620,10 +620,8 @@ def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
 
     if wp.get_device(device).is_cuda:
         simulate()  # load the modules outside capture
-        # FeatherPGS seeds its double-buffer events in each capture, after the queued clears finish.
         wp.synchronize_device(device)
         with wp.ScopedCapture(device=device) as capture:
-            solver.seed_double_buffer_events()
             simulate()
         for _ in range(3):
             wp.capture_launch(capture.graph)
@@ -994,7 +992,6 @@ def test_failed_closed_launches_are_capacity_failures(test, device):
     simulate()  # load the modules outside capture
     wp.synchronize_device(device)
     with wp.ScopedCapture(device=device) as capture:
-        solver.seed_double_buffer_events()
         simulate()
         # The updater the next launch binds to (each loads its own handle of the bridge library).
         library = pool._updates_for(contact_pool._capture_owner(wp.get_device(device)))._library
@@ -1055,7 +1052,6 @@ def test_trim_and_growth_follow_a_feather_pgs_graph(test, device):
     place(lifted)
     wp.synchronize_device(device)
     with wp.ScopedCapture(device=device) as capture:
-        solver.seed_double_buffer_events()
         simulate()
     first = pool.mapped_bytes()
     counts, recaptures, overflowed, trimmed_bytes = [], 0, [], None
@@ -1123,10 +1119,8 @@ def test_bound_graph_follows_growth_without_recapture(test, device):
             solver.step(source, target, control, contacts, 1.0 / 120.0)
 
     def capture():
-        # FeatherPGS seeds its double-buffer events in each capture, after the queued clears finish.
         wp.synchronize_device(device)
         with wp.ScopedCapture(device=device) as recording:
-            solver.seed_double_buffer_events()
             simulate()
         return recording.graph
 

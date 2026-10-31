@@ -94,11 +94,7 @@ def make_solver(model, enabled, pins=None, **overrides):
         "update_mass_matrix_interval": 2,
     }
     options.update(overrides)
-    # Both arms keep one buffer set, so rows compared after a step are still there.
-    single = {"double_buffer": False}
-    with mock.patch.dict(
-        SolverFeatherPGS._route_pins, {**single, **({} if enabled else {"storage": "dense"}), **(pins or {})}
-    ):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {**({} if enabled else {"storage": "dense"}), **(pins or {})}):
         return SolverFeatherPGS(model, **options)
 
 

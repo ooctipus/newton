@@ -13,7 +13,8 @@ import newton
 from newton._src.solvers.feather_pgs import forest_plan
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
-from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
+from newton.tests.feather_pgs_law_harness import recomputing
+from tools.fpgs_bench.public_state_oracle import force_response, physical_mass, public_state
 
 DT = 1.0 / 240.0
 
@@ -83,10 +84,9 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
                 inverse[values] = np.arange(group.size)
             plan.art_group_idx.assign(inverse)
 
-    # The held owner on dense storage, or ordinary dynamics; one buffer set either way.
-    pins = {"storage": "dense", "double_buffer": False, **({} if enabled else {"evaluator": "ordinary"})}
+    # The held owner on dense storage; without ``enabled`` it recomputes every step.
     with (
-        patch.object(SolverFeatherPGS, "_route_pins", pins),
+        patch.object(SolverFeatherPGS, "_route_pins", {"storage": "dense"}),
         patch.object(forest_plan, "_size_groups", grouping),
     ):
         solver = SolverFeatherPGS(
@@ -107,7 +107,7 @@ def make_solver(model, *, enabled=False, permuted=False, friction_anchor_beta=0.
         # production admission and complete stepping remain CUDA-only.
         solver._compact_diagonal_mass_size = 4
         solver.factor.diagonal_inverse_mass = wp.zeros(model.joint_dof_count, dtype=float, device=model.device)
-    return solver
+    return solver if enabled else recomputing(solver)
 
 
 class TestMixedTreeCache(unittest.TestCase):
@@ -127,7 +127,7 @@ class TestMixedTreeCache(unittest.TestCase):
             model = model_fixture(device, reordered=reordered, primary_dofs=primary_dofs)
             model.joint_target_ke.zero_()
             model.joint_target_kd.zero_()
-            solver, reference = (make_solver(model, permuted=True) for _ in range(2))
+            solver = make_solver(model, permuted=True)
             owner = HeldTree(solver)
             state, output, control = model.state(), model.state(), model.control()
             rng = np.random.default_rng(3401)
@@ -136,25 +136,15 @@ class TestMixedTreeCache(unittest.TestCase):
             state.joint_qd.assign(raw)
             state.body_f.assign(rng.normal(0, 0.2, (model.body_count, 6)).astype(np.float32))
             control.joint_f.assign(rng.uniform(-0.2, 0.2, model.joint_dof_count).astype(np.float32))
-            for item in (solver, reference):
-                item.factor.last_step_dt = DT
-                item.factor.fk_id_cache_enabled = False
-                item.factor.passive_spring_stiffness.fill_(0.31)
-                item.factor.passive_spring_ref.fill_(-0.07)
-                item.factor.passive_joint_damping.fill_(0.12)
+            solver.factor.last_step_dt = DT
+            solver.factor.passive_spring_stiffness.fill_(0.31)
+            solver.factor.passive_spring_ref.fill_(-0.07)
+            solver.factor.passive_joint_damping.fill_(0.12)
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            reference.factor.fk_id(state, model.state(), reference._step, reference.qd_work)
-            reference.factor.ordinary.joint_tau(state, control, DT)
-            rhs = reference.factor.joint_tau.numpy().astype(float)
+            forces = control.joint_f.numpy().astype(float)
             physical = physical_mass(model, state)
             solver.factor.joint_tau.zero_()
             owner.begin(state, solver.factor, state.joint_qd, DT, True)
-            np.testing.assert_allclose(
-                solver.factor.joint_S_s.numpy(), reference.factor.joint_S_s.numpy(), atol=4e-6, rtol=3e-5
-            )
-            np.testing.assert_allclose(
-                solver.factor.body_v_s.numpy(), reference.factor.body_v_s.numpy(), atol=4e-6, rtol=3e-5
-            )
             expected = np.zeros(model.joint_dof_count)
             starts = solver.forest.articulation_dof_start.numpy()
             for group in owner.groups:
@@ -166,7 +156,7 @@ class TestMixedTreeCache(unittest.TestCase):
                     packed = block[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
                     np.testing.assert_allclose(group.geometric.numpy()[index], packed, atol=4e-6, rtol=4e-5)
                     expected[ids] = np.linalg.solve(
-                        block + np.diag(solver.factor.R_by_size[n].numpy()[index]), rhs[ids]
+                        block + np.diag(solver.factor.R_by_size[n].numpy()[index]), forces[ids]
                     )
                     if not model.device.is_cuda and not operator.diagonal:
                         lower = solver.factor.L_by_size[n].numpy()
@@ -182,9 +172,8 @@ class TestMixedTreeCache(unittest.TestCase):
                 )
                 for group in owner.groups
             }
-            owner.predict(state, solver.factor, control, state.joint_qd, DT)
-            np.testing.assert_allclose(solver.factor.joint_qdd.numpy(), expected, atol=5e-5, rtol=5e-4)
-            np.testing.assert_allclose(solver.v_hat.numpy(), raw + DT * expected, atol=4e-6, rtol=3e-5)
+            response = force_response(owner, solver, state, control, state.joint_qd, DT)
+            np.testing.assert_allclose(response, expected, atol=5e-5, rtol=5e-4)
             solver.v_out.assign(solver.v_hat)
             owner.finish(state, solver.factor, output, DT, False)
             public_state(self, model, output)

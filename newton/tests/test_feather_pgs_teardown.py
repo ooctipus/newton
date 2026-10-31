@@ -17,8 +17,7 @@ class TestFeatherPGSTeardown(unittest.TestCase):
         """Drain queued work without trusting a stream's surviving Python wrapper."""
         owner = SimpleNamespace(
             model=SimpleNamespace(device=sentinel.device),
-            _memset_stream=sentinel.finalized_stream,
-            _size_streams={9: sentinel.finalized_stream},
+            _local_pair_stream=sentinel.finalized_stream,
         )
         with (
             patch.object(wp, "synchronize_device") as drain,

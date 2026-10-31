@@ -13,6 +13,7 @@ import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import recomputing
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 
 DT = 1.0 / 240.0
@@ -263,7 +264,7 @@ def _rollout(
     """
     if pgs_iterations is None:
         pgs_iterations = PATCH_PARITY_ITERATIONS if friction_anchor_beta > 0.0 else 8
-    pins = {"storage": "dense"} if owner else {"evaluator": "ordinary"}
+    pins = {"storage": "dense"}
     # ``_rollout.forest``: False/True pins the group form; None takes the owner's default rule.
     forest = getattr(_rollout, "forest", False)
     if forest is not None:
@@ -281,6 +282,8 @@ def _rollout(
             **(attrs or {}),
         )
     state_owner = solver.factor.held
+    if not owner:
+        recomputing(solver)
     # Sorted contacts give both arms one contact and row order whatever the thread scheduling of the atomic pair,
     # contact and row allocations. The arms are then compared, not two schedules: resting boxes and feet are
     # statically indeterminate supports, on which the order alone moves an 8-iteration rollout by up to 2.4e-4
@@ -360,8 +363,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"))
-                plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertIsNone(plain_owner)
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
                 self.assertTrue(plain_solver.forest.has_free_rigid_bodies)
                 owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
                 self.assertIsInstance(owner, HeldTree)
@@ -383,8 +385,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
     def test_multi_coordinate_descendant_joints_are_owned(self):
         """An arm with a two-coordinate D6 shoulder (Humanoid's joint class) is owned and tracks the ordinary route."""
         model = _build(wp.get_device("cuda:0"), shoulder=True)
-        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
-        self.assertIsNone(plain_owner)
+        _plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
         self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [4, 6])
@@ -396,8 +397,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
     def test_forest_group_owns_the_whole_world(self):
         """Pinned to the forest grouping, one group owns the arm, the box and the tray of each world."""
         model = _build(wp.get_device("cuda:0"), prescribed=True)
-        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
-        self.assertIsNone(plain_owner)
+        _plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False)
         _rollout.forest = True
         try:
             _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
@@ -447,8 +447,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         """An 18-coordinate free-root walker (a quadruped's class) gets a held family and tracks the ordinary route."""
         model = _build(wp.get_device("cuda:0"), quadruped=True)
         # The walker's contact and limit rows need the row budget the quadruped recipes set.
-        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
-        self.assertIsNone(plain_owner)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
         self.assertIsNone(plain_solver.placement.sparse_mass_matrix_size)
         self.assertIn(18, plain_solver.forest.size_groups)
         self.assertFalse(plain_solver.constraint_capacity_status()["dense"])
@@ -469,8 +468,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
     def test_quadruped_scenes_are_owned(self):
         """Quadruped scenes (the legged recipes' class) hand their dynamics to the owner."""
         model = _build(wp.get_device("cuda:0"), quadruped=True)
-        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
-        self.assertIsNone(plain_owner)
+        _plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256)
         self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
@@ -491,10 +489,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), cabinet=True)
-                plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertIsNone(plain_owner)
-                # Ordinary dynamics take the dense representations: the compact diagonal is the held tree's.
-                self.assertIsNone(plain_solver._compact_diagonal_mass_size)
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
                 _rollout.forest = True
                 try:
                     owner_solver, owner, cached, cached_qd = _rollout(
@@ -531,8 +526,9 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), cabinet=True)
-                plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertIsNone(plain_owner)
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(
+                    model, owner=False, friction_anchor_beta=beta, scalar=False
+                )
                 self.assertIsNone(plain_solver._scalar_branches)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, scalar=True
@@ -562,10 +558,9 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), speed_limit=0.8)
                 recipe = {"enable_joint_velocity_limits": True}
-                plain_solver, plain_owner, plain, plain_qd = _rollout(
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(
                     model, owner=False, friction_anchor_beta=beta, attrs=recipe
                 )
-                self.assertIsNone(plain_owner)
                 self.assertTrue(plain_solver.options.enable_joint_velocity_limits)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, attrs=recipe
@@ -584,8 +579,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
     def test_paired_response_scenes_are_owned(self):
         """A 17-joint arm with a free box per world (the Kuka scenes' class) selects the paired response and is owned."""
         model = _build(wp.get_device("cuda:0"), links=17)
-        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=192, swing_stride=17)
-        self.assertIsNone(plain_owner)
+        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=192, swing_stride=17)
         self.assertEqual(plain_solver._paired_response_primary_size, 17)
         self.assertTrue(plain_solver._paired_factor_coordinates)
         owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=192, swing_stride=17)
@@ -604,10 +598,9 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), mimic=True)
-                plain_solver, plain_owner, plain, plain_qd = _rollout(
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(
                     model, owner=False, friction_anchor_beta=beta, swing_joint=1
                 )
-                self.assertIsNone(plain_owner)
                 self.assertEqual(int(plain_solver.laws.mimic_count), model.world_count)
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, swing_joint=1
@@ -628,8 +621,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), prescribed=True)
-                plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertIsNone(plain_owner)
+                plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
                 self.assertTrue(plain_solver.forest.has_prescribed_response)
                 owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
                 self.assertIsInstance(owner, HeldTree)
@@ -676,11 +668,11 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
             model = _build(wp.get_device("cuda:0"))
             steps = []
 
-            def repose(solver, contacts, model=model, steps=steps):
+            def repose(solver, contacts, model=model, steps=steps, owner=owner):
                 steps.append(len(steps))
-                held = solver.factor.held
-                if held is not None:
+                if owner:
                     # Every finish and every recomputing repair adds one to its tree's generation.
+                    held = solver.factor.held
                     generations.append([int(group.data.generation.numpy().sum()) for group in held.groups])
                 if len(steps) == rewrite_after:
                     model.joint_X_p.assign(model.joint_X_p.numpy())
@@ -689,9 +681,8 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                     _repose_fixed_roots(model, solver, lift)
 
             rollouts.append((model, *_rollout(model, owner=owner, steps=60, observe=repose)))
-        (model, _plain_solver, plain_owner, plain, plain_qd) = rollouts[0]
+        (model, _plain_solver, _plain_owner, plain, plain_qd) = rollouts[0]
         (_, owner_solver, owner, cached, cached_qd) = rollouts[1]
-        self.assertIsNone(plain_owner)
         self.assertIsInstance(owner, HeldTree)
         self.assertIs(owner_solver.factor.held, owner)
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())

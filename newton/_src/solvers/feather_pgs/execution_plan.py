@@ -115,13 +115,6 @@ def _align_shared_memory(size: int) -> int:
     return (size + 15) // 16 * 16
 
 
-def _estimate_cholesky_shared_memory(n_dofs: int) -> int:
-    """Estimate the complete tiled Cholesky shared-memory footprint [B]."""
-    matrix_bytes = _align_shared_memory(4 * n_dofs * n_dofs)
-    vector_bytes = _align_shared_memory(4 * n_dofs)
-    return 3 * matrix_bytes + vector_bytes
-
-
 def _estimate_hinv_jt_shared_memory(n_dofs: int, constraint_count: int, *, tile_threads: int) -> int:
     """Estimate the complete tiled H-inverse shared-memory footprint [B]: the factor and three row tiles."""
     footprint = _align_shared_memory(4 * n_dofs * n_dofs)
@@ -157,7 +150,6 @@ class _FeatherPGSExecutionPlan:
     """Immutable device-resource choices for one solver shape."""
 
     diagonal_mass_sizes: frozenset[int]
-    cholesky_tiled_sizes: frozenset[int]
     hinv_jt_tiled_sizes: frozenset[int]
     hinv_jt_chunk_sizes: tuple[tuple[int, int], ...]
     reasons: tuple[tuple[int, str, str], ...] = ()
@@ -169,7 +161,6 @@ class _FeatherPGSExecutionPlan:
         *,
         max_constraints: int,
         max_shared_memory: int,
-        cholesky_kernel: str,
         hinv_jt_kernel: str,
         small_dof_threshold: int,
         tile_threads: int,
@@ -181,40 +172,15 @@ class _FeatherPGSExecutionPlan:
             if hinv_jt_kernel == "auto"
             else frozenset()
         )
-        cholesky_tiled_sizes: set[int] = set()
         tiled_sizes: set[int] = set()
         chunk_sizes: list[tuple[int, int]] = []
         reasons: list[tuple[int, str, str]] = []
         for size in size_groups:
             if size in planned_diagonal_sizes:
-                for name in ("cholesky_kernel", "hinv_jt_kernel"):
-                    reasons.append((size, name, "Independent-coordinate topology uses diagonal generalized inertia."))
-                continue
-            cholesky_requested = cholesky_kernel == "tiled" or (
-                cholesky_kernel == "auto" and size > small_dof_threshold
-            )
-            if cholesky_requested:
-                required = _estimate_cholesky_shared_memory(size)
-                if required <= max_shared_memory:
-                    cholesky_tiled_sizes.add(size)
-                    factor_reason = f"Tiled factor fits shared memory: {required} <= {max_shared_memory} bytes."
-                elif cholesky_kernel == "tiled":
-                    raise ValueError(
-                        f"cholesky_kernel='tiled' requires {required} bytes of shared memory for DOF size {size}, "
-                        f"but the device exposes {max_shared_memory} bytes; use cholesky_kernel='auto' or 'loop'."
-                    )
-                else:
-                    factor_reason = (
-                        f"Loop fallback: tiled factor needs {required} bytes of shared memory; "
-                        f"device limit is {max_shared_memory}."
-                    )
-            else:
-                factor_reason = (
-                    "Loop factor explicitly selected."
-                    if cholesky_kernel == "loop"
-                    else f"Loop factor: {size} DOFs do not exceed the automatic threshold {small_dof_threshold}."
+                reasons.append(
+                    (size, "hinv_jt_kernel", "Independent-coordinate topology uses diagonal generalized inertia.")
                 )
-            reasons.append((size, "cholesky_kernel", factor_reason))
+                continue
 
             if max_constraints <= 0:
                 reasons.append((size, "hinv_jt_kernel", "No tiled response with zero row capacity."))
@@ -259,7 +225,6 @@ class _FeatherPGSExecutionPlan:
 
         return cls(
             planned_diagonal_sizes,
-            frozenset(cholesky_tiled_sizes),
             frozenset(tiled_sizes),
             tuple(chunk_sizes),
             tuple(reasons),
@@ -272,10 +237,6 @@ class _FeatherPGSExecutionPlan:
     def use_diagonal_mass(self, size: int) -> bool:
         """Return whether an articulation group has diagonal generalized inertia."""
         return size in self.diagonal_mass_sizes
-
-    def use_tiled_cholesky(self, size: int) -> bool:
-        """Return whether an articulation group uses tiled Cholesky."""
-        return size in self.cholesky_tiled_sizes
 
     def hinv_jt_chunk_size(self, size: int) -> int | None:
         """Return the tiled H-inverse chunk size for a response group."""

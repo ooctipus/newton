@@ -3,15 +3,14 @@
 
 """The step's plan: what each stage launches, decided once at construction.
 
-Every stage whose work depends on the articulation size (the stage-2 factor, the
-stage-3 solve of the velocity predictor and the stage-4 contact response) has one
-table: each size's route and the reason for it. The solve of stages 5 and 6 has one
+Every stage whose work depends on the articulation size (the factor and the stage-4
+contact response) has one table: each size's route and the reason for it. The solve of stages 5 and 6 has one
 entry: the rows its sweep solves and what drives the sweep. ``step()`` launches through these tables,
 the route record (:mod:`.path_selection`) reports them, and construction builds
 exactly the kernels they name, so the three cannot disagree.
 
-The plan reads the solver's route (its row of the route table: the evaluator, the
-placement case and producer) and the mapping beside it (the
+The plan reads the solver's route (its row of the route table: the placement case
+and producer) and the mapping beside it (the
 execution plan's resource choices, the kernel choices); it decides nothing that
 construction has not, and nothing in it changes after construction.
 """
@@ -94,36 +93,26 @@ class StepPlan:
     """The per-stage dispatch tables of one solver, built once by :meth:`build`."""
 
     factor: Mapping[int, Route]
-    """Stage 2, per size: ``none`` (no dense factor), ``held`` (the held tree refreshes the factor in stage 1),
-    ``diagonal``, ``tiles`` or ``loop``."""
-    trisolve: Mapping[int, Route]
-    """Stage 3, per size: ``sparse``, ``compact_diagonal``, ``diagonal``, ``tiles`` or ``loop``; empty under a
-    held-tree owner, whose predictor replaces the stage."""
+    """Per size: ``none`` (no dense factor) or ``held`` (the held tree refreshes the factor)."""
     response: Mapping[int, Route]
     """Stage 4, per size: ``owner`` (a contact owner publishes the response), ``sparse_diagonal``,
     ``packed`` (only the packed rows' build: none reads the response), ``diagonal``, ``grouped``, ``tiles``,
     ``lanes`` or ``rows``."""
     solve: SolveRoute
-    unread_mass_sizes: tuple[int, ...]
-    """Sizes whose dense mass matrix no stage reads: every size under a held-tree owner, which refreshes the factors
-    from its own geometry (stage 2 reads no H). Their end-of-step clear is skipped."""
     jacobian_clear_sizes: tuple[int, ...]
-    """End of a double-buffered step: the sizes whose active Jacobian rows are cleared for the buffer's next use;
-    none under the matrix-free sweeps (their producers write the packed rows' sides whole) or owners that keep a
-    private Jacobian (local row packets, keyed rows), and never the sparse-diagonal response size (no dense J) or the
-    compact producer's six-coordinate size (complete stores)."""
+    """The sizes whose rows of the last step are cleared before the producers write the next: none under the
+    matrix-free sweeps (their producers write the packed rows' sides whole), native sparse factors or owners that keep
+    a private Jacobian (local row packets, keyed rows), and never the sparse-diagonal response size (no dense J) or
+    the compact producer's six-coordinate size (complete stores)."""
 
     @classmethod
     def build(cls, row: RouteRow, solver) -> StepPlan:
         """Read the plan from the solver's route ``row`` and its mapping (sizes, resource rules, kernel choices)."""
-        held = row.evaluator == "held"
         solve = _solve(row)
         return cls(
             factor=MappingProxyType(_factor(row, solver)),
-            trisolve=MappingProxyType({} if held else _trisolve(row, solver)),
             response=MappingProxyType(_response(row, solver)),
             solve=solve,
-            unread_mass_sizes=tuple(solver.forest.size_groups) if held else (),
             jacobian_clear_sizes=()
             if row.producer in ("local_packets", "keyed_rows")
             else tuple(size for size in solver.forest.size_groups if solver.placement.clears_jacobian(size)),
@@ -141,9 +130,7 @@ class StepPlan:
 
         return {
             "factor": table(self.factor),
-            "trisolve": table(self.trisolve) if self.trisolve else None,
             "response": table(self.response),
-            "unread_mass_dofs": sorted(int(size) for size in self.unread_mass_sizes),
             "jacobian_clear_dofs": [int(size) for size in self.jacobian_clear_sizes],
         }
 
@@ -156,43 +143,14 @@ def _route(solver, size: int, kernel: str, name: str, reason: str) -> Route:
 
 
 def _factor(row: RouteRow, solver) -> dict[int, Route]:
-    plan = solver._execution_plan
-    held = row.evaluator == "held"
     routes = {}
     for size in solver.forest.size_groups:
         if size == row.sizes["diagonal"]:
-            route = "none", "The compact diagonal size stores its inverse mass directly; no dense factor."
+            routes[size] = Route("none", "The compact diagonal size stores its inverse mass directly; no dense factor.")
         elif size == row.sizes["packed"]:
-            route = "none", row.reasons["K1"]
-        elif held:
-            route = "held", "The held tree refreshes the factor from its geometry in stage 1."
-        elif plan.use_diagonal_mass(size):
-            route = "diagonal", ""
-        elif plan.use_tiled_cholesky(size):
-            route = "tiles", ""
+            routes[size] = Route("none", row.reasons["K1"])
         else:
-            route = "loop", ""
-        routes[size] = _route(solver, size, "cholesky_kernel", *route)
-    return routes
-
-
-def _trisolve(row: RouteRow, solver) -> dict[int, Route]:
-    plan = solver._execution_plan
-    choice = solver.trisolve_kernel
-    threshold = f"Automatic DOF threshold {solver.small_dof_threshold}."
-    routes = {}
-    for size in solver.forest.size_groups:
-        if size == row.sizes["packed"]:
-            route = "sparse", "Native sparse factors solve in factor coordinates."
-        elif size == row.sizes["diagonal"]:
-            route = "compact_diagonal", "The compact diagonal size applies its stored inverse mass."
-        elif plan.use_diagonal_mass(size):
-            route = "diagonal", "Independent coordinates apply the diagonal inverse."
-        elif choice == "tiled" or (choice == "auto" and size > solver.small_dof_threshold):
-            route = "tiles", threshold
-        else:
-            route = "loop", threshold
-        routes[size] = _route(solver, size, "trisolve_kernel", *route)
+            routes[size] = Route("held", "The held tree refreshes the factor from its geometry.")
     return routes
 
 

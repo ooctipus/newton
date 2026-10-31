@@ -47,6 +47,7 @@ from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     assert_loaded_anchors,
@@ -774,11 +775,10 @@ class TestParallelPatchReference(unittest.TestCase):
         model = _pushed_sphere("cpu")
         limits = model.joint_velocity_limit.numpy().astype(np.float64)
         model.joint_qd.assign(prescaled_joint_velocity(model))  # what the matrix-free route predicts from
-        with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
+        with patch.dict(SolverFeatherPGS._route_pins, _DENSE):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.2)
         _rollout(model, solver, 1)
-        (size,) = solver.forest.size_groups
-        mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
+        mass_matrix = MassReference(model).mass_matrix(model.joint_q.numpy(), 0)
         case = with_velocity_limit_rows(world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         speeds = {}
@@ -1133,7 +1133,7 @@ class TestTierSweeps(unittest.TestCase):
         TestPatchParallelPhysics runs the solver's tiers on the same stance.
         """
         model = sliding_stance("cpu")
-        with patch.dict(SolverFeatherPGS._route_pins, _ORDINARY):
+        with patch.dict(SolverFeatherPGS._route_pins, _DENSE):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_iterations=2000)
         _rollout(model, solver, 1)
         case, serial = world_case(solver)
@@ -1416,9 +1416,8 @@ class TestParallelPatchKernel(unittest.TestCase):
 
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
-# Dense storage, and dense storage over ordinary dynamics (test-only route pins).
+# Dense storage (a test-only route pin).
 _DENSE = {"storage": "dense"}
-_ORDINARY = {"storage": "dense", "evaluator": "ordinary"}
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
 _STATE_FLOOR = {"joint_q": 2.0e-4, "body_q": 2.0e-4, "joint_qd": 2.0e-3, "body_qd": 2.0e-3}
 
@@ -1693,10 +1692,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 for _ in range(2):
                     pair()
                 outcomes = _admitted_modes(solver.laws.friction_patches)
-                # The eager steps queued buffer clears the graph does not wait for (seed_double_buffer_events).
                 wp.synchronize_device(model.device)
                 with scoped_capture_after_gc(device=model.device) as capture:
-                    solver.seed_double_buffer_events()
                     pair()
                 self.assertEqual(outcomes, ["sort", "keep"] if reuse is None else ["sort", "sort"], reuse)
                 replays[reuse] = []
@@ -2037,7 +2034,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         model = _limited_hand("cuda:0")
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
         # As test_serial_sweep_converges_to_the_parallel_tier builds its routes on this hand.
-        converged = {"enable_joint_velocity_limits": True, "pins": _ORDINARY, "pgs_iterations": 2000, "sweeps": 2000}
+        converged = {"enable_joint_velocity_limits": True, "pins": _DENSE, "pgs_iterations": 2000, "sweeps": 2000}
         arms = {
             "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=8, **converged),
             "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),

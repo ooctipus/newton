@@ -3,10 +3,7 @@
 
 """Free rigid bodies must not gain energy from their gyroscopic bias."""
 
-import os
 import unittest
-from unittest import mock
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -174,10 +171,8 @@ def _mixed_scene(device, *, arm, totes):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
     control.joint_target_q.fill_(0.1)
-    # One route for every scene. The held-tree owner refuses the arm's revolute root but would take
-    # the totes-only scene; none of these scenes has a constraint row.
-    with mock.patch.dict(newton.solvers.SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+    # None of these scenes has a constraint row.
+    solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
     return model, solver, control, [state, output]
 
 
@@ -203,7 +198,7 @@ def test_mixed_arm_and_spinning_bodies(test, device):
             # orientation difference into 2e-4 rad/s within seven steps.
             routes = [_route(scene[1]) for scene in scenes]
             test.assertEqual(routes, [routes[0]] * len(routes), "scenes compared across routes")
-            test.assertIsNone(routes[0][0])
+            test.assertEqual(routes[0][0], "tree")
             test.assertIsNone(routes[0][3])
             model, solver, _, states = scenes[0]
             free_bodies = (0, 20, 21, 41)
@@ -232,8 +227,6 @@ def test_mixed_arm_and_spinning_bodies(test, device):
             graph = None
             if execution == "graph":
                 with wp.ScopedCapture(device=device) as capture:
-                    for _, scene_solver, _, _ in scenes:
-                        scene_solver.seed_double_buffer_events()
                     step()
                     step()
                 graph = capture.graph
@@ -256,38 +249,7 @@ def test_mixed_arm_and_spinning_bodies(test, device):
 
 
 class TestFeatherPGSGyroscopic(unittest.TestCase):
-    def test_private_predictor_gyro_does_not_repeat_transport(self):
-        """Apply the same gyro law to a private, already transported predictor."""
-        from newton._src.solvers.feather_pgs import kernels  # noqa: PLC0415
-
-        model, state, output = _model("cpu", np.diag([0.001, 0.02, 0.0205]), (20.0, 4.0, 10.0))
-        # The opt-in stage-3 snapshots hold the predictor's input velocity and acceleration.
-        with patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}):
-            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
-        dt = 1.0 / 240.0
-        solver.step(state, output, model.control(), None, dt)
-        qd = solver._debug_stage3_qd_work
-        explicit = qd.numpy() + dt * solver._debug_stage3_joint_qdd.numpy()
-        solver.v_hat.assign(explicit)
-        solver.factor.correct_free_root_velocity(state, qd, dt, solver.v_hat)
-        expected = solver.v_hat.numpy().copy()
-        self.assertGreater(np.max(np.abs(expected[3:] - explicit[3:])), 1.0e-4)
-        solver.v_hat.assign(explicit)
-        wp.launch(
-            kernels.apply_free_root_transport_to_predictor,
-            dim=solver.forest.free_root_joint_count,
-            inputs=[
-                solver.forest.free_root_joint_indices,
-                model.joint_qd_start,
-                solver.factor.kinematic_joint_mask,
-                qd,
-                dt,
-            ],
-            outputs=[solver.v_hat],
-            device=model.device,
-        )
-        solver.factor.correct_free_root_velocity(state, qd, dt, solver.v_hat, apply_transport=False)
-        np.testing.assert_array_equal(solver.v_hat.numpy(), expected)
+    """The free roots' gyroscopic update, on every test device."""
 
 
 for _device in get_test_devices():

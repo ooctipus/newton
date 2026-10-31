@@ -260,7 +260,7 @@ def _matrix_free_solver(model, *, pins=None, **options):
         "mf_max_constraints": 32,
     }
     settings.update(options)
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", "evaluator": "ordinary", **(pins or {})}):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, {"storage": "dense", **(pins or {})}):
         return SolverFeatherPGS(model, **settings)
 
 

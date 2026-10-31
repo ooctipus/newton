@@ -13,8 +13,8 @@ from newton._src.solvers.feather_pgs import kernels
 
 
 class TestGeneralizedOperations(unittest.TestCase):
-    def test_kernels_wrap_indexed_functions(self):
-        """Every kernel form and its indexed function exist without generated source."""
+    def test_laws_are_indexed_functions(self):
+        """Every generalized law is an indexed function without generated source."""
         for name in (
             "apply_free_root_velocity_corrections",
             "remove_free_root_transport_from_qdd",
@@ -22,7 +22,6 @@ class TestGeneralizedOperations(unittest.TestCase):
             "update_qdd_from_velocity",
         ):
             with self.subTest(name=name):
-                self.assertIsInstance(getattr(kernels, name), wp.Kernel)
                 self.assertIsInstance(getattr(kernels, "_light_" + name), wp.Function)
 
     def test_permuted_physical_indices_and_prescribed_dofs(self):

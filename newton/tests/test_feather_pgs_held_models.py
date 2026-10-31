@@ -80,7 +80,6 @@ class TestHeldModels(unittest.TestCase):
                 self.assertEqual(sorted(group_to_art.tolist()), [0, 1, 2])
                 self.assertEqual(solver.forest.art_group_idx.numpy()[group_to_art].tolist(), [0, 1, 2])
                 held = solver.factor.held
-                self.assertIsNotNone(held, solver.factor.held_reason)
                 self.assertEqual(sorted(group.group_count for group in held.groups), [1, 2])
                 alone = newton.ModelBuilder()
                 _star(alone, 2, 2.0)
@@ -99,7 +98,6 @@ class TestHeldModels(unittest.TestCase):
                     [builder.add_joint_fixed(-1, body, parent_xform=wp.transform(wp.vec3(2.0, 0.0, 1.0)))]
                 )
                 solver, model, state = _fall(builder, device)
-                self.assertIsNotNone(solver.factor.held, solver.factor.held_reason)
                 np.testing.assert_allclose(state.body_q.numpy()[body, :3], [2.0, 0.0, 1.0], atol=1e-6)
                 frames = model.joint_X_p.numpy()
                 frames[2, 0] = 3.0
@@ -143,7 +141,6 @@ class TestHeldModels(unittest.TestCase):
                 outside = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(1.0, 0.0, 1.0)))
                 builder.add_joint_fixed(-1, outside, parent_xform=wp.transform(wp.vec3(1.0, 0.0, 1.0)))
                 solver, _, state = _fall(builder, device, steps=4)
-                self.assertIsNotNone(solver.factor.held, solver.factor.held_reason)
                 self.assertEqual([group.layout.dofs for group in solver.factor.held.groups], [0])
                 np.testing.assert_allclose(state.body_q.numpy()[fixed, :3], [0.0, 0.0, 1.0], atol=1e-6)
 
@@ -154,8 +151,7 @@ class TestHeldModels(unittest.TestCase):
                 builder = newton.ModelBuilder()
                 _chain(builder, 2, 0.0)
                 builder.add_particle(pos=(0.0, 2.0, 3.0), vel=(0.0, 0.0, 0.0), mass=1.0)
-                solver, _, state = _fall(builder, device)
-                self.assertIsNotNone(solver.factor.held, solver.factor.held_reason)
+                _solver, _, state = _fall(builder, device)
                 self.assertLess(state.particle_q.numpy()[0, 2], 3.0 - 0.1)
                 alone = newton.ModelBuilder()
                 _chain(alone, 2, 0.0)
@@ -169,8 +165,7 @@ class TestHeldModels(unittest.TestCase):
                 arms = [newton.ModelBuilder(), newton.ModelBuilder()]
                 for builder in arms:
                     _chain(builder, 3, 0.0)
-                solver, _, debug = _fall(arms[0], device, pgs_debug=True)
-                self.assertIsNotNone(solver.factor.held, solver.factor.held_reason)
+                _solver, _, debug = _fall(arms[0], device, pgs_debug=True)
                 _, _, plain = _fall(arms[1], device)
                 np.testing.assert_array_equal(debug.joint_q.numpy(), plain.joint_q.numpy())
 
@@ -191,8 +186,7 @@ class TestHeldModels(unittest.TestCase):
                         root = builder.add_joint_free(body)
                         tail = builder.add_joint_free(tip, parent=body)
                     builder.add_articulation([root, tail])
-                    solver, model, state = _fall(builder, device, steps=4)
-                    self.assertIsNotNone(solver.factor.held, solver.factor.held_reason)
+                    _solver, model, state = _fall(builder, device, steps=4)
                     # Nothing acts on the tree: every body stays where its coordinates put it.
                     rest = model.state()
                     newton.eval_fk(model, rest.joint_q, rest.joint_qd, rest)

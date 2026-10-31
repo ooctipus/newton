@@ -210,8 +210,8 @@ def _model(offset, scale, error, device="cuda:0"):
 def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_beta=0.0):
     model = _model(offset, scale, error)
     model.joint_velocity_limit.assign(np.tile([0.4, 0.25, 0.2], 2).astype(np.float32))
-    # The reference arm runs ordinary dynamics; both keep one buffer set, so their rows compare after a step.
-    pins = {"double_buffer": False, **({} if enabled else {"storage": "dense", "evaluator": "ordinary"})}
+    # The reference arm runs dense storage.
+    pins = {} if enabled else {"storage": "dense"}
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,

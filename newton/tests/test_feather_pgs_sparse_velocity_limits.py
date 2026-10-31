@@ -292,10 +292,9 @@ def _solve_data(sign, *, contact, iterations, omega):
 
 
 def _assert_ordinary_route(test, case):
-    """Require the reference arm to run ordinary factors, dynamics and matrix-free sweeps."""
+    """Require the reference arm to run dense factors and matrix-free sweeps."""
     selected = case[1].get_path_selection()
     test.assertEqual(selected["sparse_mass_matrix"], "off")
-    test.assertEqual(selected["cached_dynamics"], "off")
     test.assertIsNone(selected["routes"]["sweep"]["tiers"])
 
 
@@ -312,8 +311,7 @@ def _case(
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
     limits.reshape(2, -1)[:, -1] = np.inf
     model.joint_velocity_limit.assign(limits)
-    # Both arms keep one buffer set, so the rows compared after a step are still there.
-    pins = {"double_buffer": False, **({} if enabled else {"storage": "dense", "evaluator": "ordinary"})}
+    pins = {} if enabled else {"storage": "dense"}
     with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
         solver = SolverFeatherPGS(
             model,

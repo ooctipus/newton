@@ -13,14 +13,12 @@ from newton._src.solvers.feather_pgs.tree_factor import TreeFactor
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
-# FK/ID reuse and the parallel inertia refresh belong to the ordinary dense
-# route; keep sparse factors and cache owners off under either friction law.
-# The ordinary route: dense storage and ordinary dynamics (test-only route pins).
-ORDINARY_PINS = {"storage": "dense", "evaluator": "ordinary"}
+# FK/ID reuse belongs to the dense size groups: keep sparse factors off under either friction law.
+DENSE_PINS = {"storage": "dense"}
 
 
-def _ordinary_solver(model, **options):
-    with mock.patch.dict(SolverFeatherPGS._route_pins, ORDINARY_PINS):
+def _dense_solver(model, **options):
+    with mock.patch.dict(SolverFeatherPGS._route_pins, DENSE_PINS):
         return SolverFeatherPGS(model, **options)
 
 
@@ -233,34 +231,13 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
             for name in cached:
                 np.testing.assert_allclose(cached[name], recomputed[name], rtol=0.0, atol=2.0e-6, err_msg=name)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free PGS requires CUDA")
-    def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):
-        """Keep matrix-free dynamics publication on its validated zero-copy path."""
-        model = _build_floating_model("cuda:0")
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2)
-
-        self.assertTrue(solver.factor.fk_id_cache_enabled)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
-    def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
-        """Keep the unconditional FK/ID launch output valid without reuse."""
-        model = _build_model("cuda:0", num_worlds=1, ground=False)
-        solver = _ordinary_solver(model, enable_joint_velocity_limits=True)
-        self.assertFalse(solver.factor.fk_id_cache_enabled)
-        self.assertEqual(solver.factor.fk_id_cache_valid.shape[0], model.articulation_count)
-
-        state_in = _make_initial_state(model)
-        state_out = model.state()
-        solver.step(state_in, state_out, model.control(), None, DT)
-        wp.synchronize()
-
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
     def test_cached_fk_id_matches_forced_recomputation(self):
         """Match forced recomputation across cached fixed-base steps."""
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_model("cuda:0", ground=False)
-            solver = _ordinary_solver(model, update_mass_matrix_interval=2)
+            solver = _dense_solver(model, update_mass_matrix_interval=2)
             trajectory, mass_masks = _run_state_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -279,7 +256,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         trajectories = []
         for invalidate_fk_each_step in (False, True):
             model = _build_floating_model("cuda:0")
-            solver = _ordinary_solver(model, update_mass_matrix_interval=2)
+            solver = _dense_solver(model, update_mass_matrix_interval=2)
             trajectory, mass_masks = _run_floating_trajectory(
                 model, solver, num_steps=20, invalidate_fk_each_step=invalidate_fk_each_step
             )
@@ -297,8 +274,8 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         """Match captured parallel dynamics against eager fused execution."""
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        graph_solver = _ordinary_solver(graph_model, update_mass_matrix_interval=1)
-        eager_solver = _ordinary_solver(eager_model, update_mass_matrix_interval=1)
+        graph_solver = _dense_solver(graph_model, update_mass_matrix_interval=1)
+        eager_solver = _dense_solver(eager_model, update_mass_matrix_interval=1)
         graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
         eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()
@@ -428,7 +405,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         self.assertEqual(solver.factor.mass_update_requested.numpy().tolist(), [0, 0])
 
     def test_held_tree_route_consumes_mass_requests(self):
-        """Refresh the held tree once and consume every request, as the ordinary route's tail does."""
+        """Refresh the held tree once and consume every request."""
         for force, step, requested, expected in (
             (True, 1, [0, 0, 0], [1, 1, 1]),
             (False, 0, [0, 0, 0], [1, 1, 1]),
@@ -458,13 +435,10 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         local = object()
         residual = object()
         dynamics = object()
-        memset = object()
-        size = object()
         solver._local_internal_stream = local
         solver._local_residual_stream = residual
         solver._local_pair_stream = local
-        solver.factor = SimpleNamespace(dynamics_stream=dynamics, size_streams={3: local, 6: size})
-        solver._memset_stream = memset
+        solver.factor = SimpleNamespace(dynamics_stream=dynamics)
         solver.model = mock.Mock(device=object())
         with (
             mock.patch.object(wp, "synchronize_stream", side_effect=AssertionError("finalized handle")),
@@ -481,77 +455,12 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver._local_residual_stream = None
         solver._local_pair_stream = None
         solver.factor.dynamics_stream = None
-        solver._memset_stream = None
-        solver.factor.size_streams = {}
         solver.model = None
 
     def test_mass_refresh_has_no_obsolete_limit_count_state(self):
         solver = SolverFeatherPGS(_build_model(wp.get_device(), ground=False))
         for attribute in ("aug_limit_counts", "aug_prev_limit_counts", "limit_change_mask"):
             self.assertFalse(hasattr(solver, attribute), f"obsolete mass-refresh state {attribute!r} was restored")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "the warp schedule decides only on CUDA")
-    def test_crba_fill_gives_each_mass_entry_one_writer(self):
-        """Repeated CRBA fills of a free-rooted tree agree bitwise and are exactly symmetric.
-
-        Columns of one multi-coordinate joint share that joint's off-diagonal pairs. Per world a free root and
-        three revolute links (9 coordinates) put the root's six columns across a warp boundary in some of the
-        64 worlds; with two writers per pair, the stored values and the symmetry followed the warp schedule.
-        """
-        from newton._src.solvers.feather_pgs import field_group  # noqa: PLC0415
-        from newton._src.solvers.feather_pgs.spatial_laws import inertia_record  # noqa: PLC0415
-        from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, crba_fill  # noqa: PLC0415
-        from newton._src.solvers.feather_pgs.tree_plan import TreePlan  # noqa: PLC0415
-        from newton.tests.test_feather_pgs_sparse_mass_matrix import _random_inertia  # noqa: PLC0415
-
-        device = wp.get_device("cuda:0")
-        template = newton.ModelBuilder()
-        parent = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
-        joints = [template.add_joint_free(parent)]
-        for _ in range(3):
-            child = template.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.01))
-            joints.append(template.add_joint_revolute(parent=parent, child=child, axis=newton.Axis.Y))
-            parent = child
-        template.add_articulation(joints)
-        builder = newton.ModelBuilder()
-        builder.replicate(template, 64)
-        model = builder.finalize(device=device)
-        dofs = model.joint_dof_count // model.articulation_count
-        rng = np.random.default_rng(1)
-        records = np.asarray([_random_inertia(rng)[0] for _ in range(model.body_count)], dtype=np.float32)
-        plan = TreePlan.build(model.joint_ancestor.numpy())
-        dynamics = field_group.upload(
-            DynamicsData,
-            device,
-            articulation_start=model.articulation_start,
-            articulation_dof_start=wp.array(
-                model.joint_qd_start.numpy()[model.articulation_start.numpy()[:-1]], dtype=int, device=device
-            ),
-            mass_update_mask=wp.ones(model.articulation_count, dtype=int, device=device),
-            joint_child=model.joint_child,
-            joint_qd_start=model.joint_qd_start,
-            joint_dof_dim=model.joint_dof_dim,
-            joint_S_s=wp.array(rng.standard_normal((model.joint_dof_count, 6)), dtype=wp.spatial_vector, device=device),
-            dfs_order=plan.dfs_order,
-            dfs_position=plan.dfs_position,
-            dfs_end=plan.dfs_end,
-        )
-        inputs = [
-            dynamics,
-            wp.array(records, dtype=inertia_record, device=device),
-            wp.array(np.arange(model.articulation_count), dtype=int, device=device),
-            dofs,
-        ]
-        H = wp.zeros((model.articulation_count, dofs, dofs), dtype=float, device=device)
-        first = None
-        for _ in range(64):
-            H.zero_()
-            wp.launch(crba_fill, dim=H.size // dofs, inputs=inputs, outputs=[H], device=device, block_dim=128)
-            values = H.numpy()
-            np.testing.assert_array_equal(values, np.swapaxes(values, 1, 2))
-            if first is None:
-                first = values
-            np.testing.assert_array_equal(values, first)
 
 
 if __name__ == "__main__":

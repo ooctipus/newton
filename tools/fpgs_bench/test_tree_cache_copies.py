@@ -143,7 +143,6 @@ class TestTreeCacheCopies(unittest.TestCase):
             mask = wp.array([False] * 3, dtype=wp.bool, device=model.device)
             wp.synchronize()
             with wp.ScopedCapture(device=model.device) as capture:
-                solver.seed_double_buffer_events()
                 solver.reset(state, world_mask=mask)
                 for _ in range(4):
                     solver.step(state, output, control, contacts, DT)

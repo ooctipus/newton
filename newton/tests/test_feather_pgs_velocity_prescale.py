@@ -639,7 +639,6 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         with wp.ScopedCapture(device=device) as capture:
             # The uncaptured steps recorded each buffer slot's memset event outside the graph, and a
             # captured wait on such an event fails (CUDA error 905). Seed both slots, as every capture must.
-            solver.seed_double_buffer_events()
             env_step()
         self.assertEqual(len(launches), 2)
         self.assertEqual(len(predicted), 2)

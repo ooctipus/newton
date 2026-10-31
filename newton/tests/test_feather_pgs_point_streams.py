@@ -341,8 +341,6 @@ def _dense_build_calls():
     from newton._src.solvers.feather_pgs import response_builds_dense  # noqa: PLC0415
 
     for name in (
-        "factor_articulations_kernel",
-        "factor_coordinates_kernel",
         "response_rows_kernel",
         "response_lanes_kernel",
         "response_diagonal_kernel",

@@ -30,6 +30,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
+from newton.tests.feather_pgs_law_harness import recomputing
 
 DT = 1.0 / 240.0
 KINEMATIC = int(newton.BodyFlags.KINEMATIC)
@@ -50,9 +51,9 @@ def _set_flag(model, body, flag):
 
 
 def _solver(model, beta, cached, **options):
-    """A default solver under one friction law; ``cached="off"`` pins ordinary dynamics."""
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached == "off" else {}):
-        return SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=beta, **options)
+    """A default solver under one friction law; ``cached="off"`` recomputes its state from every step's input."""
+    solver = SolverFeatherPGS(model, angular_damping=0.0, friction_anchor_beta=beta, **options)
+    return recomputing(solver) if cached == "off" else solver
 
 
 def _toggle_scene():
@@ -154,13 +155,7 @@ def _sparse_case(beta, cached, *, kinematic_body=None, **options):
     model = sparse_scene.branched_model()
     if kinematic_body is not None:
         _set_flag(model, kinematic_body, KINEMATIC)
-    solver = sparse_scene.make_solver(
-        model,
-        True,
-        pins={"evaluator": "ordinary"} if cached == "off" else None,
-        friction_anchor_beta=beta,
-        **options,
-    )
+    solver = sparse_scene.make_solver(model, cached != "off", friction_anchor_beta=beta, **options)
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
@@ -520,10 +515,9 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     model, box, probe = _pair_scene()
                     solver = _solver(model, beta, cached)
                     owner = solver.factor.held
-                    self.assertEqual(owner is not None, cached == "auto")
                     _Rollout(model, solver, probe, wrench).run(5)
                     before = _solver_snapshot(solver)
-                    if owner is not None:
+                    if cached == "auto":
                         # The held tree's caches are valid, so an invalidation would show.
                         self.assertTrue(before["fk_id_cache_valid"].all())
                     _set_flag(model, box, DYNAMIC)

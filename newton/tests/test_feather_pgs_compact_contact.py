@@ -992,7 +992,6 @@ class TestCompactContact(unittest.TestCase):
                 current, following = states[index]
                 solver.reset(current)
                 with wp.ScopedCapture(device=device) as capture:
-                    solver.seed_double_buffer_events()
                     solver.step(current, following, controls[index], contacts[index], 1 / 240)
                     solver.step(following, current, controls[index], contacts[index], 1 / 240)
                 graphs.append(capture.graph)

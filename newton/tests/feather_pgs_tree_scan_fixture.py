@@ -5,14 +5,12 @@
 
 Tree shapes, every held-tree scan configuration compiled as a stand-alone
 native on a held tree's scratch layout (to compare with a float64 reference or
-time with one launch), articulated models of the shapes, and the general
-route's passes on a solver's own arrays (:class:`GeneralRoute`). It defines no
+time with one launch) and articulated models of the shapes. It defines no
 tests.
 """
 
 import functools
 from dataclasses import dataclass
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -467,123 +465,3 @@ def articulated_model(shapes, worlds: int, device, seed: int = 0):
     model.joint_q.assign(q)
     model.joint_qd.assign(rng.uniform(-1.0, 1.0, model.joint_dof_count).astype(np.float32))
     return model
-
-
-@dataclass
-class GeneralRoute:
-    """A model's general-route passes on a solver's own arrays and binding (``factor.ordinary.dynamics``), with random
-    external wrenches, generalized forces, and passive springs and dampers on the one-coordinate axes."""
-
-    model: object
-    solver: object
-    state: object
-    control: object
-    aug: object
-    """The augmented state: the solver's tree factor, which holds the step's state-derived dynamics."""
-    size_groups: list
-    """Per coordinate count: ``(size, group_to_art)``, the articulations of that size."""
-    H: dict
-    """Per coordinate count: the joint-space inertias of its articulations."""
-
-
-def general_route(model, seed: int = 3) -> GeneralRoute:
-    """The general route of ``model`` (see :class:`GeneralRoute`)."""
-    import newton  # noqa: PLC0415
-    from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
-
-    device = model.device
-    with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-        solver = SolverFeatherPGS(model)
-    state, control = model.state(), model.control()
-    rng = np.random.default_rng(seed)
-    if model.body_count:
-        state.body_f.assign(rng.standard_normal((model.body_count, 6)).astype(np.float32))
-    dofs = model.joint_dof_count
-    control.joint_f.assign(rng.standard_normal(dofs).astype(np.float32))
-    dof_joint = np.repeat(np.arange(model.joint_count), np.diff(model.joint_qd_start.numpy()))
-    axes = np.isin(
-        model.joint_type.numpy()[dof_joint], (int(newton.JointType.REVOLUTE), int(newton.JointType.PRISMATIC))
-    )
-    for name, low, high in (
-        ("passive_spring_stiffness", 0.5, 2.0),
-        ("passive_spring_ref", -0.5, 0.5),
-        ("passive_joint_damping", 0.1, 0.5),
-    ):
-        values = np.where(axes, rng.uniform(low, high, dofs), 0.0).astype(np.float32)
-        setattr(solver.factor, name, wp.array(values, dtype=float, device=device))
-    solver.factor.mass_update_mask.fill_(1)
-    starts = model.articulation_start.numpy()
-    counts = np.diff(model.joint_qd_start.numpy()[starts])
-    sizes = [int(size) for size in np.unique(counts)]
-    return GeneralRoute(
-        model,
-        solver,
-        state,
-        control,
-        solver.factor,
-        [(size, wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device)) for size in sizes],
-        {size: wp.zeros((int(np.sum(counts == size)), size, size), dtype=float, device=device) for size in sizes},
-    )
-
-
-GENERAL_PASSES = ("fk_id", "tau", "composite_inertia", "crba")
-"""The general route's passes, in step order."""
-
-
-def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None, **values):
-    """One general-route pass as a launch callable, bound once to the solver's binding of the route's state
-    (``values``: its switches), with the solver's block sizes or ``block_dim``."""
-    from newton._src.solvers.feather_pgs import tree_passes  # noqa: PLC0415
-
-    m, solver, device = route.model, route.solver, route.model.device
-    dynamics = solver.factor.ordinary.dynamics(route.state, route.control, **values)
-    kernels = {
-        "fk_id": (tree_passes.fk_id, tree_passes.SERIAL_BLOCK_DIM),
-        "tau": (tree_passes.inverse_dynamics_tau, tree_passes.SERIAL_BLOCK_DIM),
-        "composite_inertia": (tree_passes.composite_inertia, tree_passes.SERIAL_BLOCK_DIM),
-    }
-    if name in kernels:
-        kernel, solver_block = kernels[name]
-        return functools.partial(
-            wp.launch,
-            kernel,
-            m.articulation_count,
-            inputs=[dynamics],
-            block_dim=block_dim or solver_block,
-            device=device,
-        )
-    if name != "crba":
-        raise KeyError(name)
-    launches = [
-        functools.partial(
-            wp.launch,
-            tree_passes.crba_fill,
-            group_to_art.size * size,
-            inputs=[dynamics, solver.factor.body_I_c, group_to_art, size],
-            outputs=[route.H[size]],
-            block_dim=block_dim or 128,
-            device=device,
-        )
-        for size, group_to_art in route.size_groups
-    ]
-    return lambda: [launch() for launch in launches]
-
-
-def run_pass(route: GeneralRoute, name: str, **values):
-    """Launch one general-route pass (:func:`pass_launch`)."""
-    pass_launch(route, name, **values)()
-
-
-def run_inputs(route: GeneralRoute, name: str):
-    """Run the passes whose outputs ``name`` reads, with every inertia record."""
-    for previous in GENERAL_PASSES[: GENERAL_PASSES.index(name)]:
-        run_pass(route, previous, write_inertia_records=1)
-
-
-def joint_space_inertias(route: GeneralRoute) -> np.ndarray:
-    """The route's joint-space inertias by articulation, zero-padded to the widest (Newton's mass-matrix layout)."""
-    width = max(size for size, _ in route.size_groups)
-    H = np.zeros((route.model.articulation_count, width, width), dtype=np.float32)
-    for size, group_to_art in route.size_groups:
-        H[group_to_art.numpy(), :size, :size] = route.H[size].numpy()
-    return H

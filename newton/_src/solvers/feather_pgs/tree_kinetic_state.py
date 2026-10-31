@@ -22,6 +22,7 @@ from .spatial_laws import (
     SPATIAL,
     body_wrench,
     inertia_at,
+    inertia_matrix,
     inertia_record,
     joint_frame_pose,
     joint_motion,
@@ -30,7 +31,6 @@ from .spatial_laws import (
     point_velocity,
 )
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
-from .tree_passes import body_dynamics
 from .tree_plan import TreePlan
 
 HELD_PLAN = (
@@ -202,6 +202,52 @@ _DIFFERENT_MOTION_SOURCE = r"""
     return different;
 #endif
 """
+
+
+@wp.func
+def body_dynamics(
+    body: int,
+    articulation: int,
+    pose: wp.transform,
+    pose_com: wp.transform,
+    origin: wp.vec3,
+    velocity: wp.spatial_vector,
+    acceleration: wp.spatial_vector,
+    mass: float,
+    inertia: wp.mat33,
+    com: wp.vec3,
+    gravity: wp.vec3,
+    write_matrix: int,
+    write_record: int,
+    publish_twist: int,
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array[inertia_record],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Store a body's inverse-dynamics wrench about the origin (:func:`.spatial_laws.body_wrench`); optionally
+    its inertia there and its COM twist.
+
+    ``write_matrix`` stores the dense spatial inertia, ``write_record`` the inertia record. A body outside an
+    articulation (``articulation < 0``) only publishes its COM twist.
+    """
+    if articulation < 0:
+        if publish_twist != 0:
+            linear = point_velocity(velocity, wp.transform_point(pose, com))
+            body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
+        return
+    offset = wp.transform_get_translation(pose_com) - origin
+    rotation = wp.transform_get_rotation(pose_com)
+    if write_matrix != 0 or write_record != 0:
+        body_mass, moment, rotational = inertia_at(mass, inertia, rotation, offset)
+        if write_matrix != 0:
+            body_I_s[body] = inertia_matrix(body_mass, moment, rotational)
+        if write_record != 0:
+            body_inertia_terms[body] = pack_inertia(body_mass, moment, rotational)
+    body_f_s[body] = body_wrench(mass, rotation, inertia, offset, velocity, acceleration, gravity)
+    if publish_twist != 0:
+        linear = point_velocity(velocity, wp.transform_point(pose, com) - origin)
+        body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
 
 
 @functools.cache
@@ -560,7 +606,7 @@ $CLOCK0#if defined(__CUDA_ARCH__)
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
         // A kinematic body takes no external wrench, as in ordinary dynamics
-        // (tree_passes.net_wrench): its wrench must not reach its ancestors.
+        // its wrench must not reach its ancestors.
         auto input=f.body_f.data[body];
         if((f.body_flags.data[body]&$KINEMATIC_FLAG)!=0){for(int k=0;k<6;++k)input[k]=0.0f;}
         $SHIFT

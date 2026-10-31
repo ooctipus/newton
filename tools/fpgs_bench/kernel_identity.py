@@ -152,7 +152,6 @@ def factory_calls():
         response_builds_dense,
         sweep_routes,
         sweep_routes_tiers,
-        tree_ordinary,
     )
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
@@ -187,16 +186,7 @@ def factory_calls():
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
 
     dense = "response_builds_dense."
-    tiles = _unwrapped(response_builds_dense.factor_tiles_kernel)
     yield dense + "dense_factor_kernel", _unwrapped(response_builds_dense.dense_factor_kernel), (0,), {}
-    for size in (6, 9, 16):
-        yield dense + "factor_tiles_kernel", tiles, (size,), {}
-        yield (
-            "tree_ordinary.triangular_solve_kernel",
-            _unwrapped(tree_ordinary.triangular_solve_kernel),
-            (size, ARCH),
-            {},
-        )
 
 
 def _schedules(layout, chain):

@@ -14,6 +14,7 @@ import warp as wp
 
 import newton
 from newton.tests import feather_pgs_sparse_scene as split
+from newton.tests.feather_pgs_law_harness import recomputing
 from tools.fpgs_bench import test_tree_prescaled_state as prescaled
 from tools.fpgs_bench.test_tree_locked_root import locked_roots
 
@@ -53,13 +54,8 @@ def mimic_model(*, floating=False, prismatic=False, locked=False, device="cuda:0
 
 def solver_for(model, cached, interval=2):
     """Change only cached dynamics while retaining native mimic and velocity rows."""
-    return split.make_solver(
-        model,
-        True,
-        pins=None if cached else {"evaluator": "ordinary"},
-        enable_joint_velocity_limits=True,
-        update_mass_matrix_interval=interval,
-    )
+    solver = split.make_solver(model, True, enable_joint_velocity_limits=True, update_mass_matrix_interval=interval)
+    return solver if cached else recomputing(solver)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
@@ -189,8 +185,7 @@ class TestTreeMimicCache(unittest.TestCase):
             warnings.simplefilter("always")
             solver = solver_for(model, True)
         self.assertTrue(any("couples a DOF to itself" in str(m.message) for m in messages))
-        self.assertIsNone(solver.factor.held)
-        self.assertFalse(solver.factor.fk_id_cache_enabled)
+        self.assertIsNotNone(solver.factor.held)
 
 
 if __name__ == "__main__":

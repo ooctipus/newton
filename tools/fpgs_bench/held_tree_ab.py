@@ -394,7 +394,7 @@ class Recorder:
                     self.poison_heap()
                     with _heavy_chains() if chains else contextlib.nullcontext():
                         try:
-                            model, solver, _, operator, owner, _ = module.fixture(floating, self.device)
+                            model, solver, operator, owner, _ = module.fixture(floating, self.device)
                         except ValueError as error:
                             print(f"skipped {tag}: {error}", flush=True)
                             continue
@@ -413,9 +413,9 @@ class Recorder:
                 continue
             self.poison_heap()
             model = _build(wp.get_device(self.device), worlds=self.worlds, **options)
-            # Every scene stays on tree groups (a scalar-branch group holds no tree layout or cache data), and the
-            # solver builds no owner of its own: the scene builds it below.
-            with unittest.mock.patch.dict(SolverFeatherPGS._route_pins, {"star": "held", "evaluator": "ordinary"}):
+            # Every scene stays on tree groups (a scalar-branch group holds no tree layout or cache data); the owner
+            # under test is the one the scene builds below.
+            with unittest.mock.patch.dict(SolverFeatherPGS._route_pins, {"star": "held"}):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (

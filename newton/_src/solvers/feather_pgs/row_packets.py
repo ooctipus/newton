@@ -553,7 +553,7 @@ class LocalRowPackets:
         )
 
     def prepare_prefix(self, state_in, dt):
-        """Bind current coefficients/state and the current double-buffered row owners."""
+        """Bind current coefficients/state and the current row owners."""
         solver = self.solver
         # Sticky status is allocated after tiled-kernel construction.
         self.queue.status = solver.placement.constraint_capacity_status

@@ -12,31 +12,6 @@ import newton
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
-def _excess(actual, desired, rtol=0.0):
-    """Largest ``|actual - desired| - rtol * |desired|``: within ``atol`` exactly when assert_allclose passes."""
-    actual, desired = np.asarray(actual, np.float64), np.asarray(desired, np.float64)
-    return max(float(np.max(np.abs(actual - desired) - rtol * np.abs(desired))), 0.0)
-
-
-def _assert_switch_within(test, label, switch, again, tolerance):
-    """Bound an A/B difference by the tolerance plus the default arm's own run-to-run (A/A) spread.
-
-    The A/A spread must itself stay within the tolerance: a larger one means the rollout's
-    nondeterminism, not the switch, decides the comparison.
-    """
-    test.assertLessEqual(
-        again,
-        tolerance,
-        f"{label}: the default arm differs from itself by {again:.3g} (> {tolerance:.3g}); "
-        "the rollout cannot resolve the switch",
-    )
-    test.assertLessEqual(
-        switch,
-        tolerance + again,
-        f"{label}: the switch changes it by {switch:.3g}, above {tolerance:.3g} plus the A/A spread {again:.3g}",
-    )
-
-
 class TestDepthFirstIntervals(unittest.TestCase):
     def test_breadth_first_input_is_reordered(self):
         """Legs added breadth-first still get one contiguous interval per subtree."""

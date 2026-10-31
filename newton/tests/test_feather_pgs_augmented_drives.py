@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-import itertools
 import unittest
 from unittest.mock import patch
 
@@ -10,13 +9,7 @@ import warp as wp
 
 import newton
 from newton._src.sim.enums import JointType
-from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs.kernels import (
-    eval_rigid_tau_and_augmented_drives,
-)
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
-from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
-from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
 def _mixed_target_model(coord_layout, device):
@@ -53,50 +46,38 @@ def _mixed_target_model(coord_layout, device):
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
     def test_mixed_joint_target_layout_trajectories(self):
-        """Match public solver trajectories across both target layouts, on the held tree and on ordinary dynamics."""
-        for parallel_streams, evaluator in itertools.product((False, True), ("held", "ordinary")):
-            with self.subTest(parallel_streams=parallel_streams, evaluator=evaluator):
-                pins = {"evaluator": "ordinary"} if evaluator == "ordinary" else {}
-                trajectories = []
-                for coord_layout in (False, True):
-                    model, state, control, _joints, dofs, coords, targets = _mixed_target_model(
-                        coord_layout, wp.get_device()
-                    )
-                    with patch.dict(newton.solvers.SolverFeatherPGS._route_pins, pins):
-                        solver = newton.solvers.SolverFeatherPGS(
-                            model,
-                            enable_joint_limits=False,
-                            dense_max_constraints=16,
-                            mf_max_constraints=16,
-                            pgs_iterations=8,
-                        )
-                    self.assertEqual(solver.factor.held is not None, evaluator == "held")
-                    if evaluator == "ordinary":
-                        # Ordinary dynamics evaluate the drives with the joint forces.
-                        self.assertFalse(solver.factor.parallel_drives)
-                    initial_qd = state.joint_qd.numpy()[dofs].copy()
-                    position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
-                    following = model.state()
-                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-                    history = []
-                    for step in range(3):
-                        state.clear_forces()
-                        solver.step(state, following, control, None, 0.01)
-                        state, following = following, state
-                        q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
-                        if step == 0:
-                            self.assertTrue(np.all((qd[dofs] - initial_qd) * position_error > 0.0))
-                        history.append(np.concatenate((q, qd)))
-                    trajectories.append(history)
-                np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=2e-6)
+        """Match public solver trajectories across both target layouts."""
+        trajectories = []
+        for coord_layout in (False, True):
+            model, state, control, _joints, dofs, coords, targets = _mixed_target_model(coord_layout, wp.get_device())
+            solver = newton.solvers.SolverFeatherPGS(
+                model,
+                enable_joint_limits=False,
+                dense_max_constraints=16,
+                mf_max_constraints=16,
+                pgs_iterations=8,
+            )
+            initial_qd = state.joint_qd.numpy()[dofs].copy()
+            position_error = control.joint_target_q.numpy()[targets] - state.joint_q.numpy()[coords]
+            following = model.state()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            history = []
+            for step in range(3):
+                state.clear_forces()
+                solver.step(state, following, control, None, 0.01)
+                state, following = following, state
+                q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
+                if step == 0:
+                    self.assertTrue(np.all((qd[dofs] - initial_qd) * position_error > 0.0))
+                history.append(np.concatenate((q, qd)))
+            trajectories.append(history)
+        np.testing.assert_allclose(trajectories[0], trajectories[1], rtol=0.0, atol=2e-6)
 
     def test_mixed_joint_position_target_layouts(self):
         """Keep distinct world targets aligned after free and ball coordinates."""
         device, dt = wp.get_device(), 0.01
         for coord_layout in (False, True):
             model, state, control, joints, dofs, coords, targets = _mixed_target_model(coord_layout, device)
-            starts = model.joint_qd_start.numpy()
-            counts = wp.array(np.diff(starts), dtype=int, device=device)
             max_dofs = 6
             row_count = model.articulation_count * max_dofs
             expected = np.zeros(model.joint_dof_count)
@@ -105,207 +86,47 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 - state.joint_q.numpy()[coords]
                 - dt * state.joint_qd.numpy()[dofs]
             ) + 3.0 * (control.joint_target_qd.numpy()[dofs] - state.joint_qd.numpy()[dofs])
-            for path in ("combined", "per_dof"):
-                with self.subTest(coord_layout=coord_layout, path=path):
-                    row_counts = wp.zeros(model.articulation_count, dtype=int, device=device)
-                    row_indices = wp.zeros(row_count, dtype=int, device=device)
-                    row_K = wp.zeros(row_count, dtype=float, device=device)
-                    tau = wp.zeros(model.joint_dof_count, dtype=float, device=device)
-                    gains = [
+            with self.subTest(coord_layout=coord_layout):
+                row_K = wp.zeros(row_count, dtype=float, device=device)
+                tau = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+                rows = np.full(model.joint_dof_count, -1, dtype=np.int32)
+                q_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+                target_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
+                rows[dofs], q_indices[dofs] = joints * max_dofs, coords
+                target_indices[dofs] = targets
+                wp.launch(
+                    prepare_augmented_drives,
+                    dim=model.joint_dof_count,
+                    inputs=[
+                        wp.array(rows, dtype=int, device=device),
+                        wp.array(q_indices, dtype=int, device=device),
+                        wp.array(target_indices, dtype=int, device=device),
+                        state.joint_q,
+                        state.joint_qd,
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
                         control.joint_target_qd,
                         model.joint_effort_limit,
-                    ]
-                    if path == "per_dof":
-                        rows = np.full(model.joint_dof_count, -1, dtype=np.int32)
-                        q_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
-                        target_indices = np.zeros(model.joint_dof_count, dtype=np.int32)
-                        rows[dofs], q_indices[dofs] = joints * max_dofs, coords
-                        target_indices[dofs] = targets
-                        wp.launch(
-                            prepare_augmented_drives,
-                            dim=model.joint_dof_count,
-                            inputs=[
-                                wp.array(rows, dtype=int, device=device),
-                                wp.array(q_indices, dtype=int, device=device),
-                                wp.array(target_indices, dtype=int, device=device),
-                                state.joint_q,
-                                state.joint_qd,
-                                *gains,
-                                wp.zeros(model.joint_dof_count, dtype=float, device=device),
-                                dt,
-                            ],
-                            outputs=[row_K, tau],
-                            device=device,
-                        )
-                    else:
-                        zeros = wp.zeros(model.joint_dof_count, dtype=float, device=device)
-                        body_forces = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
-                        dynamics = field_group.upload(
-                            DynamicsData,
-                            device,
-                            articulation_start=model.articulation_start,
-                            articulation_joint_end=wp.array(
-                                model.articulation_start.numpy()[1:], dtype=int, device=device
-                            ),
-                            joint_type=model.joint_type,
-                            joint_parent=model.joint_parent,
-                            joint_child=model.joint_child,
-                            joint_articulation=model.joint_articulation,
-                            joint_qd_start=model.joint_qd_start,
-                            joint_q_start=model.joint_q_start,
-                            joint_dof_dim=model.joint_dof_dim,
-                            joint_f=control.joint_f,
-                            joint_q=state.joint_q,
-                            joint_qd=state.joint_qd,
-                            spring_stiffness=zeros,
-                            spring_reference=zeros,
-                            damping=zeros,
-                            joint_S_s=wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device),
-                            body_f_s=body_forces,
-                            body_f=body_forces,
-                            body_flags=model.body_flags,
-                            body_q=state.body_q,
-                            body_com=model.body_com,
-                            articulation_origin=wp.zeros(model.articulation_count, dtype=wp.vec3, device=device),
-                            body_ft_s=wp.zeros_like(body_forces),
-                            tau=tau,
-                            row_K=row_K,
-                            up_flags=wp.array(
-                                TreePlan.build(model.joint_ancestor.numpy()).up_flags, dtype=int, device=device
-                            ),
-                        )
-                        wp.launch(
-                            eval_rigid_tau_and_augmented_drives,
-                            dim=model.articulation_count,
-                            inputs=[dynamics, counts, model.joint_target_q_start, *gains, max_dofs, dt],
-                            outputs=[row_counts, row_indices],
-                            device=device,
-                        )
-                    np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
+                        wp.zeros(model.joint_dof_count, dtype=float, device=device),
+                        dt,
+                    ],
+                    outputs=[row_K, tau],
+                    device=device,
+                )
+                np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
 
-    def test_per_coordinate_drives_match_combined_kernel(self):
-        """Match the held tree's per-coordinate drives plus the joint forces to the combined kernel; clear drives
-        without gains."""
+    def test_per_coordinate_drives(self):
+        """Write each coordinate's K and clamped force from its row, and clear both without gains."""
         device = wp.get_device()
-        articulation_start = wp.array([0, 2], dtype=wp.int32, device=device)
-        articulation_joint_end = wp.array([2], dtype=wp.int32, device=device)
-        articulation_dof_count = wp.array([2], dtype=wp.int32, device=device)
-        joint_type = wp.array([JointType.REVOLUTE, JointType.REVOLUTE], dtype=wp.int32, device=device)
-        joint_parent = wp.array([-1, 0], dtype=wp.int32, device=device)
-        joint_child = wp.array([0, 1], dtype=wp.int32, device=device)
-        joint_articulation = wp.zeros(2, dtype=wp.int32, device=device)
-        up_flags = wp.array(TreePlan.build([-1, 0]).up_flags, dtype=int, device=device)
-        joint_start = wp.array([0, 1], dtype=wp.int32, device=device)
-        joint_dof_dim = wp.array([[0, 1], [0, 1]], dtype=wp.int32, device=device)
-        joint_f = wp.array([0.4, -0.2], dtype=wp.float32, device=device)
         joint_q = wp.array([0.25, -0.35], dtype=wp.float32, device=device)
         joint_qd = wp.array([0.1, -0.2], dtype=wp.float32, device=device)
-        spring_stiffness = wp.array([1.5, 0.75], dtype=wp.float32, device=device)
-        spring_ref = wp.array([0.0, 0.1], dtype=wp.float32, device=device)
-        damping = wp.array([0.2, 0.3], dtype=wp.float32, device=device)
-        joint_S_s = wp.array(
-            [wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)] * 2,
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_fb_s = wp.array(
-            [
-                wp.spatial_vector(0.1, 0.2, 0.3, 1.0, 1.5, -0.5),
-                wp.spatial_vector(-0.2, 0.4, -0.1, -0.5, 0.25, 0.75),
-            ],
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_f_ext = wp.array(
-            [
-                wp.spatial_vector(0.05, 0.0, -0.1, 0.0, 0.25, 0.0),
-                wp.spatial_vector(0.0, -0.05, 0.1, 0.15, 0.0, -0.2),
-            ],
-            dtype=wp.spatial_vector,
-            device=device,
-        )
-        body_flags = wp.zeros(2, dtype=wp.int32, device=device)
-        body_q = wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device)
-        body_com = wp.array([[0.1, 0.0, 0.0], [0.0, 0.2, 0.0]], dtype=wp.vec3, device=device)
-        articulation_origin = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
         target_ke = wp.array([10.0, 20.0], dtype=wp.float32, device=device)
         target_kd = wp.array([1.0, 2.0], dtype=wp.float32, device=device)
         target_q = wp.array([0.1, -0.1], dtype=wp.float32, device=device)
         target_qd = wp.array([0.0, 0.05], dtype=wp.float32, device=device)
         effort_limit = wp.array([1.25, 2.5], dtype=wp.float32, device=device)
-
-        def dynamics(body_ft_s, tau, row_K=None):
-            return field_group.upload(
-                DynamicsData,
-                device,
-                articulation_start=articulation_start,
-                articulation_joint_end=articulation_joint_end,
-                joint_type=joint_type,
-                joint_parent=joint_parent,
-                joint_child=joint_child,
-                joint_articulation=joint_articulation,
-                joint_qd_start=joint_start,
-                joint_q_start=joint_start,
-                joint_dof_dim=joint_dof_dim,
-                joint_f=joint_f,
-                joint_q=joint_q,
-                joint_qd=joint_qd,
-                spring_stiffness=spring_stiffness,
-                spring_reference=spring_ref,
-                damping=damping,
-                joint_S_s=joint_S_s,
-                body_f_s=body_fb_s,
-                body_f=body_f_ext,
-                body_flags=body_flags,
-                body_q=body_q,
-                body_com=body_com,
-                articulation_origin=articulation_origin,
-                body_ft_s=body_ft_s,
-                tau=tau,
-                row_K=row_K if row_K is not None else wp.zeros(1, dtype=wp.float32, device=device),
-                up_flags=up_flags,
-            )
-
-        sequential_body_ft = wp.zeros(2, dtype=wp.spatial_vector, device=device)
-        sequential_tau = wp.zeros(2, dtype=wp.float32, device=device)
-        wp.launch(inverse_dynamics_tau, dim=1, inputs=[dynamics(sequential_body_ft, sequential_tau)], device=device)
-
-        combined_body_ft = wp.zeros_like(sequential_body_ft)
-        combined_tau = wp.zeros_like(sequential_tau)
-        combined_counts = wp.zeros(1, dtype=wp.int32, device=device)
-        combined_indices = wp.zeros(2, dtype=wp.int32, device=device)
-        combined_stiffness = wp.zeros(2, dtype=wp.float32, device=device)
-        wp.launch(
-            eval_rigid_tau_and_augmented_drives,
-            dim=1,
-            inputs=[
-                dynamics(combined_body_ft, combined_tau, row_K=combined_stiffness),
-                articulation_dof_count,
-                joint_start,
-                target_ke,
-                target_kd,
-                target_q,
-                target_qd,
-                effort_limit,
-                2,
-                0.1,
-            ],
-            outputs=[combined_counts, combined_indices],
-            device=device,
-        )
-        np.testing.assert_array_equal(combined_body_ft.numpy(), sequential_body_ft.numpy())
-        expected_tau = sequential_tau.numpy() + np.array([-1.25, 2.5], dtype=np.float32)
-        np.testing.assert_allclose(combined_tau.numpy(), expected_tau, rtol=0.0, atol=1.0e-6)
-        np.testing.assert_array_equal(combined_counts.numpy(), [2])
-        np.testing.assert_array_equal(combined_indices.numpy(), [0, 1])
-        # The drive's K, ke dt^2 + kd dt, with the passive damper's, c dt.
-        np.testing.assert_allclose(combined_stiffness.numpy(), [0.22, 0.43], rtol=0.0, atol=1.0e-7)
-
-        topology_stiffness = wp.zeros_like(combined_stiffness)
-        topology_tau = wp.zeros_like(combined_tau)
+        damping = wp.array([0.2, 0.3], dtype=wp.float32, device=device)
         rows = wp.array([0, 1], dtype=wp.int32, device=device)
 
         def prepare_by_dof(ke, kd, stiffness, tau):
@@ -317,44 +138,21 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 device=device,
             )
 
-        prepare_by_dof(target_ke, target_kd, topology_stiffness, topology_tau)
-        np.testing.assert_array_equal(topology_stiffness.numpy(), combined_stiffness.numpy())
-        np.testing.assert_allclose(topology_tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
+        stiffness = wp.zeros(2, dtype=wp.float32, device=device)
+        tau = wp.zeros(2, dtype=wp.float32, device=device)
+        prepare_by_dof(target_ke, target_kd, stiffness, tau)
+        # The drive's K, ke dt^2 + kd dt, with the passive damper's, c dt.
+        np.testing.assert_allclose(stiffness.numpy(), [0.22, 0.43], rtol=0.0, atol=1.0e-7)
+        # Both forces are past their effort limits: -(10 (0.25 - 0.1 + 0.01) + 0.1) and -(20 (-0.25 - 0.02) + 2 (-0.25)).
+        np.testing.assert_allclose(tau.numpy(), [-1.25, 2.5], rtol=0.0, atol=1.0e-6)
 
-        # The combined kernel's force is one fp32 sum of the joint force and the drive force.
-        np.testing.assert_array_equal(sequential_tau.numpy() + topology_tau.numpy(), combined_tau.numpy())
-
-        # Without gains neither preparation keeps a drive force, and the passive damper keeps its K.
-        zero_target_ke = wp.zeros_like(target_ke)
-        zero_target_kd = wp.zeros_like(target_kd)
+        # Without gains the preparation keeps no drive force, and the passive damper keeps its K.
+        zero_gain = wp.zeros_like(target_ke)
         passive_stiffness = wp.array([7.0, 7.0], dtype=wp.float32, device=device)
         passive_tau = wp.array([3.0, -2.0], dtype=wp.float32, device=device)
-        prepare_by_dof(zero_target_ke, zero_target_kd, passive_stiffness, passive_tau)
+        prepare_by_dof(zero_gain, zero_gain, passive_stiffness, passive_tau)
         np.testing.assert_allclose(passive_stiffness.numpy(), [0.02, 0.03], rtol=0.0, atol=1.0e-7)
         np.testing.assert_array_equal(passive_tau.numpy(), [0.0, 0.0])
-
-        passive_counts = wp.array([7], dtype=wp.int32, device=device)
-        passive_combined_tau = wp.zeros_like(combined_tau)
-        wp.launch(
-            eval_rigid_tau_and_augmented_drives,
-            dim=1,
-            inputs=[
-                dynamics(wp.zeros_like(combined_body_ft), passive_combined_tau, row_K=wp.zeros_like(target_ke)),
-                articulation_dof_count,
-                joint_start,
-                zero_target_ke,
-                zero_target_kd,
-                target_q,
-                target_qd,
-                effort_limit,
-                2,
-                0.1,
-            ],
-            outputs=[passive_counts, wp.zeros_like(combined_indices)],
-            device=device,
-        )
-        np.testing.assert_array_equal(passive_counts.numpy(), [2])
-        np.testing.assert_array_equal(passive_combined_tau.numpy(), sequential_tau.numpy())
 
 
 if __name__ == "__main__":

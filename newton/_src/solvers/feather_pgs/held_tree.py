@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The held-tree owner: the CUDA evaluator of articulated dynamics, its groups chosen from the topology.
+"""The held-tree owner: the evaluator of articulated dynamics, its groups chosen from the topology.
 
 One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
 (:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
 the native sparse factor, when the solver admitted one, makes one complete group (:class:`TreeSparseOperator`);
 otherwise each size group of the dense factors is a group with its held leaf-first Cholesky or diagonal response
 (:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
-group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a solver's
-dynamics stay on the serial passes; :func:`install` returns the owner.
+group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a representation
+does not fit; :func:`install` returns the owner.
 """
 
 import itertools
@@ -58,7 +58,7 @@ def _diagonal_geometry(
 
 
 def decline(solver, *, sparse: bool | None = None) -> str | None:
-    """Why the held tree does not evaluate the solver's dynamics, or ``None`` when it does.
+    """Why the held tree does not evaluate a representation of the solver's dynamics, or ``None`` when it does.
 
     The laws it does not hold (loop-closing joints), then the terms of the representation: the native sparse factor's
     group (``sparse``: whether it carries velocity-limit rows; by default the representation the solver chose, and its
@@ -186,11 +186,11 @@ def _prescribed_group(solver, group_to_art):
 
 def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
     """Why the held tree would not take a native sparse factor of ``size`` coordinates and pattern ``plan``, or
-    ``None``: :func:`options_decline`, :func:`decline` of the candidate, then its one complete group's fit.
+    ``None``: :func:`decline` of the candidate, then its one complete group's fit.
 
     Only the held tree evaluates native sparse factors, so their admission reads this before choosing one.
     """
-    reason = options_decline(solver) or decline(solver, sparse=velocity_limits)
+    reason = decline(solver, sparse=velocity_limits)
     if reason is not None:
         return reason
     view = _plan_view(solver.forest.group_to_art[size], solver.forest.art_to_world, operator_metadata(plan))
@@ -203,12 +203,12 @@ def sparse_decline(solver, size, plan, *, velocity_limits) -> str | None:
 
 def compact_decline(solver, size, *, scalar) -> str | None:
     """Why the held tree would not take the dense size groups with a compact diagonal of ``size`` coordinates, or
-    ``None``: :func:`options_decline`, :func:`decline` of the candidate, then the groups' fit (the coverage, the
+    ``None``: :func:`decline`, then the groups' fit (the coverage, the
     diagonal group unless ``scalar`` branches take it, every other size group, the prescribed roots).
 
     Only the held tree evaluates a compact diagonal, so the sparse-diagonal response reads this before choosing one.
     """
-    reason = options_decline(solver) or decline(solver)
+    reason = decline(solver)
     if reason is not None:
         return reason
     try:
@@ -818,38 +818,16 @@ class HeldTree:
             group.finish(state, augmented, output, dt, refresh)
 
 
-def options_decline(solver) -> str | None:
-    """Why a test pin keeps ordinary dynamics, or ``None``.
-
-    The test pin ``evaluator='ordinary'`` keeps the serial passes. Only the held tree evaluates the native sparse
-    factor and the compact diagonal, so their admissions read this before :func:`install` does.
-    """
-    if solver._route_pins.get("evaluator") == "ordinary":
-        return "A test pin keeps ordinary dynamics (evaluator='ordinary')."
-    return None
-
-
-def install(solver) -> tuple[HeldTree | None, str]:
-    """The held tree where :func:`options_decline` and :func:`decline` admit it, with the reason
-    (:meth:`.tree_factor.TreeFactor.install` takes both).
+def install(solver) -> HeldTree:
+    """The owner of the solver's dynamics. A model it does not fit raises ``ValueError``, naming why.
 
     The native sparse factor and the compact diagonal are the held tree's representations: they are chosen only
-    where :func:`sparse_decline` and :func:`compact_decline` admit them, so the held tree takes every solver that
-    holds one.
+    where :func:`sparse_decline` and :func:`compact_decline` admit them.
     """
-    held = None
-    reason = options_decline(solver)
-    if reason is None:
-        reason = decline(solver)
-        if reason is None:
-            try:
-                held = HeldTree(solver, admission=admitted)
-            except ValueError as error:
-                reason = f"The topology does not fit the held groups: {error}"
-        if reason is None:
-            reason = (
-                "Automatic cache selection: tree cache admitted for this topology, representation and state lifecycle."
-            )
-        else:
-            reason = f"Ordinary dynamics retained: {reason}"
-    return held, reason
+    reason = decline(solver)
+    if reason is not None:
+        raise ValueError(f"FeatherPGS cannot hold this model: {reason}")
+    try:
+        return HeldTree(solver, admission=admitted)
+    except ValueError as error:
+        raise ValueError(f"FeatherPGS cannot hold this model: {error}") from error

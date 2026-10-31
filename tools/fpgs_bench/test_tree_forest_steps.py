@@ -11,8 +11,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import forest_plan
-from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_solver as native
+from newton.tests.feather_pgs_law_harness import recomputing
 from newton.tests.feather_pgs_sparse_scene import _external_forces
 from tools.fpgs_bench.forest_row_order import RowOrder
 from tools.fpgs_bench.public_state_oracle import public_state
@@ -29,10 +29,7 @@ def make_case(enabled, *, permuted=False, motion=False):
             plan.group_to_art[9].assign(order)
             plan.art_group_idx.assign(np.argsort(order).astype(np.int32))
 
-    with (
-        patch.dict(SolverFeatherPGS._route_pins, {} if enabled else {"evaluator": "ordinary"}),
-        patch.object(forest_plan, "_size_groups", grouping),
-    ):
+    with patch.object(forest_plan, "_size_groups", grouping):
         model = native._build_model(robot_count=2)
         model.joint_velocity_limit.fill_(0.08)
         solver = native._make_solver(
@@ -42,6 +39,8 @@ def make_case(enabled, *, permuted=False, motion=False):
             mf_max_constraints=64,
             enable_joint_velocity_limits=motion,
         )
+    if not enabled:
+        recomputing(solver)
     state, output, control = model.state(), model.state(), model.control()
     control.joint_f.assign(np.random.default_rng(517).normal(0.0, 0.04, model.joint_dof_count).astype(np.float32))
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)

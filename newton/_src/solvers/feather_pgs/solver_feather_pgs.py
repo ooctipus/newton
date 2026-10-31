@@ -95,7 +95,6 @@ from .kernels import (
     build_mf_contact_rows,
     classify_local_solve_worlds,
     classify_parallel_sweep_tiers,
-    clear_grouped_jacobian_active_rows,
     clear_sparse_diagonal_response_prefix,
     compact_local_pair_candidates,
     compute_contact_linear_force_from_impulses,
@@ -131,7 +130,6 @@ from .rows import JOINT_LIMIT_WARPS_PER_BLOCK, RowLaws
 from .solve_policy import SolvePolicy, SolveReadoutRecord
 from .solver_fields import (
     DOF_WORK,
-    SIZE_MASS,
     SPARSE_CONTACT_RECORDS,
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
@@ -221,7 +219,6 @@ _MFGS_RESIDENT_METADATA_MAX_BYTES = _execution_plan._MFGS_RESIDENT_METADATA_MAX_
 _HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
 _MFGSStorage = _execution_plan._MFGSStorage
 _align_shared_memory = _execution_plan._align_shared_memory
-_estimate_cholesky_shared_memory = _execution_plan._estimate_cholesky_shared_memory
 _estimate_hinv_jt_shared_memory = _execution_plan._estimate_hinv_jt_shared_memory
 _select_hinv_jt_chunk_size = _execution_plan._select_hinv_jt_chunk_size
 _FeatherPGSExecutionPlan = _execution_plan._FeatherPGSExecutionPlan
@@ -338,7 +335,7 @@ class SolverFeatherPGS(SolverBase):
     # Test-only route pins: an axis value a test fixes where the rules would choose another, so that every route the
     # data can select runs on the test scenes. No option or environment variable sets one; the route record lists them
     # (routes.pins). Keys:
-    #   storage "dense": no packed (native sparse) factor.     evaluator "ordinary": no held tree.
+    #   storage "dense": no packed (native sparse) factor.
     #   grouping "forest" or "per_size": the held families.   star "held": a star's diagonal family in the held tree.
     #   producer "compact_jacobian" or "general": no local packets or keyed rows.
     #   claims: the runtime claims kept, of ("resolved_worlds",).
@@ -346,10 +343,9 @@ class SolverFeatherPGS(SolverBase):
     #   transaction "single" or "staged": fused triplets'.     mf_storage "streamed": streamed matrix-free impulses.
     #   repair_skip, repair_classify, predicted_twists False: the held tree's launch mapping without that step.
     #   row_support False: sparse rows on explicit indices.     placement "general": case K6 (route_table.RouteTable).
-    #   double_buffer False: one set of mass matrices and Jacobians, whose rows stay readable after a step.
     #   tiers: the Jacobi tiers' row bound, on any class whose response they form (0: no tiers).
     #   tier_sweeps: every Jacobi tier's sweep budget, in place of the equal-accuracy rule.
-    #   cholesky_kernel, trisolve_kernel, hinv_jt_kernel: a dense kernel (CUDA).
+    #   hinv_jt_kernel: a dense response kernel (CUDA).
     _route_pins: ClassVar[dict[str, object]] = {}
 
     @classmethod
@@ -675,8 +671,6 @@ class SolverFeatherPGS(SolverBase):
         self._ws_prev_dt = 0.0
         self._grouped_response = False
 
-        # Double-buffered mass matrices on CUDA (the sparse factor's producers overwrite every value and take none).
-        self._double_buffer = bool(self._route_pins.get("double_buffer", True))
         self._nvtx = nvtx
         self._debug_buffers_enabled = bool(pgs_debug)
         # External NaN dumpers read the stage-3 snapshots; nothing in the solver
@@ -693,8 +687,6 @@ class SolverFeatherPGS(SolverBase):
         # and gathers, the keyed-row key scatters) grid-stride over about one wave of blocks.
         self._contact_capacity_blocks = contact_capacity_blocks(model.device)
 
-        self.cholesky_kernel = choices["cholesky_kernel"]
-        self.trisolve_kernel = choices["trisolve_kernel"]
         self.hinv_jt_kernel = choices["hinv_jt_kernel"]
         self.small_dof_threshold = small_dof_threshold
 
@@ -810,15 +802,10 @@ class SolverFeatherPGS(SolverBase):
             self.forest.size_groups,
             max_constraints=self.placement.dense_max_constraints,
             max_shared_memory=int(getattr(model.device, "max_shared_memory_per_block", 0)),
-            cholesky_kernel=self.cholesky_kernel,
             hinv_jt_kernel=self.hinv_jt_kernel,
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
-            diagonal_mass_sizes=(
-                self.forest.diagonal_mass_sizes
-                if self.cholesky_kernel == "auto" and self.trisolve_kernel == "auto"
-                else frozenset()
-            ),
+            diagonal_mass_sizes=self.forest.diagonal_mass_sizes,
         )
         self.placement.hinv_jt_diag_sizes = frozenset(
             size
@@ -1167,14 +1154,12 @@ class SolverFeatherPGS(SolverBase):
 
         self.placement.allocate_status()
 
-        self._init_double_buffer_stream()
-
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
         # then publishes: the compact diagonal's admission planned them.
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self)
 
-        # The tree factor's evaluator: the held tree where it admits the solver, else the ordinary stages.
+        # The tree factor's evaluator: the held tree.
         self.factor.install(self)
 
         # Worlds whose every candidate row separates at the predictor skip row
@@ -1192,7 +1177,6 @@ class SolverFeatherPGS(SolverBase):
         diagonal = self.routes.case == "K2"
         route = self.routes.finish(
             self.laws.set,
-            evaluator="held" if self.factor.held is not None else "ordinary",
             producer=contact_row_plan(self).producer,
             packed=self.placement.packed_response,
             tier_rows=self.placement.ink_skip_rows(),
@@ -1205,8 +1189,6 @@ class SolverFeatherPGS(SolverBase):
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
         self._plan = StepPlan.build(route, self)
         self.placement.build_response_kernels(self._plan, self._execution_plan, self.tile_threads)
-        if self.factor.ordinary is not None:
-            self.factor.ordinary.build_kernels(self._plan)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -1241,10 +1223,7 @@ class SolverFeatherPGS(SolverBase):
         contact rows built outside the sweep: the parallel tiers build keyed rows'
         direct rows in the sweep (``direct_rows``) and the free-body matrix-free
         rows follow ``free_rigid_bodies``.
-        ``dynamics.double_buffer_mass_matrix_clear_dofs`` lists the DOF sizes
-        whose double-buffered mass matrix the end of a refresh step clears (empty
-        without a double buffer, where the ordinary route's stage 1 clears it), and
-        ``contact_consumers.max_blocks`` the block cap of the launches over the
+        ``contact_consumers.max_blocks`` is the block cap of the launches over the
         contact capacity (0: uncapped). ``measurements`` holds, under
         ``pgs_solve_readout``, the cumulative sweep counts
         (``solve_readout``), kept out of ``routes`` so that two runs of one
@@ -1267,18 +1246,14 @@ class SolverFeatherPGS(SolverBase):
         host-only, detached from solver state and JSON-compliant (non-finite
         floats are strings).
         """
-        cached = self.factor.held is not None
         selection = {
             "sparse_mass_matrix": "on" if self.routes.row.case == "K1" else "off",
-            "cached_dynamics": "on" if cached else "off",
-            "publication": "cached" if cached else "ordinary",
-            "cached_prediction": "tree" if cached else None,
+            "cached_dynamics": "on",
+            "publication": "cached",
+            "cached_prediction": "tree",
             "reasons": {
                 "sparse_mass_matrix": self.routes.row.reasons["K1"],
-                "cached_dynamics": self.factor.held_reason,
-                "publication": "Paired cache owns next-state publication."
-                if cached
-                else "Ordinary state publication remains active.",
+                "publication": "Paired cache owns next-state publication.",
             },
         }
         selection["routes"] = route_selection(self)
@@ -1374,8 +1349,7 @@ class SolverFeatherPGS(SolverBase):
         if self.forest.world_count == 0:
             return
 
-        if self.factor.held is not None:
-            self.factor.held.invalidate(world_mask)
+        self.factor.held.invalidate(world_mask)
 
         self.placement.reset_status(world_mask)
         if self.laws.friction_anchors_enabled:
@@ -1778,8 +1752,6 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_velocity_limits = velocity_candidate
         # The sparse response kernel prepares the contact rows' metadata, CFM, bias and restitution.
         self.placement.sparse_prepare_contacts = True
-        # The sparse producers overwrite every live value and retain factors by the mass mask.
-        self._double_buffer = False
         self.factor.allocate_sparse(plan, self.forest.n_arts_by_size[size])
         self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         if use_support_table:
@@ -2075,28 +2047,12 @@ class SolverFeatherPGS(SolverBase):
         self.factor.allocate_common()
 
     def _allocate_buffers(self, model):
-        self.H_by_size = {}
-        double_buffered = self._double_buffer and model.device.is_cuda
-        self.placement.allocate_size_groups(double_buffered=double_buffered)
+        self.placement.allocate_size_groups()
         if not model.articulation_count:
-            self._H_bufs = None
             return
 
-        self._H_bufs = [{}, {}] if double_buffered else None
-        # The tree factor's L and R (compact and sparse sizes keep (1, 1, 1) placeholders of L) and dense-solve scratch.
+        # The tree factor's L and R (compact and sparse sizes keep (1, 1, 1) placeholders of L).
         self.factor.allocate_size_groups((self._compact_diagonal_mass_size, self.placement.sparse_mass_matrix_size))
-        for size in self.forest.size_groups:
-            n_arts = self.forest.n_arts_by_size[size]
-            # Compact and sparse sizes keep (1, 1, 1) placeholders of the mass matrix.
-            factor = 1 if size in (self._compact_diagonal_mass_size, self.placement.sparse_mass_matrix_size) else 0
-            sizes = {"factor_art": factor or n_arts, "factor_size": factor or size}
-            for H_by_size in self._H_bufs or (self.H_by_size,):
-                H_by_size[size] = self._arrays.allocate(SIZE_MASS, owner={}, **sizes)["H"]
-
-        if self._H_bufs is not None:
-            self.H_by_size = self._H_bufs[0]
-            self._buf_idx = 0
-
         self.placement.allocate_contact_rows(model)
 
     def _init_tiled_kernels(self, model):
@@ -2426,7 +2382,6 @@ class SolverFeatherPGS(SolverBase):
         read on the launch stream, which the pool registers. A trim therefore
         waits for none of them (:meth:`ContactPool.add_reader_stream`).
         """
-        self.factor.init_size_streams()
         self._local_internal_stream = (
             wp.Stream(model.device)
             if model.device.is_cuda
@@ -2462,55 +2417,6 @@ class SolverFeatherPGS(SolverBase):
         self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
         self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
         self._paired_general_done = wp.Event(model.device) if paired_overlap else None
-
-    def _init_double_buffer_stream(self):
-        """Create a CUDA stream for mass-matrix and active-Jacobian maintenance."""
-        if self._H_bufs is None or not self.model.device.is_cuda:
-            self._memset_stream = None
-            self._j_active_counts = None
-            return
-        self._memset_stream = wp.Stream(self.model.device)
-        self._j_active_counts = [
-            wp.zeros_like(self.placement.constraint_count),
-            wp.zeros_like(self.placement.constraint_count),
-        ]
-        # Track the last memset-done event per buffer slot so the main stream
-        # can wait only for the specific buffer it needs, and whether it is a
-        # seeded event (see _wait_memset_done).
-        self._memset_done_event: list[wp.Event | None] = [None, None]
-        self._memset_done_seeded = [False, False]
-
-    def seed_double_buffer_events(self):
-        """Record initial memset_done events on the main stream.
-
-        Must be called inside CUDA graph capture, before the first ``step()`` call.
-        Seeded events are not waited on: the first two captured substeps rely on
-        their buffers being clear already. That holds for the ``wp.zeros()``
-        allocation, but each :meth:`step` that ran before the capture queued
-        clears on the memset stream that nothing in the graph waits for. After
-        such steps, synchronize the device (for example with
-        ``wp.synchronize_device()``) before capturing.
-        """
-        if self._memset_stream is None:
-            return
-        main_stream = wp.get_stream(self.model.device)
-        self._record_memset_done(0, main_stream.record_event(), seeded=True)
-        self._record_memset_done(1, main_stream.record_event(), seeded=True)
-
-    def _record_memset_done(self, slot, event, *, seeded=False):
-        """Record the event a buffer slot's consumer waits for."""
-        self._memset_done_event[slot] = event
-        self._memset_done_seeded[slot] = seeded
-
-    def _wait_memset_done(self, stream, slot):
-        """Make ``stream``, the main stream, wait for a buffer slot's memset.
-
-        A seeded event, recorded on the main stream itself, orders nothing, so it
-        is not waited on: a capture paused since it was recorded, for example by
-        another solver's conditional node, would reject the wait.
-        """
-        if self._memset_done_event[slot] is not None and not self._memset_done_seeded[slot]:
-            stream.wait_event(self._memset_done_event[slot])
 
     def _launch_local_internal_solve(
         self,
@@ -3077,15 +2983,6 @@ class SolverFeatherPGS(SolverBase):
             self._step += 1
             return
 
-        # Double-buffer: select buffer set and wait for its memset to finish
-        if self._memset_stream is not None:
-            self.H_by_size = self._H_bufs[self._buf_idx]
-            self.placement.J_by_size = self.placement.J_bufs[self._buf_idx]
-            if self.placement.jy_world_aliased:
-                # J_world aliases the active J buffer; track the ping-pong.
-                self.placement.J_world = self.placement.J_by_size[self.forest.size_groups[0]]
-            self._wait_memset_done(wp.get_stream(model.device), self._buf_idx)
-
         # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
         stage3_qd, inverse_dynamics_ready = self.factor.factor(
             state_in, control, state_out, dt, self._step, self.qd_work
@@ -3111,9 +3008,8 @@ class SolverFeatherPGS(SolverBase):
         # The response Y = H^-1 J^T of each size that builds one, the diagonals (from J Y, or the packed rows'
         # |Z|^2) and the bias (the sweeps compute J v each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
-            for size, ctx in self.factor.for_sizes():
-                with ctx:
-                    self.placement.response(size, self._plan.response[size].name)
+            for size in self.forest.size_groups:
+                self.placement.response(size, self._plan.response[size].name)
             packed_diag = self.placement.diagonals(self.v_hat)
             self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
             self.placement.add_cfm()
@@ -3272,55 +3168,6 @@ class SolverFeatherPGS(SolverBase):
                     max_blocks=self._contact_capacity_blocks,
                 )
             self._ws_prev_dt = float(dt)
-
-        # Double-buffer: fork the maintenance stream to clear the current
-        # buffer for reuse. The compact path snapshots this solve's row counts
-        # on the main stream, then clears only those active J prefixes; every
-        # inactive row is already clean by induction because each previously
-        # active prefix was cleared immediately after use. H keeps its existing
-        # conditional full-buffer clear.
-        # ScopedStream(sync_enter=True) records an event on the main stream and
-        # makes the memset stream wait — this is what forks it into graph capture.
-        # J must be zeroed every step (constraint rows are rebuilt per step),
-        # but H is only zeroed on steps whose host-evaluated global mass-update
-        # flag was 1 (see TreeFactor.refresh): with update_mass_matrix_interval=N and
-        # graphs capturing a multiple of N steps, each buffer ping-pongs with
-        # period 2 and is consumed by steps of a fixed flag parity, so the
-        # baked memset cadence matches the baked rebuild cadence. Skipping the
-        # H memset is safe in every configuration because crba_fill
-        # stores all structural nonzeros of a masked articulation before
-        # apply_augmented_mass_diagonal_grouped adds onto the freshly stored
-        # diagonal, structural zeros are never written after allocation, and
-        # the Cholesky kernels never read H when mass_update_mask is 0.
-        # Sizes a held-tree owner factors from its own geometry have no H
-        # reader at all (StepPlan.unread_mass_sizes) and are never cleared.
-        if self._memset_stream is not None:
-            with wp.ScopedTimer("DB_Memset", print=False, use_nvtx=self._nvtx, synchronize=False):
-                clear = self._plan.jacobian_clear_sizes
-                if clear:
-                    wp.copy(self._j_active_counts[self._buf_idx], self.placement.constraint_count)
-                with wp.ScopedStream(self._memset_stream):
-                    for size in self.forest.size_groups:
-                        if self.factor.mass_update_global_flag and size not in self._plan.unread_mass_sizes:
-                            self._H_bufs[self._buf_idx][size].zero_()
-                        if size not in clear:
-                            continue
-                        wp.launch(
-                            clear_grouped_jacobian_active_rows,
-                            dim=self.forest.n_arts_by_size[size] * 32,
-                            inputs=[
-                                self.forest.group_to_art[size],
-                                self.forest.art_to_world,
-                                self._j_active_counts[self._buf_idx],
-                                size,
-                                self.placement.dense_max_constraints,
-                            ],
-                            outputs=[self.placement.J_bufs[self._buf_idx][size]],
-                            block_dim=256,
-                            device=self.model.device,
-                        )
-                self._record_memset_done(self._buf_idx, self._memset_stream.record_event())
-                self._buf_idx = 1 - self._buf_idx
 
         self.placement.record_watermarks(contacts)
 
@@ -3581,7 +3428,7 @@ class SolverFeatherPGS(SolverBase):
         if self.forest.has_prescribed_response:
             self.placement.mf_target_velocity.zero_()
 
-        self.placement.begin()
+        self.placement.begin(self._plan.jacobian_clear_sizes)
 
         has_free_rigid_flag = 1 if mf_active else 0
         # Dummy arrays when MF is not active (kernel still needs valid pointers).
@@ -3597,13 +3444,6 @@ class SolverFeatherPGS(SolverBase):
         mf_first_rejected_slot = (
             self.placement.mf_first_rejected_slot if mf_active else self.placement.dummy_mf_slot_counter
         )
-        # The packed rows are never cleared: every producer writes its rows' sides whole (dense_rows.clear_side).
-        j_buffers_zeroed = (
-            self.placement.mf_sweeps
-            or self.placement.sparse_mass_matrix_size is not None
-            or self.placement.row_packets is not None
-            or self.placement.keyed_rows is not None
-        )
         support = self.placement.row_support()
         if self.placement.compact_contact_boundary:
             from .compact_contact import clear_limit_prefix  # noqa: PLC0415
@@ -3618,7 +3458,6 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-            j_buffers_zeroed = True
         if self.placement.row_packets is not None:
             self.placement.row_packets.prepare_prefix(state_in, dt)
         if self.placement.keyed_rows is not None:
@@ -3649,10 +3488,6 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
-                for size in self.forest.size_groups:
-                    self.placement.J_by_size[size].zero_()
-                j_buffers_zeroed = True
             for size in self.forest.size_groups:
                 if size not in self.laws.mimic_sizes:
                     continue
@@ -3754,10 +3589,6 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
-            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
-                for size in self.forest.size_groups:
-                    self.placement.J_by_size[size].zero_()
-                j_buffers_zeroed = True
             for size in self.forest.size_groups:
                 n_arts = self.forest.n_arts_by_size[size]
                 wp.launch(
@@ -3815,10 +3646,6 @@ class SolverFeatherPGS(SolverBase):
             and self.placement.row_packets is None
             and self.placement.keyed_rows is None
         ):
-            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
-                for size in self.forest.size_groups:
-                    self.placement.J_by_size[size].zero_()
-                j_buffers_zeroed = True
             # The native limit rows (prefix_rows) read the law and write the records through one struct.
             law = field_group.bind(
                 prefix_rows.PrefixLaw,
@@ -3968,10 +3795,6 @@ class SolverFeatherPGS(SolverBase):
             and self.laws.velocity_limit_slot is not None
             and self.placement.keyed_rows is None
         ):
-            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
-                for size in self.forest.size_groups:
-                    self.placement.J_by_size[size].zero_()
-                j_buffers_zeroed = True
             for size in self.forest.size_groups:
                 n_arts = self.forest.n_arts_by_size[size]
                 if self._sparse_velocity_limits and size == self.placement.sparse_mass_matrix_size:
@@ -4083,11 +3906,6 @@ class SolverFeatherPGS(SolverBase):
                 self.placement.place_sorted_contact_rows(
                     contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot
                 )
-
-            if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
-                for size in self.forest.size_groups:
-                    self.placement.J_by_size[size].zero_()
-                j_buffers_zeroed = True
 
             # The class's case names the producer that writes every contact row (contact_row_plan):
             # get_path_selection() records the same plan (routes.contact_rows).

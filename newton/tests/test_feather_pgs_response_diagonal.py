@@ -1396,7 +1396,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             solver.forest.size_groups,
             max_constraints=solver.placement.dense_max_constraints,
             max_shared_memory=101376,
-            cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
             small_dof_threshold=12,
             tile_threads=64,

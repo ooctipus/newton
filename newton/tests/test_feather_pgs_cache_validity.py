@@ -21,13 +21,11 @@ from newton._src.solvers.feather_pgs import (
     cached_state_binding,
     capture_joins,
     path_selection,
-    step_plan,
     tree_kinetic_owner,
     tree_kinetic_state,
 )
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.tree_ordinary import OrdinaryTree
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver
 
@@ -78,13 +76,12 @@ def _fixed_root(model, world):
     return int(np.flatnonzero(roots & (model.joint_world.numpy() == world))[0])
 
 
-def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
-    """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False.
+def _mixed_solver(model, *, forest=False, lanes=None, **options):
+    """A dense-route solver with the mixed held-tree owner.
 
     ``lanes`` fixes the held-tree lane width (several small trees per block); by default the trees' data chooses.
     """
-    pins = {"storage": "dense"} if owner else {"evaluator": "ordinary"}
-    pins["grouping"] = "forest" if forest else "per_size"
+    pins = {"storage": "dense", "grouping": "forest" if forest else "per_size"}
     settings = {
         "pgs_iterations": 8,
         "enable_joint_limits": True,
@@ -259,12 +256,6 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         self.assertEqual(validity(), valid)
         model.joint_axis.assign(axes)
         self.assertEqual(invalidating_launches(JOINT), [])
-        with patch.object(SolverFeatherPGS, "_route_pins", {"evaluator": "ordinary"}):
-            ordinary = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        ordinary.factor.fk_id_cache_enabled = True
-        ordinary.factor.fk_id_cache_valid.fill_(1)
-        ordinary.notify_model_changed(JOINT)
-        np.testing.assert_array_equal(ordinary.factor.fk_id_cache_valid.numpy(), 0)
 
     def test_refused_notification_stores_no_moved_frame(self):
         """Store no moved frame in the held-tree proof when a row owner refuses the notification.
@@ -367,7 +358,6 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
             graph = None
             if captured:
                 with wp.ScopedCapture(device=device) as capture:
-                    solver.seed_double_buffer_events()
                     rollout.block()
                 graph = capture.graph
             worlds = _group_worlds(solver, owner)
@@ -480,7 +470,6 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     solver._route_pins.update(pins or {})
     owner = HeldTree(solver)
     solver.factor.held = owner
-    solver.factor.fk_id_cache_enabled = True
     states = [model.state(), model.state()]
     solver.factor.last_step_dt = DT
     return model, solver, owner, states, solver.factor
@@ -909,7 +898,6 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                             _counted_launches(_repair_kernels(owner)) as counted,
                             wp.ScopedCapture(device=device) as capture,
                         ):
-                            solver.seed_double_buffer_events()
                             block()
                         self.assertEqual(counted[0], len(_groups(owner)))
                         advance = functools.partial(wp.capture_launch, capture.graph)
@@ -961,7 +949,6 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                             _counted_launches(_repair_kernels(owner)) as counted,
                             wp.ScopedCapture(device=device) as capture,
                         ):
-                            solver.seed_double_buffer_events()
                             block()
                         self.assertEqual(counted[0], 2 * len(_groups(owner)))
                         advance = functools.partial(wp.capture_launch, capture.graph)
@@ -986,7 +973,6 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
         rollout = _Rollout(model, solver)
         rollout.block()
         with _counted_launches(_repair_kernels(owner)) as counted, wp.ScopedCapture(device=device):
-            solver.seed_double_buffer_events()
             rollout.block()
         self.assertEqual(counted[0], 2 * len(owner.groups))
 
@@ -1149,7 +1135,6 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                         _classify_every_launch(owner)
                     rollout = _Rollout(model, solver, copy_back=True)
                     with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
-                        solver.seed_double_buffer_events()
                         rollout.step()
                     groups = len(_groups(owner))
                     if classified:
@@ -1211,7 +1196,6 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                         _classify_every_launch(owner)
                     rollout = _Rollout(model, solver)
                     with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
-                        solver.seed_double_buffer_events()
                         rollout.block()
                     if motion:
                         expected, forms = {"repair": 2 * groups}, ["one_pass"] * 2
@@ -1383,7 +1367,6 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                             _cleared_arrays() as cleared,
                             wp.ScopedCapture(device=device) as capture,
                         ):
-                            solver.seed_double_buffer_events()
                             rollout.block()
                         cleared_lists = [any(array is group._list_counts for array in cleared) for group in groups]
                         if motion:
@@ -1746,204 +1729,6 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             stamps = group.data.source_q.numpy()
             stamps[rng.random(count) < 0.2] = 12345
             group.data.source_q.assign(stamps)
-
-
-def _mass_matrices(solver):
-    """Both double-buffer slots' dense mass matrices, by slot and DOF size."""
-    return [(slot, size, array) for slot, buffers in enumerate(solver._H_bufs) for size, array in buffers.items()]
-
-
-class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
-    def test_stage_two_reads_mass_only_without_an_owner(self):
-        """Under the held tree no stage-2 route reads a dense mass matrix, so the plan lists every size as unread.
-
-        The held tree's sizes take the held refresh and the compact size no factorization; without an owner the
-        diagonal, tiled and loop routes factor H.
-        """
-        sizes = (2, 4, 6, 18, 24, 25)
-
-        def opaque():
-            return {size: object() for size in sizes}
-
-        solver = SimpleNamespace(
-            _compact_diagonal_mass_size=2,
-            placement=SimpleNamespace(sparse_mass_matrix_size=None),
-            _execution_plan=SimpleNamespace(
-                use_diagonal_mass=lambda size: size == 4,
-                use_tiled_cholesky=lambda size: size >= 20,
-                selection_reasons=lambda size: {},
-            ),
-            _kernel_choice_reasons={"cholesky_kernel": "Automatic selection."},
-            _cholesky_kernels_by_size=opaque(),
-            _paired_response_primary_size=None,
-            _paired_factor_coordinates=False,
-            model=SimpleNamespace(device="cpu"),
-            tile_threads=64,
-            mass_update_mask=object(),
-            H_by_size=opaque(),
-            R_by_size=opaque(),
-            L_by_size=opaque(),
-            forest=SimpleNamespace(
-                size_groups=list(sizes), n_arts_by_size=dict.fromkeys(sizes, 3), group_to_art=opaque()
-            ),
-        )
-        # The route row's sizes: the compact diagonal size 2, no native sparse factor.
-        row = SimpleNamespace(sizes={"packed": None, "diagonal": 2}, reasons={"K1": "No sparse factors."})
-        held = step_plan._factor(SimpleNamespace(**vars(row), evaluator="held"), solver)
-        self.assertEqual(
-            {size: route.name for size, route in held.items()}, {2: "none", **dict.fromkeys(sizes[1:], "held")}
-        )
-        routes = step_plan._factor(SimpleNamespace(**vars(row), evaluator="ordinary"), solver)
-        self.assertEqual(
-            {size: route.name for size, route in routes.items()},
-            {2: "none", 4: "diagonal", 6: "loop", 18: "loop", 24: "tiles", 25: "tiles"},
-        )
-        # The ordinary evaluator's view of the solver: its plan and mass matrices, the tree factor's L, R and mask.
-        ordinary = SimpleNamespace(
-            solver=solver,
-            model=solver.model,
-            forest=solver.forest,
-            tree=SimpleNamespace(
-                mass_update_mask=solver.mass_update_mask, R_by_size=solver.R_by_size, L_by_size=solver.L_by_size
-            ),
-            cholesky_kernels_by_size=solver._cholesky_kernels_by_size,
-        )
-        launched = []
-
-        def record(kernel, *args, inputs=(), **kwargs):
-            launched.extend(inputs)
-
-        with patch.object(wp, "launch", record), patch.object(wp, "launch_tiled", record):
-            for table, owner in ((held, True), (routes, False)):
-                solver._plan = SimpleNamespace(factor=table)
-                for size, route in table.items():
-                    launched.clear()
-                    OrdinaryTree.factor(ordinary, size)
-                    reads = any(item is solver.H_by_size[size] for item in launched)
-                    self.assertEqual(reads, not owner and route.name != "none", f"size {size}, owner {owner}")
-
-    def test_step_factors_every_size_through_the_plan(self):
-        """Dispatch each size's stage-2 factorization in ``step`` through the plan's factor route.
-
-        ``unread_mass_sizes`` reads the same table, so the sizes whose clear it skips cannot drift
-        from the factorizations a step runs.
-        """
-        model = _build(wp.get_device("cpu"), worlds=2)
-        with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        state_in, state_out = model.state(), model.state()
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        factor = OrdinaryTree.factor
-        with patch.object(OrdinaryTree, "factor", autospec=True, side_effect=factor) as recorded:
-            solver.step(state_in, state_out, model.control(), None, DT)
-        self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.forest.size_groups))
-        self.assertTrue(all(call.args[0] is solver.factor.ordinary for call in recorded.call_args_list))
-
-    def test_owner_stage1_writes_no_mass_matrix(self):
-        """Leave every dense mass matrix untouched in stage 1 while a held-tree owner refreshes the factors.
-
-        No other stage writes H, so under an owner H keeps its allocation zeros and the end-of-step
-        clear its sizes skip could not change a value even with a reader. Without the owner the
-        same stage clears and fills H.
-        """
-        model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        state_in = model.state()
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        matrices = list(solver.H_by_size.values())
-        self.assertTrue(matrices)
-
-        def touched_matrices():
-            """Run stage 1 with launches and clears recorded, not executed; return the H arrays they touch."""
-            touched = []
-
-            def launch(kernel, *args, inputs=(), outputs=(), **kwargs):
-                touched.extend([*inputs, *outputs])
-
-            def zero(array):
-                touched.append(array)
-
-            with (
-                patch.object(wp, "launch", launch),
-                patch.object(wp, "launch_tiled", launch),
-                patch.object(wp.array, "zero_", zero),
-            ):
-                solver.factor.refresh(None, solver._step)
-            return [array for array in matrices if any(item is array for item in touched)]
-
-        refreshed = []
-        solver.factor.held = SimpleNamespace(refresh=refreshed.append)
-        self.assertEqual(touched_matrices(), [])
-        self.assertEqual(refreshed, [solver.factor])
-        solver.factor.held = None
-        solver.factor.ordinary = OrdinaryTree(solver)
-        self.assertEqual(len(touched_matrices()), len(matrices))
-
-    def test_clear_record_names_the_double_buffer(self):
-        """Record no double-buffer mass matrix clear on a route without a double buffer.
-
-        Stage 1 of the ordinary route clears H there, so an empty list must not read as "no clears".
-        """
-        model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-        self.assertIsNone(solver._memset_stream)
-        dynamics = solver.get_path_selection()["routes"]["dynamics"]
-        self.assertEqual(dynamics["double_buffer_mass_matrix_clear_dofs"], [])
-        self.assertNotIn("mass_matrix_clear_dofs", dynamics)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
-    def test_cuda_held_owner_clears_no_mass_matrix(self):
-        """Issue no end-of-step mass matrix clear under a held-tree owner, and every clear without one."""
-        device = wp.get_device("cuda:0")
-        for owner in (True, False):
-            with self.subTest(owner=owner):
-                model = _build(device, worlds=4)
-                solver = _mixed_solver(model, owner=owner)
-                self.assertEqual(solver.factor.held is not None, owner)
-                self.assertIsNotNone(solver._memset_stream)
-                record = solver.get_path_selection()["routes"]["dynamics"]["double_buffer_mass_matrix_clear_dofs"]
-                self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.forest.size_groups))
-                matrices = _mass_matrices(solver)
-                rollout = _Rollout(model, solver)
-                zeroed, zero = [], wp.array.zero_
-
-                def recording(array, zeroed=zeroed, zero=zero):
-                    zeroed.append(array)
-                    return zero(array)
-
-                with patch.object(wp.array, "zero_", recording):
-                    for _ in range(6):
-                        rollout.step()
-                cleared = {(slot, size) for slot, size, array in matrices if any(array is z for z in zeroed)}
-                # With update_mass_matrix_interval=2 the refresh steps use slot 0 alone.
-                expected = set() if owner else {(0, int(size)) for size in solver.forest.size_groups}
-                self.assertEqual(cleared, expected)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
-    def test_cuda_poisoned_mass_matrix_is_never_read(self):
-        """Step identically with both mass matrix slots poisoned by NaN under a held-tree owner.
-
-        The poison is never cleared and never reaches the state, so no stage reads H.
-        """
-        device = wp.get_device("cuda:0")
-        finals = []
-        for poisoned in (False, True):
-            model = _build(device, worlds=4)
-            solver = _mixed_solver(model)
-            self.assertIsNotNone(solver.factor.held)
-            if poisoned:
-                for _, _, array in _mass_matrices(solver):
-                    array.fill_(float("nan"))
-            rollout = _Rollout(model, solver)
-            for _ in range(20):
-                rollout.step()
-            if poisoned:
-                for slot, size, array in _mass_matrices(solver):
-                    self.assertTrue(np.isnan(array.numpy()).all(), f"slot {slot}, size {size}")
-            finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
-        for field in STATE_FIELDS:
-            self.assertTrue(np.isfinite(finals[1][field]).all(), field)
-            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
 if __name__ == "__main__":

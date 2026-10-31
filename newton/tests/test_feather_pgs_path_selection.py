@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, co
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.step_plan import StepPlan
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import recomputing
 from newton.tests.feather_pgs_patch_parity import (
     STANDING_REGION_BOUNDS,
     anchor_sites,
@@ -218,8 +219,9 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=Fa
     ``after_reset(solver, contacts)`` runs after the first replay that follows
     the reset; seven more replays follow it. ``deterministic`` sorts contacts.
     """
-    with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached_dynamics == "off" else {}):
-        solver = _make_solver(model, sparse, **options)
+    solver = _make_solver(model, sparse, **options)
+    if cached_dynamics == "off":
+        recomputing(solver)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=deterministic)
@@ -248,11 +250,10 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=Fa
 def _first_patch_step(model, cached_dynamics):
     """Step a fresh standing solver once, eagerly, and copy the poses and twists its release test reads."""
     # The caller compares the opt-in stage-3 snapshot of the predicted velocity.
-    with (
-        patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}),
-        patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"} if cached_dynamics == "off" else {}),
-    ):
+    with patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}):
         solver = _make_solver(model, False)
+    if cached_dynamics == "off":
+        recomputing(solver)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=True)
@@ -289,11 +290,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         with assert_host_only():
             selected = solver.get_path_selection()
         self.assertIn("CUDA", selected["reasons"]["sparse_mass_matrix"])
-        self.assertIn("tree cache admitted", selected["reasons"]["cached_dynamics"])
-        self.assertIn("CPU", selected["routes"]["stages"]["factor"]["1"]["reason"])
+        self.assertEqual(selected["routes"]["stages"]["factor"]["1"]["route"], "held")
         # Benchmark results store this record with json.dumps(..., allow_nan=False).
         json.dumps(selected, allow_nan=False)
-        selected["reasons"]["cached_dynamics"] = "edited"
+        selected["reasons"]["publication"] = "edited"
         selected["routes"]["friction"]["law"] = "edited"
         selected["options"]["pgs_iterations"]["applied"] = -1
         again = solver.get_path_selection()
@@ -816,9 +816,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # resident, under either friction law.
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320, "friction_anchor_beta": 0.0}, {}),
-            # Ordinary dynamics under either friction law.
-            ({"sparse_mass_matrix": "off", "cached_dynamics": "off", "friction_anchor_beta": 0.0}, {}),
-            ({"sparse_mass_matrix": "off", "cached_dynamics": "off"}, {}),
         )
         built = resident_rows = 0
         for options, model_options in cases:
@@ -826,8 +823,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 arguments, pins = dict(options), {}
                 if arguments.pop("sparse_mass_matrix", None) == "off":
                     pins["storage"] = "dense"
-                if arguments.pop("cached_dynamics", None) == "off":
-                    pins["evaluator"] = "ordinary"
                 try:
                     with patch.dict(SolverFeatherPGS._route_pins, pins):
                         solver = _make_solver(_build_model(**model_options), True, **arguments)
@@ -888,19 +883,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         )
 
     def test_kernel_pins_are_validated_on_the_cpu(self):
-        """Run the CPU's loop kernels, accept their own pins, and reject an invalid or a CUDA-only pin."""
+        """Run the CPU's row-parallel response, accept its pin, and reject an invalid or a CUDA-only pin."""
         model = _cpu_model()
-        solver = SolverFeatherPGS(model)
-        self.assertEqual(solver.cholesky_kernel, "loop")
-        self.assertIn("CPU", solver.get_path_selection()["routes"]["stages"]["factor"]["1"]["reason"])
-        with patch.dict(SolverFeatherPGS._route_pins, {"cholesky_kernel": "loop"}):
-            self.assertEqual(SolverFeatherPGS(model).cholesky_kernel, "loop")
-        for name, value in (
-            ("cholesky_kernel", "invalid"),
-            ("cholesky_kernel", "tiled"),
-            ("trisolve_kernel", "tiled"),
-            ("hinv_jt_kernel", "tiled"),
-        ):
+        self.assertEqual(SolverFeatherPGS(model).hinv_jt_kernel, "par_row")
+        with patch.dict(SolverFeatherPGS._route_pins, {"hinv_jt_kernel": "par_row"}):
+            self.assertEqual(SolverFeatherPGS(model).hinv_jt_kernel, "par_row")
+        for name, value in (("hinv_jt_kernel", "invalid"), ("hinv_jt_kernel", "tiled")):
             with (
                 self.subTest(name=name, value=value),
                 patch.dict(SolverFeatherPGS._route_pins, {name: value}),
@@ -1001,10 +989,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = _make_solver(model, False, friction_anchor_beta=0.0)
         self.assertEqual(solver.get_path_selection()["cached_dynamics"], "on")
         self.assertEqual(solver.get_path_selection()["cached_prediction"], "tree")
-        # The evaluator pin retains ordinary dynamics.
-        with patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
-            solver = _make_solver(model, False, friction_anchor_beta=0.0)
-        self.assertEqual(solver.get_path_selection()["cached_dynamics"], "off")
         # A revolute joint at the world is a joint root: its coordinates are a descendant's.
         world = newton.ModelBuilder()
         joints, parent = [], -1
@@ -1146,10 +1130,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_dense_patch_graph_and_reset(self):
-        """Cache the dense route under default patch friction with the ordinary step-0 operators and anchor lifecycle.
+        """Cache the dense route under default patch friction, against a solver that recomputes every step.
 
-        One eager step from the same state isolates the owner: its predicted
-        velocity, row Jacobians and biases match the ordinary route's, and each
+        One eager step from the same state isolates the cache: its predicted
+        velocity, row Jacobians and biases match the recomputing route's, and each
         route's release test reads, and publishes, forward kinematics of its
         integrated state. The owner's own forward kinematics rewrites the input
         poses by a few ulps, which the resting feet's 1/dt position gain turns
@@ -1165,10 +1149,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         degrees of freedom), so they do not compare across routes.
         """
         model = standing_model()
-        # Without the owner this is the ordinary patch route, so that the arms differ by the owner alone.
+        # The arms differ by the cache alone: the first recomputes its held state from every step's input.
         first = [_first_patch_step(model, choice) for choice in ("off", "on")]
-        self.assertIsNone(first[0][0].get_path_selection()["cached_prediction"])
-        self.assertEqual(first[1][0].get_path_selection()["cached_prediction"], "tree")
         kinematics = model.state()
         for _solver, _contacts, output, released in first:
             self.assertTrue(released, "The release test must run")
@@ -1212,8 +1194,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             _graph_and_reset_rollout(model, False, choice, deterministic=True, after_reset=reset_restarts_world_0)
             for choice in ("off", "on")
         ]
-        self.assertIsNone(runs[0][0].get_path_selection()["cached_prediction"])
-        self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
         for solver, contacts, _state in runs:
             self.assertTrue(solver.laws.friction_anchors_enabled)
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)

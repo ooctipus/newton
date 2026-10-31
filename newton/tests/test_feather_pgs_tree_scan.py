@@ -15,9 +15,7 @@ that picks them.
 * :class:`TestHeldTreeChains`: trees of 32 bodies or fewer whose heavy chains
   need two warps run the chain scans on two warps.
 * :class:`TestScheduleRule`: the schedule follows from the plan's data.
-* :class:`TestPath`: a PATH visits the root path, natively and in Warp.
-
-The general route's passes are tested in ``test_feather_pgs_tree_passes``.
+* :class:`TestPath`: a PATH visits the root path.
 """
 
 import unittest
@@ -521,34 +519,13 @@ class TestScheduleRule(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The general route
+# The root path
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@wp.struct
-class _PathVisits:
-    rank: wp.array[int]
-    visits: wp.array[int]
-    count: int
-
-
-@wp.func
-def _record_visit(ancestor: int, node: int, value: int, d: _PathVisits, count: int):
-    d.visits[node * count + ancestor] = wp.atomic_add(d.rank, node, value) + value
-
-
-_RECORD_PATH = ts.serial_path(_record_visit)
-
-
-@wp.kernel
-def _warp_path(root: int, order: wp.array[int], position: wp.array[int], end: wp.array[int], d: _PathVisits):
-    node = wp.tid()
-    _RECORD_PATH(root, node, 1, order, position, end, d, d.count)
-
-
 def check_path(test, device):
-    """A PATH visits a node's ancestors and the node, root first: the native walk (parent-first plans and
-    others) and the Warp walk, against the parent pointers."""
+    """A PATH visits a node's ancestors and the node, root first (parent-first plans and others), against the
+    parent pointers."""
     for shape in ("random24", "binary31", "star32", "chain32", "humanoid44", "random60"):
         parent = np.asarray(SHAPES[shape])
         # The same tree with its nodes renumbered so that children precede parents.
@@ -581,16 +558,6 @@ def check_path(test, device):
             kernel = wp.kernel(enable_backward=False, module="unique")(run)
             wp.launch(kernel, n, inputs=[ts.device_plan(plan, device), n, visits], device=device)
             np.testing.assert_array_equal(visits.numpy().reshape(n, n), expected, err_msg=f"native {shape} {label}")
-            d = _PathVisits()
-            d.rank = wp.zeros(n, dtype=int, device=device)
-            d.visits = wp.zeros(n * n, dtype=int, device=device)
-            d.count = n
-            arrays = [
-                wp.array(a.astype(np.int32), dtype=int, device=device)
-                for a in (plan.dfs_order, plan.dfs_position, plan.dfs_end)
-            ]
-            wp.launch(_warp_path, n, inputs=[int(plan.roots[0]), *arrays, d], device=device)
-            np.testing.assert_array_equal(d.visits.numpy().reshape(n, n), expected, err_msg=f"Warp {shape} {label}")
 
 
 class TestPath(unittest.TestCase):

@@ -71,11 +71,7 @@ from .row_laws import (
     velocity_limit_active,
 )
 from .solver_fields import Connects, Links, LocalOwners, Mimics
-from .spatial_laws import drive_force, drive_stiffness, free_root_transport, point_velocity
-from .tree_passes import (
-    DynamicsData,
-    articulation_tau,
-)
+from .spatial_laws import free_root_transport, point_velocity
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # Type 1 was the PhysX drive row; drives fold into the mass matrix.
@@ -101,10 +97,8 @@ PGS_CONSTRAINT_TYPE_CONNECT = 6
 PGS_CONSTRAINT_TYPE_TORSION = 7
 PGS_CONSTRAINT_TYPE_COUNT = 8
 
-# Keep launch-geometry-specific dynamics kernels out of the large general
-# kernel module. Warp compiles one whole module variant per block dimension:
-# the inverse-dynamics drives launch at tree_passes.SERIAL_BLOCK_DIM.
-_INVERSE_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.inverse_dynamics")
+# Keep launch-geometry-specific kernels out of the large general kernel module: Warp compiles one whole module variant
+# per block dimension.
 _MASS_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.mass_dynamics")
 
 PGS_LOCAL_SOLVE_OWNER_GENERAL = 0
@@ -423,28 +417,6 @@ def prepare_fused_diagonal_joint_limits(
     upper_rhs[world, local_dof] = rhs_upper
 
 
-@wp.kernel(module=_MASS_DYNAMICS_KERNEL_MODULE)
-def solve_diagonal_mass(
-    L_group: wp.array3d[float],
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    joint_tau: wp.array[float],
-    # output
-    joint_qdd: wp.array[float],
-):
-    """Solve a structurally diagonal generalized mass system through its leaf-first pivots."""
-    element = wp.tid()
-    group = element // n_dofs
-    dof = element - group * n_dofs
-    art = group_to_art[group]
-    global_dof = articulation_dof_start[art] + dof
-    pivot = n_dofs - 1 - dof
-    diagonal = L_group[group, pivot, pivot]
-    value = joint_tau[global_dof] / diagonal
-    joint_qdd[global_dof] = value / diagonal
-
-
 @wp.func
 def _active_free_root_dof_start(
     free_root_joint_indices: wp.array[int],
@@ -465,35 +437,6 @@ def _active_free_root_dof_start(
     if kinematic_joint_mask[joint] != 0:
         return -1
     return joint_qd_start[joint]
-
-
-@wp.kernel
-def apply_free_root_transport_to_predictor(
-    free_root_joint_indices: wp.array[int],
-    joint_qd_start: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
-    joint_qd: wp.array[float],
-    dt: float,
-    # in/out
-    v_hat: wp.array[float],
-):
-    """Lift the free root's velocity predictor onto the integrator's convention.
-
-    ``jcalc_integrate`` realizes ``qd + (qdd + omega x v) * dt`` for the root's
-    linear coordinate. Constraint rows are built against ``v_hat``, so without
-    the same term here every contact, friction, and velocity-limit row sees a
-    COM velocity the integrator never produces, off by ``dt * (omega x v)``.
-    """
-    root_index = wp.tid()
-    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
-    if d < 0:
-        return
-    v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
-    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
-    c = wp.cross(w, v)
-    v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
-    v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
-    v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
 
 
 @wp.func
@@ -551,20 +494,13 @@ def _light_apply_free_root_velocity_corrections(
     cholesky: wp.array3d[float],
     joint_qd: wp.array[float],
     dt: float,
-    apply_transport: bool,
     v_hat: wp.array[float],
 ):
-    """Fuse free-root transport with the isolated rigid-body gyroscopic update."""
+    """The isolated rigid-body gyroscopic update of a free root's predicted velocity."""
     d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
     if d < 0:
         return
     w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
-    if apply_transport:
-        v = wp.vec3(joint_qd[d + 0], joint_qd[d + 1], joint_qd[d + 2])
-        c = wp.cross(w, v)
-        v_hat[d + 0] = v_hat[d + 0] + c[0] * dt
-        v_hat[d + 1] = v_hat[d + 1] + c[1] * dt
-        v_hat[d + 2] = v_hat[d + 2] + c[2] * dt
     body = joint_child[free_root_joint_indices[root_index]]
     art = body_to_articulation[body]
     if is_free_rigid[art] == 0:
@@ -622,7 +558,6 @@ def apply_free_root_velocity_corrections(
     cholesky: wp.array3d[float],
     joint_qd: wp.array[float],
     dt: float,
-    apply_transport: bool,
     v_hat: wp.array[float],
 ):
     _light_apply_free_root_velocity_corrections(
@@ -639,7 +574,6 @@ def apply_free_root_velocity_corrections(
         cholesky,
         joint_qd,
         dt,
-        apply_transport,
         v_hat,
     )
 
@@ -687,19 +621,6 @@ def _light_remove_free_root_transport_from_qdd(
     joint_qdd[d + 0] = joint_qdd[d + 0] - c[0]
     joint_qdd[d + 1] = joint_qdd[d + 1] - c[1]
     joint_qdd[d + 2] = joint_qdd[d + 2] - c[2]
-
-
-@wp.kernel
-def remove_free_root_transport_from_qdd(
-    free_root_joint_indices: wp.array[int],
-    joint_qd_start: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
-    joint_qd: wp.array[float],
-    joint_qdd: wp.array[float],
-):
-    _light_remove_free_root_transport_from_qdd(
-        wp.tid(), free_root_joint_indices, joint_qd_start, kinematic_joint_mask, joint_qd, joint_qdd
-    )
 
 
 @wp.func
@@ -753,60 +674,6 @@ def _light_integrate_generalized_joints(
     )
 
 
-@wp.kernel
-def integrate_generalized_joints(
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    body_com: wp.array[wp.vec3],
-    joint_X_c: wp.array[wp.transform],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_qdd: wp.array[float],
-    dt: float,
-    joint_q_new: wp.array[float],
-    joint_qd_new: wp.array[float],
-):
-    _light_integrate_generalized_joints(
-        wp.tid(),
-        joint_type,
-        joint_parent,
-        joint_child,
-        joint_q_start,
-        joint_qd_start,
-        kinematic_joint_mask,
-        joint_dof_dim,
-        body_com,
-        joint_X_c,
-        joint_q,
-        joint_qd,
-        joint_qdd,
-        dt,
-        joint_q_new,
-        joint_qd_new,
-    )
-
-
-@wp.kernel
-def compute_velocity_predictor(
-    joint_qd: wp.array[float],
-    kinematic_dof_mask: wp.array[int],
-    dt: float,
-    # in/out
-    joint_qdd: wp.array[float],
-    # outputs
-    v_hat: wp.array[float],
-):
-    tid = wp.tid()
-    if kinematic_dof_mask[tid] != 0:
-        joint_qdd[tid] = 0.0
-    v_hat[tid] = joint_qd[tid] + joint_qdd[tid] * dt
-
-
 @wp.func
 def _light_update_qdd_from_velocity(
     tid: int,
@@ -821,17 +688,6 @@ def _light_update_qdd_from_velocity(
         joint_qdd[tid] = 0.0
     else:
         joint_qdd[tid] = (v_new[tid] - joint_qd[tid]) * inv_dt
-
-
-@wp.kernel
-def update_qdd_from_velocity(
-    joint_qd: wp.array[float],
-    kinematic_dof_mask: wp.array[int],
-    inv_dt: float,
-    v_new: wp.array[float],
-    joint_qdd: wp.array[float],
-):
-    _light_update_qdd_from_velocity(wp.tid(), joint_qd, kinematic_dof_mask, inv_dt, v_new, joint_qdd)
 
 
 @wp.func
@@ -969,127 +825,6 @@ def pack_contact_linear_force_as_spatial(
         contact_count,
         rigid_contact_force,
         contact_force,
-    )
-
-
-@wp.func
-def prepare_articulation_augmented_drives(
-    articulation: int,
-    articulation_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    joint_type: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_target_q_start: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    passive_damping: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    tau: wp.array[float],
-):
-    """Prepare one articulation's implicit drive rows and add their explicit force to ``tau``."""
-    joint_start = articulation_start[articulation]
-    joint_end = articulation_start[articulation + 1]
-    if articulation_H_rows[articulation] == 0:
-        row_counts[articulation] = 0
-        return
-
-    slot = int(0)
-    for joint_index in range(joint_start, joint_end):
-        type = joint_type[joint_index]
-        if type != JointType.PRISMATIC and type != JointType.REVOLUTE and type != JointType.D6:
-            continue
-
-        axis_count = joint_dof_dim[joint_index, 0] + joint_dof_dim[joint_index, 1]
-        qd_start = joint_qd_start[joint_index]
-        coord_start = joint_q_start[joint_index]
-        target_start = joint_target_q_start[joint_index]
-        for axis in range(axis_count):
-            if slot >= max_dofs:
-                break
-            dof_index = qd_start + axis
-            ke = joint_target_ke[dof_index]
-            kd = joint_target_kd[dof_index]
-            K = drive_stiffness(ke, kd, passive_damping[dof_index], dt)
-            if K <= 0.0:
-                continue
-
-            u0 = drive_force(
-                ke,
-                kd,
-                joint_q[coord_start + axis],
-                joint_qd[dof_index],
-                joint_target_pos[target_start + axis],
-                joint_target_vel[dof_index],
-                joint_effort_limit[dof_index],
-                dt,
-            )
-
-            row_index = articulation * max_dofs + slot
-            row_dof_index[row_index] = dof_index
-            row_K[row_index] = K
-            tau[dof_index] = tau[dof_index] + u0
-            slot += 1
-            if slot >= max_dofs:
-                break
-
-    row_counts[articulation] = slot
-
-
-@wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)
-def eval_rigid_tau_and_augmented_drives(
-    d: DynamicsData,
-    articulation_H_rows: wp.array[int],
-    joint_target_q_start: wp.array[int],
-    joint_target_ke: wp.array[float],
-    joint_target_kd: wp.array[float],
-    joint_target_pos: wp.array[float],
-    joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
-    max_dofs: int,
-    dt: float,
-    # outputs
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-):
-    """An articulation's joint forces (:func:`.tree_passes.articulation_tau`) and its augmented drives in one
-    launch; one thread per articulation."""
-    articulation = wp.tid()
-    articulation_tau(articulation, d)
-    prepare_articulation_augmented_drives(
-        articulation,
-        d.articulation_start,
-        articulation_H_rows,
-        d.joint_type,
-        d.joint_qd_start,
-        d.joint_q_start,
-        joint_target_q_start,
-        d.joint_dof_dim,
-        d.joint_q,
-        d.joint_qd,
-        joint_target_ke,
-        joint_target_kd,
-        joint_target_pos,
-        joint_target_vel,
-        joint_effort_limit,
-        d.damping,
-        max_dofs,
-        dt,
-        row_counts,
-        row_dof_index,
-        d.row_K,
-        d.tau,
     )
 
 
@@ -2577,46 +2312,6 @@ def snapshot_dense_phase_bound(
     dense_phase_bounds[world, bound_index] = world_slot_counter[world]
 
 
-@wp.kernel
-def apply_augmented_mass_diagonal_grouped(
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    max_dofs: int,
-    mass_update_mask: wp.array[int],
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    # outputs
-    H_group: wp.array3d[float],  # [n_arts, n_dofs, n_dofs]
-):
-    """Apply augmented mass diagonal for grouped H storage."""
-    idx = wp.tid()
-    articulation = group_to_art[idx]
-
-    if mass_update_mask[articulation] == 0:
-        return
-
-    count = row_counts[articulation]
-    if count == 0:
-        return
-
-    dof_start = articulation_dof_start[articulation]
-
-    for i in range(count):
-        row_index = articulation * max_dofs + i
-        dof = row_dof_index[row_index]
-        local = dof - dof_start
-        if local < 0 or local >= n_dofs:
-            continue
-
-        K = row_K[row_index]
-        if K <= 0.0:
-            continue
-
-        H_group[idx, local, local] += K
-
-
 # --- Tile configuration for contact system build ---
 # Kernel naming: {op}_{parallelism}
 # parallelism: tiled | loop | par_row | par_row_col | par_dof
@@ -2631,26 +2326,6 @@ TILE_CONSTRAINTS = wp.constant(128)
 
 # Threads per tile/block for tile kernels
 TILE_THREADS = 64
-
-
-@wp.kernel
-def update_body_qd_from_featherstone(
-    body_v_s: wp.array[wp.spatial_vector],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    body_to_articulation: wp.array[int],
-    articulation_origin: wp.array[wp.vec3],
-    body_qd_out: wp.array[wp.spatial_vector],
-):
-    tid = wp.tid()
-
-    twist = body_v_s[tid]  # spatial twist about origin
-    com_world = wp.transform_point(body_q[tid], body_com[tid])
-    art = body_to_articulation[tid]
-    origin = wp.vec3()
-    if art >= 0:
-        origin = articulation_origin[art]
-    body_qd_out[tid] = wp.spatial_vector(point_velocity(twist, com_world - origin), wp.spatial_bottom(twist))
 
 
 # =============================================================================
@@ -3455,91 +3130,3 @@ def clear_local_solve_diag(
 # =============================================================================
 # Tiled kernels for homogenous multi-articulation support
 # =============================================================================
-
-
-@wp.kernel
-def trisolve_loop(
-    L_group: wp.array3d[float],  # [n_arts_of_size, n_dofs, n_dofs]
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    joint_tau: wp.array[float],  # [total_dofs]
-    # output
-    joint_qdd: wp.array[float],  # [total_dofs]
-):
-    """
-    Solve H qdd = tau for grouped articulations by forward/backward substitution with the leaf-first factor
-    ``P H P^T = L L^T`` (factor coordinate ``i`` at physical coordinate ``n_dofs - 1 - i``).
-
-    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
-    """
-    idx = wp.tid()
-    art = group_to_art[idx]
-    last = articulation_dof_start[art] + n_dofs - 1
-
-    # Forward substitution: L z = P tau
-    # z is stored temporarily in joint_qdd
-    for i in range(n_dofs):
-        val = joint_tau[last - i]
-        for k in range(i):
-            L_ik = L_group[idx, i, k]
-            val -= L_ik * joint_qdd[last - k]
-
-        L_ii = L_group[idx, i, i]
-        if L_ii != 0.0:
-            joint_qdd[last - i] = val / L_ii
-        else:
-            joint_qdd[last - i] = 0.0
-
-    # Backward substitution: L^T (P qdd) = z
-    for i_rev in range(n_dofs):
-        i = n_dofs - 1 - i_rev
-
-        val = joint_qdd[last - i]
-        for k in range(i + 1, n_dofs):
-            L_ki = L_group[idx, k, i]
-            val -= L_ki * joint_qdd[last - k]
-
-        L_ii = L_group[idx, i, i]
-        if L_ii != 0.0:
-            joint_qdd[last - i] = val / L_ii
-        else:
-            joint_qdd[last - i] = 0.0
-
-
-@wp.kernel
-def gather_tau_to_groups(
-    joint_tau: wp.array[float],  # [total_dofs]
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    tau_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
-):
-    """Gather joint_tau from 1D array into grouped 3D buffer for tiled solve.
-
-    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
-    """
-    idx = wp.tid()
-    art = group_to_art[idx]
-    dof_start = articulation_dof_start[art]
-    for i in range(n_dofs):
-        tau_group[idx, i, 0] = joint_tau[dof_start + i]
-
-
-@wp.kernel
-def scatter_qdd_from_groups(
-    qdd_group: wp.array3d[float],  # [n_arts, n_dofs, 1]
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    n_dofs: int,
-    joint_qdd: wp.array[float],  # [total_dofs]
-):
-    """Scatter qdd from grouped 3D buffer back to 1D array after tiled solve.
-
-    Thread dimension: n_arts_of_size (one thread per articulation in this size group)
-    """
-    idx = wp.tid()
-    art = group_to_art[idx]
-    dof_start = articulation_dof_start[art]
-    for i in range(n_dofs):
-        joint_qdd[dof_start + i] = qdd_group[idx, i, 0]

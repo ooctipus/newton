@@ -13,17 +13,15 @@ velocities (BACKBONE §2).
 - the body inertia records, the articulation origins and the passive joint forces;
 - the mass-update cadence, its requests and the FK/ID cache.
 
-Its evaluator is the held tree (:mod:`.held_tree`) where that admits the solver, else the ordinary stages
-(:mod:`.tree_ordinary`) behind the same calls, until D. A step calls :meth:`TreeFactor.factor` (FK/ID, the drives'
-K and u0, the mass-update mask, the factor refresh), :meth:`TreeFactor.predict` (``v_hat``),
-:meth:`TreeFactor.leave` (``v = v_hat + P^T L^-T du``, where the sweep stores ``du``) and
-:meth:`TreeFactor.finish` (``qdd``, integrate, publish).
+Its evaluator is the held tree (:mod:`.held_tree`). A step calls :meth:`TreeFactor.factor` (FK/ID, the drives' K and
+u0, the mass-update mask, the factor refresh), :meth:`TreeFactor.predict` (``v_hat``), :meth:`TreeFactor.leave`
+(``v = v_hat + P^T L^-T du``, where the sweep stores ``du``) and :meth:`TreeFactor.finish` (``qdd``, integrate,
+publish).
 """
 
 from __future__ import annotations
 
 import warnings
-from contextlib import contextmanager
 
 import numpy as np
 import warp as wp
@@ -35,7 +33,6 @@ from .field_group import SolverArrays
 from .joint_table import JointTable
 from .kernels import (
     BodyFactors,
-    apply_free_root_transport_to_predictor,
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     compute_com_transforms,
@@ -50,11 +47,9 @@ from .solver_fields import (
     ARTICULATION_WORK,
     AUGMENTED_DRIVE_ROWS,
     BODY_INERTIA,
-    JOINT_FOREST,
     PREELIMINATION,
     PREELIMINATION_PLAN,
     SIZE_FACTORS,
-    SIZE_GROUPED_SOLVE,
     SPARSE_FACTOR,
     STATE_AUX,
     Preelim,
@@ -116,7 +111,7 @@ class TreeFactor:
     Built in the solver's construction order: the cadence, the cache and the augmented state here, then
     :meth:`kinematic_state` and :meth:`apply_kinematic_state`, :meth:`plan` once the forest plan and the row laws
     exist, :meth:`allocate_common`, :meth:`allocate_size_groups`, :meth:`build_body_factors`,
-    :meth:`scatter_armature`, :meth:`install` and :meth:`init_size_streams`.
+    :meth:`scatter_armature` and :meth:`install`.
 
     Args:
         model: The solver's model.
@@ -136,10 +131,7 @@ class TreeFactor:
         # Host mirror of the global mass-update flag the last factor() evaluated; it gates the per-step H memsets.
         self.mass_update_global_flag = True
         self.last_step_dt = None
-        self.fk_id_cache_available = bool(model.articulation_count and model.joint_count)
-        # The held tree's cache of next-step dynamics (enabled by install); ordinary dynamics derive them from the
-        # state at every step.
-        self.fk_id_cache_enabled = False
+        # The held tree's cache of next-step dynamics.
         self.fk_id_cache_source_state = None
         self.fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         # The augmented state is allocated here rather than on the first step: a wp.zeros() issued inside a CUDA
@@ -154,20 +146,13 @@ class TreeFactor:
         self.armature_floor = None
         self.L_by_size: dict[int, wp.array] = {}
         self.R_by_size: dict[int, wp.array] = {}
-        self.tau_by_size: dict[int, wp.array] = {}
-        self.qdd_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
         self.body_factors = None
         self.eliminates = False
         self.elimination = None
         self.block_count = 0
         self.held = None
-        self.held_reason = None
-        self.ordinary = None
         self.dynamics_stream = None
-        self.size_streams: dict[int, wp.Stream | None] = {}
-        self.size_events: dict[int, wp.Event | None] = {}
-        self._init_event = None
 
     # ---------------------------------------------------------------------------------------------------------------
     # Construction
@@ -251,10 +236,7 @@ class TreeFactor:
         """Take the forest plan and the row laws, then select the passive joint forces and the drive topology.
 
         The held tree's per-coordinate drive rows (each coordinate owns one, prepared apart from inverse dynamics)
-        hold wherever each coordinate has one owning drive row. The held tree's admission, which the
-        representations only it evaluates (the compact diagonal, the native sparse factor) read before they are
-        chosen, needs them; ordinary dynamics drop them once the held tree declines (:meth:`install`) and evaluate
-        drives with the joint forces.
+        hold wherever each coordinate has one owning drive row.
         """
         self.forest = forest
         self.laws = laws
@@ -450,7 +432,7 @@ class TreeFactor:
 
     def allocate_common(self) -> None:
         """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records (with the COM
-        frames and the joint forest's upload) and the articulation origins."""
+        frames) and the articulation origins."""
         model, forest, arrays = self.model, self.forest, self._arrays
         if model.joint_count:
             arrays.allocate(ARTICULATION_WORK, articulation=model.articulation_count)
@@ -461,7 +443,6 @@ class TreeFactor:
         )
         if model.body_count:
             arrays.allocate(BODY_INERTIA, body=model.body_count)
-            self._upload_joint_forest()
             wp.launch(
                 compute_com_transforms,
                 model.body_count,
@@ -478,21 +459,6 @@ class TreeFactor:
 
         arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
 
-    def _upload_joint_forest(self) -> None:
-        """Upload the joint forest's depth-first order, positions and subtree ends (``tree_passes.crba_fill``'s
-        ancestor test) and its up flags (the up scans', :attr:`.tree_plan.TreePlan.up_flags`)."""
-        if not self.model.joint_count:
-            self._arrays.release(JOINT_FOREST)
-            return
-        forest = self.forest.joint_forest
-        self._arrays.upload(
-            JOINT_FOREST,
-            _joint_dfs_order=forest.dfs_order,
-            _joint_dfs_position=forest.dfs_position,
-            _joint_dfs_end=forest.dfs_end,
-            _joint_up_flags=forest.up_flags,
-        )
-
     def allocate_sparse(self, plan, articulations: int) -> None:
         """The native sparse factor of ``articulations`` of one size: its pattern ``plan``, its device indices, its
         inverse entries and its status."""
@@ -501,18 +467,14 @@ class TreeFactor:
         self._arrays.allocate(SPARSE_FACTOR, group=articulations, nonzero=plan.nonzero_count)
 
     def allocate_size_groups(self, placeholder_sizes) -> None:
-        """Allocate each size group's factor L, armature R and dense-solve scratch; ``placeholder_sizes`` (the compact
-        diagonal and the native sparse factor) keep (1, 1, 1) placeholders of L and no scratch."""
+        """Allocate each size group's factor L and armature R; ``placeholder_sizes`` (the compact diagonal and the
+        native sparse factor) keep (1, 1, 1) placeholders of L."""
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
             placeholder = size in placeholder_sizes
             factor = 1 if placeholder else 0
             sizes = {"art": n_arts, "size": size, "factor_art": factor or n_arts, "factor_size": factor or size}
-            buffers = self._arrays.allocate(SIZE_FACTORS, owner={}, **sizes)
-            if not placeholder:
-                # Grouped scratch belongs to the dense triangular solve, not the compact paths.
-                buffers.update(self._arrays.allocate(SIZE_GROUPED_SOLVE, owner={}, **sizes))
-            for name, array in buffers.items():
+            for name, array in self._arrays.allocate(SIZE_FACTORS, owner={}, **sizes).items():
                 getattr(self, f"{name}_by_size")[size] = array
 
     def scatter_armature(self) -> None:
@@ -590,38 +552,13 @@ class TreeFactor:
         return self.body_factors
 
     def install(self, solver) -> None:
-        """Choose the evaluator: the held tree where :func:`.held_tree.install` admits it, else the ordinary stages.
-
-        Ordinary dynamics take the joint forces and the drives in one pass (K added after the assembly); the
-        per-coordinate drive rows are the held tree's, and their preparation overlaps FK/ID on a stream of its own.
-        """
+        """Hold the dynamics (:func:`.held_tree.install`); the drive rows' preparation overlaps FK/ID on a stream of
+        its own."""
         from . import held_tree  # noqa: PLC0415
 
-        self.held, self.held_reason = held_tree.install(solver)
-        if self.held is not None:
-            self.fk_id_cache_enabled = True
-        else:
-            self.parallel_drives = False
-            from .tree_ordinary import OrdinaryTree  # noqa: PLC0415
-
-            self.ordinary = OrdinaryTree(solver)
+        self.held = held_tree.install(solver)
         model = self.model
         self.dynamics_stream = wp.Stream(model.device) if self.parallel_drives and model.device.is_cuda else None
-
-    def init_size_streams(self) -> None:
-        """One CUDA stream and event per size group where several size groups launch in parallel (none on the CPU or
-        for a single size group)."""
-        model = self.model
-        self.size_streams = {}
-        self.size_events = {}
-        if model.device.is_cuda and len(self.forest.size_groups) > 1:
-            for size in self.forest.size_groups:
-                self.size_streams[size] = wp.Stream(model.device)
-                self.size_events[size] = wp.Event(model.device)
-        else:
-            for size in self.forest.size_groups:
-                self.size_streams[size] = None
-                self.size_events[size] = None
 
     # ---------------------------------------------------------------------------------------------------------------
     # Notifications
@@ -629,22 +566,18 @@ class TreeFactor:
 
     def forget_repair_continuity(self) -> None:
         """Launch the held tree's next repair after a host call that changes its validity or inputs."""
-        if self.held is not None:
-            self.held.forget_continuity()
+        self.held.forget_continuity()
 
     def track_step_dt(self, dt: float) -> None:
         """Record the step duration; a change refreshes mass and invalidates the FK/ID cache of every articulation."""
         if self.last_step_dt is not None and abs(self.last_step_dt - dt) > 1.0e-8:
             self.force_mass_update = True
-            if self.fk_id_cache_enabled:
-                self.fk_id_cache_valid.zero_()
+            self.fk_id_cache_valid.zero_()
             self.forget_repair_continuity()
         self.last_step_dt = dt
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation)."""
-        if not self.fk_id_cache_enabled:
-            return
         self.forget_repair_continuity()
         if articulations is None:
             self.fk_id_cache_valid.zero_()
@@ -664,7 +597,7 @@ class TreeFactor:
         # The held tree's proof stores a moved joint frame as its new reference, so it runs after every check that
         # can still refuse the notification.
         held = self.held
-        frames_proven = held is not None and held.validate_model(flags)
+        frames_proven = held.validate_model(flags)
         self.forget_repair_continuity()
         cache_inputs = int(flags) & int(
             ModelFlags.JOINT_PROPERTIES
@@ -678,16 +611,15 @@ class TreeFactor:
             # on CPU), and stepping never reads Model.joint_q: every cache input is as it was. Isaac Lab notifies so
             # on each fixed-root pose write. A moved frame leaves the flag in place and invalidates every cache below.
             cache_inputs = 0
-        elif held is not None and not frames_proven:
+        elif not frames_proven:
             from .tree_kinetic_owner import proof_runs  # noqa: PLC0415
 
             if proof_runs(flags):
                 # The proof ran and found a moved joint frame (a changed axis raises in every group's proof):
                 # invalidate every cache, whichever flag announced the move.
                 cache_inputs |= int(ModelFlags.JOINT_PROPERTIES)
-        if held is not None and cache_inputs:
+        if cache_inputs:
             held.invalidate()
-        if self.fk_id_cache_enabled and cache_inputs:
             self.fk_id_cache_valid.zero_()
         if kinematic is not None:
             self.apply_kinematic_state(kinematic)
@@ -708,19 +640,17 @@ class TreeFactor:
     def reset_cache(self, state, world_mask: wp.array | None) -> None:
         """Invalidate the FK/ID cache of the worlds ``world_mask`` selects, and of every world when ``state`` is not
         the state the cache was derived from (unless the held tree compares input banks)."""
-        if self.fk_id_cache_enabled:
-            wp.launch(
-                invalidate_articulation_fk_id_cache,
-                dim=self.model.articulation_count,
-                inputs=[world_mask, self.forest.art_to_world],
-                outputs=[self.fk_id_cache_valid],
-                device=self.model.device,
-            )
+        wp.launch(
+            invalidate_articulation_fk_id_cache,
+            dim=self.model.articulation_count,
+            inputs=[world_mask, self.forest.art_to_world],
+            outputs=[self.fk_id_cache_valid],
+            device=self.model.device,
+        )
         if (
-            self.fk_id_cache_enabled
-            and self.fk_id_cache_source_state is not None
+            self.fk_id_cache_source_state is not None
             and state is not self.fk_id_cache_source_state
-            and not getattr(self.held, "bank_compare", False)
+            and not self.held.bank_compare
         ):
             self.fk_id_cache_valid.zero_()
             self.fk_id_cache_source_state = state
@@ -729,44 +659,8 @@ class TreeFactor:
     # The step
     # ---------------------------------------------------------------------------------------------------------------
 
-    @contextmanager
-    def _parallel_size_region(self):
-        """Context for parallel dispatch across size groups."""
-        if not self.model.device.is_cuda or len(self.forest.size_groups) <= 1:
-            yield
-            return
-
-        main_stream = wp.get_stream(self.model.device)
-        self._init_event = main_stream.record_event()
-        try:
-            yield
-        finally:
-            for size in self.forest.size_groups:
-                stream = self.size_streams.get(size)
-                if stream is not None:
-                    main_stream.wait_event(stream.record_event())
-            self._init_event = None
-
-    @contextmanager
-    def _on_size_stream(self, size: int):
-        """Execute block on this size's CUDA stream."""
-        stream = self.size_streams.get(size)
-        if stream is not None and self._init_event is not None:
-            stream.wait_event(self._init_event)
-            with wp.ScopedStream(stream):
-                yield
-        else:
-            yield
-
-    def for_sizes(self):
-        """Each size group with the context that runs its launches on the size's stream."""
-        with self._parallel_size_region():
-            for size in self.forest.size_groups:
-                yield size, self._on_size_stream(size)
-
     def factor(self, state_in, control, state_out, dt: float, step: int, qd_work: wp.array):
-        """Stages 1 and 2: FK/ID, the drives' K and u0, the joint forces, the mass-update mask and the factor refresh
-        (the held tree's in stage 1, the ordinary factor per size in stage 2).
+        """FK/ID, the drives' K and u0, the mass-update mask and the factor refresh.
 
         Returns:
             ``(qd, ready)``: the predictor's velocity (``qd_work`` prescaled when velocities are limited) and the event
@@ -776,24 +670,10 @@ class TreeFactor:
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self.nvtx, synchronize=False):
             drive_rows_ready = self.prepare_drives(state_in, control, dt)
             qd = self.fk_id(state_in, state_out, step, qd_work)
-            if model.articulation_count:
-                # The held tree's joint_tau holds only u0: the predictor adds the current external, control and bias
-                # contributions after waiting for the drives. Ordinary dynamics take the joint forces and the drives
-                # in one pass.
-                if self.held is not None:
-                    ready = drive_rows_ready
-                else:
-                    self.ordinary.joint_tau(state_in, control, dt)
-                    ready = None
-            else:
-                ready = None
             self.refresh(drive_rows_ready, step)
-        with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self.nvtx, synchronize=False):
-            for size, context in self.for_sizes():
-                with context:
-                    if self.ordinary is not None:
-                        self.ordinary.factor(size)
-        return qd, ready
+        # joint_tau holds only u0: the predictor adds the current external, control and bias contributions after
+        # waiting for the drives.
+        return qd, drive_rows_ready if model.articulation_count else None
 
     def prescale_velocity(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
         """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
@@ -816,15 +696,12 @@ class TreeFactor:
 
     def fk_id(self, state_in, state_out, step: int, qd_work: wp.array) -> wp.array:
         """Forward kinematics and inverse-dynamics terms; returns the predictor's velocity (prescaled when limited)."""
-        if self.fk_id_cache_enabled:
-            if not getattr(self.held, "bank_compare", False):
-                # Held trees that compare input banks validate a changed bank on the device.
-                if self.fk_id_cache_source_state is not None and state_in is not self.fk_id_cache_source_state:
-                    self.fk_id_cache_valid.zero_()
-                    self.forget_repair_continuity()
-            self.fk_id_cache_source_state = state_in
-        else:
-            self.body_f_s.zero_()
+        if not self.held.bank_compare:
+            # Held trees that compare input banks validate a changed bank on the device.
+            if self.fk_id_cache_source_state is not None and state_in is not self.fk_id_cache_source_state:
+                self.fk_id_cache_valid.zero_()
+                self.forget_repair_continuity()
+        self.fk_id_cache_source_state = state_in
         if self.options.enable_joint_velocity_limits:
             self.prescale_velocity(state_in.joint_qd, qd_work)
             qd = qd_work
@@ -832,10 +709,7 @@ class TreeFactor:
             qd = state_in.joint_qd
 
         refresh_composite = (step % self.options.update_mass_matrix_interval) == 0 or self.force_mass_update
-        if self.held is not None:
-            self.held.begin(state_in, self, qd, self.last_step_dt, refresh_composite, state_out=state_out)
-            return qd
-        self.ordinary.fk_id(state_in, state_out, qd, refresh_composite)
+        self.held.begin(state_in, self, qd, self.last_step_dt, refresh_composite, state_out=state_out)
         return qd
 
     def prepare_drives(self, state_in, control, dt: float) -> wp.Event | None:
@@ -877,7 +751,7 @@ class TreeFactor:
         return None if dynamics_stream is None else dynamics_stream.record_event()
 
     def refresh(self, drive_rows_ready: wp.Event | None, step: int) -> None:
-        """The mass-update mask, then the held tree's factor refresh or the ordinary CRBA; consumes the requests."""
+        """The mass-update mask, then the held tree's factor refresh; consumes the requests."""
         model = self.model
         global_flag = 1 if ((step % self.options.update_mass_matrix_interval) == 0 or self.force_mass_update) else 0
         # NOTE: this host-evaluated flag is BAKED into CUDA graphs at capture
@@ -901,12 +775,9 @@ class TreeFactor:
             device=model.device,
         )
 
-        if self.held is not None:
-            if drive_rows_ready is not None:
-                wp.get_stream(model.device).wait_event(drive_rows_ready)
-            self.held.refresh(self)
-        else:
-            self.ordinary.crba(global_flag)
+        if drive_rows_ready is not None:
+            wp.get_stream(model.device).wait_event(drive_rows_ready)
+        self.held.refresh(self)
         # Consume the requests: leaving either set changes the factor cadence on subsequent captured steps.
         self.mass_update_requested.zero_()
         self.force_mass_update = False
@@ -916,24 +787,16 @@ class TreeFactor:
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self.nvtx, synchronize=False):
             if ready is not None:
                 wp.get_stream(self.model.device).wait_event(ready)
-            if self.held is not None:
-                self.held.predict(state_in, self, control, qd, dt)
-                self.correct_free_root_velocity(state_in, qd, dt, v_hat, apply_transport=False)
-            else:
-                self.ordinary.predict(state_in, qd, dt)
+            self.held.predict(state_in, self, control, qd, dt)
+            self.correct_free_root_velocity(state_in, qd, dt, v_hat)
 
-    def correct_free_root_velocity(
-        self, state_in, qd: wp.array, dt: float, v_hat: wp.array, *, apply_transport: bool = True
-    ) -> None:
-        """Apply canonical gyro physics and the free roots' spin damping after either ordinary or held prediction."""
+    def correct_free_root_velocity(self, state_in, qd: wp.array, dt: float, v_hat: wp.array) -> None:
+        """Apply canonical gyro physics and the free roots' spin damping after the held prediction."""
         model = self.model
         forest = self.forest
-        # Keep v_hat on jcalc_integrate's free-root convention. The compact
-        # launch excludes every non-root joint; a live device mask handles
-        # runtime kinematic changes without changing graph topology.
-        if not forest.free_root_joint_count:
-            return
-        if forest.free_rigid_body_count:
+        # Keep v_hat on jcalc_integrate's free-root convention. The compact launch excludes every non-root joint; a
+        # live device mask handles runtime kinematic changes without changing graph topology.
+        if forest.free_root_joint_count and forest.free_rigid_body_count:
             wp.launch(
                 apply_free_root_velocity_corrections,
                 dim=forest.free_root_joint_count,
@@ -948,21 +811,6 @@ class TreeFactor:
                     state_in.body_q,
                     model.body_inertia,
                     self.L_by_size[6],
-                    qd,
-                    dt,
-                    apply_transport,
-                ],
-                outputs=[v_hat],
-                device=model.device,
-            )
-        elif apply_transport:
-            wp.launch(
-                apply_free_root_transport_to_predictor,
-                dim=forest.free_root_joint_count,
-                inputs=[
-                    forest.free_root_joint_indices,
-                    model.joint_qd_start,
-                    self.kinematic_joint_mask,
                     qd,
                     dt,
                 ],
@@ -1011,9 +859,6 @@ class TreeFactor:
     def finish(self, state_in, state_out, dt: float, step: int) -> None:
         """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state."""
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self.nvtx, synchronize=False):
-            if self.held is not None:
-                next_refresh = ((step + 1) % self.options.update_mass_matrix_interval) == 0
-                self.held.finish(state_in, self, state_out, dt, next_refresh)
-                self.fk_id_cache_source_state = state_out
-            else:
-                self.ordinary.finish(state_in, state_out, dt)
+            next_refresh = ((step + 1) % self.options.update_mass_matrix_interval) == 0
+            self.held.finish(state_in, self, state_out, dt, next_refresh)
+            self.fk_id_cache_source_state = state_out
