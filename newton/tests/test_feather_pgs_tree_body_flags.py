@@ -315,7 +315,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     case = _sparse_case(beta, cached, kinematic_body=1)
                     solver = case[1]
                     # Ordinary dynamics take the dense factors: native sparse factors are the held tree's.
-                    self.assertEqual(solver._sparse_mass_matrix_size is not None, cached == "auto")
+                    self.assertEqual(solver.placement.sparse_mass_matrix_size is not None, cached == "auto")
                     if cached == "auto":
                         self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
                     for _ in range(40):
@@ -342,8 +342,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     runs[cached] = _snapshot(case[2])
                     if cached == "off":
                         solver = case[1]
-                        rows = int(solver.constraint_count.numpy()[0])
-                        impulses = np.abs(solver.impulses.numpy()[0, :rows])
+                        rows = int(solver.placement.constraint_count.numpy()[0])
+                        impulses = np.abs(solver.placement.impulses.numpy()[0, :rows])
                         self.assertLess(float(impulses.max(initial=0.0)), 1.0e3, "a row grew without a fixed point")
                 self._assert_states_close(runs["auto"], runs["off"], what="owner against ordinary")
 
@@ -560,8 +560,8 @@ def _rows_of_kind(solver, model, states, kind):
     """Step ``solver`` once from ``states[0]`` (then swap the states) and count its dense rows of ``kind``."""
     solver.step(states[0], states[1], model.control(), None, 1.0e-3)
     states.reverse()
-    count = int(solver.constraint_count.numpy()[0])
-    return int(np.count_nonzero(solver.row_type.numpy()[0, :count] == kind))
+    count = int(solver.placement.constraint_count.numpy()[0])
+    return int(np.count_nonzero(solver.placement.row_type.numpy()[0, :count] == kind))
 
 
 class TestPrescribedCoordinateRows(unittest.TestCase):

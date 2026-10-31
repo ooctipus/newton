@@ -363,12 +363,10 @@ def _owner_solver(device, *, anchors, beta=0.0):
             "_local_primary_articulation",
             "_local_pair_articulation",
             "_local_residual_pair_articulation",
-            "mf_constraint_count",
-            "constraint_count",
-            "_local_solve_owner",
             "_local_general_worlds",
         )
     }
+    rows = {name: ints(worlds) for name in ("mf_constraint_count", "constraint_count", "local_solve_owner")}
     active = {
         name: {PRIMARY: ints(worlds)}
         for name in (
@@ -387,9 +385,15 @@ def _owner_solver(device, *, anchors, beta=0.0):
         _local_residual_mf_max_rows=4,
         **queue,
         **active,
-        mf_body_a=ints(worlds, 4),
-        mf_body_b=ints(worlds, 4),
-        mf_row_type=ints(worlds, 4),
+        placement=SimpleNamespace(
+            **rows,
+            mf_body_a=ints(worlds, 4),
+            mf_body_b=ints(worlds, 4),
+            mf_row_type=ints(worlds, 4),
+            J_by_size={
+                size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)
+            },
+        ),
         _local_general_world_count=ints(1),
         forest=SimpleNamespace(
             world_count=worlds,
@@ -399,7 +403,6 @@ def _owner_solver(device, *, anchors, beta=0.0):
             world_response_group_to_art={size: ints(worlds) for size in (PRIMARY, SECONDARY)},
             art_group_idx=ints(2 * worlds),
         ),
-        J_by_size={size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)},
         laws=SimpleNamespace(
             friction_anchors_enabled=anchors, friction_patches=SimpleNamespace(view=view), friction_anchor_beta=beta
         ),
@@ -407,8 +410,8 @@ def _owner_solver(device, *, anchors, beta=0.0):
         _arrays=SolverArrays(None, wp.get_device(device)),
     )
     # The producers write the size groups' rows (dense_rows.jacobian_row).
-    solver._row_support = lambda: group_rows(device)
-    solver._jacobian_rows = lambda size: solver.J_by_size[size]
+    solver.placement.row_support = lambda: group_rows(device)
+    solver.placement.jacobian_rows = lambda size: solver.placement.J_by_size[size]
     return solver
 
 
@@ -741,9 +744,9 @@ def _rollout(model, *, packets, steps=120, **kwargs):
 class TestRowPacketsCUDA(unittest.TestCase):
     def _compare(self, model, **kwargs):
         plain_solver, plain = _rollout(model, packets=False, **kwargs)
-        self.assertIsNone(plain_solver._row_packets)
+        self.assertIsNone(plain_solver.placement.row_packets)
         solver, poses = _rollout(model, packets=True, **kwargs)
-        self.assertIsInstance(solver._row_packets, rp.LocalRowPackets)
+        self.assertIsInstance(solver.placement.row_packets, rp.LocalRowPackets)
         self.assertTrue(np.isfinite(poses).all())
         np.testing.assert_allclose(poses[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
         np.testing.assert_allclose(poses[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
@@ -757,21 +760,21 @@ class TestRowPacketsCUDA(unittest.TestCase):
         """A fixed-base arm over a free box: the packet owner tracks the ordinary row producers."""
         model = _build(wp.get_device("cuda:0"), worlds=6)
         solver = self._compare(model)
-        self.assertEqual((solver._row_packets.primary, solver._row_packets.secondary), (3, 6))
-        self.assertEqual(solver._row_packets.mimics, 0)
+        self.assertEqual((solver.placement.row_packets.primary, solver.placement.row_packets.secondary), (3, 6))
+        self.assertEqual(solver.placement.row_packets.mimics, 0)
 
     def test_mimic_rows_join_the_prefix(self):
         """A following finger joint: the mimic row is built in the prefix with the limits."""
         model = _build(wp.get_device("cuda:0"), worlds=6, mimic=True)
         solver = self._compare(model)
-        self.assertEqual(solver._row_packets.mimics, 1)
+        self.assertEqual(solver.placement.row_packets.mimics, 1)
         self.assertEqual(int(solver.laws.mimic_count), 6)
 
     def test_longer_arm_takes_the_same_owner(self):
         """Nothing in the owner is sized for one arm: a five-joint arm is admitted the same way."""
         model = _build(wp.get_device("cuda:0"), worlds=4, links=5)
         solver = self._compare(model)
-        self.assertEqual(solver._row_packets.primary, 5)
+        self.assertEqual(solver.placement.row_packets.primary, 5)
 
     def test_patch_friction_matches_the_ordinary_producers(self):
         """Write the ordinary producers' persistent patch rows and track their short rollout.
@@ -784,8 +787,8 @@ class TestRowPacketsCUDA(unittest.TestCase):
         """
         model = _build(wp.get_device("cuda:0"), worlds=6, mimic=True)
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PRESS) for enabled in (False, True))
-        self.assertIsNone(plain.solver._row_packets)
-        self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
+        self.assertIsNone(plain.solver.placement.row_packets)
+        self.assertIsInstance(packets.solver.placement.row_packets, rp.LocalRowPackets)
         self.assertTrue(packets.solver.laws.friction_anchors_enabled)
         routes = packets.solver.get_path_selection()["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
@@ -839,8 +842,8 @@ class TestRowPacketsCUDA(unittest.TestCase):
         """
         model = _build(wp.get_device("cuda:0"), worlds=6, pads=_PADS["start"])
         plain, packets = (_arm(model, packets=enabled, friction_anchor_beta=0.2, **_PADS) for enabled in (False, True))
-        self.assertIsNone(plain.solver._row_packets)
-        self.assertIsInstance(packets.solver._row_packets, rp.LocalRowPackets)
+        self.assertIsNone(plain.solver.placement.row_packets)
+        self.assertIsInstance(packets.solver.placement.row_packets, rp.LocalRowPackets)
         self.assertTrue(packets.solver.laws.friction_anchors_enabled)
         self._step_pad_rings(plain, packets)
 
@@ -889,7 +892,7 @@ class TestRowPacketsCUDA(unittest.TestCase):
             with self.subTest(**kwargs):
                 solver = self._compare(_build(wp.get_device("cuda:0"), **kwargs), friction_anchor_beta=0.2)
                 self.assertTrue(solver.laws.friction_anchors_enabled)
-                self.assertEqual((solver._row_packets.primary, solver._row_packets.mimics), layout)
+                self.assertEqual((solver.placement.row_packets.primary, solver.placement.row_packets.mimics), layout)
 
 
 if __name__ == "__main__":

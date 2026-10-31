@@ -81,8 +81,8 @@ PREFIX = (
     Field("weights", wp.float32, ("world", "packet", PREFIX_WIDTH), fill=None, owner="packets"),
     Field("row_contact", wp.int32, ("world", "packet"), fill=-1, owner="packets"),
     Field("mimic_slot", wp.int32, ("mimic",), owner="mimics"),
-    Field("first_rejected_slot", wp.int32, ("world",), attr="_dense_first_rejected_slot"),
-    Field("impulses", wp.float32, ("world", "row")),
+    Field("first_rejected_slot", wp.int32, ("world",), attr="dense_first_rejected_slot", owner="placement"),
+    Field("impulses", wp.float32, ("world", "row"), owner="placement"),
 )
 """The prefix kernel's inputs and outputs: the size group, the mimic tables (``mimics``: the solver's, or the
 placeholders of a model without mimics), the prefix law and the dense rows (:data:`.prefix_rows.LAW`), and the
@@ -104,14 +104,14 @@ QUEUE = (
     Field("primary", wp.int32, ("articulation",), attr="_local_primary_articulation"),
     Field("secondary", wp.int32, ("articulation",), attr="_local_pair_articulation"),
     Field("residual_secondary", wp.int32, ("articulation",), attr="_local_residual_pair_articulation"),
-    Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count"),
-    Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a"),
-    Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b"),
-    Field("mf_row_type", wp.int32, ("world", "mf_row")),
+    Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
+    Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a", owner="placement"),
+    Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b", owner="placement"),
+    Field("mf_row_type", wp.int32, ("world", "mf_row"), owner="placement"),
     Field("body_art", wp.int32, ("body",), owner="forest", attr="body_to_articulation"),
-    Field("count", wp.int32, ("world",), attr="constraint_count"),
-    Field("owner", wp.int32, ("world",), attr="_local_solve_owner"),
-    Field("status", wp.int32, (2,), attr="_constraint_capacity_status"),
+    Field("count", wp.int32, ("world",), attr="constraint_count", owner="placement"),
+    Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
+    Field("status", wp.int32, (2,), attr="constraint_capacity_status", owner="placement"),
     Field("general_count", wp.int32, (1,), attr="_local_general_world_count"),
     Field("general", wp.int32, ("world",), attr="_local_general_worlds"),
     Field("pair_count", wp.int32, (1,), owner="size"),
@@ -538,7 +538,9 @@ class LocalRowPackets:
             residual=solver._local_residual_active_candidates[self.primary],
             residual_pair=solver._local_residual_active_secondaries[self.primary],
         )
-        self.queue = field_group.bind(QueueData, solver=solver, forest=solver.forest, size=size, status=None)
+        self.queue = field_group.bind(
+            QueueData, solver=solver, placement=solver.placement, forest=solver.forest, size=size, status=None
+        )
         self.contact_input = None
         self.law = None
         self._topology = TopologyPin.read(solver.model, TOPOLOGY)
@@ -557,11 +559,12 @@ class LocalRowPackets:
         """Bind current coefficients/state and the current double-buffered row owners."""
         solver = self.solver
         # Sticky status is allocated after tiled-kernel construction.
-        self.queue.status = solver._constraint_capacity_status
+        self.queue.status = solver.placement.constraint_capacity_status
         data = field_group.bind(
             PrefixData,
             self.prefix,
             solver=solver,
+            placement=solver.placement,
             forest=solver.forest,
             factor=solver.factor,
             laws=solver.laws,
@@ -621,7 +624,7 @@ class LocalRowPackets:
             ],
             device=solver.model.device,
         )
-        support = solver._row_support()
+        support = solver.placement.row_support()
         for size in solver.forest.size_groups:
             wp.launch_tiled(
                 materialize_general_prefix,
@@ -635,7 +638,7 @@ class LocalRowPackets:
                     solver.forest.art_group_idx,
                     size,
                     support,
-                    solver._jacobian_rows(size),
+                    solver.placement.jacobian_rows(size),
                 ],
                 block_dim=32,
                 device=solver.model.device,
@@ -649,8 +652,8 @@ class LocalRowPackets:
                 outputs=[
                     solver.forest.art_group_idx,
                     support,
-                    solver._jacobian_rows(self.primary),
-                    solver._jacobian_rows(size_b),
+                    solver.placement.jacobian_rows(self.primary),
+                    solver.placement.jacobian_rows(size_b),
                 ],
                 device=solver.model.device,
             )
@@ -667,13 +670,13 @@ def decline(solver) -> str | None:
     return first_failed(
         (
             (solver.routes.case == "K3", "Local packets produce the rows of the local owners' class (case K3)."),
-            (solver._hinv_jt_writes_world, "Local packets need the response written in world layout."),
+            (solver.placement.hinv_jt_writes_world, "Local packets need the response written in world layout."),
             (
-                solver._packed_dense,
+                solver.placement.packed_dense,
                 "Local packets write their general worlds' rows at their coordinates: the packed rows are not dense.",
             ),
             (
-                solver.dense_max_constraints >= solver._local_residual_max_rows,
+                solver.placement.dense_max_constraints >= solver._local_residual_max_rows,
                 "dense_max_constraints is below the local residual owner's rows.",
             ),
             (

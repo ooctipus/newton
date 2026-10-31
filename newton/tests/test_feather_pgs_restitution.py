@@ -184,7 +184,7 @@ def _step_plane(
     solver.step(state_in, state_out, model.control(), contacts, dt)
 
     count = int(contacts.rigid_contact_count.numpy()[0])
-    active_paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+    active_paths = {int(v) for v in solver.placement.contact_path.numpy()[:count] if v >= 0}
     qd = state_out.body_qd.numpy()[body].astype(np.float64)
     q = state_out.body_q.numpy()[body].astype(np.float64)
     return {
@@ -545,7 +545,7 @@ def _step_two_spheres(
     qd = state_out.body_qd.numpy()
     q = state_out.body_q.numpy()
     count = int(contacts.rigid_contact_count.numpy()[0])
-    paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+    paths = {int(v) for v in solver.placement.contact_path.numpy()[:count] if v >= 0}
     return float(qd[body_a][2]), float(qd[body_b][2]), float(q[body_b][2] - q[body_a][2]), count, paths
 
 
@@ -649,7 +649,7 @@ def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
             solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
             count = int(contacts.rigid_contact_count.numpy()[0])
-            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            paths = {int(v) for v in solver.placement.contact_path.numpy()[:count] if v >= 0}
             velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
             expected_after = velocity_surface - restitution * closing_speed
             test.assertEqual(count, 1, f"{label}: expected one sphere contact")
@@ -755,7 +755,7 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
             count = int(contacts.rigid_contact_count.numpy()[0])
             after = state_out.body_qd.numpy()[:, 2]
             end_gap = state_out.body_q.numpy()[:, 2] - RADIUS
-            paths = solver.contact_path.numpy()[:count]
+            paths = solver.placement.contact_path.numpy()[:count]
             # Each contact pairs a world's sphere with that world's plane, which has no body.
             shapes = np.stack(
                 (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
@@ -804,8 +804,12 @@ def test_restitution_uses_ordinary_rows_and_validates_configuration(test, device
     )
     solver = _make_solver(positive_model)
     test.assertFalse(solver._debug_buffers_enabled)
-    test.assertEqual(solver.row_restitution.shape, (solver.forest.world_count, solver.dense_max_constraints))
-    test.assertEqual(solver.mf_row_restitution.shape, (solver.forest.world_count, solver.mf_max_constraints))
+    test.assertEqual(
+        solver.placement.row_restitution.shape, (solver.forest.world_count, solver.placement.dense_max_constraints)
+    )
+    test.assertEqual(
+        solver.placement.mf_row_restitution.shape, (solver.forest.world_count, solver.placement.mf_max_constraints)
+    )
     for invalid_threshold in (-1.0, float("nan"), float("inf")):
         with test.subTest(invalid_threshold=invalid_threshold):
             with test.assertRaisesRegex(ValueError, "restitution_velocity_threshold"):
@@ -886,7 +890,7 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 test.assertEqual(count, 1, f"{label}: reset impact generated {count} contacts")
                 test.assertEqual(
-                    {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0},
+                    {int(v) for v in solver.placement.contact_path.numpy()[:count] if v >= 0},
                     {expected_path},
                     f"{label}: reset impact used the wrong route",
                 )
@@ -1009,7 +1013,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
             solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
             count = int(contacts.rigid_contact_count.numpy()[0])
-            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            paths = {int(v) for v in solver.placement.contact_path.numpy()[:count] if v >= 0}
             qd = state_out.body_qd.numpy()[root].astype(np.float64)
             label = joint_kind
             test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")

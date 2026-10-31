@@ -67,9 +67,9 @@ def _build_scissor_model(device: str) -> newton.Model:
 
 def _contact_rows(solver, path_id: int, contact_count: int) -> dict[int, int]:
     """contact index -> row slot for world-0 contacts routed to the given path."""
-    contact_path = solver.contact_path.numpy().astype(np.int32)
-    contact_slot = solver.contact_slot.numpy().astype(np.int32)
-    contact_world = solver.contact_world.numpy().astype(np.int32)
+    contact_path = solver.placement.contact_path.numpy().astype(np.int32)
+    contact_slot = solver.placement.contact_slot.numpy().astype(np.int32)
+    contact_world = solver.placement.contact_world.numpy().astype(np.int32)
     out = {}
     for c in range(contact_count):
         if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
@@ -296,9 +296,9 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model)
         test.assertFalse(solver.laws.regularization_enabled)
-        test.assertIs(solver.row_w, solver._contact_row_w_dummy)
-        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
-        test.assertEqual(solver.row_w.shape, (1, 1))
+        test.assertIs(solver.placement.row_w, solver.placement.contact_row_w_dummy)
+        test.assertIs(solver.placement.mf_row_w, solver.placement.contact_row_w_dummy)
+        test.assertEqual(solver.placement.row_w.shape, (1, 1))
 
 
 def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
@@ -306,10 +306,10 @@ def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCa
     with wp.ScopedDevice(device):
         model, pipeline, solver, _bodies = _stack_scene(device, g=0.0)
         body_q, _zs = _run(model, pipeline, solver, 1)
-        test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
+        test.assertGreater(int(solver.placement.mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
-        test.assertIs(solver.mf_row_w, solver._contact_row_w_dummy)
-        test.assertEqual(float(solver.mf_row_w.numpy()[0, 0]), 1.0)
+        test.assertIs(solver.placement.mf_row_w, solver.placement.contact_row_w_dummy)
+        test.assertEqual(float(solver.placement.mf_row_w.numpy()[0, 0]), 1.0)
 
 
 def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
@@ -431,7 +431,7 @@ def test_regularization_takes_the_weighted_tiers(test: unittest.TestCase, device
                 records[g] = (
                     routes["contact_rows"]["keyed_rows"]["enabled"],
                     (routes["sweep"]["tiers"] or {}).get("family"),
-                    solver._ink_rows,
+                    solver.placement.ink_rows,
                 )
             with test.subTest(friction_anchor_beta=beta):
                 test.assertEqual(records[0.02], records[0.0])

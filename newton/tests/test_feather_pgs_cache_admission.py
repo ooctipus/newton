@@ -28,7 +28,7 @@ def _held_tree_solver(law):
     """Describe a dense-route solver that every other held-tree admission term accepts."""
     return SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
-        _sparse_mass_matrix_size=None,
+        placement=SimpleNamespace(sparse_mass_matrix_size=None),
         factor=SimpleNamespace(fk_id_cache_available=True, parallel_drives=True),
         _compact_diagonal_mass_size=None,
         forest=SimpleNamespace(size_groups=[9]),
@@ -40,7 +40,7 @@ def _sparse_tree_solver(**changes):
     """Describe a native sparse route that every sparse tree-owner admission term accepts."""
     solver = SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
-        _sparse_mass_matrix_size=18,
+        placement=SimpleNamespace(sparse_mass_matrix_size=18),
         _sparse_velocity_limits=False,
         factor=SimpleNamespace(fk_id_cache_available=True, parallel_drives=True),
         forest=SimpleNamespace(has_free_rigid_bodies=False, has_prescribed_response=False),

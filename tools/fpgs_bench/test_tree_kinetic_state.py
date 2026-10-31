@@ -84,7 +84,7 @@ def fixture(floating, device):
         solver, reference = (SolverFeatherPGS(model, friction_anchor_beta=0.0) for _ in range(2))
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
-    solver._sparse_mass_matrix_size = count
+    solver.placement.sparse_mass_matrix_size = count
     solver._sparse_mass_matrix_plan = mass
     solver._sparse_mass_matrix_indices = factor_indices(mass, device)
     solver._sparse_Linv = wp.zeros((2, mass.nonzero_count), dtype=float, device=device)
@@ -191,7 +191,7 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
                 with _heavy_chains():
                     pins = None if enabled else {"evaluator": "ordinary"}
                     case = split.make_case(True, pins=pins, floating=floating, branches=3, depth=2, device="cuda:0")
-                self.assertIsNotNone(case[1]._sparse_mass_matrix_size)
+                self.assertIsNotNone(case[1].placement.sparse_mass_matrix_size)
                 self.assertEqual(case[1].factor.held is not None, enabled)
                 cases.append(case)
             for step in range(12):

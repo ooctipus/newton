@@ -29,12 +29,12 @@ CONTACT_INPUT = (
     Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
     Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
     # The allocator's record of each contact.
-    Field("world", wp.int32, ("contact",), attr="contact_world"),
-    Field("slot", wp.int32, ("contact",), attr="contact_slot"),
-    Field("art0", wp.int32, ("contact",), attr="contact_art_a"),
-    Field("art1", wp.int32, ("contact",), attr="contact_art_b"),
-    Field("path", wp.int32, ("contact",), attr="contact_path"),
-    Field("slots_needed", wp.int32, ("contact",), attr="contact_slots_needed"),
+    Field("world", wp.int32, ("contact",), attr="contact_world", owner="placement"),
+    Field("slot", wp.int32, ("contact",), attr="contact_slot", owner="placement"),
+    Field("art0", wp.int32, ("contact",), attr="contact_art_a", owner="placement"),
+    Field("art1", wp.int32, ("contact",), attr="contact_art_b", owner="placement"),
+    Field("path", wp.int32, ("contact",), attr="contact_path", owner="placement"),
+    Field("slots_needed", wp.int32, ("contact",), attr="contact_slots_needed", owner="placement"),
     # Shapes, bodies and articulations.
     Field("shape_body", wp.int32, ("shape",), owner="model"),
     Field("body_q", wp.transform, ("body",), owner="state_in"),
@@ -109,7 +109,7 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
 
 def bind_routes(solver, contacts):
     """Bind the contacts' :data:`ContactRoutes` (the allocator's records of the last step)."""
-    return field_group.bind(ContactRoutes, solver=solver, contacts=contacts)
+    return field_group.bind(ContactRoutes, placement=solver.placement, contacts=contacts)
 
 
 def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
@@ -122,6 +122,7 @@ def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
         ContactInput,
         data,
         solver=solver,
+        placement=solver.placement,
         forest=solver.forest,
         factor=solver.factor,
         laws=solver.laws,

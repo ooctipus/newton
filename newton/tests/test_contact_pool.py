@@ -592,7 +592,7 @@ def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
     test.assertFalse(pipeline.service_capacity(lifted), "a contact-free scene keeps the first mapping")
     held = pipeline.contacts().rigid_contact_max
     test.assertGreaterEqual(held, max(contact_pool.MIN_READY_ROWS, _estimate_rigid_contact_max(model)))
-    test.assertEqual(solver.contact_slot.shape, (held,))
+    test.assertEqual(solver.placement.contact_slot.shape, (held,))
 
     worlds, boxes = 128, 8
     demand = 4 * worlds * boxes
@@ -608,8 +608,8 @@ def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
         warnings.simplefilter("error")
         test.assertFalse(pipeline.service_capacity(state_0), "the first mapping holds the measured demand")
     test.assertEqual(contacts.rigid_contact_max, rows)
-    test.assertIs(solver._contact_pool, pipeline._contact_pool)
-    test.assertEqual(solver.contact_slot.shape, (rows,))
+    test.assertIs(solver.placement.contact_pool, pipeline._contact_pool)
+    test.assertEqual(solver.placement.contact_slot.shape, (rows,))
     test.assertEqual(solver.laws.friction_patches.capacity, rows)
 
     def simulate():
@@ -647,7 +647,7 @@ def test_pipelines_of_a_model_share_its_pool(test, device):
         second = newton.CollisionPipeline(model)
         test.assertIs(first._contact_pool, model_contact_pool(model))
         test.assertIs(second._contact_pool, first._contact_pool)
-        test.assertIs(solver._contact_pool, first._contact_pool)
+        test.assertIs(solver.placement.contact_pool, first._contact_pool)
         other = newton.CollisionPipeline(_build_boxes(device))
         test.assertIsNot(other._contact_pool, first._contact_pool, "another model has a pool of its own")
         pool = first._contact_pool
@@ -656,7 +656,7 @@ def test_pipelines_of_a_model_share_its_pool(test, device):
         rows = second.contacts().rigid_contact_max
         # Ordinary arrays grow from 8 rows; CUDA virtual memory's first pages already hold the contacts.
         test.assertEqual(rows, GROWN if recapture else pool.ready)
-        test.assertEqual(solver.contact_slot.shape, (rows,))
+        test.assertEqual(solver.placement.contact_slot.shape, (rows,))
         test.assertEqual(second.service_capacity(), recapture, "the second pipeline learns of the growth too")
         test.assertFalse(first.service_capacity())
         test.assertFalse(second.service_capacity())
@@ -722,8 +722,8 @@ def test_feather_pgs_grows_mid_run(test, device):
     reallocates = _reallocates(pool)
     rows = GROWN if reallocates else pool.ready
     test.assertEqual(pool.growth_count, 1)
-    test.assertEqual(solver._contact_pool.ready, rows)
-    test.assertEqual(solver.contact_slot.shape, (rows,))
+    test.assertEqual(solver.placement.contact_pool.ready, rows)
+    test.assertEqual(solver.placement.contact_slot.shape, (rows,))
     test.assertEqual(solver.laws.friction_patches.capacity, rows)
     test.assertEqual(contacts.rigid_contact_max, rows)
     solver.check_constraint_capacity()
@@ -735,7 +735,7 @@ def test_feather_pgs_follows_a_pass_that_grew(test, device):
     """Hand FeatherPGS the rows a collision pass grew to before it reads them, so no constraint is lost."""
     state, contacts, _, solver = _feather_pgs_run(device, 2, policy=_small_pool_policy(8, 8))
     solver.check_constraint_capacity()
-    pool = solver._contact_pool
+    pool = solver.placement.contact_pool
     test.assertEqual(contacts.rigid_contact_max, GROWN if _reallocates(pool) else pool.ready)
     test.assertEqual(pool.ready, contacts.rigid_contact_max)
     test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))

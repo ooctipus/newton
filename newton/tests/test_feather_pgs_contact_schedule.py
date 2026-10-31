@@ -646,9 +646,9 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         for compact in (False, True):
             with self.subTest(compact=compact):
                 solver, records = _record_schedules(model, device, anchors=True, compact=compact)
-                self.assertTrue(solver._sparse_diagonal_contact_units)
-                self.assertTrue(solver._sparse_diagonal_speculative_contact_batches)
-                self.assertEqual(solver._compact_contact_boundary, compact)
+                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+                self.assertTrue(solver.placement.sparse_diagonal_speculative_contact_batches)
+                self.assertEqual(solver.placement.compact_contact_boundary, compact)
                 self.assertEqual(len(records), 6)
                 for step, (before, after) in enumerate(records):
                     for world in range(before["row_count"].shape[0]):
@@ -667,9 +667,9 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         for compact in (False, True):
             with self.subTest(compact=compact):
                 solver, records = _record_schedules(model, device, anchors=False, compact=compact)
-                self.assertTrue(solver._sparse_diagonal_contact_triples)
-                self.assertTrue(solver._sparse_diagonal_speculative_contact_batches)
-                self.assertEqual(solver._compact_contact_boundary, compact)
+                self.assertTrue(solver.placement.sparse_diagonal_contact_triples)
+                self.assertTrue(solver.placement.sparse_diagonal_speculative_contact_batches)
+                self.assertEqual(solver.placement.compact_contact_boundary, compact)
                 self.assertEqual(len(records), 6)
                 for step, (before, after) in enumerate(records):
                     _assert_outputs_equal(after, _serial_triple_walks(before, serial_contacts=True), f"step {step}")

@@ -120,7 +120,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         model = newton.ModelBuilder().finalize(device=device)
         solver = SolverFeatherPGS(model, row_watermark=False)
         arrays = _allocator_arrays(2, count=1, device=device)
-        arrays["capacity_status"] = solver._constraint_capacity_status
+        arrays["capacity_status"] = solver.placement.constraint_capacity_status
         arrays["contact_count"].assign(np.array([0], dtype=np.int32))
         _allocate(arrays)  # Compile before capture without overflowing.
         with wp.ScopedCapture(device=device) as capture:
@@ -205,7 +205,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 self.assertTrue(np.isfinite(state_out.joint_q.numpy()).all())
                 if capacity >= 640:
                     solver.check_constraint_capacity()
-                    self.assertEqual(int(solver.constraint_count.numpy()[0]), count * 3)
+                    self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), count * 3)
                     residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
                     self.assertGreaterEqual(float(residual.min()), -2.0e-6)
                     self.assertGreaterEqual(float(forces[:, 2].min()), -1.0e-7)
@@ -310,8 +310,8 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, dense_max_constraints=192, row_watermark=False)
         self.assertFalse(any(solver.constraint_capacity_status().values()))
-        solver._constraint_capacity_status.assign(np.array([1, 0], dtype=np.int32))
-        solver.constraint_overflow.fill_(True)
+        solver.placement.constraint_capacity_status.assign(np.array([1, 0], dtype=np.int32))
+        solver.placement.constraint_overflow.fill_(True)
         with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
             solver.check_constraint_capacity()
         solver.reset(model.state())
@@ -320,7 +320,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         self.assertTrue(solver.constraint_capacity_status(clear=True)["dense"])
         self.assertFalse(any(solver.constraint_capacity_status().values()))
         solver.check_constraint_capacity()
-        self.assertEqual(solver.dense_max_constraints, 192)
+        self.assertEqual(solver.placement.dense_max_constraints, 192)
 
     def test_public_check_rejects_capture(self):
         """Reject host reads and explicit clears during CUDA graph capture."""

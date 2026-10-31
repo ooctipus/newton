@@ -358,7 +358,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         if ordinary is not None:
             self.assertIsNone(ordinary.cholesky_kernels_by_size[16])
             self.assertIsNone(ordinary.triangular_solve_kernels_by_size[16])
-        self.assertIsNone(optimized._hinv_jt_kernels_by_size[16])
+        self.assertIsNone(optimized.placement.hinv_jt_kernels_by_size[16])
 
         forced = {"cholesky_kernel": "loop", "trisolve_kernel": "loop", "hinv_jt_kernel": "par_row"}
         with mock.patch.object(SolverFeatherPGS, "_route_pins", forced):
@@ -411,17 +411,17 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 friction_anchor_beta=0.0,
             )
 
-        self.assertTrue(optimized._sparse_diagonal_contact_solve)
-        self.assertTrue(optimized._sparse_diagonal_contact_triples)
-        self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
+        self.assertTrue(optimized.placement.sparse_diagonal_contact_solve)
+        self.assertTrue(optimized.placement.sparse_diagonal_contact_triples)
+        self.assertTrue(optimized.placement.sparse_diagonal_speculative_contact_batches)
         self.assertEqual(optimized.forest.direct_diagonal_inertia_sizes, frozenset((16,)))
-        self.assertEqual(optimized._sparse_diagonal_response_size, 16)
-        self.assertEqual(optimized._sparse_diagonal_dense_size, 3)
+        self.assertEqual(optimized.placement.sparse_diagonal_response_size, 16)
+        self.assertEqual(optimized.placement.sparse_diagonal_dense_size, 3)
         self.assertEqual(optimized.H_by_size[16].shape, (1, 1, 1))
-        self.assertEqual(optimized.J_by_size[16].shape, (1, 1, 1))
-        self.assertEqual(optimized.J_world.shape, (1, 1, 1))
-        self.assertFalse(reference._sparse_diagonal_contact_solve)
-        self.assertFalse(reference._sparse_diagonal_contact_triples)
+        self.assertEqual(optimized.placement.J_by_size[16].shape, (1, 1, 1))
+        self.assertEqual(optimized.placement.J_world.shape, (1, 1, 1))
+        self.assertFalse(reference.placement.sparse_diagonal_contact_solve)
+        self.assertFalse(reference.placement.sparse_diagonal_contact_triples)
 
         q = np.tile(np.concatenate((np.full(16, -0.105), np.full(3, 0.205))).astype(np.float32), 2)
         qd = np.tile(np.concatenate((np.full(16, -0.2), np.full(3, 0.1))).astype(np.float32), 2)
@@ -459,7 +459,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 if solver is optimized:
                     # Order snapshots after maintenance on its owning stream.
                     with wp.ScopedStream(solver._memset_stream):
-                        for buffers in solver._J_bufs:
+                        for buffers in solver.placement.J_bufs:
                             np.testing.assert_array_equal(buffers[16].numpy(), np.zeros((1, 1, 1), dtype=np.float32))
                             self.assertFalse(np.any(buffers[3].numpy()), "Dense Jacobian maintenance was skipped")
             trajectories.append(history)
@@ -516,24 +516,26 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 optimized = make_solver(**friction_kwargs)
                 with mock.patch.dict(SolverFeatherPGS._route_pins, {"placement": "general"}):
                     reference = make_solver(**friction_kwargs)
-                self.assertTrue(optimized._sparse_diagonal_contact_solve)
+                self.assertTrue(optimized.placement.sparse_diagonal_contact_solve)
                 self.assertEqual(optimized.laws.friction_anchors_enabled, label == "patch")
                 # Point contacts are uniform triples; patch contacts are units of one or three rows.
-                self.assertEqual(optimized._sparse_diagonal_contact_triples, label == "point")
-                self.assertEqual(optimized._sparse_diagonal_contact_units, label == "patch")
-                self.assertTrue(optimized._sparse_diagonal_speculative_contact_batches)
+                self.assertEqual(optimized.placement.sparse_diagonal_contact_triples, label == "point")
+                self.assertEqual(optimized.placement.sparse_diagonal_contact_units, label == "patch")
+                self.assertTrue(optimized.placement.sparse_diagonal_speculative_contact_batches)
                 self.assertEqual(optimized._pgs_solve_sparse_diagonal_kernel.key.endswith("_units"), label == "patch")
-                self.assertFalse(reference._sparse_diagonal_contact_solve)
+                self.assertFalse(reference.placement.sparse_diagonal_contact_solve)
 
                 sparse = run(optimized)
                 general = run(reference)
-                self.assertGreater(int(optimized.constraint_count.numpy().max()), 0, "no contact rows were generated")
+                self.assertGreater(
+                    int(optimized.placement.constraint_count.numpy().max()), 0, "no contact rows were generated"
+                )
                 # Each box's contacts act on its branch's coordinate alone, so they schedule independently.
                 # The serial list holds a head per row of capacity for units, and one per three rows for triples.
-                self.assertGreater(int(optimized._sparse_contact_group_count.numpy().max()), 0)
-                capacity = optimized.dense_max_constraints
+                self.assertGreater(int(optimized.placement.sparse_contact_group_count.numpy().max()), 0)
+                capacity = optimized.placement.dense_max_constraints
                 self.assertEqual(
-                    optimized._sparse_contact_serial_normals.shape,
+                    optimized.placement.sparse_contact_serial_normals.shape,
                     (2, capacity if label == "patch" else (capacity + 2) // 3),
                 )
                 for kernel in (
@@ -571,11 +573,12 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             )
             for torsion in (False, True)
         }
-        self.assertTrue(solvers[False]._sparse_diagonal_contact_solve)
+        self.assertTrue(solvers[False].placement.sparse_diagonal_contact_solve)
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
-        self.assertTrue(solvers[True]._sparse_diagonal_contact_solve)
+        self.assertTrue(solvers[True].placement.sparse_diagonal_contact_solve)
         self.assertEqual(
-            solvers[True]._sparse_diagonal_contact_triples, solvers[False]._sparse_diagonal_contact_triples
+            solvers[True].placement.sparse_diagonal_contact_triples,
+            solvers[False].placement.sparse_diagonal_contact_triples,
         )
 
     @unittest.skipUnless(wp.is_cuda_available(), "compact diagonal inertia requires CUDA")
@@ -688,11 +691,11 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     _build_chain_model(num_links=23, num_worlds=1, with_free_body=with_free_body),
                     dense_max_constraints=192,
                 )
-                self.assertTrue(solver._packed_response)
-                self.assertFalse(solver._jy_world_aliased)
-                self.assertFalse(solver._hinv_jt_writes_world)
-                self.assertEqual(solver._hinv_jt_diag_sizes, frozenset())
-                self.assertIsNone(solver.J_world)
+                self.assertTrue(solver.placement.packed_response)
+                self.assertFalse(solver.placement.jy_world_aliased)
+                self.assertFalse(solver.placement.hinv_jt_writes_world)
+                self.assertEqual(solver.placement.hinv_jt_diag_sizes, frozenset())
+                self.assertIsNone(solver.placement.J_world)
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""

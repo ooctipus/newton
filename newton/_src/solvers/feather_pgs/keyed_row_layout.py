@@ -113,7 +113,7 @@ def topology_plan(solver):
         sizes[0],
         sizes[1] if len(sizes) == 2 else 0,
         *block_offsets,
-        solver._ink_rows,
+        solver.placement.ink_rows,
         solver.options.enable_joint_velocity_limits,
         velocity_mask,
         position_mask,

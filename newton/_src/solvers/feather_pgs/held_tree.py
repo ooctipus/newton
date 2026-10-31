@@ -66,7 +66,7 @@ def decline(solver, *, sparse: bool | None = None, compact: int | None = None) -
     only the held tree evaluates, pass their candidates (:func:`sparse_decline`, :func:`compact_decline`). A term
     is read only once the earlier ones hold.
     """
-    if sparse is None and getattr(solver, "_sparse_mass_matrix_size", None) is not None:
+    if sparse is None and getattr(solver.placement, "sparse_mass_matrix_size", None) is not None:
         sparse = solver._sparse_velocity_limits
     if compact is None:
         compact = getattr(solver, "_compact_diagonal_mass_size", None)
@@ -260,7 +260,7 @@ class TreeSparseOperator:
 
     def refresh(self, state_aug):
         """Read cached physical mass terms through the unchanged sparse factor."""
-        s, n = self.solver, self.solver._sparse_mass_matrix_size
+        s, n = self.solver, self.solver.placement.sparse_mass_matrix_size
         wp.launch(
             self.refresh_kernel,
             dim=s.forest.n_arts_by_size[n] * 32,
@@ -628,7 +628,7 @@ class HeldTree:
         self.reference, self.clocked = kernel_switches()
         skip, classify = launch_switches(solver._route_pins)
         self.scalar = None
-        if solver._sparse_mass_matrix_size is not None:
+        if solver.placement.sparse_mass_matrix_size is not None:
             # The native sparse factor: one complete group, which proves its own coverage (make_plan).
             self.coverage = self.forest_reason = None
             operator = TreeSparseOperator(solver)

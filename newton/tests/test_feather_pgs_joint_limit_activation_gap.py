@@ -163,9 +163,9 @@ def _assert_dense_phase_layout(
     test_case: unittest.TestCase, solver: SolverFeatherPGS, *, expect_joint_velocity_limits: bool = True
 ):
     """Assert the three dense row-family partitions are ordered and populated."""
-    dense_count = int(solver.constraint_count.numpy()[0])
-    dense_types = solver.row_type.numpy()[0, :dense_count]
-    phase_zero_end, phase_one_end = solver.dense_phase_bounds.numpy()[0]
+    dense_count = int(solver.placement.constraint_count.numpy()[0])
+    dense_types = solver.placement.row_type.numpy()[0, :dense_count]
+    phase_zero_end, phase_one_end = solver.placement.dense_phase_bounds.numpy()[0]
     limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
     contact_rows = np.flatnonzero(dense_types == PGS_CONSTRAINT_TYPE_CONTACT)
@@ -190,9 +190,9 @@ def _assert_dense_phase_layout(
 
 def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherPGS):
     """Assert MF contacts precede the populated rigid velocity-limit tail."""
-    mf_count = int(solver.mf_constraint_count.numpy()[0])
-    mf_types = solver.mf_row_type.numpy()[0, :mf_count]
-    mf_contact_end = int(solver.mf_contact_rows_end.numpy()[0])
+    mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
+    mf_types = solver.placement.mf_row_type.numpy()[0, :mf_count]
+    mf_contact_end = int(solver.placement.mf_contact_rows_end.numpy()[0])
     contact_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_CONTACT)
     friction_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_FRICTION)
     velocity_limit_rows = np.flatnonzero(mf_types == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
@@ -217,16 +217,16 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
         state_in.clear_forces()
         model.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-        dense_count = int(solver.constraint_count.numpy()[0])
-        mf_count = int(solver.mf_constraint_count.numpy()[0])
+        dense_count = int(solver.placement.constraint_count.numpy()[0])
+        mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
         samples.append(
             {
                 "counts": (dense_count, mf_count),
-                "bounds": solver.dense_phase_bounds.numpy().copy(),
-                "row_type": solver.row_type.numpy()[0, :dense_count].copy(),
-                "mf_row_type": solver.mf_row_type.numpy()[0, :mf_count].copy(),
-                "impulses": solver.impulses.numpy()[0, :dense_count].copy(),
-                "mf_impulses": solver.mf_impulses.numpy()[0, :mf_count].copy(),
+                "bounds": solver.placement.dense_phase_bounds.numpy().copy(),
+                "row_type": solver.placement.row_type.numpy()[0, :dense_count].copy(),
+                "mf_row_type": solver.placement.mf_row_type.numpy()[0, :mf_count].copy(),
+                "impulses": solver.placement.impulses.numpy()[0, :dense_count].copy(),
+                "mf_impulses": solver.placement.mf_impulses.numpy()[0, :mf_count].copy(),
                 "joint_q": state_out.joint_q.numpy().copy(),
                 "joint_qd": state_out.joint_qd.numpy().copy(),
             }

@@ -288,12 +288,15 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         moved = frames.copy()
         moved[_fixed_root(model, 1), 2] += 0.25
         # Move the root, then move it back: each write is a move the refused notification must not store.
-        for row_owner, written in (("_row_packets", moved), ("_keyed_rows", frames)):
+        for row_owner, written in (("row_packets", moved), ("keyed_rows", frames)):
             with self.subTest(row_owner=row_owner):
                 for array in validity_arrays:
                     array.fill_(1)
                 model.joint_X_p.assign(written)
-                with patch.object(solver, row_owner, refusal), self.assertRaisesRegex(RuntimeError, "Row topology"):
+                with (
+                    patch.object(solver.placement, row_owner, refusal),
+                    self.assertRaisesRegex(RuntimeError, "Row topology"),
+                ):
                     solver.notify_model_changed(JOINT)
                 self.assertEqual([int(array.numpy().min()) for array in validity_arrays], [1] * len(validity_arrays))
                 solver.notify_model_changed(JOINT)
@@ -471,7 +474,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
     """
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-    solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
+    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
         solver.options, enable_joint_velocity_limits=motion_velocity
     )
     solver._route_pins.update(pins or {})
@@ -1531,8 +1534,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     launched.clear()
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
                     solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
-                    solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
-                        solver.options, enable_joint_velocity_limits=motion
+                    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+                        dataclasses.replace(solver.options, enable_joint_velocity_limits=motion)
                     )
                     owner = HeldTree(solver)
                     groups = []
@@ -1764,7 +1767,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
 
         solver = SimpleNamespace(
             _compact_diagonal_mass_size=2,
-            _sparse_mass_matrix_size=None,
+            placement=SimpleNamespace(sparse_mass_matrix_size=None),
             _execution_plan=SimpleNamespace(
                 use_diagonal_mass=lambda size: size == 4,
                 use_tiled_cholesky=lambda size: size >= 20,

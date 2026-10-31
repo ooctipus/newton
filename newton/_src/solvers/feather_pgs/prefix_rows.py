@@ -31,8 +31,8 @@ LAW = (
     Field("beta", wp.float32, owner="options", attr="pgs_beta"),
     Field("cfm", wp.float32, owner="options", attr="pgs_cfm"),
     Field("dt", wp.float32, owner="step"),
-    Field("slot_counter", wp.int32, ("world",)),
-    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
+    Field("slot_counter", wp.int32, ("world",), owner="placement"),
+    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds", owner="placement"),
     *(field for field in RECORDS if field.name not in ("row_w", "row_eps")),
 )
 """The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),

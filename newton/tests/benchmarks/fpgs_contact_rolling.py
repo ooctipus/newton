@@ -125,9 +125,9 @@ def run(worlds, objects, kind, warm, reduced, iterations):
     if hasattr(solver, "check_constraint_capacity"):
         solver.check_constraint_capacity()
     observed = metrics.numpy().tolist()
-    counts = solver.mf_constraint_count.numpy()
-    impulses = solver.mf_impulses.numpy()
-    row_type = solver.mf_row_type.numpy()
+    counts = solver.placement.mf_constraint_count.numpy()
+    impulses = solver.placement.mf_impulses.numpy()
+    row_type = solver.placement.mf_row_type.numpy()
     active = np.arange(impulses.shape[1])[None, :] < counts[:, None]
     normal = np.where(active & (row_type == 0), impulses, 0.0).sum(axis=1)
     expected = 2 * 9.81 * model.body_mass.numpy().reshape(worlds, objects).sum(axis=1) * DT
@@ -150,7 +150,9 @@ def run(worlds, objects, kind, warm, reduced, iterations):
         "support_relative_error": float(np.max(np.abs(normal / expected - 1))) if kind == "foot" else None,
         "final_contacts": int(contacts.rigid_contact_count.numpy()[0]),
         "max_rows": int(counts.max()),
-        "overflow": bool(solver.constraint_overflow.numpy().any()) if hasattr(solver, "constraint_overflow") else None,
+        "overflow": bool(solver.placement.constraint_overflow.numpy().any())
+        if hasattr(solver.placement, "constraint_overflow")
+        else None,
         "warp": wp.__version__,
     }
     if reduced:

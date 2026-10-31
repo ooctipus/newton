@@ -266,7 +266,7 @@ def _assert_bitwise(actual, expected):
 
 def _rowless(solver):
     """Worlds of the solver's last step without dense or matrix-free rows."""
-    dense, free = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
+    dense, free = solver.placement.constraint_count.numpy(), solver.placement.mf_constraint_count.numpy()
     return int(np.count_nonzero((dense == 0) & (free == 0)))
 
 
@@ -702,9 +702,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         (probe,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
         self.assertTrue(probe._solve_readout.kernels)
         for _ in self._steps(route, [probe], 1):
-            counts = probe.constraint_count.numpy()
-            types = probe.row_type.numpy() & _DENSE_META_ROW_TYPE_MASK
-            impulses = probe.impulses.numpy()
+            counts = probe.placement.constraint_count.numpy()
+            types = probe.placement.row_type.numpy() & _DENSE_META_ROW_TYPE_MASK
+            impulses = probe.placement.impulses.numpy()
             totals = [
                 impulses[world, :count][types[world, :count] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT]
                 for world, count in enumerate(counts)
@@ -722,7 +722,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         route, steps = _tier_route(), 4
         solver, summary, _ = self._lockstep(route, steps=steps)
         # The route's premise: no local owner claims the tripod's world, so the tiers own it.
-        self.assertFalse(solver._local_internal_fast_path)
+        self.assertFalse(solver.placement.local_internal_fast_path)
         sweep = solver.get_path_selection()["routes"]["sweep"]
         tier_kernels = {tier["kernel"] for tier in sweep["tiers"]["tiers"]}
         self.assertIn(sweep["tiers"]["family"], ("parallel", "keyed_parallel"))

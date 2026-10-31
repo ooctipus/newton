@@ -21,6 +21,7 @@ from newton.tests.test_feather_pgs_compact_contact import (
     _LAUNCH_FIELDS,
     _LAWS_FIELDS,
     _OPTIONS_FIELDS,
+    _PLACEMENT_FIELDS,
     OUTPUTS,
     fixture,
     install_prefix,
@@ -195,14 +196,19 @@ class TestCoalescedContact(unittest.TestCase):
         solver = SimpleNamespace(
             **values,
             forest=SimpleNamespace(**forest, world_count=2),
-            slot_counter=aux.counts,
-            dense_phase_bounds=aux.bounds,
-            constraint_count=wp.zeros(2, dtype=int, device="cpu"),
+            placement=SimpleNamespace(
+                **{name: getattr(data, field) for name, field in _PLACEMENT_FIELDS.items()},
+                slot_counter=aux.counts,
+                dense_phase_bounds=aux.bounds,
+                constraint_count=wp.zeros(2, dtype=int, device="cpu"),
+                J_by_size={6: data.Z},
+                # Launches sized by contact rows go through the pool, eagerly here.
+                contact_pool=ContactPool(device="cpu", rows=16),
+            ),
             model=SimpleNamespace(device="cpu", shape_body=data.shape_body),
             factor=SimpleNamespace(
                 **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
             ),
-            J_by_size={6: data.Z},
             _mark_independent_sparse_contact_candidates_kernel=marker,
             # Point friction: the patch row law with beta 0 and a disabled view.
             laws=SimpleNamespace(
@@ -213,8 +219,6 @@ class TestCoalescedContact(unittest.TestCase):
                 friction_patches=SimpleNamespace(view=point_row_law("cpu", 16).patches),
             ),
             options=SimpleNamespace(**{name: getattr(data, field) for name, field in _OPTIONS_FIELDS.items()}),
-            # Launches sized by contact rows go through the pool, eagerly here.
-            _contact_pool=ContactPool(device="cpu", rows=16),
         )
         contacts = SimpleNamespace(
             rigid_contact_max=16,
@@ -239,7 +243,7 @@ class TestCoalescedContact(unittest.TestCase):
         )
         call = launch.call_args_list[0]
         self.assertIs(call.kwargs["inputs"][0], aux.counts)
-        self.assertIsNot(call.kwargs["inputs"][0], solver.constraint_count)
+        self.assertIsNot(call.kwargs["inputs"][0], solver.placement.constraint_count)
         self.assertIs(call.kwargs["inputs"][1], aux.bounds)
         self.assertEqual(call.kwargs["dim"], (2, 256))
         self.assertEqual(call.kwargs["block_dim"], 256)

@@ -107,79 +107,79 @@ SIZE_GROUPED_SOLVE = FieldGroup(
 )
 """Grouped scratch of the dense triangular solve (not of the compact paths)."""
 
-SIZE_SYSTEM = FieldGroup(
-    Field("H", wp.float32, ("factor_art", "factor_size", "factor_size")),
-    Field("J", wp.float32, ("response_art", "response_row", "response_size")),
-)
-"""One size group's mass matrix and Jacobian; double-buffered on CUDA streams. The matrix-free sweeps' producers write
-the packed rows instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) placeholder."""
+SIZE_MASS = FieldGroup(Field("H", wp.float32, ("factor_art", "factor_size", "factor_size")))
+"""One size group's mass matrix; double-buffered on CUDA streams."""
+
+SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
+"""One size group's Jacobian; double-buffered on CUDA streams. The matrix-free sweeps' producers write the packed rows
+instead (:mod:`.packed_rows`): their Jacobian is a (1, 1, 1) placeholder."""
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Dense rows
 # ---------------------------------------------------------------------------------------------------------------------
 
 DENSE_ROWS = FieldGroup(
-    Field("rhs", wp.float32, ("world", "row")),
-    Field("impulses", wp.float32, ("world", "row")),
-    Field("diag", wp.float32, ("world", "row")),
-    Field("row_type", wp.int32, ("world", "row")),
-    Field("row_parent", wp.int32, ("world", "row"), fill=-1),
-    Field("row_mu", wp.float32, ("world", "row")),
-    Field("row_restitution", wp.float32, ("world", "row")),
-    Field("row_beta", wp.float32, ("world", "row")),
-    Field("row_cfm", wp.float32, ("world", "row")),
-    Field("phi", wp.float32, ("world", "row")),
-    Field("target_velocity", wp.float32, ("world", "row")),
-    Field("constraint_count", wp.int32, ("world",)),
-    Field("_row_sides", wp.vec2i, ("world", "row")),
+    Field("rhs", wp.float32, ("world", "row"), owner="placement"),
+    Field("impulses", wp.float32, ("world", "row"), owner="placement"),
+    Field("diag", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_type", wp.int32, ("world", "row"), owner="placement"),
+    Field("row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
+    Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_restitution", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_cfm", wp.float32, ("world", "row"), owner="placement"),
+    Field("phi", wp.float32, ("world", "row"), owner="placement"),
+    Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
+    Field("constraint_count", wp.int32, ("world",), owner="placement"),
+    Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
 """Every world's dense rows: the system and the row records (with each row's sides)."""
 
-DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0))
+DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
 """Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
 law) or a material contact's ``d / (d + eps)``."""
 
-DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row")))
+DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
 """Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
 
 WORLD_RESPONSE = FieldGroup(
-    Field("J_world", wp.float32, ("world", "row", "world_dof")),
-    Field("Y_world", wp.float32, ("world", "row", "world_dof")),
+    Field("J_world", wp.float32, ("world", "row", "world_dof"), owner="placement"),
+    Field("Y_world", wp.float32, ("world", "row", "world_dof"), owner="placement"),
 )
 """World-indexed Jacobian and response of the CUDA (matrix-free) route."""
 
 DENSE_WARMSTART = FieldGroup(
-    Field("_ws_prev_dense_impulses", wp.float32, ("world", "row")),
-    Field("_ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1),
-    Field("_ws_prev_dense_row_parent", wp.int32, ("world", "row"), fill=-1),
+    Field("ws_prev_dense_impulses", wp.float32, ("world", "row"), owner="placement"),
+    Field("ws_prev_dense_row_type", wp.int32, ("world", "row"), fill=-1, owner="placement"),
+    Field("ws_prev_dense_row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
 )
 """Identity-matched warm-start carry of the dense rows."""
 
 FUSED_DIAGONAL_LIMITS = FieldGroup(
-    Field("_fused_diagonal_limit_active", wp.int32, ("world", "world_dof")),
-    Field("_fused_diagonal_limit_lower_rhs", wp.float32, ("world", "world_dof")),
-    Field("_fused_diagonal_limit_upper_rhs", wp.float32, ("world", "world_dof")),
-    Field("_fused_diagonal_limit_lower_lambda", wp.float32, ("world", "world_dof")),
-    Field("_fused_diagonal_limit_upper_lambda", wp.float32, ("world", "world_dof")),
+    Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_lower_rhs", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_upper_rhs", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_lower_lambda", wp.float32, ("world", "world_dof"), owner="placement"),
+    Field("fused_diagonal_limit_upper_lambda", wp.float32, ("world", "world_dof"), owner="placement"),
 )
 """Position limits fused into the diagonal-mass sweep, outside the dense row system."""
 
 WORLD_ROW_STATE = FieldGroup(
-    Field("slot_counter", wp.int32, ("world",)),
-    Field("_dense_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED),
+    Field("slot_counter", wp.int32, ("world",), owner="placement"),
+    Field("dense_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
     # Per-world dense row-family boundaries, snapshotted from slot_counter each step. The dense slot layout is
     # [mimic][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the mimic and position-limit
     # prefix, [world, 1] the velocity-limit segment, and contacts/friction occupy [bounds[world, 1], m_dense).
-    Field("dense_phase_bounds", wp.int32, ("world", 2)),
+    Field("dense_phase_bounds", wp.int32, ("world", 2), owner="placement"),
     # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
-    Field("mf_contact_rows_end", wp.int32, ("world",)),
+    Field("mf_contact_rows_end", wp.int32, ("world",), owner="placement"),
 )
 """Per-world dense row reservation: the slot counter, the first rejected slot and the row-family boundaries."""
 
 CONTACT_RUNS = FieldGroup(
-    Field("_contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1),
-    Field("_contact_run_last", wp.int32, ("world", "run_block"), fill=-1),
-    Field("_contact_run_rows", wp.vec2i, ("world", "run_block")),
+    Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
+    Field("contact_run_last", wp.int32, ("world", "run_block"), fill=-1, owner="placement"),
+    Field("contact_run_rows", wp.vec2i, ("world", "run_block"), owner="placement"),
 )
 """Contact runs of each world and shape block under sorted contacts (``record_world_contact_runs``)."""
 
@@ -226,15 +226,17 @@ SPARSE_FACTOR = FieldGroup(
 """The native sparse factor's inverse entries and status, per articulation of the factored size."""
 
 SPARSE_ROWS = FieldGroup(
-    Field("_sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None),
-    Field("_sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None),
-    Field("_sparse_row_incident", wp.float32, ("world", "row"), fill=None),
-    Field("_sparse_factor_velocity_delta", wp.float32, ("world", "world_dof"), fill=None),
+    Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
+    Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),
+    Field("sparse_row_incident", wp.float32, ("world", "row"), fill=None, owner="placement"),
+    Field("sparse_factor_velocity_delta", wp.float32, ("world", "world_dof"), fill=None, owner="placement"),
 )
 """Each sparse row's factor coordinates (unless the support table holds them), factor entries and incident
 velocity, and each world's factor velocity change."""
 
-SPARSE_CONTACT_RECORDS = FieldGroup(Field("_sparse_contact_records", wp.float32, ("world", "triplet", "record")))
+SPARSE_CONTACT_RECORDS = FieldGroup(
+    Field("sparse_contact_records", wp.float32, ("world", "triplet", "record"), owner="placement")
+)
 """The single-stage transaction's per-triplet block records (``sparse_contact.CONTACT_RECORD_FLOATS``)."""
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -242,43 +244,43 @@ SPARSE_CONTACT_RECORDS = FieldGroup(Field("_sparse_contact_records", wp.float32,
 # ---------------------------------------------------------------------------------------------------------------------
 
 MF_COUNTERS = FieldGroup(
-    Field("mf_constraint_count", wp.int32, ("world",)),
-    Field("mf_slot_counter", wp.int32, ("world",)),
-    Field("_mf_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED),
+    Field("mf_constraint_count", wp.int32, ("world",), owner="placement"),
+    Field("mf_slot_counter", wp.int32, ("world",), owner="placement"),
+    Field("mf_first_rejected_slot", wp.int32, ("world",), fill=ROW_SLOT_UNBOUNDED, owner="placement"),
 )
 """Per-world matrix-free row counts, reservation counter and first rejected slot."""
 
 MF_ROWS = FieldGroup(
-    Field("mf_body_a", wp.int32, ("world", "mf_row")),
-    Field("mf_body_b", wp.int32, ("world", "mf_row")),
-    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6)),
-    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6)),
-    Field("mf_rhs", wp.float32, ("world", "mf_row")),
-    Field("mf_impulses", wp.float32, ("world", "mf_row")),
-    Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row")),
-    Field("mf_row_type", wp.int32, ("world", "mf_row")),
-    Field("mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1),
-    Field("mf_row_mu", wp.float32, ("world", "mf_row")),
-    Field("mf_phi", wp.float32, ("world", "mf_row")),
-    Field("mf_row_restitution", wp.float32, ("world", "mf_row")),
-    Field("mf_row_incident", wp.float32, ("world", "mf_row")),
-    Field("mf_dof_a", wp.int32, ("world", "mf_row")),
-    Field("mf_dof_b", wp.int32, ("world", "mf_row")),
-    Field("mf_meta_packed", wp.int32, ("world", "mf_meta")),
+    Field("mf_body_a", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_body_b", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_Z_a", wp.float32, ("world", "mf_row", 6), owner="placement"),
+    Field("mf_Z_b", wp.float32, ("world", "mf_row", 6), owner="placement"),
+    Field("mf_rhs", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_impulses", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_eff_mass_inv", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_row_type", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
+    Field("mf_row_mu", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_phi", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_row_restitution", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_row_incident", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("mf_dof_a", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_dof_b", wp.int32, ("world", "mf_row"), owner="placement"),
+    Field("mf_meta_packed", wp.int32, ("world", "mf_meta"), owner="placement"),
 )
 """Every world's matrix-free (free-body) rows. Each side's six entries hold the row's Jacobian ``J`` as the writers
 store it and its whitened form ``Z = L^-1 J^T`` once the rows' build has run (``L`` the body's held factor); a
 restitutive contact keeps its incident velocity ``J v_hat``. Packed metadata: four ints per row (dof pair, inverse
 effective mass, rhs, type and parent)."""
 
-MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0))
+MF_ROW_WEIGHTS = FieldGroup(Field("mf_row_w", wp.float32, ("world", "mf_row"), fill=1.0, owner="placement"))
 
-MF_ROW_EPS = FieldGroup(Field("mf_row_eps", wp.float32, ("world", "mf_row")))
+MF_ROW_EPS = FieldGroup(Field("mf_row_eps", wp.float32, ("world", "mf_row"), owner="placement"))
 
 MF_WARMSTART = FieldGroup(
-    Field("_ws_prev_mf_impulses", wp.float32, ("world", "mf_row")),
-    Field("_ws_prev_mf_row_type", wp.int32, ("world", "mf_row"), fill=-1),
-    Field("_ws_prev_mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1),
+    Field("ws_prev_mf_impulses", wp.float32, ("world", "mf_row"), owner="placement"),
+    Field("ws_prev_mf_row_type", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
+    Field("ws_prev_mf_row_parent", wp.int32, ("world", "mf_row"), fill=-1, owner="placement"),
 )
 """Matrix-free warm-start carry: last step's converged impulses and their row types."""
 
@@ -288,19 +290,19 @@ MF_WARMSTART = FieldGroup(
 
 ROW_WATERMARKS = FieldGroup(
     *(
-        Field(name, wp.int32, (1,))
+        Field(name, wp.int32, (1,), owner="placement")
         for name in (
-            "_row_watermark_dense",
-            "_row_watermark_mf",
-            "_row_watermark_contact",
-            "_row_watermark_dense_raw",
-            "_row_watermark_mf_raw",
-            "_row_dropped_dense_high_water",
-            "_row_dropped_mf_high_water",
-            "_row_overflow_dense_excess",
-            "_row_overflow_mf_excess",
-            "_row_overflow_dense_world_steps",
-            "_row_overflow_mf_world_steps",
+            "row_watermark_dense",
+            "row_watermark_mf",
+            "row_watermark_contact",
+            "row_watermark_dense_raw",
+            "row_watermark_mf_raw",
+            "row_dropped_dense_high_water",
+            "row_dropped_mf_high_water",
+            "row_overflow_dense_excess",
+            "row_overflow_mf_excess",
+            "row_overflow_dense_world_steps",
+            "row_overflow_mf_world_steps",
         )
     )
 )
@@ -388,20 +390,20 @@ Connects = field_group.struct(
 # ---------------------------------------------------------------------------------------------------------------------
 
 SPARSE_DIAGONAL_ROWS = FieldGroup(
-    Field("_sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1),
-    Field("_sparse_diagonal_row_z", wp.float32, ("world", "row", 2)),
+    Field("sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1, owner="placement"),
+    Field("sparse_diagonal_row_z", wp.float32, ("world", "row", 2), owner="placement"),
 )
 """Each sparse-diagonal row's two response coordinates and their whitened entries ``J / sqrt(m)``."""
 
 SPARSE_CONTACT_GROUPS = FieldGroup(
-    Field("_sparse_contact_group_count", wp.int32, ("world",)),
-    Field("_sparse_contact_group_heads", wp.int32, ("world", "world_dof"), fill=None),
+    Field("sparse_contact_group_count", wp.int32, ("world",), owner="placement"),
+    Field("sparse_contact_group_heads", wp.int32, ("world", "world_dof"), fill=None, owner="placement"),
 )
 """Independent contact groups per world (triples or units), by head row."""
 
 SPARSE_CONTACT_SERIAL = FieldGroup(
-    Field("_sparse_contact_serial_count", wp.int32, ("world",)),
-    Field("_sparse_contact_serial_normals", wp.int32, ("world", "serial"), fill=None),
+    Field("sparse_contact_serial_count", wp.int32, ("world",), owner="placement"),
+    Field("sparse_contact_serial_normals", wp.int32, ("world", "serial"), fill=None, owner="placement"),
 )
 """Contacts solved serially after the speculative batches, by normal row."""
 
@@ -410,13 +412,13 @@ SPARSE_CONTACT_SERIAL = FieldGroup(
 # ---------------------------------------------------------------------------------------------------------------------
 
 CAPACITY_STATUS = FieldGroup(
-    Field("_constraint_capacity_status", wp.int32, (2,)),
-    Field("constraint_overflow", wp.bool, ("world",)),
-    Field("_row_dropped_all", wp.int32, (2, "status_world")),
+    Field("constraint_capacity_status", wp.int32, (2,), owner="placement"),
+    Field("constraint_overflow", wp.bool, ("world",), owner="placement"),
+    Field("row_dropped_all", wp.int32, (2, "status_world"), owner="placement"),
 )
 """Sticky capacity flags of the dense and matrix-free rows, the per-world overflow latch and dropped rows."""
 
-OVERFLOW_WARNING = FieldGroup(Field("_row_overflow_warning_emitted", wp.int32, (2,)))
+OVERFLOW_WARNING = FieldGroup(Field("row_overflow_warning_emitted", wp.int32, (2,), owner="placement"))
 """The one-shot overflow warning latch of each row family."""
 
 
@@ -427,7 +429,7 @@ LOCAL_OWNERS = (
     Field("max_rows", wp.int32, attr="_local_solve_max_rows"),
     Field("residual_max_rows", wp.int32, attr="_local_residual_max_rows"),
     Field("residual_mf_max_rows", wp.int32, attr="_local_residual_mf_max_rows"),
-    Field("owner", wp.int32, ("world",), attr="_local_solve_owner"),
+    Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
     Field("general_world_count", wp.int32, (1,), attr="_local_general_world_count"),
     Field("general_worlds", wp.int32, ("world",), attr="_local_general_worlds"),
 )

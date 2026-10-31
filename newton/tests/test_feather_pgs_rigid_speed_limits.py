@@ -98,12 +98,12 @@ class TestFeatherPGSRigidSpeedLimits(unittest.TestCase):
         The box within its limits may resolve without rows, so only the first two worlds are read.
         """
         solver, _ = _step_boxes("cuda:0")
-        count = solver.mf_constraint_count.numpy()[:2]
+        count = solver.placement.mf_constraint_count.numpy()[:2]
         np.testing.assert_array_equal(count, 2)
-        types = solver.mf_row_type.numpy()[:2, :2]
+        types = solver.placement.mf_row_type.numpy()[:2, :2]
         np.testing.assert_array_equal(types, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
         # A speed row keeps its axis unwhitened.
-        jacobian = solver.mf_Z_a.numpy()[:2, :2]
+        jacobian = solver.placement.mf_Z_a.numpy()[:2, :2]
         np.testing.assert_array_equal(np.sort(np.argmax(np.abs(jacobian), axis=2), axis=1), [[0, 3]] * 2)
         np.testing.assert_array_equal(np.abs(jacobian).sum(axis=2), 1.0)
 

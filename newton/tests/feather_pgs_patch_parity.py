@@ -56,7 +56,7 @@ def route_arrays(solver, route=0):
     """Return a route's row arrays as host copies, keyed by role."""
     names = ("count", "type", "parent", "mu", "rhs", "impulse", "phi", "target")
     return {
-        role: None if attribute is None else getattr(solver, attribute).numpy()
+        role: None if attribute is None else getattr(solver.placement, attribute).numpy()
         for role, attribute in zip(names, _ROUTE_ARRAYS[route], strict=True)
     }
 
@@ -66,7 +66,7 @@ def _jacobian(solver, route, world, count):
     if route == 1:
         J_a, J_b = free_body_jacobians(solver)
         return np.concatenate([J_a[world, :count], J_b[world, :count]], axis=1)
-    if solver._sparse_mass_matrix_size is not None:
+    if solver.placement.sparse_mass_matrix_size is not None:
         from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
         return TestFeatherPGSSparseSolver()._sparse_rows_physical(solver, world, count)[1]
@@ -87,12 +87,15 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
     of each of the contact's rows, tangent rows included, instead of the
     normal row's only.
     """
-    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
-    slot, path = solver.contact_slot.numpy()[:count], solver.contact_path.numpy()[:count]
-    world, needed = solver.contact_world.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
+    slot, path = solver.placement.contact_slot.numpy()[:count], solver.placement.contact_path.numpy()[:count]
+    world, needed = (
+        solver.placement.contact_world.numpy()[:count],
+        solver.placement.contact_slots_needed.numpy()[:count],
+    )
     arrays = route_arrays(solver, route)
-    if incident and route == 0 and solver._sparse_mass_matrix_size is not None:
-        arrays["rhs"] = arrays["rhs"] + solver._sparse_row_incident.numpy()
+    if incident and route == 0 and solver.placement.sparse_mass_matrix_size is not None:
+        arrays["rhs"] = arrays["rhs"] + solver.placement.sparse_row_incident.numpy()
     patches = solver.laws.friction_patches
     view = patches.view if patches is not None and patches.view.weight.shape[0] else None
     routed = [c for c in range(count) if path[c] == route and slot[c] >= 0 and needed[c] > 0]
@@ -252,7 +255,7 @@ def assert_loaded_anchors(solver, contacts, *, carried=True, reset_worlds=()):
     rows = contact_rows(solver, contacts)
     patches = solver.laws.friction_patches
     valid, source = patches.previous.valid.numpy(), patches.current.source.numpy()
-    worlds = solver.contact_world.numpy()
+    worlds = solver.placement.contact_world.numpy()
     anchors = [c for c, record in rows.items() if len(record["types"]) == 3 and record["parents"][0] not in (-1, c)]
     if not anchors:
         raise AssertionError("No ring-linked contact holds an anchor")
@@ -293,7 +296,7 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     """
     rows = contact_rows(solver, contacts, jacobian=jacobian)
     patches = solver.laws.friction_patches
-    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
     owner = patches.current.owner.numpy()[:count]
     weight = patches.view.weight.numpy()[:count]
     location = patches.view.point_a.numpy()[:count].astype(np.float64)
@@ -551,9 +554,9 @@ def assert_history_matches_rows(solver, contacts, *, atol=1e-6, rtol=1e-6):
     count = min(int(contacts.rigid_contact_count.numpy()[0]), patches.capacity)
     valid = patches.previous.valid.numpy()[:count]
     tangent = patches.previous.tangent_impulse.numpy()[:count]
-    slot, world = solver.contact_slot.numpy()[:count], solver.contact_world.numpy()[:count]
-    needed, path = solver.contact_slots_needed.numpy()[:count], solver.contact_path.numpy()[:count]
-    impulses = solver.impulses.numpy()
+    slot, world = solver.placement.contact_slot.numpy()[:count], solver.placement.contact_world.numpy()[:count]
+    needed, path = solver.placement.contact_slots_needed.numpy()[:count], solver.placement.contact_path.numpy()[:count]
+    impulses = solver.placement.impulses.numpy()
     checked = 0
     for c in np.flatnonzero(valid):
         if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
@@ -711,11 +714,11 @@ def assert_sparse_rows_consistent(solver):
     from newton.tests.test_feather_pgs_sparse_solver import TestFeatherPGSSparseSolver  # noqa: PLC0415
 
     recover = TestFeatherPGSSparseSolver()._sparse_rows_physical
-    impulses, incident = solver.impulses.numpy(), solver._sparse_row_incident.numpy()
-    delta, dofs = solver._sparse_factor_velocity_delta.numpy(), solver.forest.world_dof_indices.numpy()
+    impulses, incident = solver.placement.impulses.numpy(), solver.placement.sparse_row_incident.numpy()
+    delta, dofs = solver.placement.sparse_factor_velocity_delta.numpy(), solver.forest.world_dof_indices.numpy()
     v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
     checked = 0
-    for world, live in enumerate(solver.constraint_count.numpy()):
+    for world, live in enumerate(solver.placement.constraint_count.numpy()):
         count = int(live)
         z, jacobian = recover(solver, world, count)
         velocity = dofs[world]

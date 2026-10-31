@@ -34,12 +34,12 @@ def _make_solver(model, *, warmstart: bool):
 def _history_specs(solver):
     specs = []
     if solver.options.pgs_warmstart:
-        specs.append(("dense impulses", solver.impulses, 7.0, 0.0))
-    if solver._ws_prev_mf_impulses is not None:
+        specs.append(("dense impulses", solver.placement.impulses, 7.0, 0.0))
+    if solver.placement.ws_prev_mf_impulses is not None:
         specs.extend(
             (
-                ("MF impulses", solver._ws_prev_mf_impulses, 11.0, 0.0),
-                ("MF row types", solver._ws_prev_mf_row_type, 13, -1),
+                ("MF impulses", solver.placement.ws_prev_mf_impulses, 11.0, 0.0),
+                ("MF row types", solver.placement.ws_prev_mf_row_type, 13, -1),
             )
         )
     return specs
@@ -97,10 +97,10 @@ class TestFeatherPGSReset(unittest.TestCase):
             with self.subTest(flags=flags):
                 specs = _history_specs(solver)
                 _poison(specs)
-                solver.constraint_overflow.fill_(True)
+                solver.placement.constraint_overflow.fill_(True)
                 solver.notify_model_changed(flags)
                 _assert_worlds(self, specs, (True, True))
-                self.assertTrue(solver.constraint_overflow.numpy().all())
+                self.assertTrue(solver.placement.constraint_overflow.numpy().all())
 
     def test_reset_clears_enabled_histories_by_scope(self):
         cases = (
@@ -122,8 +122,8 @@ class TestFeatherPGSReset(unittest.TestCase):
     def test_reset_validates_mask_before_disabled_noop(self):
         model = _build_two_world_free_model("cpu")
         solver = _make_solver(model, warmstart=False)
-        solver.impulses.fill_(17.0)
-        before = solver.impulses.numpy().copy()
+        solver.placement.impulses.fill_(17.0)
+        before = solver.placement.impulses.numpy().copy()
 
         invalid_mask = wp.ones(3, dtype=wp.bool, device=model.device)
         with self.assertRaisesRegex(ValueError, "expected 2"):
@@ -131,8 +131,8 @@ class TestFeatherPGSReset(unittest.TestCase):
 
         valid_mask = wp.array((True, False), dtype=wp.bool, device=model.device)
         solver.reset(model.state(), valid_mask)
-        np.testing.assert_array_equal(solver.impulses.numpy(), before)
-        self.assertIsNone(solver._ws_prev_mf_impulses)
+        np.testing.assert_array_equal(solver.placement.impulses.numpy(), before)
+        self.assertIsNone(solver.placement.ws_prev_mf_impulses)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA graph reset test requires CUDA")
     def test_reset_is_cuda_graph_capturable(self):

@@ -91,9 +91,9 @@ class RowOrder:
     def __init__(self, case):
         self.solver, self.contacts = case[1], case[6]
         solver = self.solver
-        self.order = wp.empty_like(solver.row_type)
-        self.inverse = wp.empty_like(solver.row_type)
-        self.keys = wp.empty(solver.row_type.shape, dtype=wp.int64, device=solver.model.device)
+        self.order = wp.empty_like(solver.placement.row_type)
+        self.inverse = wp.empty_like(solver.placement.row_type)
+        self.keys = wp.empty(solver.placement.row_type.shape, dtype=wp.int64, device=solver.model.device)
         names = (
             "rhs",
             "diag",
@@ -106,11 +106,13 @@ class RowOrder:
             "phi",
             "target_velocity",
             "row_restitution",
-            "_sparse_row_dof",
-            "_sparse_row_factor",
-            "_sparse_row_incident",
+            "sparse_row_dof",
+            "sparse_row_factor",
+            "sparse_row_incident",
         )
-        self.arrays = [(getattr(solver, name), wp.empty_like(getattr(solver, name))) for name in names]
+        self.arrays = [
+            (getattr(solver.placement, name), wp.empty_like(getattr(solver.placement, name))) for name in names
+        ]
         self.solve = solver._launch_matrix_free_gs_solve
 
     def __call__(self, *args, **kwargs):
@@ -120,14 +122,14 @@ class RowOrder:
             _order,
             dim=solver.forest.world_count,
             inputs=[
-                solver.constraint_count,
-                solver.row_type,
-                solver._sparse_row_dof,
-                solver._sparse_row_factor,
+                solver.placement.constraint_count,
+                solver.placement.row_type,
+                solver.placement.sparse_row_dof,
+                solver.placement.sparse_row_factor,
                 contacts.rigid_contact_count,
-                solver.contact_world,
-                solver.contact_slot,
-                solver.contact_slots_needed,
+                solver.placement.contact_world,
+                solver.placement.contact_slot,
+                solver.placement.contact_slots_needed,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
                 self.keys,
@@ -140,20 +142,25 @@ class RowOrder:
             wp.launch(
                 _gather2 if source.ndim == 2 else _gather3,
                 dim=source.shape,
-                inputs=[source, self.order, solver.constraint_count, target],
+                inputs=[source, self.order, solver.placement.constraint_count, target],
                 device=device,
             )
             wp.copy(source, target)
         wp.launch(
             _parents,
-            dim=solver.row_parent.shape,
-            inputs=[solver.constraint_count, self.inverse, solver.row_parent],
+            dim=solver.placement.row_parent.shape,
+            inputs=[solver.placement.constraint_count, self.inverse, solver.placement.row_parent],
             device=device,
         )
         wp.launch(
             _slots,
             dim=contacts.rigid_contact_max,
-            inputs=[contacts.rigid_contact_count, solver.contact_world, self.inverse, solver.contact_slot],
+            inputs=[
+                contacts.rigid_contact_count,
+                solver.placement.contact_world,
+                self.inverse,
+                solver.placement.contact_slot,
+            ],
             device=device,
         )
         return self.solve(*args, **kwargs)

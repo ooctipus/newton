@@ -384,6 +384,7 @@ class TestResolvedWorlds(unittest.TestCase):
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
             _route_pins={},
+            placement=SimpleNamespace(keyed_rows=None),
             laws=SimpleNamespace(set=plain_laws(warm_start=True)),
         )
         classifier = rw.ResolvedWorlds(solver)
@@ -526,8 +527,7 @@ def _admissible_solver():
     """A stand-in solver whose policy the classifier admits; device checks see CUDA."""
     return SimpleNamespace(
         _preelim_count=0,
-        _keyed_rows=None,
-        _row_watermark=False,
+        placement=SimpleNamespace(keyed_rows=None, row_watermark=False),
         routes=SimpleNamespace(case="K6"),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
         _route_pins={},
@@ -609,7 +609,7 @@ def _rollout(
         masks.append(solver._resolved_worlds.numpy().copy())
         if history is not None:
             count = int(contacts.rigid_contact_count.numpy()[0])
-            marked = solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
+            marked = solver.placement.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
             (anchors,) = held
             record = {
                 "valid": patches.previous.valid.numpy().copy(),
@@ -711,7 +711,8 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
                 self.assertTrue(solver.laws.friction_anchors_enabled)
                 self.assertIsNotNone(solver._resolved_worlds_owner)
                 self.assertEqual(
-                    solver._resolved_worlds_owner.row_bound, (solver.dense_max_constraints, solver.mf_max_constraints)
+                    solver._resolved_worlds_owner.row_bound,
+                    (solver.placement.dense_max_constraints, solver.placement.mf_max_constraints),
                 )
                 self.assertGreater(int(masks.sum()), 0)
                 self.assertLess(int(masks.sum()), masks.size)
@@ -741,7 +742,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         complete_history, history = [], []
         plain_solver, plain, _ = _rollout(model, classifier=False, history=complete_history, toss_every=1, **options)
         solver, poses, _ = _rollout(model, classifier=True, history=history, toss_every=1, **options)
-        self.assertEqual(solver._resolved_worlds_owner.row_bound, (solver.dense_max_constraints, 2))
+        self.assertEqual(solver._resolved_worlds_owner.row_bound, (solver.placement.dense_max_constraints, 2))
         held = sum(int(np.sum(record["separating"] & ~record["resolved"])) for record in history)
         self.assertGreater(held, 0, "no separating world was held for capacity")
         self.assertEqual(sum(record["marked"] for record in history), 0)
@@ -801,7 +802,7 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 friction_anchor_beta=0.0,
             )
         self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["unknown"]))
-        self.assertIsNotNone(solver._sparse_mass_matrix_size)
+        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size)
         routes = solver.get_path_selection()["routes"]
         self.assertNotIn("research_sparse_factor", routes)
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")

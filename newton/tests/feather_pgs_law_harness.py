@@ -750,10 +750,10 @@ def packed_coordinates(solver) -> np.ndarray:
     """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
     rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side). Every side holds response
     coordinates (:func:`.dense_rows.row_sides`)."""
-    sides, sizes = solver._row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
-    dof = np.full((*sides.shape[:2], solver._packed_Z.shape[2]), -1, dtype=np.int32)
-    for world, count in enumerate(solver.constraint_count.numpy()):
+    dof = np.full((*sides.shape[:2], solver.placement.packed_Z.shape[2]), -1, dtype=np.int32)
+    for world, count in enumerate(solver.placement.constraint_count.numpy()):
         for row in range(min(int(count), sides.shape[1])):
             first = 0
             for art in sides[world, row]:
@@ -762,7 +762,7 @@ def packed_coordinates(solver) -> np.ndarray:
                 n, offset = int(sizes[art]), int(offsets[art])
                 if n <= 0 or offset < 0:
                     raise AssertionError(f"world {world} row {row}: side {art} holds no response coordinates")
-                at = offset if solver._packed_dense else first
+                at = offset if solver.placement.packed_dense else first
                 dof[world, row, at : at + n] = offset + np.arange(n)
                 first += n
     return dof
@@ -773,13 +773,13 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     float64 ``[world, row, coordinate]``: the Jacobian ``J`` and the response ``H^-1 J^T`` (``P^T L^-T z`` on each
     side, the side's entries found by their coordinates)."""
     dof = packed_coordinates(solver)
-    J, Z = solver._packed_J.numpy().astype(np.float64), solver._packed_Z.numpy().astype(np.float64)
-    sides, sizes = solver._row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    J, Z = solver.placement.packed_J.numpy().astype(np.float64), solver.placement.packed_Z.numpy().astype(np.float64)
+    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
     groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
     factors = {}
     shape = (*dof.shape[:2], solver.forest.max_world_dofs)
     jacobian, response = np.zeros(shape), np.zeros(shape)
-    for world, count in enumerate(solver.constraint_count.numpy()):
+    for world, count in enumerate(solver.placement.constraint_count.numpy()):
         for row in range(min(int(count), dof.shape[1])):
             for art in sides[world, row]:
                 if art < 0:

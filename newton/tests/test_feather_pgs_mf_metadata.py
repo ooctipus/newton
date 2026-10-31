@@ -17,6 +17,7 @@ import newton
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton._src.solvers.feather_pgs.kernels import BodyFactors
+from newton._src.solvers.feather_pgs.placement import Placement
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
@@ -88,8 +89,7 @@ def _metadata_packer(source):
 def _pack_state(has_free_rigid_bodies):
     """Stand in for a solver with opaque metadata-pack operands."""
     state = SimpleNamespace(
-        _pack_mf_meta_kernel=object(),
-        _colored_units=None,
+        pack_mf_meta_kernel=object(),
         model=SimpleNamespace(device="mock-device"),
         forest=SimpleNamespace(has_free_rigid_bodies=has_free_rigid_bodies, world_count=7),
     )
@@ -116,14 +116,14 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 self.subTest(has_free_rigid_bodies=has_free),
                 patch.object(fpgs.wp, "launch_tiled") as launch,
             ):
-                fpgs.SolverFeatherPGS._pack_mf_meta(state, rhs)
+                Placement.pack_free_body_meta(state, rhs)
                 if not has_free:
                     launch.assert_not_called()
                 else:
                     # The launch contract, not its operand layout: the pack kernel packs this RHS into the metadata.
                     launch.assert_called_once()
                     args, kwargs = launch.call_args
-                    self.assertIs(args[0], state._pack_mf_meta_kernel)
+                    self.assertIs(args[0], state.pack_mf_meta_kernel)
                     self.assertTrue(any(operand is rhs for operand in kwargs["inputs"]))
                     self.assertEqual(kwargs["outputs"], [state.mf_meta_packed])
 
@@ -354,7 +354,7 @@ def _record_pack_launches(solver):
     packed = []
 
     def record(kernel, *args, **kwargs):
-        if kernel is solver._pack_mf_meta_kernel:
+        if kernel is solver.placement.pack_mf_meta_kernel:
             packed.append(kwargs["inputs"][4])
         return launch_tiled(kernel, *args, **kwargs)
 
@@ -366,17 +366,18 @@ def _launch_pack_unconditionally(solver):
 
     The solver builds the pack kernel only where it launches, so the arm builds it here.
     """
-    pack = type(solver)._pack_mf_meta
-    solver._pack_mf_meta_kernel = response_builds_rows.free_body_meta_kernel(
-        solver.mf_max_constraints, solver.model.device.arch
+    pack = Placement.pack_free_body_meta
+    solver.placement.pack_mf_meta_kernel = response_builds_rows.free_body_meta_kernel(
+        solver.placement.mf_max_constraints, solver.model.device.arch
     )
 
     def unconditional(mf_rhs):
         # The production launch, with the skip's only gate held open for the call.
-        with patch.object(solver, "forest", dataclasses.replace(solver.forest, has_free_rigid_bodies=True)):
-            pack(solver, mf_rhs)
+        placement = solver.placement
+        with patch.object(placement, "forest", dataclasses.replace(placement.forest, has_free_rigid_bodies=True)):
+            pack(placement, mf_rhs)
 
-    solver._pack_mf_meta = unconditional
+    solver.placement.pack_free_body_meta = unconditional
 
 
 def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
@@ -397,11 +398,12 @@ def _step_matrix_free(model, solver, *, steps, joint_qd=0.0, dt=1.0 / 240.0):
             states[0].clear_forces()
             solver.step(states[0], states[1], control, contacts, dt)
             states.reverse()
-            impulse_peak.append(np.abs(solver.impulses.numpy()).max())
+            impulse_peak.append(np.abs(solver.placement.impulses.numpy()).max())
     values = {name: getattr(states[0], name).numpy() for name in ("joint_q", "joint_qd", "body_q", "body_qd")}
     values["impulse_peak"] = np.array(impulse_peak)
-    for name in ("impulses", "v_out", "mf_constraint_count", "mf_meta_packed"):
-        values[name] = getattr(solver, name).numpy()
+    for name in ("impulses", "mf_constraint_count", "mf_meta_packed"):
+        values[name] = getattr(solver.placement, name).numpy()
+    values["v_out"] = solver.v_out.numpy()
     values["contact_count"] = contacts.rigid_contact_count.numpy()
     return packed, values
 
@@ -417,7 +419,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
             solver = fpgs.SolverFeatherPGS(model, pgs_iterations=6)
             self.assertFalse(solver.forest.has_free_rigid_bodies)
             # The pack kernel is built only where it launches.
-            self.assertIsNone(solver._pack_mf_meta_kernel)
+            self.assertIsNone(solver.placement.pack_mf_meta_kernel)
             if unconditional:
                 _launch_pack_unconditionally(solver)
             runs.append((solver, *_step_matrix_free(model, solver, steps=steps, joint_qd=0.2)))
@@ -431,7 +433,7 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         # The legacy arm proves the call site ran on every step.
         self.assertEqual(len(legacy_packs), steps)
         for actual in legacy_packs:
-            self.assertIs(actual, legacy.mf_rhs)
+            self.assertIs(actual, legacy.placement.mf_rhs)
         self.assertTrue(np.all(skipped["contact_count"] > 0))
         self.assertTrue(np.any(skipped["impulse_peak"] > 0.0))
         np.testing.assert_array_equal(skipped["mf_constraint_count"], 0)
@@ -455,9 +457,9 @@ class TestFeatherPGSMFMetadataPackCUDA(unittest.TestCase):
         self.assertEqual(len(packed), steps)
         pack = solver.get_path_selection()["routes"]["sweep"]["mf_meta_pack"]
         self.assertTrue(pack["launched"])
-        self.assertEqual(pack["kernel"], solver._pack_mf_meta_kernel.key)
+        self.assertEqual(pack["kernel"], solver.placement.pack_mf_meta_kernel.key)
         for rhs in packed:
-            self.assertIs(rhs, solver.mf_rhs)
+            self.assertIs(rhs, solver.placement.mf_rhs)
 
 
 if __name__ == "__main__":

@@ -177,12 +177,20 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
             live = int(contacts.rigid_contact_count.numpy()[0])
             # On CPU numpy() views the solver's buffers, which the next step overwrites.
             record = {
-                name: getattr(solver, f"contact_{name}").numpy()[:live].copy() for name in ("world", "path", "slot")
+                name: getattr(solver.placement, f"contact_{name}").numpy()[:live].copy()
+                for name in ("world", "path", "slot")
             }
             record.update(
-                counts=(solver.constraint_count.numpy().copy(), solver.mf_constraint_count.numpy().copy()),
-                dense_overflow=solver._dense_first_rejected_slot.numpy() < solver.slot_counter.numpy(),
-                starts=(solver.dense_phase_bounds.numpy()[:, 1].copy(), np.zeros(model.world_count, dtype=np.int32)),
+                counts=(
+                    solver.placement.constraint_count.numpy().copy(),
+                    solver.placement.mf_constraint_count.numpy().copy(),
+                ),
+                dense_overflow=solver.placement.dense_first_rejected_slot.numpy()
+                < solver.placement.slot_counter.numpy(),
+                starts=(
+                    solver.placement.dense_phase_bounds.numpy()[:, 1].copy(),
+                    np.zeros(model.world_count, dtype=np.int32),
+                ),
                 joint_q=state_out.joint_q.numpy().copy(),
                 joint_qd=state_out.joint_qd.numpy().copy(),
             )

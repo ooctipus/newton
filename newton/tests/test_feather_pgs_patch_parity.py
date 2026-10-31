@@ -76,9 +76,9 @@ def _ring_pool_dropped(solver):
     def cut(kernel, *args, **kwargs):
         result = launch(kernel, *args, **kwargs)
         if kernel is link_patch_routes:
-            kinds, parents = solver.row_type.numpy(), solver.row_parent.numpy()
+            kinds, parents = solver.placement.row_type.numpy(), solver.placement.row_parent.numpy()
             parents[kinds == PGS_CONSTRAINT_TYPE_CONTACT] = -1
-            solver.row_parent.assign(parents)
+            solver.placement.row_parent.assign(parents)
         return result
 
     with mock.patch.object(wp, "launch", cut):
@@ -102,17 +102,17 @@ _MF_ROWS = (
 def _permuted_slots(solver, contacts, shift):
     """Reserve the same matrix-free row blocks in rotated order, as other atomic outcomes would."""
     count = int(contacts.rigid_contact_count.numpy()[0])
-    slot, path = solver.contact_slot.numpy().copy(), solver.contact_path.numpy()
-    world, needed = solver.contact_world.numpy(), solver.contact_slots_needed.numpy()
+    slot, path = solver.placement.contact_slot.numpy().copy(), solver.placement.contact_path.numpy()
+    world, needed = solver.placement.contact_world.numpy(), solver.placement.contact_slots_needed.numpy()
     routed = [c for c in range(count) if path[c] == 1 and slot[c] >= 0 and needed[c] > 0]
-    rows = {name: getattr(solver, name).numpy() for name in _MF_ROWS}
+    rows = {name: getattr(solver.placement, name).numpy() for name in _MF_ROWS}
     permuted = {name: values.copy() for name, values in rows.items()}
     moved = {}
     for w in np.unique(world[routed]):
         blocks = [c for c in routed if world[c] == w]
         # This fixture's matrix-free rows are contacts only, so the blocks tile the world's rows.
         assert sorted(int(slot[c]) + k for c in blocks for k in range(int(needed[c]))) == list(
-            range(int(solver.mf_constraint_count.numpy()[w]))
+            range(int(solver.placement.mf_constraint_count.numpy()[w]))
         )
         start = 0
         for c in blocks[shift:] + blocks[:shift]:
@@ -126,14 +126,16 @@ def _permuted_slots(solver, contacts, shift):
         parent = int(rows["mf_row_parent"][w, old])
         permuted["mf_row_parent"][w, new] = moved.get((w, parent), parent)
     stand_in = SimpleNamespace(
-        **{name: wp.array(values, device="cpu") for name, values in permuted.items()},
-        mf_constraint_count=solver.mf_constraint_count,
-        contact_slot=wp.array(slot, device="cpu"),
-        contact_path=solver.contact_path,
-        contact_world=solver.contact_world,
-        contact_slots_needed=solver.contact_slots_needed,
+        placement=SimpleNamespace(
+            **{name: wp.array(values, device="cpu") for name, values in permuted.items()},
+            mf_constraint_count=solver.placement.mf_constraint_count,
+            contact_slot=wp.array(slot, device="cpu"),
+            contact_path=solver.placement.contact_path,
+            contact_world=solver.placement.contact_world,
+            contact_slots_needed=solver.placement.contact_slots_needed,
+            sparse_mass_matrix_size=None,
+        ),
         laws=SimpleNamespace(friction_patches=solver.laws.friction_patches),
-        _sparse_mass_matrix_size=None,
         # The bodies' factors, which whitened the rows.
         factor=SimpleNamespace(L_by_size=solver.factor.L_by_size),
         forest=SimpleNamespace(
@@ -165,7 +167,9 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         for shift in (1, 2, 3):
             with self.subTest(shift=shift):
                 stand_in = _permuted_slots(solver, contacts, shift)
-                self.assertFalse(np.array_equal(stand_in.contact_slot.numpy(), solver.contact_slot.numpy()))
+                self.assertFalse(
+                    np.array_equal(stand_in.placement.contact_slot.numpy(), solver.placement.contact_slot.numpy())
+                )
                 permuted = contact_rows(stand_in, contacts, route=1, jacobian=True)
                 assert_rows_close(rows, permuted, atol=0.0, rtol=0.0)
                 assert_contact_impulses_close(rows, permuted, atol=0.0, rtol=0.0)
@@ -196,14 +200,16 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         impulses = wp.array([[0, 1, 0, 4, 0, 1, 0] + [0] * 25], dtype=float, device="cpu")
         solved = impulses.numpy()
         stand_in = SimpleNamespace(
-            constraint_count=count,
-            row_type=rows,
-            row_parent=parents,
-            row_mu=mu,
-            rhs=rhs,
-            impulses=impulses,
-            phi=wp.zeros_like(rhs),
-            target_velocity=wp.zeros_like(rhs),
+            placement=SimpleNamespace(
+                constraint_count=count,
+                row_type=rows,
+                row_parent=parents,
+                row_mu=mu,
+                rhs=rhs,
+                impulses=impulses,
+                phi=wp.zeros_like(rhs),
+                target_velocity=wp.zeros_like(rhs),
+            )
         )
         # Each anchor's own normal carries no load: only the pooled ring budget admits the solution.
         self.assertGreater(solved[0, 1], solved[0, 0] * 0.25)
@@ -374,11 +380,11 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         def scale_carried_friction(factor):
             count = int(case[-1].rigid_contact_count.numpy()[0])
             source = patches.current.source.numpy()[:count]
-            slot, world = solver.contact_slot.numpy()[:count], solver.contact_world.numpy()[:count]
-            needed, impulses = solver.contact_slots_needed.numpy()[:count], solver.impulses.numpy()
+            slot, world = solver.placement.contact_slot.numpy()[:count], solver.placement.contact_world.numpy()[:count]
+            needed, impulses = solver.placement.contact_slots_needed.numpy()[:count], solver.placement.impulses.numpy()
             for c in np.flatnonzero((source >= 0) & (slot >= 0) & (needed == 3)):
                 impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
-            solver.impulses.assign(impulses)
+            solver.placement.impulses.assign(impulses)
 
         seed, dispatch, launch = patches.seed, solver._launch_matrix_free_gs_solve, wp.launch
 

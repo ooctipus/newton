@@ -453,7 +453,7 @@ class TestSparseContactTriplets(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=capacity,
                 )
-                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 self.assertEqual("contact_triplets" in solver._pgs_solve_sparse_kernel.key, selected)
 
     def test_factory_on_coupled_fixture_cpu(self):
@@ -779,7 +779,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=192,
                 )
-                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 key = solver._pgs_solve_sparse_kernel.key
                 self.assertTrue(key.endswith(suffix), key)
                 self.assertEqual(solver._sparse_contact_triplets, "contact_triplets" in suffix)

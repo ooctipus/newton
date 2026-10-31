@@ -155,7 +155,7 @@ def fpgs(flags=None):
     flags = flags or dict.fromkeys(checked.FPGS_FLAGS, False)
     solver.constraint_capacity_status = Mock(return_value=flags)
     solver.check_constraint_capacity = Mock()
-    solver.dense_max_constraints, solver.mf_max_constraints = 704, 64
+    solver.placement = SimpleNamespace(dense_max_constraints=704, mf_max_constraints=64)
     return solver
 
 
@@ -210,11 +210,11 @@ def legacy_manager():
     """Build the audited legacy row flags and reset-each-call collision counters."""
     solver = fpgs()
     del solver.constraint_capacity_status, solver.check_constraint_capacity
-    solver._track_row_capacity = True
+    solver.placement.track_row_capacity = True
     solver.options = SimpleNamespace(warn_constraint_overflow=True, contact_compliance=False)
     solver.laws = SimpleNamespace(friction_patches=SimpleNamespace(capacity=8), friction_anchor_beta=0.2)
-    solver._row_overflow_warning_emitted = FlagArray([0, 0, 0])
-    solver._max_contacts_alloc = 8
+    solver.placement.row_overflow_warning_emitted = FlagArray([0, 0, 0])
+    solver.placement.max_contacts_alloc = 8
     solver.contact_torsion_radius = 0.0
     pipeline = collision_pipeline()
     narrow = pipeline.narrow_phase
@@ -308,7 +308,7 @@ class TestLegacyCapacitySurvey(unittest.TestCase):
             checked.check_solver("feather_pgs", manager._solver, entry)
             checked.check_collision("feather_pgs", manager, entry)
         self.assertEqual(set(entry["flags"]), {"dense", "matrix_free", "propagation"})
-        self.assertEqual(manager._solver._row_overflow_warning_emitted.values, [0, 0, 0])
+        self.assertEqual(manager._solver.placement.row_overflow_warning_emitted.values, [0, 0, 0])
         self.assertEqual(entry["collision"]["status"], "legacy_warning_screened_boundary_snapshots")
         self.assertFalse(entry["collision"]["whole_run_collision_capacity_verified"])
         self.assertTrue(entry["collision"]["log_warning_screen_required"])
@@ -320,7 +320,7 @@ class TestLegacyCapacitySurvey(unittest.TestCase):
         for failure in ("rows", "disabled", "broad", "contacts", "patch"):
             manager, entry = legacy_manager(), {}
             if failure == "rows":
-                manager._solver._row_overflow_warning_emitted.values[1] = 1
+                manager._solver.placement.row_overflow_warning_emitted.values[1] = 1
             elif failure == "disabled":
                 manager._collision_pipeline.narrow_phase.verify_buffers = False
             elif failure == "broad":

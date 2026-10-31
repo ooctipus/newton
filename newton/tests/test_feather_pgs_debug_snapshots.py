@@ -147,12 +147,14 @@ def _reservations(solver, contacts):
     world, first slot and row count read as -1.
     """
     count = int(contacts.rigid_contact_count.numpy()[0])
-    path = solver.contact_path.numpy()[:count].copy()
-    reservation = {name: np.where(path >= 0, getattr(solver, name).numpy()[:count], -1) for name in RESERVATION_FIELDS}
+    path = solver.placement.contact_path.numpy()[:count].copy()
+    reservation = {
+        name: np.where(path >= 0, getattr(solver.placement, name).numpy()[:count], -1) for name in RESERVATION_FIELDS
+    }
     reservation["contact_path"] = path
-    reservation["constraint_count"] = solver.constraint_count.numpy().copy()
-    if getattr(solver, "mf_constraint_count", None) is not None:
-        reservation["mf_constraint_count"] = solver.mf_constraint_count.numpy().copy()
+    reservation["constraint_count"] = solver.placement.constraint_count.numpy().copy()
+    if getattr(solver.placement, "mf_constraint_count", None) is not None:
+        reservation["mf_constraint_count"] = solver.placement.mf_constraint_count.numpy().copy()
     return reservation
 
 
@@ -296,7 +298,7 @@ def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs)
         with patch.multiple(wp, **spies):
             solver.step(states[0], states[1], control, contacts, DT)
         trajectory.append({name: getattr(states[1], name).numpy().copy() for name in STATE_FIELDS})
-        trajectory[-1]["impulses"] = solver.impulses.numpy().copy()
+        trajectory[-1]["impulses"] = solver.placement.impulses.numpy().copy()
         reservations.append(_reservations(solver, contacts))
         states.reverse()
     return {
@@ -565,7 +567,7 @@ def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
 
     def record():
         trajectory.append({name: getattr(states[0], name).numpy().copy() for name in STATE_FIELDS})
-        trajectory[-1]["impulses"] = solver.impulses.numpy().copy()
+        trajectory[-1]["impulses"] = solver.placement.impulses.numpy().copy()
         reservations.append(_reservations(solver, contacts))
 
     # Compile and initialize the layouts before capture.
@@ -620,7 +622,7 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
                 # flag is all that differs between them.
                 off = _graph_rollout(_compared_scene(device), snapshots=False, **options)
                 on = _graph_rollout(_compared_scene(device), snapshots=True, **options)
-                self.assertEqual(on["solver"]._contact_pool.bound, off["solver"]._contact_pool.bound)
+                self.assertEqual(on["solver"].placement.contact_pool.bound, off["solver"].placement.contact_pool.bound)
                 self.assertGreater(min(off["contact_counts"]), 0)
                 self.assertLessEqual(
                     max(off["contact_counts"]), WARP_SIZE, "the compared contacts must fit in one warp"

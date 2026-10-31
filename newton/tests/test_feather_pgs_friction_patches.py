@@ -981,7 +981,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for world in np.flatnonzero(speeds[-1] > 0.2):
                     held = (body_world[bodies] == world) & (weight > 0.0)
                     weights.add(tuple(float(w) for w in np.sort(weight[held])))
-                slots, paths = solver.contact_slot.numpy()[:count], solver.contact_path.numpy()[:count]
+                slots, paths = (
+                    solver.placement.contact_slot.numpy()[:count],
+                    solver.placement.contact_path.numpy()[:count],
+                )
                 for world in range(model.world_count):
                     for path in np.unique(paths[paths >= 0]):
                         mine = (body_world[bodies] == world) & (paths == path)
@@ -1065,10 +1068,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         s1.body_f.assign([[1, 0, 0, 0, 0, 0.05]])
         solver.step(s1, s0, model.control(), contacts, dt)
         self.assertGreater(np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0), 0)
-        count = int(solver.mf_constraint_count.numpy()[0])
-        self.assertTrue(np.all(solver.contact_path.numpy()[:4] == 1))
+        count = int(solver.placement.mf_constraint_count.numpy()[0])
+        self.assertTrue(np.all(solver.placement.contact_path.numpy()[:4] == 1))
         J_a, _J_b = free_body_jacobians(solver)
-        solved = np.einsum("ij,i->j", J_a[0, :count], solver.mf_impulses.numpy()[0, :count]) / dt
+        solved = np.einsum("ij,i->j", J_a[0, :count], solver.placement.mf_impulses.numpy()[0, :count]) / dt
         self.assertGreater(np.linalg.norm(solved[3:]), 0.01, "fixture must exercise a nonzero contact moment")
         solver.update_contacts(contacts)
         reported = contacts.force.numpy().sum(axis=0)
@@ -1136,7 +1139,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_shape1.assign(grounds[::-1].copy())
         contacts.rigid_contact_point0.assign([[0, 0, 0.002]] * 2)
         solver.step(s1, s0, model.control(), contacts, 0.005)
-        self.assertTrue((solver.contact_slot.numpy()[:2] == -1).all())
+        self.assertTrue((solver.placement.contact_slot.numpy()[:2] == -1).all())
         bodies = patches.current.body_a.numpy()[:2]
         worlds = model.body_world.numpy()[bodies]
         np.testing.assert_array_equal(patches.previous_world.numpy()[:2], worlds)
@@ -1169,7 +1172,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 contacts.rigid_contact_point1.assign([[-0.08, 0, 0], [0, 0, 0], [0.08, 0, 0]])
                 contacts.rigid_contact_normal.assign([[0, 0, -1]] * 3)
                 solver.step(model.state(), model.state(), model.control(), contacts, 0.005)
-                rows = solver.mf_row_type.numpy()[0, : solver.mf_constraint_count.numpy()[0]]
+                rows = solver.placement.mf_row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver.laws.friction_patches.view.weight.numpy()[:3], [0, 1, 0])
 
@@ -1349,8 +1352,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             solver.step(state, model.state(), model.control(), contacts, 0.005)
             rows = np.concatenate(
                 [
-                    solver.row_type.numpy()[0, : solver.constraint_count.numpy()[0]],
-                    solver.mf_row_type.numpy()[0, : solver.mf_constraint_count.numpy()[0]],
+                    solver.placement.row_type.numpy()[0, : solver.placement.constraint_count.numpy()[0]],
+                    solver.placement.mf_row_type.numpy()[0, : solver.placement.mf_constraint_count.numpy()[0]],
                 ]
             )
             normals = int(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_CONTACT))
@@ -1382,14 +1385,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             for _ in range(40):
                 step()
             self.assertGreater(int((patches.current.source.numpy() >= 0).sum()), 0)
-            solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
-                solver.options, contact_friction_gap_threshold=-1.0
+            solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+                dataclasses.replace(solver.options, contact_friction_gap_threshold=-1.0)
             )
             step()
             self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
             self.assertGreater(int(patches.previous.valid.numpy().sum()), 0)
-            solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
-                solver.options, contact_friction_gap_threshold=0.001
+            solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+                dataclasses.replace(solver.options, contact_friction_gap_threshold=0.001)
             )
             step()
             weights = patches.view.weight.numpy()

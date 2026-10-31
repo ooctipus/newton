@@ -582,7 +582,7 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
             test.assertGreaterEqual(int(np.count_nonzero(~silent)), _WORLDS)
             # The census is FeatherPGS's own: it reserves no row for exactly the silent contacts.
             solver.step(state, model.state(), model.control(), listed, 1.0 / 120.0)
-            path = solver.contact_path.numpy()[: len(silent)]
+            path = solver.placement.contact_path.numpy()[: len(silent)]
             np.testing.assert_array_equal(path[silent], -1)
             test.assertTrue(np.all(path[~silent] >= 0), path)
             kept, record, _ = census[None]
@@ -834,7 +834,7 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
         # FeatherPGS gives the base's ground contacts no row and every other contact the same rows:
         # the same route, row count, world and first row.
         rows_of = {
-            name: [getattr(solver, f"contact_{name}").numpy().copy() for solver in solvers]
+            name: [getattr(solver.placement, f"contact_{name}").numpy().copy() for solver in solvers]
             for name in ("path", "slots_needed", "world", "slot")
         }
         paths = rows_of.pop("path")

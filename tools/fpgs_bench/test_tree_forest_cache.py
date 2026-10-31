@@ -58,7 +58,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     arts = model.articulation_count
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
-    solver._sparse_mass_matrix_size = count
+    solver.placement.sparse_mass_matrix_size = count
     solver._sparse_mass_matrix_plan = mass
     solver._sparse_mass_matrix_indices = factor_indices(mass, device)
     solver._sparse_Linv = wp.zeros((arts, mass.nonzero_count), dtype=float, device=device)
@@ -67,7 +67,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
     for item in (solver, reference):
-        item.options = item.laws.options = item.factor.options = dataclasses.replace(
+        item.options = item.laws.options = item.factor.options = item.placement.options = dataclasses.replace(
             item.options, enable_joint_velocity_limits=motion
         )
         item.factor.fk_id_cache_enabled = False

@@ -442,7 +442,7 @@ class KeyedRows:
         self.keyed_rows = True
         self.layout, groups, starts, arts = direct_topology_plan(solver)
         self.prefix_layout = self.layout
-        dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.dense_max_constraints
+        dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.placement.dense_max_constraints
         self.data, self.prefix = KineticRows(), PrefixInput()
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
         self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
@@ -474,6 +474,7 @@ class KeyedRows:
             PrefixInput,
             self.prefix,
             solver=s,
+            placement=s.placement,
             factor=s.factor,
             laws=s.laws,
             options=s.options,
@@ -505,7 +506,7 @@ class KeyedRows:
         s, layout = self.solver, self.layout
         na, nb = layout.primary, layout.secondary
         if self.contact_input is not None:
-            pool = s._contact_pool
+            pool = s.placement.contact_pool
             pool.launch(
                 scatter_contact_keys,
                 pool.launch_rows(),
@@ -520,16 +521,16 @@ class KeyedRows:
                 self.data,
                 self.data.contact,
                 self.law,
-                s.constraint_count,
-                s.mf_constraint_count,
+                s.placement.constraint_count,
+                s.placement.mf_constraint_count,
                 layout.parallel_rows,
                 na,
                 nb,
                 layout.primary_offset,
                 layout.secondary_offset,
-                s._row_support(),
-                s._jacobian_rows(na),
-                s._jacobian_rows(nb or na),
+                s.placement.row_support(),
+                s.placement.jacobian_rows(na),
+                s.placement.jacobian_rows(nb or na),
             ],
             block_dim=32,
             device=s.model.device,
@@ -546,7 +547,7 @@ def create_owner(solver):
     supported = (
         solver.routes.case == "K4"
         and capable("keyed_rows", solver.laws.set) is None
-        and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
+        and (solver.placement.hinv_jt_writes_world or solver.placement.jy_world_aliased)
     )
     if not supported:
         return None

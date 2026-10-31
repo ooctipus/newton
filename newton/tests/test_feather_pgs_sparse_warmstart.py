@@ -75,7 +75,7 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             pgs_warmstart=warmstart,
             friction_anchor_beta=0.0,
         )
-        self.assertIsNotNone(solver._sparse_mass_matrix_size, solver.routes.row.reasons["K1"])
+        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size, solver.routes.row.reasons["K1"])
         self.assertEqual("_warm_start" in solver._pgs_solve_sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
@@ -88,9 +88,9 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             states[0].clear_forces()
             solver.step(states[0], states[1], control, contacts, dt)
             states.reverse()
-            counts = solver.constraint_count.numpy()
-            rows = solver.row_type.numpy()
-            lam = solver.impulses.numpy()
+            counts = solver.placement.constraint_count.numpy()
+            rows = solver.placement.row_type.numpy()
+            lam = solver.placement.impulses.numpy()
             for world in range(model.world_count):
                 active = rows[world, : counts[world]] == PGS_CONSTRAINT_TYPE_CONTACT
                 impulse_sums[i, world] = lam[world, : counts[world]][active].sum()

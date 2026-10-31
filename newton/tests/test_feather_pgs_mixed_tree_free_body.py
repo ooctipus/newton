@@ -449,7 +449,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         # The walker's contact and limit rows need the row budget the quadruped recipes set.
         plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256)
         self.assertIsNone(plain_owner)
-        self.assertIsNone(plain_solver._sparse_mass_matrix_size)
+        self.assertIsNone(plain_solver.placement.sparse_mass_matrix_size)
         self.assertIn(18, plain_solver.forest.size_groups)
         self.assertFalse(plain_solver.constraint_capacity_status()["dense"])
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256)

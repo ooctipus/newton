@@ -456,10 +456,10 @@ class TestAdaptiveManifold(unittest.TestCase):
 
                 def force(scene, state, count_records=counts, tail_records=tail, law_records=laws):
                     value = original_force(scene, state)
-                    total = int(scene.solver.constraint_count.numpy()[0])
-                    row_types = scene.solver.row_type.numpy()[0, :total]
-                    mf_total = int(scene.solver.mf_constraint_count.numpy()[0])
-                    mf_types = scene.solver.mf_row_type.numpy()[0, :mf_total]
+                    total = int(scene.solver.placement.constraint_count.numpy()[0])
+                    row_types = scene.solver.placement.row_type.numpy()[0, :total]
+                    mf_total = int(scene.solver.placement.mf_constraint_count.numpy()[0])
+                    mf_types = scene.solver.placement.mf_row_type.numpy()[0, :mf_total]
                     count_records.append(
                         {
                             "raw": int(scene.contacts.rigid_contact_count.numpy()[0]),
@@ -481,15 +481,15 @@ class TestAdaptiveManifold(unittest.TestCase):
                         )
                     dense = cone_diagnostic(
                         row_types,
-                        scene.solver.row_parent.numpy()[0, :total],
-                        scene.solver.row_mu.numpy()[0, :total],
-                        scene.solver.impulses.numpy()[0, :total],
+                        scene.solver.placement.row_parent.numpy()[0, :total],
+                        scene.solver.placement.row_mu.numpy()[0, :total],
+                        scene.solver.placement.impulses.numpy()[0, :total],
                     )
                     mf = cone_diagnostic(
                         mf_types,
-                        scene.solver.mf_row_parent.numpy()[0, :mf_total],
-                        scene.solver.mf_row_mu.numpy()[0, :mf_total],
-                        scene.solver.mf_impulses.numpy()[0, :mf_total],
+                        scene.solver.placement.mf_row_parent.numpy()[0, :mf_total],
+                        scene.solver.placement.mf_row_mu.numpy()[0, :mf_total],
+                        scene.solver.placement.mf_impulses.numpy()[0, :mf_total],
                     )
                     law_records.append(
                         {

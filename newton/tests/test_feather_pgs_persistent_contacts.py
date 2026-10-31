@@ -51,9 +51,9 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
             values = np.zeros(3, dtype=bool)
             values[selected] = True
             mask.assign(values)
-            solver._ws_prev_mf_impulses.fill_(1.0)
+            solver.placement.ws_prev_mf_impulses.fill_(1.0)
             wp.capture_launch(capture.graph)
-            previous = solver._ws_prev_mf_impulses.numpy()
+            previous = solver.placement.ws_prev_mf_impulses.numpy()
             self.assertTrue(np.all(previous[selected] == 0.0))
             self.assertTrue(np.all(previous[1 - selected] == 1.0))
             count = int(contacts.rigid_contact_count.numpy()[0])
@@ -93,13 +93,13 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         normals[0] = old_normal
         contacts.rigid_contact_normal.assign(normals)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
-        slot = int(solver.contact_slot.numpy()[0])
+        slot = int(solver.placement.contact_slot.numpy()[0])
         self.assertGreaterEqual(slot, 0)
-        side = 0 if int(solver.mf_body_a.numpy()[0, slot]) >= 0 else 1
+        side = 0 if int(solver.placement.mf_body_a.numpy()[0, slot]) >= 0 else 1
         old_direction = free_body_jacobians(solver)[side][0, slot + 1, :3].copy()
-        previous = solver._ws_prev_mf_impulses.numpy()
+        previous = solver.placement.ws_prev_mf_impulses.numpy()
         previous[0, slot : slot + 3] = (1.0, 0.5, 0.0)
-        solver._ws_prev_mf_impulses.assign(previous)
+        solver.placement.ws_prev_mf_impulses.assign(previous)
         # Seed both owners of the previous solve's tangent impulse. Persistent
         # anchors take precedence over the contact-matched cache when carried.
         patches = solver.laws.friction_patches
@@ -123,8 +123,8 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         contacts.rigid_contact_match_index.assign(indices)
         model.shape_material_mu.fill_(friction)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
-        slot = int(solver.contact_slot.numpy()[0])
-        impulses = solver.mf_impulses.numpy()[0, slot : slot + 3]
+        slot = int(solver.placement.contact_slot.numpy()[0])
+        impulses = solver.placement.mf_impulses.numpy()[0, slot : slot + 3]
         tangent_rows = free_body_jacobians(solver)[side][0, slot + 1 : slot + 3, :3]
         world_tangent = impulses[1:] @ tangent_rows
         # Independent world-space projection; solver rows use B-to-A normals.

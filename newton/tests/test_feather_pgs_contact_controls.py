@@ -484,15 +484,15 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(solver.options.articulation_pair_contact_gap_gate, 0.0)
         self.assertFalse(solver.options.contact_friction_articulation_pairs_only)
         self.assertTrue(solver.options.warn_constraint_overflow)
-        self.assertTrue(solver._track_row_capacity)
-        self.assertFalse(solver._row_watermark)
+        self.assertTrue(solver.placement.track_row_capacity)
+        self.assertFalse(solver.placement.row_watermark)
         quiet_solver = SolverFeatherPGS(
             newton.ModelBuilder().finalize(device="cpu"),
             warn_constraint_overflow=False,
         )
         self.assertFalse(quiet_solver.options.warn_constraint_overflow)
-        self.assertFalse(quiet_solver._track_row_capacity)
-        self.assertIsNone(quiet_solver._row_overflow_warning_emitted)
+        self.assertFalse(quiet_solver.placement.track_row_capacity)
+        self.assertIsNone(quiet_solver.placement.row_overflow_warning_emitted)
         parameters = tuple(inspect.signature(SolverFeatherPGS).parameters)
         self.assertIn("same_articulation_contact_gap_gate", parameters)
         self.assertIn("contact_friction_articulation_pairs_only", parameters)

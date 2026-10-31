@@ -80,7 +80,7 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                     _change(solver, key, value)
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertFalse(solver._sparse_velocity_limits)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
+                self.assertIsNone(solver.placement.sparse_mass_matrix_size)
 
 
 class TestSparseVelocityLimitRows(unittest.TestCase):
@@ -347,7 +347,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         _assert_ordinary_route(self, reference)
         sparse_tests.TestFeatherPGSSparseSolver.assert_states_close(self, reference[2], candidate[2])
         for case in (reference, candidate):
-            self.assertFalse(case[1].constraint_overflow.numpy().any())
+            self.assertFalse(case[1].placement.constraint_overflow.numpy().any())
             for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
         np.testing.assert_array_equal(candidate[1]._sparse_mass_matrix_status.numpy(), 0)
@@ -370,8 +370,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
     def _assert_rows(self, reference, candidate):
         """Compare signed physical response, final residual and live speed-limit targets."""
         old, new = reference[1], candidate[1]
-        counts = new.constraint_count.numpy()
-        np.testing.assert_array_equal(counts, old.constraint_count.numpy())
+        counts = new.placement.constraint_count.numpy()
+        np.testing.assert_array_equal(counts, old.placement.constraint_count.numpy())
         old_j, old_y = unpacked_rows(old)
         for world, row_count in enumerate(counts):
             count = int(row_count)
@@ -381,19 +381,20 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             # Patch ring parents name other contacts' slots; _assert_patch compares them by contact.
             for name in ("row_type",) if old.laws.friction_anchors_enabled else ("row_type", "row_parent"):
                 np.testing.assert_array_equal(
-                    getattr(new, name).numpy()[world, :count], getattr(old, name).numpy()[world, :count]
+                    getattr(new.placement, name).numpy()[world, :count],
+                    getattr(old.placement, name).numpy()[world, :count],
                 )
             for name in ("diag", "rhs"):
                 np.testing.assert_allclose(
-                    getattr(new, name).numpy()[world, :count],
-                    getattr(old, name).numpy()[world, :count],
+                    getattr(new.placement, name).numpy()[world, :count],
+                    getattr(old.placement, name).numpy()[world, :count],
                     atol=3e-5,
                     rtol=3e-4,
                 )
-            finite = np.isfinite(new.rhs.numpy()[world, :count])
+            finite = np.isfinite(new.placement.rhs.numpy()[world, :count])
             dofs = new.forest.world_dof_indices.numpy()[world]
-            residual = jacobian @ new.v_out.numpy()[dofs] + new.rhs.numpy()[world, :count]
-            old_residual = old_j[world, :count] @ old.v_out.numpy()[dofs] + old.rhs.numpy()[world, :count]
+            residual = jacobian @ new.v_out.numpy()[dofs] + new.placement.rhs.numpy()[world, :count]
+            old_residual = old_j[world, :count] @ old.v_out.numpy()[dofs] + old.placement.rhs.numpy()[world, :count]
             np.testing.assert_allclose(residual[finite], old_residual[finite], atol=5e-5, rtol=5e-4)
 
     def test_last_phase_and_physical_response(self):
@@ -453,7 +454,9 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     self._assert_state(reference, candidate)
                     if step == 0:
                         self._assert_rows(reference, candidate)
-                        live = candidate[1].row_type.numpy()[0, : candidate[1].constraint_count.numpy()[0]]
+                        live = candidate[1].placement.row_type.numpy()[
+                            0, : candidate[1].placement.constraint_count.numpy()[0]
+                        ]
                         self.assertIn(VELOCITY_LIMIT, live)
                         self.assertIn(CONTACT, live)
 
@@ -495,8 +498,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             wp.capture_launch(capture.graph)
             self._assert_state(reference, candidate)
             for case in (reference, candidate):
-                for world, count in enumerate(case[1].constraint_count.numpy()):
-                    kinds = case[1].row_type.numpy()[world, :count]
+                for world, count in enumerate(case[1].placement.constraint_count.numpy()):
+                    kinds = case[1].placement.row_type.numpy()[world, :count]
                     if limit <= 0:
                         self.assertFalse(np.any(kinds == VELOCITY_LIMIT))
                     else:

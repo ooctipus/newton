@@ -42,6 +42,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prescale_joint_velocity_limits,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
+from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
@@ -399,8 +400,8 @@ def world_case(solver, world=0):
     other row, such as a drive, mimic or connect row, raises ``ValueError``.
     Returns the case and ``v_hat + Y^T lambda`` of the impulses the sweep solved.
     """
-    count = int(solver.constraint_count.numpy()[world])
-    types = solver.row_type.numpy()[world, :count]
+    count = int(solver.placement.constraint_count.numpy()[world])
+    types = solver.placement.row_type.numpy()[world, :count]
     unmodelled = sorted(
         set(types.tolist())
         - {
@@ -420,7 +421,7 @@ def world_case(solver, world=0):
     for art, n in enumerate(forest.articulation_response_dof_count.numpy()):
         if forest.art_to_world.numpy()[art] == world:
             velocity[offsets[art] : offsets[art] + n] = predicted[starts[art] : starts[art] + n]
-    cfm = solver.row_cfm.numpy()[world, :count].astype(np.float64)
+    cfm = solver.placement.row_cfm.numpy()[world, :count].astype(np.float64)
     case = {
         "J": J,
         "Y": Y,
@@ -430,13 +431,13 @@ def world_case(solver, world=0):
         "diag": np.einsum("ij,ij->i", J, Y) + cfm,
         "kinds": np.where(types == PGS_CONSTRAINT_TYPE_FRICTION, 1, 0).astype(np.int32),
         "types": types,
-        "parents": solver.row_parent.numpy()[world, :count].astype(np.int32),
-        "mu": solver.row_mu.numpy()[world, :count].astype(np.float64),
-        "rhs": solver.rhs.numpy()[world, :count].astype(np.float64),
+        "parents": solver.placement.row_parent.numpy()[world, :count].astype(np.int32),
+        "mu": solver.placement.row_mu.numpy()[world, :count].astype(np.float64),
+        "rhs": solver.placement.rhs.numpy()[world, :count].astype(np.float64),
         "impulses": np.zeros(count),
         "velocity": velocity,
     }
-    return case, velocity + Y.T @ solver.impulses.numpy()[world, :count].astype(np.float64)
+    return case, velocity + Y.T @ solver.placement.impulses.numpy()[world, :count].astype(np.float64)
 
 
 def prescaled_joint_velocity(model):
@@ -818,16 +819,16 @@ _ROW_ARRAYS = (
 def _linked_rows(solver, state, contacts, dt):
     """Step until the contact rows are built and linked, and return host copies of the rows."""
     rows = {}
-    finalize = SolverFeatherPGS._finalize_constraint_status
+    finalize = Placement.latch_status
 
     def capture(self, step_contacts):
         finalize(self, step_contacts)
-        if self is solver:
+        if self is solver.placement:
             rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
-            rows["J"] = {size: self._jacobian_rows(size).numpy().copy() for size in self.forest.size_groups}
+            rows["J"] = {size: self.jacobian_rows(size).numpy().copy() for size in self.forest.size_groups}
             raise _RowsBuilt
 
-    with patch.object(SolverFeatherPGS, "_finalize_constraint_status", capture):
+    with patch.object(Placement, "latch_status", capture):
         try:
             solver.step(state, solver.model.state(), solver.model.control(), contacts, dt)
         except _RowsBuilt:
@@ -931,7 +932,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         self.assertEqual(owner, _contact_rows_by_id(actual, live))
         slot_contact = {(world, first): c for c, (world, first, _) in owner.items()}
         bias = _general_bias(general, expected, dt)
-        size = keyed._keyed_rows.layout.primary
+        size = keyed.placement.keyed_rows.layout.primary
         linked = tangent_phi = 0
         for c, (world, first, needed) in owner.items():
             rows = slice(first, first + needed)
@@ -1033,8 +1034,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _par_tiers=[(32, 0), (64, 32)],
                 _par_sweeps_rule="auto",
                 _par_sweeps_reason="auto: ...",
-                _ink_rows=64,
-                _ink_sizes=(_DOFS, 0, 0, 0),
+                placement=SimpleNamespace(ink_rows=64, ink_sizes=(_DOFS, 0, 0, 0)),
                 routes=SimpleNamespace(
                     row=SimpleNamespace(
                         producer="general",
@@ -1169,15 +1169,20 @@ class TestTierRule(unittest.TestCase):
     def _probe(**changes):
         """A solver's tier inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows)."""
         probe = SimpleNamespace(
-            _mf_sweeps=True,
             _preelim_active=False,
-            dense_max_constraints=192,
+            placement=SimpleNamespace(
+                mf_sweeps=changes.pop("mf_sweeps", True),
+                dense_max_constraints=changes.pop("dense_max_constraints", 192),
+                inkernel_response_meta=changes.pop(
+                    "inkernel_response_meta",
+                    lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
+                ),
+            ),
             _route_pins={},
             routes=_routes(),
             laws=SimpleNamespace(set=plain_laws()),
             _parallel_contact_paths=True,
             _parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
-            _build_inkernel_response_meta=lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
             forest=SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=True),
         )
         for name, value in changes.items():
@@ -1188,16 +1193,16 @@ class TestTierRule(unittest.TestCase):
     def test_a_tree_beside_a_body_takes_the_tiers(self):
         """Bound the tiers by the dense row capacity, at most 128 rows, in whole quads."""
         probe = self._probe()
-        self.assertEqual((probe._ink_rows, probe._ink_sizes), (128, (16, 6, 0, 16)))
-        self.assertEqual(self._probe(dense_max_constraints=50)._ink_rows, 48)
-        self.assertIsNone(self._probe(dense_max_constraints=3)._ink_sizes)
+        self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (128, (16, 6, 0, 16)))
+        self.assertEqual(self._probe(dense_max_constraints=50).placement.ink_rows, 48)
+        self.assertIsNone(self._probe(dense_max_constraints=3).placement.ink_sizes)
 
     def test_other_classes_keep_their_placement(self):
         """Leave every other class to its own placement and say why."""
         torsion = "Contact torsion keeps serial sweeps and ordinary rows."
         for changes, reason in (
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
-            ({"_mf_sweeps": False}, "No matrix-free sweep"),
+            ({"mf_sweeps": False}, "No matrix-free sweep"),
             ({"_preelim_active": True}, "pre-elimination"),
             ({"routes": _routes("K3")}, "case K3"),
             ({"routes": _routes("K5")}, "case K5"),
@@ -1209,19 +1214,19 @@ class TestTierRule(unittest.TestCase):
             ({"laws": SimpleNamespace(set=plain_laws(cuda=False))}, "CUDA device"),
             ({"_route_pins": {"tiers": 0}}, "tiers=0"),
             (
-                {"_build_inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},
+                {"inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},
                 "several",
             ),
         ):
             with self.subTest(changes=sorted(changes)):
                 probe = self._probe(**changes)
-                self.assertEqual((probe._ink_rows, probe._ink_sizes), (0, None))
+                self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (0, None))
                 self.assertIn(reason, probe.routes.reasons["K4"])
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
         probe = self._probe(_has_free_rigid_bodies=False, _route_pins={"tiers": 32})
-        self.assertEqual((probe._ink_rows, probe._ink_sizes), (32, (16, 6, 0, 16)))
+        self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (32, (16, 6, 0, 16)))
 
 
 def _dummy(arg):
@@ -1565,10 +1570,10 @@ def _assert_tier_owned(test, solver, budget):
     unless a local owner holds it; the serial sweep returns early for exactly those
     worlds, so a world in that domain is the tier's (``skip_tier_rows``).
     """
-    test.assertEqual(solver._ink_rows, budget)
+    test.assertEqual(solver.placement.ink_rows, budget)
     test.assertTrue(solver._mf_gs_tiers)
-    test.assertFalse(solver._local_internal_fast_path)
-    counts, free_rows = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
+    test.assertFalse(solver.placement.local_internal_fast_path)
+    counts, free_rows = solver.placement.constraint_count.numpy(), solver.placement.mf_constraint_count.numpy()
     test.assertGreater(int(counts.max()), 0)
     for world, (rows, mf_rows) in enumerate(zip(counts, free_rows, strict=True)):
         if rows:
@@ -1578,10 +1583,10 @@ def _assert_tier_owned(test, solver, budget):
 
 def _friction_pairs(solver, world):
     """Each friction pair's impulse magnitude and pooled budget ``mu * (ring's normal impulses)``."""
-    count = int(solver.constraint_count.numpy()[world])
-    kinds = solver.row_type.numpy()[world, :count]
-    parents = solver.row_parent.numpy()[world, :count]
-    mu, impulses = solver.row_mu.numpy()[world, :count], solver.impulses.numpy()[world, :count]
+    count = int(solver.placement.constraint_count.numpy()[world])
+    kinds = solver.placement.row_type.numpy()[world, :count]
+    parents = solver.placement.row_parent.numpy()[world, :count]
+    mu, impulses = solver.placement.row_mu.numpy()[world, :count], solver.placement.impulses.numpy()[world, :count]
     pairs = []
     for row in np.flatnonzero(kinds == PGS_CONSTRAINT_TYPE_FRICTION):
         parent = int(parents[row])
@@ -1603,9 +1608,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
         patch_tiers = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **options)
         point_tiers = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **options)
         for solver, linked in ((patch_tiers, True), (point_tiers, False)):
-            self.assertEqual(solver._ink_rows, 32)
+            self.assertEqual(solver.placement.ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
-            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
             self.assertTrue(keys)
             self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
@@ -1667,7 +1672,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
                 solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
-                self.assertIsNotNone(solver._keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
+                self.assertIsNotNone(solver.placement.keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
                 tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
                 self.assertEqual((tiers["family"], tiers["linked_rows"]), ("keyed_parallel", True))
                 self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
@@ -1700,7 +1705,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                         {
                             "joint_q": states[0].joint_q.numpy(),
                             "joint_qd": states[0].joint_qd.numpy(),
-                            "impulses": solver.impulses.numpy(),
+                            "impulses": solver.placement.impulses.numpy(),
                         }
                     )
                 self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0, "the feet must touch the ground")
@@ -1838,7 +1843,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
                 def check(step, solver, contacts, state, beta=beta, parallel_rows=parallel_rows):
                     for name in _STATE_FIELDS:
                         self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-                    self.assertFalse(solver.constraint_overflow.numpy().any())
+                    self.assertFalse(solver.placement.constraint_overflow.numpy().any())
                     if parallel_rows:
                         _assert_tier_owned(self, solver, parallel_rows)
                     if beta and parallel_rows:
@@ -2038,7 +2043,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
             "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, **converged),
         }
         for name, rows in (("declined", 8), ("owned", 32), ("serial", 0)):
-            self.assertEqual(arms[name]._ink_rows, rows, name)
+            self.assertEqual(arms[name].placement.ink_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name]._mf_gs_tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             # Linked tiers with joint velocity limits take the last word.
@@ -2050,8 +2055,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
             solver.step(state, out, control, None, 1.0 / 240.0)
             velocities[name] = out.joint_qd.numpy().astype(np.float64)
         # The serial sweep returns early only for worlds of at most 8 dense rows and no matrix-free rows.
-        self.assertGreater(int(arms["declined"].constraint_count.numpy()[0]), 8)
-        self.assertEqual(int(arms["declined"].mf_constraint_count.numpy()[0]), 0)
+        self.assertGreater(int(arms["declined"].placement.constraint_count.numpy()[0]), 8)
+        self.assertEqual(int(arms["declined"].placement.mf_constraint_count.numpy()[0]), 0)
         _assert_tier_owned(self, arms["owned"], 32)
         limited = np.abs(velocities["serial"])
         self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")

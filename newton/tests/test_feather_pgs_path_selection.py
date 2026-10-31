@@ -159,18 +159,21 @@ def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
         "laws": SimpleNamespace(friction_anchors_enabled=law == "patch", set=plain_laws(contact=law)),
         "forest": SimpleNamespace(size_groups=list(sizes)),
         "routes": SimpleNamespace(case=case),
-        "_row_packets": None,
-        "_keyed_rows": None,
-        "_compact_contact_boundary": False,
-        "_sparse_mass_matrix_size": None,
-        "_sparse_prepare_contacts": False,
-        "_sparse_diagonal_response_size": None,
-        "_sparse_diagonal_contact_triples": False,
-        "_sparse_diagonal_contact_units": False,
         "_compact_contact_jacobian": False,
     }
-    values.update(attributes)
-    return SimpleNamespace(**values)
+    placement = {
+        "row_packets": None,
+        "keyed_rows": None,
+        "compact_contact_boundary": False,
+        "sparse_mass_matrix_size": None,
+        "sparse_prepare_contacts": False,
+        "sparse_diagonal_response_size": None,
+        "sparse_diagonal_contact_triples": False,
+        "sparse_diagonal_contact_units": False,
+    }
+    for name, value in attributes.items():
+        (placement if name in placement else values)[name] = value
+    return SimpleNamespace(placement=SimpleNamespace(**placement), **values)
 
 
 def _branched_arm_and_box(device="cuda:0", worlds=2, depth=9):
@@ -323,7 +326,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["routes"]["publication"]["owner"], "cached")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
-        solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
             solver.options, pgs_iterations=3
         )
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
@@ -576,11 +579,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             masked = ["contact_row_prelude", "populate_world_J_masked"]
             diagonal = {
                 "case": "K2",
-                "_sparse_diagonal_response_size": 108,
+                "sparse_diagonal_response_size": 108,
                 "_mark_independent_sparse_contact_candidates_kernel": marker,
             }
-            schedule = {"_sparse_diagonal_contact_triples": point, "_sparse_diagonal_contact_units": not point}
-            sparse = {"case": "K1", "_sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
+            schedule = {"sparse_diagonal_contact_triples": point, "sparse_diagonal_contact_units": not point}
+            sparse = {"case": "K1", "sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
 
             def same(sizes, method, kernels):
                 return dict.fromkeys(sizes, (method, kernels))
@@ -588,19 +591,19 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             cases = (
                 # (attributes, sizes, producer, {size: (method, kernels)}); the case is the attributes' "case"
                 (
-                    {"case": "K3", "_row_packets": SimpleNamespace()},
+                    {"case": "K3", "row_packets": SimpleNamespace()},
                     (18, 6),
                     "local_packets",
                     same((18, 6), "local_packets", ["produce_contacts", "materialize_fallback"]),
                 ),
                 (
-                    {"case": "K4", "_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
+                    {"case": "K4", "keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
                     (16, 6),
                     "keyed_rows",
                     same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
                 ),
                 (
-                    {"_compact_contact_boundary": True, **diagonal, **schedule},
+                    {"compact_contact_boundary": True, **diagonal, **schedule},
                     (108, 6),
                     "compact_contact_boundary",
                     {
@@ -609,7 +612,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     },
                 ),
                 (
-                    {**sparse, "_sparse_prepare_contacts": True},
+                    {**sparse, "sparse_prepare_contacts": True},
                     (18,),
                     "sparse_contact_response",
                     {18: ("sparse_response", [response.key])},
@@ -720,7 +723,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = SolverFeatherPGS(_cpu_free_body_model(velocity_limit=1.0))
         limits = solver.get_path_selection()["routes"]["velocity_limits"]
         self.assertTrue(limits["rigid_body_limits"])
-        self.assertIsNotNone(solver.rigid_velocity_limit_slot)
+        self.assertIsNotNone(solver.placement.rigid_velocity_limit_slot)
         self.assertTrue(limits["free_body_rows"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse admission requires CUDA")
@@ -735,7 +738,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         json.dumps(selected, allow_nan=False)
         routes = selected["routes"]
         sparse = routes["sparse_mass_matrix"]
-        self.assertEqual(sparse["size"], point._sparse_mass_matrix_size)
+        self.assertEqual(sparse["size"], point.placement.sparse_mass_matrix_size)
         self.assertTrue(sparse["active_rows"])
         self.assertEqual(sparse["contact_triplets"], point._sparse_contact_triplets)
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
@@ -844,7 +847,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
                 self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
-                self.assertEqual(pack["launched"], solver._pack_mf_meta_kernel is not None)
+                self.assertEqual(pack["launched"], solver.placement.pack_mf_meta_kernel is not None)
                 # The MF-GS kernel's name spells the storage the record reports.
                 mf_gs, storage = routes["sweep"]["mf_gs"], routes["sweep"]["mf_gs_storage"]
                 self.assertEqual(storage is None, mf_gs is None)
@@ -857,7 +860,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 # Applied routing options agree with the routes they request.
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
-                self.assertEqual(solver._ink_rows, tiers["tiers"][-1]["rows"] if parallel else 0)
+                self.assertEqual(solver.placement.ink_rows, tiers["tiers"][-1]["rows"] if parallel else 0)
                 # Patch friction is admitted to the parallel tiers, and the case whose class they serve builds them:
                 # ring-pooled (linked) tiers, where point friction builds point tiers.
                 patch_law = routes["friction"]["law"] == "patch"
@@ -879,7 +882,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         expected = sweep_routes_tiers.tier_sweeps(tier["rows"], applied["pgs_iterations"])
                         self.assertEqual(tier["sweeps"], expected)
                 # The grouped kernel serves only sizes whose worlds' in-kernel tier rows it skips.
-                if solver._ink_skip_rows() == 0:
+                if solver.placement.ink_skip_rows() == 0:
                     self.assertNotIn("grouped", {entry["route"] for entry in routes["stages"]["response"].values()})
         self.assertGreaterEqual(built, 8)
         self.assertGreaterEqual(
@@ -938,7 +941,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertTrue(routes["sweep"]["sparse"].endswith("_warm_start"))
                     self.assertEqual(routes["sparse_mass_matrix"]["velocity_limits"], bool(options))
                     # A placeholder stands in for the dense response that the install would read.
-                    self.assertEqual(solver.Y_by_size[9].shape, (1, 1, 1))
+                    self.assertEqual(solver.placement.Y_by_size[9].shape, (1, 1, 1))
                     # Contact warm start carries impulses by matched contact identity.
                     keys = _launched_kernel_keys(model, solver, contact_matching="latest")
                     self.assertIn(routes["sweep"]["sparse"], keys)
@@ -1128,7 +1131,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertTrue(routes["paired_response"]["contact_units"])
         self.assertIsNone(routes["sweep"]["tiers"])
         self.assertFalse(routes["contact_rows"]["keyed_rows"]["enabled"])
-        self.assertEqual(solver._ink_rows, 0)
+        self.assertEqual(solver.placement.ink_rows, 0)
         self.assertIn("case K5", solver.routes.row.reasons["K4"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
@@ -1215,7 +1218,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(runs[1][0].get_path_selection()["cached_prediction"], "tree")
         for solver, contacts, _state in runs:
             self.assertTrue(solver.laws.friction_anchors_enabled)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             self.assertIsNone(solver.get_path_selection()["routes"]["sweep"]["tiers"])
             self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
             assert_loaded_anchors(solver, contacts)

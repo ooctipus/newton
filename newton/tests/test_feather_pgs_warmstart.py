@@ -80,9 +80,9 @@ def _run_press(
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
-        counts = solver.constraint_count.numpy()
-        rows = solver.row_type.numpy()[0, : counts[0]]
-        lam = solver.impulses.numpy()[0, : counts[0]]
+        counts = solver.placement.constraint_count.numpy()
+        rows = solver.placement.row_type.numpy()[0, : counts[0]]
+        lam = solver.placement.impulses.numpy()[0, : counts[0]]
         impulse_sums[i] = np.abs(lam[rows == PGS_CONSTRAINT_TYPE_CONTACT]).sum()
         speeds[i] = np.abs(state_0.joint_qd.numpy()[0])
     return impulse_sums, speeds, state_0
@@ -331,8 +331,8 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         pipeline.collide(state_0, contacts)
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 1)
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-        old_slot = int(solver._ws_prev_slot_sorted.numpy()[0])
-        old_impulse = float(solver._ws_prev_mf_impulses.numpy()[0, old_slot])
+        old_slot = int(solver.placement.ws_prev_slot_sorted.numpy()[0])
+        old_impulse = float(solver.placement.ws_prev_mf_impulses.numpy()[0, old_slot])
         self.assertGreater(old_impulse, 0.0)
 
         # Bring the lower shape-id sphere into contact. Sorting inserts it
@@ -356,15 +356,15 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(match[b_contact]), 0)
         self.assertLess(int(match[a_contact]), 0)
 
-        solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
             solver.options, pgs_iterations=0
         )
         solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
-        slots = solver.contact_slot.numpy()[:count]
+        slots = solver.placement.contact_slot.numpy()[:count]
         b_slot = int(slots[b_contact])
         a_slot = int(slots[a_contact])
         self.assertNotEqual(b_slot, old_slot, "test did not produce actual solver-slot churn")
-        impulses = solver.mf_impulses.numpy()[0]
+        impulses = solver.placement.mf_impulses.numpy()[0]
         self.assertAlmostEqual(float(impulses[b_slot]), old_impulse, delta=1.0e-6)
         self.assertEqual(float(impulses[a_slot]), 0.0)
 

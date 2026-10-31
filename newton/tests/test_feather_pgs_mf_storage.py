@@ -1116,7 +1116,7 @@ def test_dense_rows_mark_only_sides_with_coordinates(test, device):
 
     response = solver.forest.articulation_response_dof_count.numpy()
     test.assertEqual(response.tolist(), [0, 1, 0] * 2)  # box, probe, block per world
-    counts, sides = solver.constraint_count.numpy(), solver._row_sides.numpy()
+    counts, sides = solver.placement.constraint_count.numpy(), solver.placement.row_sides.numpy()
     capacity, dofs = sides.shape[1], solver.forest.max_world_dofs
     test.assertGreaterEqual(counts.min(), 2)  # each world's two contacts reach the probe through dense rows
 
@@ -1125,7 +1125,7 @@ def test_dense_rows_mark_only_sides_with_coordinates(test, device):
     wp.launch(
         _guarded_factor_marks(capacity, dofs),
         dim=1,
-        inputs=[solver.constraint_count, solver._row_sides, solver.factor.view(), marks],
+        inputs=[solver.placement.constraint_count, solver.placement.row_sides, solver.factor.view(), marks],
         device=device,
     )
     marks = marks.numpy().reshape(model.world_count, words + 2)

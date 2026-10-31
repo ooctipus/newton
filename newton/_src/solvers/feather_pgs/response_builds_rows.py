@@ -501,12 +501,12 @@ COMPACT_BOUNDARY = (
     Field("body_single_dof", wp.int32, ("body",), owner="forest", attr="body_single_response_dof"),
     Field("dof_offset", wp.int32, ("articulation",), owner="forest", attr="articulation_world_dof_offset"),
     Field("inverse_mass", wp.float32, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
-    Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
+    Field("dense_group", wp.int32, ("world",), attr="sparse_diagonal_dense_groups", owner="placement"),
     Field("factor", wp.float32, ("group", 6, 6), owner="six"),
-    Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),
+    Field("sparse_size", wp.int32, attr="sparse_diagonal_response_size", owner="placement"),
     Field("Z", wp.float32, ("group", "row", 6), owner="six"),
-    Field("sparse_dof", wp.int32, ("world", "row", 2), attr="_sparse_diagonal_row_dof"),
-    Field("sparse_z", wp.float32, ("world", "row", 2), attr="_sparse_diagonal_row_z"),
+    Field("sparse_dof", wp.int32, ("world", "row", 2), attr="sparse_diagonal_row_dof", owner="placement"),
+    Field("sparse_z", wp.float32, ("world", "row", 2), attr="sparse_diagonal_row_z", owner="placement"),
 )
 """What the compact boundary producer writes besides the contact input's row records: each row's whitened dense-six
 part (by the six-DOF size group's factor) and its two whitened sparse slots."""

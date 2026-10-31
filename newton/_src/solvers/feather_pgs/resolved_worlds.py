@@ -676,7 +676,7 @@ def decline(solver) -> str | None:
             # A separating contact carries no load, so its friction and spin rows (contact torsion) carry nothing either:
             # the classifier's normal law decides a world with spin rows as one without.
             (not laws.compliance, "Material contacts are outside the rigid contact law it classifies."),
-            (getattr(solver, "_keyed_rows", None) is None, "Keyed rows own the contact rows."),
+            (getattr(solver.placement, "keyed_rows", None) is None, "Keyed rows own the contact rows."),
             (
                 laws.plain
                 and not laws.regularized
@@ -685,7 +685,7 @@ def decline(solver) -> str | None:
                 and solver._preelim_count == 0
                 and all(getattr(solver.laws, name, object()) == value for name, value in laws_exact.items())
                 and solver.options.enable_bilateral_preelimination is False
-                and solver._row_watermark is False
+                and solver.placement.row_watermark is False
                 and (solver.forest.max_world_dofs or 33) <= 32
                 and all(getattr(solver.forest, name) is not None for name in required)
                 and solver.laws.joint_limit_q_index is not None,
@@ -730,7 +730,7 @@ class ResolvedWorlds:
         # keeps no such bound.
         self.row_bound = None
         if self.enabled and solver.laws.set.contact == "patch":
-            self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
+            self.row_bound = (int(solver.placement.dense_max_constraints), int(solver.placement.mf_max_constraints))
         device = solver.model.device
         worlds = solver.forest.world_count if self.enabled else 0
         self.scratch = ResolvedWorldScratch()
@@ -789,7 +789,7 @@ class ResolvedWorlds:
             dt=dt,
         )
         raw = field_group.bind(RawContacts, solver=solver, laws=solver.laws, model=solver.model, contacts=contacts)
-        pool = solver._contact_pool
+        pool = solver.placement.contact_pool
         launch(
             data,
             raw,

@@ -317,6 +317,7 @@ def run_candidate(data, aux, law=None):
 
 # Solver and forest-plan attributes that launch_contacts binds, by the struct field they fill.
 _LAUNCH_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "solver"}
+_PLACEMENT_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "placement"}
 _FOREST_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "forest"}
 _LAWS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "laws"}
 _OPTIONS_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "options"}
@@ -332,13 +333,18 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
     return SimpleNamespace(
         **{name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()},
         forest=SimpleNamespace(**{name: getattr(data, field) for name, field in _FOREST_FIELDS.items()}, world_count=2),
-        slot_counter=aux.counts,
-        dense_phase_bounds=aux.bounds,
+        placement=SimpleNamespace(
+            **{name: getattr(data, field) for name, field in _PLACEMENT_FIELDS.items()},
+            slot_counter=aux.counts,
+            dense_phase_bounds=aux.bounds,
+            J_by_size={6: data.Z},
+            # Launches sized by contact rows go through the pool, eagerly here.
+            contact_pool=ContactPool(device=aux.device, rows=16),
+        ),
         model=SimpleNamespace(device=aux.device, shape_body=data.shape_body),
         factor=SimpleNamespace(
             **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
         ),
-        J_by_size={6: data.Z},
         _mark_independent_sparse_contact_candidates_kernel=object(),
         laws=SimpleNamespace(
             **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},
@@ -348,8 +354,6 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
             contact_torsion_enabled=False,
         ),
         options=SimpleNamespace(**{name: getattr(data, field) for name, field in _OPTIONS_FIELDS.items()}),
-        # Launches sized by contact rows go through the pool, eagerly here.
-        _contact_pool=ContactPool(device=aux.device, rows=16),
     )
 
 
@@ -601,10 +605,14 @@ def assert_patch_tangent_law(solver, contacts):
 
     Returns the number of anchors checked. ``contact_rows`` keeps phi for the normal row only.
     """
-    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.contact_slot.shape[0])
-    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
-    path, needed = solver.contact_path.numpy()[:count], solver.contact_slots_needed.numpy()[:count]
-    phi, beta, view = solver.phi.numpy(), solver.row_beta.numpy(), solver.laws.friction_patches.view.phi.numpy()
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
+    world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
+    path, needed = solver.placement.contact_path.numpy()[:count], solver.placement.contact_slots_needed.numpy()[:count]
+    phi, beta, view = (
+        solver.placement.phi.numpy(),
+        solver.placement.row_beta.numpy(),
+        solver.laws.friction_patches.view.phi.numpy(),
+    )
     anchors = 0
     for c in range(count):
         if path[c] != 0 or slot[c] < 0 or needed[c] != 3:
@@ -870,27 +878,34 @@ class TestCompactContact(unittest.TestCase):
         valid = {
             "model": SimpleNamespace(device=SimpleNamespace(is_cuda=True)),
             "routes": SimpleNamespace(case="K2"),
-            "_sparse_diagonal_dense_size": 6,
-            "_sparse_diagonal_response_size": 108,
-            "_sparse_diagonal_contact_triples": True,
-            "_sparse_diagonal_contact_units": False,
-            "dense_max_constraints": 40,
-            "_dense_internal_max_rows": 12,
             "_compact_diagonal_mass_size": 108,
+            "sparse_diagonal_dense_size": 6,
+            "sparse_diagonal_response_size": 108,
+            "sparse_diagonal_contact_triples": True,
+            "sparse_diagonal_contact_units": False,
+            "dense_max_constraints": 40,
+            "dense_internal_max_rows": 12,
         }
-        self.assertTrue(compact.supported(SimpleNamespace(**valid)))
+
+        def probe(fields):
+            """The class's fields on the solver, the placement's on its placement."""
+            owners = ("model", "routes", "_compact_diagonal_mass_size")
+            placement = {name: value for name, value in fields.items() if name not in owners}
+            return SimpleNamespace(placement=SimpleNamespace(**placement), **{name: fields[name] for name in owners})
+
+        self.assertTrue(compact.supported(probe(valid)))
         # Patch friction schedules units instead of triples.
-        units = {**valid, "_sparse_diagonal_contact_triples": False, "_sparse_diagonal_contact_units": True}
-        self.assertTrue(compact.supported(SimpleNamespace(**units)))
+        units = {**valid, "sparse_diagonal_contact_triples": False, "sparse_diagonal_contact_units": True}
+        self.assertTrue(compact.supported(probe(units)))
         for name, value in (
             ("routes", SimpleNamespace(case="K6")),
-            ("_sparse_diagonal_dense_size", 7),
-            ("_sparse_diagonal_contact_triples", False),
+            ("sparse_diagonal_dense_size", 7),
+            ("sparse_diagonal_contact_triples", False),
             ("dense_max_constraints", 11),
-            ("_dense_internal_max_rows", 13),
+            ("dense_internal_max_rows", 13),
             ("_compact_diagonal_mass_size", None),
         ):
-            self.assertFalse(compact.supported(SimpleNamespace(**{**valid, name: value})), name)
+            self.assertFalse(compact.supported(probe({**valid, name: value})), name)
 
     def test_actual_fixture_layout_and_cpu_fallback(self):
         """Exercise the real model/Contacts field binding and exact unsupported CPU fallback."""
@@ -903,7 +918,7 @@ class TestCompactContact(unittest.TestCase):
         install_contacts(model, state, contacts)
         self.assertEqual(contacts.rigid_contact_count.numpy()[0], 6)
         solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=64)
-        self.assertFalse(solver._compact_contact_boundary)
+        self.assertFalse(solver.placement.compact_contact_boundary)
 
     def test_cuda_actual_solver_step_reset_notify_and_graphs(self):
         """Use the actual allocator, scheduler, RHS and eight-sweep solve with loaded contacts.
@@ -932,11 +947,11 @@ class TestCompactContact(unittest.TestCase):
                             mf_max_constraints=64,
                         )
                     )
-            self.assertFalse(solvers[0]._compact_contact_boundary)
-            self.assertTrue(solvers[1]._compact_contact_boundary)
-            self.assertLessEqual(solvers[1]._dense_internal_max_rows, 12)
+            self.assertFalse(solvers[0].placement.compact_contact_boundary)
+            self.assertTrue(solvers[1].placement.compact_contact_boundary)
+            self.assertLessEqual(solvers[1].placement.dense_internal_max_rows, 12)
             for solver in solvers:
-                self.assertTrue(solver._sparse_diagonal_contact_triples)
+                self.assertTrue(solver.placement.sparse_diagonal_contact_triples)
             records = check_compact_records(self, solvers, "point")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
@@ -957,7 +972,7 @@ class TestCompactContact(unittest.TestCase):
                         )
                 for solver in solvers:
                     solver.check_constraint_capacity()
-                    self.assertGreater(int(np.sum(solver.constraint_count.numpy())), 0)
+                    self.assertGreater(int(np.sum(solver.placement.constraint_count.numpy())), 0)
                     self.assertTrue(np.all(np.isfinite(solver.v_out.numpy())))
 
             for step in range(6):
@@ -1016,8 +1031,8 @@ class TestCompactContact(unittest.TestCase):
                     )
             for solver, enabled in zip(solvers, (False, True), strict=True):
                 self.assertTrue(solver.laws.friction_anchors_enabled)
-                self.assertTrue(solver._sparse_diagonal_contact_units)
-                self.assertEqual(solver._compact_contact_boundary, enabled)
+                self.assertTrue(solver.placement.sparse_diagonal_contact_units)
+                self.assertEqual(solver.placement.compact_contact_boundary, enabled)
             records = check_compact_records(self, solvers, "patch")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
@@ -1054,8 +1069,8 @@ class TestCompactContact(unittest.TestCase):
                     solver.check_constraint_capacity()
                     assert_ring_coulomb(solver)
                     self.assertGreater(assert_patch_tangent_law(solver, contacts[index]), 0)
-                    independent[index] |= bool(np.any(solver._sparse_contact_group_count.numpy() > 0))
-                    serial[index] |= bool(np.any(solver._sparse_contact_serial_count.numpy() > 0))
+                    independent[index] |= bool(np.any(solver.placement.sparse_contact_group_count.numpy() > 0))
+                    serial[index] |= bool(np.any(solver.placement.sparse_contact_serial_count.numpy() > 0))
                 linked |= any(len(record["types"]) == 1 and record["parents"][0] >= 0 for record in reference.values())
                 pooled |= any(
                     ring_carries_friction(reference, c)

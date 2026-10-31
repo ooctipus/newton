@@ -67,7 +67,7 @@ class TestFreeBodyZBuild(unittest.TestCase):
         state, out = model.state(), model.state()
         pipeline.collide(state, contacts)
         solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
-        rows = int(solver.mf_constraint_count.numpy()[0])
+        rows = int(solver.placement.mf_constraint_count.numpy()[0])
         self.assertGreater(rows, 0, "the box must touch the ground")
         # H at the center of mass: m on the linear block, the world-frame inertia on the angular one, plus armature.
         basis = np.array(wp.quat_to_matrix(rotation), dtype=np.float64).reshape(3, 3)
@@ -80,9 +80,9 @@ class TestFreeBodyZBuild(unittest.TestCase):
         np.testing.assert_allclose((L @ L.T)[::-1, ::-1], H, rtol=1e-5, atol=1e-6)  # leaf-first: P H P^T = L L^T
         # The box is each row's one body (the ground has none): its side's Jacobian.
         J_a, J_b = (J[0, :rows] for J in free_body_jacobians(solver))
-        J = np.where((solver.mf_body_a.numpy()[0, :rows] >= 0)[:, None], J_a, J_b)
+        J = np.where((solver.placement.mf_body_a.numpy()[0, :rows] >= 0)[:, None], J_a, J_b)
         expected = np.einsum("ri,ij,rj->r", J, np.linalg.inv(H), J) + solver.options.pgs_cfm
-        np.testing.assert_allclose(1.0 / solver.mf_eff_mass_inv.numpy()[0, :rows], expected, rtol=1e-5)
+        np.testing.assert_allclose(1.0 / solver.placement.mf_eff_mass_inv.numpy()[0, :rows], expected, rtol=1e-5)
 
 
 def _lower_factors(rng, groups, size):

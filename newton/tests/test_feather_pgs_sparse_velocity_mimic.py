@@ -261,13 +261,13 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                     self._assert_state(reference, candidate)
                     if step == 0:
                         self._assert_rows(reference, candidate)
-                        for world, count in enumerate(candidate[1].constraint_count.numpy()):
-                            kinds = candidate[1].row_type.numpy()[world, :count]
+                        for world, count in enumerate(candidate[1].placement.constraint_count.numpy()):
+                            kinds = candidate[1].placement.row_type.numpy()[world, :count]
                             for kind in (MIMIC, VELOCITY_LIMIT, CONTACT):
                                 self.assertIn(kind, kinds)
                             row = int(candidate[1].laws.mimic_slot.numpy()[world])
                             expected = 0.07 * error / sparse_scene.DT
-                            self.assertAlmostEqual(candidate[1].rhs.numpy()[world, row], expected, places=5)
+                            self.assertAlmostEqual(candidate[1].placement.rhs.numpy()[world, row], expected, places=5)
 
     def test_live_coefficients_enabled_graph_and_held_reset(self):
         """Read current mimic coefficients and enabled state without stale captured rows."""
@@ -306,8 +306,8 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
             self._assert_state(reference, candidate)
             self._assert_rows(reference, candidate)
             for case in (reference, candidate):
-                for world, count in enumerate(case[1].constraint_count.numpy()):
-                    kinds = case[1].row_type.numpy()[world, :count]
+                for world, count in enumerate(case[1].placement.constraint_count.numpy()):
+                    kinds = case[1].placement.row_type.numpy()[world, :count]
                     self.assertEqual(int(np.count_nonzero(kinds == MIMIC)), int(enabled))
 
 

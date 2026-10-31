@@ -189,23 +189,23 @@ def _run_mixed_response(
         state_in.clear_forces()
         pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-        constraint_count = int(solver.constraint_count.numpy()[0])
-        mf_count = int(solver.mf_constraint_count.numpy()[0])
+        constraint_count = int(solver.placement.constraint_count.numpy()[0])
+        mf_count = int(solver.placement.mf_constraint_count.numpy()[0])
         samples.append(
             (
                 constraint_count,
-                solver.diag.numpy()[0, :constraint_count].copy(),
-                solver.impulses.numpy()[0, :constraint_count].copy(),
+                solver.placement.diag.numpy()[0, :constraint_count].copy(),
+                solver.placement.impulses.numpy()[0, :constraint_count].copy(),
                 state_out.joint_q.numpy().copy(),
                 state_out.joint_qd.numpy().copy(),
-                int(solver._local_solve_owner.numpy()[0]),
-                solver.row_type.numpy()[0, :constraint_count].copy(),
+                int(solver.placement.local_solve_owner.numpy()[0]),
+                solver.placement.row_type.numpy()[0, :constraint_count].copy(),
                 mf_count,
-                solver.mf_impulses.numpy()[0, :mf_count].copy(),
-                solver.mf_row_type.numpy()[0, :mf_count].copy(),
-                solver.mf_row_parent.numpy()[0, :mf_count].copy(),
-                solver.mf_Z_a.numpy()[0, :mf_count].copy(),
-                solver.mf_Z_b.numpy()[0, :mf_count].copy(),
+                solver.placement.mf_impulses.numpy()[0, :mf_count].copy(),
+                solver.placement.mf_row_type.numpy()[0, :mf_count].copy(),
+                solver.placement.mf_row_parent.numpy()[0, :mf_count].copy(),
+                solver.placement.mf_Z_a.numpy()[0, :mf_count].copy(),
+                solver.placement.mf_Z_b.numpy()[0, :mf_count].copy(),
             )
         )
         state_in, state_out = state_out, state_in
@@ -1404,7 +1404,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         forced_tiled = _FeatherPGSExecutionPlan.build(
             solver.forest.size_groups,
-            max_constraints=solver.dense_max_constraints,
+            max_constraints=solver.placement.dense_max_constraints,
             max_shared_memory=101376,
             cholesky_kernel="auto",
             hinv_jt_kernel="tiled",
@@ -1426,11 +1426,11 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         "tiled", warmstart=warmstart, preelimination=preelimination
                     )
 
-                    self.assertEqual(reference_solver._hinv_jt_diag_sizes, frozenset())
+                    self.assertEqual(reference_solver.placement.hinv_jt_diag_sizes, frozenset())
                     self.assertEqual(reference_solver._preelim_active, preelimination)
                     self.assertEqual(tiled_solver._preelim_active, preelimination)
                     # The packed rows' build forms every diagonal (packed_rows): no response size reduces its own.
-                    self.assertEqual(tiled_solver._hinv_jt_diag_sizes, frozenset())
+                    self.assertEqual(tiled_solver.placement.hinv_jt_diag_sizes, frozenset())
                     self.assertEqual(len(reference), len(tiled))
                     self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
                     # Without warm start or pre-elimination the par_row arm's world takes the local owners, which
@@ -1591,8 +1591,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             "par_row", warmstart=False, preelimination=False, inactive_joint_limit_capacity=True
         )
 
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         self.assertEqual(len(general), len(local))
         self.assertGreater(general[0][0], 0, "mixed scene generated no dense constraint rows")
         self.assertTrue(
@@ -1635,8 +1635,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         pair_samples = [sample for sample in local if sample[5] == PGS_LOCAL_SOLVE_OWNER_PAIR]
         self.assertTrue(pair_samples, "mixed friction contact never selected the paired local owner")
         self.assertTrue(
@@ -1677,8 +1677,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
         self.assertTrue(general_solver.laws.regularization_enabled)
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         owners = [sample[5] for sample in local]
         self.assertIn(
             PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, owners, "regularized mixed contact never selected the residual owner"
@@ -1706,8 +1706,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         self.assertTrue(general_solver.laws.friction_anchors_enabled)
         self.assertTrue(local_solver.laws.friction_anchors_enabled)
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         self.assertIn(PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL, [sample[5] for sample in local])
 
         self.assertTrue(
@@ -1753,8 +1753,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
 
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         limited = [sample for sample in local if np.any(sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)]
         self.assertTrue(limited, "free body never produced a velocity-limit row")
         for sample in general + local:
@@ -1782,8 +1782,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
         free_articulation = int(np.flatnonzero(local_solver.forest.is_free_rigid_host)[0])
         self.assertEqual(int(local_solver.forest.articulation_dof_start_host[free_articulation]), 0)
-        self.assertFalse(general_solver._local_internal_fast_path)
-        self.assertTrue(local_solver._local_internal_fast_path)
+        self.assertFalse(general_solver.placement.local_internal_fast_path)
+        self.assertTrue(local_solver.placement.local_internal_fast_path)
         np.testing.assert_array_equal(local_solver._local_residual_pair_articulation.numpy(), [-1])
         self.assertGreaterEqual(int(local_solver._local_pair_articulation.numpy()[0]), 0)
         self.assertTrue(any(sample[7] > 0 for sample in local), "free body generated no matrix-free rows")
@@ -1808,9 +1808,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     mf_max_constraints=32,
                     contact_torsion=torsion,
                 )
-        self.assertTrue(solvers[False]._local_internal_fast_path)
+        self.assertTrue(solvers[False].placement.local_internal_fast_path)
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
-        self.assertTrue(solvers[True]._local_internal_fast_path)
+        self.assertTrue(solvers[True].placement.local_internal_fast_path)
         kernels = (
             *solvers[True]._pgs_solve_local_pair_kernels.values(),
             *solvers[True]._pgs_solve_local_residual_kernels.values(),

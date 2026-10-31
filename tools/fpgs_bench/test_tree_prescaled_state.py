@@ -27,7 +27,7 @@ def fixture(floating, device):
     for item in (solver, reference):
         # Exercise the motion/predictor kernels directly on CPU too; complete
         # velocity-limit solving remains CUDA/matrix-free and is tested below.
-        item.options = item.laws.options = item.factor.options = dataclasses.replace(
+        item.options = item.laws.options = item.factor.options = item.placement.options = dataclasses.replace(
             item.options, enable_joint_velocity_limits=True
         )
         item.factor.fk_id_cache_enabled = False

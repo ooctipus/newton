@@ -683,8 +683,8 @@ class TestContactUnitTwins(unittest.TestCase):
                 self.assertIn("_contact_records", unit._sparse_contact_response_kernel.key)
                 self.assertNotIn("_contact_records", ordinary._sparse_contact_response_kernel.key)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
-                self.assertEqual(unit._sparse_contact_records.shape, (model.world_count, 32, width))
-                self.assertIsNone(ordinary._sparse_contact_records)
+                self.assertEqual(unit.placement.sparse_contact_records.shape, (model.world_count, 32, width))
+                self.assertIsNone(ordinary.placement.sparse_contact_records)
                 record = unit.get_path_selection()["routes"]["sparse_mass_matrix"]
                 self.assertNotIn("contact_transaction", record)
                 self.assertEqual(record["launch_bounds"], [64, 16])
@@ -718,8 +718,8 @@ class TestContactUnitTwins(unittest.TestCase):
             solver.step(state, output, control, contacts, dt)
             state.assign(output)
             if step == 0:
-                counts = solver.constraint_count.numpy()
-                impulses = solver.impulses.numpy()
+                counts = solver.placement.constraint_count.numpy()
+                impulses = solver.placement.impulses.numpy()
                 first = np.concatenate([impulses[world, :count] for world, count in enumerate(counts)])
             trajectory.append((first, state.body_q.numpy().copy(), state.body_qd.numpy().copy()))
         return trajectory

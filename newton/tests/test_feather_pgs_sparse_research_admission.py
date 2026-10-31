@@ -71,6 +71,7 @@ def _eligible_solver():
         _route_pins={},
         factor=SimpleNamespace(parallel_drives=True),
         _preelim_active=False,
+        placement=SimpleNamespace(),
         routes=RouteTable({}),
         forest=forest,
         options=options,
@@ -167,7 +168,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver.laws.friction_anchors_enabled = anchors
                 solver.forest.has_free_rigid_bodies = True
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
+                self.assertIsNone(solver.placement.sparse_mass_matrix_size)
                 self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
         # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
         for anchors in (False, True):
@@ -187,7 +188,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver = _eligible_solver()
             solver._route_pins = {"tiers": 32}
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             self.assertIn("Jacobi tiers", solver.routes.reasons["K1"])
 
     def test_patch_free_body_worlds_keep_the_dense_route(self):
@@ -198,7 +199,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver.laws.friction_anchors_enabled = True
             solver.forest.has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
@@ -214,13 +215,13 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     pgs_warmstart=False,
                     dense_max_constraints=40,
                 )
-                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 self.assertEqual(solver._sparse_mass_matrix_plan.nonzero_count, nonzeros)
-                self.assertEqual(solver._sparse_row_factor.shape[2], support)
+                self.assertEqual(solver.placement.sparse_row_factor.shape[2], support)
                 self.assertIsNone(solver._pgs_solve_mf_gs_kernel)
                 self.assertEqual(solver._mf_gs_tiers, [])
-                self.assertIsNone(solver._ink_sizes)
-                self.assertEqual(solver._ink_rows, 0)
+                self.assertIsNone(solver.placement.ink_sizes)
+                self.assertEqual(solver.placement.ink_rows, 0)
 
 
 if __name__ == "__main__":

@@ -1125,8 +1125,8 @@ class TestPatchSolverRoutes(unittest.TestCase):
                 )
                 self.assertGreater(solver.laws.friction_anchor_beta, 0.0)
                 arrays = (
-                    (solver.row_parent, solver.row_mu, solver.impulses),
-                    (solver.mf_row_parent, solver.mf_row_mu, solver.mf_impulses),
+                    (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),
+                    (solver.placement.mf_row_parent, solver.placement.mf_row_mu, solver.placement.mf_impulses),
                 )
                 pipeline = newton.CollisionPipeline(model, contact_matching="latest")
                 contacts = pipeline.contacts()
@@ -1141,7 +1141,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                         solver.step(state, out, control, contacts, dt)
                         state, out = out, state
                         count = int(contacts.rigid_contact_count.numpy()[0])
-                        paths.update(solver.contact_path.numpy()[:count].tolist())
+                        paths.update(solver.placement.contact_path.numpy()[:count].tolist())
                         expected = ["link", "seed", "finish"] if warmstart else ["link", "finish"]
                         self.assertEqual([name for name, _ in calls], expected, f"step {step}")
                         for name, routes in calls:

@@ -16,7 +16,7 @@ def fixture():
     """Expose current owners with mixed empty/admitted/fallback worlds."""
     solver = fpgs()
     solver.forest = SimpleNamespace(world_count=4)
-    solver.constraint_count = FlagArray([0, 3, 384, 402])
+    solver.placement.constraint_count = FlagArray([0, 3, 384, 402])
     fusion = SimpleNamespace(owner=FlagArray([1, 1, 1, 0]), fallback_counts=FlagArray([0, 0, 0, 402]))
     solver._fused_contact_solve = fusion
     solver._fused_contact_solve_active = fusion
@@ -28,7 +28,7 @@ class TestFusedMetadata(unittest.TestCase):
         """Distinguish all admitted worlds from nonempty admitted work."""
         solver = fixture()
         arrays = (
-            solver.constraint_count,
+            solver.placement.constraint_count,
             solver._fused_contact_solve.owner,
             solver._fused_contact_solve.fallback_counts,
         )
@@ -62,9 +62,9 @@ class TestFusedMetadata(unittest.TestCase):
                 elif problem == "shape":
                     fusion.owner.shape = (3,)
                 elif problem == "negative":
-                    solver.constraint_count.values[0] = -1
+                    solver.placement.constraint_count.values[0] = -1
                 elif problem == "overflow":
-                    solver.constraint_count.values[3] = 705
+                    solver.placement.constraint_count.values[3] = 705
                 elif problem == "fallback":
                     fusion.fallback_counts.values[3] = 401
                 elif problem == "capture":

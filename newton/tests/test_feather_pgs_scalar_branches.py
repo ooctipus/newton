@@ -1499,7 +1499,7 @@ def _arm_within(test, reference, actual, bodies, tag, *, again=None):
 
 def _contact_rows(test, solver, count):
     """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order."""
-    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
+    world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
     test.assertTrue(np.all(slot >= 0), "every held contact owns a row")
     return world, slot
 
@@ -1510,10 +1510,10 @@ def _normal_impulses(test, solver, count):
     A contact of a world the resolved-world classifier resolved (every row separates at the predictor) has no
     rows and carries none.
     """
-    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
-    resolved = solver.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
+    world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
+    resolved = solver.placement.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
     test.assertTrue(np.all((slot >= 0) | resolved), "every contact owns a row or sits in a resolved world")
-    return np.where(resolved, 0.0, solver.impulses.numpy()[world, np.maximum(slot, 0)]).astype(np.float64)
+    return np.where(resolved, 0.0, solver.placement.impulses.numpy()[world, np.maximum(slot, 0)]).astype(np.float64)
 
 
 def _key_inertia(model, leaves, dofs, axes):
@@ -1590,10 +1590,10 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
         solver.step(current, following, control, contacts, DT)
         states = [following, current]
         rows = _contact_rows(test, solver, len(pairs))
-        impulses.append(solver.impulses.numpy()[rows].astype(np.float64))
+        impulses.append(solver.placement.impulses.numpy()[rows].astype(np.float64))
         travel.append(following.joint_q.numpy()[coordinates].astype(np.float64))
         if diagonal is None:
-            diagonal = solver.diag.numpy()[rows].astype(np.float64)
+            diagonal = solver.placement.diag.numpy()[rows].astype(np.float64)
             axes = solver.factor.joint_S_s.numpy()[dofs, :3].astype(np.float64)
             normals = contacts.rigid_contact_normal.numpy()[: len(pairs)].astype(np.float64)
             along = np.sum(normals * axes, axis=1)
@@ -1914,7 +1914,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             np.testing.assert_allclose(impulses[2], impulses[1], err_msg=f"{tag} twin impulses", **IMPULSE_BOUND)
             for solver in solvers:
                 solver.check_constraint_capacity()
-                self.assertGreater(int(solver.constraint_count.numpy().sum()), 0)
+                self.assertGreater(int(solver.placement.constraint_count.numpy().sum()), 0)
             for owner in owners:
                 self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups[:-1])), 0)
 

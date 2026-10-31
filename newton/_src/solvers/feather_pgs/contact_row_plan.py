@@ -74,9 +74,9 @@ def contact_row_plan(solver) -> ContactRowPlan:
     sizes = solver.forest.size_groups
     case = solver.routes.case
     owned = {
-        "K3": "local_packets" if solver._row_packets is not None else None,
-        "K4": "keyed_rows" if solver._keyed_rows is not None else None,
-        "K2": "compact_contact_boundary" if solver._compact_contact_boundary else None,
+        "K3": "local_packets" if solver.placement.row_packets is not None else None,
+        "K4": "keyed_rows" if solver.placement.keyed_rows is not None else None,
+        "K2": "compact_contact_boundary" if solver.placement.compact_contact_boundary else None,
     }.get(case)
     if owned is not None:
         return ContactRowPlan(owned, law, dict.fromkeys(sizes, owned))
@@ -86,12 +86,12 @@ def contact_row_plan(solver) -> ContactRowPlan:
             if case == "K1":
                 # Native sparse factors admit one articulated size and no free rigid bodies.
                 methods[size] = "sparse_response"
-            elif case == "K2" and size == solver._sparse_diagonal_response_size:
+            elif case == "K2" and size == solver.placement.sparse_diagonal_response_size:
                 methods[size] = "sparse_diagonal"
             else:
                 methods[size] = "compact_jacobian"
         producer = {"K1": "sparse_contact_response", "K2": "sparse_diagonal"}.get(case, "compact_jacobian")
-        return ContactRowPlan(producer, law, methods, metadata_launch=not solver._sparse_prepare_contacts)
+        return ContactRowPlan(producer, law, methods, metadata_launch=not solver.placement.sparse_prepare_contacts)
     masked_sizes = tuple(size for size in sizes if size <= 32)
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
     methods = {}

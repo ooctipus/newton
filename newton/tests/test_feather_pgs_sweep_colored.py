@@ -265,13 +265,15 @@ class TestColoredSweep(unittest.TestCase):
         solver = solvers[-1]
         self.assertIsNotNone(solver._colored_units, "the tray's worlds take the colored mapping")
         host = {name: array.numpy() for name, array in solver._colored_units.units.items()}
-        metas = solver.mf_meta_packed.numpy().reshape(solver.forest.world_count, solver.mf_max_constraints, 4)
+        metas = solver.placement.mf_meta_packed.numpy().reshape(
+            solver.forest.world_count, solver.placement.mf_max_constraints, 4
+        )
         return solver, host, metas
 
     def test_units_follow_the_host_rules(self):
         """Units, row-order levels and the slot records by color equal the host reference's."""
         solver, host, metas = self._built()
-        counts, ends = solver.mf_constraint_count.numpy(), solver.mf_contact_rows_end.numpy()
+        counts, ends = solver.placement.mf_constraint_count.numpy(), solver.placement.mf_contact_rows_end.numpy()
         for world in range(solver.forest.world_count):
             want = reference_units(metas[world], int(counts[world]), int(ends[world]))
             slot = int(host["world_slot"][world])
@@ -299,7 +301,7 @@ class TestColoredSweep(unittest.TestCase):
         self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
         self.assertGreater(record["storage_bytes"], 0)
         # A slot holds a unit for every three rows of the row capacity.
-        capacity = sweep_units.unit_capacity(solver.mf_max_constraints)
+        capacity = sweep_units.unit_capacity(solver.placement.mf_max_constraints)
         self.assertEqual(units.slots["slot_data"].shape, (units.slot_count, units.layout.fields, capacity))
 
     def test_a_color_never_shares_a_body_or_a_patch(self):

@@ -96,7 +96,7 @@ class TestFeatherPGSSparseExitLaw(unittest.TestCase):
             pgs_solve_readout=readout,
             friction_anchor_beta=0.0,
         )
-        self.assertIsNotNone(solver._sparse_mass_matrix_size)
+        self.assertIsNotNone(solver.placement.sparse_mass_matrix_size)
         states = [model.state() for _ in range(2)]
         states[0].joint_qd.fill_(0.3)
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

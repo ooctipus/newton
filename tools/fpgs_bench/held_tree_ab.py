@@ -418,8 +418,8 @@ class Recorder:
             with unittest.mock.patch.dict(SolverFeatherPGS._route_pins, {"star": "held", "evaluator": "ordinary"}):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
-            solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
-                solver.options, enable_joint_velocity_limits=owner_options.get("motion", False)
+            solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+                dataclasses.replace(solver.options, enable_joint_velocity_limits=owner_options.get("motion", False))
             )
             admitted = held_tree.admitted
             if forest:

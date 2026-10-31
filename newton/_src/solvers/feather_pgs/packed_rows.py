@@ -7,12 +7,12 @@ A dense row touches at most two articulations, its sides (:func:`.dense_rows.row
 the second or none. Packed, a row holds its sides' coordinates in order, the first side's, then the second's: entry
 ``e`` of a side of ``n`` coordinates is the side's coordinate ``e``, world coordinate ``offset + e``, so a row's
 entries ascend with the world's coordinates. An entry's world coordinate is not stored: it follows from the row's
-sides (``_row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
+sides (``row_sides``, :class:`.dense_rows.RowSupport`, :data:`PACKED_SIDES`). Each entry keeps
 
-* the row's Jacobian ``J`` (``_packed_J``), which the row producers write at the row's sides
+* the row's Jacobian ``J`` (``packed_J``), which the row producers write at the row's sides
   (:func:`.dense_rows.jacobian_row`) and the velocity terms outside the sweeps read with the physical velocity
   (:func:`.kernels.world_contact_row_dot`);
-* its whitened form ``Z = L^-1 P J^T`` (``_packed_Z``) through the side's leaf-first factor ``L``, in the kit's
+* its whitened form ``Z = L^-1 P J^T`` (``packed_Z``) through the side's leaf-first factor ``L``, in the kit's
   positions: factor coordinate ``i`` of a side at its entry ``n - 1 - i``
   (:class:`.response_operator.CholeskySolve`).
 
@@ -51,8 +51,8 @@ from .response_operator import CholeskySolve, Reversed
 __all__ = ["PACKED_ROWS", "PACKED_SIDES", "apply_kernel", "pack_kernel", "project_kernel", "support_width"]
 
 PACKED_ROWS = FieldGroup(
-    Field("_packed_J", wp.float32, ("world", "row", "support")),
-    Field("_packed_Z", wp.float32, ("world", "row", "support")),
+    Field("packed_J", wp.float32, ("world", "row", "support"), owner="placement"),
+    Field("packed_Z", wp.float32, ("world", "row", "support"), owner="placement"),
 )
 """Each dense row's packed entries: world coordinate, Jacobian and whitened value."""
 

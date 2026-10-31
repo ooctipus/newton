@@ -68,10 +68,10 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 err_msg=field,
             )
         for case in (ordinary, keyed):
-            self.assertFalse(case[1].constraint_overflow.numpy().any())
-            for world, count in enumerate(case[1].constraint_count.numpy()):
-                impulse = case[1].impulses.numpy()[world, :count]
-                kind = case[1].row_type.numpy()[world, :count]
+            self.assertFalse(case[1].placement.constraint_overflow.numpy().any())
+            for world, count in enumerate(case[1].placement.constraint_count.numpy()):
+                impulse = case[1].placement.impulses.numpy()[world, :count]
+                kind = case[1].placement.row_type.numpy()[world, :count]
                 self.assertTrue(np.isfinite(impulse).all())
                 self.assertTrue((impulse[np.isin(kind, (0, 3, 4))] >= -1e-7).all())
 
@@ -81,9 +81,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
             for capacity in (8, 32):
                 with self.subTest(free_count=free_count, capacity=capacity):
                     ordinary, keyed = make_case(False, capacity, free_count), make_case(True, capacity, free_count)
-                    self.assertIsNone(ordinary[1]._keyed_rows)
-                    self.assertIsNotNone(keyed[1]._keyed_rows)
-                    self.assertEqual(keyed[1]._keyed_rows.layout.primary, 9)
+                    self.assertIsNone(ordinary[1].placement.keyed_rows)
+                    self.assertIsNotNone(keyed[1].placement.keyed_rows)
+                    self.assertEqual(keyed[1].placement.keyed_rows.layout.primary, 9)
                     seen = False
                     for _ in range(8):
                         _step(ordinary)
@@ -95,7 +95,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
     def test_held_factor_graph_and_masked_reset(self):
         """Preserve held factors and masked reset inside CUDA graphs."""
         ordinary, keyed = make_case(False, 32), make_case(True, 32)
-        self.assertIsNotNone(keyed[1]._keyed_rows)
+        self.assertIsNotNone(keyed[1].placement.keyed_rows)
         for case in (ordinary, keyed):
             _step(case)
         with wp.ScopedCapture("cuda:0") as capture:
@@ -121,8 +121,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
     def test_default_request_selects_keyed_inputs(self):
         """Adopt admitted physical keys without naming a task or adding a caller flag."""
         case = make_case(None, 32)
-        self.assertIsNotNone(case[1]._keyed_rows)
-        self.assertIsNotNone(case[1]._keyed_rows.layout)
+        self.assertIsNotNone(case[1].placement.keyed_rows)
+        self.assertIsNotNone(case[1].placement.keyed_rows.layout)
 
     def test_patch_rows_match_ordinary_patch_rows(self):
         """Solve patch friction through keyed rows as through ordinary rows in the same linked tiers.
@@ -151,8 +151,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 for case in (ordinary, keyed):
                     classifier = case[1].get_path_selection()["routes"]["resolved_worlds"]
                     self.assertFalse(classifier["enabled"], classifier["reason"])
-                self.assertIsNone(ordinary[1]._keyed_rows)
-                self.assertTrue(keyed[1]._keyed_rows.patch)
+                self.assertIsNone(ordinary[1].placement.keyed_rows)
+                self.assertTrue(keyed[1].placement.keyed_rows.patch)
                 for case in (ordinary, keyed):
                     tiers = case[1]._mf_gs_tiers
                     self.assertTrue(tiers)
@@ -194,9 +194,9 @@ class TestKeyedRowIntegration(unittest.TestCase):
                     wave, single = (
                         make_case(True, 32, 1, beta=beta, deterministic=True, rigid_contact_max=1024) for _ in range(2)
                     )
-                self.assertEqual(wave[1]._keyed_rows.patch, beta > 0.0)
+                self.assertEqual(wave[1].placement.keyed_rows.patch, beta > 0.0)
                 self.assertEqual(wave[-1].rigid_contact_max, 1024)
-                self.assertEqual(wave[1]._max_contacts_alloc, 1024)
+                self.assertEqual(wave[1].placement.max_contacts_alloc, 1024)
                 record = wave[1].get_path_selection()["routes"]["contact_consumers"]
                 self.assertEqual(record["max_blocks"], contact_capacity_blocks(device))
                 single[1]._contact_capacity_blocks = 1

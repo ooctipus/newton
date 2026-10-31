@@ -81,11 +81,11 @@ def install_cpu_keyed_rows(solver):
         max_world_dofs=int(model.joint_dof_count) // solver.forest.world_count,
         articulation_world_dof_offset=wp.zeros(model.articulation_count, dtype=int, device=model.device),
     )
-    solver.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
-    solver._ink_rows = 4
+    solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
+    solver.placement.ink_rows = 4
     solver.routes.case = "K4"
     solver.routes.row = dataclasses.replace(solver.routes.row, case="K4", producer="keyed_rows")
-    solver._keyed_rows = keyed_rows.KeyedRows(solver)
+    solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
 
 
 def _launches_per_step(builders) -> collections.Counter:

@@ -26,12 +26,12 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         """Grow the solver's per-contact scratch to a larger contact buffer before writing it."""
         model = _build_model()
         solver = SolverFeatherPGS(model)
-        rows = solver._contact_pool.ready + 64
+        rows = solver.placement.contact_pool.ready + 64
         contacts = newton.Contacts(rigid_contact_max=rows, soft_contact_max=0, device=model.device)
 
         solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
-        self.assertEqual(solver._contact_pool.ready, rows)
-        self.assertEqual(solver.contact_slot.shape, (rows,))
+        self.assertEqual(solver.placement.contact_pool.ready, rows)
+        self.assertEqual(solver.placement.contact_slot.shape, (rows,))
 
 
 if __name__ == "__main__":

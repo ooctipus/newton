@@ -185,11 +185,11 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             solver.step(s0, s1, control, contacts, 0.005)
             s0, s1 = s1, s0
         self.assertEqual(float(np.abs(solver.laws.friction_patches.view.phi.numpy()).max()), 0.0)
-        row_type = solver.row_type.numpy()
+        row_type = solver.placement.row_type.numpy()
         friction = row_type == PGS_CONSTRAINT_TYPE_FRICTION
         self.assertGreater(int(friction.sum()), 0)
-        self.assertEqual(float(np.abs(solver.phi.numpy()[friction]).max()), 0.0)
-        self.assertEqual(float(np.abs(solver.row_beta.numpy()[friction]).max()), 0.0)
+        self.assertEqual(float(np.abs(solver.placement.phi.numpy()[friction]).max()), 0.0)
+        self.assertEqual(float(np.abs(solver.placement.row_beta.numpy()[friction]).max()), 0.0)
 
     def test_anchors_do_not_require_contact_matching(self):
         """Keep patch history owned by the solver, independently of collision matching."""
@@ -276,20 +276,24 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             n = int(contacts.rigid_contact_count.numpy()[0])
             self.assertGreater(n, 0)
             fa = solver.laws.friction_patches.view.phi.numpy()[:n]
-            slot = solver.contact_slot.numpy()[:n]
-            path = solver.contact_path.numpy()[:n]
+            slot = solver.placement.contact_slot.numpy()[:n]
+            path = solver.placement.contact_path.numpy()[:n]
             checked = {0: 0, 1: 0}
             for c in range(n):
                 if slot[c] < 0 or path[c] < 0:
                     continue
                 if path[c] == 0:
-                    rt, ph, rb = solver.row_type.numpy()[0], solver.phi.numpy()[0], solver.row_beta.numpy()[0]
+                    rt, ph, rb = (
+                        solver.placement.row_type.numpy()[0],
+                        solver.placement.phi.numpy()[0],
+                        solver.placement.row_beta.numpy()[0],
+                    )
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph, rt = solver.mf_phi.numpy()[0], solver.mf_row_type.numpy()[0]
+                    ph, rt = solver.placement.mf_phi.numpy()[0], solver.placement.mf_row_type.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)

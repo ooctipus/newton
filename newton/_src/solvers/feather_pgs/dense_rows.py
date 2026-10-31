@@ -17,19 +17,19 @@ from .field_group import Field
 from .solver_fields import MF_ROWS
 
 RECORDS = (
-    Field("row_type", wp.int32, ("world", "row")),
-    Field("row_parent", wp.int32, ("world", "row")),
-    Field("row_mu", wp.float32, ("world", "row")),
-    Field("row_beta", wp.float32, ("world", "row")),
-    Field("row_cfm", wp.float32, ("world", "row")),
-    Field("phi", wp.float32, ("world", "row")),
-    Field("target", wp.float32, ("world", "row"), attr="target_velocity"),
-    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution"),
-    Field("rhs", wp.float32, ("world", "row")),
-    Field("diag", wp.float32, ("world", "row")),
-    Field("row_w", wp.float32, ("world", "row")),
-    Field("row_eps", wp.float32, ("world", "row")),
-    Field("sides", wp.vec2i, ("world", "row"), attr="_row_sides"),
+    Field("row_type", wp.int32, ("world", "row"), owner="placement"),
+    Field("row_parent", wp.int32, ("world", "row"), owner="placement"),
+    Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_cfm", wp.float32, ("world", "row"), owner="placement"),
+    Field("phi", wp.float32, ("world", "row"), owner="placement"),
+    Field("target", wp.float32, ("world", "row"), attr="target_velocity", owner="placement"),
+    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution", owner="placement"),
+    Field("rhs", wp.float32, ("world", "row"), owner="placement"),
+    Field("diag", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_w", wp.float32, ("world", "row"), owner="placement"),
+    Field("row_eps", wp.float32, ("world", "row"), owner="placement"),
+    Field("sides", wp.vec2i, ("world", "row"), attr="row_sides", owner="placement"),
 )
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
 compliance ``row_eps`` among them), and its sides (the articulations whose response coordinates it touches:
@@ -133,8 +133,8 @@ MF_RECORDS = (
             ("rhs", "mf_rhs"),
         )
     ),
-    Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity"),
-    Field("eps", wp.float32, ("world", "mf_row"), attr="mf_row_eps"),
+    Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity", owner="placement"),
+    Field("eps", wp.float32, ("world", "mf_row"), attr="mf_row_eps", owner="placement"),
 )
 """Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
 by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity
@@ -144,11 +144,11 @@ row."""
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
 
 
-def bind_mf(solver):
-    """Bind the solver's matrix-free row records into an :data:`MfRows`."""
-    return field_group.bind(MfRows, solver=solver)
+def bind_mf(placement):
+    """Bind the placement's matrix-free row records into an :data:`MfRows`."""
+    return field_group.bind(MfRows, placement=placement)
 
 
-def bind(solver, data=None):
-    """Bind the solver's dense row records into a :data:`DenseRows` (``data``: an instance to refill)."""
-    return field_group.bind(DenseRows, data, solver=solver)
+def bind(placement, data=None):
+    """Bind the placement's dense row records into a :data:`DenseRows` (``data``: an instance to refill)."""
+    return field_group.bind(DenseRows, data, placement=placement)

@@ -94,10 +94,10 @@ def _run_scene(scene: scenes.Scene, iterations: int, eliminate: bool = True):
         solver.step(state_0, state_1, control, contacts, scene.dt)
         state_0, state_1 = state_1, state_0
         positions.append(state_0.body_q.numpy()[:, :3].astype(np.float64))
-        count = int(solver.constraint_count.numpy()[0])
-        contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        count = int(solver.placement.constraint_count.numpy()[0])
+        contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
         if contact_rows.any():
-            loaded = max(loaded, float(np.max(solver.impulses.numpy()[0, :count][contact_rows])))
+            loaded = max(loaded, float(np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])))
     return solver, np.array(positions), loaded
 
 
@@ -130,7 +130,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(solver._preelim_active)
         count = int(solver._preelim_nB.numpy()[0])
         slots = solver._preelim_slots.numpy()[:count]
-        selected_types = solver.row_type.numpy()[0, slots]
+        selected_types = solver.placement.row_type.numpy()[0, slots]
         self.assertEqual(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
         self.assertGreater(int(np.count_nonzero(selected_types == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
@@ -150,7 +150,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             state_0, state_1 = state_1, state_0
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
         count = int(solver._preelim_nB.numpy()[0])
-        kept = solver.row_type.numpy()[0, solver._preelim_slots.numpy()[:count]]
+        kept = solver.placement.row_type.numpy()[0, solver._preelim_slots.numpy()[:count]]
         self.assertEqual(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_MIMIC)), 1)
         self.assertGreater(int(np.count_nonzero(kept == PGS_CONSTRAINT_TYPE_CONNECT)), 0)
 
@@ -244,15 +244,15 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
 
-        count = int(solver.constraint_count.numpy()[0])
-        contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+        count = int(solver.placement.constraint_count.numpy()[0])
+        contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
         self.assertTrue(contact_rows.any())
-        cache_peak = np.max(solver.impulses.numpy()[0, :count][contact_rows])
+        cache_peak = np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])
         self.assertGreater(cache_peak, 1.0e-4, "loaded contact cache stayed empty")
         previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
-        solver.options = solver.laws.options = solver.factor.options = dataclasses.replace(
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
             solver.options, pgs_iterations=0
         )
         pipeline.collide(state_0, contacts)
@@ -261,7 +261,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         gap = _loop_anchor_gap(model, state_1)
         self.assertTrue(solver._preelim_active)
         self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
-        self.assertGreater(np.max(solver.impulses.numpy()), 1.0e-4)
+        self.assertGreater(np.max(solver.placement.impulses.numpy()), 1.0e-4)
         self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
 
@@ -299,10 +299,10 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
             worst = max(worst, _loop_anchor_gap(model, state_0))
-            count = int(solver.constraint_count.numpy()[0])
-            contact_rows = solver.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+            count = int(solver.placement.constraint_count.numpy()[0])
+            contact_rows = solver.placement.row_type.numpy()[0, :count] == PGS_CONSTRAINT_TYPE_CONTACT
             if contact_rows.any():
-                loaded = max(loaded, float(np.max(solver.impulses.numpy()[0, :count][contact_rows])))
+                loaded = max(loaded, float(np.max(solver.placement.impulses.numpy()[0, :count][contact_rows])))
         self.assertTrue(solver._preelim_active)
         self.assertGreater(loaded, 0.1, "the contacts carried no load")
         self.assertLess(worst, 1.0e-5, f"loaded contacts opened the closure by {worst:.2e} m")
@@ -344,8 +344,8 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
     def test_rows_remain_allocated(self):
         """B rows keep their dense slots (layout/warm-start stability); they are neutralized, not removed."""
         solver, _, _, _ = _run_four_bar(steps=60, enable_bilateral_preelimination=True)
-        counts = solver.constraint_count.numpy()
-        rows = solver.row_type.numpy()
+        counts = solver.placement.constraint_count.numpy()
+        rows = solver.placement.row_type.numpy()
         seen = set()
         for w in range(rows.shape[0]):
             seen.update(rows[w, : counts[w]].tolist())

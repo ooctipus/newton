@@ -931,7 +931,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
         self.assertEqual(rows["dense_overflow_world_steps"], 1)
         self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
-        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_row_watermark_includes_rolled_back_contact_rows(self):
         """Count contact bundles rejected and rolled back by the allocator."""
@@ -983,10 +983,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
-        self.assertFalse(solver._row_watermark)
-        self.assertTrue(solver._track_row_capacity)
-        self.assertGreater(int(solver._row_dropped_dense.numpy().max()), 0)
-        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertFalse(solver.placement.row_watermark)
+        self.assertTrue(solver.placement.track_row_capacity)
+        self.assertGreater(int(solver.placement.row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
 
     def test_constraint_overflow_warning_covers_matrix_free_rows(self):
         """Identify overflows on the matrix-free contact row family."""
@@ -1011,8 +1011,8 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
-        self.assertGreater(int(solver._row_dropped_mf.numpy().max()), 0)
-        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[1]), 1)
+        self.assertGreater(int(solver.placement.row_dropped_mf.numpy().max()), 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[1]), 1)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.

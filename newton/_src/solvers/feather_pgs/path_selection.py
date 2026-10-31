@@ -28,9 +28,10 @@ from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
 # Options whose applied value lives under another attribute of the solver after construction.
 _APPLIED_ATTRIBUTES = {
     "nvtx": "_nvtx",
-    "row_watermark": "_row_watermark",
     "enable_bilateral_preelimination": "_preelim_active",
 }
+# Those it lives under on the placement.
+_APPLIED_PLACEMENT = {"row_watermark": "row_watermark"}
 
 
 def _applied(solver, name, requested):
@@ -38,6 +39,8 @@ def _applied(solver, name, requested):
     (:data:`_APPLIED_ATTRIBUTES`, capacities), else the options record's value."""
     if name == "friction_anchor_beta":
         return solver.laws.friction_anchor_beta
+    if name in _APPLIED_PLACEMENT:
+        return getattr(solver.placement, _APPLIED_PLACEMENT[name])
     attribute = _APPLIED_ATTRIBUTES.get(name, name)
     if hasattr(solver, attribute):
         return getattr(solver, attribute)
@@ -358,7 +361,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "keyed_rows":
         from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        patch = bool(solver._keyed_rows.patch)
+        patch = bool(solver.placement.keyed_rows.patch)
         # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the fallback
         # materializes the rows of every other world.
         kernels = (keyed_rows.scatter_contact_keys, keyed_rows.materialize_general_rows)
@@ -366,7 +369,7 @@ def _row_builder(solver, plan, size, source) -> dict:
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         produce = (compact_contact.produce_contacts,)
-        if size == solver._sparse_diagonal_response_size:
+        if size == solver.placement.sparse_diagonal_response_size:
             # The marker encodes schedule links into the freshly published sparse DOF slots.
             kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
         else:
@@ -375,7 +378,7 @@ def _row_builder(solver, plan, size, source) -> dict:
         kernels = (*prepare, solver._sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
         kernels = (*prepare, response_builds_rows.sparse_pair_contact_rows_kernel)
-        if solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units:
+        if solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units:
             kernels = (*kernels, solver._mark_independent_sparse_contact_candidates_kernel)
     elif method == "compact_jacobian":
         kernels = (*prepare, source.populate_world_J_for_compact_size)
@@ -395,7 +398,7 @@ def _contact_rows(solver, source) -> dict:
     methods = None
     if plan.producer == "general":
         methods = {str(int(size)): method for size, method in plan.methods.items()}
-    packets = solver._row_packets
+    packets = solver.placement.row_packets
     return {
         "producer": row.producer,
         "law": plan.law,
@@ -406,16 +409,16 @@ def _contact_rows(solver, source) -> dict:
         "point_contact_paths": point,
         "row_packets": {
             "enabled": row.producer == "local_packets",
-            "reason": solver._row_packets_reason,
+            "reason": solver.placement.row_packets_reason,
             "primary_dofs": None if packets is None else int(packets.primary),
             "secondary_dofs": None if packets is None else int(packets.secondary),
             "mimic_rows": None if packets is None else int(packets.mimics),
             "packets": None if packets is None else int(packets.packets),
         },
-        "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver._keyed_rows_reason},
+        "keyed_rows": {"enabled": row.producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
         "compact_contact": {
             "boundary": row.producer == "compact_contact_boundary",
-            "reason": solver._compact_contact_reason,
+            "reason": solver.placement.compact_contact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),
     }
@@ -480,10 +483,10 @@ def _sparse_diagonal(solver) -> dict:
         "enabled": row.case == "K2",
         "response_dofs": json_value(row.sizes["diagonal"]),
         "dense_dofs": int(row.sizes["dense"] or 0),
-        "contact_triples": bool(solver._sparse_diagonal_contact_triples),
-        "contact_units": bool(solver._sparse_diagonal_contact_units),
-        "speculative_contact_batches": bool(solver._sparse_diagonal_speculative_contact_batches),
-        "fused_joint_limits": bool(solver._fused_diagonal_joint_limits),
+        "contact_triples": bool(solver.placement.sparse_diagonal_contact_triples),
+        "contact_units": bool(solver.placement.sparse_diagonal_contact_units),
+        "speculative_contact_batches": bool(solver.placement.sparse_diagonal_speculative_contact_batches),
+        "fused_joint_limits": bool(solver.placement.fused_diagonal_joint_limits),
         "reason": row.reasons["K2"],
     }
 
@@ -522,10 +525,10 @@ def _sweep(solver) -> dict:
     solve = solver._plan.solve
     route, driver = solve.route.name, solve.driver.name
     # Only free rigid bodies produce matrix-free rows: the pack kernel is built where it launches.
-    packed = solver._pack_mf_meta_kernel is not None
+    packed = solver.placement.pack_mf_meta_kernel is not None
     mf_meta_pack = {
         "launched": packed,
-        "kernel": _key(solver._pack_mf_meta_kernel),
+        "kernel": _key(solver.placement.pack_mf_meta_kernel),
         "reason": "Free rigid-body rows pack their metadata each step."
         if packed
         else "Skipped: without free rigid bodies no matrix-free row exists.",
@@ -711,7 +714,7 @@ def _velocity_limits(solver) -> dict:
         "prescale_lanes": int(solver.laws.velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.options.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
-        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
+        # Mirrors Placement.allocate_free_body_rows and the row allocation of _stage4_build_rows (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
     }
@@ -802,14 +805,14 @@ def _dynamics(solver) -> dict:
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver.forest.diagonal_mass_sizes),
         # Response layout: whether J/Y are gathered per world or already world-indexed.
-        "jy_world_aliased": bool(solver._jy_world_aliased),
-        "hinv_jt_writes_world": bool(solver._hinv_jt_writes_world),
+        "jy_world_aliased": bool(solver.placement.jy_world_aliased),
+        "hinv_jt_writes_world": bool(solver.placement.hinv_jt_writes_world),
         # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step alone.
         "packed_rows": {
-            "support": int(solver._packed_support) if solver._mf_sweeps else None,
-            "dense": bool(solver._packed_dense),
-            "response_only": bool(solver._packed_response),
-            "reason": solver._packed_response_reason,
+            "support": int(solver.placement.packed_support) if solver.placement.mf_sweeps else None,
+            "dense": bool(solver.placement.packed_dense),
+            "response_only": bool(solver.placement.packed_response),
+            "reason": solver.placement.packed_response_reason,
         },
         "parallel_augmented_drive_topology": bool(solver.factor.parallel_drives),
         "double_buffer": bool(solver._double_buffer),

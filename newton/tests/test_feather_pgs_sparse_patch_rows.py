@@ -29,7 +29,7 @@ def _admission_probe(**changes):
     """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
     probe = SimpleNamespace(
         _route_pins={},
-        dense_max_constraints=256,
+        placement=SimpleNamespace(dense_max_constraints=256),
         forest=SimpleNamespace(max_world_dofs=18),
         laws=SimpleNamespace(friction_anchors_enabled=False),
     )
@@ -93,7 +93,10 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 self.subTest(dofs=dofs, rows=rows, environment=environment, slack=slack),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                probe = _admission_probe(forest=SimpleNamespace(max_world_dofs=dofs), dense_max_constraints=rows)
+                probe = _admission_probe(
+                    forest=SimpleNamespace(max_world_dofs=dofs),
+                    placement=SimpleNamespace(dense_max_constraints=rows),
+                )
                 staging = functools.partial(sweep_routes_sparse.sparse_staging, rows, dofs, dofs)
                 # A world past 16 DOFs or 64 rows never packs; its budget is moot.
                 packable = dofs <= 16 and rows <= 64
@@ -127,7 +130,9 @@ def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
         worlds = patches.previous_world.numpy()[:stored]
         anchors.append(np.bincount(worlds[valid], minlength=model.world_count))
         contact_counts.append(int(contacts.rigid_contact_count.numpy()[0]))
-        states.append((state.body_q.numpy().copy(), state.body_qd.numpy().copy(), solver.impulses.numpy().copy()))
+        states.append(
+            (state.body_q.numpy().copy(), state.body_qd.numpy().copy(), solver.placement.impulses.numpy().copy())
+        )
     return np.array(anchors), np.array(contact_counts), states
 
 
@@ -184,7 +189,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         for name, law in (("patch", {}), ("point", {"friction_anchor_beta": 0.0})):
             with self.subTest(law=name):
                 solver = SolverFeatherPGS(model, **law, **options)
-                self.assertEqual(solver._sparse_mass_matrix_size, 18)
+                self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 self.assertFalse(solver._sparse_active_rows)
                 self.assertIn("bitsets exceed shared memory", solver._sparse_active_rows_reason)
                 self.assertNotIn("_active", solver._pgs_solve_sparse_kernel.key)

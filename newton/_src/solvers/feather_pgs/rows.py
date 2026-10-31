@@ -213,7 +213,7 @@ class RowLaws:
 
         laws._joint_limit_tables(model)
         # Mimic/connect plans must exist before capacity selection so the row census
-        # counts their rows (see _estimate_dense_internal_rows_per_world).
+        # counts their rows (see Placement.internal_rows_per_world).
         laws._mimic_plan(model)
         laws._connect_plan(model)
         laws._contact_torsion(model, options)

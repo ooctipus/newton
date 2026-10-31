@@ -233,19 +233,19 @@ def _free_body_rows(run):
     A speed row's axis is the first DOF of the velocity it bounds: 0 for the linear, 3 for the angular.
     """
     solver = run.solver
-    count = solver.mf_constraint_count.numpy()
+    count = solver.placement.mf_constraint_count.numpy()
     rows = int(count.max())
     # A speed row keeps its axis unwhitened.
-    jacobian = solver.mf_Z_a.numpy()[:, :rows]
+    jacobian = solver.placement.mf_Z_a.numpy()[:, :rows]
     axis = np.argmax(np.abs(jacobian), axis=2)
     return SimpleNamespace(
         count=count,
-        type=solver.mf_row_type.numpy()[:, :rows],
+        type=solver.placement.mf_row_type.numpy()[:, :rows],
         axis=axis,
         sign=np.sign(np.take_along_axis(jacobian, axis[..., None], axis=2)[..., 0]),
-        rhs=solver.mf_rhs.numpy()[:, :rows],
-        eff_mass_inv=solver.mf_eff_mass_inv.numpy()[:, :rows],
-        impulses=solver.mf_impulses.numpy()[:, :rows],
+        rhs=solver.placement.mf_rhs.numpy()[:, :rows],
+        eff_mass_inv=solver.placement.mf_eff_mass_inv.numpy()[:, :rows],
+        impulses=solver.placement.mf_impulses.numpy()[:, :rows],
     )
 
 
@@ -310,7 +310,7 @@ class _FreeBodyVelocityLimitChecks:
                         np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
                     if fraction == 0.7:
                         # The activation gate reserved rows only for axes within 30% of their limit.
-                        self.assertGreater(int(run.solver.mf_constraint_count.numpy().sum()), 0)
+                        self.assertGreater(int(run.solver.placement.mf_constraint_count.numpy().sum()), 0)
 
     def test_step_clamps_speeds_past_the_limits(self):
         """Hold a free body launched or pushed past its limits on them, along its own direction.
@@ -414,7 +414,7 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
                 run = _free_boxes(self.device, world, **options)
                 self.assertEqual(run.solver._has_free_body_velocity_limit_rows, selected)
                 _step(run)
-                self.assertEqual(int(run.solver.mf_constraint_count.numpy().sum()) > 0, built)
+                self.assertEqual(int(run.solver.placement.mf_constraint_count.numpy().sum()) > 0, built)
 
 
 if __name__ == "__main__":

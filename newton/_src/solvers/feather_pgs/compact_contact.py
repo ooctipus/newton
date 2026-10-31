@@ -30,12 +30,12 @@ def supported(solver) -> bool:
     return bool(
         solver.model.device.is_cuda
         and solver.routes.case == "K2"
-        and solver._sparse_diagonal_dense_size == 6
-        and solver._sparse_diagonal_response_size > 6
-        and (solver._sparse_diagonal_contact_triples or solver._sparse_diagonal_contact_units)
-        and solver.dense_max_constraints >= 12
-        and 0 <= solver._dense_internal_max_rows <= 12
-        and solver._compact_diagonal_mass_size == solver._sparse_diagonal_response_size
+        and solver.placement.sparse_diagonal_dense_size == 6
+        and solver.placement.sparse_diagonal_response_size > 6
+        and (solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units)
+        and solver.placement.dense_max_constraints >= 12
+        and 0 <= solver.placement.dense_internal_max_rows <= 12
+        and solver._compact_diagonal_mass_size == solver.placement.sparse_diagonal_response_size
     )
 
 
@@ -109,18 +109,18 @@ def launch_contacts(solver, data, workers):
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
     boundary = field_group.bind(
         CompactBoundary,
-        solver=solver,
+        placement=solver.placement,
         forest=solver.forest,
         inverse_mass=solver.factor.diagonal_inverse_mass,
         factor=solver.factor.L_by_size[6],
-        Z=solver.J_by_size[6],
+        Z=solver.placement.J_by_size[6],
     )
     # Allocation has completed, but constraint_count is finalized later. Keep
     # this clear and the following producer ordered on the current stream.
     wp.launch(
         clear_contact_response,
         dim=(solver.forest.world_count, 256),
-        inputs=[solver.slot_counter, solver.dense_phase_bounds, boundary.dense_group, boundary.Z],
+        inputs=[solver.placement.slot_counter, solver.placement.dense_phase_bounds, boundary.dense_group, boundary.Z],
         block_dim=256,
         device=solver.model.device,
     )
@@ -131,7 +131,7 @@ def launch_contacts(solver, data, workers):
     # A thread per (contact, row); in a capture whose launches bind, each replay runs the live count. The rows
     # take their own axis: the contact axis is captured at the pool's bound, which a scalar thread index times 3
     # would overflow.
-    pool = solver._contact_pool
+    pool = solver.placement.contact_pool
     count = data.count
     rows = 4 if solver.laws.contact_torsion_enabled else 3
     pool.launch(
@@ -143,7 +143,7 @@ def launch_contacts(solver, data, workers):
         solver._mark_independent_sparse_contact_candidates_kernel,
         workers,
         inputs=[data, workers],
-        outputs=[solver._sparse_diagonal_row_dof],
+        outputs=[solver.placement.sparse_diagonal_row_dof],
         extent=count,
         clamp=True,
     )

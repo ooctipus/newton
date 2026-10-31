@@ -128,7 +128,7 @@ class StepPlan:
             unread_mass_sizes=tuple(solver.forest.size_groups) if held else (),
             jacobian_clear_sizes=()
             if row.producer in ("local_packets", "keyed_rows")
-            else tuple(size for size in solver.forest.size_groups if solver._memset_clears_jacobian(size)),
+            else tuple(size for size in solver.forest.size_groups if solver.placement.clears_jacobian(size)),
         )
 
     def sizes(self, stage: str, route: str) -> tuple[int, ...]:

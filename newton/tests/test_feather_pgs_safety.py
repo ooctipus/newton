@@ -27,7 +27,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
         with self.assertRaisesRegex(RuntimeError, "capacity"):
             solver.check_constraint_capacity()
-        self.assertTrue(solver.constraint_overflow.numpy()[0])
+        self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
         solver.reset(state_out)
         solver.check_constraint_capacity()
 

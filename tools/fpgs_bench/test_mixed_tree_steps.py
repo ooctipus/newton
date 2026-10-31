@@ -83,9 +83,9 @@ class TestMixedTreeSteps(unittest.TestCase):
             public_state(self, model, state)
             total = 0
             for prefix in ("", "mf_"):
-                counts = getattr(solver, prefix + "constraint_count").numpy()
-                impulses = getattr(solver, prefix + "impulses").numpy()
-                kinds = getattr(solver, prefix + "row_type").numpy()
+                counts = getattr(solver.placement, prefix + "constraint_count").numpy()
+                impulses = getattr(solver.placement, prefix + "impulses").numpy()
+                kinds = getattr(solver.placement, prefix + "row_type").numpy()
                 total += int(counts.sum())
                 for world, count in enumerate(counts):
                     active = impulses[world, :count]
@@ -198,13 +198,13 @@ class TestPatchMixedTreeSteps(TestMixedTreeSteps):
         assert_contact_impulses_close(rows[0], rows[1], atol=2e-5, rtol=0.0, load_rtol=5e-3)
         # The other rows by slot, at the patch history contract.
         reference, candidate = (case[1] for case in cases)
-        for world, count in enumerate(reference.constraint_count.numpy()):
-            kinds = reference.row_type.numpy()[world, :count]
+        for world, count in enumerate(reference.placement.constraint_count.numpy()):
+            kinds = reference.placement.row_type.numpy()[world, :count]
             other = (kinds != PGS_CONSTRAINT_TYPE_CONTACT) & (kinds != PGS_CONSTRAINT_TYPE_FRICTION)
-            np.testing.assert_array_equal(candidate.row_type.numpy()[world, :count][other], kinds[other])
+            np.testing.assert_array_equal(candidate.placement.row_type.numpy()[world, :count][other], kinds[other])
             np.testing.assert_allclose(
-                candidate.impulses.numpy()[world, :count][other],
-                reference.impulses.numpy()[world, :count][other],
+                candidate.placement.impulses.numpy()[world, :count][other],
+                reference.placement.impulses.numpy()[world, :count][other],
                 atol=2e-5,
                 rtol=7e-4,
             )

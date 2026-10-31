@@ -145,8 +145,8 @@ def install_collision_storage_overrides(harness, pipeline_type, report: dict, sa
 
 def legacy_row_status(solver, entry: dict) -> None:
     """Read the baseline's existing sticky row warnings without adding kernels."""
-    flags = solver._row_overflow_warning_emitted
-    if not solver.options.warn_constraint_overflow or not solver._track_row_capacity:
+    flags = solver.placement.row_overflow_warning_emitted
+    if not solver.options.warn_constraint_overflow or not solver.placement.track_row_capacity:
         raise RuntimeError("Legacy row warning recording must remain enabled")
     if flags is None or flags.shape != (3,) or flags.device.is_capturing:
         raise RuntimeError("Unexpected legacy sticky row warning storage")
@@ -154,7 +154,9 @@ def legacy_row_status(solver, entry: dict) -> None:
     if any(type(value) is not int or value not in (0, 1) for value in values):
         raise RuntimeError("Invalid legacy sticky row warning values")
     entry["flags"] = dict(zip(("dense", "matrix_free", "propagation"), map(bool, values), strict=True))
-    entry["capacities"] = {name: int(getattr(solver, name)) for name in ("dense_max_constraints", "mf_max_constraints")}
+    entry["capacities"] = {
+        name: int(getattr(solver.placement, name)) for name in ("dense_max_constraints", "mf_max_constraints")
+    }
     entry["capacity_coverage"] = "Existing sticky row warnings only; contacts checked separately at boundaries"
     entry["contact_law"] = {
         "friction_anchor_beta": float(solver.laws.friction_anchor_beta),
@@ -213,10 +215,10 @@ def legacy_collision_status(manager, result: dict) -> None:
     snapshot("contacts", contacts.rigid_contact_count, contacts.rigid_contact_max)
     result["contact_storage"] = {
         "contact_pool": int(contacts.rigid_contact_max),
-        "solver_scratch": int(solver._max_contacts_alloc),
+        "solver_scratch": int(solver.placement.max_contacts_alloc),
         "friction_patch": int(solver.laws.friction_patches.capacity),
     }
-    if min(solver._max_contacts_alloc, solver.laws.friction_patches.capacity) < contacts.rigid_contact_max:
+    if min(solver.placement.max_contacts_alloc, solver.laws.friction_patches.capacity) < contacts.rigid_contact_max:
         raise RuntimeError("Legacy contact pool exceeds solver or friction-patch storage")
     reducer = narrow.global_contact_reducer
     if reducer is not None:
@@ -343,13 +345,13 @@ def fused_contact_metadata(solver) -> dict:
         return result
     if active is not fusion:
         raise RuntimeError("Current fused contact owner differs from its configured owner")
-    arrays = (fusion.owner, solver.constraint_count, fusion.fallback_counts)
+    arrays = (fusion.owner, solver.placement.constraint_count, fusion.fallback_counts)
     if any(array.shape != (solver.forest.world_count,) or array.device.is_capturing for array in arrays):
         raise RuntimeError("Fused ownership must have one value per world and be read outside capture")
     owners, counts, fallback = (array.numpy().tolist() for array in arrays)
     if (
         any(type(value) is not int or value not in (0, 1) for value in owners)
-        or any(type(value) is not int or not 0 <= value <= solver.dense_max_constraints for value in counts)
+        or any(type(value) is not int or not 0 <= value <= solver.placement.dense_max_constraints for value in counts)
         or any(type(value) is not int for value in fallback)
         or fallback != [0 if owner else count for owner, count in zip(owners, counts, strict=True)]
     ):
@@ -379,7 +381,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
             raise RuntimeError("Checked FPGS capture resolved an unexpected solver")
         entry["solver_paths"] = {
             "grouped_response": bool(getattr(solver, "_grouped_response", False)),
-            "sparse_diagonal_contact_solve": bool(getattr(solver, "_sparse_diagonal_contact_solve", False)),
+            "sparse_diagonal_contact_solve": bool(getattr(solver.placement, "sparse_diagonal_contact_solve", False)),
         }
         read = getattr(solver, "constraint_capacity_status", None)
         check = getattr(solver, "check_constraint_capacity", None)
@@ -393,7 +395,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
             raise RuntimeError("Unrecognized FPGS capacity-status contract")
         entry["flags"] = flags
         entry["capacities"] = {
-            name: int(getattr(solver, name)) for name in ("dense_max_constraints", "mf_max_constraints")
+            name: int(getattr(solver.placement, name)) for name in ("dense_max_constraints", "mf_max_constraints")
         }
         # Execute the public checker, not merely a shadow interpretation of it.
         check()
