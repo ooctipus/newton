@@ -220,8 +220,8 @@ Preelim = field_group.struct(
 dropped) and its kept count, its Gram block and pivoted factor, and a projection's weights."""
 
 SPARSE_FACTOR = FieldGroup(
-    Field("_sparse_Linv", wp.float32, ("group", "nonzero")),
-    Field("_sparse_mass_matrix_status", wp.int32, ("group",)),
+    Field("sparse_Linv", wp.float32, ("group", "nonzero"), owner="factor"),
+    Field("sparse_mass_matrix_status", wp.int32, ("group",), owner="factor"),
 )
 """The native sparse factor's inverse entries and status, per articulation of the factored size."""
 

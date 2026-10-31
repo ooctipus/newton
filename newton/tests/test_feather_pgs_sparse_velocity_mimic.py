@@ -253,7 +253,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
                 reference = _case(False, offset, scale, error, friction_anchor_beta=beta)
                 candidate = _case(True, offset, scale, error, friction_anchor_beta=beta)
                 self.assertTrue(candidate[1]._sparse_velocity_limits)
-                self.assertFalse(candidate[1]._sparse_row_support.enabled)
+                self.assertFalse(candidate[1].placement.sparse_row_support.enabled)
                 self.assertEqual(candidate[1].laws.mimic_count, 2)
                 for step in range(4):
                     sparse_scene.step(reference)
@@ -283,13 +283,13 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
-        held = candidate[1]._sparse_Linv.numpy().copy()
+        held = candidate[1].factor.sparse_Linv.numpy().copy()
         for model, solver, state, *_ in (reference, candidate):
             solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
         for case in (reference, candidate):
             sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(candidate[1]._sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(candidate[1].factor.sparse_Linv.numpy()[1], held[1])
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
             sparse_scene.step(candidate)

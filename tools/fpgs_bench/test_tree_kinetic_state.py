@@ -85,10 +85,10 @@ def fixture(floating, device):
     count = model.joint_dof_count // 2
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver._sparse_mass_matrix_plan = mass
-    solver._sparse_mass_matrix_indices = factor_indices(mass, device)
-    solver._sparse_Linv = wp.zeros((2, mass.nonzero_count), dtype=float, device=device)
-    solver._sparse_mass_matrix_status = wp.zeros(2, dtype=int, device=device)
+    solver.factor.sparse_mass_matrix_plan = mass
+    solver.factor.sparse_mass_matrix_indices = factor_indices(mass, device)
+    solver.factor.sparse_Linv = wp.zeros((2, mass.nonzero_count), dtype=float, device=device)
+    solver.factor.sparse_mass_matrix_status = wp.zeros(2, dtype=int, device=device)
     solver._sparse_factor_warps_per_block = 4
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)
@@ -216,7 +216,7 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
                     wp.capture_launch(graph)
             for case in cases:
                 public_state(self, case[0], case[3])
-                np.testing.assert_array_equal(case[1]._sparse_mass_matrix_status.numpy(), 0)
+                np.testing.assert_array_equal(case[1].factor.sparse_mass_matrix_status.numpy(), 0)
             for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
                 np.testing.assert_allclose(
                     getattr(cases[1][3], field).numpy(), getattr(cases[0][3], field).numpy(), atol=4e-4, rtol=4e-4

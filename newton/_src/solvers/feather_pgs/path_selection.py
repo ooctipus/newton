@@ -500,14 +500,14 @@ def _sparse_mass_matrix(solver) -> dict:
         "velocity_limits": bool(solver._sparse_velocity_limits),
         "active_rows": bool(solver._sparse_active_rows),
         "active_rows_reason": solver._sparse_active_rows_reason,
-        "support_table": bool(solver._sparse_row_support.enabled),
+        "support_table": bool(solver.placement.sparse_row_support.enabled),
         "contact_triplets": bool(solver._sparse_contact_triplets),
         "contact_triplets_reason": solver._sparse_contact_triplets_reason,
     }
     if size is not None:
         record.update(
             {
-                "max_row_support": json_value(solver._sparse_max_row_support),
+                "max_row_support": json_value(solver.placement.sparse_max_row_support),
                 "solve_lanes": int(solver._sparse_solve_lanes),
                 "local_factors": bool(solver._sparse_local_factors),
                 "factor_warps_per_block": int(solver._sparse_factor_warps_per_block),

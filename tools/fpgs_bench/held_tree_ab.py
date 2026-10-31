@@ -332,8 +332,8 @@ class Recorder:
                 "damping": solver.factor.passive_joint_damping,
                 "kinematic_joint": solver.factor.kinematic_joint_mask,
             }
-            if getattr(solver, "_sparse_Linv", None) is not None:
-                arrays["sparse_Linv"] = solver._sparse_Linv
+            if getattr(solver.factor, "sparse_Linv", None) is not None:
+                arrays["sparse_Linv"] = solver.factor.sparse_Linv
             return arrays
 
         for step in range(steps):

@@ -136,7 +136,6 @@ from .solver_fields import (
     PREELIMINATION,
     SIZE_MASS,
     SPARSE_CONTACT_RECORDS,
-    SPARSE_FACTOR,
     SPARSE_ROWS,
     STAGE3_SNAPSHOTS,
     Connects,
@@ -151,7 +150,6 @@ from .sparse_contact import (
 )
 from .sparse_mass_matrix import (
     _SparseRowSupport,
-    factor_indices,
     row_supports,
 )
 from .staging import arch_budget, factor_budget
@@ -1690,7 +1688,7 @@ class SolverFeatherPGS(SolverBase):
         self.placement.sparse_mass_matrix_size = None
         self._sparse_velocity_limits = False
         self.placement.sparse_prepare_contacts = False
-        self._sparse_row_support = _SparseRowSupport()
+        self.placement.sparse_row_support = _SparseRowSupport()
         self._sparse_contact_triplets = False
         # Route details for get_path_selection(), set where the sparse owner is admitted.
         self._sparse_active_rows = False
@@ -1698,7 +1696,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_contact_triplets_reason = "Native sparse factors are not selected."
         # The admitted contact units' block records.
         self.placement.sparse_contact_records = None
-        self._sparse_max_row_support = None
+        self.placement.sparse_max_row_support = None
         # Case K1, a single tree.
         velocity_candidate = self.options.enable_joint_velocity_limits and not self.forest.has_free_rigid_bodies
         declined = (
@@ -1907,18 +1905,16 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_contact_triplets_reason = contact_triplets_reason
         self._sparse_solve_lanes = lanes
         self._sparse_local_factors = local_factors
-        self._sparse_max_row_support = int(max_support)
+        self.placement.sparse_max_row_support = int(max_support)
         self._sparse_velocity_limits = velocity_candidate
         # The sparse response kernel prepares the contact rows' metadata, CFM, bias and restitution.
         self.placement.sparse_prepare_contacts = True
         # The sparse producers overwrite every live value and retain factors by the mass mask.
         self._double_buffer = False
-        self._sparse_mass_matrix_plan = plan
-        self._sparse_mass_matrix_indices = factor_indices(plan, model.device)
-        self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
-        self._arrays.allocate(SPARSE_FACTOR, group=self.forest.n_arts_by_size[size], nonzero=plan.nonzero_count)
+        self.factor.allocate_sparse(plan, self.forest.n_arts_by_size[size])
+        self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         if use_support_table:
-            self._sparse_row_support = row_supports(
+            self.placement.sparse_row_support = row_supports(
                 support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
             )
         if contact_triplets:
@@ -2869,7 +2865,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 outputs=[
                     self.placement.sparse_factor_velocity_delta,
-                    self._sparse_row_support,
+                    self.placement.sparse_row_support,
                     *self._weight_operands(),
                     *self._material_operands(),
                     *self._solve_readout.operands(self._pgs_solve_sparse_kernel),
@@ -2881,8 +2877,8 @@ class SolverFeatherPGS(SolverBase):
                 "sparse",
                 self.v_out,
                 size=self.placement.sparse_mass_matrix_size,
-                indices=self._sparse_mass_matrix_indices,
-                Linv=self._sparse_Linv,
+                indices=self.factor.sparse_mass_matrix_indices,
+                Linv=self.factor.sparse_Linv,
                 delta=self.placement.sparse_factor_velocity_delta,
                 base=self.v_hat,
             )
@@ -3982,7 +3978,7 @@ class SolverFeatherPGS(SolverBase):
                     continue
                 n_arts = self.forest.n_arts_by_size[size]
                 if self._sparse_velocity_limits and size == self.placement.sparse_mass_matrix_size:
-                    indices = self._sparse_mass_matrix_indices
+                    indices = self.factor.sparse_mass_matrix_indices
                     wp.launch(
                         response_builds_rows.factor_mimic_rows_kernel,
                         dim=n_arts * 32,
@@ -4006,7 +4002,7 @@ class SolverFeatherPGS(SolverBase):
                             indices.ancestor_mask,
                             indices.inverse_permutation,
                             indices.lookup,
-                            self._sparse_Linv,
+                            self.factor.sparse_Linv,
                             self.v_hat,
                         ],
                         outputs=[
@@ -4128,7 +4124,7 @@ class SolverFeatherPGS(SolverBase):
                     continue
                 n_arts = self.forest.n_arts_by_size[size]
                 if size == self.placement.sparse_mass_matrix_size:
-                    indices = self._sparse_mass_matrix_indices
+                    indices = self.factor.sparse_mass_matrix_indices
                     wp.launch(
                         response_builds_rows.factor_limit_rows_kernel,
                         dim=n_arts * 32,
@@ -4141,14 +4137,14 @@ class SolverFeatherPGS(SolverBase):
                             indices.ancestor_mask,
                             indices.inverse_permutation,
                             indices.lookup,
-                            self._sparse_Linv,
+                            self.factor.sparse_Linv,
                             self.v_hat,
                         ],
                         outputs=[
                             self.placement.sparse_row_dof,
                             self.placement.sparse_row_factor,
                             self.placement.sparse_row_incident,
-                            self._sparse_row_support,
+                            self.placement.sparse_row_support,
                         ],
                         block_dim=128,
                         device=model.device,
@@ -4267,7 +4263,7 @@ class SolverFeatherPGS(SolverBase):
             for size in self.forest.size_groups:
                 n_arts = self.forest.n_arts_by_size[size]
                 if self._sparse_velocity_limits and size == self.placement.sparse_mass_matrix_size:
-                    indices = self._sparse_mass_matrix_indices
+                    indices = self.factor.sparse_mass_matrix_indices
                     wp.launch(
                         response_builds_rows.factor_velocity_limit_rows_kernel,
                         dim=n_arts * 32,
@@ -4283,7 +4279,7 @@ class SolverFeatherPGS(SolverBase):
                             indices.ancestor_mask,
                             indices.inverse_permutation,
                             indices.lookup,
-                            self._sparse_Linv,
+                            self.factor.sparse_Linv,
                             self.v_hat,
                         ],
                         outputs=[
@@ -4291,7 +4287,7 @@ class SolverFeatherPGS(SolverBase):
                             self.placement.sparse_row_dof,
                             self.placement.sparse_row_factor,
                             self.placement.sparse_row_incident,
-                            self._sparse_row_support,
+                            self.placement.sparse_row_support,
                         ],
                         block_dim=128,
                         device=model.device,
@@ -4406,7 +4402,7 @@ class SolverFeatherPGS(SolverBase):
                 for size in self.forest.size_groups:
                     method = plan.methods[size]
                     if method == "sparse_response":
-                        indices = self._sparse_mass_matrix_indices
+                        indices = self.factor.sparse_mass_matrix_indices
                         sparse_contact_workers = min(
                             contact_build_threads, contact_jacobian_workers * 32 // self._sparse_contact_lanes
                         )
@@ -4419,11 +4415,11 @@ class SolverFeatherPGS(SolverBase):
                                 self.forest.art_group_idx,
                                 self.forest.is_free_rigid,
                                 self.forest.articulation_world_dof_offset,
-                                self._sparse_body_dof_mask,
+                                self.placement.sparse_body_dof_mask,
                                 law,
                                 indices.permutation,
                                 indices.row_offsets,
-                                self._sparse_Linv,
+                                self.factor.sparse_Linv,
                                 self._sparse_free_factor_dummy,
                             ],
                             outputs=[
@@ -4435,7 +4431,7 @@ class SolverFeatherPGS(SolverBase):
                                 if self.placement.sparse_contact_records is None
                                 else self.placement.sparse_contact_records,
                                 self.placement.sparse_row_incident,
-                                self._sparse_row_support,
+                                self.placement.sparse_row_support,
                             ],
                             extent=count,
                             scale=self._sparse_contact_lanes,

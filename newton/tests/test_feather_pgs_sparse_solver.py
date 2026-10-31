@@ -177,7 +177,7 @@ def _over_budget_rows(model) -> int:
     staging = functools.partial(
         sweep_routes_sparse.sparse_staging,
         max_world_dofs=probe.forest.max_world_dofs,
-        max_row_dofs=probe._sparse_max_row_support,
+        max_row_dofs=probe.placement.sparse_max_row_support,
         active_rows=probe._sparse_active_rows,
         linked_rows=probe.laws.friction_anchors_enabled,
     )
@@ -238,8 +238,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         with mock.patch.dict(SolverFeatherPGS._route_pins, {"row_support": False}):
             explicit = _case(True)
         shared = _case(True)
-        self.assertFalse(explicit[1]._sparse_row_support.enabled)
-        self.assertTrue(shared[1]._sparse_row_support.enabled)
+        self.assertFalse(explicit[1].placement.sparse_row_support.enabled)
+        self.assertTrue(shared[1].placement.sparse_row_support.enabled)
         self.assertEqual(shared[1].placement.sparse_row_dof.shape, (1, 1, 1))
         for step in range(8):
             for case in (explicit, shared):
@@ -255,7 +255,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             self.assert_sparse_state(shared)
             counts = explicit[1].placement.constraint_count.numpy()
             np.testing.assert_array_equal(counts, shared[1].placement.constraint_count.numpy())
-            support = shared[1]._sparse_row_support
+            support = shared[1].placement.sparse_row_support
             classes, indices = support.row_class.numpy(), support.class_dof.numpy()
             for world, count in enumerate(counts):
                 np.testing.assert_array_equal(
@@ -300,7 +300,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         if ordinary is not None:
             self.assertIsNone(ordinary.cholesky_kernels_by_size[size])
             self.assertIsNone(ordinary.triangular_solve_kernels_by_size[size])
-        np.testing.assert_array_equal(solver._sparse_mass_matrix_status.numpy(), 0)
+        np.testing.assert_array_equal(solver.factor.sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.placement.constraint_overflow.numpy().any())
         for name in STATE_FIELDS:
             self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
@@ -328,10 +328,10 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
 
     def _sparse_rows_physical(self, solver, world, count):
         """Recover physical Jacobians independently from the stored inverse factors."""
-        plan = solver._sparse_mass_matrix_plan
+        plan = solver.factor.sparse_mass_matrix_plan
         size = plan.dof_count
         row_dof, values = solver.placement.sparse_row_dof.numpy(), solver.placement.sparse_row_factor.numpy()
-        shared = solver._sparse_row_support
+        shared = solver.placement.sparse_row_support
         if shared.enabled:
             row_dof = shared.class_dof.numpy()[shared.row_class.numpy()[world, :count]][None, :, :]
         z = np.zeros((count, solver.forest.max_world_dofs))
@@ -346,7 +346,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             if solver.forest.art_to_world.numpy()[art] != world:
                 continue
             inverse = np.zeros((size, size))
-            inverse[plan.entry_rows, plan.columns] = solver._sparse_Linv.numpy()[group]
+            inverse[plan.entry_rows, plan.columns] = solver.factor.sparse_Linv.numpy()[group]
             offset = int(solver.forest.articulation_world_dof_offset.numpy()[art])
             physical_j[:, offset + plan.permutation] = np.linalg.solve(inverse, z[:, offset : offset + size].T).T
         if solver.forest.has_free_rigid_bodies:
@@ -429,7 +429,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             sparse = _case(True, robot_count=2)
         self.assertFalse(sparse[1]._sparse_active_rows)
         self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
-        self.assertEqual(sparse[1]._sparse_Linv.shape[0], 4)
+        self.assertEqual(sparse[1].factor.sparse_Linv.shape[0], 4)
         self.assertEqual(sparse[1].forest.world_count, 2)
         contact_seen = False
         for _ in range(16):
@@ -477,7 +477,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assert_sparse_state(sparse)
         for case in (dense, sparse):
             _step(case)  # Step32 refreshes globally; step33 is a held-mass step.
-        held = sparse[1]._sparse_Linv.numpy().copy()
+        held = sparse[1].factor.sparse_Linv.numpy().copy()
         for model, solver, state, *_ in (dense, sparse):
             q = state.joint_q.numpy()
             q[2] += 0.02
@@ -487,7 +487,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for case in (dense, sparse):
             _step(case)
         np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(sparse[1]._sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(sparse[1].factor.sparse_Linv.numpy()[1], held[1])
         self.assert_states_close(dense[2], sparse[2])
         for model, solver, *_ in (dense, sparse):
             mass = model.body_mass.numpy()
@@ -497,7 +497,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for case in (dense, sparse):
             _step(case)
         np.testing.assert_array_equal(sparse[1].factor.mass_update_mask.numpy(), [1, 1])
-        self.assertFalse(np.array_equal(sparse[1]._sparse_Linv.numpy()[0], held[0]))
+        self.assertFalse(np.array_equal(sparse[1].factor.sparse_Linv.numpy()[0], held[0]))
         self.assert_states_close(dense[2], sparse[2])
         self.assert_sparse_state(sparse)
 

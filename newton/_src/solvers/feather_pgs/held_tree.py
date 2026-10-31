@@ -243,16 +243,16 @@ class TreeSparseOperator:
     def __init__(self, solver):
         self.solver = solver
         self.requires_body_velocity = True
-        mass = solver._sparse_mass_matrix_plan
+        mass = solver.factor.sparse_mass_matrix_plan
         n, device = mass.dof_count, solver.model.device
         self.host = operator_metadata(mass)
         self.plan = bind_operator_plan(solver, n, self.host)
         self.data = SparseData()
-        self.data.W = solver._sparse_Linv
+        self.data.W = solver.factor.sparse_Linv
         # The native factor publishes status instead of a second validity bit.
         # Initial and reset mass requests are consumed before any prediction.
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
-        self.data.status = solver._sparse_mass_matrix_status
+        self.data.status = solver.factor.sparse_mass_matrix_status
         self.refresh_kernel = sparse_factor_kernel(
             n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block
         )
@@ -272,9 +272,9 @@ class TreeSparseOperator:
                 s.factor.R_by_size[n],
                 s.factor.drive_row_by_dof,
                 s.factor.aug_row_K,
-                s._sparse_mass_matrix_indices,
+                s.factor.sparse_mass_matrix_indices,
             ],
-            outputs=[s._sparse_Linv, s._sparse_mass_matrix_status],
+            outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
             block_dim=32 * s._sparse_factor_warps_per_block,
             device=s.model.device,
         )

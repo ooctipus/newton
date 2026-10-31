@@ -51,8 +51,10 @@ from .solver_fields import (
     JOINT_FOREST,
     SIZE_FACTORS,
     SIZE_GROUPED_SOLVE,
+    SPARSE_FACTOR,
     STATE_AUX,
 )
+from .sparse_mass_matrix import factor_indices
 from .spatial_laws import drive_force, drive_stiffness
 from .tree_plan import TreePlan
 
@@ -409,6 +411,13 @@ class TreeFactor:
             _joint_dfs_end=forest.dfs_end,
             _joint_up_flags=forest.up_flags,
         )
+
+    def allocate_sparse(self, plan, articulations: int) -> None:
+        """The native sparse factor of ``articulations`` of one size: its pattern ``plan``, its device indices, its
+        inverse entries and its status."""
+        self.sparse_mass_matrix_plan = plan
+        self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
+        self._arrays.allocate(SPARSE_FACTOR, group=articulations, nonzero=plan.nonzero_count)
 
     def allocate_size_groups(self, placeholder_sizes) -> None:
         """Allocate each size group's factor L, armature R and dense-solve scratch; ``placeholder_sizes`` (the compact

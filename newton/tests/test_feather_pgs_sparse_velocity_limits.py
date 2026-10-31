@@ -350,7 +350,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             self.assertFalse(case[1].placement.constraint_overflow.numpy().any())
             for name in sparse_scene.STATE_FIELDS:
                 self.assertTrue(np.isfinite(getattr(case[2], name).numpy()).all(), name)
-        np.testing.assert_array_equal(candidate[1]._sparse_mass_matrix_status.numpy(), 0)
+        np.testing.assert_array_equal(candidate[1].factor.sparse_mass_matrix_status.numpy(), 0)
         if candidate[1].laws.friction_anchors_enabled:
             # Called unbound so that suites reusing this check (mimic rows) inherit it.
             TestSparseVelocityLimitPhysics._assert_patch(self, reference, candidate)
@@ -474,7 +474,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         self.assertTrue(candidate[1]._sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
-        held = candidate[1]._sparse_Linv.numpy().copy()
+        held = candidate[1].factor.sparse_Linv.numpy().copy()
         for model, solver, state, *_ in (reference, candidate):
             q = state.joint_q.numpy().copy()
             q[2] += 0.002
@@ -484,7 +484,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         for case in (reference, candidate):
             sparse_scene.step(case)
         np.testing.assert_array_equal(candidate[1].factor.mass_update_mask.numpy(), [1, 0])
-        np.testing.assert_array_equal(candidate[1]._sparse_Linv.numpy()[1], held[1])
+        np.testing.assert_array_equal(candidate[1].factor.sparse_Linv.numpy()[1], held[1])
         self._assert_state(reference, candidate)
         with wp.ScopedCapture("cuda:0") as capture:
             sparse_scene.step(candidate)

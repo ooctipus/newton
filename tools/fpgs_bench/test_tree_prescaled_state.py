@@ -136,7 +136,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         if epoch == 0:
                             solver.factor.mass_update_mask.fill_(1)
                             operator.refresh(solver.factor)
-                            held = solver._sparse_Linv.numpy().copy()
+                            held = solver.factor.sparse_Linv.numpy().copy()
                         owner.predict(state, solver.factor, control, motion, dt)
                     generation = owner.data.generation.numpy().copy()
                     if previous_generation is not None:
@@ -163,7 +163,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                                 actual_motion[start + 3 : start + 6], actual_motion[start : start + 3]
                             )
                     np.testing.assert_allclose(solver.v_hat.numpy(), velocity, atol=3e-5, rtol=3e-4)
-                    np.testing.assert_array_equal(solver._sparse_Linv.numpy(), held)
+                    np.testing.assert_array_equal(solver.factor.sparse_Linv.numpy(), held)
                     np.testing.assert_array_equal(state.joint_qd.numpy(), raw)
                     np.testing.assert_array_equal(owner.status.numpy(), 0)
                     if epoch == 0 and device.startswith("cuda"):
