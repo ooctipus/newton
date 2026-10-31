@@ -649,7 +649,7 @@ class TestTreePlanKinematicBodies(unittest.TestCase):
         self.assertEqual(layout.root_families, (0, 6))
         for world in range(2):
             _set_flag(model, box + 2 * world, DYNAMIC)
-        with self.assertRaisesRegex(ValueError, "A zero-family forest root must be a kinematic free body"):
+        with self.assertRaisesRegex(ValueError, "A zero-family forest tree must be a kinematic free body"):
             make_plan(model, _held_operator(model, [0, 2], [-1, -1], [6, 6], **forest), complete=False)
 
 

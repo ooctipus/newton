@@ -393,7 +393,7 @@ class Placement:
 
     def allocate_size_groups(self, *, double_buffered: bool) -> None:
         """Each size group's response and Jacobian (two sets where the memset stream clears them) and its diagonal."""
-        if not self.forest.size_groups:
+        if not self.model.articulation_count:
             self.dummy_hinv_diag = None
             self.J_bufs = None
             return

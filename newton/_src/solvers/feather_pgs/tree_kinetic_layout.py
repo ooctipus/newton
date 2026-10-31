@@ -45,7 +45,7 @@ class TreeLayout:
     shared_budget: int = STATIC_SHARED_BYTES
 
     def __post_init__(self):
-        if not (self.bodies >= 1 and self.dofs >= 1 and 0 <= self.max_depth < self.bodies):
+        if not (self.bodies >= 1 and self.dofs >= 0 and 0 <= self.max_depth < self.bodies):
             raise ValueError("Cached trees require bodies, coordinates and a depth below the bodies")
         if not self.root_coordinates:
             object.__setattr__(self, "root_coordinates", (self.root_dofs,))
@@ -76,7 +76,7 @@ class TreeLayout:
             raise ValueError("Cached trees require a complete factor-coordinate permutation")
         if not (self.dofs <= self.entries <= self.dofs * (self.dofs + 1) // 2):
             raise ValueError("Invalid packed lower operator size")
-        if not 1 <= self.inverse_width <= self.dofs:
+        if not min(1, self.dofs) <= self.inverse_width <= self.dofs:
             raise ValueError("Invalid inverse-column support width")
 
     @property

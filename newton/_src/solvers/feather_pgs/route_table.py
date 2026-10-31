@@ -115,7 +115,7 @@ _REQUIREMENTS = {
 
 CAPABILITIES = {
     # The held tree's evaluation of the dynamics, on either device (its topology fit is the held groups' own proof).
-    "held": ("no_connect", "no_loops", "no_debug_rows"),
+    "held": ("no_connect", "no_loops"),
     # The packed placement of a single tree: native sparse factors and their sweep.
     "packed": (
         "cuda",

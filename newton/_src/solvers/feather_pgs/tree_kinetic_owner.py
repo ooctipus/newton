@@ -703,11 +703,9 @@ class TreeKineticState:
         if not self.motion_velocity and velocity.ptr != raw.ptr:
             raise RuntimeError("Tree kinetic state excludes alternate prescaled predictor velocity")
 
-        def overlaps(array):
-            return velocity.ptr < array.ptr + array.capacity and array.ptr < velocity.ptr + velocity.capacity
-
-        if (velocity.ptr != raw.ptr and overlaps(raw)) or any(
-            overlaps(array) for array in (state.joint_q, state_aug.joint_qdd, self.solver.v_hat, self.solver.v_out)
+        if (velocity.ptr != raw.ptr and cached_state_binding.overlap(velocity, raw)) or any(
+            cached_state_binding.overlap(velocity, array)
+            for array in (state.joint_q, state_aug.joint_qdd, self.solver.v_hat, self.solver.v_out)
         ):
             raise RuntimeError("Tree kinetic motion velocity overlaps state coordinates or response outputs")
         return state.joint_q.ptr, raw.ptr, velocity.ptr

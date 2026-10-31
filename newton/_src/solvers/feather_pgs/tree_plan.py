@@ -169,7 +169,7 @@ def level_schedule(rows: np.ndarray, cols: np.ndarray, n: int) -> dict:
     for col in range(n):
         previous = cols[row_offsets[col] : row_offsets[col + 1] - 1]
         levels[col] = 0 if not previous.size else 1 + int(levels[previous].max())
-    level_count = int(levels.max()) + 1
+    level_count = int(levels.max(initial=-1)) + 1
     off = np.flatnonzero(rows != cols)
     entries = off[np.lexsort((rows[off], cols[off], levels[cols[off]]))]
     return {
@@ -511,8 +511,6 @@ class TreePlan:
         """The fill-free factor pattern of the joint-space inertia, of any size; its ``uint64`` masks hold at most 64
         coordinates (zero past that)."""
         n = self.dof_count
-        if n < 1:
-            raise ValueError("Factor patterns cover at least one coordinate")
         start = self.dof_start.astype(np.int64)
         # Leaf-first: the reverse depth-first order of the nodes, each node's coordinates reversed.
         permutation = np.concatenate(

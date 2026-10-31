@@ -119,8 +119,15 @@ class ForestPlan:
     """Response coordinate counts, descending."""
     n_arts_by_size: dict
     group_to_art: dict
-    """Each size group's articulations, ascending."""
+    """Each size group's articulations, by topology and ascending within one."""
     art_group_idx: wp.array | None
+    group_to_art_host: dict
+    """Each size group's articulations by group index, on the host."""
+    rest_articulations: np.ndarray
+    rest_topologies: np.ndarray
+    """The articulations without coordinates, equal trees side by side, and the bounds of each run."""
+    size_topologies: dict
+    """Each size group's ranges of equal trees: bounds into its group indices, one range for one topology."""
     """Each articulation's index in its size group (``-1`` without response)."""
     free_body_inertia_sizes: frozenset
     """Size groups of free bodies only (the composite inertia is the body's)."""
@@ -367,10 +374,33 @@ def _roots(plan, model, free_root):
     plan.has_root_free = bool(np.any(root_is_free != 0))
 
 
+def _by_topology(plan, model, arts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The articulations ``arts`` of a size group, ascending, with equal trees side by side (ascending among them),
+    and the bounds of each run of equal trees. A group of one topology keeps its order."""
+    first = model.articulation_start.numpy()[arts]
+    joints = plan.articulation_joint_end_host[arts] - first
+    ancestor, kinds = model.joint_ancestor.numpy(), model.joint_type.numpy()
+    dimensions = model.joint_dof_dim.numpy()
+    topology = np.zeros(arts.size, dtype=np.int64)
+    found = 0
+    for count in np.unique(joints):
+        members = np.flatnonzero(joints == count)
+        table = first[members, None] + np.arange(count)
+        parents = np.where(ancestor[table] >= 0, ancestor[table] - first[members, None], -1)
+        rows = np.concatenate((parents, kinds[table], dimensions[table].reshape(members.size, -1)), axis=1)
+        _, inverse = np.unique(rows, axis=0, return_inverse=True)
+        topology[members] = found + inverse.reshape(-1)
+        found += int(inverse.max()) + 1
+    return arts[np.argsort(topology, kind="stable")], host_index.offsets(np.bincount(topology), np.int64)
+
+
 def _size_groups(plan, model):
     """Response-size groups, without modifying physical topology."""
     plan.art_group_idx = None
     plan.group_to_art = {}
+    plan.group_to_art_host = {}
+    plan.size_topologies = {}
+    plan.rest_articulations, plan.rest_topologies = np.zeros(0, np.int32), np.zeros(1, np.int32)
     if not model.articulation_count or not model.joint_count:
         plan.size_groups = []
         plan.n_arts_by_size = {}
@@ -379,17 +409,20 @@ def _size_groups(plan, model):
         return
 
     response_dof_count = plan.response_dof_count
-    # Each size group holds its articulations in ascending order, the groups by descending size.
+    # Each size group holds its articulations by topology, ascending within one, the groups by descending size.
     negated_sizes, group = np.unique(-response_dof_count, return_inverse=True)
     bounds, order = host_index.group_by(group, negated_sizes.size)
-    rank = np.empty(order.size, dtype=np.int64)
-    rank[order] = host_index.segmented_rank(group[order])
-    art_group_idx = np.where(response_dof_count > 0, rank, -1).astype(np.int32)
-    group_to_art = {
-        int(-size): order[bounds[g] : bounds[g + 1]].astype(np.int32)
-        for g, size in enumerate(negated_sizes)
-        if size < 0
-    }
+    art_group_idx = np.full(response_dof_count.size, -1, dtype=np.int32)
+    group_to_art = {}
+    for g, size in enumerate(negated_sizes):
+        if size < 0:
+            arts, plan.size_topologies[int(-size)] = _by_topology(plan, model, order[bounds[g] : bounds[g + 1]])
+            art_group_idx[arts] = np.arange(arts.size)
+            group_to_art[int(-size)] = arts.astype(np.int32)
+    rest = np.flatnonzero(plan.articulation_dof_count_host == 0)
+    if rest.size:
+        plan.rest_articulations, plan.rest_topologies = _by_topology(plan, model, rest)
+    plan.group_to_art_host = group_to_art
     solve_sizes = list(group_to_art)
     plan.size_groups = solve_sizes
     plan.n_arts_by_size = {size: int(group_to_art[size].size) for size in solve_sizes}

@@ -63,8 +63,8 @@ class SparseData:
 def operator_metadata(mass, *, inverse_column_width=None):
     """Describe topology-derived factor coordinates for every cached tree adapter."""
     counts = np.diff(mass.column_offsets).astype(np.int32)
-    width = int(counts.max()) if inverse_column_width is None else inverse_column_width
-    if width < int(counts.max()):
+    width = int(counts.max(initial=0)) if inverse_column_width is None else inverse_column_width
+    if width < int(counts.max(initial=0)):
         raise ValueError("Inverse-column storage does not cover the factor topology")
     nodes = np.full((mass.dof_count, width), -1, np.int32)
     col, rank = host_index.expand(counts)

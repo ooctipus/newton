@@ -1123,9 +1123,8 @@ class SolverFeatherPGS(SolverBase):
         self._paired_factor_secondary_offsets_by_world = None
         if response_pair is not None:
             if self._paired_factor_coordinates:
-                response_dof_count = self.forest.response_dof_count
-                primary_arts = np.flatnonzero(response_dof_count == response_pair[0])
-                secondary_arts = np.flatnonzero(response_dof_count == response_pair[1])
+                primary_arts = self.forest.group_to_art_host[response_pair[0]]
+                secondary_arts = self.forest.group_to_art_host[response_pair[1]]
                 primary_groups = np.empty(self.forest.world_count, dtype=np.int32)
                 secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
                 primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
@@ -2101,7 +2100,7 @@ class SolverFeatherPGS(SolverBase):
         if self.forest.n_arts_by_size[size] != self.forest.world_count:
             return False
         articulation_world = self.forest.articulation_world
-        group_to_art = np.flatnonzero(self.forest.response_dof_count == size)
+        group_to_art = self.forest.group_to_art_host[size]
         expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
         return np.array_equal(articulation_world[group_to_art], expected_world)
 
@@ -2125,10 +2124,10 @@ class SolverFeatherPGS(SolverBase):
         responding = responding[order].tolist()
         response_by_world = [responding[world_bounds[w] : world_bounds[w + 1]] for w in range(self.forest.world_count)]
 
-        secondary_group_arts = np.flatnonzero(response_dofs == 6)
+        secondary_group_arts = self.forest.group_to_art_host[6]
         secondary_group_index = {int(art): group for group, art in enumerate(secondary_group_arts)}
         for primary_size in sorted(self._paired_response_candidate_sizes, reverse=True):
-            primary_arts = np.flatnonzero(response_dofs == primary_size)
+            primary_arts = self.forest.group_to_art_host.get(primary_size, ())
             if len(primary_arts) != self.forest.world_count:
                 continue
             paired_groups: list[int] = []
@@ -2209,7 +2208,7 @@ class SolverFeatherPGS(SolverBase):
         self.H_by_size = {}
         double_buffered = self._double_buffer and model.device.is_cuda
         self.placement.allocate_size_groups(double_buffered=double_buffered)
-        if not self.forest.size_groups:
+        if not model.articulation_count:
             self._H_bufs = None
             return
 
@@ -2933,6 +2932,8 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
             return
+        if not self.forest.max_world_dofs:
+            return  # No coordinate holds a row.
         mf_gs_kernel = self._pgs_solve_mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")
@@ -3263,7 +3264,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._eval_particle_forces(state_in, control, contacts)
 
-        if not model.joint_count:
+        if not model.articulation_count:
             self.integrate_particles(model, state_in, state_out, dt)
             self._step += 1
             return state_out

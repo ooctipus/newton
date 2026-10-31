@@ -36,12 +36,15 @@ def publication(solver, state_in, state_aug, state_out, dt):
     )
 
 
+def overlap(a, b) -> bool:
+    """Whether two arrays share bytes; an empty array shares none."""
+    return bool(a.capacity and b.capacity and a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity)
+
+
 def disjoint_states(state_in, state_out):
     """Check all generalized input/output byte ranges before any integration write."""
     return not any(
-        a.ptr < b.ptr + b.capacity and b.ptr < a.ptr + a.capacity
-        for a in (state_in.joint_q, state_in.joint_qd)
-        for b in (state_out.joint_q, state_out.joint_qd)
+        overlap(a, b) for a in (state_in.joint_q, state_in.joint_qd) for b in (state_out.joint_q, state_out.joint_qd)
     )
 
 

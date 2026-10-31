@@ -318,11 +318,11 @@ class TreeFactor:
             return
 
         dof_count = int(model.joint_dof_count)
-        # Every DOF must lie in exactly one articulation's DOF range.
+        # No DOF lies in two articulations' DOF ranges. A joint outside every articulation's lie in none.
         range_start = forest.articulation_dof_start_host.astype(np.int64)
         owner, local_dof = host_index.expand(forest.articulation_dof_count_host)
         owned_dof = range_start[owner] + local_dof
-        if np.any(np.bincount(owned_dof[owned_dof < dof_count], minlength=dof_count)[:dof_count] != 1):
+        if np.any(np.bincount(owned_dof[owned_dof < dof_count], minlength=dof_count)[:dof_count] > 1):
             return
 
         joint_type = model.joint_type.numpy()
@@ -340,9 +340,7 @@ class TreeFactor:
         supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
         # Each articulation's supported joint axes, in joint order, take its first max_dofs row slots.
         first_joint = articulation_start[: model.articulation_count]
-        articulation, position = host_index.expand(
-            np.maximum(articulation_start[1 : model.articulation_count + 1] - first_joint, 0)
-        )
+        articulation, position = host_index.expand(np.maximum(forest.articulation_joint_end_host - first_joint, 0))
         joint = first_joint[articulation] + position
         driven = np.isin(joint_type[joint], supported)
         articulation, joint = articulation[driven], joint[driven]
@@ -448,7 +446,7 @@ class TreeFactor:
             n_arts = self.forest.n_arts_by_size[size]
             R_np = np.zeros((n_arts, size), dtype=np.float32)
 
-            group_to_art_np = np.flatnonzero(self.forest.response_dof_count == size)
+            group_to_art_np = self.forest.group_to_art_host[size]
             for group_idx in range(n_arts):
                 art_idx = group_to_art_np[group_idx]
                 dof_start = art_dof_start_np[art_idx]

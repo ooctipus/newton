@@ -10,6 +10,16 @@ from .staging import static_budget
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
 
+FREE_JOINTS = (int(JointType.FREE), int(JointType.DISTANCE))
+"""The joints a root stands on with the free-root transport (the forest plan's root rule)."""
+
+
+def tree_joints(model):
+    """The joints of the articulations' trees (a mask) and their count per articulation: a joint outside every
+    articulation stays outside the plan."""
+    articulation = model.joint_articulation.numpy()
+    return articulation >= 0, np.bincount(articulation[articulation >= 0], minlength=model.articulation_count)
+
 
 def make_plan(model, operator, *, complete=True):
     """Check the tree, scalar laws and packed operator before allocating caches.
@@ -17,10 +27,9 @@ def make_plan(model, operator, *, complete=True):
     Returns the group's layout, its lanes left to the owner's launch rule, and its template tree's parents.
     """
     worlds, arts = int(model.world_count), int(model.articulation_count)
-    if worlds < 1 or arts < 1 or model.joint_count != model.body_count:
-        raise ValueError("Cached trees require complete articulation and body ownership")
-    if model.particle_count:
-        raise ValueError("Cached trees exclude particles")
+    owned, counts_by_art = tree_joints(model)
+    if worlds < 1 or arts < 1:
+        raise ValueError("Cached trees require articulations")
     starts = model.articulation_start.numpy()
     group = operator.plan.group_to_art.numpy()
     art_world = operator.plan.art_to_world.numpy()
@@ -34,7 +43,6 @@ def make_plan(model, operator, *, complete=True):
         raise ValueError("Cached tree groups require distinct valid articulation IDs")
     if complete and not np.array_equal(np.sort(group), np.arange(arts)):
         raise ValueError("Cached tree groups must cover every articulation exactly once")
-    counts_by_art = np.diff(starts)
     # A forest group owns several consecutive articulations of one world; the
     # operator names them and the group map holds the first of each.
     forest = getattr(operator, "forest_arts", None)
@@ -42,7 +50,7 @@ def make_plan(model, operator, *, complete=True):
     if forest is not None:
         if forest.ndim != 2 or forest.shape[0] != len(group) or not np.array_equal(forest[:, 0], group):
             raise ValueError("Cached forest groups must start at their group articulation")
-        if np.any(starts[forest[:, 1:]] != starts[forest[:, :-1] + 1]):
+        if np.any(starts[forest[:, 1:]] != starts[forest[:, :-1]] + counts_by_art[forest[:, :-1]]):
             raise ValueError("Cached forest articulations must be consecutive")
         bodies = int(np.sum(counts_by_art[forest[0]]))
         if np.any(np.sum(counts_by_art[forest], axis=1) != bodies) or np.any(
@@ -59,13 +67,11 @@ def make_plan(model, operator, *, complete=True):
     qd = model.joint_qd_start.numpy()
     counts = np.diff(qd)[joints]
     dofs = int(counts[0].sum())
-    if dofs < 1:
-        raise ValueError("Cached trees require coordinates")
     if art_world.shape != (arts,) or np.any(art_world < 0) or np.any(art_world >= worlds):
         raise ValueError("Cached tree articulations require valid world ownership")
     child = model.joint_child.numpy()
-    if not np.array_equal(np.sort(child), np.arange(model.body_count)):
-        raise ValueError("Cached tree publication requires every body exactly once")
+    if np.unique(child[owned]).size != np.count_nonzero(owned):
+        raise ValueError("Cached tree publication requires each body at most once")
     ancestors = model.joint_ancestor.numpy()[joints]
     local = np.where(ancestors >= 0, ancestors - starts[group, None], -1)
     parent = local[0].astype(np.int32)
@@ -81,29 +87,13 @@ def make_plan(model, operator, *, complete=True):
     types = model.joint_type.numpy()[joints]
     if not np.all(types == types[0]):
         raise ValueError("Cached trees require one uniform parent-first topology")
-    # Descendants may carry one or several coordinates: the motion scan stores
+    # Every joint may carry one or several coordinates: the motion scan stores
     # one axis per coordinate through joint_motion and the integrator handles
     # every joint type; the mass plan takes per-body coordinate counts. A root
     # stands on a free joint, on no coordinates (fixed or a locked D6), or on
     # a joint with coordinates that the stages treat as a descendant's.
-    descendants = (
-        int(JointType.FIXED),
-        int(JointType.REVOLUTE),
-        int(JointType.PRISMATIC),
-        int(JointType.D6),
-        int(JointType.BALL),
-    )
-    root_coordinates, free_roots = [], []
-    for root in root_locals:
-        kind = int(types[0, root])
-        if kind != int(JointType.FREE) and kind not in descendants:
-            raise ValueError("Cached trees require a free root or a root joint the per-node laws hold")
-        root_coordinates.append(int(counts[0, root]))
-        free_roots.append(kind == int(JointType.FREE))
-    non_root = np.ones(bodies, bool)
-    non_root[list(root_locals)] = False
-    if not np.all(np.isin(types[:, non_root], descendants)):
-        raise ValueError("Cached trees require fixed, scalar, D6 or ball descendant joints")
+    root_coordinates = [int(counts[0, root]) for root in root_locals]
+    free_roots = [int(types[0, root]) in FREE_JOINTS for root in root_locals]
     linear, angular = model.joint_dof_dim.numpy()[joints[0]].T
     own_bias = bool(np.any((types[0] == int(JointType.D6)) & (((linear > 0) & (angular > 0)) | (angular > 1))))
     if not np.all(counts == counts[0]) or not np.all(
@@ -124,9 +114,10 @@ def make_plan(model, operator, *, complete=True):
             raise ValueError("Prescribed cached roots must be single kinematic free bodies")
     elif forest is not None:
         families = np.asarray(operator.root_families, np.int64)
+        tree_ends = (*root_locals[1:], bodies)
         for r, root in enumerate(root_locals):
-            if families[r] == 0 and not np.all(kinematic[:, root]):
-                raise ValueError("A zero-family forest root must be a kinematic free body")
+            if families[r] == 0 and np.any(counts[0, root : tree_ends[r]]) and not np.all(kinematic[:, root]):
+                raise ValueError("A zero-family forest tree must be a kinematic free body or hold no coordinates")
             # Construction places the forest's held families on dynamic roots
             # only. A root made kinematic later keeps the built forest, which
             # serves it as above, although a new plan would refuse it here.

@@ -15,6 +15,7 @@
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -140,7 +141,9 @@ class _Stages:
     def __init__(self, model):
         from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
 
-        self.solver = SolverFeatherPGS(model)
+        # These are the ordinary route's stages: these trees are held by default.
+        with mock.patch.dict(SolverFeatherPGS._route_pins, {"evaluator": "ordinary"}):
+            self.solver = SolverFeatherPGS(model)
         self.state, self.out = model.state(), model.state()
 
     def mass_matrices(self) -> list:
