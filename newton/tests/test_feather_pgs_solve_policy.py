@@ -305,14 +305,14 @@ class TestSolvePolicy(unittest.TestCase):
                 self.assertEqual(body.count("if (sweep_stop) break;"), 1)
 
     def test_sweep_exit_stops_a_quiet_sweep_and_records_it(self):
-        """Stop once the gate is open and the sweep was quiet; a readout records the solve at its one exit."""
-        plain = sweep_exit(DEFAULT_POLICY, quiet="done", gate="open")
+        """Stop once the sweep was quiet; a readout records the solve at its one exit."""
+        plain = sweep_exit(DEFAULT_POLICY, quiet="done")
         self.assertEqual(
             plain,
-            "        {\n            const bool sweep_stop = open && done;\n            if (sweep_stop) break;\n        }\n",
+            "        {\n            const bool sweep_stop = done;\n            if (sweep_stop) break;\n        }\n",
         )
-        counted = sweep_exit(SWEEPS, quiet="done", gate="open", world="w", iteration="k", iterations="n", lane="l")
-        self.assertIn("const bool sweep_stop = open && done;", counted)
+        counted = sweep_exit(SWEEPS, quiet="done", world="w", iteration="k", iterations="n", lane="l")
+        self.assertIn("const bool sweep_stop = done;", counted)
         self.assertIn("if (l == 0 && (sweep_stop || k + 1 == n))", counted)
         self.assertIn("solve_readout_sweeps(w, k + 1, sweep_stop);", counted)
         bounded = sweep_exit(DEFAULT_POLICY, quiet="done", violation=("scan();", "loud", "value", "kind"))

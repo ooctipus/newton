@@ -18,7 +18,7 @@ from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 
-_SWEEP_CASES = ((0, 0, 1.0), (3, 1, 0.7), (3, 4, 1.2))
+_SWEEP_OMEGAS = (1.0, 0.7, 1.2)
 
 
 def _ring(parents, first):
@@ -41,8 +41,6 @@ def _sweep(
     mu,
     impulses,
     *,
-    friction_start=0,
-    iteration_offset=0,
     omega=1.0,
     active_rows=False,
     linked_rows=False,
@@ -65,7 +63,7 @@ def _sweep(
         and omega >= 0
         and (linked_rows or not np.any((types == PGS_CONSTRAINT_TYPE_CONTACT) & (parents >= 0)))
     )
-    for iteration in range(iterations):
+    for _ in range(iterations):
         selected = np.ones(len(types), dtype=bool)
         if active_rows:
             unilateral = np.isin(types, (PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
@@ -75,9 +73,6 @@ def _sweep(
                 ring = _ring(parents, parent) if linked_rows else [parent]
                 selected[row] = np.any(selected[ring]) or np.any(impulses[parent + 1 : parent + 3] != 0)
         for row, kind in enumerate(types):
-            if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + iteration < friction_start:
-                impulses[row] = 0.0
-                continue
             if not selected[row]:
                 continue
             if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parents[row] + 1:
@@ -268,14 +263,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     def test_factor_sweeps_match_physical_sweeps(self):
         """Preserve joint limits, pooled friction loads and seeded-impulse semantics."""
-        for seeded, (friction_start, iteration_offset, omega) in product((False, True), _SWEEP_CASES):
-            with self.subTest(
-                seeded=seeded, friction_start=friction_start, iteration_offset=iteration_offset, omega=omega
-            ):
+        for seeded, omega in product((False, True), _SWEEP_OMEGAS):
+            with self.subTest(seeded=seeded, omega=omega):
                 factor, _, rows, initial, bias, types, parents, mu, impulses, jacobian, response, incident, diag = (
                     _problem(seeded=seeded)
                 )
-                settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
+                settings = {"omega": omega}
                 expected, expected_impulses = _sweep(
                     jacobian, response, initial, bias, diag, types, parents, mu, impulses, **settings
                 )
@@ -335,7 +328,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
         Random patch rows interleave one-row normals and three-row anchor units in
         rings of one to four normals (self-loops and unlinked normals included),
-        with zero and seeded impulses, delayed friction and relaxation. Selecting a
+        with zero and seeded impulses and relaxation. Selecting a
         pair while any normal of its ring is selected, or while it holds impulse,
         equals visiting every pair. The rows include pairs whose own normal is
         unselected at sweep entry while another normal of its ring is selected, so
@@ -345,8 +338,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         ring_loaded = 0
         for case in range(120):
             rows, bias, diagonal, types, parents, mu, impulses = _patch_problem(rng)
-            friction_start, iteration_offset, omega = _SWEEP_CASES[case % len(_SWEEP_CASES)]
-            settings = {"friction_start": friction_start, "iteration_offset": iteration_offset, "omega": omega}
+            settings = {"omega": _SWEEP_OMEGAS[case % len(_SWEEP_OMEGAS)]}
             args = (rows, rows, np.zeros(rows.shape[1]), bias, diagonal, types, parents, mu, impulses)
             with self.subTest(case=case):
                 selected = _sweep(*args, active_rows=True, linked_rows=True, **settings)
@@ -371,19 +363,18 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         deferred = 0
         for case in range(60):
             rows, bias, diagonal, types, parents, mu, impulses = _patch_problem(rng)
-            friction_start, iteration_offset, omega = _SWEEP_CASES[case % len(_SWEEP_CASES)]
-            settings = {"friction_start": friction_start, "omega": omega}
+            settings = {"omega": _SWEEP_OMEGAS[case % len(_SWEEP_OMEGAS)]}
             velocity, steps, deferrals = np.zeros(rows.shape[1]), impulses, 0
-            for sweep in range(8):
+            for _ in range(8):
                 args = (rows, rows, velocity, bias, diagonal, types, parents, mu, steps)
-                once = {**settings, "iteration_offset": iteration_offset + sweep, "iterations": 1}
+                once = {**settings, "iterations": 1}
                 full = _sweep(*args, **once)
                 lazy = _sweep(*args, active_rows=True, linked_rows=True, **once)
                 deferrals += not (np.array_equal(full[0], lazy[0]) and np.array_equal(full[1], lazy[1]))
                 velocity, steps = full
             args = (rows, rows, np.zeros(rows.shape[1]), bias, diagonal, types, parents, mu, impulses)
-            full = _sweep(*args, iteration_offset=iteration_offset, **settings)
-            lazy = _sweep(*args, iteration_offset=iteration_offset, active_rows=True, linked_rows=True, **settings)
+            full = _sweep(*args, **settings)
+            lazy = _sweep(*args, active_rows=True, linked_rows=True, **settings)
             same = np.array_equal(full[0], lazy[0]) and np.array_equal(full[1], lazy[1])
             with self.subTest(case=case, deferrals=deferrals):
                 self.assertEqual(same, deferrals == 0)
@@ -393,7 +384,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_active_sweeps_match_reference(self):
-        """Match independent eligibility, seeded retraction, delayed friction and linked fallback."""
+        """Match independent eligibility, seeded retraction and linked fallback."""
         self._check_cuda_sparse_sweeps(active_rows=True)
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
@@ -404,7 +395,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_subwarp_sweeps_match_reference(self):
-        """Preserve linked friction, seeded retraction and delayed contact updates."""
+        """Preserve linked friction and seeded retraction."""
         for lanes in (8, 16):
             self._check_cuda_sparse_sweeps(active_rows=False, use_support_table=True, lanes_per_world=lanes)
             self._check_cuda_sparse_sweeps(
@@ -413,7 +404,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_linked_active_sweeps_match_reference(self):
-        """Select patch rings at sweep entry with seeded impulses, delayed friction, word-crossing rings and replay.
+        """Select patch rings at sweep entry with seeded impulses, word-crossing rings and replay.
 
         Rings loaded only through their third or their sixth member catch a ring walk, in
         the pair selection or in its pooled load, that stops after up to five members.
@@ -439,17 +430,15 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                 continue
             if use_support_table and dofs > 64:
                 continue
-            settings = product((False, True), _SWEEP_CASES) if contact_activity is None else [(False, (0, 0, 1.0))]
+            settings = product((False, True), _SWEEP_OMEGAS) if contact_activity is None else [(False, 1.0)]
             if contact_activity == "negative_omega":
-                settings = [(False, (0, 0, -0.5))]
-            for seeded, (friction_start, iteration_offset, omega) in settings:
+                settings = [(False, -0.5)]
+            for seeded, omega in settings:
                 with self.subTest(
                     dofs=dofs,
                     support=support,
                     contact_activity=contact_activity,
                     seeded=seeded,
-                    friction_start=friction_start,
-                    iteration_offset=iteration_offset,
                     omega=omega,
                 ):
                     _, indices, rows, initial, bias, types, parents, mu, impulses, _, _, incident, diag = _problem(
@@ -477,8 +466,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         parents,
                         mu,
                         impulses,
-                        friction_start=friction_start,
-                        iteration_offset=iteration_offset,
                         omega=omega,
                         active_rows=active_rows,
                         linked_rows=linked_rows,
@@ -559,8 +546,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             wp.zeros((worlds, 1), device=device),
                             8,
                             omega,
-                            friction_start,
-                            iteration_offset,
                         ],
                         "outputs": [delta, row_support],
                         "block_dim": 64,

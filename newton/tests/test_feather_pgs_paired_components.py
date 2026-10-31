@@ -242,22 +242,18 @@ class TestPairedComponentsCUDA(unittest.TestCase):
             np.testing.assert_array_equal(gpu.mf_counts.numpy(), mf_counts)
 
     def test_same_input_mixed_sweeps_and_component_publication(self):
-        """Compare the mixed fallback against the split owners, including delayed friction."""
+        """Compare the mixed fallback against the split owners."""
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("the sweep control requires CUDA")
         device = devices[0]
-        for iterations, friction_start in ((1, 0), (8, 0), (8, 2)):
-            with self.subTest(iterations=iterations, friction_start=friction_start):
+        for iterations in (1, 8):
+            with self.subTest(iterations=iterations):
                 baseline, old = solve_fixture(device)
                 candidate, new = solve_fixture(device)
                 immutable = {name: getattr(candidate, name).numpy() for name in ("counts", "mf_counts", "J", "mf_meta")}
-                launch_solve_pair(
-                    baseline, old, enabled=False, device=device, iterations=iterations, friction_start=friction_start
-                )
-                launch_solve_pair(
-                    candidate, new, enabled=True, device=device, iterations=iterations, friction_start=friction_start
-                )
+                launch_solve_pair(baseline, old, enabled=False, device=device, iterations=iterations)
+                launch_solve_pair(candidate, new, enabled=True, device=device, iterations=iterations)
                 np.testing.assert_array_equal(candidate.selector.numpy(), [-1, -1, 3, 0, -1])
                 for name in ("v_out", "world_impulses", "mf_impulses"):
                     np.testing.assert_allclose(new[name].numpy(), old[name].numpy(), rtol=2e-5, atol=3e-6, err_msg=name)

@@ -101,7 +101,6 @@ def parallel_sweep_reference(
     tol,
     linked,
     omega=1.0,
-    friction_start=0,
     pair_step="isotropic",
     velocity_limit_pass=False,
 ):
@@ -152,15 +151,13 @@ def parallel_sweep_reference(
                 step[row] = step[sibling] = min(positive)
     b = case["rhs"] + J @ v - A @ lam0
     x, y, t = lam0.copy(), lam0.copy(), 1.0
-    for sweep in range(sweeps):
+    for _ in range(sweeps):
         residual = b + A @ y
         stepped = x.copy()
         for row in np.flatnonzero(admitted):
             value = y[row] - step[row] * residual[row]
             if kinds[row] == 0:
                 value = max(value, 0.0)
-            elif kinds[row] == 1 and sweep < friction_start:
-                value = 0.0
             stepped[row] = value
         projected = stepped.copy()
         for row in np.flatnonzero(kinds == 1):
@@ -178,7 +175,7 @@ def parallel_sweep_reference(
         t = t_next
         changed = np.any(np.abs(projected - x) > tol * (np.abs(projected) + tol))
         x, y = projected, projected + beta * (projected - x)
-        if sweep >= friction_start and not changed:
+        if not changed:
             break
     if velocity_limit_pass:
         x = x.copy()

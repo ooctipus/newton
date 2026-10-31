@@ -20,13 +20,6 @@ def _finite_nonnegative(value: float) -> bool:
 
 # Each numeric option's type and admissible values: (name, type, admits, requirement, append the given value).
 _NUMBER_RULES = (
-    (
-        "contact_friction_position_iterations",
-        int,
-        lambda value: value >= -1,
-        "must be -1 for all position iterations, or a non-negative last-N iteration count",
-        False,
-    ),
     ("contact_speculative_scale", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("same_articulation_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
@@ -75,7 +68,6 @@ class Options:
     update_mass_matrix_interval: Any
     enable_contact_friction: Any
     contact_friction_gap_threshold: Any
-    contact_friction_position_iterations: int
     enable_joint_limits: Any
     enable_bilateral_preelimination: bool
     joint_limit_activation_gap: float

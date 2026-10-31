@@ -45,7 +45,6 @@ from .sweep import (
     admit_pair,
     contact_unit,
     end_sweep,
-    friction_gate,
     friction_radius,
     indent,
     material_arguments,
@@ -93,8 +92,6 @@ LOCAL_ABI = kernel_template.params(
     ("mf_row_w", wp.array2d[float]),
     ("iterations", int),
     ("omega", float),
-    ("friction_start_iteration", int),
-    ("iteration_offset", int),
     ("world_diag", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
     ("v_out", wp.array[float]),
@@ -370,7 +367,6 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
         "    if (s_active[i] == 0) continue;",
         "    const int row_type = s_type[i];",
         f"    if (row_type == {TORSION}) continue;" if torsion else "",
-        friction_gate("row_type", ctx.store("i", "0.0f"), ctx.sync(), "    ") if contacts else "",
         "    const float inverse_diagonal = s_inv_diag[i];",
         "    if (inverse_diagonal <= 0.0f) continue;",
         admit_pair("row_type", "s_parent[i]", "    ", torsion=torsion) if contacts else "",
@@ -415,7 +411,6 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             "    const int packed_tp = meta.w;",
             "    const int mf_rt = packed_tp & 0xFFFF;",
             f"    if (mf_rt == {TORSION}) continue;" if torsion else "",
-            friction_gate("mf_rt", free_ctx.store("i", "0.0f"), free_ctx.sync(), "    "),
             "    if (mf_inverse <= 0.0f) continue;",
             admit_pair("mf_rt", _mf_parent_expression("packed_tp", MFS), "    ", torsion=torsion),
             friction_radius(
@@ -432,13 +427,8 @@ def _local_sweeps(op: LocalBlock, laws: RowLaws, lanes: Lanes, R: int, MFS: int,
             "}",
         ]
     rows = "\n".join(line for line in (*dense, *free) if line)
-    head = ["    for (int iteration = 0; iteration < iterations; ++iteration) {"]
-    if contacts:
-        head.append("        const int global_iter = iteration_offset + iteration;")
-    head.append("        int iteration_changed = 0;")
-    return "\n".join(
-        [*head, indent(rows, "        "), end_sweep(laws.policy, iteration="iteration", gated=contacts) + "    }"]
-    )
+    head = ["    for (int iteration = 0; iteration < iterations; ++iteration) {", "        int iteration_changed = 0;"]
+    return "\n".join([*head, indent(rows, "        "), end_sweep(laws.policy, iteration="iteration") + "    }"])
 
 
 @cache
@@ -531,8 +521,6 @@ PAIRED_FACTOR_ABI = kernel_template.params(
     ("secondary_offset_by_world", wp.array[int]),
     ("iterations", int),
     ("omega", float),
-    ("friction_start_iteration", int),
-    ("iteration_offset", int),
     ("v_out", wp.array[float]),
 )
 """The paired factor sweep's native ABI: one world per warp, two per block (``tiles(2, 32)``)."""
@@ -679,7 +667,6 @@ def paired_factor_source(
     SYNC();
 
     for (int iter = 0; iter < iterations; ++iter) {{
-        const int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 {indent(schedule, "        ")}
 {end_sweep(solve_policy, iteration="iter")}    }}
@@ -743,8 +730,7 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
     on :class:`_UnitFactorRows` on the impulses its test loaded and applies their changes in one pass, after which the
     lanes synchronize once (:func:`.sweep.contact_unit`). An unloaded one visits its rows as the row-by-row
     sweep does: the normal on its own ladder (:func:`_unit_row`), then its pair on the pair's own (:func:`_pair_unit`),
-    only on a nonzero disk, so a unit that stays inactive reduces the normal's terms alone. The second tangent is only
-    zeroed while friction is delayed.
+    only on a nonzero disk, so a unit that stays inactive reduces the normal's terms alone.
     """
     op = ctx.operator
     velocity = op.velocity
@@ -813,9 +799,6 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
             "    if (unit_dn != 0.0f || unit_dt1 != 0.0f || unit_dt2 != 0.0f)",
             f"        {velocity} += (row_z * unit_dn + tangent1_z * unit_dt1) + tangent2_z * unit_dt2;",
         ]
-    gate = ctx.store("head + 2", "0.0f")
-    if torsion:
-        gate = ctx.lanes.first("{ s_lam[head + 2] = 0.0f; s_lam[head + 3] = 0.0f; }")
     lines += [
         f"    {ctx.lanes.sync()}",
         "} else {",
@@ -823,7 +806,6 @@ def _contact_unit(ctx: RowContext, laws: RowLaws, kind: str, mu: str) -> str:
         indent(_unit_row(ctx, laws, kind, load=False), "    "),
         indent(_pair_unit(ctx, laws, mu, spin_mu), "    "),
         "}",
-        friction_gate(str(FRICTION), gate, ctx.sync(), "", skip=False),
     ]
     return "\n".join(lines)
 
@@ -844,13 +826,10 @@ def _pair_unit(ctx: RowContext, laws: RowLaws, mu: str, spin_mu: str) -> str:
         parent="i",
         inline_velocity_limit=False,
     )
-    zero = "{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; }"
     spin = {}
     if laws.torsion:
-        zero = "{ s_lam[tangent1] = 0.0f; s_lam[tangent1 + 1] = 0.0f; s_lam[tangent1 + 2] = 0.0f; }"
         spin = {"load_spin": "s_lam[tangent1 + 2]"}
     lines = [
-        friction_gate(str(FRICTION), ctx.lanes.first(zero), ctx.sync(), ""),
         "float radius = 0.0f, load = 0.0f;" if laws.torsion else "float radius = 0.0f;",
         pair_radius(ctx.ring_load("i"), mu, "s_lam[tangent1]", "s_lam[tangent1 + 1]", "", **spin),
         pair_update(pair, laws, pad=""),
@@ -895,17 +874,14 @@ def _paired_units(ctx: RowContext, laws: RowLaws) -> str:
     """Contact units in slot order: a row by the row law, or, with the tangent pair it owns, a contact unit.
 
     A row owns the next two rows when they are tangent rows naming it as parent (and, under torsion, the spin row
-    after them). A tangent row outside a unit is zeroed while friction is delayed, and otherwise left alone.
+    after them). A tangent row outside a unit is left alone.
     """
     lines = [
         "for (int i = 0, step = 1; i < m; i += step) {",
         "    const int row_type = static_cast<int>(s_type[i]);",
         "    step = 1;",
         *((f"    if (row_type == {TORSION}) continue;",) if laws.torsion else ()),
-        f"    if (row_type == {FRICTION}) {{",
-        friction_gate("row_type", ctx.store("i", "0.0f"), ctx.sync(), "        ", skip=False),
-        "        continue;",
-        "    }",
+        f"    if (row_type == {FRICTION}) continue;",
         "    const int tangent1 = i + 1;",
         f"    const bool owns_tangents = i + 2 < m && static_cast<int>(s_type[tangent1]) == {FRICTION}",
         "        && world_row_parent.data[off + tangent1] == i;",

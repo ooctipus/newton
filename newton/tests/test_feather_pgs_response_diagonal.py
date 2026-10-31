@@ -531,7 +531,7 @@ def _unit_schedule_order(rows, schedule, world):
     return order
 
 
-def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedule=None, omega=1.0):
+def _ring_pooled_serial_reference(rows, *, iterations, schedule=None, omega=1.0):
     """Sweep the sparse-diagonal rows in float64 with the general owner's row law.
 
     Each iteration projects the fused diagonal limits, then visits rows in order (or in the unit
@@ -557,7 +557,7 @@ def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedul
         inverse = rows["inverse_mass"][w * dofs : (w + 1) * dofs].astype(np.float64)
         parents = rows["row_parent"][w, :count]
         order = range(count) if schedule is None else _unit_schedule_order(rows, schedule, w)
-        for iteration in range(iterations):
+        for _ in range(iterations):
             changed = False
             for coord in range(dofs):
                 for bit, sign, limit_rhs, lambdas in (
@@ -572,9 +572,6 @@ def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedul
                         changed |= lambdas[w, coord] != old
             for row in order:
                 kind, parent, denominator = rows["row_type"][w, row], parents[row], rows["diag"][w, row]
-                if kind == PGS_CONSTRAINT_TYPE_FRICTION and iteration < friction_start:
-                    lam[row] = 0.0
-                    continue
                 if kind == PGS_CONSTRAINT_TYPE_FRICTION and row != parent + 1:
                     continue
                 if denominator <= 0.0 and kind != PGS_CONSTRAINT_TYPE_FRICTION:
@@ -610,7 +607,7 @@ def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedul
                 changed |= new != old
                 v += Y[row] * (new - old)
                 lam[row] = new
-            if iteration >= friction_start and not changed:
+            if not changed:
                 break
     return {"impulses": impulses, "velocity": velocity, "lower": lower, "upper": upper}
 
@@ -697,9 +694,7 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
     return rows
 
 
-def _launch_paired_factor_solve(
-    kernel, rows, device, *, primary, components, iterations, omega, friction_start, offset
-):
+def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, iterations, omega):
     """Run one paired factor-coordinate sweep over the rows; return its impulses and velocities."""
     worlds, _capacity, dofs = rows["factor_rows"].shape
     secondary = dofs - primary
@@ -745,8 +740,6 @@ def _launch_paired_factor_solve(
             array(np.where(odd, 0, primary).astype(np.int32), wp.int32),
             iterations,
             omega,
-            friction_start,
-            offset,
             velocity,
         ],
         block_dim=64,
@@ -793,13 +786,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         reproduces the general sweep's bits.
         """
         device = wp.get_device("cuda:0")
-        for (capacity, primary, secondary), components, (
-            iterations,
-            omega,
-            friction_start,
-            offset,
-        ) in itertools.product(
-            ((64, 23, 6), (48, 10, 6)), (False, True), ((8, 1.0, 0, 0), (8, 0.9, 3, 0), (5, 1.0, 3, 2))
+        for (capacity, primary, secondary), components, (iterations, omega) in itertools.product(
+            ((64, 23, 6), (48, 10, 6)), (False, True), ((8, 1.0), (8, 0.9), (5, 1.0))
         ):
             rows = _paired_unit_rows(capacity + primary, capacity=capacity, primary=primary, secondary=secondary)
             self.assertGreater(rows["anchors"], 4)
@@ -820,12 +808,10 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     components=components,
                     iterations=iterations,
                     omega=omega,
-                    friction_start=friction_start,
-                    offset=offset,
                 )
                 for kernel in kernels
             )
-            with self.subTest(capacity=capacity, components=components, friction_start=friction_start, offset=offset):
+            with self.subTest(capacity=capacity, components=components, iterations=iterations, omega=omega):
                 self.assertFalse(np.array_equal(general[0], rows["impulses"]), "the sweep changed no impulse")
                 tangents = rows["row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                 self.assertTrue(np.any(general[0][tangents] != 0.0), "no tangent row was loaded")
@@ -843,8 +829,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     components=components,
                     iterations=1,
                     omega=omega,
-                    friction_start=0,
-                    offset=0,
                 )
                 for kernel in kernels
             )
@@ -965,8 +949,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 cfm,
                 iterations,
                 omega,
-                0,
-                0,
             ],
             outputs=[lower_lambda, upper_lambda, velocity],
             block_dim=32,
@@ -1069,8 +1051,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 cfm,
                 iterations,
                 omega,
-                0,
-                0,
             ],
             outputs=[
                 wp.zeros((1, world_dofs), dtype=wp.float32, device=device),
@@ -1234,11 +1214,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         mixed_rings += 1
                 independent += sum(int(count) for count in schedule["group_count"])
                 serial += sum(len(heads) for heads in schedule["serial"])
-                for iterations, friction_start in ((6, 0), (5, 2)):
-                    original = _ring_pooled_serial_reference(rows, iterations=iterations, friction_start=friction_start)
-                    scheduled = _ring_pooled_serial_reference(
-                        rows, iterations=iterations, friction_start=friction_start, schedule=schedule
-                    )
+                for iterations in (6, 5):
+                    original = _ring_pooled_serial_reference(rows, iterations=iterations)
+                    scheduled = _ring_pooled_serial_reference(rows, iterations=iterations, schedule=schedule)
                     for name, values in original.items():
                         np.testing.assert_array_equal(scheduled[name], values, err_msg=name)
         # The fixtures exercise both phases, and independent rings whose loads cross unit lengths.
@@ -1306,7 +1284,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             serial_heads = np.zeros((worlds, capacity), np.int32)
             for world, heads in enumerate(schedule["serial"]):
                 serial_heads[world, : len(heads)] = heads
-            for iterations, friction_start in ((8, 0), (5, 2)):
+            for iterations in (8, 5):
                 results = {}
                 for label, units, batches in (
                     ("serial", False, False),
@@ -1355,8 +1333,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             rows["cfm"],
                             iterations,
                             1.0,
-                            friction_start,
-                            0,
                         ],
                         outputs=[lower, upper, velocity],
                         block_dim=32,
@@ -1368,7 +1344,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         "lower": lower.numpy(),
                         "upper": upper.numpy(),
                     }
-                reference = _ring_pooled_serial_reference(rows, iterations=iterations, friction_start=friction_start)
+                reference = _ring_pooled_serial_reference(rows, iterations=iterations)
                 for label in ("units", "batches"):
                     for name, values in results["serial"].items():
                         with self.subTest(

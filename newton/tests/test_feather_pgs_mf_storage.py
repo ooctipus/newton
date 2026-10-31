@@ -435,7 +435,6 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     stream_mf_impulses=stream,
                 )
                 self.assertIn("READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
-                self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
                 start = snippet.index("const float sibling_impulse = READ(lane == 0 ? s_lam_dense[sib] : 0.0f, 0);")
                 end = snippet.index("if (delta_impulse != 0.0f || sib_delta != 0.0f) {", start)
                 owner = snippet[start:end]
@@ -653,7 +652,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         """Solve dense patch rings with resident row types and parents: identical bits out.
 
         Random patch layouts at a small and at a large dense capacity run from warm and signed-zero
-        impulses, with delayed friction, iteration offsets and regularization, both one world per block
+        impulses, with regularization, both one world per block
         and through a two-block queue whose blocks reuse their shared memory across worlds, then once
         more from a captured graph. The limit cases run the end-of-iteration limit scans, which read row
         types from global memory in both kernels.
@@ -669,14 +668,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True}, (5, 9)),
         )
         settings = (
-            {"iterations": 8, "omega": 1.0, "friction_start_iteration": 0, "iteration_offset": 0},
-            {
-                "iterations": 6,
-                "omega": 0.9,
-                "friction_start_iteration": 3,
-                "iteration_offset": 1,
-                "regularize": 1,
-            },
+            {"iterations": 8, "omega": 1.0},
+            {"iterations": 6, "omega": 0.9, "regularize": 1},
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
         for name, (dense_capacity, mf_capacity, dofs), options, rings in cases:
@@ -820,8 +813,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     "use_general_world_queue": int(grid < worlds),
                     "iterations": 8,
                     "omega": 1.0,
-                    "friction_start_iteration": 0,
-                    "iteration_offset": 0,
                     "regularize": 0,
                 }
                 results = []
@@ -984,8 +975,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             iterations=8,
             omega=1.0,
             regularize=0,
-            friction_start_iteration=2,
-            iteration_offset=0,
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
         for shared_metadata in (False, True):

@@ -308,8 +308,6 @@ def _solve_parent_rows(device, parents):
         iterations=8,
         omega=1.0,
         regularize=0,
-        friction_start_iteration=0,
-        iteration_offset=0,
     )
     kernel = sweep_routes.mf_gs_kernel(
         8,

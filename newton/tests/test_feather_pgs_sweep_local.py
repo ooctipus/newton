@@ -190,7 +190,7 @@ class TestPairedFactorRoute(unittest.TestCase):
                 self.assertLess(units.index(held), units.index(unit))
             rows = units[units.index("for (int r = 0; r < 2; ++r) {") : units.index(apply)]
             self.assertEqual(re.findall(r"s_(?:rhs|diag)\[[^\]]*\]", rows), ["s_diag[i]"])
-            self.assertEqual(units.count("SYNC();"), 3)
+            self.assertEqual(units.count("SYNC();"), 2)
             self.assertRegex(units, re.escape(apply) + r"\s+SYNC\(\);\s+}$")
             rest = body[body.index(units) + len(units) :]
             self.assertTrue(rest.startswith(" else {"))
@@ -206,7 +206,6 @@ class TestPairedFactorRoute(unittest.TestCase):
         body, _ = sweep_routes_local.paired_factor_source(64, 23, 17, 6, contact_triples=True)
         prefix = _block(body, "for (int i = 0; i < contact_start; ++i) {")
         self.assertNotIn("RING_LOAD", prefix)
-        self.assertNotIn("friction_gate", prefix)
 
 
 class TestResponseOperators(unittest.TestCase):

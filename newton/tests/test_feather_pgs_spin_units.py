@@ -98,8 +98,6 @@ def _solve(fixture, schedule, device, iterations):
         "secondary_offset_by_world": array(np.full(WORLDS, PRIMARY, np.int32)),
         "iterations": iterations,
         "omega": 1.0,
-        "friction_start_iteration": 0,
-        "iteration_offset": 0,
         "v_out": array(fixture["velocity"].copy()),
     }
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]

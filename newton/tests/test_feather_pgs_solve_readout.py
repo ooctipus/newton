@@ -71,12 +71,11 @@ def _trace(device, worlds, budget=BUDGET):
     return operand
 
 
-def _expected_counts(outputs, *, offset=0, friction_start=0):
+def _expected_counts(outputs):
     """Return the sweeps each world may have executed, from per-budget outputs ``outputs[s][world]``.
 
     The outputs settle at budget ``c``, the first from which they never change. A world stops after the first
-    sweep, once friction rows are active (global sweep index at least ``friction_start``), whose changes were all
-    quiet: sweep ``c`` (its changes within the floor) or ``c + 1`` (no change), or the first open sweep after them.
+    sweep whose changes were all quiet: sweep ``c`` (its changes within the floor) or ``c + 1`` (no change).
     A world whose outputs settle only at the budget may have run it out. Returns per world the allowed counts.
     """
     budget = len(outputs) - 1
@@ -88,8 +87,6 @@ def _expected_counts(outputs, *, offset=0, friction_start=0):
 
         settle = next(c for c in range(budget + 1) if all(same(c, later) for later in range(c, budget + 1)))
         first = max(settle, 1)
-        while first < budget and offset + first - 1 < friction_start:
-            first += 1
         counts = {first, min(first + 1, budget)} if first == settle else {first}
         allowed.append(counts)
     return allowed
@@ -118,7 +115,7 @@ def _assert_counts(test, operand, allowed, solved, *, repeats=1):
 class _SparseCase:
     """One sparse sweep problem in three worlds (the middle one without rows) and its launch buffers."""
 
-    def __init__(self, device, problem, options, friction_start, offset, omega):
+    def __init__(self, device, problem, options, omega):
         _, indices, rows, _, bias, types, parents, mu, impulses, _, _, incident, diagonal = problem
         if options.get("active_rows"):
             parents[types == 0] = -1  # A linked normal keeps the full sweep.
@@ -154,7 +151,7 @@ class _SparseCase:
             *[wp.zeros((worlds, 1, 6), device=device) for _ in range(2)],
             wp.zeros((worlds, 1), device=device),
         ]
-        self.solve = (omega, friction_start, offset)
+        self.omega = omega
         worlds_per_block = 64 // options.get("lanes_per_world", 32)
         self.blocks = (worlds + worlds_per_block - 1) // worlds_per_block
         self.worlds = worlds
@@ -169,7 +166,7 @@ class _SparseCase:
         wp.launch_tiled(
             kernel,
             dim=[self.blocks],
-            inputs=[*self.head, self.impulses, *self.tail, iterations, *self.solve],
+            inputs=[*self.head, self.impulses, *self.tail, iterations, self.omega],
             outputs=[self.delta, _SparseRowSupport(), *extra],
             block_dim=64,
             device=self.device,
@@ -245,7 +242,7 @@ class _LocalCase:
         wp.launch_tiled(
             kernel,
             dim=[self.worlds],
-            inputs=[*self.inputs, iterations, 1.0, 0, 0],
+            inputs=[*self.inputs, iterations, 1.0],
             outputs=[*self.outputs, *extra],
             block_dim=32,
             device=self.device,
@@ -285,21 +282,21 @@ class TestSolveReadoutKernels(unittest.TestCase):
 
         device = wp.get_device("cuda:0")
         cases = (
-            ((43, 18, False, None), {}, (0, 0, 1.0)),
-            ((43, 18, True, None), {}, (3, 1, 0.7)),
-            ((43, 18, False, None), {"active_rows": True}, (0, 0, 1.0)),
-            ((3, 3, False, "late_activation"), {"lanes_per_world": 16}, (0, 0, 1.0)),
+            ((43, 18, False, None), {}, 1.0),
+            ((43, 18, True, None), {}, 0.7),
+            ((43, 18, False, None), {"active_rows": True}, 1.0),
+            ((3, 3, False, "late_activation"), {"lanes_per_world": 16}, 1.0),
         )
-        for (dofs, support, seeded, activity), options, (friction_start, offset, omega) in cases:
+        for (dofs, support, seeded, activity), options, omega in cases:
             with self.subTest(dofs=dofs, seeded=seeded, activity=activity, options=options):
                 problem = _problem(dofs, support, seeded, contact_activity=activity)
-                case = _SparseCase(device, problem, options, friction_start, offset, omega)
+                case = _SparseCase(device, problem, options, omega)
                 exact, counted = case.kernel(), case.kernel(SWEEPS)
                 outputs = []
                 for budget in range(BUDGET + 1):
                     case.run(exact, budget)
                     outputs.append(case.read())
-                allowed = _expected_counts(outputs, offset=offset, friction_start=friction_start)
+                allowed = _expected_counts(outputs)
                 operand = _readout(device, case.worlds)
                 case.run(counted, BUDGET, operand)
                 for actual, expected in zip(case.read(), outputs[BUDGET], strict=True):

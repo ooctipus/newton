@@ -11,8 +11,7 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
 - each **row block** pairs a row store (where a row's impulse, type, parent, friction coefficient, right-hand side
   and diagonal live: :class:`WorldRows`, :class:`FreeBodyRows`) with a response operator
   (:mod:`.response_operator`) and the row kinds it visits;
-- the **row visit** admits a row of a row loop (:func:`row_visit`): the delayed-friction gate (:func:`friction_gate`),
-  a friction pair at its first tangent (:func:`admit_pair`), the diagonal check and the pair's disk on the patch
+- the **row visit** admits a row of a row loop (:func:`row_visit`): a friction pair at its first tangent (:func:`admit_pair`), the diagonal check and the pair's disk on the patch
   ring's pooled load (:func:`friction_radius`), then the operator's residual;
 - the **row law** is one function, :func:`row_update`: step, regularization, the projection of each row kind
   (unilateral, friction pair, velocity limit, bilateral), the change vote (:func:`change_vote`) and the
@@ -641,22 +640,6 @@ def _friction_triple(ctx: RowContext, *, own: bool) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def friction_gate(kind: str, store: str, sync: str, pad: str, *, skip: bool = True) -> str:
-    """While friction is delayed (before ``friction_start_iteration``), zero a friction row's impulses and move on.
-
-    ``store`` zeroes them (the first lane's stores, or every lane's), ``sync`` is the barrier after it (nothing for
-    one thread); with ``skip`` the row loop continues.
-    """
-    lines = [
-        f"if (ProjectionLaw::friction_gate({kind}, global_iter, friction_start_iteration)) {{",
-        indent(store, "    "),
-        f"    {sync}" if sync else "",
-        "    continue;" if skip else "",
-        "}",
-    ]
-    return indent("\n".join(line for line in lines if line), pad)
-
-
 def admit_pair(kind: str, parent: str, pad: str, *, disk: str = "", torsion: bool = False) -> str:
     """Friction rows of the row loop over ``i``: visit the first tangent only.
 
@@ -737,15 +720,14 @@ def row_visit(
 ) -> str:
     """Visit row ``i`` (``ctx.row``) of a row loop, its kind ``ctx.kind`` declared: admission, residual and row law.
 
-    A friction row waits for ``friction_start_iteration`` with a zero impulse (:func:`friction_gate`); a pair is
-    visited at its first tangent (``parent``: the row's parent, :func:`admit_pair`) and skipped while its disk and
+    A pair is visited at its first tangent (``parent``: the row's parent, :func:`admit_pair`) and skipped while its disk and
     impulses are zero (:func:`friction_radius`), before its residual is reduced. Every other row needs a positive
     diagonal ``check`` (its value or stored inverse, declared by ``declare``), unless the schedule admitted the rows
     on it already (``None``). ``hold`` declares, after the check, registers the disk and the law read (``keep_next``
     keeps the second tangent's impulse in one); the disk joins the admission's block when nothing comes between
     them. ``entries`` declares what the operator reads of the row and ``residual`` reduces ``jv`` (the operator's
     :meth:`~.ResponseOperator.residual` by default). Rows without friction pairs (``ctx.friction`` false) have no
-    gate, admission or disk. A skipped row continues the loop.
+    admission or disk. A skipped row continues the loop.
     """
     row, kind, op = ctx.row, ctx.kind, ctx.operator
     pairs = ctx.friction
@@ -754,7 +736,7 @@ def row_visit(
         exempt = f" && {kind} != {FRICTION}" if pairs else ""
         between.append(f"{pad}if ({check} <= 0.0f{exempt}) continue;")
     between.append(indent(hold, pad) if hold else "")
-    lines = [friction_gate(kind, ctx.store(row, "0.0f"), ctx.sync(), pad) if pairs else ""]
+    lines = []
     disk = (ctx.ring_load("parent"), ctx.mu(row), ctx.load(row), ctx.load(f"{row} + 1"))
     # Under torsion the spin row follows the pair (the first tangent's row plus two).
     spin = {"load_spin": ctx.load(f"{row} + 2")} if laws.torsion else {}
@@ -997,7 +979,6 @@ def end_sweep(
     policy: SolvePolicy,
     *,
     iteration: str,
-    gated: bool = True,
     violation: tuple[str, str, str, str] | None = None,
     block: bool = False,
     iterations: str = "iterations",
@@ -1005,16 +986,14 @@ def end_sweep(
 ) -> str:
     """The end of a sweep under the exit law (:func:`.solve_policy.sweep_exit`): stop once no update was loud.
 
-    A ``gated`` sweep stops only once friction is active (delayed friction is a change to come). ``violation`` bounds
+    ``violation`` bounds
     the rows a sweep of selected rows leaves unvisited. A ``block`` group spans several warps: its quiet test is the
     block's vote (:data:`BLOCK_QUIET`) and ``argmax`` its trace reduction (:func:`.solve_policy.block_argmax`).
     ``iterations`` is the sweep budget.
     """
-    gate = "global_iter >= friction_start_iteration" if gated else None
     quiet = BLOCK_QUIET if block else QUIET
     return sweep_exit(
         policy,
-        gate=gate,
         quiet=quiet,
         violation=violation,
         iteration=iteration,
@@ -1500,7 +1479,6 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     update = [
         step,
         f"if (s_kind[i] == {JACOBI_UNILATERAL}) value = ProjectionLaw::unilateral(value);",
-        f"if (s_kind[i] == {JACOBI_FRICTION} && global_iter < friction_start_iteration) value = 0.0f;",
     ]
     lines = [
         "float x_new = 0.0f, x_old = 0.0f, x_from = 0.0f, row_bound = 0.0f;",
@@ -1718,7 +1696,6 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         weight,
         f"{pad}float t_k = 1.0f;",
         f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
-        f"{inner}const int global_iter = iteration_offset + sweep;",
         op.gather(inner),
         _jacobi_step(rows, op, laws, inner),
         f"{inner}int iteration_changed = 0;",

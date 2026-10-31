@@ -82,8 +82,6 @@ MF_GS_ABI = kernel_template.params(
     ("iterations", int),
     ("omega", float),
     ("regularize", int),
-    ("friction_start_iteration", int),
-    ("iteration_offset", int),
     ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
@@ -473,26 +471,9 @@ const float mf_diag = __int_as_float(meta.y);"""
 {_unit_terms(" " * 20, torsion=torsion)}
 {unit}
 {_unit_apply(" " * 20, torsion=torsion)}
-{_second_tangent_gate(torsion)}
                 }}
                 __syncthreads();
             }}"""
-
-
-def _second_tangent_gate(torsion: bool) -> str:
-    """After a friction unit: its second tangent (and spin row) are the first tangent's visit's; only the
-    delayed-friction gate holds them."""
-    gate = "ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration)"
-    if torsion:
-        return f"""                    // The pair's second tangent and the spin row: the first's visit solved them; only the delayed-friction
-                    // gate holds them.
-                    if (rows == 4 && {gate}) {{
-                        s_lam_mf[unit_row + 2] = 0.0f;
-                        s_lam_mf[unit_row + 3] = 0.0f;
-                    }}"""
-    return f"""                    // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
-                    if (rows == 3 && {gate})
-                        s_lam_mf[unit_row + 2] = 0.0f;"""
 
 
 def _colored_metrics(units: int, *, torsion: bool = False) -> str:
@@ -717,7 +698,6 @@ def mf_gs_source(
         sweep_end = sweep_exit(
             solve_policy,
             quiet=quiet,
-            gate="global_iter >= friction_start_iteration",
             iteration="iter",
             lane="tid",
             argmax="BLOCK_ARGMAX",
@@ -791,7 +771,6 @@ def mf_gs_source(
 {prologue}
 
     for (int iter = 0; iter < iterations; iter++) {{
-        int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 
 {first_warp}{dense_rows_block(dense, dense_op, laws, admission=_DENSE_ADMISSION, pad="        ")}

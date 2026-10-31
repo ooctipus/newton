@@ -134,17 +134,15 @@ _SWEEP_TRACE = f"""    float solve_trace_max = 0.0f;
             solve_trace_kind = kind;
         }}
     }};
-    const auto solve_trace_sweep = [&](int trace_world, int executed, float change, int kind, bool eligible,
-                                       bool stopped, bool final) {{
+    const auto solve_trace_sweep = [&](int trace_world, int executed, float change, int kind, bool stopped,
+                                       bool final) {{
         const float grid[{len(TRACE_GRID)}] = {{{_GRID_LITERALS}}};
         const int columns = readout.stops.shape[1];
-        if (eligible) {{
-            const int column = executed < columns - 1 ? executed : columns - 2;
-            for (int point = 0; point < {len(TRACE_GRID)}; ++point) {{
-                if (((solve_trace_open >> point) & 1u) != 0u && change <= grid[point]) {{
-                    atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + column]), 1ull);
-                    solve_trace_open &= ~(1u << point);
-                }}
+        const int column = executed < columns - 1 ? executed : columns - 2;
+        for (int point = 0; point < {len(TRACE_GRID)}; ++point) {{
+            if (((solve_trace_open >> point) & 1u) != 0u && change <= grid[point]) {{
+                atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + column]), 1ull);
+                solve_trace_open &= ~(1u << point);
             }}
         }}
         if (!final) return;
@@ -337,7 +335,6 @@ def sweep_exit(
     policy: SolvePolicy,
     *,
     quiet: str,
-    gate: str | None = None,
     violation: tuple[str, str, str, str] | None = None,
     world: str = "world",
     iteration: str = "iteration",
@@ -354,7 +351,6 @@ def sweep_exit(
     Args:
         policy: The sweep's solve policy.
         quiet: Group-uniform condition that no update of this sweep voted (no loud change).
-        gate: Condition under which a quiet sweep may stop the world (delayed friction), or ``None``.
         violation: For sweeps that visit only rows selected at sweep entry, ``(code, loud, value, kind)``:
             group-uniform statements that set the bool ``loud`` when a visit of some zero-impulse unilateral row
             would make a loud change (:attr:`Change.loud`), the float ``value`` to the largest such change (its
@@ -368,7 +364,7 @@ def sweep_exit(
             sweeps.
         indent: Indentation of the emitted statements.
     """
-    stop = quiet if gate is None else f"{gate} && {quiet}"
+    stop = quiet
     inner = indent + "    "
 
     def block(code):
@@ -405,7 +401,7 @@ def sweep_exit(
     lines += [
         stop_line,
         f"{inner}if ({lane} == 0)",
-        f"{inner}    solve_trace_sweep({world}, {iteration} + 1, sweep_change, sweep_kind, {gate or 'true'}, sweep_stop,",
+        f"{inner}    solve_trace_sweep({world}, {iteration} + 1, sweep_change, sweep_kind, sweep_stop,",
         f"{inner}        sweep_stop || {iteration} + 1 == {iterations});",
         f"{inner}if (sweep_stop) break;",
         f"{indent}}}",

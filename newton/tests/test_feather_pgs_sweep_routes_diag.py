@@ -94,10 +94,6 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertRegex(text, r"const int i = head;\s+const int row_type = 0;")
             self.assertRegex(text, r"const int i = head \+ 1;\s+const int row_type = 2;")
             self.assertIn("parent = head;", text)
-            self.assertRegex(
-                text,
-                r"friction_gate\(2, global_iter, friction_start_iteration\)\) \{\s+s_lam_dense\[head \+ 2\] = 0\.0f;",
-            )
             self.assertNotIn("pair_visits", text)
         self.assertIn("if (head + 2 < row_count", units)
         self.assertNotIn("if (head + 2 < row_count", triples)

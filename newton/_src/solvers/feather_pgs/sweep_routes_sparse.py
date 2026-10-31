@@ -95,8 +95,6 @@ SPARSE_ABI = kernel_template.params(
     ("mf_row_mu", wp.array2d[float]),
     ("iterations", int),
     ("omega", float),
-    ("friction_start_iteration", int),
-    ("iteration_offset", int),
     ("factor_velocity_delta", wp.array2d[float]),
     ("support", _SparseRowSupport),
 )
@@ -347,7 +345,7 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
     """Select the rows a sweep visits, one lane per row, into the bitsets ``s_normal_words`` and ``s_selected_words``.
 
     A contact normal or joint limit is selected when it holds impulse or its residual at sweep entry is
-    negative (or not finite), every other non-friction row always; a delayed friction row is zeroed. A first
+    negative (or not finite), every other non-friction row always. A first
     tangent is selected while its normal is selected or its pair (or, under contact torsion, its spin row) holds
     impulse, a patch pair while any normal of its ring is. A row a sweep's earlier updates violate waits for the next
     sweep.
@@ -385,9 +383,6 @@ def active_scan(sweep: SparseSweep, op: SparseFactor, pad: str) -> str:
                 const float residual = dot + s_rhs[row];
                 selected = residual < 0.0f || !isfinite(residual);
             }}
-        }} else if (select_active && ProjectionLaw::friction_gate(kind, global_iter, friction_start_iteration)) {{
-            // The active list visits only first tangents; clear both delayed rows here.
-            s_impulse[row] = 0.0f;
         }}
     }}
     const unsigned mask = BALLOT(selected);
@@ -399,7 +394,7 @@ for (int first = 0; first < count; first += 32) {{
     bool selected = false;
     if (row < count) {{
         selected = !select_active || ((s_normal_words[first / 32] >> lane) & 1u) != 0u;
-        if (select_active && s_type[row] == {FRICTION} && global_iter >= friction_start_iteration) {{
+        if (select_active && s_type[row] == {FRICTION}) {{
             const int parent = world_row_parent.data[offset + row];
 {indent(tangent, "            ")}
         }}
@@ -699,7 +694,7 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
     )
     update = f"""if (i == consumed_tangent) continue;
 // The staged metadata first, read together: a contact normal with its two tangents.
-if ({entry_guard}{spin["last"]} < count && global_iter >= friction_start_iteration
+if ({entry_guard}{spin["last"]} < count
     && ((s_type[i] == {CONTACT}) & (s_type[i + 1] == {FRICTION}) & (s_type[i + 2] == {FRICTION}){spin["type"]}
         & (isfinite(s_diag[i]) != 0) & (s_diag[i] > 0.0f){selected})) {{
     const int head = i, tangent = i + 1, sibling = i + 2{spin["rows"]};
@@ -825,7 +820,6 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 {chr(10).join(setup)}
 
     for (int iter = 0; iter < iterations; ++iter) {{
-        const int global_iter = iteration_offset + iter;
         int iteration_changed = 0;
 {chr(10).join(scan)}
 {row_loop}
@@ -910,7 +904,7 @@ def sparse_kernel(
     """The sparse sweep kernel.
 
     Launch ``ceil(world_count / (64 / lanes_per_world))`` tiles of 64 threads. Contact units take
-    ``contact_records`` after ``iteration_offset``; a solve readout appends its operand after ``support``. The
+    ``contact_records`` after ``omega``; a solve readout appends its operand after ``support``. The
     working set must fit the static budget of ``device_arch`` (:func:`.staging.arch_budget`).
     """
     sweep = _resolve(
@@ -936,7 +930,7 @@ def sparse_kernel(
     staging.check("the sparse sweep", arch_budget(device_arch))
     extra = (*weight_arguments(sweep.weighted), *material_arguments(sweep.material), *sweep.policy.arguments)
     if sweep.triplets:
-        extra = (RowArgument("contact_records", wp.array3d[float], after="iteration_offset"), *extra)
+        extra = (RowArgument("contact_records", wp.array3d[float], after="omega"), *extra)
     return KernelTemplate.from_abi(
         sweep.name,
         SPARSE_ABI,

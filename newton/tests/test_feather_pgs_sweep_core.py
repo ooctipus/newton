@@ -20,7 +20,6 @@ from newton._src.solvers.feather_pgs.sweep import (
     UnitOperator,
     change_vote,
     contact_unit,
-    friction_gate,
     friction_radius,
     row_update,
     row_visit,
@@ -144,7 +143,6 @@ class TestRowVisit(unittest.TestCase):
     def test_rows_without_friction_pairs_have_no_gate_admission_or_disk(self):
         ctx = _context(_Rows(diagonal=lambda row: f"A[{row}]"), friction=False)
         visit = row_visit(ctx, RowLaws(regularize=False), parent="p[i]", check="denom", pad="")
-        self.assertNotIn("friction_gate", visit)
         self.assertNotIn("parent", visit)
         self.assertNotIn("sib", visit)
         self.assertIn("if (denom <= 0.0f) continue;", visit)
@@ -178,11 +176,6 @@ class TestRowVisit(unittest.TestCase):
             "    h = b;\n    if (radius == 0.0f && a == 0.0f && h == 0.0f) continue;\n}",
         )
 
-    def test_the_gate_skips_the_row_unless_asked_not_to(self):
-        gate = friction_gate("k", "lam[i] = 0.0f;", "SYNC();", "")
-        self.assertTrue(gate.endswith("    SYNC();\n    continue;\n}"))
-        self.assertNotIn("continue", friction_gate("k", "lam[i] = 0.0f;", "", "", skip=False))
-
 
 class TestContactUnit(unittest.TestCase):
     """A contact unit's rows by the row law (:func:`.sweep.contact_unit`): where the lanes synchronize."""
@@ -201,9 +194,8 @@ class TestContactUnit(unittest.TestCase):
 
     def test_held_rows_synchronize_only_before_the_normal_stores(self):
         """The rows read the unit's impulses from the registers the placement loaded and pool the ring from the
-        normal's new impulse in a register, so only the normal's stores wait for every lane's reads (besides the
-        delayed-friction gate's own barrier) and no row synchronizes after its stores: the placement does after the
-        unit's apply."""
+        normal's new impulse in a register, so only the normal's stores wait for every lane's reads and no row
+        synchronizes after its stores: the placement does after the unit's apply."""
         unit = self._unit()
         self.assertEqual(re.findall(r"lam\[[^\]]*\](?! = )", unit), [])
         self.assertIn("float unit_normal = unit_lam0;", unit)
@@ -212,7 +204,7 @@ class TestContactUnit(unittest.TestCase):
             unit,
             r"if \(r == 0\) SYNC\(\);\s+if \(lane == 0\) lam\[i\] = new_impulse;\s+if \(r == 0\) unit_normal = new_impulse;",
         )
-        self.assertEqual(unit.count("SYNC();"), 2)
+        self.assertEqual(unit.count("SYNC();"), 1)
         self.assertNotIn("if (denom <= 0.0f", unit)
 
     def test_held_rows_read_no_staged_value_after_a_barrier(self):
@@ -240,16 +232,16 @@ class TestContactUnit(unittest.TestCase):
         self.assertIn("if (denom <= 0.0f && row_type != 2) continue;", unit)
         self.assertNotIn("if (r == 0) SYNC();", unit)
         self.assertRegex(unit, r"SYNC\(\);\s+if \(lane == 0\) lam\[i\] = new_impulse;")
-        self.assertEqual(unit.count("SYNC();"), 2)
+        self.assertEqual(unit.count("SYNC();"), 1)
 
     def test_rows_every_lane_stores_read_their_own_stores(self):
-        """Rows that every lane stores alike, or one thread's, hold nothing and synchronize only at the gate."""
+        """Rows that every lane stores alike, or one thread's, hold nothing and do not synchronize."""
         for lanes, owned in ((Lanes(32), False), (Lanes(1), True)):
             with self.subTest(width=lanes.width):
                 unit = self._unit(lanes, check="denom", held=False, owned=owned)
                 self.assertNotIn("unit_normal", unit)
                 self.assertIn("RING_LOAD(lam[parent])", unit)
-                self.assertEqual(unit.count("SYNC();"), int(lanes.parallel))
+                self.assertEqual(unit.count("SYNC();"), 0)
 
     def test_owned_rows_hold_their_impulses_exactly_where_the_lanes_share_the_stores(self):
         with self.assertRaises(ValueError):

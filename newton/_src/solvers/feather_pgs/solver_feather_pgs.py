@@ -413,7 +413,6 @@ class SolverFeatherPGS(SolverBase):
         update_mass_matrix_interval: int = 1,
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
-        contact_friction_position_iterations: int = -1,
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
         joint_limit_activation_gap: float = float("inf"),
@@ -484,11 +483,6 @@ class SolverFeatherPGS(SolverBase):
                 ``phi <= contact_friction_gap_threshold``. This mirrors PhysX's separate friction-anchor
                 distance threshold while leaving speculative normal rows intact. Defaults to ``inf`` to
                 preserve legacy FeatherPGS behavior.
-            contact_friction_position_iterations (int, optional): Number of biased PGS position
-                iterations that solve contact-friction rows. ``-1`` preserves legacy FeatherPGS
-                behavior by solving friction in every position iteration; ``0`` skips position-pass
-                friction entirely; ``N > 0`` solves friction only in the final ``N`` position
-                iterations. Defaults to ``-1``.
             friction_anchor_beta (float | None, optional): Set the positional correction strength
                 for persistent patch friction. ``None`` enables it at 0.2 for the default solver;
                 the experimental contact material law instead retains velocity-only point friction and warns.
@@ -675,11 +669,6 @@ class SolverFeatherPGS(SolverBase):
         # Every sweep compiles the exit law and the policy's readout.
         self._solve_policy = SolvePolicy(readout=options.pgs_solve_readout)
         self._solve_readout = SolveReadoutRecord(self._solve_policy)
-        if options.pgs_warmstart and options.contact_friction_position_iterations >= 0:
-            raise NotImplementedError(
-                "contact_friction_position_iterations with pgs_warmstart=True needs an explicit "
-                "pre-solve zeroing pass for skipped friction rows"
-            )
 
         self._ws_prev_dt = 0.0
         self._grouped_response = False
@@ -2650,25 +2639,11 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_convergence_log = []
         self._pgs_ncp_residual_log = []
 
-    def _contact_friction_start_iteration(self, iterations: int) -> int:
-        """Return the first local PGS iteration that should solve friction rows.
-
-        ``contact_friction_position_iterations=-1`` preserves the legacy all-iteration behavior.
-        """
-        if self.options.contact_friction_position_iterations < 0:
-            return 0
-        if iterations <= 0:
-            return 0
-        active = min(self.options.contact_friction_position_iterations, iterations)
-        return iterations - active
-
     def _launch_local_internal_solve(
         self,
         dense_rhs: wp.array,
         iterations: int,
         omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
         *,
         solve_single: bool = True,
         solve_pair: bool = True,
@@ -2725,8 +2700,6 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.mf_row_w,
                     iterations,
                     omega,
-                    friction_start_iteration,
-                    iteration_offset,
                 ]
             )
             outputs = [self.placement.diag, self.placement.impulses, self.v_out]
@@ -2793,13 +2766,9 @@ class SolverFeatherPGS(SolverBase):
         mf_meta: wp.array,
         iterations: int,
         omega: float,
-        friction_start_iteration: int | None = None,
-        iteration_offset: int = 0,
     ) -> None:
         if iterations <= 0:
             return
-        if friction_start_iteration is None:
-            friction_start_iteration = self._contact_friction_start_iteration(iterations)
         route = self._plan.solve.route.name
         if route == "sparse_pgs":
             worlds_per_block = 64 // self._sparse_solve_lanes
@@ -2828,8 +2797,6 @@ class SolverFeatherPGS(SolverBase):
                     self.placement.mf_row_mu,
                     iterations,
                     omega,
-                    int(friction_start_iteration),
-                    int(iteration_offset),
                     # Contact units read the triplets' block records.
                     *(
                         ()
@@ -2892,8 +2859,6 @@ class SolverFeatherPGS(SolverBase):
                     self.options.pgs_cfm,
                     iterations,
                     omega,
-                    int(friction_start_iteration),
-                    int(iteration_offset),
                 ],
                 outputs=[
                     self.placement.fused_diagonal_limit_lower_lambda,
@@ -2993,8 +2958,6 @@ class SolverFeatherPGS(SolverBase):
                             self._paired_factor_secondary_offsets_by_world,
                             iterations,
                             omega,
-                            int(friction_start_iteration),
-                            int(iteration_offset),
                         ],
                         outputs=[
                             self.v_out,
@@ -3043,8 +3006,6 @@ class SolverFeatherPGS(SolverBase):
                 iterations,
                 omega,
                 int(self.laws.set.weighted),
-                int(friction_start_iteration),
-                int(iteration_offset),
             ]
             # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns
             # early for those and solves the rest.
@@ -3120,8 +3081,6 @@ class SolverFeatherPGS(SolverBase):
                             dense_rhs,
                             iterations,
                             omega,
-                            friction_start_iteration,
-                            iteration_offset,
                             solve_single=False,
                             solve_pair=False,
                         )
@@ -3132,8 +3091,6 @@ class SolverFeatherPGS(SolverBase):
                             dense_rhs,
                             iterations,
                             omega,
-                            friction_start_iteration,
-                            iteration_offset,
                             solve_single=False,
                             solve_residual=False,
                         )
@@ -3143,8 +3100,6 @@ class SolverFeatherPGS(SolverBase):
                         dense_rhs,
                         iterations,
                         omega,
-                        friction_start_iteration,
-                        iteration_offset,
                         solve_pair=pair_stream is None,
                         solve_residual=residual_stream is None,
                     )
@@ -3155,8 +3110,6 @@ class SolverFeatherPGS(SolverBase):
                         dense_rhs,
                         iterations,
                         omega,
-                        friction_start_iteration,
-                        iteration_offset,
                     )
         for local_done_event in local_done_events:
             wp.get_stream(self.model.device).wait_event(local_done_event)
@@ -3165,16 +3118,12 @@ class SolverFeatherPGS(SolverBase):
         self,
         *,
         iterations: int,
-        friction_start_iteration: int | None = None,
-        iteration_offset: int = 0,
     ) -> None:
         self._launch_matrix_free_gs_solve(
             dense_rhs=self.placement.rhs,
             mf_meta=self.placement.mf_meta_packed,
             iterations=iterations,
             omega=self.options.pgs_omega,
-            friction_start_iteration=friction_start_iteration,
-            iteration_offset=iteration_offset,
         )
 
     def _bind_contact_material(self, contacts: Contacts | None) -> None:
@@ -3424,7 +3373,6 @@ class SolverFeatherPGS(SolverBase):
             if self.options.pgs_debug:
                 self._pgs_convergence_log.append([])
                 self._pgs_ncp_residual_log.append([])
-                friction_start_iteration = self._contact_friction_start_iteration(self.options.pgs_iterations)
                 for _pgs_dbg_iter in range(self.options.pgs_iterations):
                     # Snapshot impulses before this iteration
                     wp.copy(self._diag_prev_impulses, self.placement.impulses)
@@ -3436,8 +3384,6 @@ class SolverFeatherPGS(SolverBase):
                     # internal phase per diagnostic sample.
                     self._launch_matrix_free_position_solve(
                         iterations=1,
-                        friction_start_iteration=friction_start_iteration,
-                        iteration_offset=_pgs_dbg_iter,
                     )
 
                     # Diagnostic kernel
@@ -3510,7 +3456,6 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self._launch_matrix_free_position_solve(
                     iterations=self.options.pgs_iterations,
-                    friction_start_iteration=self._contact_friction_start_iteration(self.options.pgs_iterations),
                 )
 
         # ══════════════════════════════════════════════════════════════

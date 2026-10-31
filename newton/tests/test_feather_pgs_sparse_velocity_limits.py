@@ -285,8 +285,6 @@ def _solve_data(sign, *, contact, iterations, omega):
         "support_class_dof": np.arange(3, dtype=np.int32)[None],
         "iterations": np.array(iterations),
         "omega": np.array(omega),
-        "friction_start_iteration": np.array(0),
-        "iteration_offset": np.array(0),
         "reference_factor_delta": np.zeros((worlds, 3), np.float32),
     }
     physical = (jacobian, response, initial, bias, diagonal, kinds, parents, mu, seeds)

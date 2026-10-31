@@ -32,8 +32,8 @@ from newton._src.solvers.feather_pgs.sweep import (
 _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
 
 # The exit of a warp's sweep and of a block's, without readout: stop a quiet sweep once friction is active.
-_EXIT = "const bool sweep_stop = global_iter >= friction_start_iteration && BALLOT(iteration_changed != 0) == 0u;"
-_BLOCK_EXIT = "const bool sweep_stop = global_iter >= friction_start_iteration && !ANY(iteration_changed != 0);"
+_EXIT = "const bool sweep_stop = BALLOT(iteration_changed != 0) == 0u;"
+_BLOCK_EXIT = "const bool sweep_stop = !ANY(iteration_changed != 0);"
 _EXIT_TEXT = f"        {{\n            {_EXIT}\n            if (sweep_stop) break;\n        }}\n"
 
 _LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)

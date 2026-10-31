@@ -7,8 +7,7 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 
 * the update: :func:`relaxed_step` (``old + omega delta``), the proximal
   regularization of a row's step, :func:`regularized_delta` (the w-form), its
-  diagonal for block solves, :func:`regularized_diagonal`, and
-  :func:`friction_gate` (friction rows wait for ``friction_start_iteration``);
+  diagonal for block solves, :func:`regularized_diagonal`;
 * sets: :func:`unilateral` (``lambda >= 0``), :func:`box` (``|lambda| <= b``),
   :func:`disk` (``|lambda_t| <= r``) and, for a contact with a spin row,
   :func:`ball`, its elliptic cone (the family :data:`CONE_LAW`, which only sweeps
@@ -26,7 +25,6 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 import warp as wp
 
 from .law_source import LawFamily
-from .row_laws import ROW_FRICTION
 
 PAIR_FLOOR = wp.constant(2.0e-7)
 """The pair's rounding floor, about two float32 ulps of its impulse: the root solve stops within it of the disk's
@@ -70,12 +68,6 @@ def regularized_diagonal(diagonal: float, w: float) -> float:
     ``-(1 / w - 1) d lambda``.
     """
     return diagonal / w
-
-
-@PROJECTION_LAW.law
-def friction_gate(kind: int, iteration: int, start_iteration: int) -> bool:
-    """Return whether a row is a friction row still held at zero: friction starts at ``start_iteration``."""
-    return kind == ROW_FRICTION and iteration < start_iteration
 
 
 @PROJECTION_LAW.law

@@ -245,7 +245,7 @@ def _packed_rows(host, arrays, device):
     arrays["factor_storage"] = storage  # The addresses stay valid while the arrays live.
 
 
-def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8, friction_start=0):
+def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     """The two sweeps' launches, ``(kernel, blocks, block size, arguments)``, on the fixture's data: the paired and
     mixed kernels for CUDA architecture ``arch``, each argument taken by the name the kernel's signature gives it.
 
@@ -258,8 +258,6 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8, friction_s
         iterations=iterations,
         omega=1.0,
         regularize=0,
-        friction_start_iteration=friction_start,
-        iteration_offset=0,
     )
     if enabled:
         values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector
@@ -271,12 +269,12 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8, friction_s
     ]
 
 
-def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_start=0):
+def launch_solve_pair(data, arrays, *, enabled, device, iterations=8):
     """Solve with separate writable outputs but identical current data and the same law (CUDA: the sweeps are
     CUDA-only bodies)."""
     if enabled:
         launch_components(data, device)
     for kernel, grid, block, arguments in solve_pair_launches(
-        data, arrays, enabled=enabled, arch=device.arch, iterations=iterations, friction_start=friction_start
+        data, arrays, enabled=enabled, arch=device.arch, iterations=iterations
     ):
         wp.launch_tiled(kernel, dim=[grid], inputs=arguments, block_dim=block, device=device)

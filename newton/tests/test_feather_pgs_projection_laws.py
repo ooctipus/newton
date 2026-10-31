@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import projection_laws as laws
-from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT
 from newton.tests.feather_pgs_law_harness import call, register_device_tests, scalars, twin_inputs
 
 
@@ -340,8 +340,6 @@ def _scalar_laws(
     diagonal: wp.array[float],
     w: wp.array[float],
     bound: wp.array[float],
-    kind: wp.array[int],
-    iteration: wp.array[int],
     out: wp.array2d[float],
 ):
     i = wp.tid()
@@ -356,7 +354,6 @@ def _scalar_laws(
     out[i, 5] = delta
     out[i, 6] = push_new
     out[i, 7] = push_delta
-    out[i, 8] = float(laws.friction_gate(kind[i], iteration[i], 3))
     row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0)
     out[i, 9] = row[2]
 
@@ -404,8 +401,6 @@ def test_scalar_laws(test, device):
     diagonal = rng.uniform(0.1, 3.0, n).astype(np.float32)
     w = rng.choice(np.array([1.0, 0.5, 0.98, 0.25], np.float32), n)
     bound = rng.uniform(0.05, 2.0, n).astype(np.float32)
-    kind = rng.integers(0, 6, n).astype(np.int32)
-    iteration = rng.integers(0, 6, n).astype(np.int32)
     out = call(
         _scalar_laws,
         n,
@@ -415,8 +410,6 @@ def test_scalar_laws(test, device):
         diagonal=diagonal,
         w=w,
         bound=bound,
-        kind=kind,
-        iteration=iteration,
         out=np.zeros((n, 10), np.float32),
     )["out"].numpy()
     o, r, d, w64, b = (v.astype(np.float64) for v in (old, residual, diagonal, w, bound))
@@ -430,7 +423,6 @@ def test_scalar_laws(test, device):
     push = np.where(r < 0.0, -r / d, 0.0)
     np.testing.assert_allclose(out[:, 6], push, rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(out[:, 7], push, rtol=1e-6, atol=1e-7)
-    np.testing.assert_array_equal(out[:, 8], (kind == ROW_FRICTION) & (iteration < 3))
     # A free body over its speed limit keeps its direction and ends on the limit.
     speed = np.abs(r) * 3.0
     over = speed > b

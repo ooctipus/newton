@@ -98,8 +98,6 @@ class TestWideContactBatches(unittest.TestCase):
             1.0e-6,
             8,
             1.0,
-            0,
-            0,
             np.zeros((worlds, dofs), np.float32),
             np.zeros((worlds, dofs), np.float32),
             velocity.ravel(),
@@ -116,8 +114,8 @@ class TestWideContactBatches(unittest.TestCase):
             kernel = sparse_diagonal_kernel(
                 capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
             )
-            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:28], outputs=arrays[28:], block_dim=32, device=device)
-            results.append([arrays[i].numpy() for i in (4, 28, 29, 30)])
+            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:26], outputs=arrays[26:], block_dim=32, device=device)
+            results.append([arrays[i].numpy() for i in (4, 26, 27, 28)])
         for reference, candidate in zip(*results, strict=True):
             np.testing.assert_allclose(candidate, reference, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_array_equal(results[1][0][0, : row_counts[0]], 0.0)

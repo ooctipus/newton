@@ -104,8 +104,6 @@ def sweep_free_body_rows(
         "iterations": int(iterations),
         "omega": 1.0,
         "regularize": int(regularize),
-        "friction_start_iteration": 0,
-        "iteration_offset": 0,
         "v_out": wp.array(Z.astype(np.float64).T @ impulses.astype(np.float64), dtype=wp.float32, device=device),
     }
     kernel = sweep_routes.mf_gs_kernel(

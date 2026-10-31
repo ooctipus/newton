@@ -84,7 +84,7 @@ def contact_records(data, *, linked=False):
     return records
 
 
-def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iteration_offset=0, linked=False):
+def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, linked=False):
     """Retain the independent physical-coordinate oracle, including its factor."""
     dofs, width = (3, 3) if activity is not None else (18, 12)
     factor, indices, z, initial, bias, kinds, parents, mu, impulses, jacobian, response, incident, diag = _problem(
@@ -129,8 +129,6 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iterat
         "support_class_dof": indices[None].astype(np.int32),
         "iterations": np.array(8),
         "omega": np.array(omega),
-        "friction_start_iteration": np.array(delay),
-        "iteration_offset": np.array(iteration_offset),
         "reference_factor_delta": np.zeros((worlds, dofs), np.float32),
     }
     expected_velocity, expected_impulse = _sweep(
@@ -144,8 +142,6 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iterat
         mu,
         impulses,
         omega=omega,
-        friction_start=delay,
-        iteration_offset=iteration_offset,
         active_rows=True,
         iterations=8,
     )
@@ -218,8 +214,6 @@ class DeviceSolve:
             zeros((self.worlds, 1)),
             int(data["iterations"]),
             float(data["omega"]),
-            int(data["friction_start_iteration"]),
-            int(data["iteration_offset"]),
         ]
         if "contact_records" in self.kernel.adj.arg_types:
             self.records = array(contact_records(data, linked=self.linked))
@@ -269,16 +263,13 @@ def assert_output(test, data, delta, impulses, *, physical=None, reference=None)
             velocity = physical["initial"] + np.linalg.solve(physical["factor"].T, delta[world])
             np.testing.assert_allclose(velocity, physical["expected_velocity"], atol=3e-5, rtol=3e-4)
             np.testing.assert_allclose(impulses[world, :count], physical["expected_impulse"], atol=3e-5, rtol=3e-4)
-        # Delayed friction intentionally discards seeds without response; do not
-        # falsely impose the ordinary delta-lambda identity on that old behavior.
-        if int(data["iteration_offset"]) >= int(data["friction_start_iteration"]):
-            dense = np.zeros((count, delta.shape[1]), dtype=np.float64)
-            indices = data["support_class_dof"][data["support_row_class"][world, :count]]
-            for row in range(count):
-                valid = indices[row] >= 0
-                dense[row, indices[row, valid]] = data["row_factor"][world, row, valid]
-            expected_delta = dense.T @ (impulses[world, :count] - data["initial_impulses"][world, :count])
-            np.testing.assert_allclose(delta[world], expected_delta, atol=3e-5, rtol=3e-4)
+        dense = np.zeros((count, delta.shape[1]), dtype=np.float64)
+        indices = data["support_class_dof"][data["support_row_class"][world, :count]]
+        for row in range(count):
+            valid = indices[row] >= 0
+            dense[row, indices[row, valid]] = data["row_factor"][world, row, valid]
+        expected_delta = dense.T @ (impulses[world, :count] - data["initial_impulses"][world, :count])
+        np.testing.assert_allclose(delta[world], expected_delta, atol=3e-5, rtol=3e-4)
         for row in range(count):
             parent = int(data["row_parent"][world, row])
             if data["row_type"][world, row] != FRICTION or row != parent + 1:
@@ -328,7 +319,7 @@ _LINKED_LAYOUTS = {
 }
 
 
-def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, delay=0, iteration_offset=0, active=True):
+def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, active=True):
     """Build ring-linked patch rows in the DeviceSolve layout, with their physical sweep.
 
     ``pad`` separating, unlinked normals lead the units, moving records and rings
@@ -383,8 +374,6 @@ def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, delay=0, iteration
         "support_class_dof": np.arange(dofs, dtype=np.int32)[None],
         "iterations": np.array(8),
         "omega": np.array(omega),
-        "friction_start_iteration": np.array(delay),
-        "iteration_offset": np.array(iteration_offset),
         "reference_factor_delta": np.zeros((worlds, dofs), np.float32),
     }
     velocity, impulse = _sweep(
@@ -398,8 +387,6 @@ def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, delay=0, iteration
         mu,
         impulses,
         omega=omega,
-        friction_start=delay,
-        iteration_offset=iteration_offset,
         active_rows=active,
         linked_rows=True,
     )
@@ -484,7 +471,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                 )
             ]
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
-            + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
         for settings in cases:
             with self.subTest(settings=settings):
@@ -552,8 +538,6 @@ class TestSparseContactTriplets(unittest.TestCase):
             "support_class_dof": indices,
             "iterations": np.array(8),
             "omega": np.array(1.0),
-            "friction_start_iteration": np.array(0),
-            "iteration_offset": np.array(0),
             "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
         }
         physical = {
@@ -729,7 +713,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         round by the ring order, a six-member loaded ring whose anchors the active scan
         fuses, interleaved one- and three-row units and an unlinked anchor, with and
         without a 30-row lead that moves records and rings across 32-row words; zero and
-        seeded impulses, delayed friction and relaxation, in the linked active scan and in
+        seeded impulses and relaxation, in the linked active scan and in
         the full sweep. The six-member rings catch a fused radius, in either sweep, or a
         pair selection that stops after up to five members. The exit law stops both sweeps
         within rounding of each other: each change against the same floor as its ordinary update's.
@@ -737,8 +721,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         settings = (
             {},
             {"seeded": True, "omega": 0.7},
-            {"seeded": True, "omega": 1.2, "delay": 3, "iteration_offset": 1},
-            {"seeded": True, "delay": 3, "iteration_offset": 4},
+            {"seeded": True, "omega": 1.2},
             {"seeded": True, "omega": -0.5},
         )
         for (name, layout), pad, options, active in product(_LINKED_LAYOUTS.items(), (0, 30), settings, (True, False)):
@@ -798,7 +781,7 @@ def check_frozen_payload(path, *, device="cuda:0"):
     """
     with np.load(Path(path), allow_pickle=False) as payload:
         data = {key: payload[key].copy() for key in payload.files}
-    assert int(data["iterations"]) == 8 and int(data["iteration_offset"]) == 0
+    assert int(data["iterations"]) == 8
     assert data["row_factor"].shape[0] == len(data["world_ids"]) <= 512
     control = DeviceSolve(data, candidate=False, device=device)
     candidate = DeviceSolve(data, candidate=True, device=device)

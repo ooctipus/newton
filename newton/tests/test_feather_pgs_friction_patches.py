@@ -754,7 +754,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         with wp.ScopedDevice(device):
             for geometry in ("sphere", "capsule"):
-                drifts = []
                 for enabled in (False, True):
                     model, jaws, obj = _build_v_jaws(5.0, geometry)
                     kwargs = dict(_SQUEEZE_SOLVER)
@@ -795,13 +794,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                             retained.append(
                                 np.count_nonzero(solver.laws.friction_patches.current.source.numpy() >= 0) >= 2
                             )
-                    drifts.append(float(np.ptp(relative_height[100:])))
                     if enabled:
                         with self.subTest(geometry=geometry):
                             self.assertGreater(np.mean(retained), 0.8)
-                            self.assertLess(drifts[-1], 1.0e-4)
-                with self.subTest(geometry=geometry):
-                    self.assertGreater(drifts[0], 5 * drifts[1] + 5.0e-5)
+                            self.assertLess(float(np.ptp(relative_height[100:])), 1.0e-4)
 
     def test_default_friction_keeps_a_box_stack_at_rest(self):
         """Settle an ordinary stack without grasp-specific settings or anchor opt-in."""

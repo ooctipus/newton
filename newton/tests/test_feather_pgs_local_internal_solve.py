@@ -177,8 +177,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 *self._empty_mf_inputs(2, device),
                 iterations,
                 omega,
-                0,
-                0,
             ],
             outputs=[diagonal_out, impulses, velocity_out],
             block_dim=32,
@@ -249,8 +247,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                     *self._empty_mf_inputs(2, device),
                     iterations,
                     omega,
-                    0,
-                    0,
                 ]
             )
             worlds_per_block = warps_per_block * 32 // lanes_per_world
@@ -289,57 +285,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
         two_warp_queue = launch_variant(2, persistent_queue=True, active_count=1)
         for one_warp, two_warp in zip(one_warp_queue, two_warp_queue, strict=True):
             np.testing.assert_array_equal(two_warp, one_warp)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
-    def test_local_kernel_waits_for_delayed_friction_activation(self):
-        device = wp.get_cuda_device()
-        dof_count = 3
-        max_constraints = 3
-        candidate = wp.array([0], dtype=wp.int32, device=device)
-        lower = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
-        jacobian = wp.array(np.eye(dof_count, dtype=np.float32)[None], dtype=wp.float32, device=device)
-        impulses = wp.array([[1.0, 0.0, 0.0]], dtype=wp.float32, device=device)
-        diagonal = wp.zeros((1, max_constraints), dtype=wp.float32, device=device)
-        velocity = wp.array([0.0, 1.0, 0.0], dtype=wp.float32, device=device)
-        kernel = local_owned_kernel(max_constraints, max_constraints, dof_count, device.arch)
-        wp.launch_tiled(
-            kernel,
-            dim=[1],
-            inputs=[
-                candidate,
-                candidate,
-                1,
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([0], dtype=wp.int32, device=device),
-                wp.array([1], dtype=wp.int32, device=device),
-                wp.array([max_constraints], dtype=wp.int32, device=device),
-                lower,
-                lower,
-                *local_packed_rows(device, [0], jacobian.numpy()),
-                wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
-                wp.array(
-                    [[PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION]],
-                    dtype=wp.int32,
-                    device=device,
-                ),
-                wp.array([[-1, 0, 0]], dtype=wp.int32, device=device),
-                wp.array([[0.0, 0.5, 0.5]], dtype=wp.float32, device=device),
-                *self._empty_mf_inputs(1, device),
-                3,
-                1.0,
-                2,
-                0,
-            ],
-            outputs=[diagonal, impulses, velocity],
-            block_dim=32,
-            device=device,
-        )
-        wp.synchronize_device(device)
-
-        np.testing.assert_allclose(diagonal.numpy()[0], np.ones(max_constraints), rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(impulses.numpy()[0], [1.0, -0.5, 0.0], rtol=0.0, atol=1.0e-6)
-        np.testing.assert_allclose(velocity.numpy(), [0.0, 0.5, 0.0], rtol=0.0, atol=1.0e-6)
 
     @unittest.skipUnless(wp.is_cuda_available(), "local internal solve requires CUDA")
     def test_local_kernel_uses_patch_load_and_coupled_tangent_response(self):
@@ -397,8 +342,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 *self._empty_mf_inputs(1, device),
                 1,
                 1.0,
-                0,
-                0,
             ],
             outputs=[diagonal, impulses, velocity],
             block_dim=32,
@@ -521,8 +464,6 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 iterations,
                 1.0,
-                0,
-                0,
             ],
             outputs=[diagonal, dense_impulses, velocity],
             block_dim=64,
@@ -637,8 +578,6 @@ def _patch_ring_solves(device, load):
                 *TestFeatherPGSLocalInternalSolve._empty_mf_inputs(1, device),
                 1,
                 1.0,
-                0,
-                0,
             ],
             outputs=[diagonal, impulses, velocity, *operands],
             block_dim=32,

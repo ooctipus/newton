@@ -278,7 +278,7 @@ class TestContactUnits(unittest.TestCase):
                     self.assertEqual(blocks == 16, capacity <= 128, (capacity, blocks))
                     # The records follow the scalar inputs, before the outputs.
                     names = list(kernel.adj.arg_types)
-                    self.assertEqual(names[names.index("iteration_offset") + 1], "contact_records")
+                    self.assertEqual(names[names.index("omega") + 1], "contact_records")
         with self.assertRaises(TypeError):
             sparse_kernel(64, 18, 12, **TRIPLETS, contact_transaction="single")
 
@@ -335,7 +335,7 @@ class TestContactUnits(unittest.TestCase):
                 self.assertEqual(re.findall(r"s_impulse\[[^\]]*\](?! = )", rows), [])
                 self.assertEqual(re.findall(r"s_(?:rhs|diag)\[", rows), [])
                 self.assertIn("if (r == 0) SYNC();", rows)
-                self.assertEqual(rows.count("SYNC();"), 2)
+                self.assertEqual(rows.count("SYNC();"), 1)
                 self.assertRegex(snippet[start:], r"consumed_tangent = tangent;\s+SYNC\(\);")
 
     def test_route_record_names_no_transaction_cpu(self):
@@ -370,7 +370,6 @@ class TestContactUnitTwins(unittest.TestCase):
             [{"offset": value, "seeded": True} for value in (0, 29, 30)]
             + [{"activity": value} for value in ("late_activation", "deferred_activation", "seeded_retraction")]
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
-            + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
         for settings, capacity in product(cases, CAPACITIES):
             with self.subTest(capacity=capacity, **settings):
@@ -391,7 +390,7 @@ class TestContactUnitTwins(unittest.TestCase):
 
     def test_patch_rings_match_ordinary_and_reference_cuda(self):
         """Pool rings of one to six members, listed or walked, in the linked active scan and the full sweep."""
-        settings = ({}, {"seeded": True, "omega": 0.7}, {"seeded": True, "delay": 3, "iteration_offset": 1})
+        settings = ({}, {"seeded": True, "omega": 0.7})
         for (name, layout), pad, options, active, capacity in product(
             triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), CAPACITIES
         ):
@@ -485,8 +484,6 @@ class TestContactUnitTwins(unittest.TestCase):
                     "support_class_dof": indices,
                     "iterations": np.array(8),
                     "omega": np.array(1.0),
-                    "friction_start_iteration": np.array(0),
-                    "iteration_offset": np.array(0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
                 unit, ordinary, _ = self._twins(data)
@@ -593,8 +590,6 @@ class TestContactUnitTwins(unittest.TestCase):
                     "support_class_dof": indices,
                     "iterations": np.array(8),
                     "omega": np.array(1.0),
-                    "friction_start_iteration": np.array(0),
-                    "iteration_offset": np.array(0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
                 unit, ordinary, solve = self._twins(data, linked=True, active=active)

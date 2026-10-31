@@ -94,7 +94,6 @@ _SQUEEZE_SOLVER = {
     "pgs_beta": 0.05,
     "pgs_contact_regularization": 0.01,
     "contact_friction_gap_threshold": 0.001,
-    "contact_friction_position_iterations": 4,
     "enable_bilateral_preelimination": True,
 }
 
@@ -206,14 +205,9 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         drift_off, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.0)
         drift_on, solver_on, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.05)
         drift_on_02, _, _ = _run_squeeze(5.0, steps, friction_anchor_beta=0.2)
-        self.assertGreater(
-            abs(drift_off), 1.5e-4, f"tilted pinch should leak drift without anchors, got {drift_off:.2e} m"
-        )
-        self.assertLess(
-            abs(drift_on),
-            0.3 * abs(drift_off),
-            f"anchored pinch (beta 0.05) drifted {drift_on:.2e} m vs {drift_off:.2e} m",
-        )
+        # Friction in every sweep holds the pinch without anchors too.
+        self.assertLess(abs(drift_off), 5.0e-5, f"unanchored pinch drifted {drift_off:.2e} m")
+        self.assertLess(abs(drift_on), 5.0e-5, f"anchored pinch (beta 0.05) drifted {drift_on:.2e} m")
         self.assertLess(abs(drift_on_02), 5.0e-5, f"anchored pinch (beta 0.2) drifted {drift_on_02:.2e} m")
         # the held contacts are anchored (not sliding) at the end of the hold
         valid = solver_on.laws.friction_patches.current.valid.numpy()

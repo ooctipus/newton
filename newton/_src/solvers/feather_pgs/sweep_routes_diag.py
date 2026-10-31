@@ -41,7 +41,6 @@ from .sweep import (
     change_vote,
     contact_unit,
     end_sweep,
-    friction_gate,
     indent,
     material_arguments,
     row_visit,
@@ -79,8 +78,6 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("fused_limit_cfm", float),
     ("iterations", int),
     ("omega", float),
-    ("friction_start_iteration", int),
-    ("iteration_offset", int),
     ("fused_limit_lower_lambda", wp.array2d[float]),
     ("fused_limit_upper_lambda", wp.array2d[float]),
     ("v_out", wp.array[float]),
@@ -326,21 +323,17 @@ def sparse_diagonal_source(
         pad="    ",
     )
     loaded = " || ".join(f"{rows.peek(row)} != 0.0f" for row in ("i", *(f"i + {r}" for r in range(1, R))))
-    # While friction is delayed the visit of a contact's pair zeroes its other rows: its second tangent (and spin).
-    held = "".join(f"{rows.peek(f'head + {r}')} = 0.0f;" for r in range(2, R))
 
     def coupled(condition: str, advance: str = "i") -> str:
         """At row ``i``, when ``condition`` holds (``i`` heads a coupled contact unit with a pair) and the unit is
-        loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`), its second tangent only zeroed
-        while friction is delayed; the loop then moves ``advance`` past its rows. An unloaded unit falls through to
-        the loop's row visits."""
+        loaded, the unit on its Gram block in the warp's layout (:class:`_UnitPairZ`); the loop then moves ``advance``
+        past its rows. An unloaded unit falls through to the loop's row visits."""
         text = f"""if ({condition}) {{
     if ({loaded}) {{
         const int head = i;
 {unit_op.unit_terms("head", "        ")}
 {indent(unit_rows, "    ")}
 {unit_op.unit_apply("        ")}
-{friction_gate(str(FRICTION), held, warp.sync(), "        ", skip=False)}
         {advance} += {R - 1};
         continue;
     }}
@@ -373,16 +366,15 @@ def sparse_diagonal_source(
     # coordinate a coupled row touches, so they commute with the coupled rows. A contact's normal links the chain's
     # next contact through its free slot (-2 ends the chain). A contact is a normal row and, for a triple or a unit
     # that owns an anchor, the tangent pair after it, which names the normal as parent: the visits' kinds are known
-    # here, so each compiles to its own law. The pair is solved at its first tangent; the second tangent is only
-    # zeroed while friction is delayed. A visit that skips its row leaves its block (do-while), not the chain.
+    # here, so each compiles to its own law. The pair is solved at its first tangent. A visit that skips its row leaves
+    # its block (do-while), not the chain.
     independent_phase = ""
     if scheduled:
         pad = " " * 16
         tangents = f"""{pad}do {{
 {pad}    const int i = head + 1;
 {visit(Lanes(1), pad + "    ", kind=FRICTION, parent="head")}
-{pad}}} while (false);
-{friction_gate(str(FRICTION), held, "", pad, skip=False)}"""
+{pad}}} while (false);"""
         if contact_units:
             tangents = f"{pad}if ({owns_tangents('head', pad + '    ')}) {{\n{indent(tangents, '    ')}\n{pad}}}"
         independent_phase = f"""
@@ -590,7 +582,6 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     SYNC();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
-        const int global_iter = iteration_offset + iteration;
         int iteration_changed = 0;
 
 {limit_rows}
