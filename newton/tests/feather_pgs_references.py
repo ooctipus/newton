@@ -172,3 +172,119 @@ def stack_compression(count, mass, stiffness, corners=4, g=GRAVITY):
     """Analytic compression of each interface of a column of ``count`` equal boxes on compliant ground with
     ``corners`` equal springs per interface: interface ``j`` (0 the ground) compresses ``(count - j) m g / (n k)``."""
     return np.array([(count - j) * mass * g / (corners * stiffness) for j in range(count)])
+
+
+def drive_rollout(inertia, ke, kd, effort, target, *, dt, steps):
+    """The exact discrete step of one hinge on an effort-limited implicit drive, from rest at zero (float64).
+
+    The drive energy is Huber: ``I dv = h clamp(u0 - (K / h) dv, +-U)`` with ``K = h (h ke + kd)`` and ``u0 = -(ke (q - q* +
+    h v) + kd v)``, whose unique solution is the unsaturated step when its force lies inside the limit, else
+    ``dv = h sign(u0) U / I``. ``effort`` 0 is no limit. Returns ``(q, v)`` after each step.
+    """
+    q, v = 0.0, 0.0
+    stiffness = dt * (dt * ke + kd)
+    history = []
+    for _ in range(steps):
+        u0 = -(ke * (q - target + dt * v) + kd * v)
+        dv = dt * u0 / (inertia + stiffness)
+        force = u0 - stiffness / dt * dv
+        if effort > 0.0 and abs(force) > effort:
+            dv = dt * math.copysign(effort, force) / inertia
+        v += dv
+        q += dt * v
+        history.append((q, v))
+    return np.asarray(history)
+
+
+def spring_rollout(omega, q0, *, dt, steps):
+    """Symplectic Euler of an undamped oscillator ``q'' = -omega^2 q`` (float64): ``(q, v)`` after each step."""
+    q, v = float(q0), 0.0
+    history = []
+    for _ in range(steps):
+        v -= dt * omega * omega * q
+        q += dt * v
+        history.append((q, v))
+    return np.asarray(history)
+
+
+def rolling_speed(v0, gyration):
+    """The speed a body sliding at ``v0`` without spin ends rolling at, ``v0 / (1 + k)`` with ``I = k m r^2``: 5/7 for a
+    solid sphere, 2/3 for a disc (Coulomb's work is independent of ``mu``)."""
+    return v0 / (1.0 + gyration)
+
+
+def tipping_force(mass, width, height, g=GRAVITY):
+    """The force at ``height`` above the support that lifts a body of base ``width`` about its far edge."""
+    return mass * g * width / (2.0 * height)
+
+
+def patch_footprint(half_x, half_y, cells=64):
+    """Quadrature points of a uniform rectangular patch, with equal load weights."""
+    x = ((np.arange(cells) + 0.5) / cells - 0.5) * 2.0 * half_x
+    y = ((np.arange(cells) + 0.5) / cells - 0.5) * 2.0 * half_y
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    points = np.stack([xx, yy], -1).reshape(-1, 2)
+    return points, np.full(points.shape[0], 1.0 / points.shape[0])
+
+
+def patch_slide_spin(half_x, half_y, speed, spin, mu, *, g=GRAVITY, dt=2.0e-4, t_end=1.2):
+    """A flat uniform box sliding at ``speed`` along x and spinning at ``spin`` about z under Coulomb friction at every
+    point of its footprint (quadrature, a body of unit mass; the motion is independent of the mass).
+
+    Returns ``(x [m], yaw [rad], stop [s])``, the distance at the end, the yaw swept and the time the spin stops.
+    """
+    points, weights = patch_footprint(half_x, half_y)
+    inertia = ((2.0 * half_x) ** 2 + (2.0 * half_y) ** 2) / 12.0
+    v, w, x, theta, t, stop = np.array([speed, 0.0]), float(spin), np.zeros(2), 0.0, 0.0, None
+    while t < t_end and (np.linalg.norm(v) > 1.0e-3 or abs(w) > 1.0e-2):
+        c, s = math.cos(theta), math.sin(theta)
+        r = points @ np.array([[c, s], [-s, c]])
+        u = np.stack([v[0] - w * r[:, 1], v[1] + w * r[:, 0]], -1)
+        force = -(weights[:, None] * u / (np.linalg.norm(u, axis=1, keepdims=True) + 1.0e-9)) * mu * g
+        v = v + dt * force.sum(0)
+        w += dt * float(np.sum(r[:, 0] * force[:, 1] - r[:, 1] * force[:, 0])) / inertia
+        x += dt * v
+        theta += dt * w
+        t += dt
+        if stop is None and abs(w) < 1.0e-1:
+            stop = t
+    return float(np.linalg.norm(x)), theta, t if stop is None else stop
+
+
+def pendulum_rollout(lengths, masses, angles, *, t_end, g=GRAVITY, dt=1.0e-4):
+    """A planar chain of point masses on rigid massless links in gravity, by RK4 in float64 (one or two links).
+
+    ``angles`` are each link's angle from the downward vertical at rest in time. Returns the angles at ``t_end``.
+    """
+    l1 = lengths[0]
+    m1 = masses[0]
+    two = len(lengths) == 2
+    l2, m2 = (lengths[1], masses[1]) if two else (0.0, 0.0)
+
+    def deriv(y):
+        a1, a2, w1, w2 = y
+        delta = a1 - a2
+        total = m1 + m2
+        h = np.array(
+            [[total * l1 * l1, m2 * l1 * l2 * math.cos(delta)], [m2 * l1 * l2 * math.cos(delta), m2 * l2 * l2]]
+        )
+        f = np.array(
+            [
+                -m2 * l1 * l2 * w2 * w2 * math.sin(delta) - total * g * l1 * math.sin(a1),
+                m2 * l1 * l2 * w1 * w1 * math.sin(delta) - m2 * g * l2 * math.sin(a2),
+            ]
+        )
+        if not two:
+            accel = np.array([f[0] / h[0, 0], 0.0])
+        else:
+            accel = np.linalg.solve(h, f)
+        return np.array([w1, w2, accel[0], accel[1]])
+
+    y = np.array([angles[0], angles[1] if two else 0.0, 0.0, 0.0])
+    for _ in range(round(t_end / dt)):
+        k1 = deriv(y)
+        k2 = deriv(y + 0.5 * dt * k1)
+        k3 = deriv(y + 0.5 * dt * k2)
+        k4 = deriv(y + dt * k3)
+        y = y + dt / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return y[:2] if two else y[:1]
