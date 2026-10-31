@@ -454,7 +454,7 @@ class TestHeldTreeChains(unittest.TestCase):
                 with (
                     unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: 64),
                     unittest.mock.patch.object(
-                        tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains, reference=False: on_chains
+                        tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains: on_chains
                     ),
                 ):
                     solver = _make_solver(model, True)

@@ -1379,24 +1379,25 @@ def reference(physics: Physics, route: Route, device) -> Reference:
 # ---------------------------------------------------------------------------------------------------------------------
 
 _MF = {}
-# Dense storage and ordinary dynamics: the route of the general placement's reference.
-_ORDINARY = {"storage": "dense", "evaluator": "ordinary"}
+# Dense storage: the route of the general placement's reference.
+_DENSE = {"storage": "dense"}
 
 
 REFERENCE_CUDA = Route(
     "reference",
     "cuda",
-    # The plain matrix-free Gauss-Seidel sweep over ordinary dynamics and rows: the general placement declines the
-    # local, paired and sparse-diagonal owners, and every world is solved (no resolved-world claim).
+    # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the local,
+    # paired and sparse-diagonal owners, and every world is solved (no resolved-world claim). The tree factor itself
+    # answers to the float64 mass matrix (test_feather_pgs_tree_invariants).
     options=_MF,
-    pins={**_ORDINARY, "hinv_jt_kernel": "tiled", "placement": "general", "claims": ()},
+    pins={**_DENSE, "placement": "general", "claims": ()},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
         "local_solve.enabled": False,
         "paired_response.enabled": False,
         "sparse_diagonal.enabled": False,
-        "held_tree.owner": None,
+        "held_tree.owner": "mixed",
         "resolved_worlds.enabled": False,
     },
 )
@@ -1408,7 +1409,7 @@ MF_GENERAL = Route(
     "cuda",
     # The clutter scenes' route: the matrix-free sweep over ordinary dynamics.
     options=_MF,
-    pins=_ORDINARY,
+    pins={**_DENSE, "evaluator": "ordinary"},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers": None, "held_tree.owner": None},
 )
 MF_HELD = Route(
@@ -1543,13 +1544,13 @@ PAIRED_FOREST = Route(
 
 
 # The CPU's route: the held tree and the general row (case K6) at the CPU's lane width, against the CUDA reference's
-# route on the CPU (whose dense kernels are the CPU's own).
+# route on the CPU.
 REFERENCE_CPU = Route(
     "reference_cpu",
     "cpu",
     options=_MF,
-    pins={**_ORDINARY, "placement": "general", "claims": ()},
-    expect={"sweep.route": "matrix_free_gs", "held_tree.owner": None},
+    pins={**_DENSE, "placement": "general", "claims": ()},
+    expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "mixed"},
 )
 CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})
 
@@ -1741,19 +1742,7 @@ def cuda_groups() -> list:
         Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL)),
         Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
-        Group(
-            # Pre-elimination solves the iterative connect rows' problem exactly: compare with the iterative reference.
-            _physics(scenes.four_bar(), None, 16),
-            ref,
-            (
-                MF_DEFAULT.but(
-                    "mf_preelimination",
-                    options={"enable_bilateral_preelimination": True},
-                    expect={"dynamics.preelimination": True},
-                ),
-            ),
-            tag="preelimination",
-        ),
+        Group(_physics(scenes.four_bar(loop="revolute"), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.mimic_pair(), None, 16), ref, (MF_HELD,)),
         Group(
             _physics(scenes.mimic_pair(), None, 16, "velocity_limits", **vlimits),

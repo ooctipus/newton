@@ -199,14 +199,14 @@ def factory_calls():
         )
 
 
-def _schedules(layout, chain, reference=False):
+def _schedules(layout, chain):
     """A held layout's scan schedules: every scan on the heavy chains (``chain``), the shared-memory jumps and
-    depth levels of the reference forms, or the warp schedules (two warps: shared memory and levels)."""
+    depth levels of two warps, or the warp schedules (two warps: shared memory and levels)."""
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import tree_scan as ts  # noqa: PLC0415
 
     schedule = ts.Schedule
-    if reference or (layout.lanes > 32 and not chain):
+    if layout.lanes > 32 and not chain:
         return native.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
     if chain:
         return native.HeldSchedules(*(schedule.HEAVY_CHAIN,) * 4)
@@ -348,19 +348,15 @@ def held_tree_calls():
         finish_options = {key: value for key, value in repair_options.items() if key != "motion_velocity"}
         variants = [{}]
         if layout_name in switched:
-            variants += [{"reference": True}, {"clocked": True}, {"body_velocity": False}]
+            variants += [{"clocked": True}, {"body_velocity": False}]
+        schedules = _schedules(tree, chain)
         for options in variants:
-            reference = options.get("reference", False)
-            schedules = _schedules(tree, chain, reference)
-            state_options = {
-                "body_velocity": True,
-                **{key: value for key, value in options.items() if key != "reference"},
-            }
+            state_options = {"body_velocity": True, **options}
             kwargs = {**layout, **repair_options, **state_options}
             yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
             kwargs = {**layout, **finish_options, **state_options}
             yield "tree_kinetic_state.get_state_kernel", state, (True, schedules), kwargs
-            if options.keys() <= {"reference", "clocked"}:
+            if options.keys() <= {"clocked"}:
                 # The CUDA predictor: it holds the twist publication where the layout admits it.
                 twists = native.publishes_twists(tree, schedules, cuda=True)
                 kwargs = {**layout, "response": response, "twists": twists, **options}

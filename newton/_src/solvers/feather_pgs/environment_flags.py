@@ -49,12 +49,6 @@ _READ = (
     ("FEATHER_PGS_SYNC_TIMINGS", "diagnostic", _SOLVER, "1, true, yes or on prints synchronized per-stage timings."),
     ("FEATHER_PGS_SYNC_TIMINGS_COUNT", "diagnostic", _SOLVER, "Number of steps with synchronized timings (default 1)."),
     ("FEATHER_PGS_SYNC_TIMINGS_START", "diagnostic", _SOLVER, "First step with synchronized timings (default 20)."),
-    (
-        "FEATHER_PGS_TREE_REFERENCE",
-        "reference",
-        ("tree_kinetic_owner",),
-        "=1 selects the serial held solve, level reduction and shared-memory scans in held-tree kernels.",
-    ),
 )
 
 FLAGS = declare(*sorted((_flag(*flag) for flag in _READ), key=lambda flag: flag.name))

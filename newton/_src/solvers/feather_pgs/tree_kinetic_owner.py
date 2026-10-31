@@ -55,23 +55,13 @@ def _bank_pointers(state):
     return state.joint_q.ptr, state.joint_qd.ptr
 
 
-def kernel_switches():
-    """Read the tree kernels' comparison and instrumentation switches, once per owner.
+def stage_clocks_on() -> bool:
+    """Read the tree kernels' instrumentation switch, once per owner.
 
-    ``FEATHER_PGS_TREE_REFERENCE=1`` selects the reference forms the A/B tests
-    compare against (the serial one-lane held solve, the depth-level subtree
-    reduction and the shared-memory scans); ``FEATHER_PGS_STAGE_CLOCKS=1`` adds
-    per-stage cycle counters. Both change the emitted code, so an owner reads
-    them at construction and passes them to every kernel factory as arguments,
-    which keeps them in the factories' cache keys.
-
-    Returns:
-        ``(reference, clocked)``.
+    ``FEATHER_PGS_STAGE_CLOCKS=1`` adds per-stage cycle counters. It changes the emitted code, so an owner reads it
+    at construction and passes it to every kernel factory as an argument, which keeps it in the factories' cache keys.
     """
-    return (
-        os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1",
-        os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1",
-    )
+    return os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"
 
 
 def launch_switches(pins=None):
@@ -173,7 +163,6 @@ class TreeKineticState:
         chains=True,
         complete=True,
         response="sparse",
-        reference=None,
         clocked=None,
         skip=None,
         classify=None,
@@ -208,13 +197,8 @@ class TreeKineticState:
         # finish inside a capture; the next begin consumes it.
         self._continuity = None
         self.group_count = sparse_owner.plan.group_to_art.size
-        # Kernel-selecting switches: a composite owner passes the values it read
-        # for all of its groups; a direct construction reads them here.
-        if reference is None or clocked is None:
-            read_reference, read_clocked = kernel_switches()
-            reference = read_reference if reference is None else reference
-            clocked = read_clocked if clocked is None else clocked
-        self.reference, self.clocked = bool(reference), bool(clocked)
+        # A composite owner passes what it read for all of its groups; a direct construction reads it here.
+        self.clocked = stage_clocks_on() if clocked is None else bool(clocked)
         if self.clocked:
             solver._stage_clocks = wp.zeros((self.group_count, 28), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
@@ -259,7 +243,7 @@ class TreeKineticState:
         self.chains = bool(chains) and not self.layout.forest
         lanes = native.held_lanes(tree, self.group_count, cuda=device.is_cuda)
         self.layout = dataclasses.replace(self.layout, lanes=lanes)
-        self.schedules = native.held_schedules(tree, lanes, chains=self.chains, reference=self.reference)
+        self.schedules = native.held_schedules(tree, lanes, chains=self.chains)
         if self.group_count % self.layout.pack:
             raise ValueError("Tree kinetic lane packing requires whole blocks of trees")
         # Forest metadata (a single tree is the one-root case of the same arrays).
@@ -419,7 +403,6 @@ class TreeKineticState:
             self.schedules,
             layout=layout,
             response=self._response,
-            reference=self.reference,
             clocked=self.clocked,
             twists=self._predicts_twists,
         )

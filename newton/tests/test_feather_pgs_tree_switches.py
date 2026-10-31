@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The tree kernels' reference and stage-clock switches are factory arguments, set once by the owner."""
+"""The tree kernels' stage-clock switch is a factory argument, set once by the owner."""
 
 import ast
 import os
@@ -21,7 +21,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 
-# A packed, warp-sized fixed-root tree: both switches change every kernel built for it.
+# A packed, warp-sized fixed-root tree: the switch changes every kernel built for it.
 _LAYOUT = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0), lanes=8)
 _TREE = TreePlan.build([-1, 0, 1, 0], [0, 1, 1, 1])
 # Modules that generate the tree kernels' code; owners read the environment for them, at construction.
@@ -34,15 +34,12 @@ _GENERATION_MODULES = (
 )
 
 
-def _switches(reference, clocked):
-    return patch.dict(
-        os.environ,
-        {"FEATHER_PGS_TREE_REFERENCE": str(int(reference)), "FEATHER_PGS_STAGE_CLOCKS": str(int(clocked))},
-    )
+def _switches(clocked):
+    return patch.dict(os.environ, {"FEATHER_PGS_STAGE_CLOCKS": str(int(clocked))})
 
 
-def _kernels(reference, clocked):
-    schedules = tree_kinetic_state.held_schedules(_TREE, _LAYOUT.lanes, chains=False, reference=reference)
+def _kernels(clocked):
+    schedules = tree_kinetic_state.held_schedules(_TREE, _LAYOUT.lanes, chains=False)
     return (
         tree_kinetic_state.get_state_kernel(False, schedules, layout=_LAYOUT, clocked=clocked),
         tree_kinetic_state.get_state_kernel(True, schedules, layout=_LAYOUT, clocked=clocked),
@@ -50,7 +47,6 @@ def _kernels(reference, clocked):
             schedules,
             layout=_LAYOUT,
             response="cholesky",
-            reference=reference,
             clocked=clocked,
             twists=tree_kinetic_state.publishes_twists(_LAYOUT, schedules, cuda=True),
         ),
@@ -143,22 +139,22 @@ def _cached_environment_reads(package):
 
 class TestTreeKernelSwitches(unittest.TestCase):
     def test_switches_select_the_kernels_by_argument(self):
-        """Build four different repair, finish and predictor kernels for the four switch combinations."""
-        built = [_kernels(reference, clocked) for reference in (False, True) for clocked in (False, True)]
+        """Build two different repair, finish and predictor kernels for the switch's two values."""
+        built = [_kernels(clocked) for clocked in (False, True)]
         for position in range(3):
-            self.assertEqual(len({kernels[position].module.name for kernels in built}), 4)
+            self.assertEqual(len({kernels[position].module.name for kernels in built}), 2)
 
     def test_factories_never_read_the_environment(self):
         """Rebuild identical kernels from the same arguments whatever the environment holds."""
-        expected = _kernels(False, False)
-        with _switches(True, True):
+        expected = _kernels(False)
+        with _switches(True):
             for factory in (
                 tree_kinetic_state.get_helpers,
                 tree_kinetic_state.get_state_kernel,
                 tree_kinetic_state.get_predictor_kernel,
             ):
                 factory.cache_clear()
-            rebuilt = _kernels(False, False)
+            rebuilt = _kernels(False)
         # Warp keeps one kernel object per emitted content, so equal code is the same object.
         for kernel, again in zip(expected, rebuilt, strict=True):
             self.assertIs(again, kernel)
@@ -184,7 +180,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory)
             (package / "switches.py").write_text(
-                'import os\n\n\ndef reference():\n    return os.environ.get("FEATHER_PGS_TREE_REFERENCE") == "1"\n'
+                'import os\n\n\ndef reference():\n    return os.environ.get("FEATHER_PGS_STAGE_CLOCKS") == "1"\n'
             )
             (package / "factories.py").write_text(
                 "import functools\n\nfrom . import switches\nfrom .switches import reference\n\n\n"
@@ -201,36 +197,22 @@ class TestTreeKernelSwitches(unittest.TestCase):
             )
 
     def test_owners_in_one_process_build_their_own_kernels(self):
-        """Bind each owner's own kernels when owners are built one after another under each switch.
-
-        On CPU the layouts are fixed (no lane timing), so the switch is the only
-        difference between the owners; the held-solve and subtree-reduce A/B tests
-        build their arms in this order.
-        """
+        """Bind each owner's own kernels when owners are built one after another under each switch value."""
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         owners = {}
-        for name, reference, clocked in (
-            ("reference", True, False),
-            ("default", False, False),
-            ("clocked", False, True),
-        ):
-            with _switches(reference, clocked):
-                owners[name] = HeldTree(solver)
-            self.assertEqual((owners[name].reference, owners[name].clocked), (reference, clocked))
-            for group in owners[name].groups:
-                self.assertEqual((group.reference, group.clocked), (reference, clocked))
+        for clocked in (False, True):
+            with _switches(clocked):
+                owners[clocked] = HeldTree(solver)
+            self.assertEqual(owners[clocked].clocked, clocked)
+            for group in owners[clocked].groups:
+                self.assertEqual(group.clocked, clocked)
         # Outside the patch: the owners keep what they read at construction.
-        self.assertTrue(owners["reference"].reference)
         self.assertIsNotNone(getattr(solver, "_stage_clocks", None))
-        self.assertTrue(owners["default"].groups)
-        for reference, default, clocked in zip(
-            owners["reference"].groups, owners["default"].groups, owners["clocked"].groups, strict=True
-        ):
-            self.assertEqual(reference.layout, default.layout)
+        for default, clocked in zip(owners[False].groups, owners[True].groups, strict=True):
+            self.assertEqual(clocked.layout, default.layout)
             for kernel in ("repair_kernel", "finish_kernel", "predictor_kernel"):
                 with self.subTest(layout=default.layout.root_families, kernel=kernel):
-                    self.assertIsNot(getattr(reference, kernel), getattr(default, kernel))
                     self.assertIsNot(getattr(clocked, kernel), getattr(default, kernel))
 
     def test_cpu_owner_publishes_forward_kinematics(self):

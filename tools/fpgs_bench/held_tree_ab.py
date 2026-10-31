@@ -126,7 +126,7 @@ def _heavy_chains():
             raise ValueError("the heavy chains do not pack into two warps")
         return max(packing.lanes, 32 if tree.count <= 32 else 64)
 
-    def schedules(tree, lanes, *, chains, reference=False):
+    def schedules(tree, lanes, *, chains):
         return tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)
 
     with (

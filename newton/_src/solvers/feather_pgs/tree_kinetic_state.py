@@ -386,15 +386,12 @@ def held_lanes(tree: TreePlan, groups: int, *, cuda: bool = True) -> int:
     return lanes
 
 
-def held_schedules(tree: TreePlan, lanes: int, *, chains: bool, reference: bool = False) -> HeldSchedules:
+def held_schedules(tree: TreePlan, lanes: int, *, chains: bool) -> HeldSchedules:
     """The schedules of a held group's scans at ``lanes`` lanes per tree, from its tree's data
     (:func:`.tree_scan.choose_schedule`).
 
-    ``chains``: the launch may give each tree its own block, which the heavy-chain scans address. ``reference``
-    selects the shared-memory jumps and depth levels the A/B tests compare against.
+    ``chains``: the launch may give each tree its own block, which the heavy-chain scans address.
     """
-    if reference:
-        return HeldSchedules(ts.Schedule.JUMP_SMEM, ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL, ts.Schedule.LEVEL)
     own_block = chains and lanes >= 32
 
     def choose(combine, direction):
@@ -1507,14 +1504,13 @@ def get_predictor_kernel(
     *,
     layout: TreeLayout = REFERENCE_LAYOUT,
     response="sparse",
-    reference: bool = False,
     clocked: bool = False,
     twists: bool,
 ):
     """Apply current external/control force and both unchanged W actions.
 
-    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``reference`` keeps the
-    serial one-lane held solve on CUDA; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`);
+    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``clocked`` adds the
+    predictor stage counters (see :func:`get_helpers`);
     ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds.
     """
     reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
@@ -1571,8 +1567,7 @@ def get_predictor_kernel(
         # (one lane per row, one shuffle per step); larger families and the
         # CPU twin keep the serial one-lane law. A prescribed root (family 0)
         # responds with zero and a diagonal-mass root (negative family) with
-        # its stored inverse. ``reference`` keeps the serial form on CUDA for
-        # comparison (the owner reads FEATHER_PGS_TREE_REFERENCE at construction).
+        # its stored inverse.
         roots = len(layout.roots)
         if not layout.forest:
             families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
@@ -1608,7 +1603,7 @@ def get_predictor_kernel(
                 + held.leave(white, white)
                 + "\n}"
             )
-            if family <= min(32, layout.lanes) and not reference:
+            if family <= min(32, layout.lanes):
                 parallel.append(
                     response_operator.LaneCholeskySolve(family, pointer).solve(
                         f"$SIX_BODIES+{offset}", f"$WHITE+{offset}"

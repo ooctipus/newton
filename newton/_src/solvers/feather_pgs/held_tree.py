@@ -24,7 +24,7 @@ from .response_builds_dense import dense_factor_kernel, dense_factor_plan
 from .response_builds_rows import sparse_factor_kernel
 from .route_table import capable
 from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
-from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
+from .tree_kinetic_owner import TreeKineticState, launch_switches, proof_runs, stage_clocks_on
 from .tree_kinetic_plan import FREE_JOINTS, make_plan, tree_joints
 from .tree_kinetic_state import HeldResponse
 from .tree_plan import TreePlan, local_parents
@@ -649,7 +649,7 @@ class HeldTree:
     def __init__(self, solver, *, admission=None):
         self.solver = solver
         # One read of the kernel and launch switches for every group this owner composes.
-        self.reference, self.clocked = kernel_switches()
+        self.clocked = stage_clocks_on()
         skip, classify = launch_switches(solver._route_pins)
         self.scalar = None
         if not (solver.model.joint_count and solver.model.articulation_count):
@@ -665,7 +665,6 @@ class HeldTree:
             group = TreeKineticState(
                 operator,
                 admission=admission,
-                reference=self.reference,
                 clocked=self.clocked,
                 skip=skip,
                 classify=classify,
@@ -720,7 +719,6 @@ class HeldTree:
                 chains=False,
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
-                reference=self.reference,
                 clocked=self.clocked,
                 skip=skip,
                 classify=classify,
