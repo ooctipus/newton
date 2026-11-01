@@ -534,11 +534,12 @@ class TestSparseContacts(unittest.TestCase):
                     def contact_bias(threshold):
                         wp.launch(
                             compute_world_contact_bias,
-                            dim=9,
+                            dim=(1, 9),
                             inputs=[
                                 reference_rows,
                                 incident,
                                 count,
+                                9,
                                 9,
                                 0.01,
                                 law["speculative_scale"],
@@ -644,11 +645,12 @@ class TestSparseContacts(unittest.TestCase):
         )
         wp.launch(
             compute_world_contact_bias,
-            dim=18,
+            dim=(3, 6),
             inputs=[
                 field_group.replace(rows, rhs=reference_rhs, row_w=array(np.full(shape, -9.0))),
                 array(np.zeros(shape)),
                 prefix_count,
+                6,
                 6,
                 0.0123,
                 1.0,
@@ -896,7 +898,7 @@ class TestSparseContacts(unittest.TestCase):
             rhs = _full((1, row_count), -7.0)
             wp.launch(
                 compute_world_contact_bias,
-                dim=row_count,
+                dim=(1, row_count),
                 inputs=[
                     field_group.upload(
                         dense_rows.DenseRows,
@@ -912,6 +914,7 @@ class TestSparseContacts(unittest.TestCase):
                     ),
                     incident,
                     count,
+                    row_count,
                     row_count,
                     0.01,
                     1.0,

@@ -227,11 +227,12 @@ def _run_general(data, layout, beta):
     def right_hand_sides(threshold):
         wp.launch(
             kernels.compute_world_contact_bias,
-            dim=WORLDS * ROWS,
+            dim=(WORLDS, ROWS),
             inputs=[
                 records,
                 incident,
                 layout.counts,
+                ROWS,
                 ROWS,
                 data.dt,
                 data.speculative_scale,

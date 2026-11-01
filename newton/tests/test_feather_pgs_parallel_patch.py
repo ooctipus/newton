@@ -855,11 +855,12 @@ def _general_bias(solver, rows, dt):
     )
     wp.launch(
         compute_world_contact_bias,
-        dim=rhs.shape[0] * rhs.shape[1],
+        dim=(rhs.shape[0], rhs.shape[1]),
         inputs=[
             records,
             wp.zeros_like(rhs),
             count,
+            rhs.shape[1],
             rhs.shape[1],
             dt,
             solver.options.contact_speculative_scale,

@@ -140,6 +140,10 @@ _select_hinv_jt_chunk_size = _execution_plan._select_hinv_jt_chunk_size
 _FeatherPGSExecutionPlan = _execution_plan._FeatherPGSExecutionPlan
 
 
+BIAS_LANES = 256
+"""The most threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`): a block."""
+
+
 class SolverFeatherPGS(SolverBase):
     """A semi-implicit integrator using symplectic Euler that operates
     on reduced (also called generalized) coordinates to simulate articulated rigid body dynamics
@@ -2202,14 +2206,17 @@ class SolverFeatherPGS(SolverBase):
             or self.placement.keyed_rows is not None
         ):
             return  # These rows write their own right-hand sides.
+        # A world's lanes: its capacity, up to a block.
+        lanes = min(self.placement.dense_max_constraints, BIAS_LANES)
         wp.launch(
             compute_world_contact_bias,
-            dim=self.forest.world_count * self.placement.dense_max_constraints,
+            dim=(self.forest.world_count, lanes),
             inputs=[
                 bind_dense_rows(self.placement),
                 self.placement.row_incident,
                 self.placement.constraint_count,
                 self.placement.dense_max_constraints,
+                lanes,
                 dt,
                 self.options.contact_speculative_scale,
                 self.laws.contact_w,

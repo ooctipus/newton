@@ -254,8 +254,8 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
         )
         wp.launch(
             kernels.compute_world_contact_bias,
-            dim=worlds * rows,
-            inputs=[records, incident, counts, rows, 0.01, 1.0, 1.0, 0.0, 0, 0],
+            dim=(worlds, rows),
+            inputs=[records, incident, counts, rows, rows, 0.01, 1.0, 1.0, 0.0, 0, 0],
             device="cpu",
         )
         # A restitutive impact: rhs = e * J v (target 0, the threshold 0 admits every approaching row).

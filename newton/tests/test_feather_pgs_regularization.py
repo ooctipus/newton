@@ -331,11 +331,12 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
         )
         wp.launch(
             compute_world_contact_bias,
-            dim=1,
+            dim=(1, 1),
             inputs=[
                 rows,
                 wp.zeros_like(row_w),
                 wp.array([1], dtype=wp.int32, device=device),
+                1,
                 1,
                 DT,
                 1.0,

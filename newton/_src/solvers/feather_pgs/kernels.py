@@ -2172,6 +2172,7 @@ def compute_world_contact_bias(
     row_incident: wp.array2d[float],
     world_constraint_count: wp.array[int],
     max_constraints: int,
+    lanes: int,
     dt: float,
     contact_speculative_scale: float,
     contact_w: float,
@@ -2189,37 +2190,38 @@ def compute_world_contact_bias(
     its rhs and compliance ``eps``, from which the sweeps form its weight, :func:`.sweep.row_weight`) keeps
     its rhs.
 
-    One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
+    A world's ``lanes`` threads stride over its live rows (``dim = (world_count, lanes)``): the grid follows the
+    worlds, and a world's slots past its rows cost no thread beyond its lanes. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
     """
-    tid = wp.tid()
-    world = tid // max_constraints
-    i = tid - world * max_constraints
-    if i >= world_constraint_count[world]:
+    world, lane = wp.tid()
+    count = wp.min(world_constraint_count[world], max_constraints)
+    if lane >= count:
         return
     line = rows.first[world]
-    kind = rows.row_type[line, i]
-    if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        if rows.row_eps[line, i] > 0.0:
-            return
     inv_dt = 1.0 / dt
-    phi = rows.phi[line, i]
-    target = rows.target[line, i]
-    rhs, row_w = row_rhs(
-        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
-    )
-    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        restitution = rows.restitution[line, i]
-        if restitution > 0.0:
-            fires, bounce = contact_restitution_rhs(
-                phi, row_incident[line, i] - target, target, restitution, dt, restitution_velocity_threshold
-            )
-            if fires:
-                rhs = bounce
-                row_w = 1.0
-    rows.rhs[line, i] = rhs
-    if weighted != 0:
-        rows.row_w[line, i] = row_w
+    for i in range(lane, count, lanes):
+        kind = rows.row_type[line, i]
+        if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+            if rows.row_eps[line, i] > 0.0:
+                continue
+        phi = rows.phi[line, i]
+        target = rows.target[line, i]
+        rhs, row_w = row_rhs(
+            kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
+        )
+        if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+            restitution = rows.restitution[line, i]
+            if restitution > 0.0:
+                fires, bounce = contact_restitution_rhs(
+                    phi, row_incident[line, i] - target, target, restitution, dt, restitution_velocity_threshold
+                )
+                if fires:
+                    rhs = bounce
+                    row_w = 1.0
+        rows.rhs[line, i] = rhs
+        if weighted != 0:
+            rows.row_w[line, i] = row_w
 
 
 @wp.kernel

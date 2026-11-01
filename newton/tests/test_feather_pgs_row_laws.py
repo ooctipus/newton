@@ -77,10 +77,11 @@ def test_row_rhs_matches_world_contact_bias(test, device):
         with test.subTest(dt=dt, contact_spec=contact_spec, contact_w=contact_w):
             out = call(
                 kernels.compute_world_contact_bias,
-                worlds * rows,
+                (worlds, rows),
                 device,
                 world_constraint_count=np.full(worlds, rows, dtype=np.int32),
                 max_constraints=rows,
+                lanes=rows,
                 world_phi=phi,
                 world_row_beta=beta,
                 world_row_type=kind,
@@ -369,10 +370,11 @@ def test_restitution_matches_matrix_free_restitution(test, device):
     }
     out = call(
         kernels.compute_world_contact_bias,
-        worlds * rows,
+        (worlds, rows),
         device,
         world_constraint_count=np.full(worlds, rows, dtype=np.int32),
         max_constraints=rows,
+        lanes=rows,
         world_row_beta=beta,
         contact_speculative_scale=1.0,
         contact_w=0.5,

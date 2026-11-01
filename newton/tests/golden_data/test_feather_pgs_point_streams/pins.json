@@ -43,7 +43,7 @@
   "kernels.compact_local_pair_candidates": "ca308dd43002026e0dff0e37cfd3bd20cd861c3cd88ac88fe55cacc1757f207d",
   "kernels.compute_com_transforms": "10a82d03e9ad7d29aef27da97019cece181e199e505186e993fbefaeeda6d86a",
   "kernels.compute_contact_linear_force_from_impulses": "411282442c7a1f78aef01a1ae13218052b302b3d573d38c91463e1b6bd789ba8",
-  "kernels.compute_world_contact_bias": "9c1db2dd9e82bd6966db624dd0e4e3138b2a7e9f49d3b5653d8b27c32a30b0cf",
+  "kernels.compute_world_contact_bias": "f58262cd133d0f705e0963511533bd2821f86a5d8516f35b457879ff8da201f0",
   "kernels.damp_free_root_spin": "a1b3474a5fe0ff5b983fb3babff06bbf336d94e861b667251540fe3705948a1e",
   "kernels.finalize_constraint_counts_with_status": "8f04d6eaacfb824d56e65b10d1f9db92df86ff8d88c0f69cc8f7994ab39ef9b6",
   "kernels.gather_dense_warmstart": "bee8f16f2c082ed7a2c9f263a213d518fcc89fd120647194d63ef706196a7aca",
