@@ -21,6 +21,7 @@ publish).
 
 from __future__ import annotations
 
+import functools
 import warnings
 
 import numpy as np
@@ -29,6 +30,7 @@ import warp as wp
 from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index, response_builds_rows
 from .conditioning import ArmatureFloor, conditioning_armature
+from .device_preludes import DevicePrelude, substitute
 from .field_group import SolverArrays
 from .joint_table import JointTable
 from .kernels import (
@@ -58,7 +60,7 @@ from .sparse_mass_matrix import factor_indices
 from .spatial_laws import drive_force, drive_stiffness
 from .tree_plan import TreePlan
 
-__all__ = ["TreeFactor", "prepare_augmented_drives"]
+__all__ = ["WALK_COORDINATE", "WALK_LINK", "TreeFactor", "prepare_augmented_drives", "walk_prelude"]
 
 
 @wp.kernel
@@ -1198,3 +1200,165 @@ class TreeWalk:
             return np.zeros((*w_k.shape[1:], *w_l.shape[1:]), dtype=self.dtype)
         gamma, _ = self.up(c, np.eye(6, dtype=self.dtype))
         return self.carry(k, w_k, c).T @ (gamma.T @ gamma) @ self.carry(l, w_l, c)
+
+    def device_data(self) -> tuple[np.ndarray, np.ndarray]:
+        """The walk's data as the device walks it (:func:`walk_prelude`), float32: each coordinate's
+        :data:`WALK_COORDINATE` floats ``s``, ``ut`` and ``1 / ell``, and each body's :data:`WALK_LINK` floats, the
+        offset to its parent's frame."""
+        data = np.zeros((self.s.shape[0], WALK_COORDINATE), dtype=np.float32)
+        data[:, 0:6], data[:, 6:12], data[:, 12] = self.s, self.ut, 1.0 / self.ell
+        link = np.zeros((self.parent.size, WALK_LINK), dtype=np.float32)
+        link[:, 0:3] = self.offset
+        return data, link
+
+    @property
+    def path_table(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """The tree's path table (:func:`walk_prelude`): each body's parent, and each body's first coordinate with the
+        count after the last."""
+        return tuple(int(b) for b in self.parent), tuple(int(c) for c in self.first)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The walk on the device (FL3.1): a lane per seed up, a lane per tree down, the path table in constant memory
+# ---------------------------------------------------------------------------------------------------------------------
+
+WALK_COORDINATE = 16
+"""Floats per coordinate of the device walk's data: ``s`` and ``ut`` (``(v, w)``, six each), ``1 / ell``, three pads, so
+a coordinate's record is four aligned ``float4``."""
+
+WALK_LINK = 4
+"""Floats per body of the device walk's data: its parent's frame less its own, a pad."""
+
+_WALK_TABLE = """    static __constant__ int WALK_PARENT[$bodies] = {$parent};
+    static __constant__ int WALK_FIRST[$ends] = {$first};"""
+
+_WALK_TABLE_CPU = """    static const int WALK_PARENT[$bodies] = {$parent};
+    static const int WALK_FIRST[$ends] = {$first};"""
+
+_WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.TreeWalk) over a class of trees whose path table
+    // is above: each body's parent (-1: the world, every parent before its children) and first coordinate. data holds
+    // each coordinate's s, ut ((v, w), six each) and 1 / ell (WALK_COORDINATE floats), link each body's offset to its
+    // parent's frame (WALK_LINK floats), as TreeWalk.device_data lays them out.
+    //
+    // WALK_UP(data, link, body, top, p, sink): the states of $rows rows, p[6 r + k] the wrench (f, t) of row r at body's
+    // frame, walked up to the root from coordinate top of body (its last for a wrench seed): each coordinate c takes
+    // the footprint z = (s_c . p) / ell_c, given to sink(r, c, z), and passes p - ut_c z; a joint passes t - d x f to
+    // its parent.
+    const auto WALK_UP = [&](const float* data, const float* link, int body, int top, float* p, auto&& sink) {
+        for (int b = body; b >= 0; b = WALK_PARENT[b]) {
+            for (int c = b == body ? top : WALK_FIRST[b + 1] - 1; c >= WALK_FIRST[b]; --c) {
+                const float* d = data + $coordinate * c;
+                for (int r = 0; r < $rows; ++r) {
+                    float* q = p + 6 * r;
+                    const float z = ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5]))
+                                    * d[12];
+                    for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
+                    sink(r, c, z);
+                }
+            }
+            if (WALK_PARENT[b] >= 0) {
+                const float* l = link + $link * b;
+                for (int r = 0; r < $rows; ++r) {
+                    float* q = p + 6 * r;
+                    const float fx = q[0], fy = q[1], fz = q[2];
+                    q[3] -= l[1] * fz - l[2] * fy;
+                    q[4] -= l[2] * fx - l[0] * fz;
+                    q[5] -= l[0] * fy - l[1] * fx;
+                }
+            }
+        }
+    };
+    // WALK_SEED(data, c, x, p, sink): the first step of rows seeded by the covector x[r] at coordinate c (a limit's, a
+    // velocity limit's), on the states p: z = (x + s_c . p) / ell_c. WALK_UP continues from c - 1 of c's body.
+    const auto WALK_SEED = [&](const float* data, int c, const float* x, float* p, auto&& sink) {
+        const float* d = data + $coordinate * c;
+        for (int r = 0; r < $rows; ++r) {
+            float* q = p + 6 * r;
+            const float z = (x[r] + ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5])))
+                            * d[12];
+            for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
+            sink(r, c, z);
+        }
+    };
+    // WALK_PARENT_TWIST(link, twist, b, V): body b's parent's twist (v, w) at b's frame, v + d x w (zero at a root).
+    const auto WALK_PARENT_TWIST = [&](const float* link, const float* twist, int b, float* V) {
+        const int up = WALK_PARENT[b];
+        if (up < 0) {
+            for (int k = 0; k < 6; ++k) V[k] = 0.0f;
+            return;
+        }
+        const float* W = twist + 6 * up;
+        const float* l = link + $link * b;
+        V[0] = W[0] + (l[1] * W[5] - l[2] * W[4]);
+        V[1] = W[1] + (l[2] * W[3] - l[0] * W[5]);
+        V[2] = W[2] + (l[0] * W[4] - l[1] * W[3]);
+        V[3] = W[3];
+        V[4] = W[4];
+        V[5] = W[5];
+    };
+    // WALK_DOWN(data, link, u, qd, twist): the leave P^T L^-T u of the class's trees, root first: each coordinate c
+    // takes qd_c = (u_c - ut_c . V) / ell_c, then V += s_c qd_c, V its body's twist; twist receives every body's
+    // twist (v, w) at its frame, six floats a body.
+    const auto WALK_DOWN = [&](const float* data, const float* link, const float* u, float* qd, float* twist) {
+        for (int b = 0; b < $bodies; ++b) {
+            float V[6];
+            WALK_PARENT_TWIST(link, twist, b, V);
+            for (int c = WALK_FIRST[b]; c < WALK_FIRST[b + 1]; ++c) {
+                const float* d = data + $coordinate * c;
+                const float q = (u[c] - ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2])
+                                         + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5]))) * d[12];
+                qd[c] = q;
+                for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
+            }
+            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
+        }
+    };
+    // WALK_TWISTS(data, link, qd, twist): every body's twist from known coordinates qd, root first, V += s_c qd_c: the
+    // writer's prologue (the predicted twists its rows' incident velocities read).
+    const auto WALK_TWISTS = [&](const float* data, const float* link, const float* qd, float* twist) {
+        for (int b = 0; b < $bodies; ++b) {
+            float V[6];
+            WALK_PARENT_TWIST(link, twist, b, V);
+            for (int c = WALK_FIRST[b]; c < WALK_FIRST[b + 1]; ++c) {
+                const float* d = data + $coordinate * c;
+                for (int k = 0; k < 6; ++k) V[k] += d[k] * qd[c];
+            }
+            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
+        }
+    };"""
+
+
+@functools.cache
+def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> DevicePrelude:
+    """The device walk of a class of trees (one tree, or a world's forest), for both devices: a prelude declaring
+
+    - the class's path table in constant memory (``WALK_PARENT``, ``WALK_FIRST``): topology, one table per class, so a
+      lane walks a root path without a global load in front of its steps (GPU_WALK §8, variant C);
+    - ``WALK_UP`` and ``WALK_SEED``, the rows: a lane per seed walks its ``rows`` rows up the seed's root path, every
+      load shared (Z_UNION Theorem B), and gives each footprint to the caller's sink, the placement's store;
+    - ``WALK_DOWN``, the leave, and ``WALK_TWISTS``, the twists of known coordinates: a lane per tree, root first.
+
+    No step launches it (FL3.1). The data is :meth:`TreeWalk.device_data`'s.
+
+    Args:
+        parent: Each body's parent (-1: the world), every parent before its children.
+        first: Each body's first coordinate, and the count after the last.
+        rows: The rows a lane walks together: the seed's unit (1 a limit, 2 a velocity limit, 3 a point contact, 4
+            with spin).
+    """
+    if len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)):
+        raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
+    if rows < 1:
+        raise ValueError(f"a lane walks at least one row, got {rows}")
+    table = {
+        "bodies": len(parent),
+        "ends": len(first),
+        "parent": ", ".join(str(b) for b in parent),
+        "first": ", ".join(str(c) for c in first),
+    }
+    walk = substitute(_WALK, rows=rows, bodies=len(parent), coordinate=WALK_COORDINATE, link=WALK_LINK)
+    return DevicePrelude(
+        f"walk_{rows}_{len(parent)}",
+        substitute(_WALK_TABLE, table) + "\n" + walk,
+        cpu=substitute(_WALK_TABLE_CPU, table) + "\n" + walk,
+    )
