@@ -14,6 +14,7 @@ fails in another, the two are separate tests, so what passes stays guarded. Runs
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import itertools
 import math
@@ -970,44 +971,106 @@ class TestQ17TimeOrder(unittest.TestCase):
                 self.assertLess(max(orders), 1.25, errors)
 
 
+def _tangent_basis(n):
+    """The tangent pair every FeatherPGS friction row uses for the normal ``n`` (``contact_tangent_basis``)."""
+    t0 = np.cross(n, (1.0, 0.0, 0.0))
+    if t0 @ t0 < 1.0e-12:
+        t0 = np.cross(n, (0.0, 1.0, 0.0))
+    t0 /= np.linalg.norm(t0)
+    t1 = np.cross(n, t0)
+    return t0, t1 / np.linalg.norm(t1)
+
+
+@dataclasses.dataclass(frozen=True)
+class FrictionUnit:
+    """The friction rows one law writes: a contact's under point friction, a patch anchor's under patch friction.
+
+    ``carrier`` is the contact that holds the rows (its normal gives the tangent pair), ``members`` the contacts whose
+    normal impulses pool into the unit's capacity, ``share`` its part of that pool, and ``point`` [m] where its tangent
+    rows act, ``None`` for the carrier's own contact point."""
+
+    carrier: int
+    members: tuple
+    share: float = 1.0
+    point: tuple | None = None
+
+
+def point_units(count):
+    """Point friction: every contact is a unit at its own point, on its own load."""
+    return [FrictionUnit(c, (c,)) for c in range(count)]
+
+
+def patch_units(solver, count):
+    """Patch friction's units on the step ``solver`` took (its patch view): each anchor at its friction location, on its
+    weight's share of its region's pooled normal impulse."""
+    view = solver.laws.friction_patches.view
+    weight, ring = view.weight.numpy()[:count], view.next_contact.numpy()[:count]
+    location = view.point.numpy()[:count].astype(np.float64)
+    units = []
+    for c in np.flatnonzero(weight > 0.0):
+        members, m = [int(c)], ring[c]
+        while m >= 0 and m != c:
+            members.append(int(m))
+            m = ring[m]
+        units.append(FrictionUnit(int(c), tuple(members), float(weight[c]), tuple(location[c])))
+    return units
+
+
 class Manufactured:
     """Q18: a contact problem with a known solution, on a real step's Jacobian and mass matrix.
 
     The solution is chosen first, so it exists for any ``J`` (tangent rows of coplanar contacts have rank 3, and a
     target chosen per row need not be reachable):
 
-    1. a velocity ``v*`` and a status per contact: separated, sticking, or sliding; sticking contacts' tangent velocity
-       is projected out of ``v*``;
-    2. each loaded contact's force: a normal load and a tangent force inside the cone, or on its edge against
-       ``r_t = J_t v*`` when sliding;
+    1. a velocity ``v*``, a status per contact (separated or loaded) and per friction unit (sticking or sliding); a
+       sticking unit's rows are projected out of ``v*``;
+    2. each loaded contact's normal load, and each unit's friction inside its cone, or on the cone's edge against its
+       slip when it slides;
     3. the predictor ``v_hat = v* - M^-1 J^T lambda*`` and each normal row's ``b``, which makes ``v*`` satisfy every row.
 
-    ``J`` and ``M`` come from Newton's public :func:`newton.eval_jacobian` and :func:`newton.eval_mass_matrix`, ``b`` reaches
-    the rows as a contact margin (the row law's gap), and ``v_hat`` as the step's initial velocity, so every placement's
-    own writers and producers run. Any placement must then return ``v*``.
+    The rows are the law's (:mod:`newton._src.solvers.feather_pgs.contact_laws`). A contact's normal row acts at its one
+    contact point, the midpoint of its surface points. A friction unit (:class:`FrictionUnit`) is a tangent pair, with
+    contact torsion also a spin row ``n . (w_a - w_b)``, on the elliptic cone ``|(t1 / mu, t2 / mu, s / mu_t)| <= share
+    load``, and slides with maximal dissipation, ``f = -share load D^2 u / |D u|`` for ``D = diag(mu, mu, mu_t)``:
 
-    Lever arms follow the margins, so ``J`` and the problem are iterated to a fixed point; the correction contracts as
-    the gap over the bodies' size.
+    - point friction: one unit per contact, at its contact point, on its own load (:func:`point_units`);
+    - patch friction: one unit per anchor, at its region's friction location, on an equal share of the region's pooled
+      load (:func:`patch_units`). Regions and locations are the law's geometry and are read from the step; the rows on
+      them, the pooled cone and the solution are the reference's own.
+
+    ``J`` and ``M`` come from Newton's public :func:`newton.eval_jacobian` and :func:`newton.eval_mass_matrix`, ``b``
+    reaches the rows as a contact margin (the row law's gap), and ``v_hat`` as the step's initial velocity, so every
+    placement's own writers and producers run. Any placement must then return ``v*``.
+
+    The margins move both surface points of a contact by the same distance, so its contact point and every friction
+    location stay where the collision put them: the rows do not depend on ``b``, and the generalized force's lever arms
+    are read once.
 
     A row holds ``b`` as a float32 gap over ``dt``, so its value sits up to about two float32 steps of a contact point
     from the stated one: 2.4e-5 m/s at 1/240 s, and a sliding pattern can carry that 4.45x into a contact's speed. The
     error is therefore read against the solution of the held rows (:meth:`held_offsets`, :meth:`response`), with the
-    offsets bounded by the test so that no wrong ``b`` passes as rounding.
+    offsets bounded by the test so that no wrong ``b`` passes as rounding. That reading needs a pattern whose
+    linearization is regular (:meth:`conditioning`); any other is judged on what every solution holds (:meth:`residual`).
     """
 
     SEPARATED, STICKING, SLIDING = 0, 1, 2
 
-    def __init__(self, model, state, contacts, dt, rng, *, beta=0.2):
-        self.model, self.state, self.contacts, self.dt, self.beta = model, state, contacts, dt, beta
+    def __init__(self, model, state, contacts, dt, rng, *, beta=0.2, units=None, spin=False, loaded=2.0 / 3.0):
+        self.model, self.state, self.contacts, self.dt, self.beta, self.spin = model, state, contacts, dt, beta, spin
         self.count = int(contacts.rigid_contact_count.numpy()[0])
         self._read_model()
         self._read_contacts()
-        self.status = rng.integers(0, 3, self.count)
+        # Loaded with probability ``loaded``, then sticking or sliding alike.
+        self.status = np.where(rng.uniform(size=self.count) < loaded, rng.integers(1, 3, self.count), self.SEPARATED)
         self.draw_velocity = rng.normal(size=self.dofs) * 0.02
         self.draw_load = rng.uniform(0.3, 1.0, self.count)
         self.draw_tangent = rng.normal(size=(self.count, 3))
         self.draw_gap = rng.uniform(0.01, 0.05, self.count)
-        for _ in range(5):
+        # A unit whose carrier is separated still holds its region's pooled load: it slides or sticks by this draw.
+        self.draw_slides = rng.uniform(size=self.count) < 0.5
+        self.units = point_units(self.count) if units is None else list(units)
+        # The second pass reads the gaps the first pass's margins hold.
+        for _ in range(2):
             self._solve()
 
     def _read_model(self):
@@ -1042,9 +1105,11 @@ class Manufactured:
         model, contacts, c = self.model, self.contacts, self.count
         shape_body = model.shape_body.numpy()
         mu = model.shape_material_mu.numpy().astype(np.float64)
+        mu_t = model.shape_material_mu_torsional.numpy().astype(np.float64)
         shapes = contacts.rigid_contact_shape0.numpy()[:c], contacts.rigid_contact_shape1.numpy()[:c]
         self.body_a, self.body_b = shape_body[shapes[0]], shape_body[shapes[1]]
         self.mu = 0.5 * (mu[shapes[0]] + mu[shapes[1]])
+        self.mu_t = 0.5 * (mu_t[shapes[0]] + mu_t[shapes[1]])
         self.normal = -contacts.rigid_contact_normal.numpy()[:c].astype(np.float64)
         self.point0 = contacts.rigid_contact_point0.numpy()[:c].astype(np.float64)
         self.point1 = contacts.rigid_contact_point1.numpy()[:c].astype(np.float64)
@@ -1058,114 +1123,275 @@ class Manufactured:
         pose = self.body_q[body]
         return pose[:3] + conformance._quat_rotate(pose[3:7], point)
 
+    def _block(self, body):
+        """``body``'s Jacobian block: its centre of mass's velocity over its angular velocity, 6 by its tree's size."""
+        art, k = self.body_at[int(body)]
+        return self.jacobian[art, 6 * k : 6 * k + 6, : self.size[art]], self.first[art], self.size[art]
+
     def _point_rows(self, body, point):
         """``J_p``: the 3 rows of the world velocity of the world point ``point`` of ``body``."""
         rows = np.zeros((3, self.dofs))
         if body < 0:
             return rows
-        art, k = self.body_at[int(body)]
-        first, size = self.first[art], self.size[art]
-        block = self.jacobian[art, 6 * k : 6 * k + 6, :size]
+        block, first, size = self._block(body)
         arm = point - self._world(body, self.body_com[body])
         cross = np.array([[0.0, -arm[2], arm[1]], [arm[2], 0.0, -arm[0]], [-arm[1], arm[0], 0.0]])
         rows[:, first : first + size] = block[:3] - cross @ block[3:]
         return rows
 
+    def _spin_rows(self, body):
+        """The 3 rows of ``body``'s angular velocity."""
+        rows = np.zeros((3, self.dofs))
+        if body >= 0:
+            block, first, size = self._block(body)
+            rows[:, first : first + size] = block[3:]
+        return rows
+
     def _geometry(self):
-        """Each contact's relative-velocity rows ``J`` (3 by dofs, A's point less B's) and its gap ``phi``."""
+        """Each contact's relative-velocity rows ``J`` (3 by dofs, A less B at its contact point), its gap ``phi`` and
+        its contact point."""
         relative = np.zeros((self.count, 3, self.dofs))
         phi = np.zeros(self.count)
+        self.points = np.zeros((self.count, 3))
         for c in range(self.count):
             n = self.normal[c]
             p_a = self._world(self.body_a[c], self.point0[c]) - self.margin0[c] * n
             p_b = self._world(self.body_b[c], self.point1[c]) + self.margin1[c] * n
             phi[c] = n @ (p_a - p_b)
-            relative[c] = self._point_rows(self.body_a[c], p_a) - self._point_rows(self.body_b[c], p_b)
+            self.points[c] = 0.5 * (p_a + p_b)
+            relative[c] = self._point_rows(self.body_a[c], self.points[c]) - self._point_rows(
+                self.body_b[c], self.points[c]
+            )
         return relative, phi
 
+    def _unit_rows(self, unit):
+        """A unit's rows: its tangent pair at its point, and its spin row under contact torsion."""
+        c = unit.carrier
+        n = self.normal[c]
+        t0, t1 = _tangent_basis(n)
+        point = self.points[c] if unit.point is None else np.asarray(unit.point, dtype=np.float64)
+        relative = self._point_rows(self.body_a[c], point) - self._point_rows(self.body_b[c], point)
+        rows = [t0 @ relative, t1 @ relative]
+        if self.spin:
+            rows.append(n @ (self._spin_rows(self.body_a[c]) - self._spin_rows(self.body_b[c])))
+        return np.stack(rows)
+
+    def _scale(self, k):
+        """Unit ``k``'s cone scale ``D``: ``mu`` on the tangent pair, ``mu_t`` on the spin row."""
+        c = self.units[k].carrier
+        return np.array([self.mu[c], self.mu[c], self.mu_t[c]][: len(self.rows[k])])
+
+    def _slides(self, k):
+        """Whether unit ``k`` slides: its carrier's status, or its own draw where the carrier is separated."""
+        carrier = self.units[k].carrier
+        if self.status[carrier] == self.SEPARATED:
+            return bool(self.draw_slides[carrier])
+        return self.status[carrier] == self.SLIDING
+
+    def _sliding(self, k):
+        """Whether unit ``k`` slides with a slip the law can read: on the cone's edge against it."""
+        weighted = self._scale(k) * (self.rows[k] @ self.v_star)
+        return self.capacity[k] > 0.0 and self._slides(k) and np.linalg.norm(weighted) > 1.0e-6 * self._scale(k)[0]
+
+    def _friction(self, k):
+        """Unit ``k``'s friction [N s] in its rows' basis: on the cone's edge against its slip, or inside the cone."""
+        if self.capacity[k] <= 0.0:
+            return np.zeros(len(self.rows[k]))
+        scale = self._scale(k)
+        if self._sliding(k):
+            weighted = scale * (self.rows[k] @ self.v_star)
+            return -self.capacity[k] * scale * weighted / np.linalg.norm(weighted)
+        c, draw = self.units[k].carrier, self.draw_tangent[self.units[k].carrier]
+        t0, t1 = _tangent_basis(self.normal[c])
+        direction = np.array([t0 @ draw, t1 @ draw, self.normal[c] @ draw])[: len(scale)]
+        return 0.5 * self.capacity[k] * scale * direction / max(float(np.linalg.norm(direction)), 1.0e-9)
+
     def _solve(self):
-        """One pass of the fixed point: ``v*``, the forces, ``v_hat`` and the margins that hold ``b``."""
-        relative, phi = self._geometry()
-        self.relative = relative
+        """State the problem: ``v*``, the forces, ``v_hat`` and the margins that hold ``b``."""
+        self.relative, phi = self._geometry()
+        self.rows = [self._unit_rows(unit) for unit in self.units]
         n = self.normal
-        tangent = np.stack([np.eye(3) - np.outer(n[c], n[c]) for c in range(self.count)])
-        tangent_rows = np.einsum("cij,cjk->cik", tangent, relative)
-        sticking = np.flatnonzero(self.status == self.STICKING)
-        self.v_star = self.draw_velocity.copy()
-        if sticking.size:
-            A = tangent_rows[sticking].reshape(-1, self.dofs)
-            self.v_star -= np.linalg.pinv(A, rcond=1.0e-10) @ (A @ self.v_star)
         solve = np.linalg.solve
+        self.load = np.zeros(self.count)
+        for c in np.flatnonzero(self.status != self.SEPARATED):
+            row = n[c] @ self.relative[c]
+            self.load[c] = self.draw_load[c] * 0.02 / max(float(row @ solve(self.M, row)), 1.0e-12)
+        self.capacity = np.array([unit.share * self.load[list(unit.members)].sum() for unit in self.units])
+        self.v_star = self.draw_velocity.copy()
+        sticking = [self.rows[k] for k in range(len(self.units)) if self.capacity[k] > 0.0 and not self._slides(k)]
+        if sticking:
+            A = np.concatenate(sticking)
+            self.v_star -= np.linalg.pinv(A, rcond=1.0e-10) @ (A @ self.v_star)
         impulse = np.zeros(self.dofs)
-        self.force = np.zeros((self.count, 3))
         for c in range(self.count):
-            if self.status[c] == self.SEPARATED:
-                continue
-            row = n[c] @ relative[c]
-            load = self.draw_load[c] * 0.02 / max(float(row @ solve(self.M, row)), 1.0e-12)
-            slip = tangent_rows[c] @ self.v_star
-            speed = float(np.linalg.norm(slip))
-            if self.status[c] == self.SLIDING and speed > 1.0e-6:
-                force = -self.mu[c] * load * slip / speed
-            else:
-                direction = tangent[c] @ self.draw_tangent[c]
-                force = 0.5 * self.mu[c] * load * direction / max(float(np.linalg.norm(direction)), 1.0e-9)
-            self.force[c] = load * n[c] + force
-            impulse += relative[c].T @ self.force[c]
+            impulse += self.load[c] * (n[c] @ self.relative[c])
+        self.friction = [self._friction(k) for k in range(len(self.units))]
+        for rows, friction in zip(self.rows, self.friction, strict=True):
+            impulse += rows.T @ friction
         self.v_hat = self.v_star - solve(self.M, impulse)
         for c in range(self.count):
-            normal_velocity = float(n[c] @ relative[c] @ self.v_star)
+            normal_velocity = float(n[c] @ self.relative[c] @ self.v_star)
             target = self.draw_gap[c] if self.status[c] == self.SEPARATED else 0.0
             bias = target - normal_velocity
             gap = bias * self.dt / self.beta if bias <= 0.0 else bias * self.dt
-            self.margin0[c] += phi[c] - gap
+            self.margin0[c] += 0.5 * (phi[c] - gap)
+            self.margin1[c] += 0.5 * (phi[c] - gap)
 
     def apply(self):
         """Write the margins that state the problem into the contacts."""
-        margin = self.contacts.rigid_contact_margin0.numpy()
-        margin[: self.count] = self.margin0
-        self.contacts.rigid_contact_margin0.assign(margin)
+        for array, values in (
+            (self.contacts.rigid_contact_margin0, self.margin0),
+            (self.contacts.rigid_contact_margin1, self.margin1),
+        ):
+            margin = array.numpy()
+            margin[: self.count] = values
+            array.assign(margin)
 
-    def held_offsets(self, solver):
-        """Each loaded contact's held ``b`` less the stated one [m/s], 0 where a world's rows stay inside its sweep."""
+    def _held(self, solver):
+        """Each contact's row store, world and first row where the audit reads its world, else ``None``; each contact
+        must hold the rows the law states, a normal and its unit's."""
         rows = solver.placement
         paths, slots, worlds = rows.contact_path.numpy(), rows.contact_slot.numpy(), rows.contact_world.numpy()
-        stores = rows.rhs.numpy().astype(np.float64), rows.mf_rhs.numpy().astype(np.float64)
+        needed = rows.contact_slots_needed.numpy()
         held = ~np.isnan(solver.read_audit()["gap"])
+        stores = [
+            (paths[c], worlds[c], slots[c]) if slots[c] >= 0 and paths[c] in (0, 1) and held[worlds[c]] else None
+            for c in range(self.count)
+        ]
+        stated = np.ones(self.count, dtype=int)
+        for unit, unit_rows in zip(self.units, self.rows, strict=True):
+            stated[unit.carrier] = 1 + len(unit_rows)
+        for c in range(self.count):
+            if stores[c] is not None and needed[c] != stated[c]:
+                raise RuntimeError(f"contact {c} holds {needed[c]} rows, the law states {stated[c]}")
+        return stores
+
+    def held_offsets(self, solver):
+        """Each loaded contact's held ``b`` less the stated one [m/s], and each unit's held tangent ``b`` (stated 0: a
+        new anchor carries no displacement); 0 where a world's rows stay inside its sweep."""
+        stores = solver.placement.rhs.numpy().astype(np.float64), solver.placement.mf_rhs.numpy().astype(np.float64)
+        held = self._held(solver)
         offsets = np.zeros(self.count)
         for c in np.flatnonzero(self.status != self.SEPARATED):
-            if slots[c] >= 0 and held[worlds[c]]:
-                row = self.normal[c] @ self.relative[c]
-                offsets[c] = stores[paths[c]][worlds[c], slots[c]] + float(row @ self.v_star)
-        return offsets
+            if held[c] is not None:
+                path, world, slot = held[c]
+                offsets[c] = stores[path][world, slot] + float(self.normal[c] @ self.relative[c] @ self.v_star)
+        tangent = 0.0
+        for unit in self.units:
+            if held[unit.carrier] is not None:
+                path, world, slot = held[unit.carrier]
+                tangent = max(tangent, float(np.abs(stores[path][world, slot + 1 : slot + 3]).max()))
+        return offsets, tangent
+
+    def pattern(self):
+        """The status pattern linearized at ``v*`` in float64: ``(A, J, mobility, normals)``, with ``A x = target`` for
+        the change ``x`` of the loaded normals' impulses (their rows' targets first, the held offsets) and of the loaded
+        units' friction (targets 0), ``J`` those unknowns' rows and ``mobility x`` the velocity they make.
+
+        A loaded normal holds its row, a sticking unit its rows' velocity, and a sliding unit its friction on the cone's
+        edge against its slip: ``dx + share g dL + load dg du = 0`` with ``g = D^2 u / |D u|`` and ``dL`` the change of
+        its pooled load."""
+        normals = np.flatnonzero(self.load > 0.0)
+        units = [k for k in range(len(self.units)) if self.capacity[k] > 0.0]
+        J = [self.normal[c] @ self.relative[c] for c in normals] + [row for k in units for row in self.rows[k]]
+        if not J:
+            return np.zeros((0, 0)), np.zeros((0, self.dofs)), np.zeros((self.dofs, 0)), normals
+        J = np.stack(J)
+        mobility = np.linalg.solve(self.M, J.T)
+        G = J @ mobility
+        A = G.copy()
+        index = {int(c): i for i, c in enumerate(normals)}
+        at = len(normals)
+        for k in units:
+            block = slice(at, at + len(self.rows[k]))
+            at += len(self.rows[k])
+            if not self._sliding(k):
+                continue
+            scale = self._scale(k)
+            weighted = scale * (self.rows[k] @ self.v_star)
+            norm = float(np.linalg.norm(weighted))
+            g = scale * weighted / norm
+            dg = (np.diag(scale * scale) - np.outer(g, g)) / norm
+            A[block] = self.capacity[k] * dg @ G[block]
+            A[block, block] += np.eye(len(scale))
+            for c in self.units[k].members:
+                if int(c) in index:
+                    A[block, index[int(c)]] += self.units[k].share * g
+        return A, J, mobility, normals
 
     def response(self, offsets):
-        """The change in ``v*`` that ``offsets`` make, in float64: the status pattern linearized at ``v*``.
-
-        A sticking contact holds its relative velocity, a sliding one its normal speed and its force on the cone against
-        the slip. A redundant pattern takes the smallest forces, which leaves the velocity unique."""
-        loaded = np.flatnonzero((self.status != self.SEPARATED) & (np.abs(self.force).max(axis=1) > 0.0))
-        rows = np.concatenate([self.relative[c] for c in loaded])
-        mobility = np.linalg.solve(self.M, rows.T)
-        G = rows @ mobility
-        A, target = np.zeros_like(G), np.zeros(G.shape[0])
-        for index, c in enumerate(loaded):
-            at, n = 3 * index, self.normal[c]
-            t0 = np.cross(n, (1.0, 0.0, 0.0)) if abs(n[0]) < 0.9 else np.cross(n, (0.0, 1.0, 0.0))
-            t0 /= np.linalg.norm(t0)
-            t1 = np.cross(n, t0)
-            A[at] = n @ G[at : at + 3]
-            target[at] = -offsets[c]
-            slip = (np.eye(3) - np.outer(n, n)) @ self.relative[c] @ self.v_star
-            speed = float(np.linalg.norm(slip))
-            for row, t in ((1, t0), (2, t1)):
-                if self.status[c] == self.SLIDING and speed > 1.0e-6:
-                    across = np.eye(3) - np.outer(slip, slip) / speed**2 - np.outer(n, n)
-                    A[at + row, at : at + 3] = t + self.mu[c] * (t @ slip) / speed * n
-                    A[at + row] += self.mu[c] * float(n @ self.force[c]) / speed * (t @ across) @ G[at : at + 3]
-                else:
-                    A[at + row] = t @ G[at : at + 3]
+        """The change in ``v*`` that ``offsets`` make, in float64: the status pattern linearized at ``v*``."""
+        A, _J, mobility, normals = self.pattern()
+        target = np.zeros(A.shape[0])
+        target[: len(normals)] = -offsets[normals]
         return mobility @ np.linalg.lstsq(A, target, rcond=1.0e-10)[0]
+
+    def conditioning(self):
+        """The smallest singular value of the linearized pattern with each condition scaled to a unit row: 0 for a
+        singular pattern (coplanar loaded normals, redundant sticks), whose impulses the problem leaves open, or one
+        without a loaded contact. Scaling the rows makes it independent of their units."""
+        A = self.pattern()[0]
+        if not A.size:
+            return 0.0
+        return float(np.linalg.svd(A / np.linalg.norm(A, axis=1, keepdims=True), compute_uv=False)[-1])
+
+    def exposure(self):
+        """How far a held ``b`` can move the answer: the largest contact-point speed change per unit offset of the
+        loaded normals' ``b`` (the infinity norm of the linearized pattern's map). It bounds a reading where a placement
+        keeps its rows inside its sweep, so the held offsets cannot be read and removed."""
+        A, _J, mobility, normals = self.pattern()
+        if not A.size:
+            return 0.0
+        moved = self.relative.reshape(-1, self.dofs) @ mobility @ np.linalg.pinv(A, rcond=1.0e-10)[:, : len(normals)]
+        return float(np.abs(moved).sum(axis=1).max())
+
+    def residual(self, solver):
+        """How far the step's ``v+`` and stored impulses are from solving the stated problem, any of its solutions:
+        ``(normal, friction, force)`` [m/s].
+
+        ``normal`` is the natural residual ``|min(d lambda, J v+ + b)|`` of each normal row on the stated ``b`` (``d`` its
+        Delassus diagonal). ``friction`` reads each unit on its stated cone: a unit inside it must not move, one on its
+        edge must slip against its friction, ``f = -t D^2 u``, and none may leave it. ``force`` is how far the stored
+        impulses, through the stated rows, move the contact points from where the step's ``v+`` put them. Never
+        ``lambda`` against ``lambda*``: a pattern that leaves it open admits any split."""
+        rows = solver.placement
+        stores = rows.impulses.numpy().astype(np.float64), rows.mf_impulses.numpy().astype(np.float64)
+        held = self._held(solver)
+        if any(h is None for h in held):
+            return None
+        velocity = solver.v_out.numpy().astype(np.float64)
+        load = np.array([stores[h[0]][h[1], h[2]] for h in held])
+        impulse = np.zeros(self.dofs)
+        normal = 0.0
+        for c in range(self.count):
+            row = self.normal[c] @ self.relative[c]
+            target = self.draw_gap[c] if self.status[c] == self.SEPARATED else 0.0
+            speed = float(row @ velocity) + target - float(row @ self.v_star)
+            diagonal = float(row @ np.linalg.solve(self.M, row))
+            normal = max(normal, abs(min(diagonal * load[c], speed)))
+            impulse += load[c] * row
+        friction = 0.0
+        for k, (unit, unit_rows) in enumerate(zip(self.units, self.rows, strict=True)):
+            path, world, slot = held[unit.carrier]
+            force = stores[path][world, slot + 1 : slot + 1 + len(unit_rows)]
+            impulse += unit_rows.T @ force
+            scale = self._scale(k)
+            capacity = unit.share * load[list(unit.members)].sum()
+            weighted_force = force / scale
+            weighted_slip = scale * (unit_rows @ velocity) / scale[0]
+            excess = np.linalg.norm(weighted_force) - capacity
+            diagonal = float(np.max(np.diag(unit_rows @ np.linalg.solve(self.M, unit_rows.T))))
+            friction = max(friction, diagonal * scale[0] * max(excess, 0.0))
+            if capacity <= 1.0e-9 * load.max():
+                continue
+            if excess < -1.0e-3 * capacity:
+                friction = max(friction, float(np.linalg.norm(weighted_slip)))
+            else:
+                against = -weighted_force / max(np.linalg.norm(weighted_force), 1.0e-30)
+                along = float(weighted_slip @ against)
+                friction = max(friction, float(np.linalg.norm(weighted_slip - along * against)), -along)
+        moved = velocity - solver.v_hat.numpy().astype(np.float64) - np.linalg.solve(self.M, impulse)
+        return normal, friction, float(np.abs(self.relative @ moved).max())
 
     def error(self, velocity, offsets=None):
         """How far ``velocity`` is from the solution of the held rows: the largest contact-point speed error, and in
@@ -1176,113 +1402,318 @@ class Manufactured:
         return float(np.abs(self.relative @ delta).max()), float(np.abs(delta).max())
 
 
-def manufactured_run(scene, route, device, *, seed=0, settle=30, sweeps=1024):
-    """Settle ``scene``, state a manufactured problem at that pose and solve it through ``route``.
+class ManufacturedScene:
+    """A scene settled through a route, where Q18 states its problems: one settle serves every seed.
 
-    Returns the problem, the solver (with the audit on) and the error of its velocity."""
-    model = scene.build(device)
-    options = {**conformance.BASE_OPTIONS, **scene.solver_options, **route.options}
-    options.update({"friction_anchor_beta": 0.0, "pgs_iterations": sweeps, "pgs_audit": True})
-    pipeline_options = {"deterministic": True}
-    if scene.rigid_contact_max is not None:
-        pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
-    pipeline = newton.CollisionPipeline(model, **pipeline_options)
-    contacts = pipeline.contacts()
-    control = model.control()
-    with conformance.route_context(route):
-        solver = SolverFeatherPGS(model, **options)
-        state, out = model.state(), model.state()
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        for step in range(settle):
-            state.clear_forces()
-            if scene.control is not None:
-                scene.control(model, control, state, step)
-            pipeline.collide(state, contacts)
-            solver.step(state, out, control, contacts, scene.dt)
-            state, out = out, state
-        wp.copy(out.joint_q, state.joint_q)
-        state.joint_qd.zero_()
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        pipeline.collide(state, contacts)
-        problem = Manufactured(model, state, contacts, scene.dt, np.random.default_rng(seed))
-        problem.apply()
+    ``law`` is ``"point"`` or ``"patch"`` friction (``friction_anchor_beta`` 0 or 0.2), ``spin`` contact torsion at
+    :data:`TORSION`, ``loaded`` the probability that a contact is loaded. A step at the settled pose says whether the
+    placement keeps its rows (``held``) and gives the patch units: the problem's margins keep every contact point, so
+    the solve's step must hold the same locations."""
+
+    def __init__(self, scene, route, device, *, settle, law="point", spin=False, loaded=2.0 / 3.0, sweeps=1024):
+        self.scene, self.route, self.device, self.law, self.spin, self.loaded = scene, route, device, law, spin, loaded
+        self.model = scene.build(device)
+        if spin:
+            self.model.shape_material_mu_torsional.fill_(TORSION)
+        options = {**conformance.BASE_OPTIONS, **scene.solver_options, **route.options}
+        options.update(
+            {
+                "friction_anchor_beta": 0.2 if law == "patch" else 0.0,
+                "contact_torsion": spin,
+                "pgs_iterations": sweeps,
+                "pgs_audit": True,
+            }
+        )
+        self.options = options
+        pipeline_options = {"deterministic": True}
+        if scene.rigid_contact_max is not None:
+            pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
+        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
+        self.contacts = self.pipeline.contacts()
+        self.control = self.model.control()
+        with conformance.route_context(route), wp.ScopedDevice(device):
+            solver = SolverFeatherPGS(self.model, **options)
+            state, self.out = self.model.state(), self.model.state()
+            newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+            for step in range(settle):
+                state.clear_forces()
+                if scene.control is not None:
+                    scene.control(self.model, self.control, state, step)
+                self.pipeline.collide(state, self.contacts)
+                solver.step(state, self.out, self.control, self.contacts, scene.dt)
+                state, self.out = self.out, state
+            wp.copy(self.out.joint_q, state.joint_q)
+            state.joint_qd.zero_()
+            newton.eval_fk(self.model, state.joint_q, state.joint_qd, state)
+            self.state = state
+            self.pipeline.collide(state, self.contacts)
+            probe = self._step(np.zeros(self.model.joint_dof_count))
+            self.held = bool(np.isfinite(probe.read_audit()["gap"]).all())
+            count = int(self.contacts.rigid_contact_count.numpy()[0])
+            self.units = patch_units(probe, count) if law == "patch" else None
+
+    def _step(self, qd):
+        """A fresh solver's step from the settled pose at ``qd``, over the current contacts."""
+        solver = SolverFeatherPGS(self.model, **self.options)
+        start = self.model.state()
+        wp.copy(start.joint_q, self.state.joint_q)
+        start.joint_qd.assign(qd.astype(np.float32))
+        newton.eval_fk(self.model, start.joint_q, start.joint_qd, start)
+        solver.step(start, self.out, self.control, self.contacts, self.scene.dt)
+        return solver
+
+    def problem(self, seed):
+        """The problem of ``seed`` at the settled pose, stated in float64 (no solve)."""
+        with wp.ScopedDevice(self.device):
+            self.pipeline.collide(self.state, self.contacts)
+            return Manufactured(
+                self.model,
+                self.state,
+                self.contacts,
+                self.scene.dt,
+                np.random.default_rng(seed),
+                units=self.units,
+                spin=self.spin,
+                loaded=self.loaded,
+            )
+
+    def seeds(self, count, *, regular=True, scan=None):
+        """The first ``count`` seeds whose pattern is regular (conditioning at least :data:`REGULAR`), or with
+        ``regular`` false the first that load a contact and are not. Where the rows stay inside the sweep, a regular
+        seed must also keep its unread offsets under half the tolerance (:meth:`Manufactured.exposure`, :data:`UNREAD`)."""
+        chosen = []
+        for seed in range(SCAN if scan is None else scan):
+            problem = self.problem(seed)
+            good = (problem.conditioning() >= REGULAR) == regular and problem.load.any()
+            if good and regular and not self.held:
+                good = problem.exposure() * UNREAD < 0.5 * TestQ18Manufactured.TOLERANCE
+            if good:
+                chosen.append(seed)
+            if len(chosen) == count:
+                break
+        return chosen
+
+    def solve(self, seed):
+        """State ``seed``'s problem and solve it through the route: ``(problem, solver)``, with the problem's
+        ``predictor_miss``, ``offsets`` (:meth:`Manufactured.held_offsets`), ``tangent_offset`` and ``drift``, how far
+        the step put a patch location from the stated one [m]."""
+        problem = self.problem(seed)
         qd = np.zeros(problem.dofs)
         # v_hat moves with qd by M^-1 (M - K): a drive's force reads qd. Newton on that map reaches v_hat in a few steps.
         response = problem.M - np.diag(problem.stiffness)
-        for _ in range(4):
-            final = SolverFeatherPGS(model, **options)
-            start = model.state()
-            wp.copy(start.joint_q, state.joint_q)
-            start.joint_qd.assign(qd.astype(np.float32))
-            newton.eval_fk(model, start.joint_q, start.joint_qd, start)
-            final.step(start, out, control, contacts, scene.dt)
-            miss = problem.v_hat - final.v_hat.numpy().astype(np.float64)
-            qd += np.linalg.solve(response, problem.M @ miss)
-        problem.predictor_miss = float(np.abs(miss).max())
-    problem.offsets = problem.held_offsets(final)
-    return problem, final, problem.error(final.v_out.numpy(), problem.offsets)
+        problem.drift = 0.0
+        with conformance.route_context(self.route), wp.ScopedDevice(self.device):
+            for _ in range(4):
+                problem.apply()
+                final = self._step(qd)
+                miss = problem.v_hat - final.v_hat.numpy().astype(np.float64)
+                qd += np.linalg.solve(response, problem.M @ miss)
+            problem.predictor_miss = float(np.abs(miss).max())
+            if self.law == "patch":
+                units = patch_units(final, problem.count)
+                if [(u.carrier, u.members, u.share) for u in units] != [
+                    (u.carrier, u.members, u.share) for u in problem.units
+                ]:
+                    raise RuntimeError("the patch regions changed with the margins")
+                problem.drift = max(
+                    (
+                        float(np.abs(np.subtract(u.point, v.point)).max())
+                        for u, v in zip(units, problem.units, strict=True)
+                    ),
+                    default=0.0,
+                )
+        problem.offsets, problem.tangent_offset = problem.held_offsets(final)
+        return problem, final
+
+
+REGULAR = 1.0e-2
+"""The conditioning (:meth:`Manufactured.conditioning`) of a pattern whose impulses the problem fixes: a seed's error is
+read against the held rows' solution only there. Measured on the scenes: singular patterns read below 1e-11, regular ones
+from 0.010; between them a legged pattern at 0.0022 has a second solution 0.04 m/s from the stated one, which the step
+finds."""
+TORSION = 0.1
+"""The torsional coefficient ``mu_t`` [m] of every shape under contact torsion. At Newton's default of 5 mm a spin of
+0.03 rad/s weighs 1.5% of a 0.02 m/s slip at ``mu = 0.5`` in a unit's cone, and a doubled ``mu_t`` passed the spin test;
+at 0.1 m it weighs 30%, and the doubled ``mu_t`` misses by up to 2.2e-3 m/s."""
+UNREAD = 2.4e-5
+"""The held offset [m/s] a reading cannot remove where a placement keeps its rows inside its sweep: about two float32
+steps of a contact point over 1/240 s (:class:`Manufactured`). Legged's regular seed of conditioning 0.043 carries it
+20x into a contact's speed, 2.6e-4 m/s on the keyed tier however converged."""
+SCAN = 64
+"""How many seeds a scene's choice reads: a problem is stated in milliseconds, without a solve."""
+SPARSE, SPARSER = 0.25, 0.15
+"""Probabilities that a contact is loaded where the default, 2/3, rarely leaves a regular pattern in :data:`SCAN` seeds
+(measured: the gripper 0 of 200 under point friction, 21 of 64 at 0.25)."""
+
+
+def check_regular(case, prepared, seed, *, audit=True):
+    """Solve ``prepared``'s regular ``seed`` and read it against the held rows' solution, in ``case``."""
+    problem, solver = prepared.solve(seed)
+    point, _coordinate = problem.error(solver.v_out.numpy(), problem.offsets)
+    bound = TestQ18Manufactured.HELD_B / prepared.scene.dt
+    case.assertGreater(problem.count, 0)
+    case.assertLess(problem.predictor_miss, 1.0e-5 if prepared.device == "cpu" else 1.0e-4)
+    case.assertLess(np.abs(problem.offsets).max(), bound)
+    case.assertLess(problem.tangent_offset, bound)
+    case.assertLess(problem.drift, TestQ18Manufactured.DRIFT)
+    case.assertLess(point, TestQ18Manufactured.TOLERANCE)
+    if audit:
+        reading = solver.read_audit()
+        case.assertLess(float(np.nanmax(reading["gap"])), 1.0e-6)
+        case.assertLess(float(np.nanmax(reading["violation"])), 1.0e-4)
+
+
+def check_regular_scenes(case, entries, route, device, *, law="point", spin=False, count=3):
+    """Choose ``count`` regular seeds on each scene's own settled pose and check each (:func:`check_regular`).
+
+    An entry is ``(build, settle)`` or ``(build, settle, loaded)``."""
+    for build, settle, *loaded in entries:
+        scene = build()
+        with wp.ScopedDevice(device):
+            prepared = ManufacturedScene(
+                scene, route, device, settle=settle, law=law, spin=spin, loaded=loaded[0] if loaded else 2.0 / 3.0
+            )
+            seeds = prepared.seeds(count)
+        with case.subTest(scene=scene.name, route=route.name, law=law, spin=spin):
+            case.assertEqual(len(seeds), count, f"{len(seeds)} regular seeds of {SCAN}")
+        for seed in seeds:
+            with case.subTest(scene=scene.name, route=route.name, law=law, spin=spin, seed=seed):
+                with wp.ScopedDevice(device):
+                    check_regular(case, prepared, seed, audit=device == "cpu")
 
 
 class TestQ18Manufactured(unittest.TestCase):
-    """Q18: every placement returns a known solution, on the CPU's core and on each CUDA route."""
+    """Q18: every placement returns a known solution, on the CPU's core and on each CUDA route.
+
+    Seeds are chosen by their pattern's conditioning (:meth:`Manufactured.conditioning`), never by number. A singular
+    pattern proves nothing about the solve's sensitivity and can admit another solution, so it is read on ``v+`` and the
+    total force only, never on ``lambda`` (:meth:`test_irregular_patterns_solve_the_stated_problem`)."""
 
     SCENES = (
         (scenes.box_drop, 60),
         (scenes.box_stack, 60),
         (scenes.legged, 30),
-        (scenes.gripper, 60),
+        (scenes.gripper, 60, SPARSE),
         (scenes.hand, 30),
         (scenes.keyboard, 30),
     )
+    """``(build, settle[, loaded])``: the gripper's twelve contacts a world act on nine coordinates, so it needs fewer
+    loaded contacts for a regular pattern (:data:`SPARSE`)."""
+    PATCH_SCENES = ((scenes.box_drop, 60), (scenes.box_stack, 60), (scenes.gripper, 60, SPARSE), (scenes.hand, 30))
+    """Scenes whose regions hold several contacts, where patch rows differ from point rows."""
+    SPIN_SCENES = (
+        (scenes.box_drop, 60, SPARSE),
+        (scenes.legged, 30, SPARSE),
+        (scenes.hand, 30, SPARSE),
+        (scenes.keyboard, 30, SPARSE),
+    )
+    """Scenes with sphere feet, fingertips and flat faces, where spin rows carry load; a spin row per unit needs fewer
+    loaded contacts for a regular pattern."""
+    PATCH_SPIN_SCENES = ((scenes.box_drop, 60, SPARSER), (scenes.box_stack, 60, SPARSER))
+    IRREGULAR_SCENES = (
+        (scenes.box_drop, 60, (("point", False), ("patch", True))),
+        (scenes.box_stack, 60, (("point", False), ("patch", False))),
+        (scenes.legged, 30, (("point", True),)),
+        (scenes.gripper, 60, (("point", False), ("patch", False))),
+        (scenes.hand, 30, (("point", False), ("patch", False))),
+    )
+    """Irregular patterns under each law: a second solution where the step finds one (legged, the hand, the stack)."""
     TOLERANCE = 1.0e-4
     """A contact point's speed error [m/s]: float32 on velocities of order 0.1 m/s, at a budget that converges."""
     HELD_B = 2.0**-21
     """The largest offset of a held ``b`` over ``1 / dt`` [m]: four float32 steps at 1 m, so a wrong ``b`` fails here."""
+    DRIFT = 1.0e-7
+    """How far a patch location may still move over the last solve [m]: the reference states the rows the step held."""
 
     def test_the_core_returns_the_solution(self):
-        """Separated, sticking and sliding contacts on free bodies, trees and forests."""
-        for build, settle in self.SCENES:
+        """Separated, sticking and sliding contacts on free bodies, trees and forests, under point friction."""
+        check_regular_scenes(self, self.SCENES, conformance.CPU, DEVICE)
+
+    def test_patch_rows_return_the_solution(self):
+        """Patch friction: anchors at their regions' friction locations, on shares of pooled loads."""
+        check_regular_scenes(self, self.PATCH_SCENES, conformance.CPU, DEVICE, law="patch")
+
+    def test_spin_rows_return_the_solution(self):
+        """Contact torsion: each unit's pair and spin row on their elliptic cone, under point and patch friction."""
+        check_regular_scenes(self, self.SPIN_SCENES, conformance.CPU, DEVICE, spin=True)
+        check_regular_scenes(self, self.PATCH_SPIN_SCENES, conformance.CPU, DEVICE, law="patch", spin=True)
+
+    def test_irregular_patterns_solve_the_stated_problem(self):
+        """A pattern that is not regular leaves the impulses open (coplanar loaded normals, redundant sticks) and can
+        admit a second solution: sliding friction on an open split, or another status. It is judged on what any solution
+        must hold, never on ``lambda``: the step's ``v+`` with its stored impulses solves the stated rows, and those
+        impulses through the stated rows are the total force that moved it (:meth:`Manufactured.residual`)."""
+        for build, settle, laws in self.IRREGULAR_SCENES:
             scene = build()
-            for seed in range(3):
-                with self.subTest(scene=scene.name, seed=seed), wp.ScopedDevice(DEVICE):
-                    problem, solver, (point, _coordinate) = manufactured_run(
-                        scene, conformance.CPU, DEVICE, seed=seed, settle=settle
-                    )
-                    self.assertGreater(problem.count, 0)
-                    self.assertLess(problem.predictor_miss, 1.0e-5)
-                    self.assertLess(np.abs(problem.offsets).max(), self.HELD_B / scene.dt)
-                    self.assertLess(point, self.TOLERANCE)
-                    audit = solver.read_audit()
-                    self.assertLess(float(np.nanmax(audit["gap"])), 1.0e-6)
-                    self.assertLess(float(np.nanmax(audit["violation"])), 1.0e-4)
+            for law, spin in laws:
+                with wp.ScopedDevice(DEVICE):
+                    prepared = ManufacturedScene(scene, conformance.CPU, DEVICE, settle=settle, law=law, spin=spin)
+                    seeds = prepared.seeds(2, regular=False)
+                with self.subTest(scene=scene.name, law=law, spin=spin):
+                    self.assertEqual(len(seeds), 2, f"{len(seeds)} irregular seeds of {SCAN}")
+                for seed in seeds:
+                    with self.subTest(scene=scene.name, law=law, spin=spin, seed=seed), wp.ScopedDevice(DEVICE):
+                        problem, solver = prepared.solve(seed)
+                        self.assertLess(np.abs(problem.offsets).max(), self.HELD_B / scene.dt)
+                        self.assertLess(problem.tangent_offset, self.HELD_B / scene.dt)
+                        self.assertLess(problem.drift, self.DRIFT)
+                        self.assertLess(max(problem.residual(solver)), self.TOLERANCE)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
 class TestQ18ManufacturedCUDA(unittest.TestCase):
-    """Q18 on every CUDA placement: each must return the solution the core returns."""
+    """Q18 on every CUDA placement: each must return the solution the core returns, on seeds its own settled pose makes
+    regular. The Jacobi tiers are read apart (:meth:`test_tiers_return_the_solution`)."""
 
     PLACEMENTS = (
-        (scenes.box_stack, 60, ("MF_HELD", "MF_DEFAULT")),
-        (scenes.legged, 30, ("MF_HELD", "SPARSE", "SPARSE_TRIPLETS", "MF_PARALLEL", "KEYED_PARALLEL")),
-        (scenes.gripper, 60, ("LOCAL_PACKETS", "LOCAL_FOREST", "LOCAL_OWNED")),
-        (scenes.keyboard, 30, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE", "COMPACT_BOUNDARY")),
-        (scenes.hand, 30, ("PAIRED", "PAIRED_FOREST")),
+        (scenes.box_stack, 60, 2.0 / 3.0, ("MF_HELD", "MF_DEFAULT")),
+        (scenes.legged, 30, 2.0 / 3.0, ("MF_HELD", "SPARSE", "SPARSE_TRIPLETS")),
+        (scenes.gripper, 60, SPARSE, ("LOCAL_PACKETS", "LOCAL_FOREST", "LOCAL_OWNED")),
+        (scenes.keyboard, 30, 2.0 / 3.0, ("SPARSE_DIAGONAL", "SPARSE_DIAGONAL_TREE", "COMPACT_BOUNDARY")),
+        (scenes.hand, 30, 2.0 / 3.0, ("PAIRED", "PAIRED_FOREST")),
     )
+    """``(build, settle, loaded, routes)``, as :attr:`TestQ18Manufactured.SCENES`."""
+    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
+    """The Jacobi tiers (K4), on legged."""
+
+    def _placements(self, law, spin, count):
+        for build, settle, loaded, names in self.PLACEMENTS:
+            entry = (build, settle, min(loaded, SPARSE) if spin else loaded)
+            for name in names:
+                check_regular_scenes(
+                    self, (entry,), getattr(conformance, name), "cuda:0", law=law, spin=spin, count=count
+                )
 
     def test_every_placement_returns_the_solution(self):
-        for build, settle, names in self.PLACEMENTS:
-            scene = build()
-            for name in names:
-                for seed in range(3):
-                    with self.subTest(scene=scene.name, route=name, seed=seed), wp.ScopedDevice("cuda:0"):
-                        route = getattr(conformance, name)
-                        problem, _solver, (point, _coordinate) = manufactured_run(
-                            scene, route, "cuda:0", seed=seed, settle=settle
-                        )
-                        self.assertGreater(problem.count, 0)
-                        self.assertLess(problem.predictor_miss, 1.0e-4)
-                        self.assertLess(np.abs(problem.offsets).max(), TestQ18Manufactured.HELD_B / scene.dt)
-                        self.assertLess(point, TestQ18Manufactured.TOLERANCE)
+        self._placements("point", False, 3)
+
+    def test_every_placement_holds_patch_rows(self):
+        self._placements("patch", False, 1)
+
+    def test_every_placement_holds_spin_rows(self):
+        self._placements("point", True, 1)
+
+    @known_failure(
+        "E2: the Jacobi tiers (K4)",
+        "on legged's regular patterns the tiers stop short at their default budget (seed 1: 6.2e-4 m/s, G 1.0e-6) and "
+        "do not converge on others even pinned (seed 34: 5.0e-4 at 1024 sweeps, 1.9e-3 at 4096, G 9.1e-6 to 1.8e-5); "
+        "Gauss-Seidel returns both within 3.1e-7",
+    )
+    def test_tiers_return_the_solution(self):
+        """At their default budget and exit law, as users run them, the tiers return the solution on legged too."""
+        build, settle, loaded, _names = self.PLACEMENTS[1]
+        wrong = {}
+        for name in self.TIERS:
+            with wp.ScopedDevice("cuda:0"):
+                prepared = ManufacturedScene(
+                    build(), getattr(conformance, name), "cuda:0", settle=settle, loaded=loaded
+                )
+                for seed in prepared.seeds(4):
+                    problem, solver = prepared.solve(seed)
+                    point = problem.error(solver.v_out.numpy(), problem.offsets)[0]
+                    if point >= TestQ18Manufactured.TOLERANCE:
+                        wrong[name, seed] = point
+        self.assertEqual(wrong, {})
 
 
 class TestRegimeSuite(unittest.TestCase):
