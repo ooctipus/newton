@@ -537,7 +537,7 @@ FACTOR_REQUEST = wp.constant(2)
 it while the held tree's repair reads the other bit on another stream, so a repair never races a saturation change."""
 
 
-@wp.func
+@SPATIAL.law
 def spring_damper_stiffness(stiffness: float, damping: float, theta: float, dt: float) -> float:
     """Return the ``K = theta k dt^2 + c dt`` a spring and damper add to their coordinate's mass.
 
@@ -572,7 +572,7 @@ def drive_force(ke: float, kd: float, q: float, qd: float, q_target: float, qd_t
     return spring_damper_force(ke, kd, q, qd, q_target, qd_target, 1.0, dt)
 
 
-@wp.func
+@SPATIAL.law
 def limited_drive_force(u0: float, effort_limit: float) -> float:
     """Return ``u0`` clamped to a positive effort limit (the actuator's force range), the force the trial solve holds."""
     if effort_limit > 0.0:
@@ -580,7 +580,7 @@ def limited_drive_force(u0: float, effort_limit: float) -> float:
     return u0
 
 
-@wp.func
+@SPATIAL.law
 def drive_step_force(u0: float, limited: float, K: float, qdd: float, inertia: float) -> float:
     """Return a drive's force on its step, read from a trial solve with every ``K`` in the mass and every force limited.
 
@@ -594,12 +594,15 @@ def drive_step_force(u0: float, limited: float, K: float, qdd: float, inertia: f
     ``I``, which is what the excess alone would add on one coordinate. So on one coordinate, under any other force,
     this is the exact step's force, and it decides what the limit decides: a stiff drive on a light joint keeps its ``K``
     at every ``u0`` it meets. Solving with every ``u0`` unlimited instead would charge each drive with its neighbours'
-    forces past their limits, and saturate the free joint beside a saturated one.
+    forces past their limits, and saturate the free joint beside a saturated one. ``inertia`` is read only with an excess.
     """
-    return limited - K * qdd + (u0 - limited) * inertia / (inertia + K)
+    force = limited - K * qdd
+    if u0 != limited:
+        force += (u0 - limited) * inertia / (inertia + K)
+    return force
 
 
-@wp.func
+@SPATIAL.law
 def free_drive_force(
     u0: float, limited: float, K: float, qdd: float, rows_qdd: float, inertia: float, effort_limit: float
 ) -> float:

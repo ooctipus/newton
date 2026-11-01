@@ -62,25 +62,14 @@ def _element(array: str, *indices: str) -> str:
 # memory and only the pattern's entries are published; past it L is factored in place in global memory, and the
 # reciprocals stay above the diagonal, which no reader of L reads. The CPU runs a warp's lanes on its first thread. A
 # structural zero of L stays the array's zero.
-_DENSE_FACTOR = """
-    const int group = tid >> 5;
-    if (group >= group_to_art.shape[0]) return;
-#if !defined(__CUDA_ARCH__)
-    if ((tid & 31) != 0) return;
-#endif
-    const int articulation = group_to_art.data[group];
-    if (mass_update_mask.data[articulation] == 0) return;
-    const int n = plan.size;
-    const int dof_start = articulation_dof_start.data[articulation];
-    const float* mass = geometric.data + geometry_group.data[group] * geometric.shape[1];
-$STAGING
+DENSE_FACTOR_BODY = """
     for (int entry = LANE; entry < plan.entry_count; entry += STRIDE) {
         const int row = plan.rows.data[entry], col = plan.columns.data[entry];
         const int geometry = plan.geometry.data[entry];
         float value = geometry < 0 ? 0.0f : mass[geometry];
         if (row == col) {
             const int physical = n - 1 - row;
-            value += R_group.data[group * n + physical];
+            value += R_group.data[factor_group * n + physical];
             const int drive_row = drive_row_by_dof.data[dof_start + physical];
             if (drive_row >= 0) {
                 row_H.data[drive_row] = value;
@@ -123,13 +112,28 @@ $STAGING
         }
         SYNC();
     }
+"""
+
+_DENSE_FACTOR = """
+    const int factor_group = tid >> 5;
+    if (factor_group >= group_to_art.shape[0]) return;
+#if !defined(__CUDA_ARCH__)
+    if ((tid & 31) != 0) return;
+#endif
+    const int articulation = group_to_art.data[factor_group];
+    if (mass_update_mask.data[articulation] == 0) return;
+    const int n = plan.size;
+    const int dof_start = articulation_dof_start.data[articulation];
+    const float* mass = geometric.data + geometry_group.data[factor_group] * geometric.shape[1];
+$STAGING
+$BODY
 $PUBLISH
 """
 
-_DENSE_FACTOR_PUBLISH = """
+DENSE_FACTOR_PUBLISH = """
     for (int entry = LANE; entry < plan.entry_count; entry += STRIDE) {
         const int element = plan.rows.data[entry] * n + plan.columns.data[entry];
-        L_group.data[group * n * n + element] = L[element];
+        L_group.data[factor_group * n * n + element] = L[element];
     }
 """
 
@@ -204,8 +208,9 @@ def dense_factor_kernel(size: int) -> wp.Kernel:
     staging = Staging((Buffer("L", "float", size * size),), groups=4, layout="arrays").declarations() if size else ""
     snippet = substitute(
         _DENSE_FACTOR,
-        STAGING=staging or "    float* L = L_group.data + group * n * n;",
-        PUBLISH=_DENSE_FACTOR_PUBLISH if size else "",
+        STAGING=staging or "    float* L = L_group.data + factor_group * n * n;",
+        BODY=DENSE_FACTOR_BODY,
+        PUBLISH=DENSE_FACTOR_PUBLISH if size else "",
     )
     return KernelTemplate(
         f"dense_factor_{size}",

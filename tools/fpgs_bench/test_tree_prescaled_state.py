@@ -127,7 +127,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                         owner.begin(state, solver.factor, motion, dt, epoch in (0, 4))
                         if epoch == 0:
                             solver.factor.mass_update_mask.fill_(1)
-                            operator.refresh(solver.factor.mass_update_mask)
+                            operator.refresh(solver.factor)
                             held = solver.factor.sparse_Linv.numpy().copy()
                         owner.predict(state, solver.factor, control, motion, dt)
                     generation = owner.data.generation.numpy().copy()

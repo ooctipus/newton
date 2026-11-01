@@ -370,6 +370,7 @@ _BUILTIN_KINDS = {
     "determinant": _SCALAR,
     "trace": _SCALAR,
     "abs": _FIRST,
+    "sign": _FIRST,
     "max": _FIRST,
     "min": _FIRST,
     "clamp": _FIRST,

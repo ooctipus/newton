@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -359,6 +360,25 @@ def _driven_hinges(inertias, *, ke, kd, effort, target, device="cpu"):
     return model, control
 
 
+def _launched(step) -> list[str]:
+    """The kernels ``step()`` launches, in order."""
+    names = []
+
+    def record(run):
+        def recorded(kernel, *args, **kwargs):
+            names.append(kernel.key)
+            return run(kernel, *args, **kwargs)
+
+        return recorded
+
+    with (
+        mock.patch.object(wp, "launch", record(wp.launch)),
+        mock.patch.object(wp, "launch_tiled", record(wp.launch_tiled)),
+    ):
+        step()
+    return names
+
+
 def _huber_step(mass, u0, stiffness, limit, dt=H):
     """The exact implicit step of effort-limited drives (float64): the drive energy is Huber, so
     ``H dv = dt clamp(u0 - (K / dt) dv, +-limit)`` is the minimum of a convex energy. Newton with a line search: an
@@ -504,21 +524,17 @@ class TestDriveSaturation(unittest.TestCase):
             v = v + _huber_step(mass, -(ke * (q - target + dt * v) + kd * v), stiffness, limit, dt)
             q = q + dt * v
             exact.append(np.abs(v).max())
-        for pins in ({}, {"evaluator": "ordinary"}):
-            with self.subTest(pins=pins), conformance.route_context(conformance.Route("drives", "cpu", pins=pins)):
-                model, control = _driven_hinges(inertias, ke=ke, kd=kd, effort=limit, target=[0.0, 0.0])
-                solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
-                state, out = model.state(), model.state()
-                speeds = []
-                for target in targets:
-                    control.joint_target_q.assign(target.astype(np.float32))
-                    solver.step(state, out, control, None, dt)
-                    state, out = out, state
-                    speeds.append(np.abs(state.joint_qd.numpy()).max())
-                self.assertLess(float(np.max(speeds)), 1.2 * max(exact))
-                self.assertLess(
-                    float(np.sqrt(np.mean(np.square(speeds)))), 1.2 * float(np.sqrt(np.mean(np.square(exact))))
-                )
+        model, control = _driven_hinges(inertias, ke=ke, kd=kd, effort=limit, target=[0.0, 0.0])
+        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+        state, out = model.state(), model.state()
+        speeds = []
+        for target in targets:
+            control.joint_target_q.assign(target.astype(np.float32))
+            solver.step(state, out, control, None, dt)
+            state, out = out, state
+            speeds.append(np.abs(state.joint_qd.numpy()).max())
+        self.assertLess(float(np.max(speeds)), 1.2 * max(exact))
+        self.assertLess(float(np.sqrt(np.mean(np.square(speeds)))), 1.2 * float(np.sqrt(np.mean(np.square(exact)))))
 
     def test_rollout_follows_the_huber_step(self):
         """Saturate, reach the target and hold it on one coordinate and on a coupled chain."""
@@ -543,13 +559,11 @@ class TestDriveSaturation(unittest.TestCase):
         """A drive at rest has ``u0`` 0 and no excess, and the trial still reads it past its limit: the joint runs at
         ``(load - limit) / I`` from the first step."""
         inertia, ke, kd, limit, load = 0.01, 100.0, 10.0, 1.0, 5.0
-        for pins in ({}, {"evaluator": "ordinary"}):
-            with self.subTest(pins=pins), conformance.route_context(conformance.Route("drives", "cpu", pins=pins)):
-                model, control = _driven_hinges([inertia], ke=ke, kd=kd, effort=limit, target=[0.0])
-                control.joint_f.assign(np.array([load], dtype=np.float32))
-                history, _ = _drive_roll(model, control, 6)
-                velocity = np.r_[0.0, history[:, 1]]
-                np.testing.assert_allclose(np.diff(velocity), H * (load - limit) / inertia, rtol=1.0e-3)
+        model, control = _driven_hinges([inertia], ke=ke, kd=kd, effort=limit, target=[0.0])
+        control.joint_f.assign(np.array([load], dtype=np.float32))
+        history, _ = _drive_roll(model, control, 6)
+        velocity = np.r_[0.0, history[:, 1]]
+        np.testing.assert_allclose(np.diff(velocity), H * (load - limit) / inertia, rtol=1.0e-3)
 
     def test_a_drive_below_its_limit_keeps_the_implicit_step(self):
         inertia, ke, kd = 0.01, 100.0, 1.0
@@ -558,15 +572,41 @@ class TestDriveSaturation(unittest.TestCase):
         history, _ = _drive_roll(model, control, 40)
         np.testing.assert_allclose(history, reference, rtol=2.0e-3, atol=1.0e-4)
 
+    def test_articulations_without_coordinates_hold_no_drives(self):
+        """The predictor binds the drive rows, which a model with no coordinates does not have."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_fixed(parent=-1, child=link)])
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+        state, out = model.state(), model.state()
+        solver.step(state, out, model.control(), None, H)
+        np.testing.assert_array_equal(out.body_q.numpy(), state.body_q.numpy())
+
+    def test_a_step_at_a_limit_launches_what_a_quiet_step_does(self):
+        """The decision, the second factor and the second solve are the predictor's: no launch of their own, so a world
+        with nothing to do pays no launch and a launch does not wait on another for its slowest world."""
+        launches, moved = [], []
+        for limit in (1.0e6, 0.5):
+            model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=limit, target=[0.6, -0.8])
+            solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
+            state, out = model.state(), model.state()
+            solver.step(state, out, control, None, H)
+            launches.append(_launched(lambda: solver.step(out, state, control, None, H)))  # noqa: B023
+            moved.append(float(solver.factor.aug_row_K.numpy().min()))
+        self.assertEqual(launches[0], launches[1])
+        for stage in ("dense_factor", "tree_kinetic_predict"):
+            self.assertEqual(sum(name.startswith(stage) for name in launches[0]), 1, stage)
+        self.assertGreater(moved[0], 1.0e-3)
+        self.assertLess(moved[1], 1.0e-6)
+
     def test_a_saturation_change_refreshes_a_stale_factor(self):
         """Hold ``update_mass_matrix_interval=2`` to the every-step result where ``H`` is constant: only ``K`` moves."""
-        for pins in ({}, {"evaluator": "ordinary"}):
-            with self.subTest(pins=pins), conformance.route_context(conformance.Route("drives", "cpu", pins=pins)):
-                arms = []
-                for interval in (1, 2):
-                    model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=1.5, target=[0.6, -0.8])
-                    arms.append(_drive_roll(model, control, 120, update_mass_matrix_interval=interval)[0])
-                np.testing.assert_allclose(arms[1], arms[0], rtol=1.0e-4, atol=2.0e-4)
+        arms = []
+        for interval in (1, 2):
+            model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=1.5, target=[0.6, -0.8])
+            arms.append(_drive_roll(model, control, 120, update_mass_matrix_interval=interval)[0])
+        np.testing.assert_allclose(arms[1], arms[0], rtol=1.0e-4, atol=2.0e-4)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "scalar branches run on CUDA")
@@ -810,13 +850,40 @@ def _driven_forest(device):
     return model, model.control()
 
 
+def _driven_chain(device):
+    """A chain of 40 hinges in each of two worlds, past a warp of lanes, with drives that saturate."""
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    parent, joints = -1, []
+    for index in range(40):
+        link = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * (0.02 + 0.01 * (index % 3))))
+        joints.append(
+            template.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=(0.0, 0.0, 1.0),
+                target_ke=80.0,
+                target_kd=4.0,
+                effort_limit=2.0,
+                armature=0.01,
+                limit_lower=-1.0e6,
+                limit_upper=1.0e6,
+            )
+        )
+        parent = link
+    template.add_articulation(joints)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.replicate(template, 2)
+    model = builder.finalize(device=device)
+    return model, model.control()
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the held tree's natives run on CUDA")
 class TestDriveSaturationOnRoutes(unittest.TestCase):
     """The decision on each evaluator of the trees: a second factor and solve that reach the right articulations."""
 
-    def _roll(self, device, pins, **options):
+    def _roll(self, device, pins, *, scene=_driven_forest, **options):
         with conformance.route_context(conformance.Route("drives", device.split(":")[0], pins=pins)):
-            model, control = _driven_forest(device)
+            model, control = scene(device)
             solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4, **options)
         state, out = model.state(), model.state()
         history = []
@@ -834,18 +901,38 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
     def test_routes_agree_with_the_cpu(self):
         reference, _ = self._roll("cpu", {})
         self.assertGreater(float(np.abs(reference).max()), 2.0)
-        for pins, owner in (({}, "mixed"), ({"grouping": "forest"}, "forest"), ({"evaluator": "ordinary"}, None)):
+        for pins, owner in (({}, "mixed"), ({"grouping": "forest"}, "forest")):
             with self.subTest(pins=pins):
                 history, solver = self._roll("cuda:0", pins)
-                if owner is not None:
-                    self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], owner)
+                self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], owner)
                 np.testing.assert_allclose(history, reference, rtol=0.0, atol=1.0e-2)
+
+    def test_a_long_chain_takes_the_decision(self):
+        """A tree of two warps: the block's barriers and, past the shared factor's size, its factor in place."""
+        reference, _ = self._roll("cpu", {}, scene=_driven_chain)
+        history, solver = self._roll("cuda:0", {}, scene=_driven_chain)
+        self.assertEqual(solver.factor.held.groups[0].layout.lanes, 64)
+        self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+        np.testing.assert_allclose(history[:20], reference[:20], rtol=0.0, atol=2.0e-2)
+
+    def test_a_second_factor_is_the_factor_kernels(self):
+        """The factor the predictor made for the ``K`` it left is the one a refresh makes from the same geometry."""
+        for device, pins in (("cpu", {}), ("cuda:0", {}), ("cuda:0", {"grouping": "forest"})):
+            with self.subTest(device=device, pins=pins):
+                _, solver = self._roll(device, pins)
+                self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+                self.assertGreater(float(solver.factor.aug_row_K.numpy().max()), 1.0e-3)
+                held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
+                solver.factor.mass_update_mask.fill_(1)
+                solver.factor.held.refresh(solver.factor)
+                for size, factor in solver.factor.L_by_size.items():
+                    np.testing.assert_allclose(held[size], np.tril(factor.numpy()), rtol=2.0e-6, atol=1.0e-7)
 
     def test_a_captured_graph_decides_like_an_eager_step(self):
         """The decision in a graph: steps at their limits, then quiet steps, then at their limits again."""
         targets = np.zeros((60, 10))
         targets[:20] = targets[40:] = np.random.default_rng(2).uniform(-1.0, 1.0, (10,))
-        for pins in ({}, {"grouping": "forest"}, {"evaluator": "ordinary"}):
+        for pins in ({}, {"grouping": "forest"}):
             with self.subTest(pins=pins), conformance.route_context(conformance.Route("drives", "cuda", pins=pins)):
                 arms = []
                 for captured in (False, True):
@@ -874,30 +961,74 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         history = _press([1.0] * 120, device="cuda:0")
         np.testing.assert_allclose(history[-20:, 0], _FINGER["limit"], rtol=2.0e-3)
 
+    def _sparse_roll(self, dense, steps, interval):
+        model = sparse._build_model(device="cuda:0")
+        dofs = np.arange(6, model.joint_dof_count)
+        for name, value in (("target_ke", 1.0e3), ("target_kd", 20.0), ("effort_limit", 0.2)):
+            array = getattr(model, f"joint_{name}")
+            values = array.numpy()
+            values[dofs] = value
+            array.assign(values)
+        control = model.control()
+        control.joint_target_q.assign(0.5 * np.cos(np.arange(control.joint_target_q.shape[0])).astype(np.float32))
+        solver = sparse._make_solver(model, not dense, update_mass_matrix_interval=interval)
+        self.assertEqual(solver.placement.sparse_mass_matrix_size is not None, not dense)
+        state, out = model.state(), model.state()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        history = []
+        for _ in range(steps):
+            solver.step(state, out, control, None, H)
+            state, out = out, state
+            history.append(state.joint_qd.numpy().copy())
+        self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+        return np.asarray(history), solver
+
     def test_the_sparse_factor_takes_the_decision(self):
-        arms = []
-        for dense in (False, True):
-            model = sparse._build_model(device="cuda:0")
-            dofs = np.arange(6, model.joint_dof_count)
-            for name, value in (("target_ke", 1.0e3), ("target_kd", 20.0), ("effort_limit", 0.2)):
-                array = getattr(model, f"joint_{name}")
-                values = array.numpy()
-                values[dofs] = value
-                array.assign(values)
-            control = model.control()
-            control.joint_target_q.assign(0.5 * np.cos(np.arange(control.joint_target_q.shape[0])).astype(np.float32))
-            solver = sparse._make_solver(model, not dense, update_mass_matrix_interval=1)
-            self.assertEqual(solver.placement.sparse_mass_matrix_size is not None, not dense)
-            state, out = model.state(), model.state()
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            history = []
-            for _ in range(60):
-                solver.step(state, out, control, None, H)
-                state, out = out, state
-                history.append(state.joint_qd.numpy().copy())
-            self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
-            arms.append(np.asarray(history))
+        arms = [self._sparse_roll(dense, 60, 1)[0] for dense in (False, True)]
         np.testing.assert_allclose(arms[1], arms[0], rtol=0.0, atol=2.0e-2)
+
+    def test_a_sparse_second_factor_is_the_factor_kernels(self):
+        """``L^-1`` included. An odd step count: the last finish left the geometry the step's factors read."""
+        _, solver = self._sparse_roll(False, 5, 2)
+        held = solver.factor.sparse_Linv.numpy().copy()
+        solver.factor.mass_update_mask.fill_(1)
+        solver.factor.held.refresh(solver.factor)
+        np.testing.assert_allclose(held, solver.factor.sparse_Linv.numpy(), rtol=2.0e-6, atol=1.0e-7)
+
+    def test_a_compact_diagonal_decides_in_its_predictor(self):
+        """A tree group of diagonal mass, the star pin keeping it from scalar branches: its inverse is the coordinate's own,
+        on a step without a mass update."""
+        limit = 0.05
+        model = branch.build_branch_model("cuda:0", worlds=2, arm=True)
+        model.gravity.fill_(wp.vec3(0.0, 0.0, 0.0))
+        size = branch.branch_size(model)
+        dofs = np.asarray(model.joint_qd_start.numpy()[model.articulation_start.numpy()[0] + 1]) + np.arange(size)
+        child = model.joint_child.numpy()[model.articulation_start.numpy()[0] + 1 + np.arange(size)]
+        inertia = model.body_mass.numpy()[child] + model.joint_armature.numpy()[dofs]
+        for name, value in (("target_ke", 1.0e4), ("target_kd", 100.0), ("effort_limit", limit), ("damping", 0.0)):
+            array = getattr(model, f"joint_{name}")
+            values = array.numpy()
+            values[dofs] = value
+            array.assign(values)
+        model.joint_spring_stiffness.zero_()
+        model.joint_limit_lower.fill_(-1.0e3)
+        model.joint_limit_upper.fill_(1.0e3)
+        solver = branch.recipe_solver(model, scalar=False, angular_damping=0.0, update_mass_matrix_interval=2)
+        self.assertTrue(any(getattr(group.sparse, "diagonal", False) for group in solver.factor.held.groups))
+        control = model.control()
+        state, out = model.state(), model.state()
+        state.joint_q.zero_()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        target = np.zeros_like(control.joint_target_q.numpy())
+        control.joint_target_q.assign(target)
+        solver.step(state, out, control, None, H)
+        state, out = out, state
+        # The first step stays below the limit at rest on target; the second is a step without a mass update.
+        target[dofs] = 1.0e3
+        control.joint_target_q.assign(target)
+        before = state.joint_qd.numpy()[dofs]
+        solver.step(state, out, control, None, H)
+        np.testing.assert_allclose(out.joint_qd.numpy()[dofs] - before, limit / inertia * H, rtol=2.0e-3)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "the specialized row stores run on CUDA")

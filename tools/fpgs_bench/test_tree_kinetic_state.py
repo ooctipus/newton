@@ -123,7 +123,7 @@ class TestTreePhysicalCPU(unittest.TestCase):
                         expected = matrix[np.ix_(mass.permutation, mass.permutation)][mass.entry_rows, mass.columns]
                         np.testing.assert_allclose(geometry[group], expected, atol=3e-6, rtol=3e-5)
                     solver.factor.mass_update_mask.fill_(1)
-                    operator.refresh(solver.factor.mass_update_mask)
+                    operator.refresh(solver.factor)
                     response = force_response(owner, solver, state, control, state.joint_qd, dt).reshape(2, count)
                     forces = control.joint_f.numpy().reshape(2, count).astype(float)
                     for group, matrix in enumerate(matrices):
@@ -141,7 +141,7 @@ class TestTreePhysicalCPU(unittest.TestCase):
                     np.testing.assert_array_equal(owner.data.generation.numpy(), np.add(before, [1, 0]))
                     held = operator.data.W.numpy().copy()
                     solver.factor.mass_update_mask.zero_()
-                    operator.refresh(solver.factor.mass_update_mask)
+                    operator.refresh(solver.factor)
                     np.testing.assert_array_equal(operator.data.W.numpy(), held)
 
     def test_physical_cache(self):

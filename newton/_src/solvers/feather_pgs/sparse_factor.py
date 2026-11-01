@@ -16,6 +16,7 @@ import warp as wp
 
 from . import field_group, host_index
 from .field_group import Field
+from .sparse_mass_matrix import _SparseMassMatrixIndices
 
 SPARSE_PLAN = (
     Field("index", wp.int32, ("i", "j"), owner="host"),
@@ -55,6 +56,8 @@ class SparseData:
     W: wp.array2d[float]
     valid: wp.array[int]
     status: wp.array[int]
+    armature: wp.array2d[float]
+    indices: _SparseMassMatrixIndices
     Z: wp.array3d[float]
     support: wp.array2d[int]
     incident: wp.array2d[float]

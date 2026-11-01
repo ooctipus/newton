@@ -444,7 +444,8 @@ def prepare_listed_augmented_drives(
         joint_target_vel,
         damping,
     )
-    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, stiffness, joint_effort_limit[dof])
+    passive = spring_damper_stiffness(0.0, damping[dof], 0.0, dt)
+    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, stiffness, passive, joint_effort_limit[dof])
 
 
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
@@ -750,16 +751,14 @@ class ScalarBranchState:
             device=model.device,
         )
 
-    def refresh(self, mask):
+    def refresh(self, state_aug):
         """Nothing to do here: ``predict`` refreshes the inverse masses the mass mask selects."""
 
     def bind_response(self):
         """The inverse diagonal is the solver's and never rebinds."""
 
-    def predict(self, state_in, state_aug, control, stage3_qd, dt, *, second_solve=False):
-        """Form each leaf's force and refresh, solve and predict its coordinate: once, a leaf's decision is its own."""
-        if second_solve:
-            return
+    def predict(self, state_in, state_aug, control, stage3_qd, dt):
+        """Form each leaf's force and refresh, solve and predict its coordinate, deciding its drive's saturation."""
         self._validate_call(state_in, state_aug, dt)
         solver, model = self.solver, self.solver.model
         inputs = [

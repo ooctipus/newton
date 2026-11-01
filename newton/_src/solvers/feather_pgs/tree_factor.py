@@ -42,7 +42,6 @@ from .kernels import (
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
     prescale_joint_velocity_limits,
-    saturate_drive_rows,
 )
 from .row_laws import LINK_ROWS
 from .solver_fields import (
@@ -60,7 +59,7 @@ from .solver_fields import (
     hold_drive_row,
 )
 from .sparse_mass_matrix import factor_indices
-from .spatial_laws import drive_force, drive_stiffness
+from .spatial_laws import drive_force, drive_stiffness, spring_damper_stiffness
 from .tree_plan import TreePlan
 
 __all__ = ["WALK_COORDINATE", "WALK_LINK", "TreeFactor", "prepare_augmented_drives", "walk_prelude"]
@@ -97,6 +96,7 @@ def prepare_augmented_drives(
     K = drive_stiffness(ke, kd, passive_damping[dof], dt)
     if K <= 0.0:
         rows.row_K[row] = 0.0
+        rows.drive[dof] = wp.vec4()
         return
     u0 = drive_force(
         ke,
@@ -107,7 +107,8 @@ def prepare_augmented_drives(
         joint_target_vel[dof],
         dt,
     )
-    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, K, joint_effort_limit[dof])
+    passive = spring_damper_stiffness(0.0, passive_damping[dof], 0.0, dt)
+    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, K, passive, joint_effort_limit[dof])
 
 
 class TreeFactor:
@@ -380,7 +381,10 @@ class TreeFactor:
                 AUGMENTED_DRIVE_ROWS,
                 articulation=model.articulation_count,
                 drive_row=model.articulation_count * forest.articulation_max_dofs,
+                dof=model.joint_dof_count,
             )
+        else:
+            self._arrays.release(AUGMENTED_DRIVE_ROWS)
         self.parallel_drives = False
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
@@ -565,17 +569,6 @@ class TreeFactor:
         self.held = held_tree.install(solver)
         model = self.model
         self.dynamics_stream = wp.Stream(model.device) if self.parallel_drives and model.device.is_cuda else None
-        self.saturating_rows = self._saturating_rows()
-
-    def _saturating_rows(self) -> wp.array | None:
-        """The drive rows the step's saturation decision reads, or ``None``: all of them but those of scalar branches,
-        a leaf being one coordinate that decides in its own predict."""
-        scalar = getattr(self.held, "scalar", None)
-        rows = self.drive_row_by_dof.numpy()
-        if scalar is not None:
-            rows = rows[scalar.other_drive_dofs.numpy()] if scalar.other_drive_dofs is not None else rows[:0]
-        rows = rows[rows >= 0]
-        return wp.array(rows.astype(np.int32), dtype=wp.int32, device=self.model.device) if rows.size else None
 
     # ---------------------------------------------------------------------------------------------------------------
     # Notifications
@@ -789,59 +782,29 @@ class TreeFactor:
         # baked memset cadence always matches the baked update cadence.
         self.mass_update_global_flag = bool(global_flag)
 
-        # The drives' requests join the mask: a saturation change refreshes its articulation's factor this step.
+        # The mask kernel reads what the drives requested.
         if drive_rows_ready is not None:
             wp.get_stream(model.device).wait_event(drive_rows_ready)
         wp.launch(
             build_mass_update_mask,
             dim=model.articulation_count,
             inputs=[global_flag],
-            outputs=[self.mass_update_requested, self.mass_update_mask, self.drive_solve_mask, self.drive_factor_mask],
+            outputs=[self.mass_update_requested, self.mass_update_mask],
             device=model.device,
         )
 
-        self.held.refresh(self.mass_update_mask)
+        self.held.refresh(self)
         self.force_mass_update = False
 
     def predict(self, state_in, control, qd: wp.array, ready: wp.Event | None, dt: float, v_hat: wp.array) -> None:
-        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included: a trial solve, the drives'
-        saturation decision (:meth:`saturate_drives`) and, where it moved a drive, a new factor and solve."""
+        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included. Each tree's launch holds the
+        drives' saturation decision and, where it moved a drive, the tree's new factor and solve
+        (:data:`.tree_kinetic_state.SATURATE_DRIVES`)."""
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self.nvtx, synchronize=False):
             if ready is not None:
                 wp.get_stream(self.model.device).wait_event(ready)
             self.held.predict(state_in, self, control, qd, dt)
-            if self.saturate_drives(dt):
-                self.held.refresh(self.drive_factor_mask)
-                self.held.predict(state_in, self, control, qd, dt, second_solve=True)
             self.correct_free_root_velocity(state_in, qd, dt, v_hat)
-
-    def saturate_drives(self, dt: float) -> bool:
-        """Read the trial solve just made (:func:`.kernels.saturate_drive_rows`) into the articulations that need a new
-        factor and those that need a new solve. Returns whether the step has rows to decide: a captured graph launches
-        what follows on every step, and a world with nothing to do returns at once."""
-        if self.saturating_rows is None:
-            return False
-        model = self.model
-        wp.launch(
-            saturate_drive_rows,
-            dim=self.saturating_rows.shape[0],
-            inputs=[
-                self.saturating_rows,
-                self.forest.articulation_max_dofs,
-                self.aug_row_dof_index,
-                self.aug_row_u0,
-                self.aug_row_H,
-                self.aug_row_dv,
-                self.joint_qdd,
-                model.joint_effort_limit,
-                self.passive_joint_damping,
-                dt,
-            ],
-            outputs=[self.aug_row_K, self.joint_tau, self.drive_factor_mask, self.drive_solve_mask],
-            block_dim=256,
-            device=model.device,
-        )
-        return True
 
     def correct_free_root_velocity(self, state_in, qd: wp.array, dt: float, v_hat: wp.array) -> None:
         """Apply canonical gyro physics and the free roots' spin damping after the held prediction."""

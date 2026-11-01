@@ -2154,6 +2154,15 @@ _FACTOR_ASSEMBLY = """
     float inverse[$NNZ];
 #endif
     const int start = articulation_dof_start.data[art];
+$BODY
+    SYNC();
+    const bool valid = status.data[group] == 0;
+    for (int entry = lane; entry < $NNZ; entry += stride) {
+        Linv_group.data[group * $NNZ + entry] = valid ? inverse[entry] : NAN;
+    }
+"""
+
+SPARSE_FACTOR_BODY = """
     if (lane == 0) status.data[group] = 0;
     SYNC();
     for (int entry = lane; entry < $NNZ; entry += stride) {
@@ -2174,12 +2183,20 @@ _FACTOR_ASSEMBLY = """
     SYNC();
     $FACTOR
     $INVERSE
-    SYNC();
-    const bool valid = status.data[group] == 0;
-    for (int entry = lane; entry < $NNZ; entry += stride) {
-        Linv_group.data[group * $NNZ + entry] = valid ? inverse[entry] : NAN;
-    }
 """
+"""The sparse factor of one tree, ``L^-1`` included: the caller binds ``indices``, ``status``, ``geometric``, ``R_group``,
+``drive_row_by_dof``, ``row_K``, ``row_H``, ``factor`` and ``inverse``, and synchronizes after it."""
+
+
+def sparse_factor_body(dof_count: int, nonzero_count: int) -> str:
+    """:data:`SPARSE_FACTOR_BODY` at a tree's sizes."""
+    return kernel_template.substitute(
+        SPARSE_FACTOR_BODY,
+        NNZ=nonzero_count,
+        N=dof_count,
+        FACTOR=sparse_cholesky_source(dof_count, nonzero_count),
+        INVERSE=sparse_inverse_source(dof_count),
+    )
 
 
 @cache
@@ -2194,14 +2211,7 @@ def sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block:
     n, nnz, warps = int(dof_count), int(nonzero_count), int(warps_per_block)
     if not 1 <= n <= 64 or not n <= nnz <= n * (n + 1) // 2 or not 1 <= warps <= 32:
         raise ValueError("Invalid sparse factor dimensions or warp count")
-    body = kernel_template.substitute(
-        _FACTOR_ASSEMBLY,
-        FACTORS=warps * nnz,
-        NNZ=nnz,
-        N=n,
-        FACTOR=sparse_cholesky_source(n, nnz),
-        INVERSE=sparse_inverse_source(n),
-    )
+    body = kernel_template.substitute(_FACTOR_ASSEMBLY, FACTORS=warps * nnz, NNZ=nnz, BODY=sparse_factor_body(n, nnz))
     return KernelTemplate(
         f"sparse_factor_{n}_{nnz}_{warps}",
         (
