@@ -133,7 +133,9 @@ def contact_points(
     normal = -normal_ab
     translation_a = point0
     translation_b = point1
-    offset_a = -margin0 * normal
+    # The margin terms negate as vectors: Warp negates a scalar by subtracting it from zero and CUDA by flipping its
+    # sign, which let the compiler contract the CUDA rendering's offsets differently from the Warp function's.
+    offset_a = -(margin0 * normal)
     offset_b = margin1 * normal
     if body_a >= 0:
         pose_a = body_q[body_a]
