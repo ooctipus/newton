@@ -5,11 +5,11 @@
 
 import contextlib
 import math
+import os
 import sys
 import time
 import unittest
 import warnings
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -26,7 +26,22 @@ from newton._src.core.contact_pool import (
     model_contact_pool,
     sized_rows,
 )
-from newton._src.sim.collide import _estimate_rigid_contact_max
+from newton._src.geometry.broad_phase_common import (
+    FORECAST_FLOATS,
+    FORECAST_REDUCED,
+    FORECAST_SLOTS_SHIFT,
+    FORECAST_TERRAIN,
+    ShapeForecast,
+    forecast_pair,
+    forecast_shape,
+)
+from newton._src.geometry.terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_WALK_SLOTS
+from newton._src.geometry.types import GeoType
+from newton._src.sim.collide import (
+    _estimate_rigid_contact_max,
+    _forecast_terrain,
+    _shape_forecast_words,
+)
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 WORLDS = 4
@@ -39,14 +54,11 @@ GROWN = math.ceil(contact_pool.HEADROOM * CONTACTS / 8) * 8
 
 @contextlib.contextmanager
 def _small_pool_policy(rows: int, quantum: int):
-    """Start new pools at ``rows`` rows, without a first mapping, and round sizes to ``quantum``.
+    """Start new pools at ``rows`` rows and round sizes to ``quantum``.
 
     A small scene then starts below its demand, which exercises growth past the mapped rows.
     """
-    with (
-        mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=quantum),
-        mock.patch.object(ContactPool, "plan_first_mapping", lambda pool, estimate: None),
-    ):
+    with mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=quantum):
         yield
 
 
@@ -105,34 +117,200 @@ def _records(contacts, *extra):
 
 
 class TestContactPoolPolicy(unittest.TestCase):
-    def test_pipelines_map_the_model_estimate_and_never_a_budget(self):
-        """A pool no pipeline planned holds the floor; a pipeline maps the model's shape-pair estimate, not a budget."""
+    def test_pipelines_map_no_estimate_and_no_budget(self):
+        """A pipeline leaves the pool at its floor: rows follow demand, not the shape pairs or a budget."""
         self.assertEqual(contact_pool.MIN_READY_ROWS, 4096)
         self.assertEqual(ContactPool(device="cpu").ready, 4096)
-        model = _build_boxes("cpu", worlds=32, boxes=8)
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertGreater(estimate, contact_pool.MIN_READY_ROWS)
+        model = _build_boxes("cpu", worlds=4096, boxes=8)
+        self.assertGreater(_estimate_rigid_contact_max(model), contact_pool.MIN_READY_ROWS)
         model.rigid_contact_max = 7
         pipeline = newton.CollisionPipeline(model, rigid_contact_max=5)
         self.assertEqual(pipeline.rigid_contact_max, 5)
-        self.assertEqual(pipeline._contact_pool.estimate, estimate)
-        self.assertEqual(pipeline.contacts().rigid_contact_max, estimate, "the estimate, never the budget")
-        small = _build_boxes("cpu", worlds=1, boxes=1)
-        self.assertEqual(newton.CollisionPipeline(small).contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
+        self.assertEqual(pipeline.contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
 
-    def test_first_mapping_keeps_a_share_of_the_free_memory(self):
-        """Cap the first mapping at FIRST_MAPPING_SHARE of the memory free at creation over every field's bytes."""
+    def test_forecast_reads_the_pairs_within_reach(self):
+        """Count a pair's worst case when the reaches of its shapes close the gap of their boxes and capsules."""
+
+        def forecast(gap=0.0, speed=0.0, spin=0.0, horizon=0.1, floats=1, half=(0.5, 0.5, 0.5), turn=0.0, offset=0.0):
+            # Shape 0, a box on a body, ``gap`` above shape 1, a box on the ground (both turned about z by ``turn``,
+            # shape 1 shifted by ``offset`` across it).
+            data = ShapeForecast()
+            data.on = wp.ones(1, dtype=wp.int32, device="cpu")
+            data.slots = wp.zeros(4, dtype=wp.int64, device="cpu")
+            data.horizon = wp.array([wp.vec2(horizon, 0.5 * 9.81 * horizon**2)], dtype=wp.vec2, device="cpu")
+            data.word = wp.array([int(FORECAST_FLOATS) if floats else 0, 0], dtype=wp.int32, device="cpu")
+            data.body_com = wp.zeros(1, dtype=wp.vec3, device="cpu")
+            data.reach = wp.zeros(2, dtype=wp.float32, device="cpu")
+            # A box's capsule runs along its longest side (the first of equal ones).
+            longest = int(np.argmax(half))
+            axis = np.zeros(3)
+            axis[longest] = half[longest]
+            radius = float(np.sqrt(sum(h * h for i, h in enumerate(half) if i != longest)))
+            data.capsule = wp.array([[*axis, radius]] * 2, dtype=wp.vec4, device="cpu")
+            data.middle = wp.array([[0.0, 0.0, 0.0, float(np.linalg.norm(half))]] * 2, dtype=wp.vec4, device="cpu")
+            data.bound_convex = 5
+            data.bound_reduced = 255
+            data.bound_hydroelastic = 260
+            rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), turn)
+            across = wp.quat_rotate(rotation, wp.vec3(0.0, 1.0, 0.0)) * offset
+            poses = [
+                wp.transform((0.0, 0.0, gap + half[2]), rotation),
+                wp.transform((across[0], across[1], -half[2]), rotation),
+            ]
+            corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * half
+            boxes = [[wp.transform_point(pose, wp.vec3(*c)) for c in corners] for pose in poses]
+            lower = wp.array([np.min(box, axis=0) for box in boxes], dtype=wp.vec3, device="cpu")
+            upper = wp.array([np.max(box, axis=0) for box in boxes], dtype=wp.vec3, device="cpu")
+            poses = wp.array(poses, dtype=wp.transform, device="cpu")
+            data.pose = poses
+            body_q = wp.array([poses.numpy()[0]], dtype=wp.transform, device="cpu")
+            body_qd = wp.array([[0.0, 0.0, -speed, 0.0, spin, 0.0]], dtype=wp.spatial_vector, device="cpu")
+            out = wp.zeros(1, dtype=wp.int32, device="cpu")
+
+            @wp.kernel
+            def pair(
+                data: ShapeForecast,
+                lower: wp.array[wp.vec3],
+                upper: wp.array[wp.vec3],
+                poses: wp.array[wp.transform],
+                body_q: wp.array[wp.transform],
+                body_qd: wp.array[wp.spatial_vector],
+                out: wp.array[wp.int32],
+            ):
+                forecast_shape(data, 0, 0, poses[0], body_q, body_qd, lower[0], upper[0])
+                forecast_shape(data, 1, -1, poses[1], body_q, body_qd, lower[1], upper[1])
+                out[0] = forecast_pair(0, 1, lower, upper, data)
+
+            wp.launch(pair, dim=1, inputs=[data, lower, upper, poses, body_q, body_qd, out], device="cpu")
+            return int(out.numpy()[0])
+
+        self.assertEqual(forecast(0.0, 0.0), 5, "boxes that touch")
+        self.assertEqual(forecast(1.0, 0.0), 0, "nothing closes the gap")
+        self.assertEqual(forecast(1.0, 9.0), 0, "the speed falls short")
+        self.assertEqual(forecast(1.0, 9.8), 5, "speed and gravity close it")
+        self.assertEqual(forecast(1.0, 0.0, spin=12.0), 5, "spin at the farthest point closes it")
+        self.assertEqual(forecast(1.0, 9.8, floats=0), 0, "no gravity for a body nothing lets fall")
+        rod = (1.0, 0.05, 0.05)
+        self.assertEqual(forecast(half=rod, turn=0.785, offset=0.7), 0, "the boxes meet, the capsules do not")
+        self.assertEqual(forecast(half=rod, turn=0.785, offset=0.7, speed=7.0), 5, "the capsules meet within reach")
+
+    def test_forecast_reads_the_terrain_under_a_shape(self):
+        """Read a heightfield's tile under a shape, not its bounding box, and bound its pairs by the law's walk slots."""
+        heights = np.zeros((17, 17), dtype=np.float32)
+        heights[9:, 9:] = 1.0
+        field = newton.Heightfield(data=heights, nrow=17, ncol=17, hx=4.0, hy=4.0, min_z=0.0, max_z=2.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.add_shape_heightfield(heightfield=field)
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 3.0), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        terrain = _forecast_terrain(model)
+        self.assertEqual(terrain.shapes.tolist(), [0, -1])
+        self.assertEqual(terrain.layouts.tolist(), [[0, 2, 2]])
+        np.testing.assert_allclose(terrain.scales, [[0.25, 0.25]])
+        np.testing.assert_allclose(terrain.tiles, [0.0, 0.0, 0.0, 2.0])
+        self.assertEqual(terrain.walk_slots[int(GeoType.BOX)], TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX])
+        words = _shape_forecast_words(model, terrain)
+        bits = (1 << int(FORECAST_SLOTS_SHIFT)) - 1
+        self.assertEqual((words & bits).tolist(), [int(FORECAST_REDUCED) | int(FORECAST_TERRAIN), int(FORECAST_FLOATS)])
+        self.assertEqual(int(words[1]) >> int(FORECAST_SLOTS_SHIFT), TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX])
+
+    def test_forecast_sizes_the_rows_while_the_demand_is_in_transit(self):
+        """Hold the forecast's rows from the start until the demand first holds still; leave a later creep to the
+        headroom; hold them again after a pass that dropped contacts, or a measured state."""
         pool = ContactPool(device="cpu")
-        pool._estimate = 10_000_000
-        self.assertEqual(pool._first_rows(100, INDEX_LIMIT), 10_000_000, "the CPU reports no free memory: no cap")
-        pool.device = SimpleNamespace(is_cuda=True)
-        pool.free_memory_at_creation = 8 * 2**30
-        share = contact_pool.FIRST_MAPPING_SHARE
-        self.assertEqual(pool._first_rows(1000, INDEX_LIMIT), int(share * 8 * 2**30) // 1000)
-        self.assertEqual(pool._first_rows(10, INDEX_LIMIT), 10_000_000, "the estimate fits the share")
-        self.assertEqual(pool._first_rows(10, 1000), 1000, "at most the bound")
-        pool._estimate = 0
-        self.assertEqual(pool._first_rows(10, INDEX_LIMIT), contact_pool.MIN_READY_ROWS, "at least the floor")
+        pool.rows((ContactField("value", wp.int32, -1),))
+        pool._high_water_host.assign([0, 0, 0, 20_000, 0, 0, 0, 0])
+        self.assertEqual(pool.forecast, 20_000)
+        pool.forecast_limit = 15_000
+        self.assertEqual(pool.forecast, 15_000, "no more than the model's estimate")
+        pool.forecast_limit = contact_pool.INDEX_LIMIT
+        pool.service()
+        self.assertGreaterEqual(pool.ready, 20_000, "no contact yet: the forecast sizes the rows")
+        pool._high_water_host.assign([1_000, 1_000, 1, 30_000, 0, 0, 0, 0])
+        pool.service()
+        self.assertGreaterEqual(pool.ready, 30_000, "the first contacts: still in transit")
+        held = pool.ready
+        passes = 1 + contact_pool.TRIM_AFTER_PASSES
+        pool._high_water_host.assign([1_050, 1_000, passes, 90_000, 0, 0, 0, 0])
+        pool.service()
+        self.assertTrue(pool._settled, "the mark held within the band")
+        self.assertEqual(pool.ready, held, "settled: the demand's headroom, not the forecast, sizes the rows")
+        self.assertEqual(pool.forecast, 90_000, "the forecast runs on")
+        pool._high_water_host.assign([2_000, 2_000, passes + 1, 90_000, 0, 0, 0, 0])
+        pool.service()
+        self.assertTrue(pool._settled, "a mark that creeps past the band later is the headroom's")
+        self.assertEqual(pool.ready, held)
+        pool._high_water_host.assign([2_000, 2_000, passes + 2, 90_000, 7, 1, passes + 2, 0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pool.service()
+        self.assertFalse(pool._settled, "a pass dropped contacts: in transit again")
+        self.assertGreaterEqual(pool.ready, 90_000, "the forecast sizes the rows")
+        pool._high_water_host.assign([2_050, 2_000, passes + 2 + contact_pool.TRIM_AFTER_PASSES, 90_000, 7, 1, 0, 0])
+        pool.service()
+        self.assertTrue(pool._settled)
+        pool.restart_transit()
+        self.assertFalse(pool._settled, "a measured state starts a graph's transit")
+
+    def test_service_waits_for_a_device_behind_the_queue(self):
+        """Hold the host at most FORECAST_QUEUE replays ahead, and let go when no replay comes."""
+        pool = ContactPool(device="cpu")
+        pool._captured_passes = {"graph": 4}
+        with mock.patch.object(contact_pool, "QUEUE_WAIT", 0.0):
+            for _ in range(contact_pool.FORECAST_QUEUE + 3):
+                pool._hold_the_queue()
+        self.assertEqual(pool._replays, contact_pool.FORECAST_QUEUE, "counted again from what ran")
+        passes = (contact_pool.FORECAST_QUEUE + 2) * 4 + contact_pool.FORECAST_PASSES + 1
+        self.assertEqual(pool.horizon(), passes * pool._pass_dt)
+
+    def test_forecast_runs_one_pass_in_eight_of_a_replay(self):
+        """In a graph flag the pass after each eighth, outside one the pass a host asks for; publish what a
+        forecasting pass left in the counters, and clear them."""
+        pool = ContactPool(device="cpu")
+        pool.rows((ContactField("value", wp.int32, -1),))
+        count = wp.zeros(1, dtype=wp.int32, device="cpu")
+        self.assertEqual(int(pool.forecast_on.numpy()[0]), 0, "nothing forecasts before a host asks or a beat")
+        pool.request_forecast()
+        self.assertTrue(pool.take_forecast_request())
+        self.assertFalse(pool.take_forecast_request(), "once")
+        pool.forecast_slots.fill_(3)
+        pool.record_demand(count, pool.ready_rows, beat=False)
+        self.assertEqual(int(pool._high_water_host.numpy()[3]), 3 * contact_pool.FORECAST_SLOTS)
+        self.assertEqual(int(pool.forecast_on.numpy()[0]), 0, "outside a graph only a request forecasts")
+        flags = []
+        for passed in range(2, 2 * contact_pool.FORECAST_PASSES + 3):
+            flags.append(int(pool.forecast_on.numpy()[0]))
+            if flags[-1]:
+                pool.forecast_slots.fill_(passed)
+            pool.record_demand(count, pool.ready_rows)
+            if flags[-1]:
+                self.assertEqual(int(pool._high_water_host.numpy()[3]), passed * contact_pool.FORECAST_SLOTS)
+        beats = [1 if passed % contact_pool.FORECAST_PASSES == 1 else 0 for passed in range(2, len(flags) + 2)]
+        self.assertEqual(flags, beats)
+        self.assertEqual(int(pool.forecast_slots.numpy().sum()), 0, "the next forecast starts from nothing")
+
+    def test_dropped_contacts_are_counted_and_latch_their_world(self):
+        """Count the contacts a pass that cannot grow drops, and the passes; a pass that runs again drops none."""
+        pool = ContactPool(device="cpu", worlds=3)
+        pool.rows((ContactField("value", wp.int32, -1),))
+        count = wp.array([pool.ready + 7], dtype=wp.int32, device="cpu")
+        status = wp.zeros(1, dtype=wp.int32, device="cpu")
+        pool.record_demand(count, pool.ready_rows, status, drops=False)
+        self.assertEqual(pool.drops().passes, 0, "a pass that grows and runs again drops nothing")
+        count.fill_(pool.ready + 7)
+        pool.record_demand(count, pool.ready_rows, status)
+        drops = pool.drops()
+        self.assertEqual((drops.contacts, drops.passes, drops.last_pass), (7, 1, 2))
+        self.assertEqual(int(count.numpy()[0]), pool.ready, "consumers read the rows held")
+        self.assertEqual(int(status.numpy()[0]), contact_pool.CAPACITY_OVERFLOW)
+        self.assertGreater(pool.peak_fill, 1.0)
+        self.assertEqual(drops.worlds.shape, (4,), "one status a world, and one for no world")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pool.service()
+            pool.service()
+        self.assertEqual(len([w for w in caught if "ran out" in str(w.message)]), 1, "one warning a new drop")
 
     def test_sizing_holds_the_headroom_per_contact(self):
         """Size for a demand at HEADROOM rows per contact, rounded up and bounded; never shrink."""
@@ -576,41 +754,36 @@ def test_example_runner_measures_and_recaptures(test, device):
     test.assertEqual(holding.captures, [GROWN] if reallocates else [], "recaptured after the first frame")
 
 
-def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
-    """Map the model's estimate before anything runs: the first replay holds every contact, and nothing grows.
-
-    The solver, constructed before the pipeline, shares the model's pool, so the pipeline's first mapping sizes its
-    per-contact buffers too. Measuring a state the estimate covers grows nothing.
-    """
-    model = _build_boxes(device)
-    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=4)
-    pipeline = newton.CollisionPipeline(model)
-    lifted = model.state()
-    body_q = lifted.body_q.numpy()
-    body_q[:, 2] += 1.0
-    lifted.body_q.assign(body_q)
-    test.assertFalse(pipeline.service_capacity(lifted), "a contact-free scene keeps the first mapping")
-    held = pipeline.contacts().rigid_contact_max
-    test.assertGreaterEqual(held, max(contact_pool.MIN_READY_ROWS, _estimate_rigid_contact_max(model)))
-    test.assertEqual(solver.placement.contact_slot.shape, (held,))
-
-    worlds, boxes = 128, 8
-    demand = 4 * worlds * boxes
-    model = _build_boxes(device, worlds=worlds, boxes=boxes)
+def test_contactless_model_stays_at_the_floor(test, device):
+    """Replay a fixed-base arm with collidable pairs that never come near: the rows stay at the floor throughout."""
+    worlds = 2048
+    template = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    bodies = []
+    for i in range(2):
+        link = template.add_link(xform=wp.transform((0.0, 2.0 * i, 3.0), wp.quat_identity()))
+        template.add_shape_box(link, hx=0.2, hy=0.05, hz=0.05)
+        joint = template.add_joint_revolute(
+            parent=-1,
+            child=link,
+            axis=(0.0, 1.0, 0.0),
+            parent_xform=wp.transform((0.0, 2.0 * i, 3.0), wp.quat_identity()),
+            child_xform=wp.transform_identity(),
+            target_kd=1.0,
+        )
+        template.add_articulation([joint])
+        bodies.append(link)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.add_ground_plane()
+    builder.replicate(template, worlds, spacing=(8.0, 8.0, 0.0))
+    model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=4)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
+    pool = pipeline._contact_pool
     state_0, state_1, control = model.state(), model.state(), model.control()
-    rows = contacts.rigid_contact_max
-    test.assertGreaterEqual(rows, _estimate_rigid_contact_max(model))
-    test.assertGreater(rows, contact_pool.HEADROOM * demand, "the estimate holds the demand with headroom")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        test.assertFalse(pipeline.service_capacity(state_0), "the first mapping holds the measured demand")
-    test.assertEqual(contacts.rigid_contact_max, rows)
-    test.assertIs(solver.placement.contact_pool, pipeline._contact_pool)
-    test.assertEqual(solver.placement.contact_slot.shape, (rows,))
-    test.assertEqual(solver.laws.friction_patches.capacity, rows)
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory follows growth in a graph")
+    test.assertGreater(_estimate_rigid_contact_max(model), contact_pool.MIN_READY_ROWS, "the old mapping held more")
 
     def simulate():
         pipeline.collide(state_0, contacts)
@@ -618,22 +791,146 @@ def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
         wp.copy(state_0.body_q, state_1.body_q)
         wp.copy(state_0.body_qd, state_1.body_qd)
 
-    if wp.get_device(device).is_cuda:
-        simulate()  # load the modules outside capture
-        wp.synchronize_device(device)
-        with wp.ScopedCapture(device=device) as capture:
-            simulate()
-        for _ in range(3):
-            wp.capture_launch(capture.graph)
-    else:
-        for _ in range(3):
-            simulate()
+    simulate()
     wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        simulate()
+    test.assertFalse(pipeline.service_capacity(state_0, dt=1.0 / 120.0))
+    # The floor in whole granules of virtual memory.
+    held, mapped = pool.ready, pool.mapped_bytes()
+    for _ in range(40):
+        wp.capture_launch(capture.graph)
+        test.assertFalse(pipeline.service_capacity())
+    wp.synchronize_device(device)
+    test.assertEqual(pool.high_water, 0)
+    test.assertEqual(pool.forecast, 0)
+    test.assertEqual(pool.ready, held)
+    test.assertEqual(pool.mapped_bytes(), mapped)
+
+
+def test_forecast_holds_a_landing_from_the_floor(test, device):
+    """Capture at the floor with every box in the air: the rows are mapped before the jump, and nothing drops.
+
+    Every world's boxes reach the ground in the same pass, past any late start-up window, and the demand jumps from
+    none to many times the floor at once. The pool's law alone reads that a replay late, so the forecast must hold it.
+    """
+    worlds, boxes = 8192, 8
+    model = _build_boxes(device, worlds=worlds, boxes=boxes)
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=4, mf_max_constraints=128)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pool = pipeline._contact_pool
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory follows growth in a graph")
+    # The solver steps the joint coordinates, so they carry the height, from one step to the next too.
+    body_q = state_0.body_q.numpy()
+    body_q[:, 2] += 0.6
+    state_0.body_q.assign(body_q)
+    joint_q = state_0.joint_q.numpy()
+    joint_q[2::7] += 0.6
+    state_0.joint_q.assign(joint_q)
+    dt = 1.0 / 240.0
+    substeps = 4
+
+    def simulate():
+        for _ in range(substeps):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, dt)
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                wp.copy(getattr(state_0, name), getattr(state_1, name))
+
+    simulate()  # load the modules outside capture
+    wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        simulate()
+    test.assertFalse(pipeline.service_capacity(state_0, dt=dt), "no graph sized work by the rows")
+    test.assertLess(pool.ready, 4 * worlds * boxes, "nothing near: no row for the landing yet")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for _ in range(60):
+            wp.capture_launch(capture.graph)
+            test.assertFalse(pipeline.service_capacity(), "bound graphs follow the rows")
+    wp.synchronize_device(device)
+    demand = 4 * worlds * boxes
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), demand)
+    test.assertEqual(pool.high_water, demand)
     test.assertFalse(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
     solver.check_constraint_capacity()
-    test.assertFalse(pipeline.service_capacity(), "no growth after the capture")
-    test.assertEqual(contacts.rigid_contact_max, rows)
+
+
+def test_forecast_keeps_the_candidates_of_every_broad_phase(test, device):
+    """A forecasting pass finds the plain pass's candidates and contacts, and every broad phase that tests all pairs
+    forecasts the same contacts: the flat pairs, the world templates and all pairs."""
+    forecasts = {}
+    for name, broad_phase, templates in (
+        ("flat", "explicit", "0"),
+        ("templates", "explicit", "1"),
+        ("nxn", "nxn", None),
+    ):
+        environment = {} if templates is None else {"NEWTON_BROAD_PHASE_TEMPLATES": templates}
+        with mock.patch.dict(os.environ, environment):
+            model = _build_boxes(device, worlds=64, boxes=6)
+            pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
+        if templates is not None:
+            test.assertEqual(
+                pipeline._pair_templates is not None, templates == "1", "the broad phase under test is the one asked"
+            )
+        state = model.state()
+        qd = state.body_qd.numpy()
+        qd[:, 2] = -2.0
+        qd[:, 0] = np.linspace(-1.0, 1.0, len(qd))
+        state.body_qd.assign(qd)
+        pool = pipeline._contact_pool
+        runs = []
+        for forecast in (False, True):
+            contacts = pipeline.contacts()
+            if forecast:
+                pool.request_forecast()
+            pipeline.collide(state, contacts)
+            count = int(pipeline.broad_phase_pair_count.numpy()[0])
+            pairs = pipeline.broad_phase_shape_pairs.numpy()[:count]
+            runs.append((pairs, _records(contacts)))
+        (plain_pairs, plain_contacts), (forecast_pairs, forecast_contacts) = runs
+        if device.is_cpu:
+            np.testing.assert_array_equal(forecast_pairs, plain_pairs, "the same candidates in the same order")
+        else:
+            np.testing.assert_array_equal(np.unique(forecast_pairs, axis=0), np.unique(plain_pairs, axis=0))
+        np.testing.assert_array_equal(forecast_contacts, plain_contacts)
+        forecasts[name] = pool.forecast
+    test.assertGreater(forecasts["flat"], 0, "boxes resting on the ground")
+    test.assertEqual(len(set(forecasts.values())), 1, forecasts)
+
+
+def test_a_replay_past_its_rows_latches_its_worlds(test, device):
+    """A replay whose contacts outrun the rows drops the rest and says so: the record counts them, every world it
+    dropped from latches the pass, the status check sees it without a synchronization, and the pool grows."""
+    model = _build_boxes(device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pool = pipeline._contact_pool
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory follows growth in a graph")
+    state = model.state()
+    pipeline.collide(state, contacts)
+    wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        pipeline.collide(state, contacts)
+    # The rows the next replay's writers hold: fewer than one world's contacts.
+    pool.ready_rows.fill_(5)
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+    drops = pipeline.contact_drops()
+    test.assertEqual(drops.contacts, CONTACTS - 5)
+    test.assertEqual(drops.passes, 1)
+    test.assertEqual(int((drops.worlds[:-1] == drops.last_pass).sum()), WORLDS, "every world dropped some")
+    test.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
+    test.assertGreater(pool.peak_fill, 1.0)
+    pool.ready_rows.fill_(pool.ready)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pipeline.service_capacity()
+    test.assertTrue(any("ran out" in str(w.message) for w in caught), "the service warns")
 
 
 def test_pipelines_of_a_model_share_its_pool(test, device):
@@ -811,7 +1108,7 @@ def test_trim_releases_pages_while_a_bound_graph_replays(test, device):
     rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
     if not pool.bindable:
         test.skipTest("only CUDA virtual memory trims")
-    pool.plan_first_mapping(4_000_000)
+    pool.grow(4_000_000)
     test.assertGreaterEqual(pool.ready, 4_000_000)
     first = pool.mapped_bytes()
     demand, count = wp.zeros(1, dtype=wp.int32, device=device), wp.zeros(1, dtype=wp.int32, device=device)
@@ -886,7 +1183,7 @@ def test_trim_waits_for_a_replay_on_another_stream(test, device):
     rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
     if not pool.bindable:
         test.skipTest("only CUDA virtual memory trims")
-    pool.plan_first_mapping(4_000_000)
+    pool.grow(4_000_000)
     full, first = pool.ready, pool.mapped_bytes()
     reader = wp.Stream(device)
     demand = wp.full(1, 100_000, dtype=wp.int32, device=device)
@@ -1016,7 +1313,7 @@ def test_failed_closed_launches_are_capacity_failures(test, device):
 
 
 def test_trim_and_growth_follow_a_feather_pgs_graph(test, device):
-    """Capture collide and FeatherPGS once with the model's estimate mapped; trim it, then grow past it while it replays.
+    """Capture collide and FeatherPGS once with the estimate's rows mapped; trim them, then grow past them while it replays.
 
     Half the boxes start in the air: once the demand settled, the service trims the first mapping (the model's
     estimate) to HEADROOM rows per contact while the graph keeps replaying. Then every box is put on the ground: the
@@ -1030,7 +1327,7 @@ def test_trim_and_growth_follow_a_feather_pgs_graph(test, device):
     pool = pipeline._contact_pool
     if not pool.bindable:
         test.skipTest("only CUDA virtual memory trims")
-    test.assertGreaterEqual(contacts.rigid_contact_max, _estimate_rigid_contact_max(model), "the estimate, mapped")
+    pool.grow(_estimate_rigid_contact_max(model))
     state_0, state_1, control = model.state(), model.state(), model.control()
 
     def simulate():
@@ -1640,12 +1937,14 @@ for name, function, check_output in (
     ("test_collide_outside_capture_grows_before_reading", test_collide_outside_capture_grows_before_reading, True),
     ("test_service_measures_a_state_before_capture", test_service_measures_a_state_before_capture, True),
     ("test_example_runner_measures_and_recaptures", test_example_runner_measures_and_recaptures, True),
+    ("test_forecast_holds_a_landing_from_the_floor", test_forecast_holds_a_landing_from_the_floor, True),
+    ("test_contactless_model_stays_at_the_floor", test_contactless_model_stays_at_the_floor, True),
+    ("test_pipelines_of_a_model_share_its_pool", test_pipelines_of_a_model_share_its_pool, True),
     (
-        "test_first_mapping_holds_the_demand_from_the_first_replay",
-        test_first_mapping_holds_the_demand_from_the_first_replay,
+        "test_forecast_keeps_the_candidates_of_every_broad_phase",
+        test_forecast_keeps_the_candidates_of_every_broad_phase,
         True,
     ),
-    ("test_pipelines_of_a_model_share_its_pool", test_pipelines_of_a_model_share_its_pool, True),
     ("test_pipeline_growth_without_overflow_matches_fixed", test_pipeline_growth_without_overflow_matches_fixed, True),
     ("test_feather_pgs_grows_mid_run", test_feather_pgs_grows_mid_run, True),
     ("test_feather_pgs_follows_a_pass_that_grew", test_feather_pgs_follows_a_pass_that_grew, True),
@@ -1680,6 +1979,7 @@ for name, function in (
     ("test_sorted_matched_graph_follows_growth", test_sorted_matched_graph_follows_growth),
     ("test_debug_clear_follows_growth", test_debug_clear_follows_growth),
     ("test_capture_after_measuring_holds_every_contact", test_capture_after_measuring_holds_every_contact),
+    ("test_a_replay_past_its_rows_latches_its_worlds", test_a_replay_past_its_rows_latches_its_worlds),
 ):
     add_function_test(TestContactPool, name, function, devices=cuda_devices, check_output=False)
     add_function_test(

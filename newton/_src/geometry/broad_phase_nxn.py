@@ -23,13 +23,23 @@ import warp as wp
 from ..core.types import Devicelike
 from .broad_phase_common import (
     BODY_FLAG_KINEMATIC,
+    FORECAST_HYDROELASTIC,
+    FORECAST_REDUCED,
+    FORECAST_SLOTS_SHIFT,
+    FORECAST_TERRAIN,
+    ShapeForecast,
     check_aabb_overlap_moving,
+    forecast_add,
+    forecasting,
     is_pair_excluded,
     is_shape_pair_immovable_filtered,
     precompute_world_map,
     test_world_and_group_pair,
     write_pair,
 )
+
+_NO_FORECAST = ShapeForecast()
+"""A forecast with no arrays: the pass forecasts nothing."""
 
 
 @wp.kernel(enable_backward=False)
@@ -53,6 +63,62 @@ def _nxn_broadphase_precomputed_pairs(
     pair = nxn_shape_pair[elementid]
     shape1 = pair[0]
     shape2 = pair[1]
+
+    # Check if gaps are provided (empty array means AABBs are pre-expanded)
+    gap1 = 0.0
+    gap2 = 0.0
+    if shape_gap.shape[0] > 0:
+        gap1 = shape_gap[shape1]
+        gap2 = shape_gap[shape2]
+
+    if check_aabb_overlap_moving(
+        shape1, shape2, shape_bounding_box_lower, shape_bounding_box_upper, gap1, gap2, shape_displacement
+    ):
+        # Only overlapping pairs gather their bodies for the immovable test; most listed pairs are apart.
+        if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
+            return
+        write_pair(
+            pair,
+            candidate_pair,
+            candidate_pair_count,
+            max_candidate_pair,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def _nxn_broadphase_precomputed_pairs_forecast(
+    # Input arrays
+    shape_bounding_box_lower: wp.array[wp.vec3],
+    shape_bounding_box_upper: wp.array[wp.vec3],
+    shape_gap: wp.array[float],  # Optional per-shape effective gaps (can be empty if AABBs pre-expanded)
+    shape_displacement: wp.array[wp.vec3],  # Optional displacement over the collision-update interval [m]
+    nxn_shape_pair: wp.array[wp.vec2i],
+    shape_body: wp.array[int],
+    body_flags: wp.array[int],
+    include_static_kinematic_pairs: bool,
+    # Output arrays
+    candidate_pair: wp.array[wp.vec2i],
+    candidate_pair_count: wp.array[int],  # Size one array
+    max_candidate_pair: int,
+    forecast: ShapeForecast,
+):
+    """:func:`_nxn_broadphase_precomputed_pairs` on a forecasting pass, which adds each pair's forecast."""
+    elementid = wp.tid()
+
+    pair = nxn_shape_pair[elementid]
+    shape1 = pair[0]
+    shape2 = pair[1]
+    forecast_add(
+        forecast,
+        elementid,
+        shape1,
+        shape2,
+        shape_bounding_box_lower,
+        shape_bounding_box_upper,
+        shape_body,
+        body_flags,
+        include_static_kinematic_pairs,
+    )
 
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
@@ -127,10 +193,10 @@ _TEMPLATE_GLOBAL = f"""
                 const wp::vec3 ub = upper.data[b];
                 hit = la[0] <= ub[0] && ua[0] >= lb[0] && la[1] <= ub[1] && ua[1] >= lb[1] && la[2] <= ub[2]
                     && ua[2] >= lb[2];
-                if (hit && immovable_filter) hit = !({_immovable("a")} && {_immovable("b")});
+                if (hit && immovable_filter) hit = !({_immovable("a")} && {_immovable("b")});FORECAST_GLOBAL
             }}
 APPEND
-        }}
+        }}FLUSH
         return;
     }}
     const int world_block = block - data.global_blocks;
@@ -165,7 +231,7 @@ _TEMPLATE_STAGE = f"""
             s_uy[base + i] = hi[1];
             s_uz[base + i] = hi[2];
             s_shape[base + i] = shape;
-            s_fixed[base + i] = immovable_filter && {_immovable("shape")};
+            s_fixed[base + i] = immovable_filter && {_immovable("shape")};FORECAST_STAGE
         }}
 """
 
@@ -183,7 +249,7 @@ _TEMPLATE_TEST = """
                 const int ib = base + (int)(packed >> 16);
                 hit = s_lx[ia] <= s_ux[ib] && s_ux[ia] >= s_lx[ib] && s_ly[ia] <= s_uy[ib] && s_uy[ia] >= s_ly[ib]
                     && s_lz[ia] <= s_uz[ib] && s_uz[ia] >= s_lz[ib];
-                if (hit && immovable_filter) hit = !(s_fixed[ia] && s_fixed[ib]);
+                if (hit && immovable_filter) hit = !(s_fixed[ia] && s_fixed[ib]);FORECAST_TEST
                 if (hit) {
                     a = s_shape[ia];
                     b = s_shape[ib];
@@ -226,29 +292,118 @@ _TEMPLATE_APPEND_CPU = """
 """
 
 
-def _pair_template_source(slots: int, threads: int, worlds: int) -> str:
-    """CUDA and CPU source of the world-template kernel.
+# The forecasting variant's additions to the template kernel (forecast=True), at the placeholders above, which run
+# when the pool's flag says the pass forecasts; the plain kernel is the one without them. The forecast
+# (broad_phase_common.forecast_pair) runs the same tests in the same order: the boxes, each shape's forecast word and
+# reach from the world's stage (or memory, for a global pair), the capsules (placed by the shapes' poses) and the
+# terrain's top, which only a pair within reach of its boxes reads, from memory.
+_FORECAST_PAIR = f"""
+    const bool fc_on = forecast.on.shape[0] > 0 && forecast.on.data[0] != 0;
+    long long fc_total = 0;
+    auto fc_pair = [&](int a, int b, int wa, int wb, float reach, float alx, float aly, float alz, float aux, float auy,
+                       float auz, float blx, float bly, float blz, float bux, float buy, float buz) -> int {{
+        if (((wa | wb) & {int(FORECAST_TERRAIN)}) != 0) {{
+            if ((wb & {int(FORECAST_TERRAIN)}) != 0)
+                return alz - forecast.top.data[a] > reach ? 0 : (wa >> {int(FORECAST_SLOTS_SHIFT)});
+            return blz - forecast.top.data[b] > reach ? 0 : (wb >> {int(FORECAST_SLOTS_SHIFT)});
+        }}
+        const float gap = wp::max(
+            wp::max(wp::max(alx - bux, blx - aux), wp::max(aly - buy, bly - auy)), wp::max(alz - buz, blz - auz));
+        if (gap > reach) return 0;
+        const wp::vec4 xa = forecast.capsule.data[a];
+        const wp::vec4 xb = forecast.capsule.data[b];
+        const float ra = xa[3];
+        const float rb = xb[3];
+        if (ra >= 0.0f && rb >= 0.0f) {{
+            const wp::transform pa = forecast.pose.data[a];
+            const wp::transform pb = forecast.pose.data[b];
+            const wp::vec4 ca = forecast.middle.data[a];
+            const wp::vec4 cb = forecast.middle.data[b];
+            const wp::vec3 ma = wp::transform_point(pa, wp::vec3(ca[0], ca[1], ca[2]));
+            const wp::vec3 ha = wp::transform_vector(pa, wp::vec3(xa[0], xa[1], xa[2]));
+            const wp::vec3 mb = wp::transform_point(pb, wp::vec3(cb[0], cb[1], cb[2]));
+            const wp::vec3 hb = wp::transform_vector(pb, wp::vec3(xb[0], xb[1], xb[2]));
+            const wp::vec3 closest = wp::closest_point_edge_edge(
+                wp::sub(ma, ha), wp::add(ma, ha), wp::sub(mb, hb), wp::add(mb, hb), 1.0e-9f);
+            if (closest[2] - ra - rb > reach) return 0;
+        }}
+        if ((wa & wb & {int(FORECAST_HYDROELASTIC)}) != 0) return forecast.bound_hydroelastic;
+        if (((wa | wb) & {int(FORECAST_REDUCED)}) != 0) return forecast.bound_reduced;
+        return forecast.bound_convex;
+    }};
+"""
+
+_FORECAST_GLOBAL = f"""
+                if (fc_on) {{
+                    int contacts = fc_pair(a, b, forecast.word.data[a], forecast.word.data[b],
+                        forecast.reach.data[a] + forecast.reach.data[b], la[0], la[1], la[2], ua[0], ua[1], ua[2],
+                        lb[0], lb[1], lb[2], ub[0], ub[1], ub[2]);
+                    if (contacts > 0 && immovable_filter && {_immovable("a")} && {_immovable("b")}) contacts = 0;
+                    fc_total += contacts;
+                }}"""
+
+_FORECAST_STAGE = """
+            if (fc_on) {
+                s_fw[base + i] = forecast.word.data[shape];
+                s_fv[base + i] = forecast.reach.data[shape];
+            }"""
+
+_FORECAST_TEST = """
+                if (fc_on) {
+                    int contacts = fc_pair(s_shape[ia], s_shape[ib], s_fw[ia], s_fw[ib], s_fv[ia] + s_fv[ib], s_lx[ia],
+                        s_ly[ia], s_lz[ia], s_ux[ia], s_uy[ia], s_uz[ia], s_lx[ib], s_ly[ib], s_lz[ib], s_ux[ib],
+                        s_uy[ib], s_uz[ib]);
+                    if (contacts > 0 && immovable_filter && s_fixed[ia] && s_fixed[ib]) contacts = 0;
+                    fc_total += contacts;
+                }"""
+
+# A warp adds its lanes' forecast in one atomic, into the counter of its warp; on CPU the block adds its own.
+_FORECAST_FLUSH_CUDA = """
+        if (fc_on) {
+            for (int offset = 16; offset > 0; offset >>= 1) fc_total += __shfl_down_sync(0xffffffffu, fc_total, offset);
+            if ((thread & 31) == 0 && fc_total != 0) {
+                const int counter = (block * 32 + (thread >> 5)) % forecast.slots.shape[0];
+                atomicAdd((unsigned long long*)(forecast.slots.data + counter), (unsigned long long)fc_total);
+            }
+        }"""
+
+_FORECAST_FLUSH_CPU = """
+        if (fc_total != 0) forecast.slots.data[block % forecast.slots.shape[0]] += fc_total;"""
+
+
+def _pair_template_source(slots: int, threads: int, worlds: int, forecast: bool = False) -> str:
+    """CUDA and CPU source of the world-template kernel, with the contact forecast on a forecasting pass.
 
     CUDA runs ``worlds`` world groups of ``threads`` lanes per block; CPU runs
     the block's groups, and every loop in them, serially in explicit-list order.
     """
 
-    def fill(text: str, lane: str, step: str, append: str) -> str:
+    def fill(text: str, lane: str, step: str, append: str, flush: str = "") -> str:
+        pieces = {
+            "FORECAST_GLOBAL": _FORECAST_GLOBAL if forecast else "",
+            "FORECAST_STAGE": _FORECAST_STAGE if forecast else "",
+            "FORECAST_TEST": _FORECAST_TEST if forecast else "",
+            "FLUSH": flush if forecast else "",
+        }
+        for name, piece in pieces.items():
+            text = text.replace(name, piece)
         return text.replace("LANE", lane).replace("STEP", step).replace("APPEND", append)
 
     def arrays(qualifier: str) -> str:
         capacity = slots * worlds
-        names = ("s_lx", "s_ly", "s_lz", "s_ux", "s_uy", "s_uz")
+        names = ("s_lx", "s_ly", "s_lz", "s_ux", "s_uy", "s_uz") + (("s_fv",) if forecast else ())
         lines = [f"    {qualifier}float {name}[{capacity}];" for name in names]
         lines += [f"    {qualifier}int s_shape[{capacity}];", f"    {qualifier}int s_fixed[{capacity}];"]
-        return "\n".join(lines) + "\n"
+        if forecast:
+            lines += [f"    {qualifier}int s_fw[{capacity}];"]
+        return "\n".join(lines) + "\n" + (_FORECAST_PAIR if forecast else "")
 
     world = _TEMPLATE_WORLD.replace("WORLDS", str(worlds)).replace("SLOTS", str(slots))
     return (
         "#if defined(__CUDA_ARCH__)\n"
         + arrays("__shared__ ")
         + "    const int thread = threadIdx.x;\n"
-        + fill(_TEMPLATE_GLOBAL, "thread", "(int)blockDim.x", _TEMPLATE_APPEND_CUDA)
+        + fill(_TEMPLATE_GLOBAL, "thread", "(int)blockDim.x", _TEMPLATE_APPEND_CUDA, _FORECAST_FLUSH_CUDA)
         + f"    const int group = thread / {threads};\n"
         + f"    const int lane = thread - group * {threads};\n"
         + "    {\n"
@@ -256,31 +411,89 @@ def _pair_template_source(slots: int, threads: int, worlds: int) -> str:
         + fill(_TEMPLATE_STAGE, "lane", str(threads), "")
         + "        __syncthreads();\n"
         + fill(_TEMPLATE_TEST, "lane", str(threads), _TEMPLATE_APPEND_CUDA)
+        + (_FORECAST_FLUSH_CUDA + "\n" if forecast else "")
         + "    }\n"
         + "#else\n"
         + "    if (logical_lane != 0) return;\n"
         + arrays("")
-        + fill(_TEMPLATE_GLOBAL, "0", "1", _TEMPLATE_APPEND_CPU)
+        + fill(_TEMPLATE_GLOBAL, "0", "1", _TEMPLATE_APPEND_CPU, _FORECAST_FLUSH_CPU)
         + f"    for (int group = 0; group < {worlds}; ++group) {{\n"
         + world
         + fill(_TEMPLATE_STAGE, "0", "1", "")
         + fill(_TEMPLATE_TEST, "0", "1", _TEMPLATE_APPEND_CPU)
         + "    }\n"
+        + (_FORECAST_FLUSH_CPU + "\n" if forecast else "")
         + "#endif\n"
     )
 
 
 @functools.cache
-def _pair_template_kernel(slots: int, threads: int, worlds: int):
+def _pair_template_kernel(slots: int, threads: int, worlds: int, forecast: bool = False):
     """World-template broad-phase kernel; launch tiled with ``block_dim = threads * worlds``.
 
     Args:
         slots: Staged shapes per world group (shared-memory capacity).
         threads: Lanes per world group, a multiple of 32 so every warp serves one world.
         worlds: World groups per block.
+        forecast: The forecasting pass's kernel, which adds the contact forecast and takes it as its last argument;
+            every other pass runs the kernel without it.
     """
+    source = _pair_template_source(slots, threads, worlds, forecast)
+    if forecast:
 
-    @wp.func_native(_pair_template_source(slots, threads, worlds))
+        @wp.func_native(source)
+        def test_templates(
+            block: int,
+            logical_lane: int,
+            lower: wp.array[wp.vec3],
+            upper: wp.array[wp.vec3],
+            pairs: wp.array[wp.vec2i],
+            data: _PairTemplateData,
+            shape_body: wp.array[int],
+            body_flags: wp.array[int],
+            immovable_filter: bool,
+            candidate_pair: wp.array[wp.vec2i],
+            candidate_pair_count: wp.array[int],
+            max_candidate_pair: int,
+            forecast: ShapeForecast,
+        ): ...
+
+        def kernel(
+            lower: wp.array[wp.vec3],
+            upper: wp.array[wp.vec3],
+            pairs: wp.array[wp.vec2i],
+            data: _PairTemplateData,
+            shape_body: wp.array[int],
+            body_flags: wp.array[int],
+            include_static_kinematic_pairs: bool,
+            candidate_pair: wp.array[wp.vec2i],
+            candidate_pair_count: wp.array[int],
+            max_candidate_pair: int,
+            forecast: ShapeForecast,
+        ):
+            block, lane = wp.tid()
+            # is_shape_pair_immovable_filtered: no filtering without shape metadata.
+            immovable_filter = (not include_static_kinematic_pairs) and shape_body.shape[0] > 0
+            test_templates(
+                block,
+                lane,
+                lower,
+                upper,
+                pairs,
+                data,
+                shape_body,
+                body_flags,
+                immovable_filter,
+                candidate_pair,
+                candidate_pair_count,
+                max_candidate_pair,
+                forecast,
+            )
+
+        kernel.__name__ = kernel.__qualname__ = f"broad_phase_pair_templates_forecast_{slots}_{threads}_{worlds}"
+        return wp.kernel(enable_backward=False, module="unique", grid_stride=False)(kernel)
+
+    @wp.func_native(source)
     def test_templates(
         block: int,
         logical_lane: int,
@@ -448,6 +661,7 @@ def _nxn_broadphase_kernel(
     candidate_pair: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[int],  # Size one array
     max_candidate_pair: int,
+    forecast: ShapeForecast,
 ):
     tid = wp.tid()
 
@@ -490,6 +704,21 @@ def _nxn_broadphase_kernel(
     # Check both world and collision groups
     if not test_world_and_group_pair(world1, world2, collision_group1, collision_group2):
         return
+
+    if forecasting(forecast) and (
+        num_filter_pairs == 0 or not is_pair_excluded(wp.vec2i(shape1, shape2), filter_pairs, num_filter_pairs)
+    ):
+        forecast_add(
+            forecast,
+            tid,
+            shape1,
+            shape2,
+            shape_bounding_box_lower,
+            shape_bounding_box_upper,
+            shape_body,
+            body_flags,
+            include_static_kinematic_pairs,
+        )
 
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
@@ -623,6 +852,7 @@ class BroadPhaseAllPairs:
         body_flags: wp.array[int] | None = None,
         include_static_kinematic_pairs: bool = True,
         shape_displacement: wp.array[wp.vec3] | None = None,
+        forecast: ShapeForecast | None = None,
     ) -> None:
         """Launch the N x N broad phase collision detection.
 
@@ -662,6 +892,8 @@ class BroadPhaseAllPairs:
                 :ref:`Speculative contacts <speculative-contacts>`. :class:`CollisionPipeline` computes it as the
                 shape-origin velocity, including the angular contribution from its COM offset, times ``dt``; angular
                 travel expands the supplied AABB separately.
+            forecast: The contact forecast a collision pass adds the tested pairs into
+                (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`); ``None`` forecasts nothing.
 
         The method will populate candidate_pair with the indices of shape pairs (i,j) where i < j whose AABBs overlap
         (with optional margin expansion), whose collision groups allow interaction, and whose world indices are
@@ -718,7 +950,12 @@ class BroadPhaseAllPairs:
                 filter_pairs_arr,
                 n_filter,
             ],
-            outputs=[candidate_pair, candidate_pair_count, max_candidate_pair],
+            outputs=[
+                candidate_pair,
+                candidate_pair_count,
+                max_candidate_pair,
+                _NO_FORECAST if forecast is None else forecast,
+            ],
             device=device,
             record_tape=False,
         )
@@ -752,6 +989,7 @@ class BroadPhaseExplicit:
         body_flags: wp.array[int] | None = None,
         include_static_kinematic_pairs: bool = True,
         shape_displacement: wp.array[wp.vec3] | None = None,
+        forecast: ShapeForecast | None = None,
     ) -> None:
         """Launch the explicit pairs broad phase collision detection.
 
@@ -785,6 +1023,8 @@ class BroadPhaseExplicit:
                 :ref:`Speculative contacts <speculative-contacts>`. :class:`CollisionPipeline` computes it as the
                 shape-origin velocity, including the angular contribution from its COM offset, times ``dt``; angular
                 travel expands the supplied AABB separately.
+            forecast: The contact forecast a collision pass adds the tested pairs into
+                (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`); ``None`` forecasts nothing.
 
         The method will populate candidate_pair with the indices of shape pairs whose AABBs overlap
         (with optional margin expansion), but only checking the explicitly provided pairs.
@@ -811,22 +1051,25 @@ class BroadPhaseExplicit:
                 f"({shape_lower.shape[0]}), got {shape_displacement.shape[0]}"
             )
 
+        inputs = [
+            shape_lower,
+            shape_upper,
+            shape_gap,
+            shape_displacement,
+            shape_pairs,
+            shape_body,
+            body_flags,
+            include_static_kinematic_pairs,
+            candidate_pair,
+            candidate_pair_count,
+            max_candidate_pair,
+        ]
         wp.launch(
-            kernel=_nxn_broadphase_precomputed_pairs,
+            kernel=_nxn_broadphase_precomputed_pairs
+            if forecast is None
+            else _nxn_broadphase_precomputed_pairs_forecast,
             dim=shape_pair_count,
-            inputs=[
-                shape_lower,
-                shape_upper,
-                shape_gap,
-                shape_displacement,
-                shape_pairs,
-                shape_body,
-                body_flags,
-                include_static_kinematic_pairs,
-                candidate_pair,
-                candidate_pair_count,
-                max_candidate_pair,
-            ],
+            inputs=inputs if forecast is None else [*inputs, forecast],
             device=device,
             record_tape=False,
         )
@@ -1084,10 +1327,14 @@ class BroadPhaseExplicitTemplates:
         self._slot_pair_start = device_array("slot_pair_start")
         self._empty = wp.empty(0, dtype=wp.int32, device=self.device)
         self._kernel = _pair_template_kernel(self.staged_capacity, self.threads_per_world, self.worlds_per_block)
-        # Load the variant launch() runs (Warp launches CPU kernels with block_dim 1) outside any
+        self._forecast_kernel = _pair_template_kernel(
+            self.staged_capacity, self.threads_per_world, self.worlds_per_block, True
+        )
+        # Load the variants launch() runs (Warp launches CPU kernels with block_dim 1) outside any
         # capture: drivers older than CUDA 12.3 cannot load a module during graph capture, and
         # capture_begin then preloads only the variants already loaded, else block_dim 256.
-        wp.load_module(self._kernel.module, device=self.device, block_dim=1 if self.device.is_cpu else self.block_dim)
+        for kernel in (self._kernel, self._forecast_kernel):
+            wp.load_module(kernel.module, device=self.device, block_dim=1 if self.device.is_cpu else self.block_dim)
         self.data = data
 
     @property
@@ -1166,6 +1413,7 @@ class BroadPhaseExplicitTemplates:
         shape_body: wp.array[int] | None = None,
         body_flags: wp.array[int] | None = None,
         include_static_kinematic_pairs: bool = True,
+        forecast: ShapeForecast | None = None,
     ) -> None:
         """Test the templates against pre-expanded AABBs.
 
@@ -1182,6 +1430,9 @@ class BroadPhaseExplicitTemplates:
             shape_body: Body of each shape; omitting it disables immovable-pair filtering.
             body_flags: Body flags used to identify kinematic bodies.
             include_static_kinematic_pairs: Whether to keep pairs whose shapes are both immovable.
+            forecast: On a forecasting pass, the contact forecast the tested pairs add into, which the kernel's
+                forecasting variant reads from the staged shapes
+                (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`); ``None`` runs the plain kernel.
         """
         if self.unsupported_reason is not None:
             raise ValueError(self.unsupported_reason)
@@ -1189,21 +1440,26 @@ class BroadPhaseExplicitTemplates:
         if blocks == 0:
             return
         self._upload()
+        inputs = [
+            shape_lower,
+            shape_upper,
+            shape_pairs,
+            self.data,
+            self._empty if shape_body is None else shape_body,
+            self._empty if body_flags is None else body_flags,
+            include_static_kinematic_pairs,
+            candidate_pair,
+            candidate_pair_count,
+            candidate_pair.shape[0],
+        ]
+        kernel = self._kernel
+        if forecast is not None:
+            kernel = self._forecast_kernel
+            inputs.append(forecast)
         wp.launch_tiled(
-            self._kernel,
+            kernel,
             dim=[blocks],
-            inputs=[
-                shape_lower,
-                shape_upper,
-                shape_pairs,
-                self.data,
-                self._empty if shape_body is None else shape_body,
-                self._empty if body_flags is None else body_flags,
-                include_static_kinematic_pairs,
-                candidate_pair,
-                candidate_pair_count,
-                candidate_pair.shape[0],
-            ],
+            inputs=inputs,
             block_dim=self.block_dim,
             device=self.device,
             record_tape=False,

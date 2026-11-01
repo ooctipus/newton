@@ -895,7 +895,9 @@ def test_graph_replays_template_broad_phase(test, device):
             graph, launches = _launched(
                 functools.partial(_capture_collide, templated, state, contacts, force_module_load=False)
             )
-            test.assertEqual(launches, {"templates": 1, "flat": 0})
+            # The capture holds the kernel's plain and forecasting variants, one in each branch of the conditional
+            # node that picks the forecasting pass.
+            test.assertEqual(launches, {"templates": 2, "flat": 0})
             count = _replay_matches_flat(test, graph, templated, contacts, flat, state)
             # Lift world 4 clear of the global box and its static shape: the replay must read the new poses.
             body_q = state.body_q.numpy()
@@ -985,8 +987,10 @@ def test_first_captured_collide_matches_eager(test, device):
                 graph, launches = _launched(functools.partial(_capture_collide, captured, state, contacts))
             test.assertEqual(recorded, [])
             test.assertEqual(set(kernel.module.execs), loaded, "the capture loaded the template kernel")
+            # A templated capture holds the kernel's plain and forecasting variants, one in each branch of the
+            # conditional node that picks the forecasting pass.
             test.assertEqual(
-                launches, {"templates": int(templated), "flat": int(broad_phase == "explicit" and not templated)}
+                launches, {"templates": 2 * int(templated), "flat": int(broad_phase == "explicit" and not templated)}
             )
             eager_contacts = eager.contacts()
             counts = []

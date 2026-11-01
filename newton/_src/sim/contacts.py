@@ -320,10 +320,10 @@ class Contacts:
 
     Every rigid contact array holds :attr:`rigid_contact_max` rows, the rows the buffer holds
     now. A :meth:`newton.CollisionPipeline.contacts` buffer holds its model's contact rows, which
-    start at the model's shape-pair contact estimate, trim to the measured demand once it holds
-    still and grow from it, limited only by the device memory: a collision pass outside graph
-    capture grows them as it needs, and :meth:`newton.CollisionPipeline.service_capacity` trims
-    or grows them between graph replays; a solver writing contacts of its own declares them with
+    start at a few thousand and grow from the measured and forecast demand, limited only by the
+    device memory: a collision pass outside graph capture grows them as it needs, and
+    :meth:`newton.CollisionPipeline.service_capacity` grows them between graph replays; a solver
+    writing contacts of its own declares them with
     :meth:`reserve_rigid_contacts`. Growth and trims replace the array attributes with other views
     (on CUDA, of the same memory), so read them from this object rather than keeping them. After a collision pass :attr:`rigid_contact_count` never
     exceeds the rows: the pass drops the contacts past them and flags its capacity status.

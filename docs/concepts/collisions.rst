@@ -1928,15 +1928,13 @@ storage is allocated explicitly.
 
 There is no rigid contact budget to configure. The rigid contact buffers of a
 model's pipelines, of their :meth:`~CollisionPipeline.contacts` and of the solvers
-that step the model share one set of rows: map big, then trim. A pipeline maps
-rows for the model's shape-pair contact estimate up front (at most a quarter of the
-device memory free when the rows were created, across all their fields; at least
-4096 rows), so the first steps drop nothing. Once the measured contact count has
-settled (grown by less than 10% over 200 collision passes),
-:meth:`~CollisionPipeline.service_capacity` trims the rows to 2.5 per contact of the
-largest count ever measured, and beyond that the rows grow from
-the measured count, keeping their contents, up to what the device memory can back;
-a growth the device cannot back raises :class:`MemoryError`. On CUDA with the
+that step the model share one set of rows, sized from demand that was measured or
+forecast: never from an estimate of the model. They start at 4096 rows and grow to 2.5
+per contact of the measured count, keeping their contents, up to what the device
+memory can back; a growth the device cannot back raises :class:`MemoryError`. Every
+pipeline forecasts its demand for the whole run, so that the rows are mapped before
+a jump: see
+:ref:`Graph capture <Contact graph capture>`. On CUDA with the
 optional ``gpu_components`` package the rows are CUDA virtual memory: every
 per-contact field reserves addresses for as many rows as the device memory could
 hold and maps physical pages for the rows in use; growth maps more pages behind
@@ -1952,8 +1950,7 @@ trim: see :ref:`Graph capture <Contact graph capture>`.
 
 ``CollisionPipeline(rigid_contact_max=...)``, :attr:`CollisionPipeline.rigid_contact_max`,
 ``Model.rigid_contact_max`` and ``ModelBuilder.num_rigid_contacts_per_world`` are kept
-for compatibility with Newton main; none of them sizes the contact buffers, whose
-first mapping takes the shape-pair estimate even when they are set
+for compatibility with Newton main; none of them sizes the contact buffers
 (:class:`~solvers.SolverKamino` still sizes its fixed contact container by
 ``Model.rigid_contact_max``).
 
@@ -2538,18 +2535,32 @@ memory, whose growth reallocates them.
         if pipeline.service_capacity():  # a graph sized work by the old rows
             graph = capture()
 
-A replayed pass whose contacts outnumber the rows drops the rows past them and flags
-it (:meth:`~geometry.NarrowPhase.check_buffer_capacity`), and
-:meth:`~CollisionPipeline.service_capacity` warns. The service sees the demand of
-replays that already ran, so the replays launched before it also run at the old
-rows: at least the next one, more when the host runs ahead of the device. A scene
-whose contacts jump, such as a pile of parts dropped into a bin, interpenetrates
-over those frames. To hold its contacts from the first replay, size the buffers
-before capturing: measure the state a graph starts from with
-``service_capacity(state)``, or step the scene outside capture until its contacts
-settle (its passes grow the buffers before anything reads them). The example
-runner (``newton.examples.run``) measures, services and recaptures the examples
-this way.
+The service sees the demand of replays that already ran, so it cannot grow the rows
+for a jump in the contacts by reading it. One collision pass in eight of every replay
+therefore forecasts the demand, inside the launches it already makes: the bounding-box
+pass states each shape's reach over the service's lag (its speed, the spin at its
+farthest point and, on a floating body, gravity's fall), and the broad phase sums the
+worst case of the pairs it tests whose shapes and bounding capsules can meet within
+their reaches; the world-template broad phase runs a forecasting variant of its kernel
+on that pass, which a conditional node picks. A sweep and prune broad phase sees only
+the pairs whose projections overlap on its axis. While the demand is in transit (from
+the start, a state measured before a graph or a pass that dropped contacts, until the
+high-water mark holds within 10% for 200 passes) the service maps rows ahead of the
+forecast, up to the model's shape-pair estimate; once it settled, 2.5 rows per contact
+of the mark size the rows, also as it creeps, and a trim returns what the forecast held. The host runs at most two
+replays ahead of the device: the service waits past them. Measure the state a graph
+starts from with ``service_capacity(state, dt=dt)``, which also tells the forecast the
+time between passes, so the first replay finds its rows. The example runner
+(``newton.examples.run``) measures, services and recaptures the examples this way.
+
+A replayed pass whose contacts outnumber the rows drops the rows past them, flags it
+(:meth:`~geometry.NarrowPhase.check_buffer_capacity`), counts the contacts and the
+pass, and latches the world of each dropped contact with the pass in pinned memory:
+:meth:`~CollisionPipeline.contact_drops` reads them without a synchronization, and
+:meth:`~CollisionPipeline.service_capacity` warns. That takes a jump past what the
+forecast or 1.67 times the demand covers within the service's lag: a pair whose
+closing speed rose by more than gravity within the lag, a settled demand that jumps
+by more than that, or a state the host moved without measuring it.
 
 A trim lowers the rows first and unmaps the pages past them once every stream that
 may read them has finished the work it submitted before: the streams collision

@@ -16,9 +16,19 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ..core.contact_pool import ContactField, capturing, model_contact_pool
+from ..core.contact_pool import ContactDrops, ContactField, _capture_owner, capturing, model_contact_pool
 from ..core.environment_flags import record_newton_environment, retired_notice
 from ..core.reset import normalize_reset_world_mask
+from ..geometry.broad_phase_common import (
+    FORECAST_FLOATS,
+    FORECAST_HYDROELASTIC,
+    FORECAST_REDUCED,
+    FORECAST_SLOTS_SHIFT,
+    FORECAST_TERRAIN,
+    ShapeForecast,
+    forecast_shape,
+    forecasting,
+)
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseExplicitTemplates
 from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
@@ -48,9 +58,16 @@ from ..geometry.support_function import (
     SupportMapDataProvider,
     pack_mesh_ptr,
 )
+from ..geometry.terrain_contacts import (
+    TERRAIN_PARTNER_BOX,
+    TERRAIN_PARTNER_CYLINDER,
+    TERRAIN_PARTNER_HULL,
+    TERRAIN_PARTNER_POINT,
+    TERRAIN_PARTNER_WALK_SLOTS,
+)
 from ..geometry.types import GeoType
 from ..sim.contacts import Contacts, note_contact_frame_write
-from ..sim.enums import BodyFlags, ModelFlags
+from ..sim.enums import BodyFlags, JointType, ModelFlags
 from ..sim.model import Model
 from ..sim.state import State
 
@@ -189,11 +206,17 @@ class ContactWriterData:
     bound), which only stops the narrow phase's work early; ``contact_limit``
     holds the rows writable now (its pool's ready rows, on the device), and the
     writer drops every row past it. A writer without ``contact_limit`` (an empty
-    array) drops the rows past ``contact_max``.
+    array) drops the rows past ``contact_max``. A writer that drops a contact
+    latches its world in ``dropped_world`` with the pass (one store), so no drop
+    is silent (:meth:`~newton._src.core.contact_pool.ContactPool.drops`).
     """
 
     contact_max: int
     contact_limit: wp.array[wp.int32]
+    # The pool's per-world status of dropped contacts (empty: none), the shapes' worlds and the passes recorded.
+    dropped_world: wp.array[wp.int32]
+    shape_world: wp.array[int]
+    pass_count: wp.array[wp.int32]
     # Body information arrays (for transforming to body-local coordinates)
     body_q: wp.array[wp.transform]
     shape_body: wp.array[int]
@@ -224,6 +247,22 @@ class ContactWriterData:
     max_speculative_extension: float
 
 
+_NO_FORECAST = ShapeForecast()
+"""A forecast with no arrays: the pass forecasts nothing."""
+
+
+@wp.func
+def _latch_dropped_world(writer_data: ContactWriterData, shape_a: int, shape_b: int):
+    """Latch the world of a dropped contact with the pass that dropped it; the last entry takes contacts of no world."""
+    last = writer_data.dropped_world.shape[0] - 1
+    world = writer_data.shape_world[shape_a]
+    if world < 0:
+        world = writer_data.shape_world[shape_b]
+    if world < 0 or world >= last:
+        world = last
+    writer_data.dropped_world[world] = writer_data.pass_count[0] + 1
+
+
 @wp.func
 def _write_contact_at_index(
     contact_data: ContactData,
@@ -233,11 +272,13 @@ def _write_contact_at_index(
     point_b_world: wp.vec3,
     normal_a_to_b: wp.vec3,
 ):
-    """Write a previously accepted contact at a reserved output index."""
+    """Write a previously accepted contact at a reserved output index, or latch its world if the rows ran out."""
     limit = writer_data.contact_max
     if writer_data.contact_limit.shape[0] > 0:
         limit = writer_data.contact_limit[0]
     if index >= limit:
+        if writer_data.dropped_world.shape[0] > 0:
+            _latch_dropped_world(writer_data, contact_data.shape_a, contact_data.shape_b)
         return
 
     writer_data.out_shape0[index] = contact_data.shape_a
@@ -377,6 +418,8 @@ def compute_shape_aabbs(
     contact_generation: wp.array[wp.int32],
     broad_phase_pair_count: wp.array[wp.int32],
     num_contact_counters: int,
+    body_qd: wp.array[wp.spatial_vector],
+    forecast: ShapeForecast,
     # outputs
     aabb_lower: wp.array[wp.vec3],
     aabb_upper: wp.array[wp.vec3],
@@ -389,6 +432,8 @@ def compute_shape_aabbs(
     zeroing, and generation bumping into a single kernel launch.
     """
     shape_id = wp.tid()
+    # Read the forecast's flag first: its load overlaps the shape's, not the stores below.
+    forecast_pass = forecasting(forecast)
 
     # Thread 0: zero contact counters, bump contact generation, and zero the
     # broad phase candidate-pair count in a single fused step.
@@ -550,6 +595,9 @@ def compute_shape_aabbs(
     geom_data[shape_id] = wp.vec4(geom_scale[0], geom_scale[1], geom_scale[2], margin)
     geom_xform[shape_id] = X_ws
 
+    if forecast_pass:
+        forecast_shape(forecast, shape_id, rigid_id, X_ws, body_q, body_qd, aabb_lower[shape_id], aabb_upper[shape_id])
+
 
 @wp.kernel(enable_backward=False)
 def _compute_pair_shape_aabbs(
@@ -570,6 +618,8 @@ def _compute_pair_shape_aabbs(
     contact_generation: wp.array[wp.int32],
     broad_phase_pair_count: wp.array[wp.int32],
     num_contact_counters: int,
+    body_qd: wp.array[wp.spatial_vector],
+    forecast: ShapeForecast,
     # outputs
     aabb_lower: wp.array[wp.vec3],
     aabb_upper: wp.array[wp.vec3],
@@ -582,6 +632,8 @@ def _compute_pair_shape_aabbs(
     the full kernel unchanged until exact device replay gates this opt-in path.
     """
     work_id = wp.tid()
+    # Read the forecast's flag first: its load overlaps the shape's, not the stores below.
+    forecast_pass = forecasting(forecast)
 
     # Thread 0: zero contact counters, bump contact generation, and zero the
     # broad phase candidate-pair count in a single fused step.
@@ -748,6 +800,9 @@ def _compute_pair_shape_aabbs(
     geom_data[shape_id] = wp.vec4(geom_scale[0], geom_scale[1], geom_scale[2], margin)
     geom_xform[shape_id] = X_ws
 
+    if forecast_pass:
+        forecast_shape(forecast, shape_id, rigid_id, X_ws, body_q, body_qd, aabb_lower[shape_id], aabb_upper[shape_id])
+
 
 # Per-pair worst-case contact counts established by the narrow phase:
 #
@@ -781,6 +836,10 @@ _MESH_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR
 #   on top of the reduced slots — worst case ``MAX_CONTACTS_PER_PAIR +
 #   NUM_NORMAL_BINS`` per pair.
 _HYDRO_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS
+
+
+FORECAST_TILE_CELLS = 8
+"""Heightfield cells a side of a forecast tile holds: small enough that a shape's box meets at most four."""
 
 
 @wp.kernel(enable_backward=False)
@@ -859,6 +918,168 @@ _RIGID_CONTACTS_PER_PRIMITIVE_PAIR = 5
 _RIGID_CONTACTS_PER_MESH_PAIR = 40
 _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE = 20
 _RIGID_CONTACT_MIN_CAPACITY = 1000
+
+
+def _shape_capsules(model: Model) -> tuple[np.ndarray, np.ndarray]:
+    """Return each shape's bounding capsule in its own frame: (half axis, radius) and (center, farthest point).
+
+    A box, a mesh by its local box, or a cylinder takes the capsule along its longest side; a capsule and a sphere
+    are their own; a shape of no simpler form takes its bounding sphere; a plane or a heightfield has none (radius
+    -1), so only its bounding box tells a gap. The farthest point of the shape from its origin is its spin's lever.
+    """
+    types = model.shape_type.numpy()
+    scale = model.shape_scale.numpy()
+    center = np.zeros((len(types), 3), dtype=np.float32)
+    axis = np.zeros((len(types), 3), dtype=np.float32)
+    radius = model.shape_collision_radius.numpy().copy()
+    lower, upper = model.shape_collision_aabb_lower.numpy(), model.shape_collision_aabb_upper.numpy()
+    farthest = np.maximum(np.linalg.norm(np.maximum(np.abs(lower), np.abs(upper)), axis=1), radius)
+
+    capsule = types == int(GeoType.CAPSULE)
+    axis[capsule, 2] = scale[capsule, 1]
+    radius[capsule] = scale[capsule, 0]
+    sphere = types == int(GeoType.SPHERE)
+    radius[sphere] = scale[sphere, 0]
+
+    meshes = (types == int(GeoType.MESH)) | (types == int(GeoType.CONVEX_MESH))
+    boxes = (types == int(GeoType.BOX)) | meshes
+    half = np.zeros((len(types), 3), dtype=np.float32)
+    half[types == int(GeoType.BOX)] = scale[types == int(GeoType.BOX)]
+    center[meshes] = (0.5 * (lower + upper))[meshes]
+    half[meshes] = (0.5 * (upper - lower))[meshes]
+    cylinder = (types == int(GeoType.CYLINDER)) & ~(scale[:, 2] >= scale[:, 1])
+    half[cylinder] = scale[cylinder][:, [0, 0, 1]]
+    sided = boxes | cylinder
+    shapes = np.flatnonzero(sided)
+    longest = half[shapes].argmax(axis=1)
+    axis[shapes, longest] = half[shapes, longest]
+    sides = half[shapes].copy()
+    sides[np.arange(len(shapes)), longest] = 0.0
+    radius[shapes] = np.sqrt((sides**2).sum(axis=1))
+    radius[(types == int(GeoType.PLANE)) | (types == int(GeoType.HFIELD))] = -1.0
+    capsules = np.concatenate([axis, radius[:, None]], axis=1).astype(np.float32)
+    middles = np.concatenate([center, farthest[:, None]], axis=1).astype(np.float32)
+    return capsules, middles
+
+
+@dataclass
+class _ForecastTerrain:
+    """What the forecast reads of a model's heightfields (:func:`_forecast_terrain`)."""
+
+    shapes: np.ndarray
+    """Each shape's terrain, ``-1`` for a shape that is no upright heightfield."""
+    walk_slots: np.ndarray
+    """The most rows the terrain law's walk holds for a pair, by its partner's :class:`GeoType`."""
+    origins: np.ndarray
+    """Each terrain's corner in the world and its height origin [m]."""
+    scales: np.ndarray
+    """Each terrain's tiles per meter along x and y."""
+    layouts: np.ndarray
+    """Each terrain's first tile, tile rows and tile columns."""
+    tiles: np.ndarray
+    """The highest height of each tile [m]."""
+
+
+def _forecast_terrain(model: Model) -> _ForecastTerrain:
+    """Return the tiles of the model's upright heightfields and the shapes they belong to."""
+    types = model.shape_type.numpy()
+    fields = np.full(len(types), -1, dtype=np.int32)
+    origins, scales, layouts, tiles, first = [], [], [], [], 0
+    transforms = model.shape_transform.numpy()
+    bodies = model.shape_body.numpy()
+    for shape in np.flatnonzero(types == int(GeoType.HFIELD)):
+        field = model.shape_source[shape]
+        upright = np.allclose(np.abs(transforms[shape, 3:7]), (0.0, 0.0, 0.0, 1.0))
+        if field is None or bodies[shape] >= 0 or not upright:
+            continue
+        heights = field.min_z + np.asarray(field.data).reshape(field.nrow, field.ncol) * (field.max_z - field.min_z)
+        rows = max((field.nrow - 1 + FORECAST_TILE_CELLS - 1) // FORECAST_TILE_CELLS, 1)
+        columns = max((field.ncol - 1 + FORECAST_TILE_CELLS - 1) // FORECAST_TILE_CELLS, 1)
+        top = np.zeros((rows, columns), dtype=np.float32)
+        for row in range(rows):
+            for column in range(columns):
+                cells = heights[
+                    row * FORECAST_TILE_CELLS : (row + 1) * FORECAST_TILE_CELLS + 1,
+                    column * FORECAST_TILE_CELLS : (column + 1) * FORECAST_TILE_CELLS + 1,
+                ]
+                top[row, column] = cells.max()
+        fields[shape] = len(origins)
+        position = transforms[shape, :3]
+        origins.append((position[0] - field.hx, position[1] - field.hy, position[2]))
+        scales.append((columns / (2.0 * field.hx), rows / (2.0 * field.hy)))
+        layouts.append((first, rows, columns))
+        tiles.append(top.reshape(-1))
+        first += top.size
+    slots = np.full(len(GeoType), TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_HULL], dtype=np.int64)
+    slots[int(GeoType.SPHERE)] = slots[int(GeoType.CAPSULE)] = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_POINT]
+    slots[int(GeoType.BOX)] = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
+    slots[int(GeoType.CYLINDER)] = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_CYLINDER]
+    return _ForecastTerrain(
+        fields,
+        slots.astype(np.int32),
+        np.asarray(origins, dtype=np.float32).reshape(-1, 3) if origins else np.zeros((1, 3), dtype=np.float32),
+        np.asarray(scales, dtype=np.float32).reshape(-1, 2) if scales else np.zeros((1, 2), dtype=np.float32),
+        np.asarray(layouts, dtype=np.int32).reshape(-1, 3) if layouts else np.zeros((1, 3), dtype=np.int32),
+        np.concatenate(tiles) if tiles else np.zeros(1, dtype=np.float32),
+    )
+
+
+def _shape_forecast_words(model: Model, terrain: _ForecastTerrain) -> np.ndarray:
+    """Return each shape's forecast word: its forecast bits, and the terrain law's walk rows for a heightfield pair
+    of it (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`)."""
+    types = model.shape_type.numpy()
+    words = np.zeros(len(types), dtype=np.int32)
+    words[(types == int(GeoType.MESH)) | (types == int(GeoType.HFIELD))] |= int(FORECAST_REDUCED)
+    shape_flags = getattr(model, "shape_flags", None)
+    if shape_flags is not None:
+        words[(shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0] |= int(FORECAST_HYDROELASTIC)
+    floating = np.ones(max(model.body_count, 1), dtype=bool)
+    if model.joint_count:
+        joint_articulation = model.joint_articulation.numpy()
+        roots = model.joint_type.numpy()[model.articulation_start.numpy()[:-1]]
+        anchored = np.flatnonzero((roots != int(JointType.FREE)) & (roots != int(JointType.DISTANCE)))
+        held = np.isin(joint_articulation, anchored)
+        floating[model.joint_child.numpy()[held]] = False
+    bodies = model.shape_body.numpy()
+    words[floating[np.maximum(bodies, 0)] & (bodies >= 0)] |= int(FORECAST_FLOATS)
+    words[terrain.shapes >= 0] |= int(FORECAST_TERRAIN)
+    words |= terrain.walk_slots[types].astype(np.int32) << int(FORECAST_SLOTS_SHIFT)
+    return words
+
+
+def _shape_forecast(model: Model, pool, poses: wp.array, *, terrain_law: bool, estimate: int | None) -> ShapeForecast:
+    """Return the forecast of a pipeline's passes over ``model``, adding into ``pool``'s forecast.
+
+    ``poses`` are the shapes' world transforms, which the bounding-box pass writes. Without the terrain law a
+    heightfield pair's contacts come from contact reduction, which bounds them instead of the law's walk rows.
+    """
+    device = pool.device
+    terrain = _forecast_terrain(model)
+    if not terrain_law:
+        terrain.walk_slots[:] = _MESH_PAIR_MAX_CONTACTS
+    capsules, middles = _shape_capsules(model)
+    forecast = ShapeForecast()
+    forecast.on = pool.forecast_on
+    forecast.slots = pool.forecast_slots
+    forecast.horizon = pool.forecast_reach
+    forecast.word = wp.array(_shape_forecast_words(model, terrain), dtype=wp.int32, device=device)
+    forecast.capsule = wp.array(capsules, dtype=wp.vec4, device=device)
+    forecast.middle = wp.array(middles, dtype=wp.vec4, device=device)
+    forecast.pose = poses
+    forecast.body_com = model.body_com if model.body_count else wp.zeros(1, dtype=wp.vec3, device=device)
+    forecast.reach = wp.zeros(model.shape_count, dtype=wp.float32, device=device)
+    forecast.terrain_count = int(terrain.shapes.max(initial=-1)) + 1
+    if forecast.terrain_count:
+        forecast.top = wp.zeros(model.shape_count, dtype=wp.float32, device=device)
+    forecast.terrain_origin = wp.array(terrain.origins, dtype=wp.vec3, device=device)
+    forecast.terrain_scale = wp.array(terrain.scales, dtype=wp.vec2, device=device)
+    forecast.terrain_layout = wp.array(terrain.layouts, dtype=wp.vec3i, device=device)
+    forecast.terrain_tiles = wp.array(terrain.tiles, dtype=wp.float32, device=device)
+    forecast.bound_convex = _CONVEX_PAIR_MAX_CONTACTS
+    forecast.bound_reduced = _MESH_PAIR_MAX_CONTACTS
+    forecast.bound_hydroelastic = _HYDRO_PAIR_MAX_CONTACTS
+    pool.forecast_limit = _estimate_rigid_contact_max(model) if estimate is None else estimate
+    return forecast
 
 
 def _estimate_rigid_contact_max(model: Model) -> int:
@@ -2078,7 +2299,7 @@ class CollisionPipeline:
         self._terrain_law_listed = None
 
         # Kept for compatibility with Newton main, with its explicit > model > estimated precedence and the
-        # model kept in sync; nothing of this pipeline is sized by it (the first mapping below takes the estimate).
+        # model kept in sync; nothing of this pipeline is sized by it.
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
         estimate = None
         if rigid_contact_max is None:
@@ -2093,7 +2314,7 @@ class CollisionPipeline:
         if requires_grad is None:
             requires_grad = model.requires_grad
         # Every per-contact buffer of this pipeline, its Contacts and the solvers that step the model
-        # holds the model's pool's ready rows: the first mapping planned below, then sized from measured demand.
+        # holds the model's pool's ready rows, sized from measured and forecast demand.
         self._contact_pool = model_contact_pool(model, device)
         # The pool's generation the last service_capacity() reported.
         self._service_generation = self._contact_pool.generation
@@ -2889,12 +3110,15 @@ class CollisionPipeline:
         # concurrently by independent graph executables.
         self._body_pair_reduction_capture_tokens: set[object] = set()
         self._captured_contacts: Contacts | None = None
-        # Map big, then trim: the model's pool maps rows for its shape-pair contact estimate (never an explicit
-        # budget) once its fields exist, and trims to the measured demand in service_capacity().
+        # The forecast every pass of this pipeline adds into, on the passes the pool picks (ShapeForecast).
         pool = self._contact_pool
-        if pool.estimate is None:
-            pool.plan_first_mapping(_estimate_rigid_contact_max(model) if estimate is None else estimate)
-            self._service_generation = pool.generation
+        self._forecast = None
+        self._no_velocities = wp.empty(0, dtype=wp.spatial_vector, device=device)
+        if pool.forecast_on is not None and model.shape_count:
+            self._forecast = _shape_forecast(
+                model, pool, self.geom_transform, terrain_law=self._terrain_law_listed is not None, estimate=estimate
+            )
+        pool.publish_reach(float(np.linalg.norm(model.gravity.numpy().reshape(-1, 3), axis=1).max()))
         # Captured contact launches that a replay skipped surface with the narrow phase's capacity flags.
         self.narrow_phase.contact_pool = pool
 
@@ -3668,7 +3892,7 @@ class CollisionPipeline:
 
         The buffers of this pipeline, of its :meth:`contacts` and of the solvers
         that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
-        start with rows for the model's shape-pair contact estimate. Call this
+        start at a few thousand rows. Call this
         once per step outside capture, e.g. right after launching the step's
         graph. Every
         :meth:`collide` records its contact count in a sticky high-water mark,
@@ -3677,12 +3901,20 @@ class CollisionPipeline:
         flight, and when it passes
         :data:`~newton._src.core.contact_pool.GROW_THRESHOLD` of the rows the
         buffers grow to :data:`~newton._src.core.contact_pool.HEADROOM` rows per
-        contact of it. On CUDA with ``gpu_components`` growth maps more memory
+        contact of it. One collision pass in
+        :data:`~newton._src.core.contact_pool.FORECAST_PASSES` of every graph replay
+        forecasts, inside its bounding-box and broad-phase launches, the contacts its
+        pairs can make within the service's lag; while the demand is in transit (from
+        the start, a measured state or a pass that dropped contacts, until the mark
+        holds within :data:`~newton._src.core.contact_pool.TRIM_BAND` for
+        :data:`~newton._src.core.contact_pool.TRIM_AFTER_PASSES` passes) the buffers
+        grow ahead of it. On CUDA with ``gpu_components`` growth maps more memory
         behind the buffers' fixed addresses without synchronizing the device,
         and graphs whose contact launches follow the rows (this pipeline's and
-        FeatherPGS's) use the new rows from their next replay. The replay whose
-        contacts first outnumbered the rows dropped the excess and flagged its
-        capacity status; this warns. Once the mark has stayed within
+        FeatherPGS's) use the new rows from their next replay. A replay whose
+        contacts outnumbered the rows dropped the excess, flagged its capacity
+        status and latched the worlds it dropped them from (:meth:`contact_drops`);
+        this warns. Once the mark has stayed within
         :data:`~newton._src.core.contact_pool.TRIM_BAND` for
         :data:`~newton._src.core.contact_pool.TRIM_AFTER_PASSES` collision
         passes, the rows trim to
@@ -3704,9 +3936,10 @@ class CollisionPipeline:
         Args:
             state: A state to measure before a graph starts from it, or ``None``.
                 Ignored during graph capture.
-            dt: The time step [s] of the collision passes the graph runs, when
-                speculative contacts are enabled; without it the state is
-                measured without speculative extension.
+            dt: The time step [s] of the collision passes the graph runs. The
+                forecast's horizon follows it, and speculative contacts extend a
+                measured state by it; without it the state is measured without
+                speculative extension.
 
         Returns:
             True when the buffers grew since this pipeline's last call (here, in
@@ -3722,16 +3955,43 @@ class CollisionPipeline:
         pool = self._contact_pool
         if capturing(self.device):
             return False
+        if dt is not None:
+            pool.set_pass_dt(dt)
         if state is not None and pool.growable:
+            pool.publish_reach()
+            # The measuring pass forecasts too, and the graph's first replays are in transit: the service below and
+            # the ones after it hold the rows the forecast bounds until the demand settles.
+            pool.request_forecast()
+            pool.restart_transit()
             demand = self._measure_rigid_contacts(state, dt=dt)
             pool.size(max(demand, pool.high_water))
-            logger.info("Measured %d rigid contacts in a state; the contact buffers hold %d rows", demand, pool.ready)
+            logger.info(
+                "Measured %d rigid contacts in a state, %d forecast; the contact buffers hold %d rows",
+                demand,
+                pool.forecast,
+                pool.ready,
+            )
         pool.service()
         # Each pipeline learns of a growth once, also of one another owner of the model's pool caused.
         generation = pool.generation
         grew = generation != self._service_generation
         self._service_generation = generation
         return grew and pool.needs_recapture
+
+    def contact_drops(self) -> ContactDrops:
+        """Return the rigid contacts this pipeline's passes dropped for want of rows, and by which worlds.
+
+        Reads pinned memory that every collision pass writes, also in graph
+        replays, without synchronizing: it reports the passes that completed.
+        A pass drops contacts only when its demand outran the rows the service
+        held (see :meth:`service_capacity`), and flags its capacity status as
+        well. Nothing clears the record: compare the pass numbers in
+        :attr:`ContactDrops.worlds <newton._src.core.contact_pool.ContactDrops.worlds>`
+        with the last one read.
+
+        .. experimental::
+        """
+        return self._contact_pool.drops()
 
     def _measure_rigid_contacts(self, state: State, *, dt: float | None) -> int:
         """Count the rigid contacts of ``state`` into scratch rows, recording them as demand, and return the count.
@@ -4096,17 +4356,41 @@ class CollisionPipeline:
                 # A pool created during a capture holds its rows until a recapture: publish them here.
                 limit = self._contact_limit
                 limit.fill_(contacts._rigid_contact_rows)
-            self._launch_rigid_detection(state, contacts, limit, dt=dt)
-            pool.record_demand(contacts.rigid_contact_count, limit, self.narrow_phase._buffer_capacity_status)
+            # A pass that grows its rows and runs again drops nothing, so only a pass that cannot records drops.
+            # In a graph the record picks the forecasting passes on the device; outside one a host asks for one.
+            in_graph = capturing(self.device)
+            requested = not in_graph and pool.take_forecast_request()
+            self._launch_rigid_detection(
+                state, contacts, limit, dt=dt, latch_drops=not grows, forecast_requested=requested
+            )
+            pool.record_demand(
+                contacts.rigid_contact_count,
+                limit,
+                self.narrow_phase._buffer_capacity_status,
+                drops=not grows,
+                beat=in_graph,
+            )
             if not (grows and pool.fit()):
                 break
             wp.copy(self.narrow_phase._buffer_capacity_status, self._capacity_status_before_pass)
         pool.begin_updates()
 
-    def _launch_rigid_detection(self, state: State, contacts: Contacts, limit: wp.array, *, dt: float | None) -> None:
+    def _launch_rigid_detection(
+        self,
+        state: State,
+        contacts: Contacts,
+        limit: wp.array,
+        *,
+        dt: float | None,
+        latch_drops: bool = True,
+        forecast_requested: bool = False,
+    ) -> None:
         """Launch the broad and narrow phases, and the terrain law's writes, into ``contacts``' rigid rows.
 
-        ``limit`` holds the rows the writers may fill, on the device.
+        ``limit`` holds the rows the writers may fill, on the device; with ``latch_drops`` a writer that drops a
+        contact past them latches its world in the pool's status. The launches also forecast the demand on a
+        forecasting pass (:attr:`~newton._src.core.contact_pool.ContactPool.forecast_on`): in a graph the device
+        flag picks it, outside one ``forecast_requested`` says the host asked for it.
         """
         model = self.model
         if self._speculative_enabled:
@@ -4130,6 +4414,13 @@ class CollisionPipeline:
         # never captured on an active wp.Tape.  The differentiable
         # augmentation and soft-contact kernels that follow are tape-safe
         # and recorded normally.
+
+        # The forecast this pass adds into on a forecasting pass: none without velocities to read.
+        forecast = self._forecast
+        body_qd = state.body_qd
+        if forecast is None or body_qd is None or contacts._rigid_contact_pool is not self._contact_pool:
+            forecast = None
+            body_qd = self._no_velocities
 
         # Compute AABBs for all shapes, zero counters, bump generation.
         # Fuses contacts.clear() + broad_phase_pair_count.zero_() + AABB update.
@@ -4161,6 +4452,8 @@ class CollisionPipeline:
                 contacts.contact_generation,
                 self.broad_phase_pair_count,
                 contacts.contact_counters.shape[0],
+                body_qd,
+                _NO_FORECAST if forecast is None else forecast,
             ],
             outputs=[
                 self.narrow_phase.shape_aabb_lower,
@@ -4220,6 +4513,7 @@ class CollisionPipeline:
                 num_filter_pairs=self.shape_pairs_excluded_count,
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
                 shape_displacement=self._shape_displacement if speculative_active else None,
+                forecast=forecast,
             )
         elif isinstance(self.broad_phase, BroadPhaseSAP):
             self.broad_phase.launch(
@@ -4238,17 +4532,33 @@ class CollisionPipeline:
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
                 shape_displacement=self._shape_displacement if speculative_active else None,
                 sort_axis_displacement_limit=max_speculative_extension if speculative_active else None,
+                forecast=forecast,
             )
         elif self._pair_templates is not None:
-            # Same pairs as the flat list (verified at construction), tested per world template.
-            self._pair_templates.launch(
-                self.narrow_phase.shape_aabb_lower,
-                self.narrow_phase.shape_aabb_upper,
-                self.shape_pairs_filtered,
-                self.broad_phase_shape_pairs,
-                self.broad_phase_pair_count,
-                **pair_filter,
-            )
+            # Same pairs as the flat list (verified at construction), tested per world template. A forecasting pass
+            # launches the kernel's forecasting variant, every other pass the plain one: in a graph Warp captures a
+            # conditional node picks it on the pool's flag, in a capture of its own the variant reads the flag.
+            def test_templates(forecasting: bool = False):
+                self._pair_templates.launch(
+                    self.narrow_phase.shape_aabb_lower,
+                    self.narrow_phase.shape_aabb_upper,
+                    self.shape_pairs_filtered,
+                    self.broad_phase_shape_pairs,
+                    self.broad_phase_pair_count,
+                    **pair_filter,
+                    forecast=forecast if forecasting else None,
+                )
+
+            if forecast is None or not capturing(self.device):
+                test_templates(forecast is not None and forecast_requested)
+            elif self.device.is_cuda and _capture_owner(self.device) is None:
+                test_templates(True)
+            else:
+                wp.capture_if(
+                    self._contact_pool.forecast_on,
+                    on_true=lambda: test_templates(True),
+                    on_false=test_templates,
+                )
         else:  # BroadPhaseExplicit
             self.broad_phase.launch(
                 self.narrow_phase.shape_aabb_lower,
@@ -4262,12 +4572,17 @@ class CollisionPipeline:
                 device=self.device,
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
                 shape_displacement=self._shape_displacement if speculative_active else None,
+                forecast=forecast,
             )
 
         # Create ContactWriterData struct for custom contact writing
         writer_data = ContactWriterData()
         writer_data.contact_max = contacts._rigid_contact_pool.bound
         writer_data.contact_limit = limit
+        if latch_drops and contacts._rigid_contact_pool.dropped_worlds is not None:
+            writer_data.dropped_world = contacts._rigid_contact_pool.dropped_worlds
+            writer_data.shape_world = model.shape_world
+            writer_data.pass_count = contacts._rigid_contact_pool._passes
         writer_data.body_q = state.body_q
         writer_data.shape_body = model.shape_body
         writer_data.shape_gap = model.shape_gap

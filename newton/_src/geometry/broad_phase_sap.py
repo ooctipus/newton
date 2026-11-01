@@ -19,8 +19,10 @@ import warp as wp
 
 from ..core.types import Devicelike
 from .broad_phase_common import (
+    ShapeForecast,
     binary_search,
     check_aabb_overlap_moving,
+    forecast_add,
     is_pair_excluded,
     is_shape_pair_immovable_filtered,
     precompute_world_map,
@@ -32,6 +34,9 @@ wp.set_module_options({"enable_backward": False})
 
 
 SAPSortMode = Literal["segmented", "tile"]
+
+_NO_FORECAST = ShapeForecast()
+"""A forecast with no arrays: the pass forecasts nothing."""
 
 
 def _normalize_sort_mode(mode: str) -> SAPSortMode:
@@ -285,6 +290,8 @@ def _process_single_sap_pair(
     shape_body: wp.array[int],
     body_flags: wp.array[int],
     include_static_kinematic_pairs: bool,
+    thread: int,
+    forecast: ShapeForecast,
 ):
     shape1 = pair[0]
     shape2 = pair[1]
@@ -292,6 +299,19 @@ def _process_single_sap_pair(
     # Skip explicitly excluded pairs (e.g. shape_collision_filter_pairs)
     if num_filter_pairs > 0 and is_pair_excluded(pair, filter_pairs, num_filter_pairs):
         return
+
+    # The forecast sees the pairs the sweep visits: those whose projections overlap on its axis.
+    forecast_add(
+        forecast,
+        thread,
+        shape1,
+        shape2,
+        shape_bounding_box_lower,
+        shape_bounding_box_upper,
+        shape_body,
+        body_flags,
+        include_static_kinematic_pairs,
+    )
 
     # Check if margins are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
@@ -338,6 +358,7 @@ def _process_sap_work_package(
     candidate_pair: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[int],
     max_candidate_pair: int,
+    forecast: ShapeForecast,
 ):
     """Process one mapped SAP work package."""
     j = flat_id + workid + 1
@@ -398,6 +419,8 @@ def _process_sap_work_package(
             shape_body,
             body_flags,
             include_static_kinematic_pairs,
+            workid,
+            forecast,
         )
 
 
@@ -435,6 +458,7 @@ def _sap_broadphase_kernel(
     candidate_pair: wp.array[wp.vec2i],
     candidate_pair_count: wp.array[int],  # Size one array
     max_candidate_pair: int,
+    forecast: ShapeForecast,
 ):
     tid = wp.tid()
 
@@ -470,6 +494,7 @@ def _sap_broadphase_kernel(
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                forecast,
             )
             workid += nsweep_in
         return
@@ -511,6 +536,7 @@ def _sap_broadphase_kernel(
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                forecast,
             )
         chunk_base = _advance_sap_chunk_base(chunk_base, chunk_stride, total_work_packages)
 
@@ -649,6 +675,7 @@ class BroadPhaseSAP:
         include_static_kinematic_pairs: bool = True,
         shape_displacement: wp.array[wp.vec3] | None = None,
         sort_axis_displacement_limit: float | None = None,
+        forecast: ShapeForecast | None = None,
     ) -> None:
         """Launch the sweep and prune broad phase collision detection with per-world segmented sort.
 
@@ -688,6 +715,8 @@ class BroadPhaseSAP:
                 :ref:`Speculative contacts <speculative-contacts>`. :class:`CollisionPipeline` computes it as the
                 shape-origin velocity, including the angular contribution from its COM offset, times ``dt``; angular
                 travel expands the supplied AABB separately.
+            forecast: The contact forecast a collision pass adds the tested pairs into
+                (:class:`~newton._src.geometry.broad_phase_common.ShapeForecast`); ``None`` forecasts nothing.
             sort_axis_displacement_limit: Optional non-negative cap on each displacement projected onto the SAP sort
                 axis [m]. This cap affects only candidate search; retained pairs are tested using the uncapped
                 displacement. Displacements beyond the cap may cause pairs to be missed.
@@ -843,6 +872,7 @@ class BroadPhaseSAP:
                 candidate_pair,
                 candidate_pair_count,
                 max_candidate_pair,
+                _NO_FORECAST if forecast is None else forecast,
             ],
             device=device,
             record_tape=False,

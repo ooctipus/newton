@@ -10,20 +10,36 @@ holds them at one *ready* row count. Every rigid contact buffer of a model
 shares the model's pool (:func:`model_contact_pool`), so a pipeline and the
 solvers that consume its contacts grow together from the moment they exist.
 
-Sizing: map big, then trim. The collision pipeline plans a *first mapping*
-(:meth:`ContactPool.plan_first_mapping`): rows for the model's shape-pair
-contact estimate, at most :data:`FIRST_MAPPING_SHARE` of the device memory
-free when the pool was created across all its fields, so the first replays
-drop nothing. Once the demand has been observed (the high-water mark stayed
-within :data:`TRIM_BAND` for :data:`TRIM_AFTER_PASSES` collision passes), :meth:`ContactPool.service`
-trims the pool to :data:`HEADROOM` rows per contact of the largest demand ever
-recorded, never below :data:`MIN_READY_ROWS`. Past the mapped rows the pool
-still grows from measured demand, without a recapture; a replay drops
-contacts (and flags it) only when the demand outruns that growth. No configured
-contact budget sizes anything: the only limit, the pool's *bound*, is the most
-rows the platform could ever back, the device memory divided by the bytes one
-row costs in the pool's fields, at most the rows every field's int32 Warp
-indices reach (:func:`device_row_limit`, :meth:`ContactField.row_limit`).
+Sizing: rows are mapped for demand that was measured or forecast, never for an
+estimate of the model. A pool starts at :data:`MIN_READY_ROWS`. A pass outside
+capture grows its rows before anything reads them, so it drops nothing
+(:meth:`ContactPool.fit`). A graph replay cannot map, and the service reads what
+replays already wrote, so demand that rises faster than the service's lag would
+find no rows. Every pipeline therefore forecasts its demand, on one collision
+pass in :data:`FORECAST_PASSES` of every graph replay for the whole run (the
+record picks it on the device, :attr:`ContactPool.forecast_on`), inside the
+launches that pass already makes: the bounding-box pass states each shape's
+reach over the service's lag (its speed and, on a floating body, gravity's
+fall) and the broad phase sums, over the pairs that can meet within it, the
+contacts such a pair can make
+(:func:`~newton._src.geometry.broad_phase_common.forecast_pair`). The forecast is a bound, so
+while the demand is in transit (no contact yet, or a high-water mark that rose
+past :data:`TRIM_BAND` within the last :data:`TRIM_AFTER_PASSES` passes) the
+service holds as many rows as it, up to the model's shape-pair estimate
+(:attr:`ContactPool.forecast_limit`). Once the mark holds still the demand's
+:data:`HEADROOM` sizes the rows and a trim returns what the forecast held: on
+a hand around a cube most pairs are within reach of each other at every pass,
+so a forecast held there would keep ten times the rows the demand needs. A state
+measured before a graph starts covers the first replay
+(:meth:`CollisionPipeline.service_capacity`). A replay drops contacts when the
+demand outruns both, and never silently: the record counts the contacts and
+passes it dropped, and each writer that drops a contact latches its world's
+status with the pass (:meth:`ContactPool.drops`), all in pinned memory that the
+host reads without a synchronization. No configured contact budget sizes
+anything: the only limit, the pool's *bound*, is the most rows the platform
+could ever back, the device memory divided by the bytes one row costs in the
+pool's fields, at most the rows every field's int32 Warp indices reach
+(:func:`device_row_limit`, :meth:`ContactField.row_limit`).
 
 Storage:
 
@@ -51,12 +67,13 @@ Storage:
 
 Counts: the collision pipeline's writers count every contact they find and
 drop the rows past :attr:`ContactPool.ready_rows`, which they read on the
-device. After each pass :meth:`ContactPool.record_demand` records the count as
-demand, in a sticky high-water mark that the same launch writes into pinned
-host memory (mapped into the device's address space, so graphs replay no
-copy), clamps the count to the ready rows and flags the overflow: a stream's
-``rigid_contact_count`` never exceeds its rows, so consumers read every row
-below it.
+device, latching the world of each contact they drop. After each pass
+:meth:`ContactPool.record_demand` records the count as demand, in a sticky
+high-water mark that the same launch writes into pinned host memory (mapped
+into the device's address space, so graphs replay no copy) with the pass's
+forecast, its fill and the contacts it dropped, clamps the count to the ready
+rows and flags the overflow: a stream's ``rigid_contact_count`` never exceeds
+its rows, so consumers read every row below it.
 
 Graph capture: a consumer launches each contact-sized kernel through
 :meth:`ContactPool.launch`. In a CUDA graph capture the launch is captured once
@@ -93,6 +110,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import time
 import warnings
 import weakref
 from dataclasses import dataclass
@@ -111,20 +129,32 @@ contact-free tasks through passes that follow the rows (cartpole +6.9% under
 patch friction on the GB300), so the floor stays a few thousand rows.
 """
 
-FIRST_MAPPING_SHARE = 0.25
-"""Share of the device memory free at a pool's creation that its first mapping may take, across all its fields.
+FORECAST_PASSES = 8
+"""Collision passes from one forecast to the next in a graph replay, for the whole run.
 
-The first mapping holds rows for the model's shape-pair contact estimate
-(:meth:`ContactPool.plan_first_mapping`) unless that would map more than this
-share; a field created later lowers the rows it may hold. Chosen on the 21-task
-Isaac Lab suite (16,384 worlds, RTX PRO 6000, one task at a time) and the
-hardware scene: the estimates exceed the demand 100-250 times where they are
-large (keyboard-so101 127M rows for 0.52M contacts, hardware 87M for 1.3M), so
-the share only caps those, and a quarter still holds 20 times their demand; at
-half, keyboard-so101 under patch friction left 18 GB free after the environment
-was created (77 GB start-up peak), little for a training run's own buffers
-before the trim.
-"""
+A forecasting pass reads each shape's velocity and pose and tests the reach of every pair, about as much again as the
+broad phase's own pass on the largest suite task (keyboard-so101, 59M pairs). One pass in eight keeps that near 0.5%
+of its step. The horizon counts the passes between (:meth:`ContactPool.horizon`)."""
+
+FORECAST_SLOTS = 16
+"""Counters the broad phase adds a forecast into, by warp: the record sums them in one unrolled loop, and no counter
+sees every warp's atomic."""
+
+FILL_SCALE = 10000
+"""Units of the record's fill: the largest demand of a pass over its ready rows, times this."""
+
+FORECAST_QUEUE = 2
+"""Graph replays the host may run ahead of the device; the service waits past them.
+
+The forecast must look as far ahead as the service lags, and a host that runs ahead without bound leaves it no
+horizon to look at. The wait reads the pinned record, so it costs nothing while the device keeps up."""
+
+DEFAULT_PASS_DT = 1.0 / 60.0
+"""Time between collision passes [s] until a caller states it (:meth:`CollisionPipeline.service_capacity`): the
+longest a task runs them, so the forecast looks too far rather than too near."""
+
+QUEUE_WAIT = 0.25
+"""Longest a service waits for the device [s]: past it, the service counts replays from what ran."""
 
 TRIM_AFTER_PASSES = 200
 """Collision passes the recorded high-water mark must stay within :data:`TRIM_BAND` before :meth:`ContactPool.service` trims.
@@ -298,22 +328,53 @@ def _fill_index(start: int, out: wp.array[wp.int32]):
     out[i] = wp.int32(i)
 
 
+RECORD_WORDS = 8
+"""Words of a pool's pinned record: the high-water mark, the last pass's demand, the passes recorded, the forecast
+published last, the contacts dropped, the passes that dropped some, the last pass that dropped one, and the fill."""
+
+
 @wp.kernel(enable_backward=False)
 def _record_demand(
     count: wp.array[wp.int32],
     ready_rows: wp.array[wp.int32],
     high_water: wp.array[wp.int32],
     passes: wp.array[wp.int32],
+    forecast_slots: wp.array[wp.int64],
+    forecast_on: wp.array[wp.int32],
     mirror: wp.array[wp.int32],
     rows_used: wp.array[wp.int32],
     status: wp.array[wp.int32],
+    record_drops: int,
+    beat: int,
 ):
     demand = count[0]
+    rows = ready_rows[0]
     if high_water.shape[0] > 0:
         mirror[0] = wp.max(wp.atomic_max(high_water, 0, demand), demand)
         mirror[1] = demand
-        mirror[2] = wp.atomic_add(passes, 0, 1) + 1
-    rows = ready_rows[0]
+        passed = wp.atomic_add(passes, 0, 1) + 1
+        mirror[2] = passed
+        if forecast_on[0] != 0:
+            # This pass forecast: publish its sum, and start the next one from nothing.
+            total = wp.int64(0)
+            for slot in range(FORECAST_SLOTS):
+                total += forecast_slots[slot]
+            for slot in range(FORECAST_SLOTS):
+                forecast_slots[slot] = wp.int64(0)
+            mirror[3] = wp.int32(wp.min(total, wp.int64(INDEX_LIMIT)))
+        # In a graph the pass after each FORECAST_PASSES-th forecasts; outside one, the pass a host asks for.
+        if beat != 0 and passed % FORECAST_PASSES == 0:
+            forecast_on[0] = 1
+        else:
+            forecast_on[0] = 0
+        if record_drops != 0:
+            # A pass that cannot grow its rows and run again: its fill, and the contacts it dropped.
+            fill = wp.int64(demand) * wp.int64(FILL_SCALE) / wp.int64(wp.max(rows, 1))
+            mirror[7] = wp.max(mirror[7], wp.int32(wp.min(fill, wp.int64(INDEX_LIMIT))))
+            if demand > rows:
+                mirror[4] = wp.int32(wp.min(wp.int64(mirror[4]) + wp.int64(demand - rows), wp.int64(INDEX_LIMIT)))
+                mirror[5] = mirror[5] + 1
+                mirror[6] = passed
     held = wp.min(demand, rows)
     if rows_used.shape[0] > 0:
         wp.atomic_max(rows_used, 0, held)
@@ -322,6 +383,21 @@ def _record_demand(
         count[0] = rows
         if status.shape[0] > 0:
             wp.atomic_or(status, 0, CAPACITY_OVERFLOW)
+
+
+@dataclass(frozen=True)
+class ContactDrops:
+    """The contacts a pool's passes dropped, as the pinned record reads now (:meth:`ContactPool.drops`)."""
+
+    contacts: int
+    """Contacts dropped so far, saturating at :data:`INDEX_LIMIT`."""
+    passes: int
+    """Collision passes that dropped at least one."""
+    last_pass: int
+    """The last recorded pass that dropped one, 0 if none did."""
+    worlds: Any
+    """For each world, and last for the contacts between two global shapes, the last pass whose writers dropped one
+    of its contacts, 0 if none did (int32 NumPy array, a view of pinned memory: copy what you keep)."""
 
 
 def capturing(device) -> bool:
@@ -752,21 +828,17 @@ class ContactPool:
     Args:
         device: The device of the buffers.
         rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`.
+        worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
+            (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
 
-    def __init__(self, *, device, rows: int | None = None):
+    def __init__(self, *, device, rows: int | None = None, worlds: int = 0):
         self.device = wp.get_device(device)
+        self.world_count = max(int(worlds), 0)
+        """The worlds whose dropped contacts :meth:`drops` reports one by one."""
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
-        # The free memory the first mapping's share applies to: queried when the pool is created.
-        self.free_memory_at_creation = (
-            int(self.device.free_memory) if self.device.is_cuda and not capturing(self.device) else 0
-        )
-        """Device memory free when the pool was created [bytes]; 0 on the CPU."""
-        # The model's contact estimate a pipeline planned (plan_first_mapping), while it sizes the rows.
-        self._estimate: int | None = None
-        self._first_mapping = False
         self._members: list[weakref.ReferenceType] = []
         # The bound of the members so far. It never rises: graphs captured at it keep covering the rows.
         self._bound = INDEX_LIMIT
@@ -779,6 +851,40 @@ class ContactPool:
         self._high_water = None
         self._passes = None
         self._high_water_host = None
+        self.forecast_slots = None
+        """Contacts the model's pairs may make within the horizon, summed by the broad phase of a forecast pass
+        (int64, shape :data:`FORECAST_SLOTS`, on the device; the record publishes and clears them)."""
+        self.forecast_reach = None
+        """The forecast's horizon [s] and the fall gravity adds over it [m] (vec2, shape 1, on the device)."""
+        self.forecast_on = None
+        """Whether the current collision pass forecasts, which the record of the pass before sets (int32, shape 1, on
+        the device): in a graph replay one pass in :data:`FORECAST_PASSES`, outside one a pass a host asks for
+        (:meth:`request_forecast`)."""
+        self.dropped_worlds = None
+        """Per world, and last for contacts of no world, the last pass whose writers dropped one of its contacts
+        (int32, shape ``world_count + 1``, on the device: pinned host memory on CUDA)."""
+        self._dropped_host = None
+        self.forecast_limit = INDEX_LIMIT
+        """The most contacts a forecast counts: the model's shape-pair estimate, whose locality cap binds on a dense
+        pile of mesh parts, where every near pair's worst case sums past anything the device could back."""
+        # Replays launched since the first service, the passes a replay holds and the seconds between them.
+        self._replays = 0
+        self._replay_passes = 0
+        self._captured_passes: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._passes_at_replays = 0
+        self._pass_dt = DEFAULT_PASS_DT
+        self._gravity = 0.0
+        self._reach = None
+        # Whether the high-water mark holds within TRIM_BAND over TRIM_AFTER_PASSES passes now, and whether the demand
+        # settled since it last went in transit (the pool's start, a measured state, a pass that dropped contacts):
+        # the forecast sizes the rows while it is in transit, the demand's headroom after.
+        self._held = False
+        self._settled = False
+        self._drops_watched = 0
+        # Whether the next pass outside capture forecasts (request_forecast), as the host knows it.
+        self._forecast_requested = False
+        # The passes that dropped contacts the last service warned of.
+        self._drops_seen = 0
         self.rows_used = None
         """The most contacts any recorded pass held, at most the ready rows then (int32, shape 1, on the device):
         the rows a sweep over every used row covers. ``None`` for a pool created during capture."""
@@ -787,18 +893,28 @@ class ContactPool:
             self.rows_used = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._passes = wp.zeros(1, dtype=wp.int32, device=self.device)
-            # [high-water mark, the last pass's demand, passes recorded]
-            self._high_water_host = wp.zeros(3, dtype=wp.int32, device=self.device)
+            self.forecast_slots = wp.zeros(FORECAST_SLOTS, dtype=wp.int64, device=self.device)
+            self.forecast_reach = wp.zeros(1, dtype=wp.vec2, device=self.device)
+            # A pass forecasts once a host asks or the record's beat picks it.
+            self.forecast_on = wp.zeros(1, dtype=wp.int32, device=self.device)
+            # The record (RECORD_WORDS) and each world's dropped-contact status.
+            self._high_water_host = wp.zeros(RECORD_WORDS, dtype=wp.int32, device=self.device)
+            self._dropped_host = wp.zeros(self.world_count + 1, dtype=wp.int32, device=self.device)
             if self.device.is_cuda:
                 _RETIRED_HOST.clear()
-                self._high_water_host = wp.zeros(3, dtype=wp.int32, device="cpu", pinned=True)
-                weakref.finalize(self, _RETIRED_HOST.append, self._high_water_host).atexit = False
-        # The record kernel writes the mark straight into the host copy, which pinned memory maps into the
+                self._high_water_host = wp.zeros(RECORD_WORDS, dtype=wp.int32, device="cpu", pinned=True)
+                self._dropped_host = wp.zeros(self.world_count + 1, dtype=wp.int32, device="cpu", pinned=True)
+                weakref.finalize(self, _RETIRED_HOST.extend, (self._high_water_host, self._dropped_host)).atexit = False
+        # The record kernel and the writers write straight into the host copies, which pinned memory maps into the
         # device's address space: a copy node per collision pass costs a contact-free task 5-8% of its step.
         self._high_water_mirror = self._high_water_host
+        self.dropped_worlds = self._dropped_host
         if self._high_water_host is not None and self._high_water_host.device != self.device:
             self._high_water_mirror = wp.array(
-                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(3,), device=self.device
+                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(RECORD_WORDS,), device=self.device
+            )
+            self.dropped_worlds = wp.array(
+                ptr=self._dropped_host.ptr, dtype=wp.int32, shape=(self.world_count + 1,), device=self.device
             )
         self.growth_count = 0
         """Growths so far."""
@@ -842,11 +958,6 @@ class ContactPool:
                 self._graph_ops = (graph_ops, vm[4])
 
     @property
-    def estimate(self) -> int | None:
-        """The contact estimate a pipeline planned the first mapping for (:meth:`plan_first_mapping`), or ``None``."""
-        return self._estimate
-
-    @property
     def bound(self) -> int:
         """The most rows the device could back for the pool's fields (:func:`device_row_limit`).
 
@@ -882,16 +993,12 @@ class ContactPool:
         """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`).
 
         Their bytes per row lower the pool's bound; their storage reserves the new bound.
-        While the pool holds its first mapping, they also lower the rows it may hold
-        (:meth:`plan_first_mapping`): the other fields shrink first.
 
         Raises:
             MemoryError: If the device cannot back the pool's ready rows of every field.
         """
         fields = tuple(fields)
         bound = self._limit(fields)
-        if self._first_mapping and not capturing(self.device):
-            self._size_first_mapping(sum(field.row_bytes for field in fields), bound)
         if self.ready > bound:
             row_bytes = self.row_bytes + sum(field.row_bytes for field in fields)
             raise MemoryError(
@@ -902,62 +1009,6 @@ class ContactPool:
         self._members.append(weakref.ref(rows))
         self._bound = bound
         return rows
-
-    def plan_first_mapping(self, estimate: int) -> None:
-        """Hold rows for ``estimate`` contacts from now on, outside capture: the model's shape-pair contact estimate.
-
-        A collision pipeline plans this when it is created, so the first graph
-        replays find the rows mapped. The rows are at least :data:`MIN_READY_ROWS`
-        and, on CUDA, cost at most :data:`FIRST_MAPPING_SHARE` of the device memory
-        free when the pool was created, in every field of the pool: a field created
-        later lowers them (:meth:`rows`). They stay until :meth:`service` trims the
-        pool to the measured demand. A pool plans once.
-
-        Raises:
-            MemoryError: If the device cannot back the rows.
-        """
-        if self._estimate is not None or capturing(self.device):
-            return
-        self._estimate = max(int(estimate), 0)
-        self._first_mapping = True
-        self._size_first_mapping(0, self.bound)
-
-    def _first_rows(self, row_bytes: int, bound: int) -> int:
-        """Return the rows of the first mapping for ``row_bytes`` bytes per row in all fields."""
-        rows = max(MIN_READY_ROWS, self._estimate)
-        if self.device.is_cuda and row_bytes > 0:
-            rows = min(rows, max(MIN_READY_ROWS, int(FIRST_MAPPING_SHARE * self.free_memory_at_creation) // row_bytes))
-        return min(rows, bound)
-
-    def _size_first_mapping(self, added_row_bytes: int, bound: int) -> None:
-        """Hold the first mapping for the live fields and ``added_row_bytes`` more per row, outside capture.
-
-        Growth maps rows; a field that lowers them trims the others first, joining
-        the stream (members are created during setup, which joins it anyway). Never
-        below the rows a recorded demand or a reservation needs.
-        """
-        target = self._first_rows(self.row_bytes + added_row_bytes, bound)
-        target = max(target, self._kept_rows(self.high_water))
-        if target > self.ready:
-            previous = self.ready
-            self.grow(target)
-            logger.info(
-                "Rigid contact pool maps %d rows for the model's estimate of %d contacts (from %d; %d bytes per row, "
-                "%.1f MiB free at creation): %.1f MiB",
-                self.ready,
-                self._estimate,
-                previous,
-                self.row_bytes + added_row_bytes,
-                self.free_memory_at_creation / 2**20,
-                self.mapped_bytes() / 2**20,
-            )
-        elif target < self.ready and self._trimmable():
-            rows = self._trim_rows(target)
-            if rows < self.ready:
-                self._begin_trim(rows, self._kept_rows(self.high_water))
-                for event in self._trim[0]:
-                    wp.synchronize_event(event)
-                self._finish_trim()
 
     def settle(self) -> None:
         """Publish every row all live members hold, outside capture: CUDA virtual memory maps whole granules.
@@ -1149,22 +1200,40 @@ class ContactPool:
             return False
         return self._grow_logged(target, demand)
 
-    def record_demand(self, count: wp.array, rows: wp.array, status: wp.array | None = None) -> None:
+    def record_demand(
+        self,
+        count: wp.array,
+        rows: wp.array,
+        status: wp.array | None = None,
+        *,
+        drops: bool = True,
+        beat: bool = True,
+    ) -> None:
         """Record a pass's contact count as demand, then clamp it to the rows the writers held.
 
         One launch, which graph capture records: it raises the sticky high-water
-        mark and writes it and the pass's count into the pinned host copy (a
-        pool created during capture records no demand), and when the count
-        exceeds ``rows`` (the writers dropped the rows past them) sets it to
-        ``rows`` and :data:`CAPACITY_OVERFLOW` in ``status``.
+        mark and writes it, the pass's count, the forecast of a forecasting pass,
+        the pass's fill and the contacts it dropped into the pinned host copy (a
+        pool created during capture records no demand), picks whether the next
+        pass forecasts, and when the count exceeds ``rows`` (the writers dropped
+        the rows past them) sets it to ``rows`` and :data:`CAPACITY_OVERFLOW` in
+        ``status``.
 
         Args:
             count: The pass's contact count (int32, shape 1), written by its writers.
             rows: The writers' row limit on the device: :attr:`ready_rows`, or the
                 rows a pool created during capture holds.
             status: A capacity-status array (int32) whose element 0 flags the overflow, or ``None``.
+            drops: Whether contacts past ``rows`` count as dropped (:meth:`drops`) and the pass's fill counts
+                (:attr:`peak_fill`); a pass outside capture that grows its rows and runs again (:meth:`fit`) drops none.
+            beat: Whether the pass replays in a graph, where the record picks the next forecasting pass
+                (:data:`FORECAST_PASSES`); outside one the next pass forecasts only when a host asks for it. A pass
+                that forecast (:attr:`forecast_on`) publishes the sum the broad phase left in :attr:`forecast_slots`.
         """
         self._note_reader()
+        owner = _capture_owner(self.device)
+        if owner is not None:
+            self._captured_passes[owner] = self._captured_passes.get(owner, 0) + 1
         empty = wp.empty(0, dtype=wp.int32, device=self.device)
         wp.launch(
             _record_demand,
@@ -1174,9 +1243,13 @@ class ContactPool:
                 rows,
                 empty if self._high_water is None else self._high_water,
                 empty if self._high_water is None else self._passes,
+                wp.empty(0, dtype=wp.int64, device=self.device) if self._high_water is None else self.forecast_slots,
+                empty if self._high_water is None else self.forecast_on,
                 empty if self._high_water is None else self._high_water_mirror,
                 empty if self.rows_used is None else self.rows_used,
                 empty if status is None else status,
+                int(drops),
+                int(beat),
             ],
             device=self.device,
             record_tape=False,
@@ -1242,19 +1315,113 @@ class ContactPool:
         """The collision passes recorded so far, as last copied to the host (no synchronization)."""
         return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[2])
 
+    @property
+    def forecast(self) -> int:
+        """The contacts the last forecasting pass found within the horizon, as last copied to the host (no
+        synchronization), at most :attr:`forecast_limit`."""
+        if self._high_water_host is None:
+            return 0
+        return min(int(self._high_water_host.numpy()[3]), self.forecast_limit)
+
+    @property
+    def peak_fill(self) -> float:
+        """The largest demand of any recorded pass that could not grow its rows over the ready rows it held (a graph
+        replay's), as last copied to the host (no synchronization): above 1, a pass dropped contacts."""
+        return 0.0 if self._high_water_host is None else int(self._high_water_host.numpy()[7]) / FILL_SCALE
+
+    def drops(self) -> ContactDrops:
+        """Return the contacts the recorded passes dropped, and by which worlds, as last copied to the host.
+
+        Reads pinned memory without synchronizing: it reports the passes that completed. Nothing clears it; a
+        reader keeps the last pass it saw and compares (:attr:`ContactDrops.worlds` holds pass numbers).
+        """
+        if self._high_water_host is None:
+            return ContactDrops(0, 0, 0, None)
+        record = self._high_water_host.numpy()
+        return ContactDrops(int(record[4]), int(record[5]), int(record[6]), self._dropped_host.numpy())
+
+    def request_forecast(self) -> None:
+        """Have the next collision pass outside capture forecast, outside capture: the pass that measures a state
+        before a graph starts from it."""
+        if self.forecast_on is not None and not capturing(self.device):
+            self.forecast_on.fill_(1)
+            self._forecast_requested = True
+
+    def take_forecast_request(self) -> bool:
+        """Return whether a host asked the pass about to run outside capture to forecast, and clear the request."""
+        requested, self._forecast_requested = self._forecast_requested, False
+        return requested
+
+    def set_pass_dt(self, dt: float) -> None:
+        """State the time between collision passes [s], which the forecast's horizon follows."""
+        self._pass_dt = float(dt)
+
+    def _hold_the_queue(self) -> None:
+        """Wait until at most :data:`FORECAST_QUEUE` replays are ahead of the device, reading the pinned record:
+        the forecast's horizon counts them."""
+        passes = max(self._captured_passes.values(), default=0)
+        if self._high_water_host is None or passes == 0:
+            return
+        if passes != self._replay_passes:
+            # Replays start, or a recapture changed them.
+            self._replay_passes = passes
+            self._replays = 0
+            self._passes_at_replays = self.recorded_passes
+        self._replays += 1
+        behind = self._passes_at_replays + (self._replays - FORECAST_QUEUE) * passes
+        deadline = time.monotonic() + QUEUE_WAIT
+        while self.recorded_passes < behind:
+            if time.monotonic() > deadline:
+                # Not every service follows a replay: count from what ran, not from what never will.
+                self._replays = FORECAST_QUEUE
+                self._passes_at_replays = self.recorded_passes
+                return
+            time.sleep(1.0e-4)
+
+    def horizon(self) -> float:
+        """Return the seconds the forecast must look ahead: the passes between a read and the replay its rows reach.
+
+        The replays the host may run ahead, the replay read from and the one launched next, plus the passes from
+        one forecast to the next, and the forecasting pass itself.
+        """
+        replays = FORECAST_QUEUE + 2
+        return (replays * max(self._captured_passes.values(), default=1) + FORECAST_PASSES + 1) * self._pass_dt
+
+    def publish_reach(self, gravity: float | None = None) -> None:
+        """Publish the forecast's horizon and the fall gravity adds over it, outside capture, when they changed.
+
+        Args:
+            gravity: The model's largest gravity [m/s^2], once a pipeline knows it.
+        """
+        if gravity is not None:
+            self._gravity = float(gravity)
+        if self.forecast_reach is None or capturing(self.device):
+            return
+        horizon = self.horizon()
+        reach = (horizon, 0.5 * self._gravity * horizon * horizon)
+        if reach != self._reach:
+            self._reach = reach
+            self.forecast_reach.fill_(wp.vec2(*reach))
+
     def service(self) -> bool:
-        """Grow from the recorded demand and reservations, or trim to it, outside capture, without synchronizing.
+        """Grow from the recorded and forecast demand and reservations, or trim to it, outside capture.
 
-        Reads the pinned high-water mark, which lags the device by the passes
-        still in flight, and grows to :func:`grown_rows` or to a reservation made
-        during capture, logging the change. Bound graphs follow the new rows from
-        their next replay. A high-water mark at or above the ready rows means a
-        replay dropped contacts, which its capacity status flags; this warns.
+        Reads the pinned record, which lags the device by the passes still in
+        flight, after holding the host to :data:`FORECAST_QUEUE` replays ahead of
+        the device, and grows to :func:`grown_rows`, to a reservation made during
+        capture and, while the demand is in transit, to the forecast, logging the
+        change. It synchronizes nothing. Bound graphs follow the new rows from
+        their next replay. A pass that dropped contacts (its capacity status and
+        :meth:`drops` say so) warns.
 
-        Without a growth, once the mark has stayed within :data:`TRIM_BAND` of
-        where it stood :data:`TRIM_AFTER_PASSES` recorded passes earlier, it trims the rows to
-        :data:`HEADROOM` rows per contact of the mark, at least :data:`MIN_READY_ROWS`,
-        a reservation and the rows of any graph that sized work by the host's
+        The demand is in transit from the pool's start, from a state measured
+        before a graph starts (:meth:`restart_transit`) and from a pass that
+        dropped contacts, until the high-water mark has stayed within
+        :data:`TRIM_BAND` of where it stood :data:`TRIM_AFTER_PASSES` recorded
+        passes earlier; a mark that creeps past the band later is the headroom's.
+        Whenever the mark holds still, without a growth, the service trims the rows to :data:`HEADROOM`
+        rows per contact of the mark, at least :data:`MIN_READY_ROWS`, a
+        reservation and the rows of any graph that sized work by the host's
         rows, in whole granules: it lowers the ready rows in stream order on every
         reader stream (:meth:`add_reader_stream`) and unmaps the pages past them in
         a later call, once the work each of those streams submitted before has
@@ -1269,27 +1436,64 @@ class ContactPool:
         while self._stale_status:
             offset, count = self._stale_status.pop()
             self._update_status[offset : offset + count].zero_()
+        _release_retired(self.device)
         self._finish_trim()
         self.settle()
+        self._hold_the_queue()
+        self.publish_reach()
+        self._watch()
+        self._warn_drops()
         if self.growable:
             high_water = self.high_water
             target = grown_rows(high_water, self.ready, self.bound)
+            if not self._settled:
+                # The demand is in transit: hold the rows the forecast bounds it by.
+                forecast = self.forecast
+                if forecast > self.ready:
+                    target = max(target, reserved_rows(forecast, self.bound))
             if self._reserved > self.ready:
                 target = max(target, reserved_rows(self._reserved, self.bound))
             if target > self.ready:
-                previous = self.ready
-                recapture = self._grow_logged(target, high_water)
-                if high_water >= previous:
-                    warnings.warn(
-                        f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, "
-                        f"which dropped the contacts past them (its capacity status flags it); the buffers grew to "
-                        f"{target} rows for the next replay.",
-                        RuntimeWarning,
-                        stacklevel=3,
-                    )
-                return recapture
+                return self._grow_logged(target, high_water)
         self._consider_trim()
         return False
+
+    def _watch(self) -> None:
+        """Follow the demand: the high-water mark holds still once it stayed within :data:`TRIM_BAND` for
+        :data:`TRIM_AFTER_PASSES` recorded passes, and a demand in transit settles the first time it does; a pass
+        that dropped contacts puts it in transit again."""
+        if self._high_water_host is None:
+            return
+        mark = self._high_water_host.numpy()
+        high_water, passes, dropped = int(mark[0]), int(mark[2]), int(mark[5])
+        if high_water == 0 or high_water > (1.0 + TRIM_BAND) * self._still[0]:
+            self._still = (high_water, passes)
+            self._held = False
+        elif passes - self._still[1] >= TRIM_AFTER_PASSES:
+            self._held = True
+            self._settled = True
+        if dropped > self._drops_watched:
+            # The headroom did not hold the demand: the forecast's bound sizes the rows until it settles again.
+            self._drops_watched = dropped
+            self._settled = False
+
+    def restart_transit(self) -> None:
+        """Put the demand in transit: a measured state starts a graph, whose first replays the forecast sizes until
+        the high-water mark holds still (:meth:`service`)."""
+        self._settled = False
+
+    def _warn_drops(self) -> None:
+        """Warn once for each service that finds passes which dropped contacts since the last one."""
+        drops = self.drops()
+        if drops.passes > self._drops_seen:
+            warnings.warn(
+                f"Rigid contact rows ran out in {drops.passes - self._drops_seen} collision pass(es) up to pass "
+                f"{drops.last_pass}: {drops.contacts} contacts dropped so far (the capacity status flags it); the "
+                f"buffers grow for the next replay.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            self._drops_seen = drops.passes
 
     # -- trim ----------------------------------------------------------------------------------------------------
 
@@ -1319,22 +1523,14 @@ class ContactPool:
         return min(self.ready, *(member.covered_at(rows, granule) for member in members))
 
     def _consider_trim(self) -> None:
-        """Trim once the high-water mark stayed within :data:`TRIM_BAND` for :data:`TRIM_AFTER_PASSES` recorded passes."""
-        if self._high_water_host is None or not self._trimmable():
+        """Trim to the demand's headroom once the high-water mark held still and the demand settled
+        (:meth:`_watch`)."""
+        if not (self._held and self._settled) or not self._trimmable():
             return
-        mark = self._high_water_host.numpy()
-        high_water, passes = int(mark[0]), int(mark[2])
-        # The window opens at the first contact: before it, the demand has not been observed.
-        if high_water == 0 or high_water > (1.0 + TRIM_BAND) * self._still[0]:
-            self._still = (high_water, passes)
-            return
-        if passes - self._still[1] < TRIM_AFTER_PASSES:
-            return
-        kept = self._kept_rows(high_water)
+        kept = self._kept_rows(self.high_water)
         rows = self._trim_rows(kept)
         if rows < self.ready:
             self._begin_trim(rows, kept)
-            self._first_mapping = False
 
     def _reader_streams(self) -> tuple[int, ...]:
         """Return the raw handles of the live reader streams other than the current one."""
@@ -1630,8 +1826,8 @@ def model_contact_pool(model, device=None) -> ContactPool:
         pools = _MODEL_POOLS.setdefault(model, {})
     except TypeError:
         # A model that cannot be weakly referenced keeps a pool per owner.
-        return ContactPool(device=device)
+        return ContactPool(device=device, worlds=getattr(model, "world_count", 0))
     pool = pools.get(device.alias)
     if pool is None:
-        pool = pools[device.alias] = ContactPool(device=device)
+        pool = pools[device.alias] = ContactPool(device=device, worlds=getattr(model, "world_count", 0))
     return pool
