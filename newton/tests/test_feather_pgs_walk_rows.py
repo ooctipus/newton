@@ -26,7 +26,8 @@ import newton
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
-from newton.tests.test_feather_pgs_walk import BOUND, ROUNDING, catalogue, run_route
+from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
+from newton.tests.test_feather_pgs_walk import BOUND, ROUNDING, Capture, catalogue, run_route
 
 F32 = np.float32
 
@@ -317,15 +318,17 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     ``J v_hat`` and the step's leave against the float64 walk's, as ratios to their rounding: ``n u |Z_i| |u_hat|``
     (and ``u`` of the incident velocity), and ``n u kappa |dv|`` (FL3.1's leave bound) with the publication's rounding
     of ``v_hat`` and ``v_out``. A free rigid body is a one-body tree of six coordinates. A tree whose drives slip this
-    step (its rows carry the release, :class:`TestSlipRelease`), the closure's corrected rows (``test_feather_pgs_preelim``)
-    and a world whose speed ball acted (its ``du`` is a law's, not ``sum Z lambda``) are left to their own checks."""
+    step leaves ``R^T du`` (its rows carry the release and are checked by :class:`TestSlipRelease`); the closure's
+    corrected rows (``test_feather_pgs_preelim``) and a world whose speed ball acted (its ``du`` is a law's, not
+    ``sum Z lambda``) are left to their own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
-    out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0}
+    out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0, "slipping": 0}
     sizes = forest.articulation_response_dof_count.numpy()
     offsets = forest.articulation_world_dof_offset.numpy()
     starts = forest.articulation_dof_start.numpy()
     art_world = forest.art_to_world.numpy()
     body_art = forest.body_to_articulation.numpy()
+    free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(sizes.size, dtype=np.int32)
     slips = factor.walk_view().release.count.numpy()
     dense = bool(placement.packed_dense)
     incident = placement.row_incident.numpy().astype(np.float64)
@@ -400,10 +403,12 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 bound = 6 * ROUNDING * np.sqrt(scale_z * scale_u) + ROUNDING * abs(incident_row)
                 if bound > 0.0:
                     out["free_rows"] = max(out["free_rows"], abs(term - incident_row) / bound)
-    # The leave: the published dv against the float64 walk's leave of the step's du (the final rows' Z lambda).
+    # The leave: the published dv against the float64 walk's leave of the step's du (the final rows' Z lambda), a
+    # slipping tree's after its rows' release, R^T du (the device's release, tree_factor.walk_release_kernel).
+    view = factor.walk_view()
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
-        if world < 0 or n == 0 or slips[art] or solver.factor.eliminates or ball[world]:
+        if world < 0 or n == 0 or solver.factor.eliminates or ball[world]:
             continue
         line, count = int(first[world]), int(counts[world])
         du = np.zeros(n) + free_du.get(art, 0.0)
@@ -419,7 +424,22 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                     du += capture.Z_final[line, row, start : start + m] * capture.impulses[line, row]
         if not np.any(du):
             continue
-        out["free_bodies"] += int(art in free_du)
+        out["free_bodies"] += int(free[art] != 0)
+        if slips[art]:
+            # R^T du: the last slip first, each along its path root first (the leave's text, sweep_routes.walk_leave).
+            release = view.release
+            coordinate, b, a, g = (getattr(release, k).numpy()[art] for k in ("coordinate", "b", "a", "g"))
+            du = du.copy()
+            for j in reversed(range(int(slips[art]))):
+                t = 0.0
+                for k in reversed(range(coordinate.shape[1])):
+                    c = int(coordinate[j, k])
+                    if c < 0:
+                        continue
+                    x = float(g[j, k]) * du[c] + float(a[j, k]) * t
+                    du[c] = x
+                    t -= float(b[j, k]) * x
+            out["slipping"] += 1
         dofs = int(starts[art]) + np.arange(n)
         dv = capture.v_out[dofs] - capture.v_hat[dofs]
         walk = walk_of(art)
@@ -454,6 +474,75 @@ class TestWalkedPlacement(unittest.TestCase):
         self.assertLess(worst["rows"], BOUND, worst)
         self.assertLess(worst["free_rows"], BOUND, worst)
         self.assertLess(worst["leave"], BOUND, worst)
+
+
+def paired_arm_and_box(device, drives: bool):
+    """Two worlds of a 23-DOF arm and a free box sliding down onto it (case K5 on CUDA: the paired factor sweep), with
+    ``drives`` stiff PD drives on the arm held past their effort limits, so they slip."""
+    model = _build_mixed_response_model(device, world_count=2, dof_count=23, friction=0.7)
+    qd = model.joint_qd.numpy()
+    q_start = model.joint_qd_start.numpy()
+    free = model.joint_type.numpy() == int(newton.JointType.FREE)
+    for joint in np.flatnonzero(free):
+        qd[q_start[joint] : q_start[joint] + 6] = (0.3, 0.0, -1.0, 0.0, 0.0, 0.0)
+    model.joint_qd.assign(qd)
+    control = model.control()
+    if drives:
+        arm = np.flatnonzero(~np.repeat(free, np.diff(q_start)))
+        for name, value in (("joint_target_ke", 50.0), ("joint_target_kd", 1.0), ("joint_effort_limit", 1.0e-3)):
+            values = getattr(model, name).numpy()
+            values[arm] = value
+            getattr(model, name).assign(values)
+        targets = control.joint_target_q.numpy()
+        targets[arm] = 1.5
+        control.joint_target_q.assign(targets)
+    return model, control
+
+
+class TestPairedPlacement(unittest.TestCase):
+    """Case K5 walks (FL3.3 stage two C): its rows by the one writer, the paired factor sweep's leave by the walk."""
+
+    @unittest.skipUnless(wp.is_cuda_available(), "The paired factor sweep requires CUDA")
+    def test_one_frame_on_the_paired_class(self):
+        for drives in (False, True):
+            with self.subTest(drives=drives):
+                model, control = paired_arm_and_box("cuda:0", drives)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    solver = SolverFeatherPGS(
+                        model, pgs_iterations=16, enable_joint_limits=True, dense_max_constraints=96,
+                        mf_max_constraints=32,
+                    )
+                self.assertEqual(solver.routes.case, "K5")
+                self.assertTrue(solver.placement.walks)
+                self.assertIsNotNone(solver.sweep.paired_factor_kernel)
+                capture = Capture(solver)
+                pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
+                contacts = pipeline.contacts()
+                state, out = model.state(), model.state()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                worst = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0}
+                seen = {"free_bodies": 0, "slipping": 0, "rows": 0}
+                for _ in range(6):
+                    state.clear_forces()
+                    pipeline.collide(state, contacts)
+                    solver.step(state, out, control, contacts, 1.0 / 240.0)
+                    joint_q = solver.cut.mirror(state).joint_q.numpy().astype(np.float64)
+                    capture.finish()
+                    seen["rows"] += int(solver.placement.constraint_count.numpy().sum())
+                    result = walked_frames(solver, joint_q, capture)
+                    for key in worst:
+                        worst[key] = max(worst[key], result[key])
+                    for key in ("free_bodies", "slipping"):
+                        seen[key] += result[key]
+                    state, out = out, state
+                self.assertGreater(seen["rows"], 0, "no row reached the paired sweep")
+                self.assertGreater(seen["free_bodies"], 0)
+                if drives:
+                    self.assertGreater(seen["slipping"], 0, "no drive slipped")
+                self.assertLess(worst["rows"], BOUND, worst)
+                self.assertLess(worst["free_rows"], BOUND, worst)
+                self.assertLess(worst["leave"], BOUND, worst)
 
 
 if __name__ == "__main__":

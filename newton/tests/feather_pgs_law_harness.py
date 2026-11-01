@@ -712,6 +712,25 @@ def local_packed_rows(device, art_world, rows_by_art) -> list:
     ]
 
 
+def _walked_coordinates(solver):
+    """Where the placement walks (:mod:`.walk_rows`), ``u_hat`` in the walk's frame, ``[world, world coordinate]``: the
+    walk's enter of ``v_hat`` (:func:`.tree_factor.walk_enter_kernel`, the audit's), the coordinates its rows are
+    whitened against; ``None`` elsewhere (the held factors' ``L^T P v_hat``)."""
+    if not getattr(solver.placement, "walks", False):
+        return None
+    from newton._src.solvers.feather_pgs.tree_factor import walk_enter_kernel  # noqa: PLC0415
+
+    forest, factor = solver.forest, solver.factor
+    coordinates = wp.zeros((forest.world_count, max(int(forest.max_world_dofs), 1)), dtype=float, device=solver.model.device)
+    wp.launch(
+        walk_enter_kernel(),
+        dim=factor.walk_arts.shape[0],
+        inputs=[factor.walk_arts, factor.walk_view(), forest.art_to_world, forest.articulation_world_dof_offset, solver.v_hat, coordinates],
+        device=solver.model.device,
+    )
+    return coordinates.numpy().astype(np.float64)
+
+
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
     six coordinates, ``u_hat = L^T P v_hat`` through the body's factor, and its terms' magnitude."""
@@ -726,6 +745,7 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     body_art = solver.forest.body_to_articulation.numpy()
     starts, groups = solver.forest.articulation_dof_start.numpy(), solver.forest.art_group_idx.numpy()
     factors = solver.factor.L_by_size[6].numpy().astype(np.float64) if 6 in solver.factor.L_by_size else None
+    walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
         for row in range(int(count)):
@@ -736,6 +756,11 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
                 if body < 0:
                     continue
                 art = body_art[body]
+                if walked is not None:
+                    # The walk's coordinates, by coordinate (not reversed): the walked rows' frame.
+                    first = int(offsets[art])
+                    term = np.concatenate((term, Z[world, row] * walked[world, first : first + 6]))
+                    continue
                 L = np.tril(factors[groups[art]])
                 u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + 6][::-1]
                 term = np.concatenate((term, Z[world, row][::-1] * u_hat))
@@ -859,6 +884,7 @@ def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     groups, offsets = solver.forest.art_group_idx.numpy(), solver.forest.articulation_world_dof_offset.numpy()
     starts = solver.forest.articulation_dof_start.numpy()
     gaps, terms = np.zeros(dof.shape[:2]), np.zeros(dof.shape[:2])
+    walked = _walked_coordinates(solver)
     for world, count in enumerate(solver.placement.constraint_count.numpy()):
         for row in range(min(int(count), dof.shape[1])):
             term = np.zeros(0)
@@ -867,6 +893,10 @@ def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
                     continue
                 n, first = int(sizes[art]), int(offsets[art])
                 held = (dof[world, row] >= first) & (dof[world, row] < first + n)
+                if walked is not None:
+                    # The walked rows' frame: each held entry against the walk's coordinate it sits at.
+                    term = np.concatenate((term, Z[world, row, held] * walked[world, dof[world, row, held]]))
+                    continue
                 L = np.tril(solver.factor.L_by_size[n].numpy().astype(np.float64)[groups[art]])
                 u_hat = L.T @ v_hat[int(starts[art]) : int(starts[art]) + n][::-1]
                 term = np.concatenate((term, Z[world, row, held][::-1] * u_hat))

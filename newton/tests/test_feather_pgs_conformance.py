@@ -1513,14 +1513,14 @@ PAIRED = Route(
 PAIRED_FOREST = Route(
     "paired_forest",
     "cuda",
-    # The kuka recipes' route: the paired factor sweep over one held forest per world.
+    # The kuka recipes' route: the paired factor sweep over one held forest per world, its rows by the one writer.
     options=_MF,
     pins={"grouping": "forest"},
     expect={
         "paired_response.enabled": True,
         "paired_response.factor_coordinates": True,
         "held_tree.owner": "forest",
-        "contact_rows.producer": "general",
+        "contact_rows.producer": "walk",
     },
 )
 
