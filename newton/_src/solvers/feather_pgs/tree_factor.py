@@ -151,8 +151,11 @@ class TreeFactor:
         self.armature = None
         self.armature_floor = None
         self.L_by_size: dict[int, wp.array] = {}
+        self.T_by_size: dict[int, wp.array] = {}
         self.R_by_size: dict[int, wp.array] = {}
         self.diagonal_inverse_mass = None
+        self.diagonal_inverse_trial = None
+        self.driven_articulations = np.zeros(0, dtype=bool)
         self.body_factors = None
         self.eliminates = False
         self.elimination = None
@@ -386,6 +389,7 @@ class TreeFactor:
         else:
             self._arrays.release(AUGMENTED_DRIVE_ROWS)
         self.parallel_drives = False
+        self.driven_articulations = np.zeros(model.articulation_count, dtype=bool)
         self.drive_row_by_dof = wp.full((max(1, int(model.joint_dof_count)),), -1, dtype=wp.int32, device=model.device)
         self.drive_q_index_by_dof = None
         self.drive_target_index_by_dof = None
@@ -438,7 +442,13 @@ class TreeFactor:
         self.drive_target_index_by_dof = wp.array(drive_target_index_by_dof, dtype=wp.int32, device=model.device)
         self.aug_row_counts.assign(row_counts)
         self.aug_row_dof_index.assign(row_dof_index)
+        self.driven_articulations = row_counts > 0
         self.parallel_drives = True
+
+    def _driven(self, articulations) -> bool:
+        """Whether any of ``articulations`` holds a drive row, so its factor needs a trial factor beside it."""
+        articulations = np.asarray(articulations, dtype=np.int64)
+        return bool(self.driven_articulations.size and np.any(self.driven_articulations[articulations]))
 
     def allocate_common(self) -> None:
         """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records (with the COM
@@ -450,6 +460,10 @@ class TreeFactor:
             arrays.release(ARTICULATION_WORK)
         self.diagonal_inverse_mass = (
             wp.zeros_like(model.joint_qd) if forest.diagonal_mass_sizes else arrays.placeholder(wp.float32)
+        )
+        driven_diagonal = any(self._driven(forest.group_to_art_host[size]) for size in forest.diagonal_mass_sizes)
+        self.diagonal_inverse_trial = (
+            wp.zeros_like(model.joint_qd) if driven_diagonal else arrays.placeholder(wp.float32)
         )
         if model.body_count:
             arrays.allocate(BODY_INERTIA, body=model.body_count)
@@ -474,7 +488,8 @@ class TreeFactor:
         inverse entries and its status."""
         self.sparse_mass_matrix_plan = plan
         self.sparse_mass_matrix_indices = factor_indices(plan, self.model.device)
-        self._arrays.allocate(SPARSE_FACTOR, group=articulations, nonzero=plan.nonzero_count)
+        trial = articulations if self.driven_articulations.any() else 1
+        self._arrays.allocate(SPARSE_FACTOR, group=articulations, trial_group=trial, nonzero=plan.nonzero_count)
 
     def allocate_size_groups(self, placeholder_sizes) -> None:
         """Allocate each size group's factor L and armature R; ``placeholder_sizes`` (the compact diagonal and the
@@ -483,7 +498,15 @@ class TreeFactor:
             n_arts = self.forest.n_arts_by_size[size]
             placeholder = size in placeholder_sizes
             factor = 1 if placeholder else 0
-            sizes = {"art": n_arts, "size": size, "factor_art": factor or n_arts, "factor_size": factor or size}
+            trial = factor or (0 if self._driven(self.forest.group_to_art_host[size]) else 1)
+            sizes = {
+                "art": n_arts,
+                "size": size,
+                "factor_art": factor or n_arts,
+                "factor_size": factor or size,
+                "trial_art": trial or n_arts,
+                "trial_size": trial or size,
+            }
             for name, array in self._arrays.allocate(SIZE_FACTORS, owner={}, **sizes).items():
                 getattr(self, f"{name}_by_size")[size] = array
 
@@ -798,8 +821,9 @@ class TreeFactor:
 
     def predict(self, state_in, control, qd: wp.array, ready: wp.Event | None, dt: float, v_hat: wp.array) -> None:
         """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``, the free-root correction included. Each tree's launch holds the
-        drives' saturation decision and, where it moved a drive, the tree's new factor and solve
-        (:data:`.tree_kinetic_state.SATURATE_DRIVES`)."""
+        drives' saturation decision and, where it moved a drive, the tree's new step factor and solve
+        (:data:`.tree_kinetic_state.SATURATE_DRIVES`); the trial factor keeps every ``K`` while the step factor holds a
+        decided set, so no saturation ever asks the refresh for a factor."""
         with wp.ScopedTimer("S3_Trisolve_Vhat", print=False, use_nvtx=self.nvtx, synchronize=False):
             if ready is not None:
                 wp.get_stream(self.model.device).wait_event(ready)

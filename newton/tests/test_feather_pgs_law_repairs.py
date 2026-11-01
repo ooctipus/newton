@@ -418,6 +418,15 @@ def _huber_rollout(mass, ke, kd, limit, target, steps, dt=H):
     return np.asarray(history)
 
 
+def _decided_K(solver) -> np.ndarray:
+    """The ``K`` each drive row holds in a step factor that holds a decided set; the trial factor holds every drive's."""
+    factor = solver.factor
+    rows = factor.drive_row_by_dof.numpy()
+    rows = rows[rows >= 0]
+    decided = factor.aug_decided.numpy()[rows // solver.forest.articulation_max_dofs] != 0
+    return factor.aug_row_Kd.numpy()[rows[decided]]
+
+
 def _drive_roll(model, control, steps, *, dt=H, **options):
     """Step the drives from rest; each step's coordinates and velocities."""
     solver = SolverFeatherPGS(model, **{"angular_damping": 0.0, "pgs_iterations": 4, **options})
@@ -593,12 +602,12 @@ class TestDriveSaturation(unittest.TestCase):
             state, out = model.state(), model.state()
             solver.step(state, out, control, None, H)
             launches.append(_launched(lambda: solver.step(out, state, control, None, H)))  # noqa: B023
-            moved.append(float(solver.factor.aug_row_K.numpy().min()))
+            moved.append(_decided_K(solver))
         self.assertEqual(launches[0], launches[1])
         for stage in ("dense_factor", "tree_kinetic_predict"):
             self.assertEqual(sum(name.startswith(stage) for name in launches[0]), 1, stage)
-        self.assertGreater(moved[0], 1.0e-3)
-        self.assertLess(moved[1], 1.0e-6)
+        self.assertEqual(moved[0].size, 0)
+        self.assertLess(float(moved[1].min()), 1.0e-6)
 
     def test_a_saturation_change_refreshes_a_stale_factor(self):
         """Hold ``update_mass_matrix_interval=2`` to the every-step result where ``H`` is constant: only ``K`` moves."""
@@ -877,6 +886,17 @@ def _driven_chain(device):
     return model, model.control()
 
 
+def _refresh_decided(solver) -> None:
+    """Refresh every step factor from the held geometry with the ``K`` it holds, its decided set's where it holds one."""
+    factor = solver.factor
+    decided = factor.aug_decided.numpy()
+    rows = np.arange(factor.aug_row_K.shape[0])
+    held = decided[rows // solver.forest.articulation_max_dofs] != 0
+    factor.aug_row_K.assign(np.where(held, factor.aug_row_Kd.numpy(), factor.aug_row_K.numpy()).astype(np.float32))
+    factor.mass_update_mask.fill_(1)
+    factor.held.refresh(factor)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "the held tree's natives run on CUDA")
 class TestDriveSaturationOnRoutes(unittest.TestCase):
     """The decision on each evaluator of the trees: a second factor and solve that reach the right articulations."""
@@ -912,19 +932,19 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         reference, _ = self._roll("cpu", {}, scene=_driven_chain)
         history, solver = self._roll("cuda:0", {}, scene=_driven_chain)
         self.assertEqual(solver.factor.held.groups[0].layout.lanes, 64)
-        self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+        self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
         np.testing.assert_allclose(history[:20], reference[:20], rtol=0.0, atol=2.0e-2)
 
     def test_a_second_factor_is_the_factor_kernels(self):
-        """The factor the predictor made for the ``K`` it left is the one a refresh makes from the same geometry."""
+        """The factor the predictor made for the ``K`` it left is the one a refresh makes from the same geometry and
+        ``K``."""
         for device, pins in (("cpu", {}), ("cuda:0", {}), ("cuda:0", {"grouping": "forest"})):
             with self.subTest(device=device, pins=pins):
                 _, solver = self._roll(device, pins)
-                self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+                self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
                 self.assertGreater(float(solver.factor.aug_row_K.numpy().max()), 1.0e-3)
                 held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
-                solver.factor.mass_update_mask.fill_(1)
-                solver.factor.held.refresh(solver.factor)
+                _refresh_decided(solver)
                 for size, factor in solver.factor.L_by_size.items():
                     np.testing.assert_allclose(held[size], np.tril(factor.numpy()), rtol=2.0e-6, atol=1.0e-7)
 
@@ -980,7 +1000,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
             solver.step(state, out, control, None, H)
             state, out = out, state
             history.append(state.joint_qd.numpy().copy())
-        self.assertLess(float(solver.factor.aug_row_K.numpy().min()), 1.0e-6)
+        self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
         return np.asarray(history), solver
 
     def test_the_sparse_factor_takes_the_decision(self):
@@ -991,8 +1011,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         """``L^-1`` included. An odd step count: the last finish left the geometry the step's factors read."""
         _, solver = self._sparse_roll(False, 5, 2)
         held = solver.factor.sparse_Linv.numpy().copy()
-        solver.factor.mass_update_mask.fill_(1)
-        solver.factor.held.refresh(solver.factor)
+        _refresh_decided(solver)
         np.testing.assert_allclose(held, solver.factor.sparse_Linv.numpy(), rtol=2.0e-6, atol=1.0e-7)
 
     def test_a_compact_diagonal_decides_in_its_predictor(self):

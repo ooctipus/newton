@@ -108,6 +108,12 @@ class HeldResponse:
     lower2: wp.array3d[float]
     lower3: wp.array3d[float]
     factor_index: wp.array2d[int]
+    # The trial factors, every drive's K, which a root's trial reads while its step factor holds a decided set.
+    trial: wp.array3d[float]
+    trial1: wp.array3d[float]
+    trial2: wp.array3d[float]
+    trial3: wp.array3d[float]
+    inverse_trial: wp.array[float]
     # What each root's second factor reads (:func:`_second_factor`).
     armature: wp.array2d[float]
     armature1: wp.array2d[float]
@@ -143,11 +149,15 @@ FORCE_INPUT = (
     Field("drive", wp.vec4, ("dof",), owner="factor", attr="aug_drive"),
     Field("drive_row", wp.int32, ("dof",), owner="factor", attr="drive_row_by_dof"),
     Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
+    Field("row_Kd", wp.float32, ("drive_row",), owner="factor", attr="aug_row_Kd"),
     Field("row_H", wp.float32, ("drive_row",), owner="factor", attr="aug_row_H"),
     Field("row_dv", wp.float32, ("drive_row",), owner="factor", attr="aug_row_dv"),
+    Field("decided", wp.int32, ("articulation",), owner="factor", attr="aug_decided"),
+    Field("mask", wp.int32, ("articulation",), owner="factor", attr="mass_update_mask"),
 )
 """The held-tree predictor's inputs: the step's state and control, the solver's passive and kinematic tables, the
-augmented state and the drive rows it writes, and the step's values."""
+augmented state and the drive rows it writes, which articulations' step factors hold a decided set and which this step
+refreshed, and the step's values."""
 
 ForceInput = field_group.struct("ForceInput", FORCE_INPUT, __name__)
 
@@ -626,7 +636,7 @@ $START_FORWARD    $FORWARD_STAGE
 $START_RESPONSE    for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
         const int dof=ds+$RESPONSE_PHYSICAL;
-        const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!d.status.data[group]&&!cache.status.data[group]&&wp::isfinite(value);
+        const bool valid=cache.current_valid.data[art]&&d.valid.data[group]&&!($STATUS)&&!cache.status.data[group]&&wp::isfinite(value);
         f.qdd.data[dof]=valid?value:NAN;
         f.vhat.data[dof]=$VELOCITY;
         if(!valid) {
@@ -655,13 +665,14 @@ _PREDICT = r"""    $PHYSICAL_TABLE
     $SCRATCH
     __shared__ int nonzero_all[$PACK];int& nonzero=nonzero_all[SUB];
     __shared__ int moved_all[$PACK];int& moved=moved_all[SUB];
+    __shared__ int held_all[$PACK];int& held=held_all[SUB];
     const auto MOVE=[&](int bits){atomicOr(&moved,bits);};
 #else
     const int lane=0,stride=1;
-    float s[$PREDICT_WORDS];int nonzero=0;int moved=0;
+    float s[$PREDICT_WORDS];int nonzero=0;int moved=0;int held=0;
     const auto MOVE=[&](int bits){moved|=bits;};
 #endif
-    if(lane==0){nonzero=0;moved=0;}
+    if(lane==0){nonzero=0;moved=0;held=0;$HELD}
 $CLOCK0#if defined(__CUDA_ARCH__)
     SYNC();
 #endif
@@ -685,11 +696,15 @@ $CLOCK0#if defined(__CUDA_ARCH__)
     SYNC();
 #endif
 $CLOCK1$REDUCE
+    $TRIAL_FACTORS
     $TRIAL
-$CLOCK4    if(moved!=0) {
+$CLOCK4    if(moved!=0||held!=0) {
     $SATURATE
     $SECOND_FACTOR
+    if(moved&1) {
     $SECOND_SOLVE
+    }
+    $RECORD
     }
     // A prescribed (kinematic) free root keeps its given velocity: no transport.
     $TRANSPORT_BLOCK
@@ -706,55 +721,117 @@ QUIET_DRIVE = r"""const wp::vec4 drive=f.drive.data[dof];
 A world every drive of which passes reads nothing else of the decision and takes no second stage."""
 
 SATURATE_DRIVES = r"""    for(int i=lane;i<$DOFS;i+=stride) {
-        const int dof=ds+i;
+        const int dof=ds+i,row=f.drive_row.data[dof];
+        if(row<0)continue;
+        const int root=$ROOT;
         const wp::vec4 drive=f.drive.data[dof];
         const float K=drive[0],passive=drive[1],limit=drive[2],u0=drive[3];
-        if(K<=0.0f||limit<=0.0f)continue;
-        const int row=f.drive_row.data[dof];
-        const float qdd=f.qdd.data[dof];
-        const float limited=Spatial::limited_drive_force(u0,limit);
-        const float inertia=u0!=limited?f.row_H.data[row]+passive:0.0f;
-        const float force=Spatial::drive_step_force(u0,limited,K,qdd,inertia);
-        if(wp::abs(force)>limit) {
-            f.row_K.data[row]=passive;
-            f.u0.data[dof]=f.u0.data[dof]-limited+wp::sign(force)*limit;
-            MOVE($SATURATED);
-        } else if(u0!=limited) {
-            const float rows=f.row_dv.data[row]/f.dt;
-            f.u0.data[dof]=f.u0.data[dof]-limited+Spatial::free_drive_force(u0,limited,K,qdd,rows,inertia,limit);
+        const float all=f.row_K.data[row];
+        float decided=all;
+        if(K>0.0f&&limit>0.0f) {
+            const float qdd=f.qdd.data[dof];
+            const float limited=Spatial::limited_drive_force(u0,limit);
+            const float inertia=u0!=limited?f.row_H.data[row]+passive:0.0f;
+            const float force=Spatial::drive_step_force(u0,limited,K,qdd,inertia);
+            if(wp::abs(force)>limit) {
+                decided=passive;
+                f.u0.data[dof]=f.u0.data[dof]-limited+wp::sign(force)*limit;
+                MOVE(1|(256<<root));
+            } else if(u0!=limited) {
+                const float rows=f.row_dv.data[row]/f.dt;
+                f.u0.data[dof]=f.u0.data[dof]-limited+Spatial::free_drive_force(u0,limited,K,qdd,rows,inertia,limit);
+            }
         }
+        if(decided!=(((held>>root)&1)?f.row_Kd.data[row]:all))MOVE(2<<root);
+        f.row_Kd.data[row]=decided;
     }
     SYNC();
 """
 """The drives' saturation decision (:func:`.spatial_laws.drive_step_force`), read from the trial solve just made, the
-step's: a drive past its limit becomes the constant ``+-limit`` with no ``K``, which asks its root for a new factor, and
-a drive within it takes back what its limit held off (:func:`.spatial_laws.free_drive_force`). The tree solves again in
-this launch, so a world with nothing to do pays its :data:`QUIET_DRIVE` tests and no launch, and a captured graph has
-nothing to skip. ``moved``: bit 0, a new solve; bit ``1 + r``, root ``r``'s new factor."""
+step's: a drive past its limit becomes the constant ``+-limit`` with no ``K``, and a drive within it takes back what its
+limit held off (:func:`.spatial_laws.free_drive_force`). Each drive's decided ``K`` goes to ``row_Kd``; a root whose
+decided set differs from the one its step factor holds asks for a new step factor. The tree solves again in this launch,
+so a world with nothing to do pays its :data:`QUIET_DRIVE` tests and no launch, and a captured graph has nothing to skip.
+``moved``: bit 0, a new solve; bit ``1 + r``, root ``r``'s step factor changes; bit ``8 + r``, root ``r`` holds a
+saturated drive. ``held``: bit ``r``, root ``r``'s step factor holds last step's decided set, which its trial did not
+read (:func:`_second_factor`)."""
 
 
-def _saturated_drive(layout: TreeLayout) -> str:
-    """Native expression of ``moved``'s bits for a saturated drive: a new solve and its root's new factor."""
-    return "(2<<plan.root_of.data[p.dof_joint.data[dof-ds]])|1" if layout.forest else "3"
+def _root(layout: TreeLayout) -> str:
+    """Native expression of the root of coordinate ``i``."""
+    return "plan.root_of.data[p.dof_joint.data[i]]" if layout.forest else "0"
+
+
+def _root_articulation(layout: TreeLayout, r: int) -> str:
+    """Native expression of root ``r``'s articulation."""
+    return f"plan.arts.data[group*{len(layout.roots)}+{r}]" if layout.forest else "art"
+
+
+def _driven_roots(layout: TreeLayout, response: str) -> list[int]:
+    """The roots a factor holds: every one but a prescribed root's (family 0)."""
+    if not layout.dofs:
+        return []
+    if response != "cholesky":
+        return [0]
+    return [r for r, family in enumerate(layout.root_families) if family != 0]
+
+
+def _held(layout: TreeLayout, response: str) -> str:
+    """Native statements of lane 0 that set ``held``'s bit ``r`` where root ``r``'s step factor holds a decided set this step:
+    one its articulation decided, and no refresh since (``mask``), which leaves every ``K`` in it and clears the record."""
+    return "".join(
+        f"{{const int a={_root_articulation(layout, r)};if(f.decided.data[a]){{if(f.mask.data[a])f.decided.data[a]=0;"
+        f"else held|={1 << r};}}}}"
+        for r in _driven_roots(layout, response)
+    )
+
+
+def _record(layout: TreeLayout, response: str) -> str:
+    """Native statement of lane 0 recording which roots' step factors now hold a decided set."""
+    return (
+        "if(lane==0){"
+        + "".join(
+            f"f.decided.data[{_root_articulation(layout, r)}]=(moved>>{8 + r})&1;"
+            for r in _driven_roots(layout, response)
+        )
+        + "}"
+    )
+
+
+def _copy_pattern(target: str, source: str) -> str:
+    """Native loop copying a dense factor's pattern entries from ``source`` to ``target`` (``plan`` and ``n`` in scope)."""
+    return (
+        "for(int entry=lane;entry<plan.entry_count;entry+=stride){"
+        f"const int e=plan.rows.data[entry]*n+plan.columns.data[entry];{target}[e]={source}[e];}}"
+    )
 
 
 def _second_factor(layout: TreeLayout, response: str) -> str:
-    """Native statements of a tree's second factors for the bits of ``moved``, from the geometry its refresh read: the texts
-    of the factor kernels, on the predictor's lanes. A working factor sits in the predictor's block after its scratch, past
+    """Native statements of a tree's step factors for the bits of ``moved``. A root whose decided set holds a saturated
+    drive refactors its step factor from the geometry its refresh read, with the texts of the factor kernels on the
+    predictor's lanes, after keeping every drive's ``K`` in its trial factor if the step factor held them; a root whose
+    set emptied takes its trial factor back. A working factor sits in the predictor's block after its scratch, past
     :data:`.response_builds_dense.STAGED_FACTOR_SIZE` in place in global memory, with a sparse ``L^-1`` in place; a compact
     diagonal's inverses are the division of ``held_tree._diagonal_geometry`` from the ``H_ii`` of its rows."""
-    drive_rows = "const auto& drive_row_by_dof=f.drive_row;const auto& row_K=f.row_K;const auto& row_H=f.row_H;"
+    drive_rows = "const auto& drive_row_by_dof=f.drive_row;const auto& row_K=f.row_Kd;const auto& row_H=f.row_H;"
     if response == "sparse":
         return (
             "if(moved&2) {\n"
+            "        float* inverse=d.W.data+group*$NNZ;float* const kept=d.W_trial.data+group*$NNZ;\n"
+            "        if(moved&256) {\n"
+            "        if(!(held&1))for(int entry=lane;entry<$NNZ;entry+=stride)kept[entry]=inverse[entry];\n"
             f"        {drive_rows}\n"
             "        const auto& indices=d.indices;const auto& status=d.status;const auto& geometric=cache.geometric;\n"
             "        const auto& R_group=d.armature;\n"
             "        const int start=ds;\n"
-            "        float* factor=s+$PRED_SCRATCH;float* inverse=d.W.data+group*$NNZ;\n"
+            "        float* factor=s+$PRED_SCRATCH;\n"
             + response_builds_rows.sparse_factor_body(layout.dofs, layout.entries)
             + "        SYNC();\n"
             "        if(status.data[group]!=0)for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=NAN;\n"
+            "        } else {\n"
+            "        for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=kept[entry];\n"
+            "        if(lane==0)d.status.data[group]=0;\n"
+            "        }\n"
             "        SYNC();\n"
             "    }\n"
         )
@@ -764,15 +841,17 @@ def _second_factor(layout: TreeLayout, response: str) -> str:
     for r, family in enumerate(families):
         if family == 0:
             continue
-        root_art = f"plan.arts.data[group*{roots}+{r}]" if layout.forest else "art"
         if family < 0:
             offset = layout.root_offsets[r]
             blocks.append(
                 f"if(moved&{2 << r}) {{\n"
                 f"        for(int i={offset}+lane;i<{offset - family};i+=stride) {{\n"
-                "            const int dof=ds+i,row=f.drive_row.data[dof];\n"
+                "            const int dof=ds+i;\n"
+                f"            if(!(moved&{256 << r})){{d.inverse.data[dof]=d.inverse_trial.data[dof];continue;}}\n"
+                f"            if(!(held&{1 << r}))d.inverse_trial.data[dof]=d.inverse.data[dof];\n"
+                "            const int row=f.drive_row.data[dof];\n"
                 "            if(row<0)continue;\n"
-                "            const float K=f.row_K.data[row],H=f.row_H.data[row];\n"
+                "            const float K=f.row_Kd.data[row],H=f.row_H.data[row];\n"
                 "            d.inverse.data[dof]=1.0f/(K>0.0f?H+K:H);\n"
                 "        }\n"
                 "        SYNC();\n"
@@ -782,21 +861,29 @@ def _second_factor(layout: TreeLayout, response: str) -> str:
         factor_group = f"d.factor_index.data[group*{roots}+{r}]" if layout.forest else "group"
         blocks.append(
             f"if(moved&{2 << r}) {{\n"
-            f"        const int root_art={root_art},factor_group={factor_group};\n"
+            f"        const int root_art={_root_articulation(layout, r)},factor_group={factor_group};\n"
             f"        const auto& plan=d.factor_plans.data[{r}];const auto& R_group=d.{root_field('armature', r)};\n"
             f"        {drive_rows}\n"
             "        const int n=plan.size,dof_start=p.art_dof_start.data[root_art];\n"
             "        const float* mass=cache.geometric.data+group*$NNZ;\n"
             f"        const auto& L_group=d.{root_field('lower', r)};\n"
+            "        float* const decided_factor=L_group.data+factor_group*n*n;\n"
+            f"        float* const kept=d.{root_field('trial', r)}.data+factor_group*n*n;\n"
+            f"        if(moved&{256 << r}) {{\n"
+            f"        if(!(held&{1 << r})){{{_copy_pattern('kept', 'decided_factor')}}}\n"
+            "        SYNC();\n"
             + (
                 "        float* L=s+$PRED_SCRATCH;\n"
                 + response_builds_dense.DENSE_FACTOR_BODY
                 + response_builds_dense.DENSE_FACTOR_PUBLISH
-                + "        SYNC();\n"
                 if family <= response_builds_dense.STAGED_FACTOR_SIZE
-                else "        float* L=L_group.data+factor_group*n*n;\n" + response_builds_dense.DENSE_FACTOR_BODY
+                else "        float* L=decided_factor;\n" + response_builds_dense.DENSE_FACTOR_BODY
             )
-            + "    }\n"
+            + "        } else {\n"
+            f"        {_copy_pattern('decided_factor', 'kept')}\n"
+            "        }\n"
+            "        SYNC();\n"
+            "    }\n"
         )
     return "\n".join(blocks)
 
@@ -1698,34 +1785,11 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
     return python_kernel(classify, name)
 
 
-@functools.cache
-def get_predictor_kernel(
-    schedules: HeldSchedules,
-    *,
-    layout: TreeLayout = REFERENCE_LAYOUT,
-    response="sparse",
-    clocked: bool = False,
-    twists: bool,
-):
-    """Apply current external/control force and both unchanged W actions.
-
-    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``clocked`` adds the
-    predictor stage counters (see :func:`get_helpers`);
-    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds.
-    """
-    reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
-    inverse = response_operator.SparseInverseFactor(
-        "d.W.data+group*$NNZ",
-        response_operator.IndexedSupport(
-            "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
-        ),
-    )
-    operations = {
-        "PHYSICAL_TABLE": layout.physical_table(),
-        "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
-        "SHIFT": cached_force.shift_wrench(
-            "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
-        ),
+def _solve_operations(layout: TreeLayout, response: str, *, trial: bool) -> tuple[str, dict[str, str]]:
+    """The operands of a predictor's solve (:data:`_SOLVE`) and the declarations they read: the trial's read each root's
+    trial factor while ``held`` says its step factor holds a decided set, the step's read the step factor."""
+    declarations = []
+    solve = {
         "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
         # Passive springs act on no root coordinate.
         "SPRING_GUARD": f"i>={layout.root_dofs if layout.free_root else 0}"
@@ -1733,35 +1797,37 @@ def get_predictor_kernel(
         else "plan.dof_passive.data[i]!=0",
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
-        "TRANSPORT_BLOCK": (
-            "if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {\n        "
-            + _FORCE.transport("ds", "f.vhat.data[ds+k]")
-            + "\n    }"
-            if not layout.forest
-            else "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
-            "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
-            + _FORCE.transport("rd", "f.vhat.data[rd+k]")
-            + "\n    }"
-        ),
-        "REDUCE": reduction,
-        "TRANSPOSE_ACTION": inverse.transpose("col", lambda index: f"s[$WHITE+{index}]"),
-        "RESPONSE_PHYSICAL": layout.physical("col"),
+        "STATUS": "d.status.data[group]",
     }
-    forward = inverse.forward("row", lambda index: f"s[$SIX_BODIES+{layout.physical(index)}]")
-    operations["FORWARD_STAGE"] = (
-        """for(int row=lane;row<$DOFS;row+=stride) {
+    if response == "sparse":
+        factor = "d.W.data+group*$NNZ"
+        if trial:
+            declarations.append("const float* const trial_W=((held&1)?d.W_trial.data:d.W.data)+group*$NNZ;")
+            factor = "trial_W"
+            # The trial factor is a valid all-K factor whenever it is read; the status is the step factor's.
+            solve["STATUS"] = "(held&1)?0:d.status.data[group]"
+        inverse = response_operator.SparseInverseFactor(
+            factor,
+            response_operator.IndexedSupport(
+                "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
+            ),
+        )
+        forward = inverse.forward("row", lambda index: f"s[$SIX_BODIES+{layout.physical(index)}]")
+        solve["FORWARD_STAGE"] = (
+            """for(int row=lane;row<$DOFS;row+=stride) {
         """
-        + forward
-        + """
+            + forward
+            + """
         s[$WHITE+row]=value;
     }
 #if defined(__CUDA_ARCH__)
     SYNC();
 #endif
 """
-    )
-    data_type = sparse_factor.SparseData
-    if response == "cholesky":
+        )
+        solve["TRANSPOSE_ACTION"] = inverse.transpose("col", lambda index: f"s[$WHITE+{index}]")
+        solve["RESPONSE_PHYSICAL"] = layout.physical("col")
+    elif response == "cholesky":
         # Held factor families applied in physical coordinates. On CUDA every
         # family of at most one warp of coordinates is solved lane-parallel
         # (one lane per row, one shuffle per step); larger families and the
@@ -1770,28 +1836,42 @@ def get_predictor_kernel(
         # its stored inverse.
         roots = len(layout.roots)
         if not layout.forest:
-            families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
+            families = [(0, 0, layout.dofs, "d.lower", "d.trial", "group", layout.dofs)]
         else:
             families = []
             for r, (offset, family) in enumerate(zip(layout.root_offsets, layout.root_families, strict=True)):
-                lower = "d.lower" if r == 0 else f"d.lower{r}"
-                pointer = f"{lower}.data+d.factor_index.data[group*{roots}+{r}]*{family * family}"
-                families.append((offset, family, pointer, layout.root_coordinates[r] if family == 0 else abs(family)))
+                index = f"d.factor_index.data[group*{roots}+{r}]"
+                width = layout.root_coordinates[r] if family == 0 else abs(family)
+                families.append(
+                    (r, offset, family, f"d.{root_field('lower', r)}", f"d.{root_field('trial', r)}", index, width)
+                )
         serial, parallel = [], []
-        for offset, family, pointer, width in families:
+        for r, offset, family, lower, kept, index, width in families:
             if family == 0:
                 serial.append(f"if(lane==0){{for(int k=0;k<{width};++k)s[$WHITE+{offset}+k]=0.0f;}}")
                 parallel.append(f"if(lane<{width})s[$WHITE+{offset}+lane]=0.0f;")
                 continue
             if family < 0:
+                inverse = "d.inverse.data"
+                if trial:
+                    declarations.append(
+                        f"const float* const trial_inverse{r}=(held&{1 << r})?d.inverse_trial.data:d.inverse.data;"
+                    )
+                    inverse = f"trial_inverse{r}"
                 serial.append(
                     f"if(lane==0){{for(int k=0;k<{width};++k)"
-                    f"s[$WHITE+{offset}+k]=d.inverse.data[ds+{offset}+k]*s[$SIX_BODIES+{offset}+k];}}"
+                    f"s[$WHITE+{offset}+k]={inverse}[ds+{offset}+k]*s[$SIX_BODIES+{offset}+k];}}"
                 )
                 parallel.append(
-                    f"if(lane<{width})s[$WHITE+{offset}+lane]=d.inverse.data[ds+{offset}+lane]*s[$SIX_BODIES+{offset}+lane];"
+                    f"if(lane<{width})s[$WHITE+{offset}+lane]={inverse}[ds+{offset}+lane]*s[$SIX_BODIES+{offset}+lane];"
                 )
                 continue
+            pointer = f"{lower}.data+{index}*{family * family}"
+            if trial:
+                declarations.append(
+                    f"const float* const trial_L{r}=((held&{1 << r})?{kept}.data:{lower}.data)+{index}*{family * family};"
+                )
+                pointer = f"trial_L{r}"
             held = response_operator.CholeskySolve(family, pointer)
 
             def white(index, o=offset):
@@ -1811,54 +1891,87 @@ def get_predictor_kernel(
                 )
             else:
                 parallel.append(serial[-1])
-        operations["FORWARD_STAGE"] = (
+        solve["FORWARD_STAGE"] = (
             "#if defined(__CUDA_ARCH__)\n"
             + "\n".join(parallel)
             + "\n#else\n"
             + "\n".join(serial)
             + "\n#endif\n#if defined(__CUDA_ARCH__)\nSYNC();\n#endif\n"
         )
-        operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
-        operations["RESPONSE_PHYSICAL"] = "col"
-        data_type = HeldResponse
-    elif response == "diagonal":
-        operations["FORWARD_STAGE"] = ""
-        operations["TRANSPOSE_ACTION"] = "float value=d.inverse.data[ds+col]*s[$SIX_BODIES+col];"
-        operations["RESPONSE_PHYSICAL"] = "col"
-        data_type = HeldResponse
-    elif response != "sparse":
+        solve["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
+        solve["RESPONSE_PHYSICAL"] = "col"
+    else:
+        inverse = "d.inverse.data"
+        if trial:
+            declarations.append("const float* const trial_inverse0=(held&1)?d.inverse_trial.data:d.inverse.data;")
+            inverse = "trial_inverse0"
+        solve["FORWARD_STAGE"] = ""
+        solve["TRANSPOSE_ACTION"] = f"float value={inverse}[ds+col]*s[$SIX_BODIES+col];"
+        solve["RESPONSE_PHYSICAL"] = "col"
+    return "\n    ".join(declarations), {name: substitute(text, layout.sizes()) for name, text in solve.items()}
+
+
+@functools.cache
+def get_predictor_kernel(
+    schedules: HeldSchedules,
+    *,
+    layout: TreeLayout = REFERENCE_LAYOUT,
+    response="sparse",
+    clocked: bool = False,
+    twists: bool,
+):
+    """Apply current external/control force and both unchanged W actions.
+
+    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``clocked`` adds the
+    predictor stage counters (see :func:`get_helpers`);
+    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds.
+    """
+    reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
+    operations = {
+        "PHYSICAL_TABLE": layout.physical_table(),
+        "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
+        "SHIFT": cached_force.shift_wrench(
+            "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
+        ),
+        "TRANSPORT_BLOCK": (
+            "if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {\n        "
+            + _FORCE.transport("ds", "f.vhat.data[ds+k]")
+            + "\n    }"
+            if not layout.forest
+            else "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
+            "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
+            + _FORCE.transport("rd", "f.vhat.data[rd+k]")
+            + "\n    }"
+        ),
+        "REDUCE": reduction,
+    }
+    if response not in ("sparse", "cholesky", "diagonal"):
         raise ValueError("Unknown held tree response representation")
+    data_type = sparse_factor.SparseData if response == "sparse" else HeldResponse
     operations["TWIST_BLOCK"] = _twist_block() if twists else ""
     words = str(predict_words(layout, response))
     clocks = _native_clocks(clocked, "f", stages=5, column=8)
-    solve_operands = (
-        "PROJECT",
-        "SPRING_GUARD",
-        "PASSIVE",
-        "FORWARD_STAGE",
-        "TRANSPOSE_ACTION",
-        "RESPONSE_PHYSICAL",
-        "VELOCITY",
-    )
-    solve_operations = {name: substitute(operations.pop(name), layout.sizes()) for name in solve_operands}
+    trial_factors, trial_solve = _solve_operations(layout, response, trial=True)
+    _, step_solve = _solve_operations(layout, response, trial=False)
     source = layout.native(
         _PREDICT,
         preludes=SPATIAL.preludes(),
         SCRATCH=_placed_block(layout, "s", words),
         PREDICT_WORDS=words,
+        HELD=_held(layout, response),
+        TRIAL_FACTORS=substitute(trial_factors, layout.sizes()),
         TRIAL=substitute(
             _SOLVE,
             layout.sizes(),
-            **solve_operations,
+            **trial_solve,
             START_FORWARD=clocks["CLOCK2"],
             START_RESPONSE=clocks["CLOCK3"],
             DECIDE=QUIET_DRIVE,
         ),
-        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), SATURATED=_saturated_drive(layout)),
+        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
         SECOND_FACTOR=_second_factor(layout, response),
-        SECOND_SOLVE=substitute(
-            _SOLVE, layout.sizes(), **solve_operations, START_FORWARD="", START_RESPONSE="", DECIDE=""
-        ),
+        SECOND_SOLVE=substitute(_SOLVE, layout.sizes(), **step_solve, START_FORWARD="", START_RESPONSE="", DECIDE=""),
+        RECORD=_record(layout, response),
         **operations,
         **{name: text for name, text in clocks.items() if name not in ("CLOCK2", "CLOCK3")},
     )
