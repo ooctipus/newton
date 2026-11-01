@@ -30,8 +30,9 @@ import warp as wp
 
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
-from . import field_group, host_index, prefix_rows, response_builds_rows
+from . import field_group, host_index, prefix_rows, response_builds_rows, walk_rows
 from .configuration import Options
+from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .contact_input import bind_routes as bind_contact_routes
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
@@ -148,11 +149,16 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
     """Build the general route's joint-limit rows, one warp per articulation (:func:`.prefix_rows.prefix_rows`)."""
     # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficient), or the size
     # group's row (cleared each step).
-    sink = f"""            float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
-            if (support.packed != 0) {{
-                for (int e = 0; e < {size}; ++e) J_side[e] = 0.0f;
-            }}
-            J_side[d0] = w0;"""
+    sink = f"""            if (support.walks != 0) {{
+                // The one writer walks the row (walk_rows): its unit source, the coordinate's side.
+                support.units.data[at] = (2 << 28) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
+            }} else {{
+                float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
+                if (support.packed != 0) {{
+                    for (int e = 0; e < {size}; ++e) J_side[e] = 0.0f;
+                }}
+                J_side[d0] = w0;
+            }}"""
     rows = prefix_rows.prefix_rows(
         ((prefix_rows.limits(tuple(range(size)), "first_dof + d", "law."),),),
         law="law.",
@@ -1001,7 +1007,16 @@ class RowLaws:
             # The class's case names the producer that writes every contact row (contact_row_plan):
             # get_path_selection() records the same plan (routes.contact_rows).
             plan = contact_row_plan(solver)
-            if plan.producer == "local_packets":
+            if plan.producer == "walk":
+                pool.launch(
+                    walk_rows.write_contact_units,
+                    contact_build_threads * 4,
+                    inputs=[contact_input, contact_build_threads * 4, law, solver.placement.unit_source],
+                    extent=count,
+                    scale=4,
+                    clamp=True,
+                )
+            elif plan.producer == "local_packets":
                 solver.placement.row_packets.produce_contacts(contact_input)
             elif plan.producer == "keyed_rows":
                 solver.placement.keyed_rows.produce_contacts(contact_input)
@@ -1341,6 +1356,7 @@ class RowLaws:
             solver.placement.sparse_prepare_contacts
             or solver.placement.row_packets is not None
             or solver.placement.keyed_rows is not None
+            or solver.placement.walks
         ):
             return  # These rows write their own right-hand sides.
         # A world's lanes: its capacity, up to a block.
@@ -1362,6 +1378,52 @@ class RowLaws:
                 int(solver.options.contact_compliance),
             ],
             device=solver.model.device,
+        )
+
+    def write_walked(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+        """The general placement's one writer (:func:`.walk_rows.write_walked_rows`): every dense row's seed walked
+        into the packed rows, its diagonal, incident velocity and rhs, once the predictor's twists are known."""
+        placement, factor, model = solver.placement, solver.factor, solver.model
+        factor.walk_frames()
+        factor.twists(solver.v_hat)
+        # Without contacts no row is a contact's: the writer reads no contact input.
+        contact_input = (
+            bind_contact_input(solver, state_in, factor, contacts, dt, 1.0) if contacts is not None else ContactInput()
+        )
+        mimics = self.mimic_count > 0
+        links = self.link_count > 0
+        dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
+        lanes = min(placement.dense_max_constraints, BIAS_LANES)
+        wp.launch(
+            walk_rows.write_walked_rows,
+            dim=(solver.forest.world_count, lanes),
+            inputs=[
+                bind_dense_rows(placement),
+                placement.row_support(),
+                placement.constraint_count,
+                lanes,
+                contact_input,
+                patch_row_law(solver),
+                factor.walk_view(),
+                solver.forest.body_to_articulation,
+                self._mimic_dof0 if mimics else dummy_int,
+                self._mimic_dof1 if mimics else dummy_int,
+                model.constraint_mimic_coef1 if mimics else dummy_float,
+                self._link_primary if links else dummy_int,
+                self._link_shadow if links else dummy_int,
+                self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
+                state_in.body_q,
+                model.body_com,
+                solver.v_hat,
+                dt,
+                solver.options.contact_speculative_scale,
+                self.contact_w,
+                self.effective_restitution_velocity_threshold,
+                int(self.set.weighted),
+                int(solver.options.contact_compliance),
+            ],
+            outputs=[placement.packed_Z, placement.row_incident],
+            device=model.device,
         )
 
     def _build_friction_patches(self, solver, state_in, contacts):

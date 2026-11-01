@@ -176,6 +176,7 @@ def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
         "sparse_diagonal_contact_triples": False,
         "sparse_diagonal_contact_units": False,
         "sparse_contact_response_kernel": None,
+        "walks": False,
     }
     for name, value in attributes.items():
         (placement if name in placement else values)[name] = value
@@ -404,13 +405,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["free_rigid_bodies"]["owners"], ["matrix_free_rows"])
         # The arm's revolute root is a joint root: the arm and the free box form one mixed held group.
         self.assertEqual(routes["held_tree"]["owner"], "mixed")
-        self.assertEqual(routes["contact_rows"]["producer"], "general")
-        method = "masked_combined"
-        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
-        # Every size names its builder and the law it writes; one masked launch pair builds both sizes.
+        self.assertEqual(routes["contact_rows"]["producer"], "walk")
+        self.assertIsNone(routes["contact_rows"]["general_method_by_dof"])
+        # Every size names its builder and the law it writes; the one writer builds both sizes.
         self.assertEqual(routes["contact_rows"]["law"], "patch")
-        masked = {"method": method, "kernels": ["contact_row_prelude", "populate_world_J_masked"], "law": "patch"}
-        self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": masked, "1": masked})
+        walked = {"method": "walk", "kernels": ["write_contact_units", "write_walked_rows"], "law": "patch"}
+        self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": walked, "1": walked})
         self.assertFalse(routes["contact_rows"]["row_packets"]["enabled"])
         # The packet producer implements patch friction; its laws need the joint-limit rows this model lacks.
         self.assertIn("Local packets need joint-limit rows", routes["contact_rows"]["row_packets"]["reason"])
@@ -454,14 +454,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(friction["law"], "patch")
         # The resolved-world classifier serves patch friction.
         self.assertNotIn("resolved-world classifier", friction["reason"])
-        # The general builder's masked rows take the patch row law.
-        method = "masked_combined"
-        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
-        kernels = ["contact_row_prelude", "populate_world_J_masked"]
-        builder = {"method": method, "kernels": kernels, "law": "patch"}
+        # The general placement's one writer takes the patch row law (its records by write_contact_row).
+        self.assertIsNone(routes["contact_rows"]["general_method_by_dof"])
+        kernels = ["write_contact_units", "write_walked_rows"]
+        builder = {"method": "walk", "kernels": kernels, "law": "patch"}
         self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
-        # Contact torsion keeps ordinary factors and serial sweeps; its rows take the masked builder, as the
-        # solver's without torsion do.
+        # Contact torsion keeps ordinary factors and serial sweeps; its rows take the one writer, as the solver's
+        # without torsion do.
         for flags in ({},):
             with self.subTest(torsion=True, **flags), patch.dict(os.environ, flags):
                 routes = SolverFeatherPGS(model, contact_torsion=True).get_path_selection()["routes"]
@@ -489,8 +488,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 keys = _launched_kernel_keys(model, solver)
                 # The general row sweeps every iteration of a world's dense and free-body rows in one launch.
                 self.assertEqual([key for key in keys if key.startswith("sweep_")], [sweep["mf_gs"]])
-                methods = routes["contact_rows"]["general_method_by_dof"]
-                self.assertEqual(keys.count("populate_world_J_for_size"), list(methods.values()).count("per_contact"))
+                # The general placement's one writer: no Jacobian builder launches.
+                self.assertEqual(routes["contact_rows"]["producer"], "walk")
+                self.assertEqual(keys.count("populate_world_J_for_size"), 0)
                 assert_row_builders_named(self, routes["contact_rows"], keys)
 
     def test_cpu_record_names_every_launched_row_builder(self):
@@ -501,25 +501,27 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         CPU stand-ins.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
-        pair = ("6", "1")
         cases = (
-            # (model, friction_anchor_beta, methods by size)
-            (mixed, None, dict.fromkeys(pair, "masked_combined")),
-            (mixed, 0.0, dict.fromkeys(pair, "masked_combined")),
-            (three, None, dict.fromkeys(("6", "2", "1"), "masked")),
-            (three, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
-            (wide, None, {"34": "per_contact", "6": "masked_combined"}),
-            (wide, 0.0, {"34": "per_contact", "6": "masked_combined"}),
+            # (model, friction_anchor_beta, sizes): the general placement's one writer takes every size.
+            (mixed, None, ("6", "1")),
+            (mixed, 0.0, ("6", "1")),
+            (three, None, ("6", "2", "1")),
+            (three, 0.0, ("6", "2", "1")),
+            (wide, None, ("34", "6")),
+            (wide, 0.0, ("34", "6")),
         )
-        for model, beta, methods in cases:
+        for model, beta, sizes in cases:
             law = "patch" if beta is None else "point"
-            with self.subTest(sizes=list(methods), law=law):
+            with self.subTest(sizes=list(sizes), law=law):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 record = solver.get_path_selection()["routes"]["contact_rows"]
                 keys = _launched_kernel_keys(model, solver)
-                self.assertEqual((record["producer"], record["law"]), ("general", law))
-                self.assertEqual({size: entry["method"] for size, entry in record["builder_by_dof"].items()}, methods)
-                self.assertEqual(record["general_method_by_dof"], methods)
+                self.assertEqual((record["producer"], record["law"]), ("walk", law))
+                self.assertEqual(
+                    {size: entry["method"] for size, entry in record["builder_by_dof"].items()},
+                    dict.fromkeys(sizes, "walk"),
+                )
+                self.assertIsNone(record["general_method_by_dof"])
                 assert_row_builders_named(self, record, keys)
         model = standing_model(device="cpu", worlds=2)
         for law, beta in (("patch", 0.2), ("point", 0.0)):
@@ -625,6 +627,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     "compact_jacobian",
                     same((6, 1), "compact_jacobian", [prepare, compact]),
                 ),
+                ({"walks": True}, (6, 1), "walk", same((6, 1), "walk", ["write_contact_units", "write_walked_rows"])),
                 ({}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked)),
                 ({}, (34, 6), "general", {34: ("per_contact", per_contact), 6: ("masked_combined", masked)}),
             )
@@ -649,56 +652,41 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_row_builder_check_rejects_wrong_order_and_counts(self):
         """Fail the launch check for a record that names the launched kernels in the wrong order or count.
 
-        Three sizes take the masked builder's per-size method, one prelude and one Jacobian launch each.
-        A record that lists one size's kernels in reverse, or names one size's launch as part of a combined
-        launch, still names the launched set, and the check must reject it.
+        Three sizes take the one writer: its unit launch, then the writer, once a step for every size. A record
+        that lists the kernels in reverse, or names them as per-size launches, still names the launched set, and
+        the check must reject it.
         """
         model = _resting_arms_and_box(1, 2)
         solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
         record = solver.get_path_selection()["routes"]["contact_rows"]
         keys = _launched_kernel_keys(model, solver)
-        self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"masked"})
+        self.assertEqual({entry["method"] for entry in record["builder_by_dof"].values()}, {"walk"})
         assert_row_builders_named(self, record, keys)
         reversed_order = copy.deepcopy(record)
         reversed_order["builder_by_dof"]["2"]["kernels"].reverse()
-        combined = copy.deepcopy(record)
-        combined["builder_by_dof"]["2"]["method"] = "masked_combined"
-        for name, wrong in (("order", reversed_order), ("count", combined)):
+        per_size = copy.deepcopy(record)
+        for entry in per_size["builder_by_dof"].values():
+            entry["method"] = "masked"
+        for name, wrong in (("order", reversed_order), ("count", per_size)):
             with self.subTest(name), self.assertRaises(AssertionError):
                 assert_row_builders_named(self, wrong, keys)
 
     def test_cpu_row_build_dispatches_on_the_recorded_plan(self):
         """Record and launch the builders of one plan: the row build and the record call the same function.
 
-        Both modules bind one contact_row_plan. A plan that names per-contact rows where the data selects
-        combined masked rows, substituted in both, makes the record name the per-contact builder and the row
-        build launch it, so neither can follow a decision of its own.
+        Both modules bind one contact_row_plan: the general placement's plan names the one writer, the row build
+        launches it, and the record names exactly what launched.
         """
         self.assertIs(path_selection.contact_row_plan, rows.contact_row_plan)
         model = _cpu_free_body_model()
-        plan_rows = rows.contact_row_plan
-
-        def per_contact(solver):
-            plan = plan_rows(solver)
-            return dataclasses.replace(plan, methods=dict.fromkeys(plan.methods, "per_contact"), combined=())
-
         solver = SolverFeatherPGS(model)
         record = solver.get_path_selection()["routes"]["contact_rows"]
-        masked = _launched_kernel_keys(model, solver)
-        with (
-            patch.object(rows, "contact_row_plan", per_contact),
-            patch.object(path_selection, "contact_row_plan", per_contact),
-        ):
-            forced_record = solver.get_path_selection()["routes"]["contact_rows"]
-            forced = _launched_kernel_keys(model, solver)
-        self.assertEqual(record["general_method_by_dof"], {"6": "masked_combined", "1": "masked_combined"})
-        self.assertEqual(forced_record["general_method_by_dof"], {"6": "per_contact", "1": "per_contact"})
-        assert_row_builders_named(self, record, masked)
-        assert_row_builders_named(self, forced_record, forced)
-        builders = ("contact_row_prelude", "populate_world_J_masked", "populate_world_J_for_size")
-        # One combined masked launch for both sizes, then one per-contact launch per size.
-        self.assertEqual([key for key in masked if key in builders], list(builders[:2]))
-        self.assertEqual([key for key in forced if key in builders], [builders[2]] * 2)
+        launched = _launched_kernel_keys(model, solver)
+        self.assertEqual(record["producer"], "walk")
+        assert_row_builders_named(self, record, launched)
+        builders = ("write_contact_units", "write_walked_rows", "contact_row_prelude", "populate_world_J_for_size")
+        # One unit launch for every size, then the writer; no Jacobian builder.
+        self.assertEqual([key for key in launched if key in builders], list(builders[:2]))
 
     def test_cpu_route_reports_free_body_velocity_limit_rows(self):
         """Report free-body velocity-limit rows on the CPU, where the row builder allocates them as well."""

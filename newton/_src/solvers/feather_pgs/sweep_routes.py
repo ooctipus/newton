@@ -23,6 +23,7 @@ from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, FreeBodyZ, Lanes, SparseFactor, Velocity
+from .row_inputs import RowArgument
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, QUIET_LITERAL, SolvePolicy, block_argmax, sweep_exit
 from .staging import Buffer, Staging, arch_budget
@@ -48,6 +49,7 @@ from .sweep import (
     speed_rows_pass,
     velocity_limit_pass,
 )
+from .tree_factor import FRAME_SLIPS, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_paths_prelude
 
 # The row loops leave the velocity-limit rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {VELOCITY_LIMIT}) continue;"
@@ -144,10 +146,41 @@ class FactorCoordinates:
     }}
 }}"""
 
-    def leave_all(self, dofs: int, thread: str, threads: str, sync: str) -> str:
-        """Every marked articulation leaves factor coordinates in place, a thread per bitmap word."""
+    def leave_all(self, dofs: int, thread: str, threads: str, sync: str, *, walk: bool = False) -> str:
+        """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
+        general placement's one writer, :mod:`.walk_rows`) a tree leaves by the walk down (``WALK_DOWN`` of
+        :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch), its rows' frame; a free rigid body
+        keeps its 6x6 factor."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
+        walked = ""
+        if walk:
+            walked = f"""        if (walk.free.data[art] == 0) {{
+            const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+            const int slips = walk.slips.data[art];
+            if (slips > 0) {{
+                // The slips' frame: du <- F^T du = du + Bh (Ln - I) Bh^T du (tree_factor.walk_frame_kernel).
+                const int width = walk.basis.shape[2], cap = walk.scale.shape[2];
+                const float* basis = walk.basis.data + (size_t)art * walk.basis.shape[1] * width;
+                const float* scale = walk.scale.data + (size_t)art * walk.scale.shape[1] * cap;
+                float y[{FRAME_SLIPS}];
+                for (int j = 0; j < slips; ++j) {{
+                    float acc = 0.0f;
+                    for (int c = 0; c < size; ++c) acc += basis[j * width + c] * s_v[d + c];
+                    y[j] = acc;
+                }}
+                for (int j = 0; j < slips; ++j) {{
+                    float shift = -y[j];
+                    for (int k = 0; k <= j; ++k) shift += scale[j * cap + k] * y[k];
+                    for (int c = 0; c < size; ++c) s_v[d + c] += shift * basis[j * width + c];
+                }}
+            }}
+            WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, size);
+            WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},
+                      &s_v[d], &s_v[d], reinterpret_cast<float*>(walk.scratch.data + j0));
+            continue;
+        }}
+"""
         return f"""for (int w = {thread}; w < {self.words(dofs)}; w += {threads}) {{
     unsigned bits = s_factor_marks[w];
     while (bits != 0u) {{
@@ -155,7 +188,7 @@ class FactorCoordinates:
         bits &= bits - 1u;
         const int art = {factors}.first_art.data[world_dof_indices.data[dof_map_base + d]];
         const int size = {factors}.size.data[art];
-        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
+{walked}        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
         if (size == 6) {{
 {indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
         }} else {{
@@ -610,6 +643,7 @@ def mf_gs_source(
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
+    walk: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -826,7 +860,7 @@ def mf_gs_source(
 {end_first_warp}{sweep_vote}{sweep_end}    }}
 
     {barrier}
-{indent(bodies.leave_all(D, thread, threads, sync), "    ")}
+{indent(bodies.leave_all(D, thread, threads, sync, walk=walk), "    ")}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] += s_v[d];
@@ -845,6 +879,7 @@ def mf_gs_source(
         PACKED_SIDES,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if contact_torsion else ())),
         *solve_policy.preludes,
+        *((walk_paths_prelude(1),) if walk else ()),
     )
     if lanes == 1:
         return dual_native(body, preludes=(*preludes, CPU_MATH)), staging
@@ -875,6 +910,7 @@ def mf_gs_kernel(
     material: bool = False,
     seeded: bool = False,
     wide_rows: bool = False,
+    walk: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -902,6 +938,7 @@ def mf_gs_kernel(
         material=material,
         seeded=seeded,
         wide_rows=wide_rows,
+        walk=walk,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -921,6 +958,7 @@ def mf_gs_kernel(
         + ("_material" if material else "")
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")
+        + ("_walk" if walk else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(
@@ -928,7 +966,11 @@ def mf_gs_kernel(
         COLORED_ABI if colored else COLORED_WORLDS_ABI if colored_worlds else MF_GS_ABI,
         snippet,
         kernel_template.WORLD_QUEUE,
-        extra=(*material_arguments(material), *solve_policy.arguments),
+        extra=(
+            *material_arguments(material),
+            *solve_policy.arguments,
+            *((RowArgument("walk", WalkTrees, after="factors"),) if walk else ()),
+        ),
         composed=True,
         native_name="sweep_mf_colored_native" if colored else "sweep_mf_gs_native",
         launch_bounds=(COLORED_THREADS, 1) if colored else None,

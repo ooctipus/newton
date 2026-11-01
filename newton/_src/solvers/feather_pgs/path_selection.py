@@ -352,7 +352,12 @@ def _row_builder(solver, plan, size, source) -> dict:
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
     prepare = (source.prepare_world_contact_rows,) if plan.metadata_launch else ()
-    if method == "local_packets":
+    if method == "walk":
+        from . import walk_rows  # noqa: PLC0415 - the one writer's module
+
+        # The row pass writes the records and unit sources; the one writer walks every row (walk_rows).
+        kernels = (walk_rows.write_contact_units, walk_rows.write_walked_rows)
+    elif method == "local_packets":
         from . import row_packets  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         kernels = (row_packets.produce_contacts, row_packets.materialize_fallback)

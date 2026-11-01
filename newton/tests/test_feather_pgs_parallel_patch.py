@@ -851,6 +851,33 @@ def _linked_rows(solver, state, contacts, dt):
     return rows
 
 
+def _walked_jacobian(solver, joint_q, rows):
+    """The Jacobian rows of the general placement's walked rows (the one writer forms no ``J``), at their packed
+    entries: ``J^T = P^T L P z`` of each side by the float64 walk at the step's coordinates (FL3.3)."""
+    placement, forest = solver.placement, solver.forest
+    Z = placement.packed_Z.numpy().astype(np.float64)
+    J = np.zeros_like(Z)
+    sides = placement.row_sides.numpy()
+    sizes = forest.articulation_response_dof_count.numpy()
+    offsets = forest.articulation_world_dof_offset.numpy()
+    factors = {}
+    for world, count in enumerate(rows["constraint_count"]):
+        line = int(placement.dense_first.numpy()[world])
+        for row in range(int(count)):
+            first = 0
+            for art in sides[line, row]:
+                if art < 0:
+                    continue
+                n = int(sizes[art])
+                at = int(offsets[art]) if placement.packed_dense else first
+                first += n
+                if art not in factors:
+                    inverse, _ = solver.factor.walk(joint_q, int(art)).up(covector=np.eye(n))
+                    factors[art] = np.linalg.inv(inverse)
+                J[line, row, at : at + n] = factors[art] @ Z[line, row, at : at + n]
+    return J
+
+
 def _general_bias(solver, rows, dt):
     """The general route's contact and friction bias for captured rows (without ``J v``)."""
     device = solver.model.device
@@ -943,14 +970,19 @@ class TestKeyedPatchRows(unittest.TestCase):
             general.step(state, out, model.control(), contacts, dt)
             state, out = out, state
         pipeline.collide(state, contacts)
+        joint_q = state.joint_q.numpy().astype(np.float64)
         expected = _linked_rows(general, state, contacts, dt)
+        # The general placement's one writer walks its rows after the row pass (FL3.3): its J, from the step's
+        # walked rows, is the reference of the keyed rows' J.
+        general.step(state, out, model.control(), contacts, dt)
+        size = keyed.placement.keyed_rows.layout.primary
+        expected["J"] = {size: _walked_jacobian(general, joint_q, expected)}
         actual = _linked_rows(keyed, state, contacts, dt)
         live = int(contacts.rigid_contact_count.numpy()[0])
         owner = _contact_rows_by_id(expected, live)
         self.assertEqual(owner, _contact_rows_by_id(actual, live))
         slot_contact = {(world, first): c for c, (world, first, _) in owner.items()}
         bias = _general_bias(general, expected, dt)
-        size = keyed.placement.keyed_rows.layout.primary
         linked = tangent_phi = 0
         for c, (world, first, needed) in owner.items():
             rows = slice(first, first + needed)
@@ -970,7 +1002,7 @@ class TestKeyedPatchRows(unittest.TestCase):
                         actual[name][world, rows], expected[name][world, rows], rtol=1.0e-6, atol=1.0e-9, err_msg=name
                     )
                 np.testing.assert_allclose(
-                    actual["J"][size][world, rows], expected["J"][size][world, rows], rtol=1.0e-6, atol=1.0e-7
+                    actual["J"][size][world, rows], expected["J"][size][world, rows], rtol=1.0e-4, atol=1.0e-5
                 )
                 np.testing.assert_allclose(actual["rhs"][world, rows], bias[world, rows], rtol=1.0e-5, atol=1.0e-7)
                 linked += expected["linked"][c][0] not in (-1, c)

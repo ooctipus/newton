@@ -212,22 +212,19 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
 
-    def test_point_and_patch_friction_take_the_masked_builder(self):
-        """Build a size of at most 32 DOFs with the masked builder under explicit point friction and patch friction.
-
-        Patch friction takes the masked builder's patch-law variant. The row build
-        dispatches on contact_row_plan.
-        """
-        with wp.ScopedDevice("cpu"):  # the general builder; CUDA admits other producers first
+    def test_point_and_patch_friction_take_the_one_writer(self):
+        """The general placement's contact rows, under explicit point friction and patch friction, are the one writer's
+        (:mod:`.walk_rows`): the row build dispatches on contact_row_plan, which names it for every size."""
+        with wp.ScopedDevice("cpu"):  # the general placement; CUDA admits other producers first
             model = _build_chain_model(num_links=12, num_worlds=1)
         for beta, point in ((None, False), (0.0, True)):
             with self.subTest(beta=beta):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 self.assertEqual(solver.laws.set.point, point)
                 plan = contact_row_plan(solver)
-                self.assertEqual(plan.producer, "general")
-                self.assertEqual(plan.methods, {12: "masked_combined"})
-                self.assertEqual(plan.combined, (12,))
+                self.assertEqual(plan.producer, "walk")
+                self.assertEqual(plan.methods, {12: "walk"})
+                self.assertEqual(plan.combined, ())
 
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()

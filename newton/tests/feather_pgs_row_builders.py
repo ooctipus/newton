@@ -26,6 +26,8 @@ from newton._src.solvers.feather_pgs import keyed_rows
 # new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
+        "write_contact_units",
+        "write_walked_rows",
         "populate_world_J_for_size",
         "contact_row_prelude",
         "populate_world_J_masked",
@@ -83,6 +85,8 @@ def install_cpu_keyed_rows(solver):
     )
     solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
     solver.placement.ink_rows = 4
+    # Case K4's rows: the producers store J for the in-kernel whitening, not the general placement's unit sources.
+    solver.placement.walks = False
     solver.routes.case = "K4"
     solver.routes.row = dataclasses.replace(solver.routes.row, case="K4", producer="keyed_rows")
     solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)

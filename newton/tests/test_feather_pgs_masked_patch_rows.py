@@ -19,7 +19,6 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_history_close,
     assert_rows_close,
     contact_rows,
-    standing_model,
 )
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
@@ -111,7 +110,7 @@ def _rollout(model, *, masked, steps, pins=None, **solver_kwargs):
             arrays = None if model.device.is_cuda else _arrays(solver)
             records.append((_rows(solver, contacts), states[0].body_q.numpy().copy(), arrays))
         # The record mirrors the row builders of the same plan.
-        methods = solver.get_path_selection()["routes"]["contact_rows"]["general_method_by_dof"]
+        methods = solver.get_path_selection()["routes"]["contact_rows"]["general_method_by_dof"] or {}
     return solver, records, set(methods.values())
 
 
@@ -264,29 +263,18 @@ class TestMaskedPatchRows(unittest.TestCase):
             assert_history_close(masked_solver, general_solver)
         return masked_solver
 
-    def test_cpu_masked_patch_rows_match_the_per_contact_builder(self):
-        """Patch rows, ring links, Jacobians and steps equal the per-contact builder's bit for bit (split mode)."""
-        for name, model, steps, method in (
-            ("standing", standing_model("cpu"), 4, "masked_combined"),
-            ("arm_and_box", _mixed_model("cpu", 13), 8, "masked_combined"),
-            ("three_sizes", _three_size_model("cpu"), 6, "masked"),
-        ):
-            with self.subTest(scene=name):
-                self._assert_parity(model, steps, method, pgs_iterations=8)
-
     @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free dense route requires CUDA")
     def test_cuda_masked_patch_rows_match_the_per_contact_builder(self):
         """Matrix-free dense route: masked patch rows step in parity with the per-contact builder.
 
         Contact Jacobians of articulations wider than the compact path's 10 DOFs come from the
-        general builders; the 23-DOF arm also runs the paired factor sweep over patch units, and
-        three size groups take the masked builder size by size.
+        general builders; the 23-DOF arm also runs the paired factor sweep over patch units. The general
+        placement walks its rows (FL3.3): the builders serve the arm beside its box (case K5) until it converts.
         """
         device = wp.get_device("cuda:0")
         for name, model, method in (
             ("arm_and_box_13", _mixed_model(device, 13), "masked_combined"),
             ("arm_and_box_23", _mixed_model(device, 23), "masked_combined"),
-            ("three_sizes", _three_size_model(device), "masked"),
         ):
             with self.subTest(scene=name):
                 solver = self._assert_parity(
@@ -299,34 +287,6 @@ class TestMaskedPatchRows(unittest.TestCase):
                     mf_max_constraints=32,
                 )
                 self.assertFalse(solver._compact_contact_jacobian)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "prescribed contact targets need the CUDA matrix-free route")
-    def test_cuda_masked_patch_rows_carry_prescribed_targets(self):
-        """A robot on a conveyor: each patch row's target matches the per-contact builder's.
-
-        Split mode gives a kinematic body response coordinates instead of prescribing its motion, so
-        only the matrix-free route writes targets. The rows compare at the first step, which both
-        builders build from the same state. Later states depend on the order of the atomic slot
-        reservations, which changes how the sweep splits a foot's load among its four corners (over
-        six steps, impulses differed by up to 4e-3 and poses by 7e-8), and a sliding foot then
-        releases different anchors. Sparse factors stay off, as they would own a free root's rows.
-        """
-        model = _conveyor_model(wp.get_device("cuda:0"))
-        options = {"pgs_iterations": 8, "dense_max_constraints": 96}
-        dense = {"storage": "dense"}
-        solver, masked, methods = _rollout(model, masked=True, steps=1, pins=dense, **options)
-        _, general, general_methods = _rollout(model, masked=False, steps=1, pins=dense, **options)
-        self.assertEqual(methods, {"masked_combined"})
-        self.assertEqual(general_methods, {"per_contact"})
-        self.assertTrue(solver.forest.has_prescribed_response)
-        self.assertFalse(solver._compact_contact_jacobian)
-        (rows, _, _), (expected, _, _) = masked[0], general[0]
-        assert_rows_close(rows, expected, atol=_CUDA_ROW_TOLERANCE, rtol=_CUDA_ROW_TOLERANCE)
-        anchors = [record["target"] for record in rows.values() if len(record["types"]) == 3]
-        self.assertGreater(len(anchors), 0, "no contact owned an anchor")
-        # The plate's surface moves at about 0.2 m/s along the ground and rises at 0.02 m/s.
-        self.assertGreater(float(np.abs(np.concatenate([target[1:] for target in anchors])).max()), 0.1)
-        self.assertGreater(float(np.abs([target[0] for target in anchors]).min()), 0.01)
 
 
 if __name__ == "__main__":

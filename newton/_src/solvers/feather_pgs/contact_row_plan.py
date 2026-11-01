@@ -17,6 +17,7 @@ SHARED_METADATA_PRODUCERS = ("sparse_contact_response", "sparse_diagonal", "comp
 
 # Every builder method a plan can name, by producer; the route record names each one's kernels.
 BUILDER_METHODS = (
+    "walk",
     "local_packets",
     "keyed_rows",
     "compact_contact_boundary",
@@ -34,9 +35,9 @@ class ContactRowPlan:
     """The contact-row producer of one solver and the builder method of each DOF size."""
 
     producer: str
-    """The producer the class's placement case names: ``local_packets``, ``keyed_rows``,
-    ``compact_contact_boundary``, ``sparse_contact_response``, ``sparse_diagonal``, ``compact_jacobian`` or
-    ``general``."""
+    """The producer the class's placement case names: ``walk`` (the general placement's one writer),
+    ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``, ``sparse_contact_response``, ``sparse_diagonal``,
+    ``compact_jacobian`` or ``general``."""
     law: str
     """The friction law of the contact rows: ``"point"`` or ``"patch"``."""
     methods: dict[int, str]
@@ -74,6 +75,10 @@ def contact_row_plan(solver) -> ContactRowPlan:
     law = "patch" if solver.laws.friction_anchors_enabled else "point"
     sizes = solver.forest.size_groups
     case = solver.routes.case
+    if getattr(solver.placement, "walks", False):
+        # The general placement's one writer (walk_rows): the row pass writes each contact row's records and unit
+        # source, and the writer walks its seed.
+        return ContactRowPlan("walk", law, dict.fromkeys(sizes, "walk"))
     owned = {
         "K3": "local_packets" if solver.placement.row_packets is not None else None,
         "K4": "keyed_rows" if solver.placement.keyed_rows is not None else None,

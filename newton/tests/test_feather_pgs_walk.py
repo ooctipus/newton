@@ -171,6 +171,9 @@ class Capture:
         placement, solver = self.solver.placement, self.solver
         self.Z_final = placement.packed_Z.numpy().astype(np.float64)
         self.impulses = placement.impulses.numpy().astype(np.float64)
+        # The general placement's one writer (FL3.3) runs no pack: its rows' sides and counts are the step's.
+        self.sides = placement.row_sides.numpy().copy()
+        self.counts = placement.constraint_count.numpy().copy()
         self.mf_final = None
         if self.mf is not None:
             self.mf_final = (
@@ -369,7 +372,8 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     # The leave: the step's du is sum Z lambda over its final rows; each articulation leaves it once.
     D = int(forest.max_world_dofs)
     du = np.zeros((int(forest.world_count), max(D, 1)))
-    if capture.J is not None:
+    # Every stored row's footprints, the pack's or the one writer's (FL3.3, whose rows form no J).
+    if capture.J is not None or getattr(solver.placement, "walks", False):
         for world, count in enumerate(capture.counts):
             line = int(capture.dense_first[world])
             for row in range(int(count)):

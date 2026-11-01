@@ -73,13 +73,37 @@ def row_sides(art_a: int, art_b: int, response_dofs: wp.array[int]) -> wp.vec2i:
     return wp.vec2i(wp.min(a, b), wp.max(a, b))
 
 
+UNIT_CONTACT = wp.constant(1)
+"""A row's unit source (:func:`unit_source`): contact ``c``'s row ``r``, index ``4 c + r``."""
+UNIT_LIMIT = wp.constant(2)
+"""A joint limit's row: coordinate ``dof``'s side (0 below, ``J = +1``; 1 above, ``J = -1``), index ``2 dof + side``."""
+UNIT_MIMIC = wp.constant(3)
+"""A mimic's row: index the mimic."""
+UNIT_LINK = wp.constant(4)
+"""A link's row: index ``6 link + row``."""
+UNIT_VELOCITY = wp.constant(5)
+"""A joint velocity limit's row: index ``2 dof + side``, its sign ``velocity_limit_sign``'s."""
+UNIT_SHIFT = wp.constant(28)
+"""Bits of a unit source's index: its kind sits above them."""
+
+
+@wp.func
+def unit_source(kind: int, index: int) -> int:
+    """A row's unit source: what the one writer (:mod:`.walk_rows`) reads to find the row's law and seed, its kind
+    (``UNIT_*``) above :data:`UNIT_SHIFT` bits of index."""
+    return (kind << UNIT_SHIFT) | index
+
+
 @wp.struct
 class RowSupport:
     """Where a dense row's Jacobian entries sit. In the matrix-free sweeps' packed rows (``packed``,
     :mod:`.packed_rows`) a row of world ``w`` is ``J[w, row, :]``: its sides (``sides``: :func:`row_sides`), each
     articulation's coordinates (``dofs``), first world coordinate (``offset``) and world (``world``), and the layout
     (``dense``: entry ``e`` is world coordinate ``e``; else the first side's entries, then the second's). Otherwise a
-    size group's rows hold each articulation's side from entry 0, row ``J[group, row, :]``."""
+    size group's rows hold each articulation's side from entry 0, row ``J[group, row, :]``.
+
+    Where the one writer walks the rows (``walks``, :mod:`.walk_rows`), a producer writes no ``J``: it records each
+    row's unit source (``units``, :func:`unit_source`), by world line and row, from which the writer takes its seed."""
 
     sides: wp.array2d[wp.vec2i]
     dofs: wp.array[int]
@@ -88,6 +112,8 @@ class RowSupport:
     dense: int
     packed: int
     first: wp.array[int]
+    units: wp.array2d[int]
+    walks: int
 
 
 @wp.func

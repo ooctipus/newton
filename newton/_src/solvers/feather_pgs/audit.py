@@ -48,6 +48,7 @@ from .row_laws import (
     ROW_TORSION,
 )
 from .sparse_mass_matrix import _SparseRowSupport
+from .tree_factor import walk_enter_kernel
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -561,6 +562,23 @@ class Audit:
                 wp.launch(
                     enter, dim=dim, inputs=[*inputs[:-1], solver.v_hat], outputs=[self.coordinates_hat], device=device
                 )
+            if solver.placement.walks:
+                # The one writer's rows are the walk's (walk_rows): their trees' coordinates are the walk's too.
+                factor = solver.factor
+                for velocity, coordinates in ((v, self.coordinates), (solver.v_hat, self.coordinates_hat)):
+                    wp.launch(
+                        walk_enter_kernel(),
+                        dim=factor.walk_arts.shape[0],
+                        inputs=[
+                            factor.walk_arts,
+                            factor.walk_view(),
+                            forest.art_to_world,
+                            forest.articulation_world_dof_offset,
+                            velocity,
+                            coordinates,
+                        ],
+                        device=device,
+                    )
             inputs = [
                 a,
                 solver.placement.row_support(),

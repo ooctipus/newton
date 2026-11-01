@@ -385,6 +385,14 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "frame": 0.0, "tight": 0.0, "leave": 0.0, "kernel": 0.0, "general": 0, "in_kernel": 0}
     out["unstored"] = 0
+    if getattr(placement, "walks", False):
+        # The general placement's one writer (FL3.3): its rows are walked from seeds, no J is stored. Its rows against
+        # their physical J v_hat and its leave against the float64 walk's (test_feather_pgs_walk_rows).
+        from newton.tests.test_feather_pgs_walk_rows import walked_frames  # noqa: PLC0415
+
+        walked = walked_frames(solver, joint_q, capture)
+        out.update(rows=walked["rows"], leave=walked["leave"], general=walked["worlds"])
+        return out
     if capture.J is None or solver.routes.case in ("K1", "K2"):
         out["unstored"] = int(forest.world_count)
         return out

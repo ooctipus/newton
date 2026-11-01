@@ -269,6 +269,10 @@ class Placement:
         self.contact_row_eps_dummy = self.arrays.placeholder(wp.float32, (1, 1))
         self.row_eps = self.mf_row_eps = self.contact_row_eps_dummy
         self.J_by_size: dict[int, wp.array] = {}
+        # The general placement's one writer (walk_rows): each row's unit source, by world line and row.
+        self.walks = False
+        self.dummy_units = self.arrays.placeholder(wp.int32, (1, 1))
+        self.unit_source = None
 
     # ---------------------------------------------------------------------------------------------------------------
     # Construction
@@ -1008,6 +1012,8 @@ class Placement:
         support.dense = int(self.packed_dense)
         support.packed = int(self.mf_sweeps)
         support.first = self.dense_first
+        support.walks = int(self.walks)
+        support.units = self.unit_source if self.walks else self.dummy_units
         return support
 
     def jacobian_rows(self, size: int) -> wp.array:
@@ -1040,10 +1046,17 @@ class Placement:
     # Step: the whitening and the diagonals
     # ---------------------------------------------------------------------------------------------------------------
 
+    def hold_units(self) -> None:
+        """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row."""
+        self.unit_source = wp.full(
+            (self.forest.world_count, self.dense_max_constraints), 0, dtype=wp.int32, device=self.model.device
+        )
+
     def pack_rows(self, v_hat: wp.array, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
-        (:func:`.packed_rows.pack_kernel`, one launch; :meth:`diagonals`)."""
-        if not self.mf_sweeps:
+        (:func:`.packed_rows.pack_kernel`, one launch; :meth:`diagonals`). The one writer's rows (``walks``) are
+        whitened where they are written (:mod:`.walk_rows`)."""
+        if not self.mf_sweeps or self.walks:
             return
         # The parallel tiers and the local owners whiten their worlds' rows in the kernel: the build leaves them, and
         # keyed rows and the row packets keep them out of the store.

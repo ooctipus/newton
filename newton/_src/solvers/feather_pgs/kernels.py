@@ -35,7 +35,19 @@ from .contact_laws import (
     prescribed_target,
     spin_entry,
 )
-from .dense_rows import DenseRows, MfRows, RowSupport, clear_side, jacobian_row, row_sides
+from .dense_rows import (
+    UNIT_LIMIT,
+    UNIT_LINK,
+    UNIT_MIMIC,
+    UNIT_VELOCITY,
+    DenseRows,
+    MfRows,
+    RowSupport,
+    clear_side,
+    jacobian_row,
+    row_sides,
+    unit_source,
+)
 from .device_preludes import (
     dual_native,
     lane_group,
@@ -940,9 +952,12 @@ def build_joint_limit_rows_for_size(
                 if slot < 0:
                     continue
 
-                at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-                clear_side(support, J_group, at, slot, art)
-                J_group[at[0], slot, at[1] + local_dof] = sign
+                if support.walks != 0:
+                    support.units[line, slot] = unit_source(UNIT_LIMIT, 2 * dof + side)
+                else:
+                    at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+                    clear_side(support, J_group, at, slot, art)
+                    J_group[at[0], slot, at[1] + local_dof] = sign
                 rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                 rows.sides[line, slot] = wp.vec2i(art, -1)
                 rows.row_parent[line, slot] = -1
@@ -1032,10 +1047,13 @@ def populate_mimic_J_for_size(
 
         # Jacobian: +1 on the follower DOF, -coef1 on the leader DOF. The two
         # DOFs are guaranteed distinct by the host-side validity mask.
-        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-        clear_side(support, J_group, at, slot, art)
-        J_group[at[0], slot, at[1] + mimics.dof0[k] - dof_start] = 1.0
-        J_group[at[0], slot, at[1] + mimics.dof1[k] - dof_start] = -c1
+        if support.walks != 0:
+            support.units[line, slot] = unit_source(UNIT_MIMIC, k)
+        else:
+            at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+            clear_side(support, J_group, at, slot, art)
+            J_group[at[0], slot, at[1] + mimics.dof0[k] - dof_start] = 1.0
+            J_group[at[0], slot, at[1] + mimics.dof1[k] - dof_start] = -c1
 
         rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_MIMIC
         rows.sides[line, slot] = wp.vec2i(art, -1)
@@ -1167,47 +1185,50 @@ def write_link_rows(
     line = rows.first[world]
     for row in range(LINK_ROWS):
         slot = base + row
-        for side in range(2):
-            if sides[side] >= 0:
-                clear_side(support, J, jacobian_row(support, 0, sides[side], sides), slot, sides[side])
         axis = row % 3
         angular = row >= 3
-        direction = wp.vec3(0.0, 0.0, 0.0)
-        direction[axis] = 1.0
-        link_side(
-            joints,
-            support,
-            primary,
-            art_p,
-            1.0,
-            point_p,
-            direction,
-            angular,
-            sides,
-            body_to_joint,
-            joint_ancestor,
-            joint_S_s,
-            articulation_origin,
-            slot,
-            J,
-        )
-        link_side(
-            joints,
-            support,
-            shadow,
-            art_s,
-            -1.0,
-            point_s,
-            direction,
-            angular,
-            sides,
-            body_to_joint,
-            joint_ancestor,
-            joint_S_s,
-            articulation_origin,
-            slot,
-            J,
-        )
+        if support.walks != 0:
+            support.units[line, slot] = unit_source(UNIT_LINK, LINK_ROWS * k + row)
+        else:
+            for side in range(2):
+                if sides[side] >= 0:
+                    clear_side(support, J, jacobian_row(support, 0, sides[side], sides), slot, sides[side])
+            direction = wp.vec3(0.0, 0.0, 0.0)
+            direction[axis] = 1.0
+            link_side(
+                joints,
+                support,
+                primary,
+                art_p,
+                1.0,
+                point_p,
+                direction,
+                angular,
+                sides,
+                body_to_joint,
+                joint_ancestor,
+                joint_S_s,
+                articulation_origin,
+                slot,
+                J,
+            )
+            link_side(
+                joints,
+                support,
+                shadow,
+                art_s,
+                -1.0,
+                point_s,
+                direction,
+                angular,
+                sides,
+                body_to_joint,
+                joint_ancestor,
+                joint_S_s,
+                articulation_origin,
+                slot,
+                J,
+            )
         rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
         rows.sides[line, slot] = sides
         rows.row_parent[line, slot] = -1
@@ -1374,9 +1395,12 @@ def populate_joint_velocity_limit_J_for_size(
     qdot_max = joints.joint_velocity_limit[dof]
     sign = velocity_limit_sign[row_idx]
 
-    at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
-    clear_side(support, J_group, at, slot, art)
-    J_group[at[0], slot, at[1] + local_dof] = sign
+    if support.walks != 0:
+        support.units[line, slot] = unit_source(UNIT_VELOCITY, row_idx)
+    else:
+        at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
+        clear_side(support, J_group, at, slot, art)
+        J_group[at[0], slot, at[1] + local_dof] = sign
 
     rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
     rows.sides[line, slot] = wp.vec2i(art, -1)
@@ -2168,6 +2192,46 @@ TILE_THREADS = 64
 # =============================================================================
 
 
+@wp.func
+def row_bias(
+    rows: DenseRows,
+    line: int,
+    i: int,
+    incident: float,
+    dt: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    restitution_velocity_threshold: float,
+    weighted: int,
+    material: int,
+):
+    """Row ``i``'s rhs by its row law (:func:`.row_laws.row_rhs`) from its records, and a bouncing contact's rebound
+    from its incident velocity ``J v_hat`` (:func:`.row_laws.contact_restitution_rhs`, weight 1); a material contact
+    (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store their regularization weight."""
+    kind = rows.row_type[line, i]
+    if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        if rows.row_eps[line, i] > 0.0:
+            return
+    inv_dt = 1.0 / dt
+    phi = rows.phi[line, i]
+    target = rows.target[line, i]
+    rhs, row_w = row_rhs(
+        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
+    )
+    if kind == PGS_CONSTRAINT_TYPE_CONTACT:
+        restitution = rows.restitution[line, i]
+        if restitution > 0.0:
+            fires, bounce = contact_restitution_rhs(
+                phi, incident - target, target, restitution, dt, restitution_velocity_threshold
+            )
+            if fires:
+                rhs = bounce
+                row_w = 1.0
+    rows.rhs[line, i] = rhs
+    if weighted != 0:
+        rows.row_w[line, i] = row_w
+
+
 @wp.kernel
 def compute_world_contact_bias(
     rows: DenseRows,
@@ -2201,29 +2265,19 @@ def compute_world_contact_bias(
     if lane >= count:
         return
     line = rows.first[world]
-    inv_dt = 1.0 / dt
     for i in range(lane, count, lanes):
-        kind = rows.row_type[line, i]
-        if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
-            if rows.row_eps[line, i] > 0.0:
-                continue
-        phi = rows.phi[line, i]
-        target = rows.target[line, i]
-        rhs, row_w = row_rhs(
-            kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
+        row_bias(
+            rows,
+            line,
+            i,
+            row_incident[line, i],
+            dt,
+            contact_speculative_scale,
+            contact_w,
+            restitution_velocity_threshold,
+            weighted,
+            material,
         )
-        if kind == PGS_CONSTRAINT_TYPE_CONTACT:
-            restitution = rows.restitution[line, i]
-            if restitution > 0.0:
-                fires, bounce = contact_restitution_rhs(
-                    phi, row_incident[line, i] - target, target, restitution, dt, restitution_velocity_threshold
-                )
-                if fires:
-                    rhs = bounce
-                    row_w = 1.0
-        rows.rhs[line, i] = rhs
-        if weighted != 0:
-            rows.row_w[line, i] = row_w
 
 
 @wp.kernel

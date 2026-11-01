@@ -1291,6 +1291,7 @@ class Sweep:
                 "max_row_dofs": self.placement.packed_support,
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
+                "walk": bool(self.placement.walks),
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,
@@ -1725,6 +1726,9 @@ class Sweep:
                 "use_general_world_queue": int(self.placement.local_internal_fast_path),
                 "factors": self.factor.view(),
             }
+            if self.factor.walk_arts is not None:
+                # The general sweep built for the one writer's rows leaves by the walk (sweep_routes.leave_all).
+                queue["walk"] = self.factor.walk_view()
             if components is not None:
                 queue["local_solve_owner"] = components.selector
             # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns

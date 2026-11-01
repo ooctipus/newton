@@ -709,6 +709,25 @@ class SolverFeatherPGS(SolverBase):
                 if self.placement.keyed_rows is not None
                 else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
             )
+        # The general placement (case K6) whitens and leaves its rows by the walk (FL3.3): the factor holds the walk's
+        # data for every responding tree, and the one writer and the sweep's leave read it. Rows that an in-kernel owner
+        # sweeps (local owners, tiers, their packets and keyed rows) keep the old pack until their owners convert
+        # (FL3.6, FL3.7): their sweeps whiten their worlds' J in the kernel.
+        free = self.forest.is_free_rigid_host if self.forest.is_free_rigid is not None else 0
+        self.placement.walks = bool(
+            self.routes.case == "K6"
+            and self.placement.mf_sweeps
+            and self.placement.row_packets is None
+            and self.placement.keyed_rows is None
+            and not self.placement.ink_skip_rows()
+            and not self.placement.local_internal_fast_path
+            # Free rigid bodies keep their 6x6 factor until they convert (stage two): a class of them alone holds no
+            # tree to walk and no dense row.
+            and np.any((self.forest.response_dof_count > 0) & (np.asarray(free) == 0))
+        )
+        if self.placement.walks:
+            self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
+            self.placement.hold_units()
         self.sweep.build()
         self.sweep.open_streams(overlap=not _FPGS_SYNC_TIMINGS)
         self.placement.allocate_placeholders()
@@ -1147,8 +1166,12 @@ class SolverFeatherPGS(SolverBase):
         # each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
             packed_diag = self.placement.diagonals(self.v_hat)
-            self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
-            self.laws.write_rhs(self, dt)
+            if self.placement.walks:
+                # The general placement's one writer: seeds walked into the packed rows, their headers (walk_rows).
+                self.laws.write_walked(self, state_in, contacts, dt)
+            else:
+                self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
+                self.laws.write_rhs(self, dt)
 
         # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities
         if self.forest.has_free_rigid_bodies:
