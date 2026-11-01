@@ -80,6 +80,7 @@ __all__ = ["Sweep"]
 # (tiers - 1) x worlds idle block entries.
 _TIER_LIST_MIN_TIERS = 3
 _CRBA_CHOLESKY_WARPS_PER_BLOCK = 4
+_CONTACT_JACOBIAN_MAX_DOF = 10
 # A persistent queue avoids launching one expensive general-solver block for
 # every mostly local world. Eight blocks per SM preserves general-only latency.
 _LOCAL_GENERAL_BLOCKS_PER_SM = 8
@@ -91,6 +92,28 @@ _LOCAL_RESIDUAL_MAX_ROWS = 40
 _LOCAL_RESIDUAL_MF_MAX_ROWS = 12
 _PERSISTENT_HINV_JT_MIN_DOF = 17
 _MFGSStorage = _execution_plan._MFGSStorage
+
+
+def _world_diagonal_pairs(
+    articulation_world: np.ndarray, response_dof_count: np.ndarray, world_count: int, diagonal_sizes: frozenset[int]
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Split each world's two response articulations into the one whose size is in ``diagonal_sizes`` and the other.
+
+    Returns:
+        ``(diagonal, dense)`` articulation indices per world, or ``None`` unless every
+        world has exactly two response articulations, exactly one of them diagonal.
+    """
+    articulations = np.flatnonzero(response_dof_count > 0)
+    bounds, order = host_index.group_by(articulation_world[articulations], world_count)
+    if np.any(np.diff(bounds) != 2):
+        return None
+    # Each world's pair, in ascending articulation order.
+    pairs = articulations[order].reshape(world_count, 2)
+    diagonal = np.isin(response_dof_count[pairs], list(diagonal_sizes))
+    if np.any(diagonal.sum(axis=1) != 1):
+        return None
+    first_diagonal = diagonal[:, 0]
+    return np.where(first_diagonal, pairs[:, 0], pairs[:, 1]), np.where(first_diagonal, pairs[:, 1], pairs[:, 0])
 
 
 @dataclasses.dataclass
@@ -163,6 +186,159 @@ class Sweep:
             and self.execution_plan.use_tiled_hinv_jt(size)
             and self.execution_plan.hinv_jt_chunk_size(size) < self.placement.dense_max_constraints
         )
+
+    def admit_diagonal(self, held_decline: Callable) -> None:
+        """Case K2, a tree beside a star: the sparse diagonal, with the fused limits of its star."""
+        model = self.model
+        self._select_fused_diagonal_limits()
+        # Case K2, a tree beside a star: the sparse diagonal.
+        declined = self.routes.taken("K2")
+        sparse_diagonal_pair = (
+            None
+            if declined
+            else self._select_sparse_diagonal_response_pair(
+                factor_dense_contract=self.placement.fused_diagonal_joint_limits
+            )
+        )
+        held = None
+        if sparse_diagonal_pair is not None:
+            held = held_decline(sparse_diagonal_pair[0])
+            if held is not None:
+                sparse_diagonal_pair = None
+        self.placement.sparse_diagonal_contact_solve = self.routes.claim("K2", sparse_diagonal_pair is not None)
+        if declined:
+            self.routes.reasons["K2"] = declined
+        elif held is not None:
+            self.routes.reasons["K2"] = f"Only the held tree evaluates the compact diagonal. {held}"
+        elif sparse_diagonal_pair is None:
+            self.routes.reasons["K2"] = (
+                "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
+            )
+        else:
+            self.routes.reasons["K2"] = (
+                "One diagonal-mass articulation and one compact dense articulation per world share one owner."
+            )
+        if sparse_diagonal_pair is None:
+            # Limit rows belong to this specialized owner. If the complete
+            # response composition is unavailable, retain the ordinary rows.
+            self.placement.fused_diagonal_joint_limits = False
+            self.placement.fused_diagonal_joint_limit_sizes = frozenset()
+            self.placement.fused_diagonal_limit_dof_mask_host.fill(0)
+        self.placement.sparse_diagonal_response_size = (
+            sparse_diagonal_pair[0] if sparse_diagonal_pair is not None else None
+        )
+        self.placement.sparse_diagonal_dense_size = sparse_diagonal_pair[1] if sparse_diagonal_pair is not None else 0
+        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
+        # uniform normal/tangent/tangent triples; keep the triple schedule for point friction only.
+        self.placement.sparse_diagonal_contact_triples = bool(
+            self.placement.sparse_diagonal_contact_solve
+            and self.options.enable_contact_friction
+            and self.options.contact_friction_gap_threshold == math.inf
+            and not self.laws.friction_anchors_enabled
+        )
+        # Patch contacts are units instead: a normal row, followed by its two tangent rows only when the contact
+        # owns an anchor. The unit schedule replaces every stride-3 assumption of the triple schedule.
+        self.placement.sparse_diagonal_contact_units = bool(
+            self.placement.sparse_diagonal_contact_solve
+            and self.options.enable_contact_friction
+            and self.options.contact_friction_gap_threshold == math.inf
+            and self.laws.friction_anchors_enabled
+        )
+        self.placement.sparse_diagonal_speculative_contact_batches = bool(
+            (self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units)
+            and self.placement.sparse_diagonal_dense_size + 2 <= 16
+        )
+        self.placement.sparse_diagonal_dense_offsets = wp.array(
+            sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
+            dtype=wp.int32,
+            device=model.device,
+        )
+        self.placement.sparse_diagonal_dense_groups = wp.array(
+            sparse_diagonal_pair[3] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
+            dtype=wp.int32,
+            device=model.device,
+        )
+
+    def _select_fused_diagonal_limits(self) -> None:
+        """Select independent position limits that can remain outside the dense row system."""
+        model = self.model
+        self.placement.fused_diagonal_joint_limits = False
+        self.placement.fused_diagonal_joint_limit_sizes = frozenset()
+        self.placement.fused_diagonal_limit_dof_mask_host = np.zeros(model.joint_dof_count, dtype=np.int32)
+        supported = bool(
+            model.device.is_cuda
+            and model.joint_dof_count > 0
+            and self.options.enable_joint_limits
+            and self.options.enable_contact_friction
+            and not self.options.enable_joint_velocity_limits
+            and not self.options.pgs_warmstart
+            and not self.options.pgs_warmstart
+            and not self.factor.eliminates
+            and not self.forest.has_free_rigid_bodies
+            and self.laws.mimic_count == 0
+            and self.laws.link_count == 0
+        )
+        if not supported:
+            return
+
+        candidate_sizes = self.forest.diagonal_mass_sizes.intersection(self.laws.joint_limit_sizes)
+        if not candidate_sizes:
+            return
+        response_dof_count = self.forest.response_dof_count
+        articulation_world = self.forest.articulation_world
+        articulation_dof_start = self.forest.articulation_dof_start_host
+        pairs = _world_diagonal_pairs(articulation_world, response_dof_count, self.forest.world_count, candidate_sizes)
+        if pairs is None:
+            return
+        diagonal_articulations, dense_articulations = pairs
+        dense_size = response_dof_count[dense_articulations]
+        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
+            return
+
+        # The diagonal articulations with a limited DOF fuse all their DOFs' limits.
+        diagonal_size = response_dof_count[diagonal_articulations]
+        art, local_dof = host_index.expand(diagonal_size)
+        dof = articulation_dof_start[diagonal_articulations][art] + local_dof
+        valid = self.laws.joint_limit_q_index_host[dof] >= 0
+        limited = np.bincount(art[valid], minlength=diagonal_articulations.size) > 0
+        self.placement.fused_diagonal_limit_dof_mask_host[dof[limited[art]]] = valid[limited[art]]
+        # Add each size where a world first has it, as the per-world set did.
+        selected_sizes: set[int] = {int(size) for size in host_index.ordered_unique(diagonal_size[limited])}
+        self.placement.fused_diagonal_joint_limit_sizes = frozenset(selected_sizes)
+        self.placement.fused_diagonal_joint_limits = bool(selected_sizes)
+
+    def _select_sparse_diagonal_response_pair(
+        self, *, factor_dense_contract: bool
+    ) -> tuple[int, int, np.ndarray, np.ndarray] | None:
+        """Select one independent wide component plus one compact dense component per world."""
+        if not factor_dense_contract or not self.placement.fused_diagonal_joint_limits:
+            return None
+
+        response_dofs = self.forest.response_dof_count
+        articulation_world = self.forest.articulation_world
+        is_free_rigid = self.forest.is_free_rigid_host
+        offsets = self.forest.articulation_world_dof_offset.numpy()
+        group_indices = self.forest.art_group_idx.numpy()
+        pairs = _world_diagonal_pairs(
+            articulation_world, response_dofs, self.forest.world_count, self.placement.fused_diagonal_joint_limit_sizes
+        )
+        if pairs is None or self.forest.world_count == 0:
+            return None
+        diagonal_arts, dense_arts = pairs
+        if np.any(is_free_rigid[diagonal_arts] != 0) or np.any(is_free_rigid[dense_arts] != 0):
+            return None
+        # Every world pairs the same two sizes.
+        diagonal_size = response_dofs[diagonal_arts]
+        dense_size = response_dofs[dense_arts]
+        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
+            return None
+        if np.any(diagonal_size != diagonal_size[0]) or np.any(dense_size != dense_size[0]):
+            return None
+        dense_offsets = offsets[dense_arts].astype(np.int32)
+        dense_groups = group_indices[dense_arts].astype(np.int32)
+        if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
+            return None
+        return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
     def admit_local(self) -> None:
         """Case K3, a small tree beside a body: the local owners, their candidates, queues and blocks."""

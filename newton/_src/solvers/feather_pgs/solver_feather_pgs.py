@@ -15,7 +15,6 @@
 
 import copy
 import functools
-import math
 import os
 import sys
 import time
@@ -43,7 +42,6 @@ from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import (
     field_group,
-    host_index,
     prefix_rows,
     response_builds_rows,
 )
@@ -105,7 +103,7 @@ from .sparse_contact import (
     finalize_sparse_joint_limit_rows,
 )
 from .step_plan import StepPlan
-from .sweep_plan import Sweep
+from .sweep_plan import _CONTACT_JACOBIAN_MAX_DOF, Sweep
 from .tree_factor import TreeFactor
 
 _FPGS_SYNC_TIMINGS = os.environ.get("FEATHER_PGS_SYNC_TIMINGS", "0").lower() in {"1", "true", "yes", "on"}
@@ -120,29 +118,6 @@ _CONTACT_BUILD_THREAD_CAP = 65536
 # The masked row builder's thread budget, in multiples of the contact-build cap.
 _ROWS_THREADS_X = 4
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
-_CONTACT_JACOBIAN_MAX_DOF = 10
-
-
-def _world_diagonal_pairs(
-    articulation_world: np.ndarray, response_dof_count: np.ndarray, world_count: int, diagonal_sizes: frozenset[int]
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Split each world's two response articulations into the one whose size is in ``diagonal_sizes`` and the other.
-
-    Returns:
-        ``(diagonal, dense)`` articulation indices per world, or ``None`` unless every
-        world has exactly two response articulations, exactly one of them diagonal.
-    """
-    articulations = np.flatnonzero(response_dof_count > 0)
-    bounds, order = host_index.group_by(articulation_world[articulations], world_count)
-    if np.any(np.diff(bounds) != 2):
-        return None
-    # Each world's pair, in ascending articulation order.
-    pairs = articulations[order].reshape(world_count, 2)
-    diagonal = np.isin(response_dof_count[pairs], list(diagonal_sizes))
-    if np.any(diagonal.sum(axis=1) != 1):
-        return None
-    first_diagonal = diagonal[:, 0]
-    return np.where(first_diagonal, pairs[:, 0], pairs[:, 1]), np.where(first_diagonal, pairs[:, 1], pairs[:, 0])
 
 
 # Retain the internal metadata API while sharing its implementation.
@@ -654,85 +629,12 @@ class SolverFeatherPGS(SolverBase):
         laws = self.laws.set
         # The passive joint forces and the per-coordinate drive rows the held tree's admission reads.
         self.factor.plan(self.forest, self.laws)
-        self._setup_fused_diagonal_joint_limits(model)
         from . import held_tree  # noqa: PLC0415
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
         # Axis 3 of the route table, the placement case: the owners below, in precedence order (route_table.CASES),
         # each test their own fit once no earlier case holds the class, and the first that fits claims it.
         self.routes = RouteTable(self._route_pins)
-        # Case K2, a tree beside a star: the sparse diagonal.
-        declined = self.routes.taken("K2")
-        sparse_diagonal_pair = (
-            None
-            if declined
-            else self._select_sparse_diagonal_response_pair(
-                factor_dense_contract=self.placement.fused_diagonal_joint_limits
-            )
-        )
-        held = None
-        if sparse_diagonal_pair is not None:
-            # Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
-            # the dense groups with it, the diagonal group as scalar branches or a held family.
-            scalar, _ = plan_scalar_branches(self, size=sparse_diagonal_pair[0])
-            held = held_tree.compact_decline(self, sparse_diagonal_pair[0], scalar=scalar is not None)
-            if held is not None:
-                sparse_diagonal_pair = None
-        self.placement.sparse_diagonal_contact_solve = self.routes.claim("K2", sparse_diagonal_pair is not None)
-        if declined:
-            self.routes.reasons["K2"] = declined
-        elif held is not None:
-            self.routes.reasons["K2"] = f"Only the held tree evaluates the compact diagonal. {held}"
-        elif sparse_diagonal_pair is None:
-            self.routes.reasons["K2"] = (
-                "No world pairs a diagonal-mass articulation with fused limits and one compact dense articulation."
-            )
-        else:
-            self.routes.reasons["K2"] = (
-                "One diagonal-mass articulation and one compact dense articulation per world share one owner."
-            )
-        if sparse_diagonal_pair is None:
-            # Limit rows belong to this specialized owner. If the complete
-            # response composition is unavailable, retain the ordinary rows.
-            self.placement.fused_diagonal_joint_limits = False
-            self.placement.fused_diagonal_joint_limit_sizes = frozenset()
-            self.placement.fused_diagonal_limit_dof_mask_host.fill(0)
-        self.placement.sparse_diagonal_response_size = (
-            sparse_diagonal_pair[0] if sparse_diagonal_pair is not None else None
-        )
-        self.placement.sparse_diagonal_dense_size = sparse_diagonal_pair[1] if sparse_diagonal_pair is not None else 0
-        # Persistent patches allocate one tangent pair per surviving anchor, so their contact rows are not
-        # uniform normal/tangent/tangent triples; keep the triple schedule for point friction only.
-        self.placement.sparse_diagonal_contact_triples = bool(
-            self.placement.sparse_diagonal_contact_solve
-            and self.options.enable_contact_friction
-            and self.options.contact_friction_gap_threshold == math.inf
-            and not self.laws.friction_anchors_enabled
-        )
-        # Patch contacts are units instead: a normal row, followed by its two tangent rows only when the contact
-        # owns an anchor. The unit schedule replaces every stride-3 assumption of the triple schedule.
-        self.placement.sparse_diagonal_contact_units = bool(
-            self.placement.sparse_diagonal_contact_solve
-            and self.options.enable_contact_friction
-            and self.options.contact_friction_gap_threshold == math.inf
-            and self.laws.friction_anchors_enabled
-        )
-        self.placement.sparse_diagonal_speculative_contact_batches = bool(
-            (self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units)
-            and self.placement.sparse_diagonal_dense_size + 2 <= 16
-        )
-        self.placement.sparse_diagonal_dense_offsets = wp.array(
-            sparse_diagonal_pair[2] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
-            dtype=wp.int32,
-            device=model.device,
-        )
-        self.placement.sparse_diagonal_dense_groups = wp.array(
-            sparse_diagonal_pair[3] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
-            dtype=wp.int32,
-            device=model.device,
-        )
-        self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
-        self.placement.hinv_jt_computes_diag = not self.factor.eliminates
         self._execution_plan = _FeatherPGSExecutionPlan.build(
             self.forest.size_groups,
             max_constraints=self.placement.dense_max_constraints,
@@ -741,12 +643,6 @@ class SolverFeatherPGS(SolverBase):
             small_dof_threshold=self.small_dof_threshold,
             tile_threads=self.tile_threads,
             diagonal_mass_sizes=self.forest.diagonal_mass_sizes,
-        )
-        self.placement.hinv_jt_diag_sizes = frozenset(
-            size
-            for size in self.forest.size_groups
-            if self.placement.hinv_jt_computes_diag
-            and (self._execution_plan.use_diagonal_mass(size) or self._execution_plan.use_tiled_hinv_jt(size))
         )
         # The sweep: its owners claim the class below, in the route table's order.
         self.sweep = Sweep(
@@ -761,6 +657,22 @@ class SolverFeatherPGS(SolverBase):
             self._route_pins,
             self._sync_timed,
             nvtx,
+        )
+
+        def diagonal_decline(size: int) -> str | None:
+            """Its compact diagonal is the held tree's representation: a candidate only where the held tree takes
+            the dense groups with it, the diagonal group as scalar branches or a held family."""
+            scalar, _ = plan_scalar_branches(self, size=size)
+            return held_tree.compact_decline(self, size, scalar=scalar is not None)
+
+        self.sweep.admit_diagonal(diagonal_decline)
+        self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
+        self.placement.hinv_jt_computes_diag = not self.factor.eliminates
+        self.placement.hinv_jt_diag_sizes = frozenset(
+            size
+            for size in self.forest.size_groups
+            if self.placement.hinv_jt_computes_diag
+            and (self._execution_plan.use_diagonal_mass(size) or self._execution_plan.use_tiled_hinv_jt(size))
         )
         self.sweep.admit_local()
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
@@ -1140,53 +1052,6 @@ class SolverFeatherPGS(SolverBase):
         """
         self.factor.notify_state_changed(self.cut.trees(articulations))
 
-    def _setup_fused_diagonal_joint_limits(self, model) -> None:
-        """Select independent position limits that can remain outside the dense row system."""
-        self.placement.fused_diagonal_joint_limits = False
-        self.placement.fused_diagonal_joint_limit_sizes = frozenset()
-        self.placement.fused_diagonal_limit_dof_mask_host = np.zeros(model.joint_dof_count, dtype=np.int32)
-        supported = bool(
-            model.device.is_cuda
-            and model.joint_dof_count > 0
-            and self.options.enable_joint_limits
-            and self.options.enable_contact_friction
-            and not self.options.enable_joint_velocity_limits
-            and not self.options.pgs_warmstart
-            and not self.options.pgs_warmstart
-            and not self.factor.eliminates
-            and not self.forest.has_free_rigid_bodies
-            and self.laws.mimic_count == 0
-            and self.laws.link_count == 0
-        )
-        if not supported:
-            return
-
-        candidate_sizes = self.forest.diagonal_mass_sizes.intersection(self.laws.joint_limit_sizes)
-        if not candidate_sizes:
-            return
-        response_dof_count = self.forest.response_dof_count
-        articulation_world = self.forest.articulation_world
-        articulation_dof_start = self.forest.articulation_dof_start_host
-        pairs = _world_diagonal_pairs(articulation_world, response_dof_count, self.forest.world_count, candidate_sizes)
-        if pairs is None:
-            return
-        diagonal_articulations, dense_articulations = pairs
-        dense_size = response_dof_count[dense_articulations]
-        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-            return
-
-        # The diagonal articulations with a limited DOF fuse all their DOFs' limits.
-        diagonal_size = response_dof_count[diagonal_articulations]
-        art, local_dof = host_index.expand(diagonal_size)
-        dof = articulation_dof_start[diagonal_articulations][art] + local_dof
-        valid = self.laws.joint_limit_q_index_host[dof] >= 0
-        limited = np.bincount(art[valid], minlength=diagonal_articulations.size) > 0
-        self.placement.fused_diagonal_limit_dof_mask_host[dof[limited[art]]] = valid[limited[art]]
-        # Add each size where a world first has it, as the per-world set did.
-        selected_sizes: set[int] = {int(size) for size in host_index.ordered_unique(diagonal_size[limited])}
-        self.placement.fused_diagonal_joint_limit_sizes = frozenset(selected_sizes)
-        self.placement.fused_diagonal_joint_limits = bool(selected_sizes)
-
     def _detect_jy_world_identity(self) -> bool:
         """Return whether host-side group and compact world J/Y layouts are identical."""
         if len(self.forest.size_groups) != 1 or self.forest.art_to_world is None:
@@ -1198,39 +1063,6 @@ class SolverFeatherPGS(SolverBase):
         group_to_art = self.forest.group_to_art_host[size]
         expected_world = np.arange(len(group_to_art), dtype=articulation_world.dtype)
         return np.array_equal(articulation_world[group_to_art], expected_world)
-
-    def _select_sparse_diagonal_response_pair(
-        self, *, factor_dense_contract: bool
-    ) -> tuple[int, int, np.ndarray, np.ndarray] | None:
-        """Select one independent wide component plus one compact dense component per world."""
-        if not factor_dense_contract or not self.placement.fused_diagonal_joint_limits:
-            return None
-
-        response_dofs = self.forest.response_dof_count
-        articulation_world = self.forest.articulation_world
-        is_free_rigid = self.forest.is_free_rigid_host
-        offsets = self.forest.articulation_world_dof_offset.numpy()
-        group_indices = self.forest.art_group_idx.numpy()
-        pairs = _world_diagonal_pairs(
-            articulation_world, response_dofs, self.forest.world_count, self.placement.fused_diagonal_joint_limit_sizes
-        )
-        if pairs is None or self.forest.world_count == 0:
-            return None
-        diagonal_arts, dense_arts = pairs
-        if np.any(is_free_rigid[diagonal_arts] != 0) or np.any(is_free_rigid[dense_arts] != 0):
-            return None
-        # Every world pairs the same two sizes.
-        diagonal_size = response_dofs[diagonal_arts]
-        dense_size = response_dofs[dense_arts]
-        if np.any((dense_size <= 0) | (dense_size > _CONTACT_JACOBIAN_MAX_DOF)):
-            return None
-        if np.any(diagonal_size != diagonal_size[0]) or np.any(dense_size != dense_size[0]):
-            return None
-        dense_offsets = offsets[dense_arts].astype(np.int32)
-        dense_groups = group_indices[dense_arts].astype(np.int32)
-        if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
-            return None
-        return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
     def _allocate_common_buffers(self, model):
         arrays = self._arrays
