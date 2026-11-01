@@ -655,8 +655,8 @@ class SolverFeatherPGS(SolverBase):
             self.routes,
             self._execution_plan,
             self._route_pins,
-            self._sync_timed,
-            nvtx,
+            timed=self._sync_timed,
+            nvtx=nvtx,
         )
 
         def diagonal_decline(size: int) -> str | None:

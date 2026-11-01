@@ -502,8 +502,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
     for param, annotation in sig.parameters.items():
         if param in ("kind",):
             values[param] = ints(0, 8)
-        elif param in ("iteration", "start_iteration"):
-            values[param] = ints(0, 6)
         elif param in ("inv_dt",):
             values[param] = rng.choice([60.0, 120.0, 1.0 / 7.0e-3, 240.0], n).astype(np.float32)
         elif param in ("dt",):

@@ -759,10 +759,8 @@ class Placement:
         self.dummy_mf_slot_counter = placeholder(wp.int32, (self.forest.world_count,))
         self.dummy_mf_impulses = placeholder(wp.float32, (1, 1))
         self.dummy_contact_count = placeholder(wp.int32, (1,))
-        self.dummy_contact_row_type = placeholder(wp.int32, (1, 1))
         self.reset_dummy_mf_row_type = placeholder(wp.int32, (1, 1), -1)
         self.reset_dummy_mf_row_parent = placeholder(wp.int32, (1, 1), -1)
-        self.dummy_contact_row_parent = placeholder(wp.int32, (1, 1), -1)
 
     def build_response_kernels(self, plan, execution_plan, tile_threads: int) -> None:
         """Build the stage-4 kernels the plan's response table launches, and only those (one entry per size)."""

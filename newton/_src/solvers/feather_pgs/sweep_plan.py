@@ -5,8 +5,8 @@
 
 :class:`Sweep` owns the solve of one step:
 
-- the admission of the owners that sweep their own worlds (cases K1, K3, K4 and K5 of the route table), with their
-  kernels and streams (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
+- the admission of the owners that sweep their own worlds (the route table's cases, in its order), with their kernels
+  and streams (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
 - the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim`), and the resolved worlds;
 - the warm start: the impulses gathered by contact identity (:meth:`Sweep.warm_start`), the patch seed, and what a step
   carries to the next (:meth:`Sweep.carry`);
@@ -160,7 +160,7 @@ class Sweep:
         nvtx: Whether the step's scopes mark NVTX ranges.
     """
 
-    def __init__(self, model, options, forest, laws, placement, factor, routes, execution_plan, pins, timed, nvtx):
+    def __init__(self, model, options, forest, laws, placement, factor, routes, execution_plan, pins, *, timed, nvtx):
         self.model = model
         self.options = options
         self.forest = forest
@@ -341,14 +341,13 @@ class Sweep:
         return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
     def admit_local(self) -> None:
-        """Case K3, a small tree beside a body: the local owners, their candidates, queues and blocks."""
+        """Case K3, a small tree beside a body: the local owners, claimed per world at run time."""
         model = self.model
         laws = self.laws.set
         self.local_solve_max_rows = min(_LOCAL_SOLVE_MAX_ROWS, self.placement.dense_max_constraints)
         self.local_residual_max_rows = min(_LOCAL_RESIDUAL_MAX_ROWS, self.placement.dense_max_constraints)
         self.local_residual_mf_max_rows = min(_LOCAL_RESIDUAL_MF_MAX_ROWS, self.placement.mf_max_constraints)
         local_budget = arch_budget(model.device.arch) if model.device.is_cuda else 0
-        # Case K3, a small tree beside a body: the local owners, claimed per world at run time.
         local_decline = (
             self.routes.taken("K3")
             or capable("local", laws)
@@ -800,7 +799,6 @@ class Sweep:
         """Case K5, a tree beside one free body: the paired response and its factor coordinates."""
         model = self.model
         laws = self.laws.set
-        # Case K5, a tree beside one free body: factor coordinates, over the paired response.
         self.paired_response_reason = self.routes.taken("K5")
         response_pair = None if self.paired_response_reason else self._select_paired_response()
         if response_pair is None and self.paired_response_reason is None:
@@ -1904,9 +1902,7 @@ class Sweep:
         prev_mf_row_type = self.placement.ws_prev_mf_row_type
         prev_mf_row_parent = self.placement.ws_prev_mf_row_parent
         if prev_mf_row_type is None:
-            # Use the dedicated reset sink, not dummy_contact_row_type: the
-            # kernel writes -1 into this buffer and the shared dummy must stay
-            # all zeros for its other consumers.
+            # The dedicated reset sink: the kernel writes -1 into this buffer.
             prev_mf_row_type = self.placement.reset_dummy_mf_row_type
         if prev_mf_row_parent is None:
             prev_mf_row_parent = self.placement.reset_dummy_mf_row_parent
@@ -1945,20 +1941,6 @@ class Sweep:
 
         dt = self.factor.last_step_dt
         inv_dt = 0.0 if dt is None or dt <= 0.0 else 1.0 / dt
-        enable_friction_flag = 1 if self.options.enable_contact_friction else 0
-        mf_impulses = getattr(self.placement, "mf_impulses", None)
-        if mf_impulses is None:
-            mf_impulses = self.placement.dummy_contact_impulses
-        mf_constraint_count = getattr(self.placement, "mf_constraint_count", None)
-        if mf_constraint_count is None:
-            mf_constraint_count = self.placement.dummy_contact_count
-        mf_row_type = getattr(self.placement, "mf_row_type", None)
-        if mf_row_type is None:
-            mf_row_type = self.placement.dummy_contact_row_type
-        mf_row_parent = getattr(self.placement, "mf_row_parent", None)
-        if mf_row_parent is None:
-            mf_row_parent = self.placement.dummy_contact_row_parent
-
         pool = self.placement.contact_pool
         rows = pool.launch_rows()
         pool.launch(
@@ -1967,14 +1949,14 @@ class Sweep:
             inputs=[
                 bind_contact_routes(self, contacts),
                 self.placement.impulses,
-                mf_impulses,
+                self.placement.mf_impulses,
                 self.placement.constraint_count,
-                mf_constraint_count,
+                self.placement.mf_constraint_count,
                 self.placement.row_type,
                 self.placement.row_parent,
-                mf_row_type,
-                mf_row_parent,
-                enable_friction_flag,
+                self.placement.mf_row_type,
+                self.placement.mf_row_parent,
+                int(self.options.enable_contact_friction),
                 inv_dt,
             ],
             outputs=[contacts.rigid_contact_force],
