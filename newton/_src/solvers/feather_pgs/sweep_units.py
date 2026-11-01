@@ -708,18 +708,10 @@ class ColoredUnits:
         pack (a host readback)."""
         return bool(self.status.numpy()[0])
 
-    def operands(self) -> list:
-        """The colored sweep's operands (:data:`.sweep_routes.COLORED_ABI`, after the matrix-free sweep's)."""
-        return [
-            self.units["world_colored"],
-            self.units["world_slot"],
-            self.units["color_count"],
-            self.units["color_offset"],
-            self.units["color_slot"],
-            self.slots["slot_data"],
-            self.slots["slot_words"],
-            self.slots["slot_metric"],
-        ]
+    def operands(self) -> dict:
+        """The colored sweep's operands by name (:data:`.sweep_routes.COLORED_ABI`, after the matrix-free sweep's)."""
+        names = ("world_colored", "world_slot", "color_count", "color_offset", "color_slot")
+        return {**{name: self.units[name] for name in names}, **self.slots}
 
     def stats(self) -> list[dict]:
         """The last build's units, colors, largest color and mapping of each world that took units (a host

@@ -307,21 +307,16 @@ class SweepTier:
         kernel: The tier's Warp kernel.
         block_dim: Threads per block of its tiled launches.
         tier: Its index among the parallel tiers' world lists, or ``None`` for a tier on the general queue.
-        response_inputs: It takes the in-kernel response inputs after ``omega``.
         kinetic_rows: It reads the keyed rows' operands after those.
         linked_rows: It projects each friction pair on its patch ring's pooled normal load.
         velocity_limit_pass: It runs the last-word velocity-limit pass after its final sweep.
         sweeps: Its sweep budget (0 for an incremental tier).
-        colored_worlds: It reads each world's mapping before ``v_out`` and leaves the colored worlds
-            (:data:`.sweep_routes.COLORED_WORLDS_ABI`).
     """
 
     kernel: wp.Kernel
     block_dim: int = 32
     tier: int | None = None
-    response_inputs: bool = False
     kinetic_rows: bool = False
     linked_rows: bool = False
     velocity_limit_pass: bool = False
     sweeps: int = 0
-    colored_worlds: bool = False

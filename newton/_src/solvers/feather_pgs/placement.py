@@ -1102,12 +1102,17 @@ class Placement:
         """The dense rows of the worlds the tiers own, whose response they form in-kernel (0 without tiers)."""
         return int(getattr(self, "ink_rows", 0))
 
-    def inkernel_response_inputs(self) -> list:
+    def inkernel_response_inputs(self) -> dict:
         """The parallel tiers' in-kernel response operands: the worlds' group indices, the primary and secondary
         groups' factors (the primary's for a model without a secondary) and the rows' cfm."""
         na, nb = self.ink_sizes[0], self.ink_sizes[1]
         L_b = self.factor.L_by_size[nb] if nb else self.factor.L_by_size[na]
-        return [self.ink_meta, self.factor.L_by_size[na], L_b, self.row_cfm]
+        return {
+            "ink_meta": self.ink_meta,
+            "ink_L_a": self.factor.L_by_size[na],
+            "ink_L_b": L_b,
+            "world_row_cfm": self.row_cfm,
+        }
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the response, the whitening and the diagonals

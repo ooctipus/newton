@@ -50,7 +50,6 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
         captured = _Scene(model, _tier_solver(model))
         tiers = captured.solver.sweep.tiers
         self.assertTrue(tiers)
-        self.assertTrue(all(tier.response_inputs for tier in tiers))
         tier_kernels = [tier.kernel for tier in tiers]
         self.assertIsNotNone(captured.solver.placement.ink_sizes)
         allocated, tier_inputs = [], []

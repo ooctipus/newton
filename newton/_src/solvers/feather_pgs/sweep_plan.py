@@ -778,16 +778,6 @@ class Sweep:
         )
         return built
 
-    def weight_operands(self) -> list:
-        """The row weights and the run-time switch that a sweep without them takes once the laws are weighted
-        (:func:`.sweep.weight_arguments`)."""
-        return [self.placement.row_w, 1] if self.laws.set.weighted else []
-
-    def material_operands(self) -> list:
-        """The material contacts' compliance per row, which every sweep built with them takes after its own operands
-        (:func:`.sweep.material_arguments`)."""
-        return [self.placement.row_eps, self.placement.mf_row_eps] if self.options.contact_compliance else []
-
     def _sparse_small_world_lanes(self, staging, budget: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
 
@@ -1418,12 +1408,60 @@ class Sweep:
                     patch_routes(seeded),
                 )
 
+    def _operands(self, v_hat: wp.array, v_out: wp.array) -> dict:
+        """The step's sweep operands by parameter name, which every sweep kernel takes from (:meth:`_launch`). A row
+        array is read here, each step: the contact pool's growth rebinds what a build would hold."""
+        placement, forest = self.placement, self.forest
+        return {
+            "world_constraint_count": placement.constraint_count,
+            "dense_phase_bounds": placement.dense_phase_bounds,
+            "local_solve_owner": placement.local_solve_owner,
+            "world_dof_indices": forest.world_dof_indices,
+            "rhs_bias": placement.rhs,
+            "row_incident": placement.row_incident,
+            "world_diag": placement.diag,
+            "world_row_w": placement.row_w,
+            "world_row_eps": placement.row_eps,
+            "world_impulses": placement.impulses,
+            "response_dofs": forest.articulation_response_dof_count,
+            "articulation_world_dof_offset": forest.articulation_world_dof_offset,
+            "packed_dense": int(placement.packed_dense),
+            "packed_Z": placement.packed_Z,
+            "row_sides": placement.row_sides,
+            "world_row_type": placement.row_type,
+            "world_row_parent": placement.row_parent,
+            "world_row_mu": placement.row_mu,
+            "mf_constraint_count": placement.mf_constraint_count,
+            "mf_contact_rows_end": placement.mf_contact_rows_end,
+            "mf_meta": placement.mf_meta_packed,
+            "mf_impulses": placement.mf_impulses,
+            "mf_Z_a": placement.mf_Z_a,
+            "mf_Z_b": placement.mf_Z_b,
+            "mf_row_mu": placement.mf_row_mu,
+            "mf_row_w": placement.mf_row_w,
+            "mf_row_eps": placement.mf_row_eps,
+            "regularize": int(self.laws.set.weighted),
+            "iterations": self.options.pgs_iterations,
+            "omega": self.options.pgs_omega,
+            "v_hat": v_hat,
+            "v_out": v_out,
+        }
+
+    def _launch(self, kernel, operands: dict, dim: int, block_dim: int, *, stream=None, **named) -> None:
+        """Launch a sweep with each of its parameters read by name: ``named`` first, then ``operands``."""
+        named.update(zip(("readout",), self.readout.operands(kernel), strict=False))
+        wp.launch_tiled(
+            kernel,
+            dim=[dim],
+            inputs=[named[arg.label] if arg.label in named else operands[arg.label] for arg in kernel.adj.args],
+            block_dim=block_dim,
+            device=self.model.device,
+            stream=stream,
+        )
+
     def _launch_local_internal_solve(
         self,
-        v_out: wp.array,
-        dense_rhs: wp.array,
-        iterations: int,
-        omega: float,
+        operands: dict,
         *,
         solve_single: bool = True,
         solve_pair: bool = True,
@@ -1440,59 +1478,28 @@ class Sweep:
             owner: int,
             count: int,
             active_count: wp.array,
-            use_active_queue: bool,
             warps_per_block: int = 1,
             worlds_per_block: int | None = None,
         ) -> None:
             if worlds_per_block is None:
                 worlds_per_block = warps_per_block
-            secondary_group_size = secondary_size if secondary_size > 0 else primary_size
-            inputs = [primary_candidates, secondary_candidates]
-            if use_active_queue:
-                inputs.extend([active_count, count])
-            inputs.extend(
-                [
-                    owner,
-                    self.forest.art_group_idx,
-                    self.forest.art_to_world,
-                    self.forest.articulation_dof_start,
-                    self.placement.local_solve_owner,
-                    self.placement.constraint_count,
-                    self.factor.L_by_size[primary_size],
-                    self.factor.L_by_size[secondary_group_size],
-                    self.placement.packed_Z,
-                    self.placement.row_sides,
-                    self.forest.articulation_response_dof_count,
-                    self.forest.articulation_world_dof_offset,
-                    int(self.placement.packed_dense),
-                    dense_rhs,
-                    self.placement.row_type,
-                    self.placement.row_parent,
-                    self.placement.row_mu,
-                    self.placement.mf_constraint_count,
-                    self.placement.mf_meta_packed,
-                    self.placement.mf_impulses,
-                    self.placement.mf_Z_a,
-                    self.placement.mf_Z_b,
-                    self.placement.mf_row_mu,
-                    int(self.laws.set.weighted),
-                    self.placement.row_w,
-                    self.placement.mf_row_w,
-                    iterations,
-                    omega,
-                ]
-            )
-            outputs = [self.placement.diag, self.placement.impulses, v_out]
-            if self.placement.row_packets is not None:
-                outputs.extend([self.placement.row_packets.prefix, self.placement.row_packets.packet])
-            outputs.extend([*self.material_operands(), *self.readout.operands(kernel)])
-            wp.launch_tiled(
+            packets = self.placement.row_packets
+            self._launch(
                 kernel,
-                dim=[count // worlds_per_block],
-                inputs=inputs,
-                outputs=outputs,
-                block_dim=32 * warps_per_block,
-                device=self.model.device,
+                operands,
+                count // worlds_per_block,
+                32 * warps_per_block,
+                candidate_articulations=primary_candidates,
+                candidate_secondary_articulations=secondary_candidates,
+                active_candidate_count=active_count,
+                candidate_grid_stride=count,
+                expected_owner=owner,
+                articulation_group_index=self.forest.art_group_idx,
+                articulation_world=self.forest.art_to_world,
+                articulation_dof_start=self.forest.articulation_dof_start,
+                L_group=self.factor.L_by_size[primary_size],
+                secondary_L_group=self.factor.L_by_size[secondary_size if secondary_size > 0 else primary_size],
+                **({} if packets is None else {"prefix": packets.prefix, "packets": packets.packet}),
             )
 
         if solve_single:
@@ -1506,7 +1513,6 @@ class Sweep:
                     PGS_LOCAL_SOLVE_OWNER_SINGLE,
                     self.local_internal_art_counts[size],
                     self.local_general_world_count,
-                    False,
                     self.local_internal_warps_per_block[size],
                     self.local_internal_worlds_per_block[size],
                 )
@@ -1521,7 +1527,6 @@ class Sweep:
                     PGS_LOCAL_SOLVE_OWNER_PAIR,
                     self.local_pair_solver_blocks[size],
                     self.local_pair_active_counts[size],
-                    True,
                     self.local_pair_warps_per_block[size],
                 )
         if solve_residual:
@@ -1535,118 +1540,64 @@ class Sweep:
                     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
                     self.local_residual_solver_warps[size],
                     self.local_residual_active_counts[size],
-                    True,
                     self.local_residual_warps_per_block[size],
                 )
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
         """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: the claims in order, then the rest."""
-        dense_rhs = self.placement.rhs
-        mf_meta = self.placement.mf_meta_packed
         iterations = self.options.pgs_iterations
-        omega = self.options.pgs_omega
         if iterations <= 0 and not self.seeded:
             return
+        operands = self._operands(v_hat, v_out)
         if self.routes.case == "K1":
+            placement = self.placement
             worlds_per_block = 64 // self.sparse_solve_lanes
-            wp.launch_tiled(
+            self._launch(
                 self.sparse_kernel,
-                dim=[(self.forest.world_count + worlds_per_block - 1) // worlds_per_block],
-                inputs=[
-                    self.forest.world_count,
-                    self.placement.constraint_count,
-                    dense_rhs,
-                    self.placement.diag,
-                    self.placement.impulses,
-                    self.placement.sparse_row_dof,
-                    self.placement.sparse_row_factor,
-                    self.placement.row_incident,
-                    self.placement.row_type,
-                    self.placement.row_parent,
-                    self.placement.row_mu,
-                    self.forest.world_dof_indices,
-                    v_hat,
-                    self.placement.mf_constraint_count,
-                    mf_meta,
-                    self.placement.mf_impulses,
-                    self.placement.mf_Z_a,
-                    self.placement.mf_Z_b,
-                    self.placement.mf_row_mu,
-                    iterations,
-                    omega,
-                    # Contact units read the triplets' block records.
-                    *(
-                        ()
-                        if self.placement.sparse_contact_records is None
-                        else (self.placement.sparse_contact_records,)
-                    ),
-                ],
-                outputs=[
-                    self.placement.sparse_factor_velocity_delta,
-                    self.placement.sparse_row_support,
-                    *self.weight_operands(),
-                    *self.material_operands(),
-                    *self.readout.operands(self.sparse_kernel),
-                ],
-                block_dim=64,
-                device=self.model.device,
+                operands,
+                (self.forest.world_count + worlds_per_block - 1) // worlds_per_block,
+                64,
+                world_count=self.forest.world_count,
+                row_dof=placement.sparse_row_dof,
+                row_factor=placement.sparse_row_factor,
+                factor_velocity_delta=placement.sparse_factor_velocity_delta,
+                support=placement.sparse_row_support,
+                contact_records=placement.sparse_contact_records,
             )
             self.factor.leave(
                 v_out,
-                size=self.placement.sparse_mass_matrix_size,
+                size=placement.sparse_mass_matrix_size,
                 indices=self.factor.sparse_mass_matrix_indices,
                 Linv=self.factor.sparse_Linv,
-                delta=self.placement.sparse_factor_velocity_delta,
+                delta=placement.sparse_factor_velocity_delta,
                 base=v_hat,
             )
             return
         if self.routes.case == "K2":
-            kernel = self.sparse_diagonal_kernel
-            if kernel is None:
-                raise RuntimeError("Sparse diagonal GS kernel is unavailable for this solver shape")
-            dense_size = self.placement.sparse_diagonal_dense_size
-            wp.launch_tiled(
-                kernel,
-                dim=[self.forest.world_count],
-                inputs=[
-                    self.placement.constraint_count,
-                    self.forest.world_dof_indices,
-                    dense_rhs,
-                    self.placement.row_incident,
-                    self.placement.diag,
-                    self.placement.impulses,
-                    self.placement.row_type,
-                    self.placement.row_parent,
-                    self.placement.row_mu,
-                    self.placement.dense_phase_bounds,
-                    self.placement.sparse_contact_group_count,
-                    self.placement.sparse_contact_group_heads,
-                    self.placement.sparse_contact_serial_count,
-                    self.placement.sparse_contact_serial_normals,
-                    self.placement.sparse_diagonal_dense_offsets,
-                    self.placement.sparse_diagonal_dense_groups,
-                    self.factor.L_by_size[dense_size],
-                    self.placement.J_by_size[dense_size],
-                    self.placement.sparse_diagonal_row_dof,
-                    self.placement.sparse_diagonal_row_z,
-                    self.placement.fused_diagonal_limit_active,
-                    self.placement.fused_diagonal_limit_lower_rhs,
-                    self.placement.fused_diagonal_limit_upper_rhs,
-                    self.factor.diagonal_inverse_mass,
-                    self.options.pgs_cfm,
-                    iterations,
-                    omega,
-                ],
-                outputs=[
-                    self.placement.fused_diagonal_limit_lower_lambda,
-                    self.placement.fused_diagonal_limit_upper_lambda,
-                    v_out,
-                    *self.weight_operands(),
-                    *self.material_operands(),
-                    *self.readout.operands(kernel),
-                ],
-                block_dim=32,
-                device=self.model.device,
+            placement = self.placement
+            dense_size = placement.sparse_diagonal_dense_size
+            self._launch(
+                self.sparse_diagonal_kernel,
+                operands,
+                self.forest.world_count,
+                32,
+                sparse_contact_group_count=placement.sparse_contact_group_count,
+                sparse_contact_group_heads=placement.sparse_contact_group_heads,
+                sparse_contact_serial_count=placement.sparse_contact_serial_count,
+                sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
+                dense_offsets=placement.sparse_diagonal_dense_offsets,
+                dense_groups=placement.sparse_diagonal_dense_groups,
+                dense_L=self.factor.L_by_size[dense_size],
+                dense_Z=placement.J_by_size[dense_size],
+                sparse_row_dof=placement.sparse_diagonal_row_dof,
+                sparse_row_z=placement.sparse_diagonal_row_z,
+                fused_limit_active=placement.fused_diagonal_limit_active,
+                fused_limit_lower_rhs=placement.fused_diagonal_limit_lower_rhs,
+                fused_limit_upper_rhs=placement.fused_diagonal_limit_upper_rhs,
+                diagonal_inverse_mass=self.factor.diagonal_inverse_mass,
+                fused_limit_cfm=self.options.pgs_cfm,
+                fused_limit_lower_lambda=placement.fused_diagonal_limit_lower_lambda,
+                fused_limit_upper_lambda=placement.fused_diagonal_limit_upper_lambda,
             )
             return
         if not self.forest.max_world_dofs:
@@ -1657,10 +1608,11 @@ class Sweep:
 
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
         self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
-        launch_local = bool(self.local_internal_kernels or self.local_pair_kernels or self.local_residual_kernels)
-        local_stream = self.local_internal_stream if launch_local else None
-        pair_stream = self.local_pair_stream if launch_local else None
-        residual_stream = self.local_residual_stream if launch_local else None
+        local_stream, pair_stream, residual_stream = (
+            self.local_internal_stream,
+            self.local_pair_stream,
+            self.local_residual_stream,
+        )
         if local_stream is not None:
             local_ready_event = wp.get_stream(self.model.device).record_event()
             local_stream.wait_event(local_ready_event)
@@ -1668,9 +1620,6 @@ class Sweep:
                 pair_stream.wait_event(local_ready_event)
             if residual_stream is not None:
                 residual_stream.wait_event(local_ready_event)
-        use_general_queue = bool(self.placement.local_internal_fast_path)
-        general_block_count = self.mf_gs_block_count
-        if local_stream is not None:
             # Admit scarce residual and paired worlds before the bulk single-world grid can occupy the GPU.
             if residual_stream is not None:
                 wp.launch(local_solve_launch_gate, dim=1, device=self.model.device)
@@ -1686,102 +1635,47 @@ class Sweep:
         factor_kernel = self.paired_factor_kernel
         components = self.paired_components
         if components is not None:
-            components.prepare(self, dense_rhs, mf_meta)
+            components.prepare(self, self.placement.rhs, self.placement.mf_meta_packed)
         factor_stream = self.paired_general_solve_stream
         if factor_stream is not None:
             wp.get_stream(self.model.device).record_event(self.paired_general_ready)
             factor_stream.wait_event(self.paired_general_ready)
-        if factor_kernel is not None:
-            primary_size = self.paired_response_primary_size
-            secondary_size = self.paired_response_secondary_size
-            if (
-                primary_size is None
-                or secondary_size is None
-                or self.paired_factor_primary_groups_by_world is None
-                or self.paired_factor_secondary_groups_by_world is None
-                or self.paired_factor_primary_offsets_by_world is None
-                or self.paired_factor_secondary_offsets_by_world is None
-            ):
-                raise RuntimeError("paired factor-coordinate solve metadata is incomplete")
 
-            def launch_factor_solve():
-                with self.timed(f"factor_pgs_iters{iterations}"):
-                    wp.launch_tiled(
-                        factor_kernel,
-                        dim=[(self.forest.world_count + 1) // 2],
-                        inputs=[
-                            self.forest.world_count,
-                            self.placement.constraint_count,
-                            self.placement.dense_phase_bounds,
-                            self.forest.world_dof_indices,
-                            dense_rhs,
-                            self.placement.row_incident,
-                            self.placement.diag,
-                            self.placement.impulses,
-                            # The factor rows: the packed rows at their world coordinates.
-                            self.placement.packed_Z,
-                            self.placement.row_type,
-                            self.placement.row_parent,
-                            self.placement.row_mu,
-                            self.placement.mf_constraint_count if components is None else components.selector,
-                            self.factor.L_by_size[primary_size],
-                            self.factor.L_by_size[secondary_size],
-                            self.paired_factor_primary_groups_by_world,
-                            self.paired_factor_secondary_groups_by_world,
-                            self.paired_factor_primary_offsets_by_world,
-                            self.paired_factor_secondary_offsets_by_world,
-                            iterations,
-                            omega,
-                        ],
-                        outputs=[
-                            v_out,
-                            *self.weight_operands(),
-                            *self.material_operands(),
-                            *self.readout.operands(factor_kernel),
-                        ],
-                        block_dim=64,
-                        device=self.model.device,
-                        stream=factor_stream,
-                    )
+        def launch_factor_solve():
+            with self.timed(f"factor_pgs_iters{iterations}"):
+                self._launch(
+                    factor_kernel,
+                    operands,
+                    (self.forest.world_count + 1) // 2,
+                    64,
+                    stream=factor_stream,
+                    world_count=self.forest.world_count,
+                    # The factor rows: the packed rows at their world coordinates.
+                    factor_rows=self.placement.packed_Z,
+                    world_mf_constraint_count=(
+                        self.placement.mf_constraint_count if components is None else components.selector
+                    ),
+                    primary_L=self.factor.L_by_size[self.paired_response_primary_size],
+                    secondary_L=self.factor.L_by_size[self.paired_response_secondary_size],
+                    primary_group_by_world=self.paired_factor_primary_groups_by_world,
+                    secondary_group_by_world=self.paired_factor_secondary_groups_by_world,
+                    primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
+                    secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
+                )
 
-            if factor_stream is None:
-                launch_factor_solve()
+        if factor_kernel is not None and factor_stream is None:
+            launch_factor_solve()
         with self.timed(f"mfgs_iters{iterations}"):
-            mf_gs_inputs = [
-                self.local_general_world_count,
-                self.local_general_worlds,
-                general_block_count,
-                int(use_general_queue),
-                self.placement.constraint_count,
-                self.placement.dense_phase_bounds,
-                self.placement.local_solve_owner if components is None else components.selector,
-                self.forest.world_dof_indices,
-                dense_rhs,
-                self.placement.row_incident,
-                self.placement.diag,
-                self.placement.row_w,
-                self.placement.impulses,
-                self.forest.articulation_response_dof_count,
-                self.forest.articulation_world_dof_offset,
-                int(self.placement.packed_dense),
-                self.placement.packed_Z,
-                self.placement.row_sides,
-                self.placement.row_type,
-                self.placement.row_parent,
-                self.placement.row_mu,
-                self.placement.mf_constraint_count,
-                self.placement.mf_contact_rows_end,
-                mf_meta,
-                self.placement.mf_impulses,
-                self.placement.mf_Z_a,
-                self.placement.mf_Z_b,
-                self.factor.view(),
-                self.placement.mf_row_mu,
-                self.placement.mf_row_w,
-                iterations,
-                omega,
-                int(self.laws.set.weighted),
-            ]
+            # The worlds a sweep walks and which of them each row claims: the world queue, or every world.
+            queue = {
+                "general_world_count": self.local_general_world_count,
+                "general_worlds": self.local_general_worlds,
+                "general_world_grid_stride": self.mf_gs_block_count,
+                "use_general_world_queue": int(self.placement.local_internal_fast_path),
+                "factors": self.factor.view(),
+            }
+            if components is not None:
+                queue["local_solve_owner"] = components.selector
             # The tiers own the worlds with only dense rows inside their row bound; the general sweep returns
             # early for those and solves the rest.
             tier_lists = self.tier_worlds is not None
@@ -1800,46 +1694,30 @@ class Sweep:
                     outputs=[self.tier_worlds, self.tier_counts],
                     device=self.model.device,
                 )
-            sweeps = list(self.tiers)
             colored_kernel = self.mf_colored_kernel
-            if mf_gs_kernel is not None:
-                sweeps.append(SweepTier(mf_gs_kernel, colored_worlds=colored_kernel is not None))
-            for sweep in sweeps:
-                inputs = mf_gs_inputs
-                dim = general_block_count
-                if sweep.tier is not None and tier_lists:
+            for tier in self.tiers:
+                named = dict(queue)
+                dim = self.mf_gs_block_count
+                if tier_lists:
                     # This tier grid-strides over its own compacted world list.
-                    inputs = [
-                        self.tier_count_views[sweep.tier],
-                        self.tier_world_views[sweep.tier],
-                        self.tier_blocks,
-                        1,
-                        *mf_gs_inputs[4:],
-                    ]
                     dim = self.tier_blocks
-                if sweep.response_inputs:
-                    inputs = inputs + self.placement.inkernel_response_inputs()
-                    if sweep.kinetic_rows:
-                        inputs = [*inputs, *self.placement.keyed_rows.parallel_arguments()]
-                if sweep.colored_worlds:
-                    inputs = [*inputs, self.colored_units.world_colored]
-                wp.launch_tiled(
-                    sweep.kernel,
-                    dim=[dim],
-                    inputs=inputs,
-                    outputs=[v_out, *self.material_operands(), *self.readout.operands(sweep.kernel)],
-                    block_dim=sweep.block_dim,
-                    device=self.model.device,
-                )
+                    named.update(
+                        general_world_count=self.tier_count_views[tier.tier],
+                        general_worlds=self.tier_world_views[tier.tier],
+                        general_world_grid_stride=self.tier_blocks,
+                        use_general_world_queue=1,
+                    )
+                named.update(self.placement.inkernel_response_inputs())
+                if tier.kinetic_rows:
+                    keyed = self.placement.keyed_rows.parallel_arguments()
+                    named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
+                self._launch(tier.kernel, operands, dim, tier.block_dim, **named)
+            colored = {} if colored_kernel is None else self.colored_units.operands()
+            self._launch(mf_gs_kernel, operands, self.mf_gs_block_count, 32, **queue, **colored)
             if colored_kernel is not None:
                 # The worlds the unit builder's rule picked: a block each, a color's units at once.
-                wp.launch_tiled(
-                    colored_kernel,
-                    dim=[general_block_count],
-                    inputs=[*mf_gs_inputs, *self.colored_units.operands()],
-                    outputs=[v_out, *self.material_operands(), *self.readout.operands(colored_kernel)],
-                    block_dim=sweep_routes.COLORED_THREADS,
-                    device=self.model.device,
+                self._launch(
+                    colored_kernel, operands, self.mf_gs_block_count, sweep_routes.COLORED_THREADS, **queue, **colored
                 )
         if factor_stream is not None:
             # Queue the scarce general tail first; the independent paired
@@ -1847,45 +1725,22 @@ class Sweep:
             launch_factor_solve()
             factor_stream.record_event(self.paired_general_done)
             wp.get_stream(self.model.device).wait_event(self.paired_general_done)
+        if local_stream is None:
+            return
         local_done_events = []
-        if launch_local:
-            if local_stream is not None:
-                if residual_stream is not None:
-                    with wp.ScopedStream(residual_stream, sync_enter=False):
-                        self._launch_local_internal_solve(
-                            dense_rhs,
-                            iterations,
-                            omega,
-                            solve_single=False,
-                            solve_pair=False,
-                        )
-                    local_done_events.append(residual_stream.record_event())
-                if pair_stream is not None:
-                    with wp.ScopedStream(pair_stream, sync_enter=False):
-                        self._launch_local_internal_solve(
-                            dense_rhs,
-                            iterations,
-                            omega,
-                            solve_single=False,
-                            solve_residual=False,
-                        )
-                    local_done_events.append(pair_stream.record_event())
-                with wp.ScopedStream(local_stream, sync_enter=False):
-                    self._launch_local_internal_solve(
-                        dense_rhs,
-                        iterations,
-                        omega,
-                        solve_pair=pair_stream is None,
-                        solve_residual=residual_stream is None,
-                    )
-                local_done_events.append(local_stream.record_event())
-            else:
-                with self.timed(f"mfgs_local_internal_iters{iterations}"):
-                    self._launch_local_internal_solve(
-                        dense_rhs,
-                        iterations,
-                        omega,
-                    )
+        if residual_stream is not None:
+            with wp.ScopedStream(residual_stream, sync_enter=False):
+                self._launch_local_internal_solve(operands, solve_single=False, solve_pair=False)
+            local_done_events.append(residual_stream.record_event())
+        if pair_stream is not None:
+            with wp.ScopedStream(pair_stream, sync_enter=False):
+                self._launch_local_internal_solve(operands, solve_single=False, solve_residual=False)
+            local_done_events.append(pair_stream.record_event())
+        with wp.ScopedStream(local_stream, sync_enter=False):
+            self._launch_local_internal_solve(
+                operands, solve_pair=pair_stream is None, solve_residual=residual_stream is None
+            )
+        local_done_events.append(local_stream.record_event())
         for local_done_event in local_done_events:
             wp.get_stream(self.model.device).wait_event(local_done_event)
 

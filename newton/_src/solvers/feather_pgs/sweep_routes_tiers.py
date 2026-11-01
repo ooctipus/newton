@@ -328,7 +328,6 @@ def parallel_kernel(
     return SweepTier(
         kernel,
         block_dim=NT,
-        response_inputs=True,
         kinetic_rows=row_inputs is not None,
         linked_rows=bool(linked_rows),
         velocity_limit_pass=bool(velocity_limit_pass),
