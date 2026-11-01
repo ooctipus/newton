@@ -258,6 +258,15 @@ class Sweep:
             dtype=wp.int32,
             device=model.device,
         )
+        # Each world's dense arm, the tree the walk whitens and leaves (FL3.5).
+        self.placement.sparse_diagonal_dense_arts_host = (
+            sparse_diagonal_pair[4] if sparse_diagonal_pair is not None else np.zeros(0, dtype=np.int32)
+        )
+        self.placement.sparse_diagonal_dense_arts = wp.array(
+            sparse_diagonal_pair[4] if sparse_diagonal_pair is not None else np.zeros(1, dtype=np.int32),
+            dtype=wp.int32,
+            device=model.device,
+        )
 
     def _select_fused_diagonal_limits(self) -> None:
         """Select independent position limits that can remain outside the dense row system."""
@@ -309,8 +318,9 @@ class Sweep:
 
     def _select_sparse_diagonal_response_pair(
         self, *, factor_dense_contract: bool
-    ) -> tuple[int, int, np.ndarray, np.ndarray] | None:
-        """Select one independent wide component plus one compact dense component per world."""
+    ) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Select one independent wide component plus one compact dense component per world: the two sizes, then per
+        world the dense component's first world coordinate, its group index and its articulation."""
         if not factor_dense_contract or not self.placement.fused_diagonal_joint_limits:
             return None
 
@@ -338,7 +348,7 @@ class Sweep:
         dense_groups = group_indices[dense_arts].astype(np.int32)
         if np.any(dense_offsets < 0) or np.any(dense_groups < 0):
             return None
-        return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
+        return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups, dense_arts.astype(np.int32)
 
     def admit_local(self) -> None:
         """Case K3, a small tree beside a body: the local owners, claimed per world at run time."""
@@ -1308,6 +1318,8 @@ class Sweep:
                 contact_units=self.placement.sparse_diagonal_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
+                # The dense arm leaves by the walk: its slips' frame is compiled where a drive can saturate.
+                walk_frame=bool(self.factor.walk_slip_capacity),
             )
             if self.placement.sparse_diagonal_contact_solve
             else None
@@ -1735,7 +1747,8 @@ class Sweep:
             sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
             dense_offsets=placement.sparse_diagonal_dense_offsets,
             dense_groups=placement.sparse_diagonal_dense_groups,
-            dense_L=self.factor.L_by_size[dense_size],
+            dense_arts=placement.sparse_diagonal_dense_arts,
+            walk=self.factor.walk_view(),
             dense_Z=placement.J_by_size[dense_size],
             sparse_row_dof=placement.sparse_diagonal_row_dof,
             sparse_row_z=placement.sparse_diagonal_row_z,

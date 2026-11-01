@@ -717,13 +717,17 @@ class SolverFeatherPGS(SolverBase):
         # their keyed rows) keep the old pack until their owner converts (FL3.7): its sweep whitens its worlds' J in the
         # kernel. The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support
         # sink.
-        self.placement.walks = self.routes.case == "K1" or bool(
+        general = self.routes.case == "K1" or bool(
             self.routes.case in ("K6", "K5", "K3")
             and self.placement.mf_sweeps
             and self.placement.keyed_rows is None
             and not self.placement.ink_skip_rows()
             and np.any(self.forest.response_dof_count > 0)
         )
+        # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it
+        # by the walk; a key of the star is one step to the world (walk_rows.star_step) and holds no walk data.
+        diagonal = bool(self.routes.case == "K2" and self.placement.sparse_diagonal_contact_solve)
+        self.placement.walks = general or diagonal
         if self.factor.eliminates and not self.placement.walks:
             raise RuntimeError(
                 "Bilateral blocks are closed in the one writer's block phase (walk_rows): their class must walk "
@@ -731,8 +735,11 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
-        if self.placement.walks:
+        if general:
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
+        elif diagonal:
+            self.factor.plan_walk(self.placement.sparse_diagonal_dense_arts_host)
+        if self.placement.walks:
             self.placement.hold_units()
             if self.routes.case == "K1":
                 self.sweep.plan_support_walk()
@@ -1174,8 +1181,9 @@ class SolverFeatherPGS(SolverBase):
         # each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
             packed_diag = self.placement.diagonals(self.v_hat)
-            if self.placement.walks:
-                # The general placement's one writer: seeds walked into the packed rows, their headers (walk_rows).
+            if self.placement.walks and self.routes.case != "K2":
+                # The one writer: seeds walked into the packed rows or the support sink, their headers (walk_rows). The
+                # sparse diagonal's rows are written whole in the row pass (RowLaws.write_slot_rows).
                 self.laws.write_walked(self, state_in, contacts, dt)
             else:
                 self.placement.pack_rows(self.v_hat, write_diag=packed_diag)

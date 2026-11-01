@@ -20,7 +20,6 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from . import response_builds_rows
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF
@@ -352,18 +351,28 @@ def _row_builder(solver, plan, size, source) -> dict:
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
     prepare = (source.prepare_world_contact_rows,) if plan.metadata_launch else ()
+    marker = ()
+    if solver.routes.case == "K2" and size == solver.placement.sparse_diagonal_response_size:
+        # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
+        marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
     if method == "walk":
         from . import walk_rows  # noqa: PLC0415 - the one writer's module
 
         # The row pass writes the records and unit sources; the one writer walks every row (walk_rows): the general
-        # placement's into its packed rows, the support placement's (K1) into its support sink.
-        writer = solver.sweep.support_rows if solver.routes.case == "K1" else walk_rows.writer_kernel(solver)
-        kernels = (walk_rows.write_contact_units, writer)
+        # placement's into its packed rows, the support placement's (K1) into its support sink, the sparse diagonal's
+        # (K2) into its slots sink.
+        if solver.routes.case == "K1":
+            writer = solver.sweep.support_rows
+        elif solver.routes.case == "K2":
+            writer = walk_rows.write_slot_rows
+        else:
+            writer = walk_rows.writer_kernel(solver)
+        kernels = (walk_rows.write_contact_units, writer, *marker)
     elif method == "local_packets":
         from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
         # The packets' producer records every row and its unit source; the one writer walks the general worlds' rows.
-        kernels = (row_packets.produce_contacts, walk_rows.write_walked_rows)
+        kernels = (row_packets.produce_contacts, walk_rows.writer_kernel(solver))
     elif method == "keyed_rows":
         from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
@@ -372,18 +381,10 @@ def _row_builder(solver, plan, size, source) -> dict:
         # materializes the rows of every other world.
         kernels = (keyed_rows.scatter_contact_keys, keyed_rows.materialize_general_rows)
     elif method == "compact_contact_boundary":
-        from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
+        from . import compact_contact, walk_rows  # noqa: PLC0415 - the owner's modules; loaded with the owner
 
-        produce = (compact_contact.produce_contacts,)
-        if size == solver.placement.sparse_diagonal_response_size:
-            # The marker encodes schedule links into the freshly published sparse DOF slots.
-            kernels = (*produce, solver.sweep.sparse_contact_marker)
-        else:
-            kernels = (compact_contact.clear_contact_response, *produce)
-    elif method == "sparse_diagonal":
-        kernels = (*prepare, response_builds_rows.sparse_pair_contact_rows_kernel)
-        if solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units:
-            kernels = (*kernels, solver.sweep.sparse_contact_marker)
+        # The boundary writes the contact rows whole; the one writer walks the limit prefix (walk_rows).
+        kernels = (compact_contact.produce_contacts, walk_rows.write_slot_rows, *marker)
     elif method == "compact_jacobian":
         kernels = (*prepare, source.populate_world_J_for_compact_size)
     else:

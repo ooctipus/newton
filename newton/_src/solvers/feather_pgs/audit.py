@@ -240,7 +240,7 @@ def diagonal_rows(
     dense_offsets: wp.array[int],
     dense_groups: wp.array[int],
     dense_dofs: int,
-    dense_L: wp.array3d[float],
+    coordinates: wp.array2d[float],
     dense_Z: wp.array3d[float],
     sparse_row_dof: wp.array3d[int],
     sparse_row_z: wp.array3d[float],
@@ -248,22 +248,17 @@ def diagonal_rows(
     v: wp.array[float],
     velocity: wp.array2d[float],
 ):
-    """One thread per world: each sparse-diagonal row's ``Z_i^T u+ + eps_i lambda_i``, ``u = L^T P v`` on the dense
-    part (factor coordinate ``k`` at position ``dense_dofs - 1 - k``) and ``u = v / s``, ``s = m^-1/2``, on a slot's
-    coordinate."""
+    """One thread per world: each sparse-diagonal row's ``Z_i^T u+ + eps_i lambda_i``, ``u`` on the dense part the walk's
+    coordinates of ``v`` (``coordinates``, :func:`.tree_factor.walk_enter_kernel`, the frame its rows were whitened in)
+    and ``u = v / s``, ``s = m^-1/2``, on a slot's coordinate."""
     world = wp.tid()
     offset = dense_offsets[world]
     group = dense_groups[world]
     line = a.rows.first[world]
     for i in range(wp.min(a.counts[world], a.capacity)):
         term = float(0.0)
-        for k in range(dense_dofs):
-            u = float(0.0)
-            for j in range(k, dense_dofs):
-                dof = world_dof_indices[world, offset + dense_dofs - 1 - j]
-                if dof >= 0:
-                    u += dense_L[group, j, k] * v[dof]
-            term += dense_Z[group, i, dense_dofs - 1 - k] * u
+        for c in range(dense_dofs):
+            term += dense_Z[group, i, c] * coordinates[world, offset + c]
         for slot in range(2):
             world_dof = sparse_row_dof[line, i, slot]
             if world_dof >= 0:
@@ -539,6 +534,25 @@ class Audit:
         a.capacity = solver.placement.dense_max_constraints
         return a
 
+    def _walk_coordinates(self, velocity: wp.array, coordinates: wp.array) -> None:
+        """The walked trees' coordinates of ``velocity`` in the walk's frame, at their world coordinates
+        (:func:`.tree_factor.walk_enter_kernel`)."""
+        solver = self.solver
+        factor, forest = solver.factor, solver.forest
+        wp.launch(
+            walk_enter_kernel(),
+            dim=factor.walk_arts.shape[0],
+            inputs=[
+                factor.walk_arts,
+                factor.walk_view(),
+                forest.art_to_world,
+                forest.articulation_world_dof_offset,
+                velocity,
+                coordinates,
+            ],
+            device=solver.model.device,
+        )
+
     def launch(self) -> None:
         """Audit the step: after the solve, on the published velocity ``v_out``."""
         solver, forest = self.solver, self.solver.forest
@@ -557,13 +571,15 @@ class Audit:
             wp.launch(sparse_rows, dim=worlds, inputs=inputs, outputs=[self.velocity], device=device)
         elif route == "sparse_diagonal":
             size = solver.placement.sparse_diagonal_dense_size
+            # The dense arms' rows are the walk's (walk_rows): their coordinates are the walk's too.
+            self._walk_coordinates(v, self.coordinates)
             inputs = [
                 a,
                 forest.world_dof_indices,
                 solver.placement.sparse_diagonal_dense_offsets,
                 solver.placement.sparse_diagonal_dense_groups,
                 size,
-                solver.factor.L_by_size[size],
+                self.coordinates,
                 solver.placement.J_by_size[size],
                 solver.placement.sparse_diagonal_row_dof,
                 solver.placement.sparse_diagonal_row_z,
@@ -600,21 +616,8 @@ class Audit:
                 )
             if solver.placement.walks:
                 # The one writer's rows are the walk's (walk_rows): their trees' coordinates are the walk's too.
-                factor = solver.factor
-                for velocity, coordinates in ((v, self.coordinates), (solver.v_hat, self.coordinates_hat)):
-                    wp.launch(
-                        walk_enter_kernel(),
-                        dim=factor.walk_arts.shape[0],
-                        inputs=[
-                            factor.walk_arts,
-                            factor.walk_view(),
-                            forest.art_to_world,
-                            forest.articulation_world_dof_offset,
-                            velocity,
-                            coordinates,
-                        ],
-                        device=device,
-                    )
+                self._walk_coordinates(v, self.coordinates)
+                self._walk_coordinates(solver.v_hat, self.coordinates_hat)
             inputs = [
                 a,
                 solver.placement.row_support(),

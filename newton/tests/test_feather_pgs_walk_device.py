@@ -72,10 +72,10 @@ from newton.tests.test_feather_pgs_walk_rows import random_tree
 
 UNITS = (1, 2, 3, 4)
 """Rows a lane walks: a limit, a velocity limit's pair, a point contact, a contact with spin."""
-UNSTORED = ("sparse", "compact", "keyed")
-"""Prefixes of the CUDA catalogue's routes whose rows no store holds as ``J`` or packed ``Z``: native sparse factors
-(rows in factor coordinates, whitened from a ``J`` in shared scratch), the sparse diagonal and the compact boundary,
-and the keyed rows; :func:`placement_frames` also counts the row packets' worlds as unstored."""
+UNSTORED = ("sparse", "sparse_triplets", "keyed_parallel")
+"""The CUDA catalogue's routes whose rows no store holds as ``J``, packed ``Z`` or the walk's slots: native sparse
+factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the keyed rows;
+:func:`placement_frames` also counts the row packets' worlds as unstored."""
 
 
 def devices() -> list:
@@ -458,14 +458,16 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "frame": 0.0, "tight": 0.0, "leave": 0.0, "kernel": 0.0, "general": 0, "in_kernel": 0}
     out["unstored"] = 0
-    walks = getattr(placement, "walks", False)
+    walks = getattr(placement, "walks", False) and solver.routes.case != "K1"
     if walks:
-        # The general placement's one writer (FL3.3): its rows are walked from seeds, no J is stored. Its rows against
-        # their physical J v_hat and its leave against the float64 walk's (test_feather_pgs_walk_rows); the local
-        # owners' packets' worlds below, in the kernel.
-        from newton.tests.test_feather_pgs_walk_rows import walked_frames  # noqa: PLC0415
+        # The one writer of the general placement (FL3.3) and of the sparse diagonal (FL3.5): its rows are walked from
+        # seeds, no J is stored. Its rows against their physical J v_hat and its leave against the float64 walk's
+        # (test_feather_pgs_walk_rows); the local owners' packets' worlds below, in the kernel. The support
+        # placement's rows (case K1) are TestSupportPlacement's.
+        from newton.tests.test_feather_pgs_walk_rows import slot_frames, walked_frames  # noqa: PLC0415
 
-        walked = walked_frames(solver, joint_q, capture)
+        frames = slot_frames if placement.sparse_diagonal_contact_solve else walked_frames
+        walked = frames(solver, joint_q, capture)
         out.update(rows=walked["rows"], leave=walked["leave"], general=walked["worlds"])
         if placement.row_packets is None:
             return out
@@ -646,7 +648,7 @@ def cuda_placements() -> list:
         for group in conformance.cuda_groups()
         if group.physics.law != "patch"
         for route in (group.reference, *group.routes)
-        if not route.name.startswith(UNSTORED)
+        if route.name not in UNSTORED
     ]
 
 

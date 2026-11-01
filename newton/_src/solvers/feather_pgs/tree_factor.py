@@ -176,6 +176,7 @@ class TreeFactor:
         self.held = None
         self.dynamics_stream = None
         self.walk_arts = None
+        self.walk_slip_capacity = 0
 
     # ---------------------------------------------------------------------------------------------------------------
     # Construction

@@ -423,16 +423,10 @@ class Placement:
 
     def clears_jacobian(self, size: int) -> bool:
         """Whether a size group's rows of the last step are cleared before the producers write the next: not under the
-        matrix-free sweeps (their producers write the packed rows' sides whole) or native sparse factors (no dense
-        Jacobian), nor for the sparse-diagonal response size (no dense Jacobian) or the compact boundary's six
-        coordinates (it clears its rows itself); :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a
-        private Jacobian."""
-        return not (
-            self.mf_sweeps
-            or self.sparse_mass_matrix_size is not None
-            or (self.sparse_diagonal_contact_solve and size == self.sparse_diagonal_response_size)
-            or (self.compact_contact_boundary and size == 6)
-        )
+        matrix-free sweeps (their producers write the packed rows' sides whole), native sparse factors (no dense
+        Jacobian) or the sparse diagonal (its writers store every row's dense part whole, :mod:`.walk_rows`);
+        :attr:`.step_plan.StepPlan.jacobian_clear_sizes` adds the owners of a private Jacobian."""
+        return not (self.mf_sweeps or self.sparse_mass_matrix_size is not None or self.sparse_diagonal_contact_solve)
 
     def _on_contact_rows(self, rows) -> None:
         """Assign the per-contact buffers at the contact pool's ready rows, on creation and after each growth."""
@@ -1047,10 +1041,12 @@ class Placement:
     # ---------------------------------------------------------------------------------------------------------------
 
     def hold_units(self) -> None:
-        """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row."""
-        self.unit_source = wp.full(
-            (self.forest.world_count, self.dense_max_constraints), 0, dtype=wp.int32, device=self.model.device
+        """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row; under the compact
+        boundary only its limit prefix's (its producer walks the contact rows where it reads them)."""
+        rows = (
+            max(int(self.dense_internal_max_rows), 1) if self.compact_contact_boundary else self.dense_max_constraints
         )
+        self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
     def pack_rows(self, v_hat: wp.array, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
@@ -1089,7 +1085,7 @@ class Placement:
 
     def diagonals(self, v_hat: wp.array) -> int:
         """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`: the packed
-        rows, the sparse diagonal or native sparse factors); what the packed rows' build owes (:meth:`pack_rows`,
+        rows; the sparse diagonal's and native sparse factors' writers store theirs); what the packed rows' build owes (:meth:`pack_rows`,
         :func:`.packed_rows.pack_kernel`'s ``write_diag``): 0 nothing, 2 ``|Z|^2 + cfm``."""
         if self.packed_response:
             # The packed rows' build stores |Z|^2 + cfm in the general worlds; local row packets keep their worlds'
@@ -1097,37 +1093,8 @@ class Placement:
             if self.row_packets is None:
                 self.diag.zero_()
             return 2
-        if self.sparse_diagonal_contact_solve:
-            # The sparse-diagonal owner whitens its rows' dense parts in place and stores their diagonals with cfm:
-            # every row, or the compact boundary's limit prefix (its producer whitens its contact rows as it writes).
-            size = self.sparse_diagonal_dense_size
-            rows = 12 if self.compact_contact_boundary else self.dense_max_constraints
-            wp.launch(
-                response_builds_rows.SPARSE_PAIR.whiten(),
-                dim=self.forest.world_count * rows,
-                inputs=[
-                    self.factor.L_by_size[size],
-                    self.sparse_diagonal_dense_groups,
-                    self.sparse_diagonal_dense_offsets,
-                    self.forest.world_dof_indices,
-                    self.constraint_count,
-                    self.dense_first,
-                    self.dense_phase_bounds,
-                    int(self.compact_contact_boundary),
-                    rows,
-                    self.dense_max_constraints,
-                    size,
-                    self.sparse_diagonal_row_dof,
-                    self.sparse_diagonal_row_z,
-                    self.row_cfm,
-                    self.factor.diagonal_inverse_mass,
-                    v_hat,
-                ],
-                outputs=[self.J_by_size[size], self.diag, self.row_incident],
-                device=self.model.device,
-            )
-            return 0
-        # Native sparse factors (case K1): their producers write the diagonal with its CFM.
+        # Native sparse factors (case K1) and the sparse diagonal (K2, walk_rows): their writers store the diagonal with
+        # its CFM.
         return 0
 
     def whiten_free_bodies(self, v_hat: wp.array, dt: float):

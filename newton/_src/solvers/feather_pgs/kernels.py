@@ -1958,21 +1958,6 @@ def populate_world_J_for_compact_size(
                 J_group[at[0], slot + CONTACT_SPIN_ROW, at[1] + local_dof] = spin_b
 
 
-@wp.kernel
-def clear_sparse_diagonal_response_prefix(
-    dense_first: wp.array[int],
-    dense_phase_bounds: wp.array2d[int],
-    # in/out
-    sparse_row_dof: wp.array3d[int],
-):
-    """Remove stale sparse entries from the non-contact row prefix."""
-    world = wp.tid()
-    line = dense_first[world]
-    for row in range(dense_phase_bounds[world, 1]):
-        sparse_row_dof[line, row, 0] = -1
-        sparse_row_dof[line, row, 1] = -1
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Free bodies in factor coordinates
 # ---------------------------------------------------------------------------------------------------------------------

@@ -30,7 +30,7 @@ import warp as wp
 
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
-from . import field_group, host_index, prefix_rows, response_builds_rows, walk_rows
+from . import field_group, host_index, prefix_rows, walk_rows
 from .configuration import Options
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
@@ -55,7 +55,6 @@ from .kernels import (
     allocate_world_contact_slots,
     build_joint_limit_rows_for_size,
     build_mf_contact_rows,
-    clear_sparse_diagonal_response_prefix,
     compute_world_contact_bias,
     finalize_constraint_counts_with_status,
     gather_mf_warmstart,
@@ -150,8 +149,11 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
     # A row's side: its articulation's coordinates in the packed rows (cleared, then the coefficient), or the size
     # group's row (cleared each step).
     sink = f"""            if (support.walks != 0) {{
-                // The one writer walks the row (walk_rows): its unit source, the coordinate's side.
-                support.units.data[at] = (2 << 28) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
+                // The one writer walks the row (walk_rows): its unit source, the coordinate's side, in the units' own
+                // rows (the compact boundary keeps its limit prefix's alone).
+                if (slot < support.units.shape[1])
+                    support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] =
+                        (2 << 28) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0));
             }} else {{
                 float* J_side = &J_group.data[((size_t)row_index * J_group.shape[1] + slot) * J_group.shape[2] + first];
                 if (support.packed != 0) {{
@@ -579,20 +581,6 @@ class RowLaws:
             solver.placement.mf_first_rejected_slot if mf_active else solver.placement.dummy_mf_slot_counter
         )
         support = solver.placement.row_support()
-        if solver.placement.compact_contact_boundary:
-            from .compact_contact import clear_limit_prefix  # noqa: PLC0415
-
-            wp.launch(
-                clear_limit_prefix,
-                dim=(solver.forest.world_count, 12),
-                inputs=[
-                    solver.placement.dense_first,
-                    solver.placement.sparse_diagonal_dense_groups,
-                    solver.placement.J_by_size[6],
-                    solver.placement.sparse_diagonal_row_dof,
-                ],
-                device=model.device,
-            )
         if solver.placement.row_packets is not None:
             solver.placement.row_packets.prepare_prefix(state_in, dt)
         if solver.placement.keyed_rows is not None:
@@ -813,15 +801,6 @@ class RowLaws:
                 device=model.device,
             )
 
-        if solver.placement.sparse_diagonal_contact_solve:
-            wp.launch(
-                clear_sparse_diagonal_response_prefix,
-                dim=solver.forest.world_count,
-                inputs=[solver.placement.dense_first, solver.placement.dense_phase_bounds],
-                outputs=[solver.placement.sparse_diagonal_row_dof],
-                device=model.device,
-            )
-
         if (
             solver.options.enable_joint_velocity_limits
             and self.velocity_limit_slot is not None
@@ -844,6 +823,10 @@ class RowLaws:
                     outputs=[solver.placement.jacobian_rows(size), dense_rows],
                     device=model.device,
                 )
+
+        # The sparse diagonal on the walk (FL3.5): its rows, its contact producers among them.
+        slots = solver.placement.walks and solver.placement.sparse_diagonal_contact_solve
+        slots_written = False
 
         if (
             contacts is not None
@@ -927,7 +910,7 @@ class RowLaws:
             elif plan.producer == "compact_contact_boundary":
                 from .compact_contact import launch_contacts  # noqa: PLC0415
 
-                launch_contacts(solver, contact_input, contact_build_threads)
+                launch_contacts(solver, contact_input, dt)
             elif plan.producer in SHARED_METADATA_PRODUCERS:
                 if plan.metadata_launch:
                     pool.launch(
@@ -940,8 +923,6 @@ class RowLaws:
                 contact_jacobian_workers = min(rows, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in solver.forest.size_groups:
                     method = plan.methods[size]
-                    if method == "sparse_diagonal":
-                        continue  # sparse_pair_contact_rows_kernel below writes these rows.
                     pool.launch(
                         populate_world_J_for_compact_size,
                         (contact_jacobian_workers, 32),
@@ -957,40 +938,6 @@ class RowLaws:
                         extent=count,
                         clamp=True,
                     )
-                if plan.producer == "sparse_diagonal":
-                    # The dense builder has 32 lanes per worker. Give the scalar
-                    # builder the contact-build thread budget; its live-prefix
-                    # stride covers larger counts without visiting unused slots.
-                    sparse_contact_response_workers = contact_build_threads
-                    pool.launch(
-                        response_builds_rows.sparse_pair_contact_rows_kernel,
-                        sparse_contact_response_workers,
-                        inputs=[
-                            solver.placement.dense_first,
-                            contact_input,
-                            sparse_contact_response_workers,
-                            solver.placement.sparse_diagonal_response_size,
-                            solver.forest.articulation_world_dof_offset,
-                            solver.forest.body_single_response_dof,
-                            solver.factor.diagonal_inverse_mass,
-                            law,
-                        ],
-                        outputs=[solver.placement.sparse_diagonal_row_dof, solver.placement.sparse_diagonal_row_z],
-                        extent=count,
-                        clamp=True,
-                    )
-                    if (
-                        solver.placement.sparse_diagonal_contact_triples
-                        or solver.placement.sparse_diagonal_contact_units
-                    ):
-                        pool.launch(
-                            solver.sweep.sparse_contact_marker,
-                            contact_build_threads,
-                            inputs=[solver.placement.dense_first, contact_input, contact_build_threads],
-                            outputs=[solver.placement.sparse_diagonal_row_dof],
-                            extent=count,
-                            clamp=True,
-                        )
             else:
                 # The masked builder: a prelude writes the row records and per-contact flags, then one
                 # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
@@ -1055,6 +1002,20 @@ class RowLaws:
                             support,
                         ],
                         outputs=[solver.placement.jacobian_rows(size)],
+                        extent=count,
+                        clamp=True,
+                    )
+            if slots:
+                # The sparse diagonal's rows, every one or the compact boundary's limit prefix, then the independent
+                # chains' marks in the slots they hold.
+                self.write_slot_rows(solver, contact_input, law, dt)
+                slots_written = True
+                if solver.sweep.sparse_contact_marker is not None:
+                    pool.launch(
+                        solver.sweep.sparse_contact_marker,
+                        contact_build_threads,
+                        inputs=[solver.placement.dense_first, contact_input, contact_build_threads],
+                        outputs=[solver.placement.sparse_diagonal_row_dof],
                         extent=count,
                         clamp=True,
                     )
@@ -1207,6 +1168,9 @@ class RowLaws:
                 device=model.device,
             )
 
+        if slots and not slots_written:
+            # Without contact rows the sparse diagonal's rows are its limits.
+            self.write_slot_rows(solver, ContactInput(), patch_row_law(solver), dt)
         if solver.placement.row_packets is not None:
             solver.placement.row_packets.finish_rows()
         wp.launch(
@@ -1348,6 +1312,38 @@ class RowLaws:
                 int(solver.options.contact_compliance),
             ],
             device=model.device,
+        )
+
+    def write_slot_rows(self, solver, contact_input: ContactInput, law, dt: float) -> None:
+        """The sparse diagonal's one writer (:func:`.walk_rows.write_slot_rows`): every dense row, or under the compact
+        boundary its limit prefix, walked into the slots sink with its diagonal, incident velocity and rhs."""
+        placement = solver.placement
+        prefix = bool(placement.compact_contact_boundary)
+        rows = max(int(placement.dense_internal_max_rows), 1) if prefix else placement.dense_max_constraints
+        lanes = min(rows, BIAS_LANES)
+        wp.launch(
+            walk_rows.write_slot_rows,
+            dim=(solver.forest.world_count, lanes),
+            inputs=[
+                bind_dense_rows(placement),
+                placement.row_support(),
+                walk_rows.bind_slot_rows(solver),
+                placement.slot_counter,
+                placement.dense_phase_bounds,
+                int(prefix),
+                lanes,
+                contact_input,
+                law,
+                solver.factor.walk_view(),
+                solver.v_hat,
+                dt,
+                solver.options.contact_speculative_scale,
+                self.contact_w,
+                self.effective_restitution_velocity_threshold,
+                int(self.set.weighted),
+                int(solver.options.contact_compliance),
+            ],
+            device=solver.model.device,
         )
 
     def _build_friction_patches(self, solver, state_in, contacts):

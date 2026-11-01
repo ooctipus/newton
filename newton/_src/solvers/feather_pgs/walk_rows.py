@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The one writer of the general placement (FL3.3): every row a seed and a law, whitened by the walk.
+"""The one writer of the general placement (FL3.3) and of the sparse diagonal (FL3.5): every row a seed and a law,
+whitened by the walk.
 
 A dense row of the general placement (case K6) holds its unit source (:func:`.dense_rows.unit_source`), which its
 producer records with the row's slot and records, in place of a Jacobian. After the row pass, the writer takes every
@@ -42,8 +43,9 @@ from functools import cache
 
 import warp as wp
 
+from . import field_group
 from .contact_input import ContactInput, contact_frame
-from .contact_laws import CONTACT_SPIN_ROW, contact_row_frame, contact_seed, spin_seed
+from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_row_frame, contact_seed, spin_seed
 from .dense_rows import (
     UNIT_CONTACT,
     UNIT_LIMIT,
@@ -58,6 +60,7 @@ from .dense_rows import (
     unit_source,
 )
 from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
+from .field_group import Field
 from .friction_patches import PatchRowLaw
 from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
@@ -82,8 +85,10 @@ from .tree_factor import (
 )
 
 __all__ = [
+    "SlotRows",
     "SupportSink",
     "SupportUnit",
+    "bind_slot_rows",
     "free_body_headers_kernel",
     "support_publish_kernel",
     "support_rows_kernel",
@@ -91,6 +96,7 @@ __all__ = [
     "walked_rows_kernel",
     "write_contact_units",
     "write_free_body_rows",
+    "write_slot_rows",
     "writer_kernel",
     "writer_lanes",
 ]
@@ -101,6 +107,7 @@ def walk_wrench(
     walk: WalkTrees,
     support: RowSupport,
     sides: wp.vec2i,
+    group: int,
     body: int,
     art: int,
     sign: float,
@@ -113,14 +120,14 @@ def walk_wrench(
     slot: int,
 ) -> wp.vec2:
     """Walk a row's seed at ``body``, the wrench of ``sign`` along ``direction`` at ``point`` (a pure ``torque`` about
-    it), into its side's entries of row ``slot``: stored, or added with ``add`` (a second seed on the same side). Return
-    its part of the incident velocity ``J v_hat`` (the step's ``J`` entries the walk passes) and the sum of its
+    it), into its side's entries of row ``slot`` (:func:`.dense_rows.jacobian_row`: the packed rows, or the size group
+    ``group``'s): stored, or added with ``add`` (a second seed on the same side). Return its part of the incident velocity ``J v_hat`` (the step's ``J`` entries the walk passes) and the sum of its
     footprints' squares. A body without response coordinates adds nothing."""
     if body < 0 or art < 0:
         return wp.vec2(0.0)
     if support.dofs[art] <= 0:
         return wp.vec2(0.0)
-    at = jacobian_row(support, 0, art, sides)
+    at = jacobian_row(support, group, art, sides)
     wrench = body_wrench(walk, body, sign * direction, point, torque)
     return walk_body(walk, art, body, wrench, v_hat, add, packed_Z, at[0], slot, at[1])
 
@@ -179,6 +186,7 @@ def walk_covector(
     walk: WalkTrees,
     support: RowSupport,
     sides: wp.vec2i,
+    group: int,
     art: int,
     dof: int,
     value: float,
@@ -187,15 +195,16 @@ def walk_covector(
     packed_Z: wp.array3d[float],
     slot: int,
 ) -> wp.vec2:
-    """Walk a row's covector ``value e_dof`` (a joint row's seed) into its side's entries of row ``slot`` (added with
-    ``add``); return its part of the incident velocity, ``value v_hat[dof]``, and the sum of its footprints' squares."""
+    """Walk a row's covector ``value e_dof`` (a joint row's seed) into its side's entries of row ``slot`` (in the size
+    group ``group``'s rows where they are not packed; added with ``add``); return its part of the incident velocity,
+    ``value v_hat[dof]``, and the sum of its footprints' squares."""
     if art < 0:
         return wp.vec2(0.0)
     if support.dofs[art] <= 0:
         return wp.vec2(0.0)
     d0 = walk.dof_start[art]
     j0 = walk.joint_start[art]
-    at = jacobian_row(support, 0, art, sides)
+    at = jacobian_row(support, group, art, sides)
     return walk_into(
         walk,
         j0,
@@ -225,14 +234,15 @@ def slips_on(walk: WalkTrees, art: int) -> int:
 
 @wp.func
 def release_side(
-    walk: WalkTrees, support: RowSupport, sides: wp.vec2i, art: int, packed_Z: wp.array3d[float], slot: int
+    walk: WalkTrees, support: RowSupport, sides: wp.vec2i, group: int, art: int, packed_Z: wp.array3d[float], slot: int
 ):
-    """The slips' release on articulation ``art``'s side of row ``slot``: ``z <- R z``, the root-most slip first, each
-    along its path leaf first (:func:`.tree_factor.walk_release_tree`), the decided operator's row on the all-``K``
-    walk. The packed side holds the whole tree, and ``R`` keeps every row's support."""
+    """The slips' release on articulation ``art``'s side of row ``slot`` (in the size group ``group``'s rows where they
+    are not packed): ``z <- R z``, the root-most slip first, each along its path leaf first
+    (:func:`.tree_factor.walk_release_tree`), the decided operator's row on the all-``K`` walk. The side holds the whole
+    tree, and ``R`` keeps every row's support."""
     if art < 0:
         return
-    at = jacobian_row(support, 0, art, sides)
+    at = jacobian_row(support, group, art, sides)
     for j in range(walk.release.count[art]):
         release_path(walk.release, art, j, packed_Z, at[0], slot, at[1])
 
@@ -461,10 +471,10 @@ def write_row(
         if art_a >= 0 and art_a == art_b:
             shared = 1
         walked += walk_wrench(
-            walk, support, sides, body_a, art_a, 1.0, direction, row_point, spin, v_hat, 0, packed_Z, slot
+            walk, support, sides, 0, body_a, art_a, 1.0, direction, row_point, spin, v_hat, 0, packed_Z, slot
         )
         walked += walk_wrench(
-            walk, support, sides, body_b, art_b, -1.0, direction, row_point, spin, v_hat, shared, packed_Z, slot
+            walk, support, sides, 0, body_b, art_b, -1.0, direction, row_point, spin, v_hat, shared, packed_Z, slot
         )
         summed = shared == 0
     elif kind == UNIT_LINK:
@@ -483,10 +493,10 @@ def write_row(
         point_p = wp.transform_point(body_q[primary], body_com[primary])
         point_s = wp.transform_point(body_q[shadow], body_com[shadow])
         walked += walk_wrench(
-            walk, support, sides, primary, art_p, 1.0, direction, point_p, angular, v_hat, 0, packed_Z, slot
+            walk, support, sides, 0, primary, art_p, 1.0, direction, point_p, angular, v_hat, 0, packed_Z, slot
         )
         walked += walk_wrench(
-            walk, support, sides, shadow, art_s, -1.0, direction, point_s, angular, v_hat, shared, packed_Z, slot
+            walk, support, sides, 0, shadow, art_s, -1.0, direction, point_s, angular, v_hat, shared, packed_Z, slot
         )
         summed = shared == 0
     elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY:
@@ -494,19 +504,19 @@ def write_row(
         value = 1.0 - 2.0 * float(index - 2 * dof)
         if kind == UNIT_VELOCITY:
             value = velocity_limit_sign[index]
-        walked += walk_covector(walk, support, sides, sides[0], dof, value, v_hat, 0, packed_Z, slot)
+        walked += walk_covector(walk, support, sides, 0, sides[0], dof, value, v_hat, 0, packed_Z, slot)
     elif kind == UNIT_MIMIC:
-        walked += walk_covector(walk, support, sides, sides[0], mimic_dof0[index], 1.0, v_hat, 0, packed_Z, slot)
+        walked += walk_covector(walk, support, sides, 0, sides[0], mimic_dof0[index], 1.0, v_hat, 0, packed_Z, slot)
         walked += walk_covector(
-            walk, support, sides, sides[0], mimic_dof1[index], -mimic_coef1[index], v_hat, 1, packed_Z, slot
+            walk, support, sides, 0, sides[0], mimic_dof1[index], -mimic_coef1[index], v_hat, 1, packed_Z, slot
         )
         summed = False
     # The block's first phase: the slips' release on each side that slips (the closure follows, on these rows).
     if slips_on(walk, sides[0]) != 0:
-        release_side(walk, support, sides, sides[0], packed_Z, slot)
+        release_side(walk, support, sides, 0, sides[0], packed_Z, slot)
         summed = False
     if sides[1] != sides[0] and slips_on(walk, sides[1]) != 0:
-        release_side(walk, support, sides, sides[1], packed_Z, slot)
+        release_side(walk, support, sides, 0, sides[1], packed_Z, slot)
         summed = False
     norm = walked[1]
     if not summed:
@@ -1180,3 +1190,327 @@ def support_publish_kernel(parent: tuple[int, ...], first: tuple[int, ...], node
         dual=True,
         native_name="support_publish_native",
     ).kernel()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The sparse diagonal (case K2): a tree beside a star, its rows into the slots sink (FL3.5)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A world of the sparse diagonal pairs a dense arm (its tree walks) with a star of one-coordinate keys on a fixed root.
+# A row's seed on the arm walks into the row's dense part, the arm's coordinates in the walk's order; a seed on a key is
+# one step to the world, z = (s . w) / ell, the key's step J entry over the root of its pivot (the J / sqrt(m) slot,
+# 1 / ell = sqrt(m^-1) of the factor's diagonal), into the row's two slots. The sweep reads the dense part and the slots
+# (:class:`.response_operator.SparsePairZ`) and leaves the arm by the walk (:func:`.sweep_routes.walk_leave`), the
+# release its rows carry.
+
+SLOT_ROWS = (
+    Field("single_dof", wp.int32, ("body",), owner="forest", attr="body_single_response_dof"),
+    Field("dof_offset", wp.int32, ("articulation",), owner="forest", attr="articulation_world_dof_offset"),
+    Field("inverse_mass", wp.float32, ("dof",), owner="factor", attr="diagonal_inverse_mass"),
+    Field("star", wp.int32, attr="sparse_diagonal_response_size", owner="placement"),
+    Field("dense_group", wp.int32, ("world",), attr="sparse_diagonal_dense_groups", owner="placement"),
+    Field("Z", wp.float32, ("group", "row", "dense"), owner="dense"),
+    Field("dof", wp.int32, ("world", "row", 2), attr="sparse_diagonal_row_dof", owner="placement"),
+    Field("z", wp.float32, ("world", "row", 2), attr="sparse_diagonal_row_z", owner="placement"),
+    Field("incident", wp.float32, ("world", "row"), attr="row_incident", owner="placement"),
+)
+"""The slots sink of the sparse diagonal: each body's single response coordinate, the articulations' first world
+coordinates, the factor's diagonal inverse mass (a key's ``1 / ell^2``), the star's coordinates (``star``), each world's
+dense group; the rows' dense parts by group (``Z``, ``J_by_size`` of the arm's size), their two slots (a world
+coordinate, -1 for none, and its footprint) and their incident velocities."""
+
+SlotRows = field_group.struct("SlotRows", SLOT_ROWS, __name__)
+
+
+def bind_slot_rows(solver) -> SlotRows:
+    """The sparse diagonal's slots sink (:data:`SLOT_ROWS`) of ``solver``."""
+    placement = solver.placement
+    return field_group.bind(
+        SlotRows,
+        placement=placement,
+        forest=solver.forest,
+        factor=solver.factor,
+        Z=placement.J_by_size[placement.sparse_diagonal_dense_size],
+    )
+
+
+@wp.func
+def star_step(
+    slots: SlotRows,
+    data: ContactInput,
+    v_hat: wp.array[float],
+    art: int,
+    body: int,
+    sign: float,
+    row: int,
+    direction: wp.vec3,
+    point: wp.vec3,
+):
+    """A seed on the star, one step to the world: the key's world coordinate and footprint ``z = (s . w) / ell``, ``s .
+    w`` the step's ``J`` entry of ``sign``'s contact row ``row`` along ``direction`` at ``point``
+    (:func:`.contact_laws.contact_row_entry`) and ``1 / ell = sqrt(m^-1)``, and its incident velocity ``j v_hat``;
+    ``(-1, 0, 0)`` for a body without a single response coordinate in its articulation's window."""
+    coordinate = int(-1)
+    value = float(0.0)
+    incident = float(0.0)
+    dof = slots.single_dof[body]
+    if dof >= 0:
+        local = dof - data.dof_start[art]
+        if local >= 0 and local < slots.star:
+            coordinate = slots.dof_offset[art] + local
+            j = contact_row_entry(row, data.motion[dof], direction, point, data.origin[art]) * sign
+            value = j * wp.sqrt(slots.inverse_mass[dof])
+            incident = j * v_hat[dof]
+    return coordinate, value, incident
+
+
+@wp.func
+def slot_seed(
+    walk: WalkTrees,
+    support: RowSupport,
+    slots: SlotRows,
+    data: ContactInput,
+    v_hat: wp.array[float],
+    sides: wp.vec2i,
+    group: int,
+    body: int,
+    art: int,
+    sign: float,
+    row: int,
+    direction: wp.vec3,
+    point: wp.vec3,
+    add: int,
+    slot: int,
+):
+    """One endpoint of contact row ``row`` (``slot``): on a key, its slot (:func:`star_step`); on the arm, walked into
+    the row's dense part (:func:`walk_wrench`, the spin row a torque about the normal; stored, or added with ``add``).
+    Returns the key's coordinate (-1 for none), its footprint, the seed's incident velocity and its footprints' sum of
+    squares on the arm."""
+    coordinate = int(-1)
+    value = float(0.0)
+    walked = wp.vec2(0.0)
+    if body >= 0 and art >= 0:
+        if data.response_dofs[art] == slots.star:
+            coordinate, value, incident = star_step(slots, data, v_hat, art, body, sign, row, direction, point)
+            walked = wp.vec2(incident, 0.0)
+        else:
+            walked = walk_wrench(
+                walk,
+                support,
+                sides,
+                group,
+                body,
+                art,
+                sign,
+                direction,
+                point,
+                row == CONTACT_SPIN_ROW,
+                v_hat,
+                add,
+                slots.Z,
+                slot,
+            )
+    return coordinate, value, walked
+
+
+@wp.func
+def contact_seeds(
+    walk: WalkTrees,
+    support: RowSupport,
+    slots: SlotRows,
+    data: ContactInput,
+    v_hat: wp.array[float],
+    sides: wp.vec2i,
+    group: int,
+    slot: int,
+    row: int,
+    direction: wp.vec3,
+    point: wp.vec3,
+    body_a: int,
+    art_a: int,
+    body_b: int,
+    art_b: int,
+):
+    """Contact row ``row``'s two endpoints (:func:`slot_seed`), the second's seed negated: the row's incident velocity and
+    its arm footprints' sum of squares (``x``, ``y``; negative where both endpoints walk the arm, whose footprints add),
+    then each endpoint's key coordinate (-1 for none) and footprint."""
+    arm_a = int(0)
+    if body_a >= 0 and art_a >= 0:
+        if data.response_dofs[art_a] > 0 and data.response_dofs[art_a] != slots.star:
+            arm_a = 1
+    coord_a, z_a, walked_a = slot_seed(
+        walk, support, slots, data, v_hat, sides, group, body_a, art_a, 1.0, row, direction, point, 0, slot
+    )
+    coord_b, z_b, walked_b = slot_seed(
+        walk, support, slots, data, v_hat, sides, group, body_b, art_b, -1.0, row, direction, point, arm_a, slot
+    )
+    walked = walked_a + walked_b
+    if arm_a != 0 and walked_b[1] > 0.0:
+        walked = wp.vec2(walked[0], -1.0)
+    return walked, coord_a, z_a, coord_b, z_b
+
+
+@wp.func
+def clear_dense_part(slots: SlotRows, group: int, slot: int):
+    """Zero row ``slot``'s dense part before its seeds walk into it."""
+    for c in range(slots.Z.shape[2]):
+        slots.Z[group, slot, c] = 0.0
+
+
+@wp.func
+def slot_header(
+    rows: DenseRows,
+    support: RowSupport,
+    slots: SlotRows,
+    walk: WalkTrees,
+    sides: wp.vec2i,
+    group: int,
+    line: int,
+    slot: int,
+    walked: wp.vec2,
+    coord_a: int,
+    z_a: float,
+    coord_b: int,
+    z_b: float,
+    dt: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    restitution_velocity_threshold: float,
+    weighted: int,
+    material: int,
+):
+    """Finish row ``slot`` once its seeds are walked (``walked``: its incident velocity and its arm footprints' sum of
+    squares, negative where they must be re-read): its two slots, merged into the first on one coordinate; the arm's
+    slips' release (:func:`release_side`); its diagonal ``(|z|^2 + sum_s z_s^2) + cfm``, incident velocity and rhs by the
+    row law (:func:`.kernels.row_bias`)."""
+    if coord_a >= 0 and coord_a == coord_b:
+        z_a += z_b
+        coord_b = -1
+        z_b = 0.0
+    slots.dof[line, slot, 0] = coord_a
+    slots.dof[line, slot, 1] = coord_b
+    slots.z[line, slot, 0] = z_a
+    slots.z[line, slot, 1] = z_b
+    norm = walked[1]
+    if slips_on(walk, sides[0]) != 0:
+        release_side(walk, support, sides, group, sides[0], slots.Z, slot)
+        norm = -1.0
+    if sides[1] != sides[0] and slips_on(walk, sides[1]) != 0:
+        release_side(walk, support, sides, group, sides[1], slots.Z, slot)
+        norm = -1.0
+    if norm < 0.0:
+        norm = float(0.0)
+        for c in range(slots.Z.shape[2]):
+            z = slots.Z[group, slot, c]
+            norm += z * z
+    sparse = float(0.0)
+    if coord_a >= 0:
+        sparse += z_a * z_a
+    if coord_b >= 0:
+        sparse += z_b * z_b
+    rows.diag[line, slot] = (norm + sparse) + rows.row_cfm[line, slot]
+    slots.incident[line, slot] = walked[0]
+    row_bias(
+        rows,
+        line,
+        slot,
+        walked[0],
+        dt,
+        contact_speculative_scale,
+        contact_w,
+        restitution_velocity_threshold,
+        weighted,
+        material,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def write_slot_rows(
+    rows: DenseRows,
+    support: RowSupport,
+    slots: SlotRows,
+    counts: wp.array[int],
+    bounds: wp.array2d[int],
+    prefix: int,
+    lanes: int,
+    data: ContactInput,
+    law: PatchRowLaw,
+    walk: WalkTrees,
+    v_hat: wp.array[float],
+    dt: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    restitution_velocity_threshold: float,
+    weighted: int,
+    material: int,
+):
+    """The sparse diagonal's one writer: a world's ``lanes`` threads stride over its rows (``dim = (worlds, lanes)``),
+    every row (``counts``, the allocation's watermark) or its limit prefix alone (``prefix``: ``bounds[:, 1]``, where the
+    compact boundary writes the contact rows in its producer). Each row's law from its unit source: a contact row's two
+    endpoints (:func:`contact_seeds`), a limit's covector on the arm (:func:`walk_covector`); then its header
+    (:func:`slot_header`)."""
+    world, lane = wp.tid()
+    end = counts[world]
+    if prefix != 0:
+        end = bounds[world, 1]
+    end = wp.min(end, support.units.shape[1])
+    line = rows.first[world]
+    group = slots.dense_group[world]
+    for slot in range(lane, end, lanes):
+        source = support.units[line, slot]
+        kind = source >> UNIT_SHIFT
+        index = source & ((1 << UNIT_SHIFT) - 1)
+        sides = rows.sides[line, slot]
+        clear_dense_part(slots, group, slot)
+        walked = wp.vec2(0.0)
+        coord_a = int(-1)
+        z_a = float(0.0)
+        coord_b = int(-1)
+        z_b = float(0.0)
+        if kind == UNIT_CONTACT:
+            c = index // 4
+            r = index - 4 * c
+            body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+            direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
+            walked, coord_a, z_a, coord_b, z_b = contact_seeds(
+                walk,
+                support,
+                slots,
+                data,
+                v_hat,
+                sides,
+                group,
+                slot,
+                r,
+                direction,
+                row_point,
+                body_a,
+                data.art0[c],
+                body_b,
+                data.art1[c],
+            )
+        elif kind == UNIT_LIMIT:
+            dof = index // 2
+            value = 1.0 - 2.0 * float(index - 2 * dof)
+            walked = walk_covector(walk, support, sides, group, sides[0], dof, value, v_hat, 0, slots.Z, slot)
+        slot_header(
+            rows,
+            support,
+            slots,
+            walk,
+            sides,
+            group,
+            line,
+            slot,
+            walked,
+            coord_a,
+            z_a,
+            coord_b,
+            z_b,
+            dt,
+            contact_speculative_scale,
+            contact_w,
+            restitution_velocity_threshold,
+            weighted,
+            material,
+        )

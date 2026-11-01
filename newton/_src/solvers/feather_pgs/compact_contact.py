@@ -1,23 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Experimental complete contact owner for the existing dense-six + sparse solver.
+"""The compact boundary: the sparse diagonal's contact rows written whole where the contacts are read.
 
-Allocation, contact admission, scheduling, RHS and the solve remain authoritative
-in the original pipeline. This module only changes the representation producer.
-Persistent patch friction writes its tangent rows with the patch row law. The
-patch link, ``_FrictionPatchState.link``, runs after this producer and alone
-links the patch rings and divides the friction coefficient, in one
-``link_patch_routes`` launch over every route.
+A thread per contact row, in the contacts' collision order, calls the contact law (its records,
+:func:`.row_build.write_contact_row`) and walks the row's seeds into the slots sink (:func:`.walk_rows.contact_seeds`,
+:func:`.walk_rows.slot_header`): the same row the sparse diagonal's one writer (:func:`.walk_rows.write_slot_rows`)
+writes from a unit source, without the unit source's pass. Allocation, admission, scheduling and the solve stay the
+original pipeline's. Persistent patch friction writes its tangent rows with the patch row law; the patch link,
+``_FrictionPatchState.link``, runs after this producer and alone links the patch rings and divides the friction
+coefficient, in one ``link_patch_routes`` launch over every route.
 """
 
 import warp as wp
 
-from . import field_group
 from .contact_input import ContactInput
+from .dense_rows import DenseRows, RowSupport
 from .friction_patches import PatchRowLaw, patch_row_law
-from .response_builds_rows import CompactBoundary, sparse_pair_row_response
 from .row_build import write_contact_row
+from .tree_factor import WalkTrees
+from .walk_rows import SlotRows, bind_slot_rows, clear_dense_part, contact_seeds, slot_header
 
 
 def supported(solver) -> bool:
@@ -39,48 +41,24 @@ def supported(solver) -> bool:
     )
 
 
-@wp.kernel
-def clear_limit_prefix(
-    dense_first: wp.array[int], dense_groups: wp.array[int], J: wp.array3d[float], sparse_dof: wp.array3d[int]
+@wp.kernel(enable_backward=False)
+def produce_contacts(
+    data: ContactInput,
+    rows: DenseRows,
+    support: RowSupport,
+    slots: SlotRows,
+    walk: WalkTrees,
+    law: PatchRowLaw,
+    dt: float,
+    contact_speculative_scale: float,
+    contact_w: float,
+    restitution_velocity_threshold: float,
+    weighted: int,
+    material: int,
 ):
-    """Clear every possible dense-six limit row before partial limit writers run."""
-    world, row = wp.tid()
-    line = dense_first[world]
-    for dof in range(6):
-        J[dense_groups[world], row, dof] = 0.0
-    sparse_dof[line, row, 0] = -1
-    sparse_dof[line, row, 1] = -1
-
-
-@wp.kernel
-def clear_contact_response(
-    counts: wp.array[int],
-    bounds: wp.array2d[int],
-    groups: wp.array[int],
-    Z: wp.array3d[float],
-):
-    """Clear only current contact coefficients, with contiguous lanes within each world."""
-    world, lane = wp.tid()
-    start = wp.max(bounds[world, 1], 0)
-    end = wp.min(counts[world], Z.shape[1])
-    if end <= start:
-        return
-    group = groups[world]
-    # The limit prefix already contains the producers' current J. Align the first coefficient tile down for
-    # coalescing, but never write its prefix lanes.
-    first = (start * 6 // 32) * 32
-    for coefficient in range(first + lane, end * 6, 256):
-        if coefficient >= start * 6:
-            row = coefficient // 6
-            dof = coefficient % 6
-            Z[group, row, dof] = 0.0
-
-
-@wp.kernel
-def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
     """Publish each contact's rows in their original collision order, one thread per row (3 per contact, 4 under
-    contact torsion): its records (:func:`.row_build.write_contact_row`), then its whitened dense-six part and sparse
-    slots.
+    contact torsion): its records (:func:`.row_build.write_contact_row`), then its seeds walked into the slots sink and
+    its header (:func:`.walk_rows.contact_seeds`, :func:`.walk_rows.slot_header`).
 
     Tangent rows act at the friction location and follow the patch row law (``patch_tangent_row``): under
     persistent patches at the patch friction location with the anchor's tangential phi, ``law.beta`` and the
@@ -94,59 +72,78 @@ def produce_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRo
     if data.path[contact] != 0 or slot < 0 or row >= data.slots_needed[contact]:
         return
     world = data.world[contact]
-    art0 = data.art0[contact]
-    art1 = data.art1[contact]
+    line = data.first[world]
+    group = slots.dense_group[world]
+    r = slot + row
     body0, body1, direction, row_point = write_contact_row(data, law, contact, row, False)
-    has_dense = False
-    if art0 >= 0 and body0 >= 0:
-        has_dense = data.response_dofs[art0] == 6
-    if art1 >= 0 and body1 >= 0:
-        has_dense = has_dense or data.response_dofs[art1] == 6
-    group = boundary.dense_group[world]
-    sparse_pair_row_response(
-        data, boundary, world, row, slot + row, group, has_dense, art0, body0, art1, body1, direction, row_point
+    sides = rows.sides[line, r]
+    clear_dense_part(slots, group, r)
+    walked, coord0, z0, coord1, z1 = contact_seeds(
+        walk,
+        support,
+        slots,
+        data,
+        data.incident,
+        sides,
+        group,
+        r,
+        row,
+        direction,
+        row_point,
+        body0,
+        data.art0[contact],
+        body1,
+        data.art1[contact],
+    )
+    slot_header(
+        rows,
+        support,
+        slots,
+        walk,
+        sides,
+        group,
+        line,
+        r,
+        walked,
+        coord0,
+        z0,
+        coord1,
+        z1,
+        dt,
+        contact_speculative_scale,
+        contact_w,
+        restitution_velocity_threshold,
+        weighted,
+        material,
     )
 
 
-def launch_contacts(solver, data, workers):
+def launch_contacts(solver, data: ContactInput, dt: float) -> None:
     """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
-    boundary = field_group.bind(
-        CompactBoundary,
-        placement=solver.placement,
-        forest=solver.forest,
-        inverse_mass=solver.factor.diagonal_inverse_mass,
-        factor=solver.factor.L_by_size[6],
-        Z=solver.placement.J_by_size[6],
-    )
-    # Allocation has completed, but constraint_count is finalized later. Keep
-    # this clear and the following producer ordered on the current stream.
-    wp.launch(
-        clear_contact_response,
-        dim=(solver.forest.world_count, 256),
-        inputs=[solver.placement.slot_counter, solver.placement.dense_phase_bounds, boundary.dense_group, boundary.Z],
-        block_dim=256,
-        device=solver.model.device,
-    )
-    # Persistent patches write their tangent rows with the patch row law. The
-    # patch link (_FrictionPatchState.link, one link_patch_routes launch) still
-    # runs after this producer: it alone links normal rows into patch rings and
-    # divides the tangent coefficient.
+    from .dense_rows import bind as bind_dense_rows  # noqa: PLC0415
+
     # A thread per (contact, row); in a capture whose launches bind, each replay runs the live count. The rows
     # take their own axis: the contact axis is captured at the pool's bound, which a scalar thread index times 3
     # would overflow.
     pool = solver.placement.contact_pool
-    count = data.count
-    rows = 4 if solver.laws.contact_torsion_enabled else 3
+    laws = solver.laws
+    rows = 4 if laws.contact_torsion_enabled else 3
     pool.launch(
-        produce_contacts, (pool.launch_rows(), rows), inputs=[data, boundary, patch_row_law(solver)], extent=count
-    )
-    # These original kernels encode schedule links into the freshly published
-    # sparse DOF slots. Never overwrite those fields after this point.
-    pool.launch(
-        solver.sweep.sparse_contact_marker,
-        workers,
-        inputs=[solver.placement.dense_first, data, workers],
-        outputs=[solver.placement.sparse_diagonal_row_dof],
-        extent=count,
-        clamp=True,
+        produce_contacts,
+        (pool.launch_rows(), rows),
+        inputs=[
+            data,
+            bind_dense_rows(solver.placement),
+            solver.placement.row_support(),
+            bind_slot_rows(solver),
+            solver.factor.walk_view(),
+            patch_row_law(solver),
+            dt,
+            solver.options.contact_speculative_scale,
+            laws.contact_w,
+            laws.effective_restitution_velocity_threshold,
+            int(laws.set.weighted),
+            int(solver.options.contact_compliance),
+        ],
+        extent=data.count,
     )

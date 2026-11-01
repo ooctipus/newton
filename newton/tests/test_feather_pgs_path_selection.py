@@ -595,32 +595,29 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     same((16, 6), "keyed_rows", ["scatter_contact_keys", "materialize_general_rows"]),
                 ),
                 (
-                    {"compact_contact_boundary": True, **diagonal, **schedule},
+                    {"compact_contact_boundary": True, "walks": True, **diagonal, **schedule},
                     (108, 6),
                     "compact_contact_boundary",
                     {
-                        108: ("compact_contact_boundary", ["produce_contacts", marker.key]),
-                        6: ("compact_contact_boundary", ["clear_contact_response", "produce_contacts"]),
+                        108: ("compact_contact_boundary", ["produce_contacts", "write_slot_rows", marker.key]),
+                        6: ("compact_contact_boundary", ["produce_contacts", "write_slot_rows"]),
                     },
                 ),
                 (sparse, (18,), "walk", {18: ("walk", ["write_contact_units", response.key])}),
                 (
-                    {**diagonal, **schedule},
+                    {**diagonal, **schedule, "walks": True},
                     (108, 6),
-                    "sparse_diagonal",
+                    "walk",
                     {
-                        108: ("sparse_diagonal", [prepare, "sparse_pair_contact_rows_kernel", marker.key]),
-                        6: ("compact_jacobian", [prepare, compact]),
+                        108: ("walk", ["write_contact_units", "write_slot_rows", marker.key]),
+                        6: ("walk", ["write_contact_units", "write_slot_rows"]),
                     },
                 ),
                 (
-                    diagonal,
+                    {**diagonal, "sweep": SimpleNamespace(sparse_contact_marker=None), "walks": True},
                     (108, 6),
-                    "sparse_diagonal",
-                    {
-                        108: ("sparse_diagonal", [prepare, "sparse_pair_contact_rows_kernel"]),
-                        6: ("compact_jacobian", [prepare, compact]),
-                    },
+                    "walk",
+                    same((108, 6), "walk", ["write_contact_units", "write_slot_rows"]),
                 ),
                 (
                     {"_compact_contact_jacobian": True},

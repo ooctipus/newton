@@ -1427,11 +1427,11 @@ class SparsePairZ(ResponseOperator):
 
     The sparse-diagonal rows: a world pairs one compact dense articulation (its group ``group``, first coordinate
     ``offset``) with diagonal-mass coordinates, and the sweep holds the velocity change in factor coordinates: ``u =
-    L^T P dv`` on the dense articulation (``L`` its leaf-first factor) and ``u = sqrt(m) dv`` on a diagonal coordinate
-    (a star's factor is diagonal). Row ``i``'s dense part is ``Z = L^-1 P J^T`` at ``Z[(group * rows + i) * dofs + l]`` on
-    coordinate ``offset + l`` (factor coordinates at the leaf-first positions of ``J``); its sparse part is two slots
-    ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an independent chain's link)
-    and ``Z_s = J_s / sqrt(m_s)`` at ``sparse_z[(base + i) * 2 + s]``. A row's velocity term is ``Z^T u``, its update
+    F^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' frame) and ``u = sqrt(m) dv`` on a
+    diagonal coordinate (a star's factor is diagonal). Row ``i``'s dense part is its walk's footprints ``Z = F L^-1 P
+    J^T`` at ``Z[(group * rows + i) * dofs + l]`` on coordinate ``offset + l`` (the walk's coordinate ``l``); its sparse
+    part is two slots ``s``: coordinate ``sparse_dof[(base + i) * 2 + s]`` (``-1`` for none, below ``-1`` an
+    independent chain's link) and ``Z_s = J_s / sqrt(m_s)``, a key's one step, at ``sparse_z[(base + i) * 2 + s]``. A row's velocity term is ``Z^T u``, its update
     ``u += Z delta``, and two rows couple through ``Z_i^T Z_s``: ``W = Z^T Z``.
 
     With lanes (a warp, or a segment of ``width`` lanes), lane ``l < dofs`` owns dense coordinate ``l`` and lanes
@@ -1444,8 +1444,8 @@ class SparsePairZ(ResponseOperator):
     whose dense part is empty), through the slot that holds it: its product is rounded on its own (``__fmul_rn``,
     no contraction into the right-hand side's add), as the lanes' sum of one product rounds it.
 
-    Built with the rows (:data:`.response_builds_rows.SPARSE_PAIR`), ``A_ii = |Z|^2 + cfm`` is stored as a value; the
-    step divides by it.
+    Written with the rows (:func:`.walk_rows.write_slot_rows`, :func:`.compact_contact.produce_contacts`), ``A_ii =
+    |Z|^2 + cfm`` is stored as a value; the step divides by it.
     """
 
     dofs: int
@@ -1462,17 +1462,6 @@ class SparsePairZ(ResponseOperator):
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
     name = "sparse_pair_z"
-
-    # -- build (response_builds_rows) ---------------------------------------------------------------------------------
-
-    @staticmethod
-    def build():
-        """The rows' build (:data:`.response_builds_rows.SPARSE_PAIR`): each row's slots ``Z_s = J_s / sqrt(m_s)``,
-        merged on a shared coordinate, its dense part whitened through the compact factor, and ``A_ii = |Z|^2 +
-        cfm``."""
-        from .response_builds_rows import SPARSE_PAIR  # noqa: PLC0415
-
-        return SPARSE_PAIR
 
     def _entries(self, row: str, coord: str, value: str, indent: str, active=None) -> str:
         """Declare this lane's coordinate and entry of row ``row`` (``coord`` negative for none)."""

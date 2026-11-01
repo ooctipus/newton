@@ -28,6 +28,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
+from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkRelease, WalkTrees
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines, row_velocity
 
@@ -270,11 +271,33 @@ _UNIT_EDGES = (
 )
 
 
-def _diagonal_factor(inverse):
-    """The leaf-first factor of a diagonal mass matrix ``H = diag(1 / inverse)``: ``L = diag(sqrt(m))`` in factor
-    coordinates (factor coordinate ``k`` at position ``n - 1 - k``), as the sparse-diagonal sweep reads its dense
-    articulation's factor."""
-    return np.diag(np.sqrt(1.0 / np.asarray(inverse, np.float64)[::-1])).astype(np.float32)
+def _diagonal_walk(inverse, device):
+    """The walk of each world's dense articulation whose mass matrix is diagonal, ``H = diag(1 / inverse[w])``, as the
+    sparse-diagonal sweep leaves it (:func:`.sweep_routes.walk_leave`): world ``w``'s articulation ``w``, a chain of one
+    coordinate a body whose columns and lifts are zero, so ``WALK_DOWN`` leaves ``u_c / ell_c = u_c sqrt(m_c^-1)``.
+    Returns its articulations by world and its :class:`.tree_factor.WalkTrees`."""
+    inverse = np.asarray(inverse, np.float32)
+    worlds, n = inverse.shape
+    walk = WalkTrees()
+    data = np.zeros((worlds * n, WALK_COORDINATE), np.float32)
+    data[:, 12] = np.sqrt(inverse.reshape(-1))
+    walk.data = wp.array(data, device=device)
+    walk.link = wp.zeros((worlds * n, WALK_LINK), dtype=wp.float32, device=device)
+    path = np.stack([np.arange(n) - 1, np.arange(n)], axis=1).astype(np.int32)
+    walk.path = wp.array(np.tile(path, (worlds, 1)), dtype=wp.vec2i, device=device)
+    walk.scratch = wp.zeros(worlds * n, dtype=wp.spatial_vector, device=device)
+    starts = (np.arange(worlds) * n).astype(np.int32)
+    walk.joint_start = wp.array(starts, device=device)
+    walk.joint_end = wp.array(starts + n, device=device)
+    walk.dof_start = wp.array(starts, device=device)
+    walk.dofs = wp.full(worlds, n, dtype=wp.int32, device=device)
+    release = WalkRelease()
+    release.count = wp.zeros(worlds, dtype=wp.int32, device=device)
+    release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
+    release.coordinate = wp.full((1, 1, 1), -1, dtype=wp.int32, device=device)
+    release.b, release.a, release.g = (wp.zeros((1, 1, 1), dtype=wp.float32, device=device) for _ in range(3))
+    walk.release = release
+    return wp.array(np.arange(worlds, dtype=np.int32), device=device), walk
 
 
 def _whiten_slots(sparse_dof, jacobian, inverse):
@@ -408,10 +431,10 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         rows["limit_active"][w, limited] = rng.integers(1, 4, 3)
         rows["limit_lower_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
         rows["limit_upper_rhs"][w, limited] = rng.uniform(-0.1, 0.05, 3)
-    # The sweep's whitened rows: the dense articulation's factor and Z = L^-1 P J^T (its mass matrix is diagonal
-    # here), and the slots' J / sqrt(m).
+    # The sweep's whitened rows: the dense articulation's walk (its mass matrix is diagonal here) and Z = L^-1 P J^T,
+    # and the slots' J / sqrt(m).
     inverse = rows["inverse_mass"].reshape(worlds, dofs)
-    rows["dense_L"] = np.stack([_diagonal_factor(inverse[w, diagonal:]) for w in range(worlds)])
+    rows["dense_inverse"] = inverse[:, diagonal:].copy()
     rows["dense_Z"] = (rows["dense_J"] * np.sqrt(inverse[:, None, diagonal:])).astype(np.float32)
     # Each row's incident velocity J v over the fixture's velocity, and the limits' on their coordinates.
     velocity = rows["velocity"].reshape(worlds, dofs)
@@ -948,7 +971,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.empty((1, (max_constraints + 2) // 3), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                wp.array(_diagonal_factor(inverse_mass[:dense_dofs])[None], device=device),
+                *_diagonal_walk(inverse_mass[None, :dense_dofs], device),
                 wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
                 wp.array(
@@ -1052,7 +1075,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(normal_rows[None, :], device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                wp.array(_diagonal_factor(inverse_mass[:dense_dofs])[None], device=device),
+                *_diagonal_walk(inverse_mass[None, :dense_dofs], device),
                 wp.array(dense_j * np.sqrt(inverse_mass[:dense_dofs]), device=device),
                 wp.array(sparse_dof, device=device),
                 wp.array(
@@ -1347,7 +1370,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(serial_heads, device=device),
                             wp.array(rows["dense_offsets"], device=device),
                             wp.array(rows["dense_groups"], device=device),
-                            wp.array(rows["dense_L"], device=device),
+                            *_diagonal_walk(rows["dense_inverse"], device),
                             wp.array(rows["dense_Z"], device=device),
                             wp.array(schedule["sparse_row_dof"], device=device),
                             wp.array(rows["sparse_z"], device=device),
@@ -1814,6 +1837,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         )
         self.assertTrue(kernels)
         self.assertTrue(all("_torsion" in kernel.key for kernel in kernels))
+
 
 if __name__ == "__main__":
     unittest.main()

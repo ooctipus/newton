@@ -271,4 +271,4 @@ def _whiten_six_snippet() -> str:
 @wp.func_native(_whiten_six_snippet())
 def whiten_six(factor: wp.array3d[float], group: int, jacobian: _Vec6) -> _Vec6:
     """One row of the six-coordinate group whitened in registers, ``Z = L^-1 P J^T`` by the kit's forward solve (Z0):
-    the dense part of a compact boundary row (:func:`.response_builds_rows.sparse_pair_dense`)."""
+    a free rigid body's side of a walked row (:func:`.walk_rows.walk_wrench`) until the free bodies walk."""

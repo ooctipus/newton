@@ -8,6 +8,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton.tests.feather_pgs_law_harness import row_velocity
+from newton.tests.test_feather_pgs_response_diagonal import _diagonal_walk
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "contact batch screening requires CUDA")
@@ -90,7 +91,8 @@ class TestWideContactBatches(unittest.TestCase):
             serial,
             np.zeros(worlds, np.int32),
             np.arange(worlds, dtype=np.int32),
-            jacobian[:, :, :width].copy(),
+            # The dense part's articulation and its walk (a diagonal one: both schedules leave alike).
+            "dense_walk",
             response[:, :, :width].copy(),
             sparse_dof,
             sparse_jy,
@@ -108,17 +110,20 @@ class TestWideContactBatches(unittest.TestCase):
         device = wp.get_device("cuda:0")
         results = []
         for batch in (False, True):
-            arrays = [
-                wp.array(value, dtype=wp.int32 if value.dtype == np.int32 else wp.float32, device=device)
-                if isinstance(value, np.ndarray)
-                else value
-                for value in host
-            ]
+            arrays = []
+            for value in host:
+                if isinstance(value, str):
+                    arrays.extend(_diagonal_walk(np.ones((worlds, width), np.float32), device))
+                elif isinstance(value, np.ndarray):
+                    dtype = wp.int32 if value.dtype == np.int32 else wp.float32
+                    arrays.append(wp.array(value, dtype=dtype, device=device))
+                else:
+                    arrays.append(value)
             kernel = sparse_diagonal_kernel(
                 capacity, dofs, width, str(device.arch), contact_triples=True, speculative_contact_batches=batch
             )
-            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:28], outputs=arrays[28:], block_dim=32, device=device)
-            results.append([arrays[i].numpy() for i in (6, 28, 29, 30)])
+            wp.launch_tiled(kernel, dim=[worlds], inputs=arrays[:29], outputs=arrays[29:], block_dim=32, device=device)
+            results.append([arrays[i].numpy() for i in (6, 29, 30, 31)])
         for reference, candidate in zip(*results, strict=True):
             np.testing.assert_allclose(candidate, reference, rtol=2.0e-5, atol=2.0e-6)
         np.testing.assert_array_equal(results[1][0][0, : row_counts[0]], 0.0)

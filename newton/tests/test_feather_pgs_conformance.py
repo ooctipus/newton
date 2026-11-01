@@ -1542,7 +1542,7 @@ def _unsupported(solver) -> bool:
     return False
 
 
-# The sparse-diagonal producers write the rows of a dense articulation other than six coordinates (franka-cabinet's
+# The sparse diagonal's one writer walks the rows of a dense articulation other than six coordinates (franka-cabinet's
 # nine); on the keyboard the compact boundary would own them, so these routes withhold its admission.
 _SPARSE_DIAGONAL_ROWS = {"compact_contact.supported": _unsupported}
 SPARSE_DIAGONAL = Route(
@@ -1552,7 +1552,7 @@ SPARSE_DIAGONAL = Route(
     module=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
-        "contact_rows.producer": "sparse_diagonal",
+        "contact_rows.producer": "walk",
         "held_tree.scalar_branches.enabled": True,
     },
 )
@@ -1565,7 +1565,7 @@ SPARSE_DIAGONAL_TREE = Route(
     module=_SPARSE_DIAGONAL_ROWS,
     expect={
         "sweep.route": "sparse_diagonal",
-        "contact_rows.producer": "sparse_diagonal",
+        "contact_rows.producer": "walk",
         "held_tree.scalar_branches.enabled": False,
         "held_tree.groups.0.operator": "TreeHeldOperator",
     },

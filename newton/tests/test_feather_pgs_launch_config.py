@@ -397,8 +397,9 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     )
             trajectories.append(history)
 
-        self.assertEqual(cleared_shapes[id(optimized)], [(2, 64, 3)] * 3)
-        # The reference's matrix-free sweeps read the packed rows, which their producers write whole: no group rows.
+        # The sparse diagonal's writers store every row's dense part whole (walk_rows), and the reference's matrix-free
+        # sweeps read the packed rows, which their producers write whole: no group rows are cleared.
+        self.assertEqual(cleared_shapes[id(optimized)], [])
         self.assertEqual(cleared_shapes[id(reference)], [])
 
         first_q, first_qd = trajectories[0][0]

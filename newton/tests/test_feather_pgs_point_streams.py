@@ -343,7 +343,6 @@ def _dense_build_calls():
     # and the bilateral projection.
     for sizes in ((6,), (6, 9), (18,), (6, 106)):
         yield "packed_rows.pack_kernel", packed_rows.pack_kernel.__wrapped__, (sizes,), {}
-    from newton._src.solvers.feather_pgs import response_builds_rows  # noqa: PLC0415
 
     # The general placement's one writer: plain, with the slips' release, with blocks of up to eight rows (the closure),
     # mimics among them.
@@ -351,14 +350,6 @@ def _dense_build_calls():
 
     for args in ((False, 0, False), (True, 0, False), (False, 8, False), (True, 8, True)):
         yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, args, {}
-
-    # The sparse-diagonal rows whitened in place, with their diagonals.
-    yield (
-        "response_builds_rows.sparse_pair_whiten_kernel",
-        response_builds_rows.sparse_pair_whiten_kernel.__wrapped__,
-        (),
-        {},
-    )
 
 
 def _solver_factory_calls():

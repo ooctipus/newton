@@ -14,6 +14,8 @@
 - **One frame per placement** (general worlds, the CPU catalogue): every walked row against its physical ``J v_hat``
   (``Z_i^T L^T P v_hat`` against the incident velocity its walk summed), and the step's leave against the float64
   walk's.
+- **The sparse diagonal** (FL3.5, CUDA): its arm's rows of a slipping tree give the decided operator, and the keyboard's
+  rows (arm and keys) and its arm's leave hold the same invariant on each of its routes.
 """
 
 import unittest
@@ -638,6 +640,175 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         bound = n * ROUNDING * kappa * np.linalg.norm(expected) + published
         out["leave"] = max(out["leave"], np.linalg.norm(dv - expected) / bound)
     return out
+
+
+def slot_frames(solver, joint_q: np.ndarray, capture) -> dict:
+    """The sparse diagonal's walked rows (FL3.5) against their physical ``J v_hat`` and its arms' leave against the
+    float64 walk's, as :func:`walked_frames` reads the general worlds': a row is its arm's dense part (the walk's
+    coordinates, ``u_hat = L^T P v_hat`` by the float64 walk) and its keys' slots (``u_hat = v_hat / s``, ``s =
+    m^-1/2``). An arm whose drives slip this step is left to :class:`TestSlotFrame`."""
+    forest, placement, factor = solver.forest, solver.placement, solver.factor
+    out = {"rows": 0.0, "leave": 0.0, "worlds": 0}
+    n = int(placement.sparse_diagonal_dense_size)
+    Z = placement.J_by_size[n].numpy().astype(np.float64)
+    slot_dof = placement.sparse_diagonal_row_dof.numpy()
+    slot_z = placement.sparse_diagonal_row_z.numpy().astype(np.float64)
+    groups = placement.sparse_diagonal_dense_groups.numpy()
+    arts = placement.sparse_diagonal_dense_arts.numpy()
+    world_dofs = forest.world_dof_indices.numpy()
+    inverse_mass = factor.diagonal_inverse_mass.numpy().astype(np.float64)
+    starts = forest.articulation_dof_start.numpy()
+    slips = factor.walk_view().slips.numpy()
+    incident = placement.row_incident.numpy().astype(np.float64)
+    first = placement.dense_first.numpy()
+    for world in range(int(forest.world_count)):
+        art, group, line, count = int(arts[world]), int(groups[world]), int(first[world]), int(capture.counts[world])
+        if count == 0 or slips[art]:
+            continue
+        walk = factor.walk(joint_q, art)
+        inverse, _ = walk.up(covector=np.eye(n))
+        dofs = int(starts[art]) + np.arange(n)
+        u_hat = np.linalg.solve(inverse.T, capture.v_hat[dofs])
+        du = np.zeros(n)
+        for row in range(count):
+            dense = Z[group, row, :n]
+            term, scale_z, scale_u = dense @ u_hat, dense @ dense, u_hat @ u_hat
+            for s in range(2):
+                coordinate = int(slot_dof[line, row, s])
+                if coordinate < 0:
+                    continue  # no key, or an independent chain's link
+                dof = int(world_dofs[world, coordinate])
+                u = capture.v_hat[dof] / np.sqrt(inverse_mass[dof])
+                z = slot_z[line, row, s]
+                term, scale_z, scale_u = term + z * u, scale_z + z * z, scale_u + u * u
+            bound = n * ROUNDING * np.sqrt(scale_z * scale_u) + ROUNDING * abs(incident[line, row])
+            if bound > 0.0:
+                out["rows"] = max(out["rows"], abs(term - incident[line, row]) / bound)
+            du += dense * capture.impulses[line, row]
+        out["worlds"] += 1
+        if not np.any(du):
+            continue
+        # The arm's leave: its published dv against the float64 walk's leave of du.
+        dv = capture.v_out[dofs] - capture.v_hat[dofs]
+        expected = walk.down(du)[0]
+        kappa = float(np.linalg.cond(inverse))
+        published = 2.0 * ROUNDING * (np.linalg.norm(capture.v_out[dofs]) + np.linalg.norm(capture.v_hat[dofs]))
+        bound = n * ROUNDING * kappa * np.linalg.norm(expected) + published
+        out["leave"] = max(out["leave"], np.linalg.norm(dv - expected) / bound)
+    return out
+
+
+def star_beside_hinges(device):
+    """Case K2 (a tree beside a star): four limited prismatic keys on a fixed frame, and :func:`slipping_hinges`' three
+    hinges, each held past its effort limit, as the dense arm."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    frame = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01))
+    keys = [builder.add_joint_fixed(-1, frame)]
+    for k in range(4):
+        key = builder.add_link(mass=0.01, inertia=wp.mat33(np.eye(3) * 1.0e-5))
+        keys.append(
+            builder.add_joint_prismatic(
+                frame,
+                key,
+                axis=(0.0, 0.0, 1.0),
+                parent_xform=wp.transform(wp.vec3(0.03 * k, 1.0, 0.0), wp.quat_identity()),
+                limit_lower=-0.008,
+                limit_upper=0.002,
+            )
+        )
+    builder.add_articulation(keys)
+    parent, joints = -1, []
+    for inertia, (lo, hi) in zip((0.05, 0.01, 0.02), ((-0.2, 0.0), (-0.1, 0.0), (-0.3, 0.05)), strict=True):
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=link,
+                axis=(0.0, 0.0, 1.0),
+                target_ke=2.0e3,
+                target_kd=20.0,
+                effort_limit=1.0,
+                armature=0.0,
+                limit_lower=lo,
+                limit_upper=hi,
+                parent_xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    control = model.control()
+    targets = np.zeros(model.joint_dof_count, dtype=np.float32)
+    targets[-3:] = (3.0, -3.0, 3.0)
+    control.joint_target_q.assign(targets)
+    return model, control
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "the sparse diagonal is a CUDA placement")
+class TestSlotFrame(unittest.TestCase):
+    """The sparse diagonal on the walk (FL3.5): the arm's rows of H7's decided set, the keyboard's rows and leave."""
+
+    def test_arm_rows_take_the_decided_operator(self):
+        model, control = star_beside_hinges("cuda:0")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=30, enable_joint_limits=True)
+        self.assertEqual(solver.routes.case, "K2")
+        self.assertTrue(solver.placement.walks)
+        state, out = model.state(), model.state()
+        joint_q = state.joint_q.numpy().astype(np.float64)
+        solver.step(state, out, control, None, 1.0 / 60.0)
+        art = int(solver.placement.sparse_diagonal_dense_arts.numpy()[0])
+        view = solver.factor.walk_view()
+        slips = int(view.slips.numpy()[art])
+        self.assertEqual(slips, 3)
+        walk = solver.factor.walk(joint_q, art)
+        n = walk.s.shape[0]
+        dofs = solver.forest.articulation_dof_start.numpy()[art] + np.arange(n)
+        drive_rows = solver.factor.drive_row_by_dof.numpy()[dofs]
+        K = solver.factor.aug_row_K.numpy()[drive_rows].astype(np.float64)
+        Kd = solver.factor.aug_row_Kd.numpy()[drive_rows].astype(np.float64)
+        released = K - Kd
+        B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
+        basis = view.basis.numpy()[art, :slips, :n].astype(np.float64).T
+        scale = np.tril(view.scale.numpy()[art, :slips, :slips].astype(np.float64))
+        F = np.eye(n) + basis @ (scale.T - np.eye(slips)) @ basis.T
+        # The hinges' limit rows in the arm's dense parts: their Gram is the decided operator's (TestSlipFrame).
+        p = solver.placement
+        count = int(p.constraint_count.numpy()[0])
+        self.assertGreater(count, 0)
+        group = int(p.sparse_diagonal_dense_groups.numpy()[0])
+        Z = p.J_by_size[n].numpy()[group, :count, :n].astype(np.float64)
+        J = Z @ np.linalg.inv(F).T @ np.linalg.inv(B).T
+        A = np.linalg.inv(B.T @ B)
+        W_rows = Z @ Z.T
+        W_decided = J @ np.linalg.solve(A - np.diag(released), J.T)
+        W_all = J @ np.linalg.solve(A, J.T)
+        scale_W = np.linalg.norm(W_decided)
+        self.assertLess(np.linalg.norm(W_rows - W_decided) / scale_W, 1.0e-4)
+        self.assertGreater(np.linalg.norm(W_all - W_decided) / scale_W, 1.0e-1)
+
+    def test_one_frame_on_the_keyboard(self):
+        """The keyboard on each sparse-diagonal route: its rows against ``J v_hat`` and its arms' leave against the
+        float64 walk's, within ``BOUND`` of their rounding."""
+        from newton.tests import test_feather_pgs_conformance as conformance  # noqa: PLC0415
+
+        names = {route.name for route in (conformance.SPARSE_DIAGONAL, conformance.SPARSE_DIAGONAL_TREE)}
+        names.add(conformance.COMPACT_BOUNDARY.name)
+        done = set()
+        for group in conformance.cuda_groups():
+            for route in (group.reference, *group.routes):
+                if route.name not in names or route.name in done:
+                    continue
+                with self.subTest(problem=group.physics.name, route=route.name):
+                    solver, joint_q, capture = run_route(group.physics, route, device="cuda:0")
+                    self.assertTrue(solver.placement.walks)
+                    result = slot_frames(solver, joint_q, capture)
+                    self.assertGreater(result["worlds"], 0)
+                    self.assertLess(result["rows"], BOUND, result)
+                    self.assertLess(result["leave"], BOUND, result)
+                    done.add(route.name)
+        self.assertEqual(done, names)
 
 
 class TestWalkedPlacement(unittest.TestCase):

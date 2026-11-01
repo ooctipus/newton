@@ -5,8 +5,8 @@
 
 :func:`sparse_diagonal_kernel`: a world's dense group plus diagonal-mass coordinates as whitened rows
 (:class:`.SparsePairZ`), one warp per world, on the velocity change from the predictor in factor coordinates, from zero:
-``du = L^T P dv`` on the dense articulation and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the
-predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
+``du = F^-T L^T P dv`` on the dense articulation (the walk's factor and its slips' frame, the frame its rows were whitened
+in) and ``du = sqrt(m) dv`` on a diagonal coordinate, left once and added to the predictor. Each sweep runs its coordinates' fused joint limits, its independent scalar contacts one lane per chain, then its
 coupled rows in order (plain, contact triples or contact units, optionally with speculative batches), a loaded coupled
 contact unit by the unit law (:class:`_UnitPairZ`, :func:`.sweep.contact_unit`). Its working set fits the static
 budget of the device it is built for (:func:`.staging.arch_budget`).
@@ -24,7 +24,7 @@ from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import CholeskySolve, Lanes, SparsePairZ
+from .response_operator import Lanes, SparsePairZ
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, Change, SolvePolicy, bound
 from .staging import Buffer, Staging, arch_budget
@@ -46,6 +46,8 @@ from .sweep import (
     row_visit,
     weight_arguments,
 )
+from .sweep_routes import walk_leave
+from .tree_factor import WalkTrees, walk_paths_prelude
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Sparse diagonal: a dense group plus two scalar coordinates per row
@@ -69,7 +71,8 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("sparse_contact_serial_normals", wp.array2d[int]),
     ("dense_offsets", wp.array[int]),
     ("dense_groups", wp.array[int]),
-    ("dense_L", wp.array3d[float]),
+    ("dense_arts", wp.array[int]),
+    ("walk", WalkTrees),
     ("dense_Z", wp.array3d[float]),
     ("sparse_row_dof", wp.array3d[int]),
     ("sparse_row_z", wp.array3d[float]),
@@ -159,7 +162,7 @@ class _UnitPairZ(UnitOperator, ReducedPairCoupling, SparsePairZ):
     (:class:`.sweep.UnitOperator`).
 
     A contact's rows act on its two bodies' coordinates, which the build puts in the same slot of each row
-    (:func:`.response_builds_rows.sparse_pair_slots`), so the lane that owns a coordinate holds all three rows' entries
+    (:func:`.walk_rows.slot_header`), so the lane that owns a coordinate holds all three rows' entries
     there: the unit reads the velocity there once (:meth:`unit_terms`) and writes it once (:meth:`unit_apply`). Its
     ladder reduces the pair's coupling too, and its rows vote on their reduced terms, as the rows' own visits do.
     Under contact torsion (``spin``) the unit's fourth row is its spin row (``head + 3``), on the same coordinates.
@@ -228,6 +231,7 @@ def sparse_diagonal_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    walk_frame: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the sparse-diagonal Gauss-Seidel sweep: one warp per world.
 
@@ -244,7 +248,8 @@ def sparse_diagonal_source(
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
     otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
-    spin row follows its pair (four rows: a triple's stride is four), solved with it.
+    spin row follows its pair (four rows: a triple's stride is four), solved with it. The dense articulation leaves by
+    the walk (:func:`.sweep_routes.walk_leave`), with its slips' release where the class can slip (``walk_frame``).
 
     Returns the body and its staging.
     """
@@ -542,11 +547,6 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
         f"{P};\nconst float diagonal_scale = !dense_coordinate && global_dof >= 0\n"
         "    ? sqrtf(diagonal_inverse_mass.data[global_dof]) : 0.0f;"
     )
-    dense_solve = CholeskySolve(P, "dense_factor", unroll=True)
-
-    def dense_velocity(position):
-        return f"s_v[dense_offset + {position}]"
-
     sweep_end = end_sweep(solve_policy, iteration="iteration")
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
@@ -585,10 +585,11 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 
     for (int i = lane; i < row_count; i += 32) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
-    // Leave factor coordinates: dv = P^T L^-T u on the dense articulation, dv = u / sqrt(m) on a diagonal coordinate.
-    const float* dense_factor = &dense_L.data[(size_t)dense_group * {P * P}];
+    // Leave factor coordinates: on the dense articulation by the walk, dv = P^T L^-T R^T u (the release its rows carry,
+    // sweep_routes.walk_leave); dv = u / sqrt(m) on a diagonal coordinate.
     if (lane == 0) {{
-{indent(dense_solve.leave(dense_velocity, dense_velocity), "        ")}
+        const int dense_art = dense_arts.data[world];
+{walk_leave("dense_art", "(&s_v[dense_offset])", str(P), frame=walk_frame, pad="        ")}
     }}
     SYNC();
     for (int d = lane; d < {D}; d += 32) {{
@@ -600,7 +601,14 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 #endif
 """
     cone = (CONE_LAW,) if torsion else ()
-    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *solve_policy.preludes)
+    preludes = (
+        lane_group(32),
+        SHARED_STORAGE,
+        RING,
+        *law_preludes(PROJECTION_LAW, *cone),
+        *solve_policy.preludes,
+        walk_paths_prelude(1),
+    )
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -618,6 +626,7 @@ def sparse_diagonal_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    walk_frame: bool = False,
 ) -> wp.Kernel:
     """The sparse-diagonal sweep kernel; weighted rows (:func:`.sweep.weight_arguments`) and material contacts
     (:func:`.sweep.material_arguments`) add their operands."""
@@ -632,6 +641,7 @@ def sparse_diagonal_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        walk_frame=walk_frame,
     )
     staging.check("the sparse-diagonal sweep", arch_budget(device_arch))
     name = (
@@ -642,6 +652,7 @@ def sparse_diagonal_kernel(
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
+        + ("_walkframe" if walk_frame else "")
         + solve_policy.suffix
     )
     extra = (*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments)

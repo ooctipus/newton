@@ -126,12 +126,13 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
         marked = "!(sparse_row_dof.data[(row_base + i) * 2] < -1 || sparse_row_dof.data[(row_base + i) * 2 + 1] < -1)"
         self.assertLess(plain.index(marked), plain.index(loaded))
         # The rows act in factor coordinates on the velocity change: it leaves once before it adds to the predictor,
-        # a diagonal coordinate scaled by its m^-1/2.
+        # the dense articulation by the walk (in its rows' frame), a diagonal coordinate scaled by its m^-1/2.
         for text in (plain, triples, units):
             self.assertIn("rhs_bias.data[off_dense + (i)] + row_incident.data[off_dense + (i)]", text)
             self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
             self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
-            self.assertLess(text.index("for (int iteration = 0;"), text.index("dv = P^T L^-T u"))
+            self.assertLess(text.index("for (int iteration = 0;"), text.index("dv = P^T L^-T F^T u"))
+            self.assertLess(text.index("dv = P^T L^-T F^T u"), text.rindex("WALK_DOWN("))
 
 
 class TestSweepRoutesDiagOperators(unittest.TestCase):

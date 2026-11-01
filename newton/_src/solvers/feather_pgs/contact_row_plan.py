@@ -11,8 +11,8 @@ that launch.
 
 import dataclasses
 
-# Producers that write the row metadata with prepare_world_contact_rows and build each size's response or Jacobian.
-SHARED_METADATA_PRODUCERS = ("sparse_diagonal", "compact_jacobian")
+# Producers that write the row metadata with prepare_world_contact_rows and build each size's Jacobian.
+SHARED_METADATA_PRODUCERS = ("compact_jacobian",)
 
 # Every builder method a plan can name, by producer; the route record names each one's kernels.
 BUILDER_METHODS = (
@@ -20,7 +20,6 @@ BUILDER_METHODS = (
     "local_packets",
     "keyed_rows",
     "compact_contact_boundary",
-    "sparse_diagonal",
     "compact_jacobian",
     "per_contact",
     "masked",
@@ -33,9 +32,9 @@ class ContactRowPlan:
     """The contact-row producer of one solver and the builder method of each DOF size."""
 
     producer: str
-    """The producer the class's placement case names: ``walk`` (the one writer: the general placement's and the
-    support placement's, case K1), ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``,
-    ``sparse_diagonal``, ``compact_jacobian`` or ``general``."""
+    """The producer the class's placement case names: ``walk`` (the one writer: the general placement's, the support
+    placement's, case K1, and the sparse diagonal's, case K2), ``local_packets``, ``keyed_rows``,
+    ``compact_contact_boundary``, ``compact_jacobian`` or ``general``."""
     law: str
     """The friction law of the contact rows: ``"point"`` or ``"patch"``."""
     methods: dict[int, str]
@@ -49,18 +48,18 @@ class ContactRowPlan:
 def contact_row_plan(solver) -> ContactRowPlan:
     """Decide the contact-row producer and each DOF size's builder method.
 
-    The class's placement case (``solver.routes.case``) names the producer that writes every contact row: the one
-    writer where the class walks its rows (K6, K1), local row packets for the local owners (K3), keyed rows for the
-    tiers (K4) and the compact contact boundary for the sparse diagonal (K2), each where its own fit admitted it; then
-    the shared-metadata producers (the sparse-diagonal rows for K2, the compact Jacobian) and last the general builder.
+    The class's placement case (``solver.routes.case``) names the producer that writes every contact row: local row
+    packets for the local owners (K3), keyed rows for the tiers (K4) and the compact contact boundary for the sparse
+    diagonal (K2), each where its own fit admitted it; then the one writer where the class walks its rows (K6, K1 and
+    the rest of the sparse diagonal), the compact Jacobian and last the general builder.
     Owners decided at construction admit the producers, so the plan stays fixed for a solver; it is evaluated from
     the solver's current attributes.
 
     Builder methods by producer:
 
     - ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``: the owner's own builder.
-    - Shared-metadata producers: ``sparse_diagonal`` for the diagonal-mass size; ``compact_jacobian`` for every
-      other size.
+    - ``walk``: the row pass writes each contact row's records and unit source; the one writer walks it.
+    - Shared-metadata producers: ``compact_jacobian`` for every size.
     - ``general``: sizes of at most 32 DOFs take the masked builder (``masked_combined``, one launch
       for one or two such sizes; ``masked``, one launch per size for three or more); wider sizes take
       ``per_contact``.
@@ -79,17 +78,11 @@ def contact_row_plan(solver) -> ContactRowPlan:
         return ContactRowPlan(owned, law, dict.fromkeys(sizes, owned))
     if getattr(solver.placement, "walks", False):
         # The one writer (walk_rows): the row pass writes each contact row's records and unit source, and the writer
-        # walks its seed into the class's sink (the general placement's packed rows, the support placement's support).
+        # walks its seed into the class's sink (the general placement's packed rows, the support placement's support,
+        # the sparse diagonal's slots).
         return ContactRowPlan("walk", law, dict.fromkeys(sizes, "walk"))
-    if case == "K2" or solver._compact_contact_jacobian:
-        methods = {}
-        for size in sizes:
-            if case == "K2" and size == solver.placement.sparse_diagonal_response_size:
-                methods[size] = "sparse_diagonal"
-            else:
-                methods[size] = "compact_jacobian"
-        producer = "sparse_diagonal" if case == "K2" else "compact_jacobian"
-        return ContactRowPlan(producer, law, methods, metadata_launch=True)
+    if solver._compact_contact_jacobian:
+        return ContactRowPlan("compact_jacobian", law, dict.fromkeys(sizes, "compact_jacobian"), metadata_launch=True)
     masked_sizes = tuple(size for size in sizes if size <= 32)
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
     methods = {}
