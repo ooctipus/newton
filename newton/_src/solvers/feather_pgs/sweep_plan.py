@@ -631,9 +631,6 @@ class Sweep:
             self.paired_response_reason = "No world pairs one tiled-response articulation with exactly one free body."
         self.paired_response_primary_size = response_pair[0] if response_pair is not None else None
         self.paired_response_secondary_size = response_pair[1] if response_pair is not None else None
-        self.paired_response_secondary_groups = (
-            wp.array(response_pair[2], dtype=wp.int32, device=model.device) if response_pair is not None else None
-        )
         self.routes.reasons["K5"] = ("No paired response." if response_pair is None else None) or capable(
             "paired_factor", laws
         )
@@ -657,37 +654,32 @@ class Sweep:
         self.paired_factor_secondary_groups_by_world = None
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
-        if response_pair is not None:
-            if self.paired_factor_coordinates:
-                primary_arts = self.forest.group_to_art_host[response_pair[0]]
-                secondary_arts = self.forest.group_to_art_host[response_pair[1]]
-                primary_groups = np.empty(self.forest.world_count, dtype=np.int32)
-                secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
-                primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
-                secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
-                articulation_world = self.forest.articulation_world
-                articulation_dof_start = self.forest.articulation_dof_start_host
-                for primary_group, primary_art in enumerate(primary_arts):
-                    world = int(articulation_world[primary_art])
-                    secondary_group = int(response_pair[2][primary_group])
-                    secondary_art = int(secondary_arts[secondary_group])
-                    primary_groups[world] = primary_group
-                    secondary_groups[world] = secondary_group
-                    primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
-                    primary_offsets[world] = 0 if primary_first else response_pair[1]
-                    secondary_offsets[world] = response_pair[0] if primary_first else 0
-                self.paired_factor_primary_groups_by_world = wp.array(
-                    primary_groups, dtype=wp.int32, device=model.device
-                )
-                self.paired_factor_secondary_groups_by_world = wp.array(
-                    secondary_groups, dtype=wp.int32, device=model.device
-                )
-                self.paired_factor_primary_offsets_by_world = wp.array(
-                    primary_offsets, dtype=wp.int32, device=model.device
-                )
-                self.paired_factor_secondary_offsets_by_world = wp.array(
-                    secondary_offsets, dtype=wp.int32, device=model.device
-                )
+        if self.paired_factor_coordinates:
+            primary_arts = self.forest.group_to_art_host[response_pair[0]]
+            secondary_arts = self.forest.group_to_art_host[response_pair[1]]
+            primary_groups = np.empty(self.forest.world_count, dtype=np.int32)
+            secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
+            primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
+            secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
+            articulation_world = self.forest.articulation_world
+            articulation_dof_start = self.forest.articulation_dof_start_host
+            for primary_group, primary_art in enumerate(primary_arts):
+                world = int(articulation_world[primary_art])
+                secondary_group = int(response_pair[2][primary_group])
+                secondary_art = int(secondary_arts[secondary_group])
+                primary_groups[world] = primary_group
+                secondary_groups[world] = secondary_group
+                primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
+                primary_offsets[world] = 0 if primary_first else response_pair[1]
+                secondary_offsets[world] = response_pair[0] if primary_first else 0
+            self.paired_factor_primary_groups_by_world = wp.array(primary_groups, dtype=wp.int32, device=model.device)
+            self.paired_factor_secondary_groups_by_world = wp.array(
+                secondary_groups, dtype=wp.int32, device=model.device
+            )
+            self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
+            self.paired_factor_secondary_offsets_by_world = wp.array(
+                secondary_offsets, dtype=wp.int32, device=model.device
+            )
 
     def plan_tier_rows(self) -> None:
         """Choose the Jacobi tiers from the class (case K4): their row bound and their in-kernel response.
@@ -940,34 +932,22 @@ class Sweep:
             self.paired_components_reason = (
                 "Admitted: each paired world splits into independent articulation and free-body components."
             )
-        if self.paired_response_primary_size is not None:
-            primary_size = self.paired_response_primary_size
-            secondary_size = self.paired_response_secondary_size
-            self.paired_factor_kernel = (
-                self.kernel(
-                    "paired_factor",
-                    sweep_routes_local.paired_factor_kernel,
-                    self.placement.dense_max_constraints,
-                    self.forest.max_world_dofs,
-                    primary_size,
-                    secondary_size,
-                    device_arch,
-                    contact_triples=self.factor_coordinate_contact_triples,
-                    independent_components=self.paired_components is not None,
-                    contact_units=self.factor_coordinate_contact_units,
-                    weighted=self.laws.set.weighted,
-                    torsion=self.laws.contact_torsion_enabled,
-                )
-                if self.paired_factor_coordinates
-                else None
+        self.paired_factor_kernel = (
+            self.kernel(
+                "paired_factor",
+                sweep_routes_local.paired_factor_kernel,
+                self.placement.dense_max_constraints,
+                self.forest.max_world_dofs,
+                self.paired_response_primary_size,
+                self.paired_response_secondary_size,
+                device_arch,
+                contact_triples=self.factor_coordinate_contact_triples,
+                independent_components=self.paired_components is not None,
+                contact_units=self.factor_coordinate_contact_units,
+                weighted=self.laws.set.weighted,
+                torsion=self.laws.contact_torsion_enabled,
             )
-        else:
-            self.paired_factor_kernel = None
-
-        # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step.
-        self.placement.pack_mf_meta_kernel = (
-            response_builds_rows.free_body_meta_kernel(self.placement.mf_max_constraints, device_arch)
-            if self.forest.has_free_rigid_bodies and self.placement.mf_max_constraints > 0
+            if self.paired_factor_coordinates
             else None
         )
 
@@ -1087,10 +1067,6 @@ class Sweep:
         # The Jacobi tiers ahead of the matrix-free sweep (SweepTier).
         self.tiers = []
         self.tier_worlds = None
-        if model.device.is_cuda and int(model.articulation_count) > 0:
-            # The grouped response solve (Placement._response_grouped), for the sizes StepPlan gives it from the data.
-            self.placement.grouped_response = True
-            self.placement.grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         if self.placement.mf_sweeps:
@@ -1437,63 +1413,72 @@ class Sweep:
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
         """Launch the step's sweeps from the predictor ``v_hat`` into ``v_out``: the claims in order, then the rest."""
-        iterations = self.options.pgs_iterations
-        if iterations <= 0 and not self.seeded:
+        if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)
         if self.routes.case == "K1":
-            placement = self.placement
-            worlds_per_block = 64 // self.sparse_solve_lanes
-            self._launch(
-                self.sparse_kernel,
-                operands,
-                (self.forest.world_count + worlds_per_block - 1) // worlds_per_block,
-                64,
-                world_count=self.forest.world_count,
-                row_dof=placement.sparse_row_dof,
-                row_factor=placement.sparse_row_factor,
-                factor_velocity_delta=placement.sparse_factor_velocity_delta,
-                support=placement.sparse_row_support,
-                contact_records=placement.sparse_contact_records,
-            )
-            self.factor.leave(
-                v_out,
-                size=placement.sparse_mass_matrix_size,
-                indices=self.factor.sparse_mass_matrix_indices,
-                Linv=self.factor.sparse_Linv,
-                delta=placement.sparse_factor_velocity_delta,
-                base=v_hat,
-            )
-            return
-        if self.routes.case == "K2":
-            placement = self.placement
-            dense_size = placement.sparse_diagonal_dense_size
-            self._launch(
-                self.sparse_diagonal_kernel,
-                operands,
-                self.forest.world_count,
-                32,
-                sparse_contact_group_count=placement.sparse_contact_group_count,
-                sparse_contact_group_heads=placement.sparse_contact_group_heads,
-                sparse_contact_serial_count=placement.sparse_contact_serial_count,
-                sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
-                dense_offsets=placement.sparse_diagonal_dense_offsets,
-                dense_groups=placement.sparse_diagonal_dense_groups,
-                dense_L=self.factor.L_by_size[dense_size],
-                dense_Z=placement.J_by_size[dense_size],
-                sparse_row_dof=placement.sparse_diagonal_row_dof,
-                sparse_row_z=placement.sparse_diagonal_row_z,
-                fused_limit_active=placement.fused_diagonal_limit_active,
-                fused_limit_lower_rhs=placement.fused_diagonal_limit_lower_rhs,
-                fused_limit_upper_rhs=placement.fused_diagonal_limit_upper_rhs,
-                diagonal_inverse_mass=self.factor.diagonal_inverse_mass,
-                fused_limit_cfm=self.options.pgs_cfm,
-                fused_limit_lower_lambda=placement.fused_diagonal_limit_lower_lambda,
-                fused_limit_upper_lambda=placement.fused_diagonal_limit_upper_lambda,
-            )
-            return
-        if not self.forest.max_world_dofs:
-            return  # No coordinate holds a row.
+            self._solve_packed(operands)
+        elif self.routes.case == "K2":
+            self._solve_diagonal(operands)
+        elif self.forest.max_world_dofs:
+            self._solve_claims(operands)
+
+    def _solve_packed(self, operands: dict) -> None:
+        """Case K1: the sparse sweep in factor coordinates, then its velocity change back onto ``v_out``."""
+        placement = self.placement
+        worlds_per_block = 64 // self.sparse_solve_lanes
+        self._launch(
+            self.sparse_kernel,
+            operands,
+            (self.forest.world_count + worlds_per_block - 1) // worlds_per_block,
+            64,
+            world_count=self.forest.world_count,
+            row_dof=placement.sparse_row_dof,
+            row_factor=placement.sparse_row_factor,
+            factor_velocity_delta=placement.sparse_factor_velocity_delta,
+            support=placement.sparse_row_support,
+            contact_records=placement.sparse_contact_records,
+        )
+        self.factor.leave(
+            operands["v_out"],
+            size=placement.sparse_mass_matrix_size,
+            indices=self.factor.sparse_mass_matrix_indices,
+            Linv=self.factor.sparse_Linv,
+            delta=placement.sparse_factor_velocity_delta,
+            base=operands["v_hat"],
+        )
+
+    def _solve_diagonal(self, operands: dict) -> None:
+        """Case K2: the sparse-diagonal sweep over the schedule of :meth:`claim`."""
+        placement = self.placement
+        dense_size = placement.sparse_diagonal_dense_size
+        self._launch(
+            self.sparse_diagonal_kernel,
+            operands,
+            self.forest.world_count,
+            32,
+            sparse_contact_group_count=placement.sparse_contact_group_count,
+            sparse_contact_group_heads=placement.sparse_contact_group_heads,
+            sparse_contact_serial_count=placement.sparse_contact_serial_count,
+            sparse_contact_serial_normals=placement.sparse_contact_serial_normals,
+            dense_offsets=placement.sparse_diagonal_dense_offsets,
+            dense_groups=placement.sparse_diagonal_dense_groups,
+            dense_L=self.factor.L_by_size[dense_size],
+            dense_Z=placement.J_by_size[dense_size],
+            sparse_row_dof=placement.sparse_diagonal_row_dof,
+            sparse_row_z=placement.sparse_diagonal_row_z,
+            fused_limit_active=placement.fused_diagonal_limit_active,
+            fused_limit_lower_rhs=placement.fused_diagonal_limit_lower_rhs,
+            fused_limit_upper_rhs=placement.fused_diagonal_limit_upper_rhs,
+            diagonal_inverse_mass=self.factor.diagonal_inverse_mass,
+            fused_limit_cfm=self.options.pgs_cfm,
+            fused_limit_lower_lambda=placement.fused_diagonal_limit_lower_lambda,
+            fused_limit_upper_lambda=placement.fused_diagonal_limit_upper_lambda,
+        )
+
+    def _solve_claims(self, operands: dict) -> None:
+        """The other cases: each owner's worlds on its streams, then the matrix-free sweep of the rest."""
+        iterations = self.options.pgs_iterations
         mf_gs_kernel = self.mf_gs_kernel
         if mf_gs_kernel is None:
             raise RuntimeError("Matrix-free GS kernel is unavailable for this solver shape")

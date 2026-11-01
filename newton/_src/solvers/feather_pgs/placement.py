@@ -249,7 +249,10 @@ class Placement:
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
         # The grouped response solve, for the sizes StepPlan gives it from the data.
-        self.grouped_response = False
+        self.grouped_response = bool(model.device.is_cuda and model.articulation_count > 0)
+        self.grouped_dummy_diag = (
+            wp.zeros((1, 1), dtype=wp.float32, device=model.device) if self.grouped_response else None
+        )
         # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
         self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
         self.mf_max_constraints = options.mf_max_constraints
@@ -560,6 +563,12 @@ class Placement:
         skips its launch. The rows then hold one slot per world and the per-world
         counts keep their real width.
         """
+        # Only free rigid bodies produce matrix-free rows, which the CUDA step packs each step.
+        self.pack_mf_meta_kernel = (
+            response_builds_rows.free_body_meta_kernel(self.mf_max_constraints, model.device.arch)
+            if self.forest.has_free_rigid_bodies and self.mf_max_constraints > 0
+            else None
+        )
         arrays = self.arrays
         worlds = self.forest.world_count
         rows = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 1
