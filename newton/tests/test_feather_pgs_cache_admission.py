@@ -66,7 +66,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
                 self.assertTrue(held_tree.admitted(_held_tree_solver(law)))
 
     def test_contact_law_predicates_precede_route_selection(self):
-        """Read the laws, and the parallel-row admission, before sparse route selection."""
+        """Read the laws before sparse route selection."""
         builder = newton.ModelBuilder()
         body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
         builder.add_articulation([builder.add_joint_revolute(-1, body)])
@@ -75,7 +75,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         seen = []
 
         def recording(sweep, *arguments):
-            seen.append((sweep.laws.set.point, sweep.parallel_contact_paths))
+            seen.append(sweep.laws.set.point)
             return setup(sweep, *arguments)
 
         with (
@@ -84,8 +84,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                    # Both laws may run the parallel tiers.
-                    self.assertEqual(seen[-1], (law == "point", True))
+                    self.assertEqual(seen[-1], law == "point")
                     self.assertEqual(solver.laws.set.contact, law)
 
 

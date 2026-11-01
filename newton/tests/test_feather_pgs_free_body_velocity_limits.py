@@ -404,15 +404,14 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
         select it although no row is built, and an infinite activation fraction declines it.
         """
         world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
-        for name, options, selected, built in (
-            ("limits", {}, True, True),
-            ("infinite_limits", {"limits": INFINITE_LIMITS}, True, False),
-            ("unregistered", {"limits": None}, False, False),
-            ("never_activated", {"fraction": float("inf")}, False, False),
+        for name, options, built in (
+            ("limits", {}, True),
+            ("infinite_limits", {"limits": INFINITE_LIMITS}, False),
+            ("unregistered", {"limits": None}, False),
+            ("never_activated", {"fraction": float("inf")}, False),
         ):
             with self.subTest(name):
                 run = _free_boxes(self.device, world, **options)
-                self.assertEqual(run.solver.sweep.has_free_body_velocity_limit_rows, selected)
                 _step(run)
                 self.assertEqual(int(run.solver.placement.mf_constraint_count.numpy().sum()) > 0, built)
 

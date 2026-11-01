@@ -427,9 +427,7 @@ def test_regularization_takes_the_weighted_tiers(test: unittest.TestCase, device
             for g in (0.0, 0.02):
                 solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta, pgs_contact_regularization=g)
                 routes = solver.get_path_selection()["routes"]
-                parallel_rows = routes["friction"]["parallel_rows"]
                 with test.subTest(friction_anchor_beta=beta, g=g):
-                    test.assertTrue(parallel_rows["admitted"], parallel_rows["reason"])
                     test.assertNotIn("parallel matrix-free tiers", routes["friction"]["reason"])
                 records[g] = (
                     routes["contact_rows"]["keyed_rows"]["enabled"],

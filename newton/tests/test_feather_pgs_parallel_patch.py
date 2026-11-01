@@ -1006,19 +1006,11 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 selected = solver.get_path_selection()
                 friction = selected["routes"]["friction"]
                 keyed = selected["routes"]["contact_rows"]["keyed_rows"]
-                self.assertTrue(solver.sweep.parallel_contact_paths)
-                self.assertTrue(friction["parallel_rows"]["admitted"])
                 if beta == 0.0:
-                    self.assertIn("Point friction", friction["parallel_rows"]["reason"])
                     continue
                 self.assertNotIn("keyed rows", friction["reason"])
                 self.assertNotIn("need point friction", friction["reason"])
-                self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                 self.assertNotIn("point contacts", keyed["reason"])
-        # Torsion takes the tiers, and so do weighted contact rows (the weighted tiers).
-        for law in ({"torsion": True}, {"regularized": True}, {"compliance": True}):
-            other = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(**law)))
-            self.assertTrue(Sweep._admit_parallel_contact_paths(other)[0], law)
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
@@ -1184,8 +1176,6 @@ class TestTierRule(unittest.TestCase):
             pins={},
             routes=_routes(),
             laws=SimpleNamespace(set=plain_laws()),
-            parallel_contact_paths=True,
-            parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
             forest=SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=True),
         )
         for name, value in changes.items():
@@ -1202,7 +1192,6 @@ class TestTierRule(unittest.TestCase):
 
     def test_other_classes_keep_their_placement(self):
         """Leave every other class to its own placement and say why."""
-        torsion = "Contact torsion keeps serial sweeps and ordinary rows."
         for changes, reason in (
             # Packed factors (a single tree) or the sparse diagonal (a star) leave no matrix-free sweep.
             ({"mf_sweeps": False}, "No matrix-free sweep"),
@@ -1211,7 +1200,6 @@ class TestTierRule(unittest.TestCase):
             ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
-            ({"parallel_contact_paths": False, "parallel_contact_paths_reason": torsion}, "torsion"),
             ({"routes": _routes(placement="general")}, "general placement"),
             # The tiers' bodies are written for CUDA only (the CPU takes the general row).
             ({"laws": SimpleNamespace(set=plain_laws(cuda=False))}, "CUDA device"),

@@ -464,7 +464,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 friction = routes["friction"]
                 self.assertEqual((friction["law"], friction["torsion"]), ("patch", True))
                 self.assertNotIn("need point friction", friction["reason"])
-                self.assertTrue(friction["parallel_rows"]["admitted"])
                 self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Point friction's record names no patch route.
         point = SolverFeatherPGS(model, friction_anchor_beta=0.0).get_path_selection()
@@ -858,7 +857,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 # Patch friction is admitted to the parallel tiers, and the case whose class they serve builds them:
                 # ring-pooled (linked) tiers, where point friction builds point tiers.
                 patch_law = routes["friction"]["law"] == "patch"
-                self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
                 if patch_law:
                     self.assertEqual(parallel, options is patch_parallel[0])
                 if parallel:
@@ -1107,7 +1105,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         selected = solver.get_path_selection()
         routes = selected["routes"]
         self.assertEqual(routes["friction"]["law"], "patch")
-        self.assertTrue(routes["friction"]["parallel_rows"]["admitted"])
         self.assertEqual(selected["sparse_mass_matrix"], "off")
         self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
         self.assertTrue(routes["paired_response"]["factor_coordinates"])

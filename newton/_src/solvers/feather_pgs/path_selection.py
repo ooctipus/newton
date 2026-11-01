@@ -760,26 +760,15 @@ def _friction(solver) -> dict:
     patch = bool(solver.laws.friction_anchors_enabled)
     reason = _BETA_REASONS[solver.laws.friction_anchor_beta_source]
     if patch:
-        owners = []
-        if not solver.sweep.parallel_contact_paths:
-            owners.append("keyed rows and parallel matrix-free tiers")
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under compliance.
         if solver.laws.set.compliance:
-            owners.append("the resolved-world classifier")
-        if owners:
-            reason += f" Point-contact owners ({', '.join(owners)}) need point friction."
+            reason += " Point-contact owners (the resolved-world classifier) need point friction."
     return {
         "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.laws.friction_anchor_beta),
         "anchor_beta_source": solver.laws.friction_anchor_beta_source,
         "torsion": bool(solver.laws.contact_torsion_enabled),
         "compliance": bool(solver.options.contact_compliance),
-        # Whether the parallel tiers and keyed rows may serve this law; routes.sweep.tiers and
-        # routes.contact_rows.keyed_rows report whether the recipe built them.
-        "parallel_rows": {
-            "admitted": bool(solver.sweep.parallel_contact_paths),
-            "reason": solver.sweep.parallel_contact_paths_reason,
-        },
         "reason": reason,
         "frame_reuse": {
             "enabled": solver.laws.friction_patches.reuse_frames,

@@ -844,9 +844,7 @@ class SolverFeatherPGS(SolverBase):
                 else "The local packet law does not admit this topology."
             )
         self.placement.keyed_rows = None
-        if not self.sweep.parallel_contact_paths:
-            self.placement.keyed_rows_reason = self.sweep.parallel_contact_paths_reason
-        elif (declined := capable("keyed_rows", self.laws.set)) is not None:
+        if (declined := capable("keyed_rows", self.laws.set)) is not None:
             self.placement.keyed_rows_reason = declined
         elif self._route_pins.get("producer") not in (None, "keyed_rows"):
             self.placement.keyed_rows_reason = "A test pin selects another contact-row producer."
@@ -2132,11 +2130,8 @@ class SolverFeatherPGS(SolverBase):
                         clamp=True,
                     )
                     if self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units:
-                        marker = self.sweep.sparse_contact_marker
-                        if marker is None:
-                            raise RuntimeError("Independent sparse-contact marker kernel is unavailable")
                         pool.launch(
-                            marker,
+                            self.sweep.sparse_contact_marker,
                             contact_build_threads,
                             inputs=[contact_input, contact_build_threads],
                             outputs=[self.placement.sparse_diagonal_row_dof],

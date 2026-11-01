@@ -163,10 +163,6 @@ class Sweep:
             and self.execution_plan.use_tiled_hinv_jt(size)
             and self.execution_plan.hinv_jt_chunk_size(size) < self.placement.dense_max_constraints
         )
-        # The parallel matrix-free tiers pool each friction pair's cone over its patch
-        # ring and keyed rows write the patch row law, so both can serve point and patch
-        # friction (Jacobi sweeps, not the serial patch sweep).
-        self.parallel_contact_paths, self.parallel_contact_paths_reason = self._admit_parallel_contact_paths()
 
     def admit_local(self) -> None:
         """Case K3, a small tree beside a body: the local owners, their candidates, queues and blocks."""
@@ -699,8 +695,11 @@ class Sweep:
         The tiers serve the dense rows of a tree beside a free body where no earlier case claims the class
         (:meth:`.route_table.RouteTable.taken`). They form each world's response in the kernel, which bounds the class
         (:meth:`.placement.Placement.inkernel_response_meta`: one articulation of each of one or two sizes per world, at most
-        ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement
-        (:meth:`_admit_parallel_contact_paths`). Their row bound is the dense row capacity, at most
+        ``_INKERNEL_MAX_DOF`` coordinates each), under the contact laws they implement: they pool each friction pair's
+        cone over its patch ring and step it isotropically, so a sliding pair converges to the serial pair solve's maximal
+        dissipation under either friction law (per-row steps moved body-velocity RMS by 0.4-0.9% on two contact-rich
+        patch workloads, and left point tiers 3.9 times the serial sweep's p90 error from its fixed point on anymal-D's
+        33-48-row worlds). Their row bound is the dense row capacity, at most
         :data:`.sweep_routes_tiers.TIER_MAX_ROWS`, in whole quads; a test pin (``tiers``) sets it on any class whose
         response they form. ``ink_rows`` is 0 without tiers and the route table's K4 reason says why or why not
         (``routes.row.reasons``). The local packets and the keyed rows read this before the tiers are built.
@@ -722,7 +721,6 @@ class Sweep:
                         bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
                         "The tiers serve a tree beside a free body (case K4).",
                     ),
-                    (self.parallel_contact_paths, self.parallel_contact_paths_reason),
                 )
             )
         )
@@ -735,31 +733,6 @@ class Sweep:
             elif sizes is not None:
                 reason = f"The dense row capacity {self.placement.dense_max_constraints} holds no tier of four rows."
         self.routes.reasons["K4"] = reason
-
-    def _admit_parallel_contact_paths(self) -> tuple[bool, str]:
-        """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
-
-        They pool each friction pair's cone over its patch ring and write the patch
-        row law, so they serve patch friction as they serve point friction. Every tier steps each friction pair
-        isotropically, so a sliding pair converges to the serial pair solve's maximal
-        dissipation under either law; with per-row steps it did not, which moved
-        body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction workloads, and
-        converged point tiers sat 3.9 times the serial sweep's p90 error away from its
-        fixed point on anymal-D's 33-48-row worlds. Both project joint velocity-limit
-        rows by one unilateral law, so the tiers share the serial sweep's fixed point
-        there too, and weighted contact rows (the relative regularization, material
-        contacts) by their weights, the serial sweeps' row law. Contact torsion's spin
-        rows project with their pairs onto their cone (keyed rows write none: the tiers
-        then take the general producer's rows).
-        """
-        laws = self.laws.set
-        if laws.contact == "point":
-            return True, "Point friction: parallel tiers and keyed rows serve it."
-        return True, (
-            "Patch friction: parallel tiers and keyed rows serve it. In the parallel (Jacobi) sweeps each tangent "
-            "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
-            "one isotropic step per pair, the serial pair solve's friction law."
-        )
 
     def _parallel_velocity_limit_pass(self) -> bool:
         """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
@@ -1207,13 +1180,7 @@ class Sweep:
                     from .keyed_rows import get_parallel_factory  # noqa: PLC0415
 
                     parallel_factory = get_parallel_factory(parallel_factory, self.placement.keyed_rows.layout)
-                tiers = [(min(32, parallel_rows), 0)]
-                if parallel_rows > 32:
-                    tiers.append((min(64, parallel_rows), 32))
-                if parallel_rows > 64:
-                    tiers.append((min(96, parallel_rows), 64))
-                if parallel_rows > 96:
-                    tiers.append((parallel_rows, 96))
+                tiers = [(min(first + 32, parallel_rows), first) for first in range(0, parallel_rows, 32)]
                 self.par_tiers = list(tiers)
                 if len(tiers) >= _TIER_LIST_MIN_TIERS:
                     dev = model.device
@@ -1246,16 +1213,6 @@ class Sweep:
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self.readout.register_skipped(world_count=int(self.forest.world_count), device=model.device)
-
-        # The gate of the row builder (_stage4_build_rows): it allocates free-body velocity-limit rows into
-        # rigid_velocity_limit_slot when free rigid bodies exist, and an infinite activation fraction reserves
-        # none. The route record names the law of the CPU's free-body sweep wherever the builder can allocate them,
-        # even when every registered limit is infinite and no row is built.
-        self.has_free_body_velocity_limit_rows = bool(
-            self.forest.has_free_rigid_bodies
-            and getattr(self.placement, "rigid_velocity_limit_slot", None) is not None
-            and not np.isinf(self.options.velocity_limit_activation_fraction)
-        )
 
     def open_streams(self, *, overlap: bool) -> None:
         """Initialize CUDA streams for parallel kernel launches across size groups.
@@ -1300,9 +1257,6 @@ class Sweep:
         """Publish the schedule of the rows the row pass wrote and each owner's worlds (run after every producer)."""
         model = self.model
         if self.placement.sparse_diagonal_contact_triples or self.placement.sparse_diagonal_contact_units:
-            schedule = self.sparse_contact_schedule
-            if schedule is None:
-                raise RuntimeError("Independent sparse-contact schedule kernel is unavailable")
             # Unit heads come from the row types and the tangent rows' parents.
             unit_rows = (
                 [self.placement.row_type, self.placement.row_parent]
@@ -1310,7 +1264,7 @@ class Sweep:
                 else []
             )
             wp.launch(
-                schedule,
+                self.sparse_contact_schedule,
                 dim=self.forest.world_count * 32,
                 inputs=[
                     self.placement.constraint_count,

@@ -50,11 +50,6 @@ class _LawsProbe(SimpleNamespace):
         )
 
 
-class _AdmissionProbe(SimpleNamespace):
-    # Every contact law may run the parallel tiers.
-    parallel_contact_paths = True
-
-
 def _eligible_solver():
     """Provide only the host fields needed before topology planning starts."""
     forest = _ForestProbe(has_free_rigid_bodies=False)
@@ -64,7 +59,7 @@ def _eligible_solver():
         pgs_warmstart=False,
         contact_compliance=False,
     )
-    return _AdmissionProbe(
+    return SimpleNamespace(
         pins={},
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         placement=SimpleNamespace(),
