@@ -240,9 +240,9 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         previous_predictor = solver.v_hat.numpy().copy()
         targets[0] = -0.6
         control.joint_target_q.assign(targets)
-        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
-            solver.options, pgs_iterations=0
-        )
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+            solver.sweep.options
+        ) = dataclasses.replace(solver.options, pgs_iterations=0)
         pipeline.collide(state_0, contacts)
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)

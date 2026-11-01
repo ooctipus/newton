@@ -354,31 +354,34 @@ def _owner_solver(device, *, anchors, beta=0.0):
     queue = {
         name: ints(worlds)
         for name in (
-            "_local_primary_articulation",
-            "_local_pair_articulation",
-            "_local_residual_pair_articulation",
-            "_local_general_worlds",
+            "local_primary_articulation",
+            "local_pair_articulation",
+            "local_residual_pair_articulation",
+            "local_general_worlds",
         )
     }
     rows = {name: ints(worlds) for name in ("mf_constraint_count", "constraint_count", "local_solve_owner")}
     active = {
         name: {PRIMARY: ints(worlds)}
         for name in (
-            "_local_pair_active_counts",
-            "_local_pair_active_candidates",
-            "_local_pair_active_secondaries",
-            "_local_residual_active_counts",
-            "_local_residual_active_candidates",
-            "_local_residual_active_secondaries",
+            "local_pair_active_counts",
+            "local_pair_active_candidates",
+            "local_pair_active_secondaries",
+            "local_residual_active_counts",
+            "local_residual_active_candidates",
+            "local_residual_active_secondaries",
         )
     }
     solver = SimpleNamespace(
         model=SimpleNamespace(device=wp.get_device(device), articulation_count=2 * worlds),
-        _local_solve_max_rows=PACKETS // 2,
-        _local_residual_max_rows=PACKETS,
-        _local_residual_mf_max_rows=4,
-        **queue,
-        **active,
+        sweep=SimpleNamespace(
+            local_solve_max_rows=PACKETS // 2,
+            local_residual_max_rows=PACKETS,
+            local_residual_mf_max_rows=4,
+            local_general_world_count=ints(1),
+            **queue,
+            **active,
+        ),
         placement=SimpleNamespace(
             **rows,
             mf_body_a=ints(worlds, 4),
@@ -388,7 +391,6 @@ def _owner_solver(device, *, anchors, beta=0.0):
                 size: wp.zeros((worlds, ROWS, size), dtype=float, device=device) for size in (PRIMARY, SECONDARY)
             },
         ),
-        _local_general_world_count=ints(1),
         forest=SimpleNamespace(
             world_count=worlds,
             size_groups=[PRIMARY, SECONDARY],

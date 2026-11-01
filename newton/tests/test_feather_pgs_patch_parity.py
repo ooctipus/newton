@@ -386,7 +386,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
             solver.placement.impulses.assign(impulses)
 
-        seed, dispatch, launch = patches.seed, solver._launch_matrix_free_gs_solve, wp.launch
+        seed, dispatch, launch = patches.seed, solver.sweep.solve, wp.launch
 
         def rescaled(state, world, slot, path, slots_needed, routes):
             routes.scale = wp.vec3(0.5 * routes.scale[0], routes.scale[1], routes.scale[2])
@@ -410,7 +410,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             "not 0 times": mock.patch.object(patches, "seed", lambda *args: None),
             "warm-start scale": mock.patch.object(patches, "seed", rescaled),
             "seeded friction rows": mock.patch.object(wp, "launch", altered),
-            "the sweep starts from": mock.patch.object(solver, "_launch_matrix_free_gs_solve", overwritten),
+            "the sweep starts from": mock.patch.object(solver.sweep, "solve", overwritten),
         }
         for message, defect in defects.items():
             with self.subTest(defect=message), defect, self.assertRaisesRegex(AssertionError, message):

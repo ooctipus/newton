@@ -26,8 +26,8 @@ def fixture(floating, device):
     model.joint_velocity_limit.fill_(0.25)
     # Exercise the motion/predictor kernels directly on CPU too; complete
     # velocity-limit solving remains CUDA/matrix-free and is tested below.
-    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
-        solver.options, enable_joint_velocity_limits=True
+    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = solver.sweep.options = (
+        dataclasses.replace(solver.options, enable_joint_velocity_limits=True)
     )
     solver.factor.passive_spring_stiffness.fill_(0.27)
     solver.factor.passive_spring_ref.fill_(-0.1)

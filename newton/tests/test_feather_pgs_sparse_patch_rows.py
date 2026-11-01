@@ -15,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.staging import arch_budget
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
@@ -28,7 +29,7 @@ _UNFUSED = {"contact_units": None}
 def _admission_probe(**changes):
     """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
     probe = SimpleNamespace(
-        _route_pins={},
+        pins={},
         placement=SimpleNamespace(dense_max_constraints=256),
         forest=SimpleNamespace(max_world_dofs=18),
         laws=SimpleNamespace(friction_anchors_enabled=False),
@@ -39,7 +40,7 @@ def _admission_probe(**changes):
 
 
 def _admit(probe, *, velocity=False, lanes=0, fits=True):
-    return SolverFeatherPGS._admit_sparse_active_rows(
+    return Sweep._admit_sparse_active_rows(
         probe, velocity_candidate=velocity, small_world_lanes=lanes, fits=lambda: fits
     )
 
@@ -56,7 +57,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
         ):
             expected = not pins and not velocity and fits
             with self.subTest(pins=pins, velocity=velocity, fits=fits):
-                probe = _admission_probe(_route_pins=pins)
+                probe = _admission_probe(pins=pins)
                 active, reason = _admit(probe, velocity=velocity, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 if active:
@@ -74,7 +75,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
             ({}, 0, False, False, "bitsets exceed shared memory"),
         ):
             with self.subTest(pins=pins, lanes=lanes, fits=fits):
-                probe = _admission_probe(laws=SimpleNamespace(friction_anchors_enabled=True), _route_pins=pins)
+                probe = _admission_probe(laws=SimpleNamespace(friction_anchors_enabled=True), pins=pins)
                 active, reason = _admit(probe, lanes=lanes, fits=fits)
                 self.assertEqual(active, expected)
                 self.assertIn(phrase, reason)
@@ -101,7 +102,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                 # A world past 16 DOFs or 64 rows never packs; its budget is moot.
                 packable = dofs <= 16 and rows <= 64
                 packed = staging(lanes_per_world=8 if dofs <= 8 else 16).bytes if packable else 1 << 20
-                lanes = SolverFeatherPGS._sparse_small_world_lanes(probe, staging, packed + slack)
+                lanes = Sweep._sparse_small_world_lanes(probe, staging, packed + slack)
                 self.assertEqual(lanes, expected)
 
 
@@ -190,9 +191,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             with self.subTest(law=name):
                 solver = SolverFeatherPGS(model, **law, **options)
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
-                self.assertFalse(solver._sparse_active_rows)
-                self.assertIn("bitsets exceed shared memory", solver._sparse_active_rows_reason)
-                self.assertNotIn("_active", solver._pgs_solve_sparse_kernel.key)
+                self.assertFalse(solver.sweep.sparse_active_rows)
+                self.assertIn("bitsets exceed shared memory", solver.sweep.sparse_active_rows_reason)
+                self.assertNotIn("_active", solver.sweep.sparse_kernel.key)
                 self.assertIn(f"{full.bytes}/{budget}", solver.routes.row.reasons["K1"])
 
     def test_small_worlds_keep_their_packed_patch_sweep(self):
@@ -202,11 +203,11 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
         with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
             solvers["off"] = _make_solver(model, True)
         for solver in solvers.values():
-            self.assertEqual(solver._sparse_solve_lanes, 16)
-            self.assertFalse(solver._sparse_active_rows)
-            self.assertIn("_lanes16", solver._pgs_solve_sparse_kernel.key)
-        self.assertIs(solvers["on"]._pgs_solve_sparse_kernel, solvers["off"]._pgs_solve_sparse_kernel)
-        self.assertIn("16-lane", solvers["on"]._sparse_active_rows_reason)
+            self.assertEqual(solver.sweep.sparse_solve_lanes, 16)
+            self.assertFalse(solver.sweep.sparse_active_rows)
+            self.assertIn("_lanes16", solver.sweep.sparse_kernel.key)
+        self.assertIs(solvers["on"].sweep.sparse_kernel, solvers["off"].sweep.sparse_kernel)
+        self.assertIn("16-lane", solvers["on"].sweep.sparse_active_rows_reason)
         runs = {name: _rollout(solver, model, steps=24) for name, solver in solvers.items()}
         np.testing.assert_array_equal(runs["on"][0], runs["off"][0])
         self.assertGreater(runs["on"][1].min(), 0)
@@ -233,9 +234,9 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
                 solvers[triplets] = _make_solver(model, True, **options)
         # The full ordered sweep: no "_active" between the support width and the table.
-        self.assertRegex(solvers["1"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked$")
-        self.assertRegex(solvers["0"]._pgs_solve_sparse_kernel.key, r"_\d+_support_table$")
-        self.assertFalse(solvers["1"]._sparse_active_rows)
+        self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked$")
+        self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_support_table$")
+        self.assertFalse(solvers["1"].sweep.sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, ordinary_anchors = runs["1"][0], runs["0"][0]
         self.assertTrue(np.any(ordinary_anchors[:, 1] < 4), "The sliding world must release anchors")
@@ -278,8 +279,8 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             solvers = {"active": _make_solver(model, True, **options)}
         with mock.patch.dict(SolverFeatherPGS._route_pins, {**_UNFUSED, "active_rows": False}):
             solvers["full"] = _make_solver(model, True, **options)
-        self.assertTrue(solvers["active"]._sparse_active_rows)
-        self.assertFalse(solvers["full"]._sparse_active_rows)
+        self.assertTrue(solvers["active"].sweep.sparse_active_rows)
+        self.assertFalse(solvers["full"].sweep.sparse_active_rows)
         runs = {name: _rollout(solver, model, steps=240, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, full_anchors = runs["active"][0], runs["full"][0]
         np.testing.assert_array_equal(runs["active"][1], runs["full"][1])

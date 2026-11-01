@@ -140,7 +140,7 @@ def launch_contacts(solver, data, workers):
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     pool.launch(
-        solver._mark_independent_sparse_contact_candidates_kernel,
+        solver.sweep.sparse_contact_marker,
         workers,
         inputs=[data, workers],
         outputs=[solver.placement.sparse_diagonal_row_dof],

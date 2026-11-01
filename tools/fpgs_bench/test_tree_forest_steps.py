@@ -76,13 +76,13 @@ class TestTreeForestSteps(unittest.TestCase):
                         if index in (5, 13, 19):
                             mask = wp.array([index != 13, index == 13], dtype=wp.bool, device=case[0].device)
                             solver.reset(case[2], world_mask=mask)
-                        solve = solver._launch_matrix_free_gs_solve
+                        solve = solver.sweep.solve
 
                         def ordered(*args, _case=case, _solve=solve, _orders=orders, **kwargs):
                             _orders.append(inspector._order_multi_articulation_rows(_case))
                             return _solve(*args, **kwargs)
 
-                        with patch.object(solver, "_launch_matrix_free_gs_solve", side_effect=ordered):
+                        with patch.object(solver.sweep, "solve", side_effect=ordered):
                             cases[arm] = step(case)
                     self.assertEqual(orders[0], orders[1])
                     inspector.assert_states_close(cases[0][2], cases[1][2])
@@ -110,7 +110,7 @@ class TestTreeForestSteps(unittest.TestCase):
                 ordering = [RowOrder(case) for case in cases]
                 for arm in range(len(cases)):
                     case = cases[arm]
-                    with patch.object(case[1], "_launch_matrix_free_gs_solve", side_effect=ordering[arm]):
+                    with patch.object(case[1].sweep, "solve", side_effect=ordering[arm]):
                         for _ in range(4):
                             case = step(case)
                         mask = wp.array([False, False], dtype=wp.bool, device=case[0].device)

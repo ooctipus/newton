@@ -207,8 +207,8 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     solver = SolverFeatherPGS(model, pgs_iterations=8, friction_anchor_beta=0.0, **options)
                     record = solver.get_path_selection()["routes"]["contact_consumers"]
                     self.assertEqual(record["max_blocks"], contact_capacity_blocks(model.device))
-                    self.assertEqual(record["max_blocks"], solver._contact_capacity_blocks)
-                    solver._contact_capacity_blocks = 3
+                    self.assertEqual(record["max_blocks"], solver.placement.contact_capacity_blocks)
+                    solver.placement.contact_capacity_blocks = 3
                     self.assertEqual(solver.get_path_selection()["routes"]["contact_consumers"]["max_blocks"], 3)
                     pipeline = newton.CollisionPipeline(model, contact_matching="sticky")
                     contacts = pipeline.contacts()

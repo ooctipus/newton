@@ -380,7 +380,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
         if type(solver).__name__ != "SolverFeatherPGS":
             raise RuntimeError("Checked FPGS capture resolved an unexpected solver")
         entry["solver_paths"] = {
-            "grouped_response": bool(getattr(solver, "_grouped_response", False)),
+            "grouped_response": bool(getattr(solver.placement, "grouped_response", False)),
             "sparse_diagonal_contact_solve": bool(getattr(solver.placement, "sparse_diagonal_contact_solve", False)),
         }
         read = getattr(solver, "constraint_capacity_status", None)

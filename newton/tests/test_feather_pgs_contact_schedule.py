@@ -19,8 +19,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs import field_group, sweep_levels
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -28,7 +27,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
 )
-from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
@@ -370,14 +369,14 @@ def _unit_builder_path_marks(rows, device):
     The builder is rebuilt without serial lists, so that nothing else writes the serial count, and with a
     lane-0 store of ``1`` there after its parallel links, which only the parallel path runs.
     """
-    link_source = solver_module._link_scalar_contacts_source
+    link_source = sweep_levels._link_scalar_contacts_source
 
     def marked_link_source(**kwargs):
         return f"{link_source(**kwargs)}\n    if (lane == 0) serial_count_out.data[world] = 1;\n"
 
     capacity, dofs = rows["row_type"].shape[1], rows["group_heads"].shape[1]
-    with mock.patch.object(solver_module, "_link_scalar_contacts_source", marked_link_source):
-        kernel = solver_module._build_independent_sparse_contact_units_kernel(capacity, dofs, False)
+    with mock.patch.object(sweep_levels, "_link_scalar_contacts_source", marked_link_source):
+        kernel = sweep_levels._build_independent_sparse_contact_units_kernel(capacity, dofs, False)
     unmarked = {**rows, "serial_count": np.full(rows["row_type"].shape[0], _UNWRITTEN, np.int32)}
     return _launch(kernel, unmarked, device, units=True)["serial_count"]
 
@@ -411,7 +410,7 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
     launch = wp.launch
 
     def recording_launch(kernel, *args, **kwargs):
-        if kernel is not solver._build_independent_sparse_contact_groups_kernel:
+        if kernel is not solver.sweep.sparse_contact_schedule:
             return launch(kernel, *args, **kwargs)
         arrays = dict(zip(names, (*kwargs["inputs"], *kwargs["outputs"]), strict=True))
         before = {name: array.numpy().copy() for name, array in arrays.items()}

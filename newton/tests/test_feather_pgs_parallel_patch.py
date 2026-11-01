@@ -45,6 +45,7 @@ from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -733,7 +734,7 @@ class TestParallelPatchReference(unittest.TestCase):
 
     def test_solver_builds_the_pass_for_limited_linked_tiers(self):
         """Build the last-word pass exactly for linked tiers with joint velocity limits."""
-        decide = SolverFeatherPGS._parallel_velocity_limit_pass
+        decide = Sweep._parallel_velocity_limit_pass
         for anchors, limits in itertools.product((False, True), repeat=2):
             probe = SimpleNamespace(
                 laws=SimpleNamespace(friction_anchors_enabled=anchors),
@@ -1005,7 +1006,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 selected = solver.get_path_selection()
                 friction = selected["routes"]["friction"]
                 keyed = selected["routes"]["contact_rows"]["keyed_rows"]
-                self.assertTrue(solver._parallel_contact_paths)
+                self.assertTrue(solver.sweep.parallel_contact_paths)
                 self.assertTrue(friction["parallel_rows"]["admitted"])
                 if beta == 0.0:
                     self.assertIn("Point friction", friction["parallel_rows"]["reason"])
@@ -1017,7 +1018,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
         # Torsion takes the tiers, and so do weighted contact rows (the weighted tiers).
         for law in ({"torsion": True}, {"regularized": True}, {"compliance": True}):
             other = SimpleNamespace(laws=SimpleNamespace(set=plain_laws(**law)))
-            self.assertTrue(SolverFeatherPGS._admit_parallel_contact_paths(other)[0], law)
+            self.assertTrue(Sweep._admit_parallel_contact_paths(other)[0], law)
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
@@ -1030,10 +1031,12 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
             probe = SimpleNamespace(
-                _mf_gs_tiers=kernels,
-                _par_tiers=[(32, 0), (64, 32)],
-                _par_sweeps_rule="auto",
-                _par_sweeps_reason="auto: ...",
+                sweep=SimpleNamespace(
+                    tiers=kernels,
+                    par_tiers=[(32, 0), (64, 32)],
+                    par_sweeps_rule="auto",
+                    par_sweeps_reason="auto: ...",
+                ),
                 placement=SimpleNamespace(ink_rows=64, ink_sizes=(_DOFS, 0, 0, 0)),
                 routes=SimpleNamespace(
                     row=SimpleNamespace(
@@ -1102,23 +1105,23 @@ class TestTierSweeps(unittest.TestCase):
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
         for anchors in (False, True):
             probe = SimpleNamespace(
-                _route_pins={},
+                pins={},
                 laws=SimpleNamespace(friction_anchors_enabled=anchors),
                 options=SimpleNamespace(pgs_iterations=12),
             )
             with self.subTest(anchors=anchors):
-                budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
+                budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
                 self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
                 self.assertIn("ceil(7/2 * pgs_iterations * sqrt(R / 32))", reason)
                 self.assertIn("pgs_iterations=12", reason)
                 self.assertIn("at most 128", reason)
         # A test pin sets every tier's budget.
         probe = SimpleNamespace(
-            _route_pins={"tier_sweeps": 160},
+            pins={"tier_sweeps": 160},
             laws=SimpleNamespace(friction_anchors_enabled=False),
             options=SimpleNamespace(pgs_iterations=12),
         )
-        budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
+        budgets, rule, reason = Sweep._parallel_tier_sweeps(probe, tiers)
         self.assertEqual((budgets, rule), ([160] * 4, "pinned"))
         self.assertIn("tier_sweeps=160", reason)
 
@@ -1178,16 +1181,16 @@ class TestTierRule(unittest.TestCase):
                     lambda: ((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
                 ),
             ),
-            _route_pins={},
+            pins={},
             routes=_routes(),
             laws=SimpleNamespace(set=plain_laws()),
-            _parallel_contact_paths=True,
-            _parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
+            parallel_contact_paths=True,
+            parallel_contact_paths_reason="Point friction: parallel tiers and keyed rows serve it.",
             forest=SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=True),
         )
         for name, value in changes.items():
             setattr(probe, name, value)
-        SolverFeatherPGS._plan_tier_rows(probe)
+        Sweep.plan_tier_rows(probe)
         return probe
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
@@ -1208,11 +1211,11 @@ class TestTierRule(unittest.TestCase):
             ({"routes": _routes("K5")}, "case K5"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=False, has_non_free_articulations=True)}, "case K4"),
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True, has_non_free_articulations=False)}, "case K4"),
-            ({"_parallel_contact_paths": False, "_parallel_contact_paths_reason": torsion}, "torsion"),
+            ({"parallel_contact_paths": False, "parallel_contact_paths_reason": torsion}, "torsion"),
             ({"routes": _routes(placement="general")}, "general placement"),
             # The tiers' bodies are written for CUDA only (the CPU takes the general row).
             ({"laws": SimpleNamespace(set=plain_laws(cuda=False))}, "CUDA device"),
-            ({"_route_pins": {"tiers": 0}}, "tiers=0"),
+            ({"pins": {"tiers": 0}}, "tiers=0"),
             (
                 {"inkernel_response_meta": lambda: (None, "A world has several articulations of size 6.")},
                 "several",
@@ -1225,7 +1228,7 @@ class TestTierRule(unittest.TestCase):
 
     def test_a_pin_builds_the_tiers_on_a_single_tree(self):
         """Build the tiers a test pin asks for on a class whose response they form, at the pinned bound."""
-        probe = self._probe(_has_free_rigid_bodies=False, _route_pins={"tiers": 32})
+        probe = self._probe(_has_free_rigid_bodies=False, pins={"tiers": 32})
         self.assertEqual((probe.placement.ink_rows, probe.placement.ink_sizes), (32, (16, 6, 0, 16)))
 
 
@@ -1571,7 +1574,7 @@ def _assert_tier_owned(test, solver, budget):
     worlds, so a world in that domain is the tier's (``skip_tier_rows``).
     """
     test.assertEqual(solver.placement.ink_rows, budget)
-    test.assertTrue(solver._mf_gs_tiers)
+    test.assertTrue(solver.sweep.tiers)
     test.assertFalse(solver.placement.local_internal_fast_path)
     counts, free_rows = solver.placement.constraint_count.numpy(), solver.placement.mf_constraint_count.numpy()
     test.assertGreater(int(counts.max()), 0)
@@ -1611,7 +1614,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertEqual(solver.placement.ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)
-            keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
+            keys = [tier.kernel.key for tier in solver.sweep.tiers]
             self.assertTrue(keys)
             self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
             self.assertTrue(all(("_linked" in key) == linked for key in keys), keys)
@@ -1745,7 +1748,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             }
         for limits, solver in built.items():
             with self.subTest(limits=limits):
-                keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
+                keys = [tier.kernel.key for tier in solver.sweep.tiers]
                 self.assertTrue(keys)
                 self.assertTrue(all(key.endswith("_linked_lw" if limits else "_linked") for key in keys))
                 selected = solver.get_path_selection()
@@ -1761,7 +1764,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
         velocities = {}
         for (sweeps, last_word), solver in budgets.items():
-            keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
+            keys = [tier.kernel.key for tier in solver.sweep.tiers]
             self.assertTrue(
                 keys and all(f"_sweeps{sweeps}_" in key and key.endswith("_lw") == last_word for key in keys), keys
             )
@@ -1785,7 +1788,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             with self.subTest(beta=beta, sweeps=sweeps):
                 # 7/2 * 8 * sqrt(rows / 32): 28 and 40 sweeps for 32 and 64 rows, unless a test pin sets them.
                 expected, rule = ([28, 40], "auto") if sweeps is None else ([sweeps, sweeps], "pinned")
-                keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
+                keys = [tier.kernel.key for tier in solver.sweep.tiers]
                 self.assertEqual(len(keys), 2, keys)
                 for key, budget in zip(keys, expected, strict=True):
                     self.assertIn(f"_sweeps{budget}_", key)
@@ -1819,7 +1822,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
 
     def _assert_budget(self, solver, parallel_rows):
         """Require the tiers to sweep the automatic budget of 32 rows at eight iterations."""
-        keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
+        keys = [tier.kernel.key for tier in solver.sweep.tiers]
         self.assertEqual(bool(keys), bool(parallel_rows), keys)
         budget = sweep_routes_tiers.tier_sweeps(32, 8)
         self.assertTrue(all(f"_sweeps{budget}_" in key for key in keys), keys)
@@ -1963,7 +1966,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
             routes["budgeted"] = _matrix_free_solver(model, beta=0.2, parallel_rows=32, sweeps=2000)
         for name in ("truncated", "budgeted"):
             sweeps = 2000 if name == "budgeted" else 2
-            tiers = routes[name]._mf_gs_tiers
+            tiers = routes[name].sweep.tiers
             self.assertTrue(tiers and all(f"_sweeps{sweeps}_" in tier.kernel.key for tier in tiers), name)
         velocities = {}
         for name, solver in routes.items():
@@ -2042,7 +2045,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         }
         for name, rows in (("declined", 8), ("owned", 32), ("serial", 0)):
             self.assertEqual(arms[name].placement.ink_rows, rows, name)
-            keys = [tier.kernel.key for tier in arms[name]._mf_gs_tiers]
+            keys = [tier.kernel.key for tier in arms[name].sweep.tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             # Linked tiers with joint velocity limits take the last word.
             self.assertTrue(all(key.endswith("_linked_lw") for key in keys), keys)

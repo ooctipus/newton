@@ -460,7 +460,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(optimized.placement.sparse_diagonal_contact_triples, label == "point")
                 self.assertEqual(optimized.placement.sparse_diagonal_contact_units, label == "patch")
                 self.assertTrue(optimized.placement.sparse_diagonal_speculative_contact_batches)
-                self.assertEqual(optimized._pgs_solve_sparse_diagonal_kernel.key.endswith("_units"), label == "patch")
+                self.assertEqual(optimized.sweep.sparse_diagonal_kernel.key.endswith("_units"), label == "patch")
                 self.assertFalse(reference.placement.sparse_diagonal_contact_solve)
 
                 sparse = run(optimized)
@@ -477,8 +477,8 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     (2, capacity if label == "patch" else (capacity + 2) // 3),
                 )
                 for kernel in (
-                    optimized._mark_independent_sparse_contact_candidates_kernel,
-                    optimized._build_independent_sparse_contact_groups_kernel,
+                    optimized.sweep.sparse_contact_marker,
+                    optimized.sweep.sparse_contact_schedule,
                 ):
                     self.assertEqual(kernel.key.endswith("_units"), label == "patch", kernel.key)
                 self.assertGreater(

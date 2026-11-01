@@ -189,5 +189,5 @@ for kind in ("kuka", "franka"):
         "contacts",
         int(contacts.rigid_contact_count.numpy()[0]),
         "resolved worlds",
-        int(solver._resolved_worlds.numpy().sum()) if solver._resolved_worlds.shape[0] else "n/a",
+        int(solver.sweep.resolved_worlds.numpy().sum()) if solver.sweep.resolved_worlds.shape[0] else "n/a",
     )

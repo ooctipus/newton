@@ -356,9 +356,9 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         self.assertEqual(int(match[b_contact]), 0)
         self.assertLess(int(match[a_contact]), 0)
 
-        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
-            solver.options, pgs_iterations=0
-        )
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+            solver.sweep.options
+        ) = dataclasses.replace(solver.options, pgs_iterations=0)
         solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
         slots = solver.placement.contact_slot.numpy()[:count]
         b_slot = int(slots[b_contact])

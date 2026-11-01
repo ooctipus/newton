@@ -94,7 +94,7 @@ def _is_default(value, default) -> bool:
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
     # A readout applies only where a sweep kernel carries its counters.
-    "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver._solve_readout.kernels else "off",
+    "pgs_solve_readout": lambda solver: solver.options.pgs_solve_readout if solver.sweep.readout.kernels else "off",
 }
 
 
@@ -191,8 +191,8 @@ def measurement_selection(solver) -> dict:
     The counters accumulate, so a window is the difference of two records.
     """
     record = {}
-    if solver._solve_readout.kernels:
-        record["solve_readout"] = json_value(solver._solve_readout.summary())
+    if solver.sweep.readout.kernels:
+        record["solve_readout"] = json_value(solver.sweep.readout.summary())
     return record
 
 
@@ -369,15 +369,15 @@ def _row_builder(solver, plan, size, source) -> dict:
         produce = (compact_contact.produce_contacts,)
         if size == solver.placement.sparse_diagonal_response_size:
             # The marker encodes schedule links into the freshly published sparse DOF slots.
-            kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
+            kernels = (*produce, solver.sweep.sparse_contact_marker)
         else:
             kernels = (compact_contact.clear_contact_response, *produce)
     elif method == "sparse_response":
-        kernels = (*prepare, solver._sparse_contact_response_kernel)
+        kernels = (*prepare, solver.placement.sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
         kernels = (*prepare, response_builds_rows.sparse_pair_contact_rows_kernel)
         if solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units:
-            kernels = (*kernels, solver._mark_independent_sparse_contact_candidates_kernel)
+            kernels = (*kernels, solver.sweep.sparse_contact_marker)
     elif method == "compact_jacobian":
         kernels = (*prepare, source.populate_world_J_for_compact_size)
     else:
@@ -423,7 +423,7 @@ def _contact_rows(solver, source) -> dict:
 
 
 def _contact_consumers(solver) -> dict:
-    blocks = int(solver._contact_capacity_blocks)
+    blocks = int(solver.placement.contact_capacity_blocks)
     return {
         "max_blocks": blocks,
         "reason": (
@@ -440,31 +440,31 @@ def _local_solve(solver) -> dict:
     enabled = row.case == "K3"
     return {
         "enabled": enabled,
-        "internal_articulations_by_dof": _counts(solver._local_internal_art_counts) if enabled else {},
-        "pair_articulations_by_dof": _counts(solver._local_pair_art_counts) if enabled else {},
-        "residual_articulations_by_dof": _counts(solver._local_residual_art_counts) if enabled else {},
+        "internal_articulations_by_dof": _counts(solver.sweep.local_internal_art_counts) if enabled else {},
+        "pair_articulations_by_dof": _counts(solver.sweep.local_pair_art_counts) if enabled else {},
+        "residual_articulations_by_dof": _counts(solver.sweep.local_residual_art_counts) if enabled else {},
         "reason": row.reasons["K3"],
     }
 
 
 def _paired_response(solver) -> dict:
     row = solver.routes.row
-    primary = solver._paired_response_primary_size
+    primary = solver.sweep.paired_response_primary_size
     if primary is None:
-        return {"enabled": False, "reason": solver._paired_response_reason}
+        return {"enabled": False, "reason": solver.sweep.paired_response_reason}
     factor = row.case == "K5"
-    overlap = solver._paired_general_solve_stream is not None
+    overlap = solver.sweep.paired_general_solve_stream is not None
     return {
         "enabled": True,
         "primary_dofs": int(primary),
-        "secondary_dofs": int(solver._paired_response_secondary_size),
+        "secondary_dofs": int(solver.sweep.paired_response_secondary_size),
         "factor_coordinates": factor,
         # Why the paired response keeps its register inverse instead of factor coordinates (None when admitted).
         "factor_coordinates_reason": row.reasons["K5"],
-        "contact_triples": bool(solver._factor_coordinate_contact_triples),
-        "contact_units": bool(solver._factor_coordinate_contact_units),
-        "components": solver._paired_components is not None,
-        "components_reason": solver._paired_components_reason,
+        "contact_triples": bool(solver.sweep.factor_coordinate_contact_triples),
+        "contact_units": bool(solver.sweep.factor_coordinate_contact_units),
+        "components": solver.sweep.paired_components is not None,
+        "components_reason": solver.sweep.paired_components_reason,
         "two_stream_overlap": overlap,
         "two_stream_reason": "The paired factor sweep and the general sweep fork onto two streams."
         if overlap
@@ -495,24 +495,24 @@ def _sparse_mass_matrix(solver) -> dict:
     record = {
         "size": json_value(size),
         "reason": row.reasons["K1"],
-        "velocity_limits": bool(solver._sparse_velocity_limits),
-        "active_rows": bool(solver._sparse_active_rows),
-        "active_rows_reason": solver._sparse_active_rows_reason,
+        "velocity_limits": bool(solver.sweep.sparse_velocity_limits),
+        "active_rows": bool(solver.sweep.sparse_active_rows),
+        "active_rows_reason": solver.sweep.sparse_active_rows_reason,
         "support_table": bool(solver.placement.sparse_row_support.enabled),
-        "contact_triplets": bool(solver._sparse_contact_triplets),
-        "contact_triplets_reason": solver._sparse_contact_triplets_reason,
+        "contact_triplets": bool(solver.sweep.sparse_contact_triplets),
+        "contact_triplets_reason": solver.sweep.sparse_contact_triplets_reason,
     }
     if size is not None:
         record.update(
             {
                 "max_row_support": json_value(solver.placement.sparse_max_row_support),
-                "solve_lanes": int(solver._sparse_solve_lanes),
-                "local_factors": bool(solver._sparse_local_factors),
-                "factor_warps_per_block": int(solver._sparse_factor_warps_per_block),
-                "contact_response_kernel": _key(solver._sparse_contact_response_kernel),
-                "sweep_kernel": _key(solver._pgs_solve_sparse_kernel),
+                "solve_lanes": int(solver.sweep.sparse_solve_lanes),
+                "local_factors": bool(solver.sweep.sparse_local_factors),
+                "factor_warps_per_block": int(solver.factor.sparse_factor_warps_per_block),
+                "contact_response_kernel": _key(solver.placement.sparse_contact_response_kernel),
+                "sweep_kernel": _key(solver.sweep.sparse_kernel),
                 # The sweep's launch bounds from its shared memory and register budget (threads, minimum blocks).
-                "launch_bounds": json_value(solver._pgs_solve_sparse_kernel.options.get("launch_bounds")),
+                "launch_bounds": json_value(solver.sweep.sparse_kernel.options.get("launch_bounds")),
             }
         )
     return record
@@ -535,19 +535,19 @@ def _sweep(solver) -> dict:
     if row.case == "K3":
         local = {
             "factory": "row_packets" if row.producer == "local_packets" else "local_owned",
-            "internal": _keys_by_size(solver._pgs_solve_local_internal_kernels),
-            "pair": _keys_by_size(solver._pgs_solve_local_pair_kernels),
-            "residual": _keys_by_size(solver._pgs_solve_local_residual_kernels),
+            "internal": _keys_by_size(solver.sweep.local_internal_kernels),
+            "pair": _keys_by_size(solver.sweep.local_pair_kernels),
+            "residual": _keys_by_size(solver.sweep.local_residual_kernels),
         }
     record = {
         "route": route,
         "reason": solve.route.reason,
         "iterations": int(solver.options.pgs_iterations),
         "mf_meta_pack": mf_meta_pack,
-        "sparse": _key(solver._pgs_solve_sparse_kernel) if route == "sparse_pgs" else None,
-        "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
-        "paired_factor": _key(solver._paired_factor_solve_kernel),
-        "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
+        "sparse": _key(solver.sweep.sparse_kernel) if route == "sparse_pgs" else None,
+        "sparse_diagonal": _key(solver.sweep.sparse_diagonal_kernel),
+        "paired_factor": _key(solver.sweep.paired_factor_kernel),
+        "mf_gs": _key(solver.sweep.mf_gs_kernel),
         "mf_gs_storage": _mf_gs_storage(solver),
         "mf_colored": _mf_colored(solver),
         "tiers": _tiers(solver),
@@ -560,10 +560,10 @@ def _sweep(solver) -> dict:
 
 def _mf_colored(solver) -> dict | None:
     """The colored mapping of the matrix-free sweep: its kernel and the worlds it takes, or ``None`` unbuilt."""
-    kernel = solver._pgs_solve_mf_colored_kernel
+    kernel = solver.sweep.mf_colored_kernel
     if kernel is None:
         return None
-    units = solver._colored_units
+    units = solver.sweep.colored_units
     rule = units.rule
     return {
         "kernel": _key(kernel),
@@ -587,7 +587,7 @@ def _mf_colored(solver) -> dict | None:
 
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and how a solve counts."""
-    counted = solver._solve_readout.kernels
+    counted = solver.sweep.readout.kernels
     if solver.options.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
     else:
@@ -596,7 +596,7 @@ def _readout(solver, record) -> dict:
         "mode": solver.options.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         # Whether the solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
-        "counts_skipped": bool(counted) and solver._solve_readout.counts_skipped,
+        "counts_skipped": bool(counted) and solver.sweep.readout.counts_skipped,
         "reason": reason,
     }
 
@@ -617,7 +617,7 @@ def _exit_law(solver, record) -> dict:
 
 def _mf_gs_storage(solver) -> dict | None:
     # Storage classes of the MF-GS kernel, chosen by execution_plan._select_mfgs_storage.
-    storage = solver._mfgs_storage
+    storage = solver.sweep.mf_gs_storage
     if storage is None:
         return None
 
@@ -634,7 +634,7 @@ def _mf_gs_storage(solver) -> dict | None:
 
 def _tiers(solver) -> dict | None:
     row = solver.routes.row
-    tiers = list(solver._mf_gs_tiers)
+    tiers = list(solver.sweep.tiers)
     if not tiers:
         return None
     return {
@@ -647,8 +647,8 @@ def _tiers(solver) -> dict | None:
         "velocity_limit_pass": all(tier.velocity_limit_pass for tier in tiers),
         # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
         "sweeps": max(tier.sweeps for tier in tiers),
-        "sweeps_rule": solver._par_sweeps_rule,
-        "sweeps_reason": solver._par_sweeps_reason,
+        "sweeps_rule": solver.sweep.par_sweeps_rule,
+        "sweeps_reason": solver.sweep.par_sweeps_reason,
         "tiers": [
             {
                 "rows": int(rows),
@@ -656,13 +656,13 @@ def _tiers(solver) -> dict | None:
                 "sweeps": tier.sweeps,
                 "kernel": _key(tier.kernel),
             }
-            for (rows, min_rows), tier in zip(solver._par_tiers, tiers, strict=True)
+            for (rows, min_rows), tier in zip(solver.sweep.par_tiers, tiers, strict=True)
         ],
     }
 
 
 def _resolved_worlds(solver) -> dict:
-    owner = solver._resolved_worlds_owner
+    owner = solver.sweep.resolved_worlds_owner
     published = bool(owner is not None and owner.published)
     if owner is None:
         twists = None
@@ -672,7 +672,7 @@ def _resolved_worlds(solver) -> dict:
         twists = "The classifier builds body twists itself: a responding articulation has no twist-publishing tree."
     return {
         "enabled": owner is not None,
-        "reason": solver._resolved_worlds_reason,
+        "reason": solver.sweep.resolved_worlds_reason,
         "publishes_predicted_twists": published,
         "twists_reason": twists,
     }
@@ -689,7 +689,7 @@ def _publication(solver) -> dict:
 def _velocity_limits(solver) -> dict:
     if not solver.options.enable_joint_velocity_limits:
         joint, reason = "off", "enable_joint_velocity_limits is False."
-    elif solver._sparse_velocity_limits:
+    elif solver.sweep.sparse_velocity_limits:
         joint, reason = "sparse_factor_rows", "Native sparse factors solve velocity-limit rows in factor coordinates."
     else:
         joint, reason = "rows", "Dedicated velocity-limit rows."
@@ -716,12 +716,12 @@ def _free_rigid_bodies(solver) -> dict:
     if count:
         if row.case == "K1":
             owners.append("sparse_free_rows")
-        if solver._paired_response_primary_size is not None:
+        if solver.sweep.paired_response_primary_size is not None:
             owners.append("paired_factor" if row.case == "K5" else "paired_response")
         # Built local kernels only.
-        if solver._pgs_solve_local_pair_kernels:
+        if solver.sweep.local_pair_kernels:
             owners.append("local_pair")
-        if solver._pgs_solve_local_residual_kernels:
+        if solver.sweep.local_residual_kernels:
             owners.append("local_residual")
         owners.append("matrix_free_rows")
     return {
@@ -761,7 +761,7 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver.laws.friction_anchor_beta_source]
     if patch:
         owners = []
-        if not solver._parallel_contact_paths:
+        if not solver.sweep.parallel_contact_paths:
             owners.append("keyed rows and parallel matrix-free tiers")
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under compliance.
         if solver.laws.set.compliance:
@@ -777,8 +777,8 @@ def _friction(solver) -> dict:
         # Whether the parallel tiers and keyed rows may serve this law; routes.sweep.tiers and
         # routes.contact_rows.keyed_rows report whether the recipe built them.
         "parallel_rows": {
-            "admitted": bool(solver._parallel_contact_paths),
-            "reason": solver._parallel_contact_paths_reason,
+            "admitted": bool(solver.sweep.parallel_contact_paths),
+            "reason": solver.sweep.parallel_contact_paths_reason,
         },
         "reason": reason,
         "frame_reuse": {

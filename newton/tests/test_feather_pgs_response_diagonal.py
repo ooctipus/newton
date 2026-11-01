@@ -22,8 +22,8 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.response_builds_dense import diagonal_groups_kernel, response_tiles_kernel
-from newton._src.solvers.feather_pgs.solver_feather_pgs import (
-    _FeatherPGSExecutionPlan,
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSExecutionPlan
+from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
@@ -1465,15 +1465,15 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     "auto", friction_anchor_beta=friction_anchor_beta, **run_kwargs
                 )
 
-                self.assertIsNone(reference_solver._paired_response_primary_size)
+                self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
                 self.assertEqual(paired_solver.laws.friction_anchors_enabled, label == "patch")
-                self.assertEqual(paired_solver._paired_response_primary_size, 23)
-                self.assertEqual(paired_solver._paired_response_secondary_size, 6)
-                self.assertIsNotNone(paired_solver._paired_factor_solve_kernel)
-                self.assertTrue(paired_solver._paired_factor_coordinates)
-                self.assertEqual(paired_solver._factor_coordinate_contact_triples, triples)
-                self.assertEqual(paired_solver._factor_coordinate_contact_units, label == "patch")
-                self.assertEqual("_units" in paired_solver._paired_factor_solve_kernel.key, label == "patch")
+                self.assertEqual(paired_solver.sweep.paired_response_primary_size, 23)
+                self.assertEqual(paired_solver.sweep.paired_response_secondary_size, 6)
+                self.assertIsNotNone(paired_solver.sweep.paired_factor_kernel)
+                self.assertTrue(paired_solver.sweep.paired_factor_coordinates)
+                self.assertEqual(paired_solver.sweep.factor_coordinate_contact_triples, triples)
+                self.assertEqual(paired_solver.sweep.factor_coordinate_contact_units, label == "patch")
+                self.assertEqual("_units" in paired_solver.sweep.paired_factor_kernel.key, label == "patch")
                 self.assertGreater(reference[0][0], 0, "mixed scene generated no dense constraint rows")
                 self.assertTrue(
                     any(np.any(sample[6] == PGS_CONSTRAINT_TYPE_FRICTION) for sample in paired),
@@ -1509,8 +1509,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         reference_solver, reference = _run_mixed_response("par_row", **run_kwargs)
         paired_solver, paired = _run_mixed_response("auto", **run_kwargs)
 
-        self.assertIsNone(reference_solver._paired_response_primary_size)
-        self.assertTrue(paired_solver._paired_factor_coordinates)
+        self.assertIsNone(reference_solver.sweep.paired_response_primary_size)
+        self.assertTrue(paired_solver.sweep.paired_factor_coordinates)
         self.assertTrue(any(sample[7] > 0 for sample in paired), "static contact generated no matrix-free rows")
         for step, (expected, actual) in enumerate(zip(reference, paired, strict=True)):
             self.assertEqual(actual[0], expected[0], f"constraint count differed at step {step}")
@@ -1553,22 +1553,22 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 friction_anchor_beta=0.0,
             )
         self.assertTrue(solvers[False].laws.friction_anchors_enabled)
-        self.assertTrue(solvers[False]._paired_factor_coordinates)
+        self.assertTrue(solvers[False].sweep.paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
-        self.assertFalse(solvers[False]._factor_coordinate_contact_triples)
-        self.assertTrue(solvers[False]._factor_coordinate_contact_units)
-        self.assertIn("_units", solvers[False]._paired_factor_solve_kernel.key)
+        self.assertFalse(solvers[False].sweep.factor_coordinate_contact_triples)
+        self.assertTrue(solvers[False].sweep.factor_coordinate_contact_units)
+        self.assertIn("_units", solvers[False].sweep.paired_factor_kernel.key)
         self.assertTrue(solvers[False].get_path_selection()["routes"]["paired_response"]["contact_units"])
         self.assertFalse(point.laws.friction_anchors_enabled)
-        self.assertTrue(point._paired_factor_coordinates)
-        self.assertTrue(point._factor_coordinate_contact_triples)
-        self.assertFalse(point._factor_coordinate_contact_units)
+        self.assertTrue(point.sweep.paired_factor_coordinates)
+        self.assertTrue(point.sweep.factor_coordinate_contact_triples)
+        self.assertFalse(point.sweep.factor_coordinate_contact_units)
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
-        self.assertIsNotNone(solvers[True]._paired_response_primary_size)
-        self.assertTrue(solvers[True]._paired_factor_coordinates)
-        self.assertFalse(solvers[True]._factor_coordinate_contact_triples)
-        self.assertTrue(solvers[True]._factor_coordinate_contact_units)
-        self.assertIn("_torsion", solvers[True]._paired_factor_solve_kernel.key)
+        self.assertIsNotNone(solvers[True].sweep.paired_response_primary_size)
+        self.assertTrue(solvers[True].sweep.paired_factor_coordinates)
+        self.assertFalse(solvers[True].sweep.factor_coordinate_contact_triples)
+        self.assertTrue(solvers[True].sweep.factor_coordinate_contact_units)
+        self.assertIn("_torsion", solvers[True].sweep.paired_factor_kernel.key)
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_local_internal_mixed_world_matches_general_response(self):
@@ -1749,7 +1749,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         for sample in general + local:
             np.testing.assert_array_equal(sample[8][sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT], 0.0)
         # The residual owner is eligible for this world; only the velocity-limit rows keep it general.
-        self.assertGreaterEqual(int(local_solver._local_residual_pair_articulation.numpy()[0]), 0)
+        self.assertGreaterEqual(int(local_solver.sweep.local_residual_pair_articulation.numpy()[0]), 0)
         for sample in limited:
             self.assertEqual(sample[5], PGS_LOCAL_SOLVE_OWNER_GENERAL, "velocity-limit rows left the general owner")
         _assert_owner_parity(self, general, local)
@@ -1773,8 +1773,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertEqual(int(local_solver.forest.articulation_dof_start_host[free_articulation]), 0)
         self.assertFalse(general_solver.placement.local_internal_fast_path)
         self.assertTrue(local_solver.placement.local_internal_fast_path)
-        np.testing.assert_array_equal(local_solver._local_residual_pair_articulation.numpy(), [-1])
-        self.assertGreaterEqual(int(local_solver._local_pair_articulation.numpy()[0]), 0)
+        np.testing.assert_array_equal(local_solver.sweep.local_residual_pair_articulation.numpy(), [-1])
+        self.assertGreaterEqual(int(local_solver.sweep.local_pair_articulation.numpy()[0]), 0)
         self.assertTrue(any(sample[7] > 0 for sample in local), "free body generated no matrix-free rows")
         for sample in local:
             if sample[7] > 0:
@@ -1801,8 +1801,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
         self.assertTrue(solvers[True].placement.local_internal_fast_path)
         kernels = (
-            *solvers[True]._pgs_solve_local_pair_kernels.values(),
-            *solvers[True]._pgs_solve_local_residual_kernels.values(),
+            *solvers[True].sweep.local_pair_kernels.values(),
+            *solvers[True].sweep.local_residual_kernels.values(),
         )
         self.assertTrue(kernels)
         self.assertTrue(all("_torsion" in kernel.key for kernel in kernels))

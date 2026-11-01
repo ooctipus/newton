@@ -29,6 +29,7 @@ import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
 from ...sim import Contacts
+from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
 from . import host_index, packed_rows, response_builds_dense, response_builds_rows
 from .dense_rows import RowSupport
@@ -244,6 +245,11 @@ class Placement:
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
+        # Launches over the contact capacity (the force export, the warm-start snapshot and gathers, the keyed-row key
+        # scatters) grid-stride over about one wave of blocks.
+        self.contact_capacity_blocks = contact_capacity_blocks(model.device)
+        # The grouped response solve, for the sizes StepPlan gives it from the data.
+        self.grouped_response = False
         # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
         self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
         self.mf_max_constraints = options.mf_max_constraints

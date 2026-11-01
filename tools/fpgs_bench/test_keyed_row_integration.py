@@ -154,7 +154,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 self.assertIsNone(ordinary[1].placement.keyed_rows)
                 self.assertTrue(keyed[1].placement.keyed_rows.patch)
                 for case in (ordinary, keyed):
-                    tiers = case[1]._mf_gs_tiers
+                    tiers = case[1].sweep.tiers
                     self.assertTrue(tiers)
                     self.assertTrue(all(tier.linked_rows for tier in tiers))
                 linked = False
@@ -199,7 +199,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 self.assertEqual(wave[1].placement.max_contacts_alloc, 1024)
                 record = wave[1].get_path_selection()["routes"]["contact_consumers"]
                 self.assertEqual(record["max_blocks"], contact_capacity_blocks(device))
-                single[1]._contact_capacity_blocks = 1
+                single[1].placement.contact_capacity_blocks = 1
                 blocks, launch = [], wp.launch
 
                 def recording(kernel, *args, scatter=scatter, blocks=blocks, launch=launch, **kwargs):

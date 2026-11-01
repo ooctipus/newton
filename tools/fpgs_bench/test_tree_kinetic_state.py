@@ -88,7 +88,7 @@ def fixture(floating, device):
     solver.factor.sparse_mass_matrix_indices = factor_indices(mass, device)
     solver.factor.sparse_Linv = wp.zeros((2, mass.nonzero_count), dtype=float, device=device)
     solver.factor.sparse_mass_matrix_status = wp.zeros(2, dtype=int, device=device)
-    solver._sparse_factor_warps_per_block = 4
+    solver.factor.sparse_factor_warps_per_block = 4
     operator = TreeSparseOperator(solver)
     owner = TreeKineticState(operator)
     operator.kinetic_state = owner

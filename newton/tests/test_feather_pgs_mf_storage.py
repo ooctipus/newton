@@ -848,7 +848,7 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
 
         with mock.patch.object(sweep_routes, "mf_gs_kernel", recording):
             solver = fpgs.SolverFeatherPGS(model, **options)
-        production = solver._pgs_solve_mf_gs_kernel
+        production = solver.sweep.mf_gs_kernel
         self.assertIn("_gmeta_smeta", production.key)
         args, kwargs = next((args, kwargs) for args, kwargs, kernel in calls if kernel is production)
         twin = factory(*args, **{**kwargs, "resident_row_metadata": False})
@@ -887,12 +887,12 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         with mock.patch.dict(fpgs.SolverFeatherPGS._route_pins, {"storage": "dense"}):
             solver, records = self._replay_solver_launches(model, options)
             sweep = solver.get_path_selection()["routes"]["sweep"]
-            self.assertEqual(sweep["mf_gs"], solver._pgs_solve_mf_gs_kernel.key)
+            self.assertEqual(sweep["mf_gs"], solver.sweep.mf_gs_kernel.key)
             storage = sweep["mf_gs_storage"]
             self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
             self.assertIn("2-block grid fits one block per SM", storage["reason"])
             # The selection judged the grid the launches use.
-            self.assertEqual(solver._mf_gs_block_count, 2)
+            self.assertEqual(solver.sweep.mf_gs_block_count, 2)
             self.assertEqual(
                 {(*record["dim"], record["scalars"]["general_world_grid_stride"]) for record in records}, {(2, 2)}
             )
@@ -916,8 +916,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         with mock.patch.object(device, "sm_count", 1):
             declined = fpgs.SolverFeatherPGS(model, **options)
         storage = declined.get_path_selection()["routes"]["sweep"]["mf_gs_storage"]
-        self.assertIn("_gmeta", declined._pgs_solve_mf_gs_kernel.key)
-        self.assertNotIn("_smeta", declined._pgs_solve_mf_gs_kernel.key)
+        self.assertIn("_gmeta", declined.sweep.mf_gs_kernel.key)
+        self.assertNotIn("_smeta", declined.sweep.mf_gs_kernel.key)
         self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "streamed"))
         self.assertIn("2-block grid exceeds one block per SM (1 SMs)", storage["reason"])
 
@@ -1102,7 +1102,7 @@ def test_dense_rows_mark_only_sides_with_coordinates(test, device):
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     pipeline.collide(state_0, contacts)
-    with mock.patch.object(solver, "_launch_matrix_free_gs_solve"):
+    with mock.patch.object(solver.sweep, "solve"):
         solver.step(state_0, state_1, None, contacts, 1.0 / 240.0)
 
     response = solver.forest.articulation_response_dof_count.numpy()

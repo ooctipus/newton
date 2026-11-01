@@ -29,9 +29,9 @@ PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),
     Field("counts", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("mf_counts", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
-    Field("primary_offset", wp.int32, ("world",), attr="_paired_factor_primary_offsets_by_world"),
-    Field("secondary_offset", wp.int32, ("world",), attr="_paired_factor_secondary_offsets_by_world"),
-    Field("primary_group", wp.int32, ("world",), attr="_paired_factor_primary_groups_by_world"),
+    Field("primary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_offsets_by_world"),
+    Field("secondary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_secondary_offsets_by_world"),
+    Field("primary_group", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_groups_by_world"),
     Field("selector", wp.int32, ("world",), owner="components"),
     Field("Y", wp.float32, ("world", "row", "world_dof"), attr="packed_Z", owner="placement"),
     Field("L", wp.float32, ("art", "size", "size"), owner="step"),
@@ -56,15 +56,15 @@ FREE_BODY_DOFS = 6
 PAIRED_COMPONENT_THREADS = 128
 
 
-def decline(solver) -> str | None:
-    """Why the solver's paired worlds cannot be split into components, or ``None`` when they can: the laws
+def decline(sweep) -> str | None:
+    """Why the sweep's paired worlds cannot be split into components, or ``None`` when they can: the laws
     components implement (``route_table.CAPABILITIES``), then their fit."""
-    return capable("components", solver.laws.set) or first_failed(
+    return capable("components", sweep.laws.set) or first_failed(
         (
-            (solver.routes.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
+            (sweep.routes.case == "K5", "Components need the paired factor-coordinate sweep (case K5)."),
             (
-                solver._paired_response_secondary_size == FREE_BODY_DOFS
-                and 1 <= (solver._paired_response_primary_size or 0) <= 32,
+                sweep.paired_response_secondary_size == FREE_BODY_DOFS
+                and 1 <= (sweep.paired_response_primary_size or 0) <= 32,
                 "Components pair an articulation of at most 32 DOFs with one free body per world.",
             ),
         )
@@ -74,13 +74,13 @@ def decline(solver) -> str | None:
 class PairedComponents:
     """One private selector allocation; every numerical array keeps its owner."""
 
-    def __init__(self, solver):
-        self.primary_size = int(solver._paired_response_primary_size)
-        self.secondary_size = int(solver._paired_response_secondary_size)
-        self.world_count = solver.forest.world_count
+    def __init__(self, sweep):
+        self.primary_size = int(sweep.paired_response_primary_size)
+        self.secondary_size = int(sweep.paired_response_secondary_size)
+        self.world_count = sweep.forest.world_count
         self.data = PairedComponentData()
-        self.data.selector = wp.zeros(solver.forest.world_count, dtype=wp.int32, device=solver.model.device)
-        self.workers = min(solver.forest.world_count, 512)
+        self.data.selector = wp.zeros(sweep.forest.world_count, dtype=wp.int32, device=sweep.model.device)
+        self.workers = min(sweep.forest.world_count, 512)
         from .response_builds_rows import paired_components_kernel  # noqa: PLC0415 - the build reads this module
 
         self.kernel = paired_components_kernel(self.primary_size, self.secondary_size)
@@ -89,14 +89,14 @@ class PairedComponents:
     def selector(self):
         return self.data.selector
 
-    def prepare(self, solver, rhs, mf_meta):
+    def prepare(self, sweep, rhs, mf_meta):
         data = field_group.bind(
             PairedComponentData,
             self.data,
-            solver=solver,
-            placement=solver.placement,
+            sweep=sweep,
+            placement=sweep.placement,
             components=SimpleNamespace(world_count=self.world_count, selector=self.data.selector),
-            L=solver.factor.L_by_size[self.primary_size],
+            L=sweep.factor.L_by_size[self.primary_size],
             rhs=rhs,
             mf_meta=mf_meta,
         )
@@ -105,5 +105,5 @@ class PairedComponents:
             dim=[self.workers],
             inputs=[self.workers, data],
             block_dim=PAIRED_COMPONENT_THREADS,
-            device=solver.model.device,
+            device=sweep.model.device,
         )

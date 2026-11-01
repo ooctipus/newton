@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT 
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as MIMIC
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
@@ -36,7 +37,7 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True),
             self.assertRaises(_TopologyReached),
         ):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            Sweep.admit_packed(solver, model, None)
 
 
 class TestSparseVelocityMimicRows(unittest.TestCase):
@@ -252,7 +253,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
             with self.subTest(friction_anchor_beta=beta, offset=offset, scale=scale, error=error):
                 reference = _case(False, offset, scale, error, friction_anchor_beta=beta)
                 candidate = _case(True, offset, scale, error, friction_anchor_beta=beta)
-                self.assertTrue(candidate[1]._sparse_velocity_limits)
+                self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
                 self.assertFalse(candidate[1].placement.sparse_row_support.enabled)
                 self.assertEqual(candidate[1].laws.mimic_count, 2)
                 for step in range(4):
@@ -280,7 +281,7 @@ class TestSparseVelocityMimicPhysics(unittest.TestCase):
     def _check_live_coefficients(self, friction_anchor_beta):
         reference = _case(False, friction_anchor_beta=friction_anchor_beta)
         candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
-        self.assertTrue(candidate[1]._sparse_velocity_limits)
+        self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
         held = candidate[1].factor.sparse_Linv.numpy().copy()

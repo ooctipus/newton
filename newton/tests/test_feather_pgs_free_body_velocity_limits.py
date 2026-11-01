@@ -412,7 +412,7 @@ class TestFreeBodyVelocityLimits(_FreeBodyVelocityLimitChecks, unittest.TestCase
         ):
             with self.subTest(name):
                 run = _free_boxes(self.device, world, **options)
-                self.assertEqual(run.solver._has_free_body_velocity_limit_rows, selected)
+                self.assertEqual(run.solver.sweep.has_free_body_velocity_limit_rows, selected)
                 _step(run)
                 self.assertEqual(int(run.solver.placement.mf_constraint_count.numpy().sum()) > 0, built)
 

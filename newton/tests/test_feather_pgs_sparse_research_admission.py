@@ -13,6 +13,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.route_table import Laws, RouteTable
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 
 
@@ -51,7 +52,7 @@ class _LawsProbe(SimpleNamespace):
 
 class _AdmissionProbe(SimpleNamespace):
     # Every contact law may run the parallel tiers.
-    _parallel_contact_paths = True
+    parallel_contact_paths = True
 
 
 def _eligible_solver():
@@ -64,7 +65,7 @@ def _eligible_solver():
         contact_compliance=False,
     )
     return _AdmissionProbe(
-        _route_pins={},
+        pins={},
         factor=SimpleNamespace(parallel_drives=True, eliminates=False),
         placement=SimpleNamespace(),
         routes=RouteTable({}),
@@ -126,7 +127,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
         solver = _eligible_solver()
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            Sweep.admit_packed(solver, model, None)
 
     def test_removed_packed_route_flags_reach_general_sparse(self):
         """Admit the general sparse route under either friction law when a recipe sets the removed flags."""
@@ -151,7 +152,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             ):
                 solver = _eligible_solver()
                 solver.laws.friction_anchors_enabled = anchors
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                Sweep.admit_packed(solver, model, None)
 
     def test_free_rigid_bodies_keep_the_dense_route(self):
         """A world pairing an articulation with free rigid bodies declines the sparse route, for both friction laws."""
@@ -161,7 +162,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 solver = _eligible_solver()
                 solver.laws.friction_anchors_enabled = anchors
                 solver.forest.has_free_rigid_bodies = True
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                Sweep.admit_packed(solver, model, None)
                 self.assertIsNone(solver.placement.sparse_mass_matrix_size)
                 self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
         # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
@@ -173,15 +174,15 @@ class TestSparseResearchAdmission(unittest.TestCase):
             ):
                 solver = _eligible_solver()
                 solver.laws.friction_anchors_enabled = anchors
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                Sweep.admit_packed(solver, model, None)
 
     def test_a_tier_pin_keeps_dense_storage(self):
         """Keep the dense storage the Jacobi tiers need where a test pin builds them on a single tree."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         with mock.patch.dict(os.environ, {}, clear=True):
             solver = _eligible_solver()
-            solver._route_pins = {"tiers": 32}
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            solver.pins = {"tiers": 32}
+            Sweep.admit_packed(solver, model, None)
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             self.assertIn("Jacobi tiers", solver.routes.reasons["K1"])
 
@@ -192,7 +193,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver = _eligible_solver()
             solver.laws.friction_anchors_enabled = True
             solver.forest.has_free_rigid_bodies = True
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            Sweep.admit_packed(solver, model, None)
             self.assertIsNone(solver.placement.sparse_mass_matrix_size)
             self.assertIn("free rigid bodies", solver.routes.reasons["K1"])
 
@@ -212,8 +213,8 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
                 self.assertEqual(solver.factor.sparse_mass_matrix_plan.nonzero_count, nonzeros)
                 self.assertEqual(solver.placement.sparse_row_factor.shape[2], support)
-                self.assertIsNone(solver._pgs_solve_mf_gs_kernel)
-                self.assertEqual(solver._mf_gs_tiers, [])
+                self.assertIsNone(solver.sweep.mf_gs_kernel)
+                self.assertEqual(solver.sweep.tiers, [])
                 self.assertIsNone(solver.placement.ink_sizes)
                 self.assertEqual(solver.placement.ink_rows, 0)
 

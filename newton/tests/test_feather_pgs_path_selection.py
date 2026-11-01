@@ -171,6 +171,7 @@ def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
         "sparse_diagonal_response_size": None,
         "sparse_diagonal_contact_triples": False,
         "sparse_diagonal_contact_units": False,
+        "sparse_contact_response_kernel": None,
     }
     for name, value in attributes.items():
         (placement if name in placement else values)[name] = value
@@ -326,9 +327,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["routes"]["publication"]["owner"], "cached")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
-        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
-            solver.options, pgs_iterations=3
-        )
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+            solver.sweep.options
+        ) = dataclasses.replace(solver.options, pgs_iterations=3)
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
 
     def test_positional_options_warn_and_build_the_keyword_solver(self):
@@ -476,7 +477,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         solver = SolverFeatherPGS(_cpu_free_body_model())
         # A stand-in for the CUDA-only grouped response of a row that builds responses (no packed rows): the plan
         # reads host state only, and the record its table.
-        solver._grouped_response = True
+        solver.placement.grouped_response = True
         for skip, route in ((0, "rows"), (8, "grouped")):
             with self.subTest(skip_rows=skip):
                 row = dataclasses.replace(solver.routes.row, tier_rows=skip, packed=False)
@@ -578,10 +579,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             diagonal = {
                 "case": "K2",
                 "sparse_diagonal_response_size": 108,
-                "_mark_independent_sparse_contact_candidates_kernel": marker,
+                "sweep": SimpleNamespace(sparse_contact_marker=marker),
             }
             schedule = {"sparse_diagonal_contact_triples": point, "sparse_diagonal_contact_units": not point}
-            sparse = {"case": "K1", "sparse_mass_matrix_size": 18, "_sparse_contact_response_kernel": response}
+            sparse = {"case": "K1", "sparse_mass_matrix_size": 18, "sparse_contact_response_kernel": response}
 
             def same(sizes, method, kernels):
                 return dict.fromkeys(sizes, (method, kernels))
@@ -738,9 +739,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         sparse = routes["sparse_mass_matrix"]
         self.assertEqual(sparse["size"], point.placement.sparse_mass_matrix_size)
         self.assertTrue(sparse["active_rows"])
-        self.assertEqual(sparse["contact_triplets"], point._sparse_contact_triplets)
+        self.assertEqual(sparse["contact_triplets"], point.sweep.sparse_contact_triplets)
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
-        self.assertEqual(routes["sweep"]["sparse"], point._pgs_solve_sparse_kernel.key)
+        self.assertEqual(routes["sweep"]["sparse"], point.sweep.sparse_kernel.key)
         self.assertIn("_active", routes["sweep"]["sparse"])
         if sparse["contact_triplets"]:
             self.assertIn("_contact_triplets", routes["sweep"]["sparse"])
@@ -784,15 +785,15 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         routes = selected["routes"]
         paired = routes["paired_response"]
         self.assertEqual(paired["primary_dofs"], 17)
-        self.assertEqual(paired["factor_coordinates"], solver._paired_factor_coordinates)
-        self.assertEqual(paired["components"], solver._paired_components is not None)
-        self.assertEqual(paired["two_stream_overlap"], solver._paired_general_solve_stream is not None)
-        self.assertEqual(routes["sweep"]["paired_factor"], getattr(solver._paired_factor_solve_kernel, "key", None))
+        self.assertEqual(paired["factor_coordinates"], solver.sweep.paired_factor_coordinates)
+        self.assertEqual(paired["components"], solver.sweep.paired_components is not None)
+        self.assertEqual(paired["two_stream_overlap"], solver.sweep.paired_general_solve_stream is not None)
+        self.assertEqual(routes["sweep"]["paired_factor"], getattr(solver.sweep.paired_factor_kernel, "key", None))
         self.assertEqual(routes["held_tree"]["owner"], "mixed")
         self.assertIn("grouping='per_size'", routes["held_tree"]["layout_reason"])
         self.assertEqual(sorted(group["dofs"] for group in routes["held_tree"]["groups"]), [6, 17])
         self.assertIn(routes["free_rigid_bodies"]["owners"][0], ("paired_factor", "paired_response"))
-        self.assertEqual(routes["resolved_worlds"]["enabled"], solver._resolved_worlds_owner is not None)
+        self.assertEqual(routes["resolved_worlds"]["enabled"], solver.sweep.resolved_worlds_owner is not None)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free routes require CUDA")
     def test_route_record_is_json_across_routes(self):
@@ -837,8 +838,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 routes = selected["routes"]
                 # Owners are reported only where their kernels were built.
                 owners = routes["free_rigid_bodies"]["owners"]
-                self.assertEqual("local_pair" in owners, bool(solver._pgs_solve_local_pair_kernels))
-                self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
+                self.assertEqual("local_pair" in owners, bool(solver.sweep.local_pair_kernels))
+                self.assertEqual("local_residual" in owners, bool(solver.sweep.local_residual_kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
                 self.assertEqual(pack["launched"], solver.placement.pack_mf_meta_kernel is not None)
                 # The MF-GS kernel's name spells the storage the record reports.
@@ -1087,7 +1088,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         self.assertEqual(record["producer"], "sparse_contact_response")
                         (entry,) = record["builder_by_dof"].values()
                         self.assertEqual(entry["method"], "sparse_response")
-                        self.assertEqual(entry["kernels"], [solver._sparse_contact_response_kernel.key])
+                        self.assertEqual(entry["kernels"], [solver.placement.sparse_contact_response_kernel.key])
                     if name == "compact_jacobian":
                         builder = ["prepare_world_contact_rows", "populate_world_J_for_compact_size"]
                         self.assertEqual(

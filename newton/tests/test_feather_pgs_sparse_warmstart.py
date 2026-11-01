@@ -76,7 +76,7 @@ class TestFeatherPGSSparseWarmstart(unittest.TestCase):
             friction_anchor_beta=0.0,
         )
         self.assertIsNotNone(solver.placement.sparse_mass_matrix_size, solver.routes.row.reasons["K1"])
-        self.assertEqual("_warm_start" in solver._pgs_solve_sparse_kernel.key, warmstart)
+        self.assertEqual("_warm_start" in solver.sweep.sparse_kernel.key, warmstart)
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
         states = [model.state() for _ in range(2)]

@@ -178,7 +178,7 @@ def _over_budget_rows(model) -> int:
         sweep_routes_sparse.sparse_staging,
         max_world_dofs=probe.forest.max_world_dofs,
         max_row_dofs=probe.placement.sparse_max_row_support,
-        active_rows=probe._sparse_active_rows,
+        active_rows=probe.sweep.sparse_active_rows,
         linked_rows=probe.laws.friction_anchors_enabled,
     )
     budget = arch_budget(model.device.arch)
@@ -420,7 +420,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         dense = _case(False, robot_count=2)
         with mock.patch.dict(SolverFeatherPGS._route_pins, {"active_rows": False}):
             sparse = _case(True, robot_count=2)
-        self.assertFalse(sparse[1]._sparse_active_rows)
+        self.assertFalse(sparse[1].sweep.sparse_active_rows)
         self.assertEqual(sparse[1].placement.sparse_mass_matrix_size, 9)
         self.assertEqual(sparse[1].factor.sparse_Linv.shape[0], 4)
         self.assertEqual(sparse[1].forest.world_count, 2)
@@ -428,7 +428,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for _ in range(16):
             row_orders = []
             for case in (dense, sparse):
-                solve = case[1]._launch_matrix_free_gs_solve
+                solve = case[1].sweep.solve
 
                 def ordered_solve(*args, _case=case, _solve=solve, _orders=row_orders, **kwargs):
                     # Both production GPU paths solve the same semantic order;
@@ -436,7 +436,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                     _orders.append(self._order_multi_articulation_rows(_case))
                     return _solve(*args, **kwargs)
 
-                with mock.patch.object(case[1], "_launch_matrix_free_gs_solve", side_effect=ordered_solve):
+                with mock.patch.object(case[1].sweep, "solve", side_effect=ordered_solve):
                     _step(case)
             self.assertEqual(len(row_orders), 2)
             self.assertEqual(*row_orders)

@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import held_tree
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_scenes import plain_laws
 
@@ -41,7 +42,7 @@ def _sparse_tree_solver(**changes):
     solver = SimpleNamespace(
         model=SimpleNamespace(particle_count=0),
         placement=SimpleNamespace(sparse_mass_matrix_size=18),
-        _sparse_velocity_limits=False,
+        sweep=SimpleNamespace(sparse_velocity_limits=False),
         factor=SimpleNamespace(fk_id_cache_available=True, parallel_drives=True),
         forest=SimpleNamespace(has_free_rigid_bodies=False, has_prescribed_response=False),
         laws=SimpleNamespace(set=plain_laws(), mimic_count=0, mimic_valid_np=None),
@@ -70,15 +71,15 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
         builder.add_articulation([builder.add_joint_revolute(-1, body)])
         model = builder.finalize(device="cpu")
-        setup = SolverFeatherPGS._setup_sparse_mass_matrix
+        setup = Sweep.admit_packed
         seen = []
 
-        def recording(solver, source):
-            seen.append((solver.laws.set.point, solver._parallel_contact_paths))
-            return setup(solver, source)
+        def recording(sweep, *arguments):
+            seen.append((sweep.laws.set.point, sweep.parallel_contact_paths))
+            return setup(sweep, *arguments)
 
         with (
-            patch.object(SolverFeatherPGS, "_setup_sparse_mass_matrix", recording),
+            patch.object(Sweep, "admit_packed", recording),
         ):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):

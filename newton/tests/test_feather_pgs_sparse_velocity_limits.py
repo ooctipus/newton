@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT 
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -63,13 +64,13 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True),
                 self.assertRaises(_TopologyReached),
             ):
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                Sweep.admit_packed(solver, model, None)
 
     def test_default_and_unsupported_recipes_keep_existing_owner(self):
         """Decline unsupported laws before removing ordinary response storage."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for changes in (
-            {"_route_pins": {"storage": "dense"}},
+            {"pins": {"storage": "dense"}},
             {"pgs_warmstart": True, "forest": _ForestProbe(has_free_rigid_bodies=True)},
             {"forest": _ForestProbe(has_free_rigid_bodies=True)},
         ):
@@ -78,8 +79,8 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                 solver.options.enable_joint_velocity_limits = True
                 for key, value in changes.items():
                     _change(solver, key, value)
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertFalse(solver._sparse_velocity_limits)
+                Sweep.admit_packed(solver, model, None)
+                self.assertFalse(solver.sparse_velocity_limits)
                 self.assertIsNone(solver.placement.sparse_mass_matrix_size)
 
 
@@ -441,8 +442,8 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             with self.subTest(friction_anchor_beta=beta, shape=shape):
                 reference = _case(False, friction_anchor_beta=beta, **shape)
                 candidate = _case(True, friction_anchor_beta=beta, **shape)
-                self.assertFalse(reference[1]._sparse_velocity_limits)
-                self.assertTrue(candidate[1]._sparse_velocity_limits)
+                self.assertFalse(reference[1].sweep.sparse_velocity_limits)
+                self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
                 self.assertEqual(candidate[1].options.pgs_iterations, 8)
                 for step in range(4):
                     sparse_scene.step(reference)
@@ -467,7 +468,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
     def _check_held_factor_graph(self, friction_anchor_beta):
         reference = _case(False, friction_anchor_beta=friction_anchor_beta)
         candidate = _case(True, friction_anchor_beta=friction_anchor_beta)
-        self.assertTrue(candidate[1]._sparse_velocity_limits)
+        self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
         for case in (reference, candidate):
             sparse_scene.step(case)
         held = candidate[1].factor.sparse_Linv.numpy().copy()
@@ -509,7 +510,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                     _case(False, activation_fraction=fraction),
                     _case(True, activation_fraction=fraction),
                 )
-                self.assertTrue(candidate[1]._sparse_velocity_limits)
+                self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
                 for _ in range(2):
                     sparse_scene.step(reference)
                     sparse_scene.step(candidate)

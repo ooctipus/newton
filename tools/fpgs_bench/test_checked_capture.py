@@ -712,7 +712,7 @@ class TestCheckedCapture(unittest.TestCase):
     def test_fpgs_actual_paths_are_recorded(self):
         """Record the actual solver paths without changing state."""
         solver, entry = fpgs(), {}
-        solver._grouped_response = True
+        solver.placement.grouped_response = True
         checked.check_solver("feather_pgs", solver, entry)
         self.assertNotIn("solver_recipe", entry)
         self.assertTrue(entry["solver_paths"]["grouped_response"])

@@ -193,7 +193,7 @@ class TestCoalescedContact(unittest.TestCase):
             factor=SimpleNamespace(
                 **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
             ),
-            _mark_independent_sparse_contact_candidates_kernel=marker,
+            sweep=SimpleNamespace(sparse_contact_marker=marker),
             # Point friction: the patch row law with beta 0 and a disabled view.
             laws=SimpleNamespace(
                 **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},

@@ -509,7 +509,7 @@ class KeyedRows:
                 pool.launch_rows(),
                 inputs=[self.contact_input, self.data, self.law],
                 extent=self.contact_input.count,
-                max_blocks=s._contact_capacity_blocks,
+                max_blocks=s.placement.contact_capacity_blocks,
             )
         wp.launch_tiled(
             materialize_general_rows,

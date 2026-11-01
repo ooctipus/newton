@@ -602,7 +602,7 @@ def _rollout(
         solver.step(states[0], states[1], control, contacts, DT)
         states.reverse()
         poses.append(states[0].body_q.numpy().copy())
-        masks.append(solver._resolved_worlds.numpy().copy())
+        masks.append(solver.sweep.resolved_worlds.numpy().copy())
         if history is not None:
             count = int(contacts.rigid_contact_count.numpy()[0])
             marked = solver.placement.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
@@ -612,7 +612,7 @@ def _rollout(
                 "marked": int(np.sum(marked)),
                 "released": int(np.sum(marked & (anchors[:count] != 0))),
             }
-            owner = solver._resolved_worlds_owner
+            owner = solver.sweep.resolved_worlds_owner
             if owner is not None:
                 scratch = owner.scratch
                 invalid = int(scratch.global_invalid.numpy()[0]) != 0
@@ -666,10 +666,10 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         """Fixed-base arms over free boxes: resolved worlds step identically with no rows built."""
         model = _build(wp.get_device("cuda:0"), worlds=6)
         plain_solver, plain, plain_masks = _rollout(model, classifier=False)
-        self.assertIsNone(plain_solver._resolved_worlds_owner)
+        self.assertIsNone(plain_solver.sweep.resolved_worlds_owner)
         self.assertEqual(plain_masks.shape[1], 0)
         solver, poses, masks = _rollout(model, classifier=True)
-        self.assertIsNotNone(solver._resolved_worlds_owner)
+        self.assertIsNotNone(solver.sweep.resolved_worlds_owner)
         self.assertEqual(masks.shape, (90, 6))
         resolved_steps = int(masks.sum())
         self.assertGreater(resolved_steps, 0)
@@ -699,15 +699,15 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
                     history=complete_history,
                     solver_kwargs=solver_kwargs,
                 )
-                self.assertIsNone(plain_solver._resolved_worlds_owner)
+                self.assertIsNone(plain_solver.sweep.resolved_worlds_owner)
                 self.assertEqual(plain_masks.shape[1], 0)
                 solver, poses, masks = _rollout(
                     model, classifier=True, friction_anchor_beta=None, history=history, solver_kwargs=solver_kwargs
                 )
                 self.assertTrue(solver.laws.friction_anchors_enabled)
-                self.assertIsNotNone(solver._resolved_worlds_owner)
+                self.assertIsNotNone(solver.sweep.resolved_worlds_owner)
                 self.assertEqual(
-                    solver._resolved_worlds_owner.row_bound,
+                    solver.sweep.resolved_worlds_owner.row_bound,
                     (solver.placement.dense_max_constraints, solver.placement.mf_max_constraints),
                 )
                 self.assertGreater(int(masks.sum()), 0)
@@ -738,7 +738,7 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         complete_history, history = [], []
         plain_solver, plain, _ = _rollout(model, classifier=False, history=complete_history, toss_every=1, **options)
         solver, poses, _ = _rollout(model, classifier=True, history=history, toss_every=1, **options)
-        self.assertEqual(solver._resolved_worlds_owner.row_bound, (solver.placement.dense_max_constraints, 2))
+        self.assertEqual(solver.sweep.resolved_worlds_owner.row_bound, (solver.placement.dense_max_constraints, 2))
         held = sum(int(np.sum(record["separating"] & ~record["resolved"])) for record in history)
         self.assertGreater(held, 0, "no separating world was held for capacity")
         self.assertEqual(sum(record["marked"] for record in history), 0)
@@ -754,8 +754,8 @@ class TestResolvedWorldsCUDA(unittest.TestCase):
         model = _build(wp.get_device("cuda:0"), worlds=6)
         own_solver, own_poses, own_masks = _rollout(model, classifier=True, published=False)
         solver, poses, masks = _rollout(model, classifier=True)
-        self.assertFalse(own_solver._resolved_worlds_owner.published)
-        self.assertTrue(solver._resolved_worlds_owner.published)
+        self.assertFalse(own_solver.sweep.resolved_worlds_owner.published)
+        self.assertTrue(solver.sweep.resolved_worlds_owner.published)
         self.assertGreater(int(masks.sum()), 0)
         # The published twist sums the same axis terms in tree order; a residual within
         # rounding of the margin may decide differently on a handful of steps.
@@ -802,8 +802,8 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
         routes = solver.get_path_selection()["routes"]
         self.assertNotIn("research_sparse_factor", routes)
         self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
-        self.assertIsNone(solver._resolved_worlds_owner)
-        self.assertEqual(solver._resolved_worlds.shape, (0,))
+        self.assertIsNone(solver.sweep.resolved_worlds_owner)
+        self.assertEqual(solver.sweep.resolved_worlds.shape, (0,))
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         states = [model.state() for _ in range(2)]

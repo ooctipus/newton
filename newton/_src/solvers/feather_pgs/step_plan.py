@@ -174,7 +174,7 @@ def _response(row: RouteRow, solver) -> dict[int, Route]:
         if route is None and plan.use_diagonal_mass(size):
             route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
         if route is None:
-            grouped, reason = _grouped(row, size) if solver._grouped_response else (False, "")
+            grouped, reason = _grouped(row, size) if solver.placement.grouped_response else (False, "")
             if grouped:
                 name = "grouped"
             elif plan.use_tiled_hinv_jt(size):

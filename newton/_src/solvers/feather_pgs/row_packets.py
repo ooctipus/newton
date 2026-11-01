@@ -101,9 +101,9 @@ ContactPacketData = field_group.struct("ContactPacketData", CONTACT_PACKETS, __n
 
 
 QUEUE = (
-    Field("primary", wp.int32, ("articulation",), attr="_local_primary_articulation"),
-    Field("secondary", wp.int32, ("articulation",), attr="_local_pair_articulation"),
-    Field("residual_secondary", wp.int32, ("articulation",), attr="_local_residual_pair_articulation"),
+    Field("primary", wp.int32, ("articulation",), owner="sweep", attr="local_primary_articulation"),
+    Field("secondary", wp.int32, ("articulation",), owner="sweep", attr="local_pair_articulation"),
+    Field("residual_secondary", wp.int32, ("articulation",), owner="sweep", attr="local_residual_pair_articulation"),
     Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
     Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a", owner="placement"),
     Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b", owner="placement"),
@@ -112,8 +112,8 @@ QUEUE = (
     Field("count", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
     Field("status", wp.int32, (2,), attr="constraint_capacity_status", owner="placement"),
-    Field("general_count", wp.int32, (1,), attr="_local_general_world_count"),
-    Field("general", wp.int32, ("world",), attr="_local_general_worlds"),
+    Field("general_count", wp.int32, (1,), owner="sweep", attr="local_general_world_count"),
+    Field("general", wp.int32, ("world",), owner="sweep", attr="local_general_worlds"),
     Field("pair_count", wp.int32, (1,), owner="size"),
     Field("pair", wp.int32, ("candidate",), owner="size"),
     Field("pair_secondary", wp.int32, ("candidate",), owner="size"),
@@ -474,18 +474,16 @@ def plan(solver):
     if solver.laws._mimic_art_start is not None and solver.laws._mimic_art_list is not None:
         starts = solver.laws._mimic_art_start.numpy()
         mimics = int(np.max(np.diff(starts))) if len(starts) > 1 else 0
-    if mimics + 2 * primary > solver._local_residual_max_rows:
+    if mimics + 2 * primary > solver.sweep.local_residual_max_rows:
         return None
     return primary, secondary, mimics
 
 
 def topology_supported(solver, primary, mimics):
     """Check all prefix entries, not only currently enabled or valid mimic rows."""
-    if any(
-        primary not in getattr(solver, name) for name in ("_local_pair_active_counts", "_local_residual_active_counts")
-    ):
+    if primary not in solver.sweep.local_pair_active_counts or primary not in solver.sweep.local_residual_active_counts:
         return False
-    if np.any(solver._local_primary_articulation.numpy() < 0):
+    if np.any(solver.sweep.local_primary_articulation.numpy() < 0):
         return False
     if solver.laws._mimic_art_start is None or solver.laws._mimic_art_list is None:
         return mimics == 0
@@ -509,7 +507,7 @@ class LocalRowPackets:
     def __init__(self, solver, primary, secondary, mimics):
         self.solver = solver
         self.primary, self.secondary, self.mimics = int(primary), int(secondary), int(mimics)
-        self.packets = int(solver._local_residual_max_rows)
+        self.packets = int(solver.sweep.local_residual_max_rows)
         device = solver.model.device
         worlds = solver.forest.world_count
         self.workers = max(1, min(worlds, int(device.sm_count) * 4))
@@ -528,15 +526,15 @@ class LocalRowPackets:
         self._absent_mimics["mimic_start"] = placeholder(wp.int32, (solver.model.articulation_count + 1,))
         # The capacity status is allocated after tiled-kernel construction; prepare_prefix binds it.
         size = SimpleNamespace(
-            pair_count=solver._local_pair_active_counts[self.primary],
-            pair=solver._local_pair_active_candidates[self.primary],
-            pair_secondary=solver._local_pair_active_secondaries[self.primary],
-            residual_count=solver._local_residual_active_counts[self.primary],
-            residual=solver._local_residual_active_candidates[self.primary],
-            residual_pair=solver._local_residual_active_secondaries[self.primary],
+            pair_count=solver.sweep.local_pair_active_counts[self.primary],
+            pair=solver.sweep.local_pair_active_candidates[self.primary],
+            pair_secondary=solver.sweep.local_pair_active_secondaries[self.primary],
+            residual_count=solver.sweep.local_residual_active_counts[self.primary],
+            residual=solver.sweep.local_residual_active_candidates[self.primary],
+            residual_pair=solver.sweep.local_residual_active_secondaries[self.primary],
         )
         self.queue = field_group.bind(
-            QueueData, solver=solver, placement=solver.placement, forest=solver.forest, size=size, status=None
+            QueueData, sweep=solver.sweep, placement=solver.placement, forest=solver.forest, size=size, status=None
         )
         self.contact_input = None
         self.law = None
@@ -614,9 +612,9 @@ class LocalRowPackets:
             inputs=[
                 self.prefix,
                 queue,
-                int(solver._local_solve_max_rows),
-                int(solver._local_residual_max_rows),
-                int(solver._local_residual_mf_max_rows),
+                int(solver.sweep.local_solve_max_rows),
+                int(solver.sweep.local_residual_max_rows),
+                int(solver.sweep.local_residual_mf_max_rows),
                 self.primary,
             ],
             device=solver.model.device,
@@ -673,7 +671,7 @@ def decline(solver) -> str | None:
                 "Local packets write their general worlds' rows at their coordinates: the packed rows are not dense.",
             ),
             (
-                solver.placement.dense_max_constraints >= solver._local_residual_max_rows,
+                solver.placement.dense_max_constraints >= solver.sweep.local_residual_max_rows,
                 "dense_max_constraints is below the local residual owner's rows.",
             ),
             (

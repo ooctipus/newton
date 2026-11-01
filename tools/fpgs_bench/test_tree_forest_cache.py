@@ -62,11 +62,11 @@ def fixture(floating, device, *, permuted=True, motion=False):
     solver.factor.sparse_mass_matrix_indices = factor_indices(mass, device)
     solver.factor.sparse_Linv = wp.zeros((arts, mass.nonzero_count), dtype=float, device=device)
     solver.factor.sparse_mass_matrix_status = wp.zeros(arts, dtype=int, device=device)
-    solver._sparse_factor_warps_per_block = 4
+    solver.factor.sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
-    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = dataclasses.replace(
-        solver.options, enable_joint_velocity_limits=motion
+    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = solver.sweep.options = (
+        dataclasses.replace(solver.options, enable_joint_velocity_limits=motion)
     )
     solver.factor.passive_spring_stiffness.fill_(0.27)
     solver.factor.passive_spring_ref.fill_(-0.1)

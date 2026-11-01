@@ -48,7 +48,7 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = standing_model()
         captured = _Scene(model, _tier_solver(model))
-        tiers = captured.solver._mf_gs_tiers
+        tiers = captured.solver.sweep.tiers
         self.assertTrue(tiers)
         self.assertTrue(all(tier.response_inputs for tier in tiers))
         tier_kernels = [tier.kernel for tier in tiers]

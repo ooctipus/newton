@@ -263,8 +263,8 @@ class TestColoredSweep(unittest.TestCase):
         solvers = []
         self._simulate(tray(), law, solvers)
         solver = solvers[-1]
-        self.assertIsNotNone(solver._colored_units, "the tray's worlds take the colored mapping")
-        host = {name: array.numpy() for name, array in solver._colored_units.units.items()}
+        self.assertIsNotNone(solver.sweep.colored_units, "the tray's worlds take the colored mapping")
+        host = {name: array.numpy() for name, array in solver.sweep.colored_units.units.items()}
         metas = solver.placement.mf_meta_packed.numpy().reshape(
             solver.forest.world_count, solver.placement.mf_max_constraints, 4
         )
@@ -285,16 +285,16 @@ class TestColoredSweep(unittest.TestCase):
             self.assertEqual(colors, want["color_count"])
             np.testing.assert_array_equal(host["color_offset"][slot, : colors + 1], want["color_offset"])
             np.testing.assert_array_equal(host["color_slot"][slot, :units], want["color_slot"])
-        stats = solver._colored_units.stats()
+        stats = solver.sweep.colored_units.stats()
         self.assertEqual(len(stats), solver.forest.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))
-        self.assertFalse(solver._colored_units.capacity_status())
+        self.assertFalse(solver.sweep.colored_units.capacity_status())
 
     def test_the_route_record_reports_the_storage(self):
         """The path selection records the colored kernel, its capable worlds and their storage's bytes."""
         solver, _, _ = self._built()
         record = solver.get_path_selection()["routes"]["sweep"]["mf_colored"]
-        units = solver._colored_units
+        units = solver.sweep.colored_units
         self.assertEqual(record["capable_worlds"], solver.forest.world_count)
         self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
         arrays = (*units.units.values(), *units.slots.values(), units.slot_world, units.status)
@@ -343,7 +343,7 @@ class TestColoredSweep(unittest.TestCase):
         solvers = []
         with mock.patch.object(sweep_units, "UNIT_ROWS", 1024):
             over = self._simulate(tray(), "patch", solvers)
-        units = solvers[-1]._colored_units
+        units = solvers[-1].sweep.colored_units
         self.assertIsNotNone(units)
         self.assertTrue(units.capacity_status())
         stats = units.stats()
@@ -351,7 +351,7 @@ class TestColoredSweep(unittest.TestCase):
         self.assertTrue(all(world["units"] > units.unit_capacity for world in stats), stats)
         plain = []
         warp = self._simulate(tray(), "patch", plain, units=4096)
-        self.assertIsNone(plain[-1]._colored_units)
+        self.assertIsNone(plain[-1].sweep.colored_units)
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(over, name), getattr(warp, name), err_msg=name)
 
@@ -362,14 +362,14 @@ class TestColoredSweep(unittest.TestCase):
             np.testing.assert_array_equal(getattr(first, name), getattr(second, name), err_msg=name)
         solvers = []
         self._simulate(tray(), "patch", solvers, units=4096)
-        self.assertIsNone(solvers[-1]._colored_units, "no world's row capacity holds 4096 contact units")
+        self.assertIsNone(solvers[-1].sweep.colored_units, "no world's row capacity holds 4096 contact units")
 
     def test_the_rule_leaves_thin_worlds_to_the_warp(self):
         """A world under the rule's units per color keeps the one-warp mapping beside a built colored one, bitwise."""
         # Five units per color: the tray's 19 free bodies admit it, its 76 units in 44 colors do not take it.
         solvers = []
         thin = self._simulate(tray(), "patch", solvers, parallelism=5.0)
-        built = solvers[-1]._colored_units
+        built = solvers[-1].sweep.colored_units
         self.assertIsNotNone(built)
         stats = built.stats()
         self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
@@ -377,7 +377,7 @@ class TestColoredSweep(unittest.TestCase):
         # the tray's worlds of 1.75 units per color and more).
         plain = []
         warp = self._simulate(tray(), "patch", plain, units=4096)
-        self.assertIsNone(plain[-1]._colored_units)
+        self.assertIsNone(plain[-1].sweep.colored_units)
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(thin, name), getattr(warp, name), err_msg=name)
 

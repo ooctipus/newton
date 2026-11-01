@@ -435,9 +435,9 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         local = object()
         residual = object()
         dynamics = object()
-        solver._local_internal_stream = local
-        solver._local_residual_stream = residual
-        solver._local_pair_stream = local
+        solver.sweep = SimpleNamespace(
+            local_internal_stream=local, local_residual_stream=residual, local_pair_stream=local
+        )
         solver.factor = SimpleNamespace(dynamics_stream=dynamics)
         solver.model = mock.Mock(device=object())
         with (
@@ -451,9 +451,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         # Prevent a second meaningful synchronization when Python collects the
         # deliberately uninitialized instance after this regression returns.
-        solver._local_internal_stream = None
-        solver._local_residual_stream = None
-        solver._local_pair_stream = None
+        solver.sweep = None
         solver.factor.dynamics_stream = None
         solver.model = None
 

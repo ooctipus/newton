@@ -23,6 +23,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.staging import arch_budget
+from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
@@ -441,7 +442,7 @@ class TestSparseContactTriplets(unittest.TestCase):
                     dense_max_constraints=capacity,
                 )
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
-                self.assertEqual("contact_triplets" in solver._pgs_solve_sparse_kernel.key, selected)
+                self.assertEqual("contact_triplets" in solver.sweep.sparse_kernel.key, selected)
 
     def test_factory_on_coupled_fixture_cpu(self):
         """Exercise coupled normal and tangent rows before constructing the opt-in kernel."""
@@ -661,7 +662,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({"forest": SimpleNamespace(has_free_rigid_bodies=True)}, False, False, True, 32, True, False, "free-body"),
             ({}, True, False, False, 32, True, False, "support table"),
             ({}, True, False, True, 32, False, False, "room for contact units"),
-            ({"_route_pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
+            ({"pins": {"contact_units": None}}, True, False, True, 32, True, False, "contact_units=None"),
             # Point friction keeps its rule: triplets need the active-row scan.
             (
                 {"laws": SimpleNamespace(friction_anchors_enabled=False)},
@@ -686,14 +687,14 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         )
         for changes, active, velocity, table, lanes, fits, admitted, phrase in cases:
             probe = SimpleNamespace(
-                _route_pins={},
+                pins={},
                 forest=SimpleNamespace(has_free_rigid_bodies=False),
                 laws=SimpleNamespace(friction_anchors_enabled=True),
             )
             for name, value in changes.items():
                 setattr(probe, name, value)
             with self.subTest(changes=changes, active=active, velocity=velocity, table=table, lanes=lanes, fits=fits):
-                decision, reason = SolverFeatherPGS._admit_sparse_contact_triplets(
+                decision, reason = Sweep._admit_sparse_contact_triplets(
                     probe,
                     active_rows=active,
                     velocity_candidate=velocity,
@@ -763,14 +764,14 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     dense_max_constraints=192,
                 )
                 self.assertEqual(solver.placement.sparse_mass_matrix_size, 18)
-                key = solver._pgs_solve_sparse_kernel.key
+                key = solver.sweep.sparse_kernel.key
                 self.assertTrue(key.endswith(suffix), key)
-                self.assertEqual(solver._sparse_contact_triplets, "contact_triplets" in suffix)
+                self.assertEqual(solver.sweep.sparse_contact_triplets, "contact_triplets" in suffix)
         with mock.patch.dict(os.environ, {}, clear=True):
             packed = _make_solver(_build_model(), True)
-        self.assertEqual(packed._sparse_solve_lanes, 16)
-        self.assertFalse(packed._sparse_contact_triplets)
-        self.assertIn("16-lane", packed._sparse_contact_triplets_reason)
+        self.assertEqual(packed.sweep.sparse_solve_lanes, 16)
+        self.assertFalse(packed.sweep.sparse_contact_triplets)
+        self.assertIn("16-lane", packed.sweep.sparse_contact_triplets_reason)
 
 
 def check_frozen_payload(path, *, device="cuda:0"):

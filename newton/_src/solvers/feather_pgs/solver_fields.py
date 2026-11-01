@@ -385,15 +385,15 @@ OVERFLOW_WARNING = FieldGroup(Field("row_overflow_warning_emitted", wp.int32, (2
 
 
 LOCAL_OWNERS = (
-    Field("primary_articulation", wp.int32, ("world",), attr="_local_primary_articulation"),
-    Field("pair_articulation", wp.int32, ("world",), attr="_local_pair_articulation"),
-    Field("residual_pair_articulation", wp.int32, ("world",), attr="_local_residual_pair_articulation"),
-    Field("max_rows", wp.int32, attr="_local_solve_max_rows"),
-    Field("residual_max_rows", wp.int32, attr="_local_residual_max_rows"),
-    Field("residual_mf_max_rows", wp.int32, attr="_local_residual_mf_max_rows"),
+    Field("primary_articulation", wp.int32, ("world",), owner="sweep", attr="local_primary_articulation"),
+    Field("pair_articulation", wp.int32, ("world",), owner="sweep", attr="local_pair_articulation"),
+    Field("residual_pair_articulation", wp.int32, ("world",), owner="sweep", attr="local_residual_pair_articulation"),
+    Field("max_rows", wp.int32, owner="sweep", attr="local_solve_max_rows"),
+    Field("residual_max_rows", wp.int32, owner="sweep", attr="local_residual_max_rows"),
+    Field("residual_mf_max_rows", wp.int32, owner="sweep", attr="local_residual_mf_max_rows"),
     Field("owner", wp.int32, ("world",), attr="local_solve_owner", owner="placement"),
-    Field("general_world_count", wp.int32, (1,), attr="_local_general_world_count"),
-    Field("general_worlds", wp.int32, ("world",), attr="_local_general_worlds"),
+    Field("general_world_count", wp.int32, (1,), owner="sweep", attr="local_general_world_count"),
+    Field("general_worlds", wp.int32, ("world",), owner="sweep", attr="local_general_worlds"),
 )
 """Each world's local-solve candidates (its primary articulation and paired articulations), the local row limits,
 and the per-step owner of each world with the compact list of the general solver's worlds."""

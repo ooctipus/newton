@@ -65,7 +65,7 @@ def decline(solver, *, sparse: bool | None = None) -> str | None:
     hold.
     """
     if sparse is None and getattr(solver.placement, "sparse_mass_matrix_size", None) is not None:
-        sparse = solver._sparse_velocity_limits
+        sparse = solver.sweep.sparse_velocity_limits
     # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the solver
     # pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body twists every
     # group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
@@ -238,7 +238,7 @@ class TreeSparseOperator:
         self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
         self.data.status = solver.factor.sparse_mass_matrix_status
         self.refresh_kernel = sparse_factor_kernel(
-            n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block
+            n, mass.nonzero_count, warps_per_block=solver.factor.sparse_factor_warps_per_block
         )
         self.kinetic_state = None
 
@@ -259,7 +259,7 @@ class TreeSparseOperator:
                 s.factor.sparse_mass_matrix_indices,
             ],
             outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
-            block_dim=32 * s._sparse_factor_warps_per_block,
+            block_dim=32 * s.factor.sparse_factor_warps_per_block,
             device=s.model.device,
         )
 

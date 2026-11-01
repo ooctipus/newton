@@ -587,8 +587,8 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         variants = [{"pgs_solve_readout": "off"}, {"pgs_solve_readout": "off"}, {"pgs_solve_readout": readout}]
         solvers = self._solvers(route, variants)
         counted = solvers[-1]
-        self.assertTrue(set(counted._solve_readout.kernels.values()) & route["labels"], counted._solve_readout.kernels)
-        self.assertEqual(solvers[0]._solve_readout.kernels, {})
+        self.assertTrue(set(counted.sweep.readout.kernels.values()) & route["labels"], counted.sweep.readout.kernels)
+        self.assertEqual(solvers[0].sweep.readout.kernels, {})
         rowless = 0
         for step, states in self._steps(route, solvers, steps):
             rowless += _rowless(counted)
@@ -603,14 +603,14 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual(record["options"]["pgs_solve_readout"]["applied"], readout)
         counts = record["routes"]["sweep"]["readout"]
         self.assertEqual(counts["mode"], readout)
-        self.assertEqual(counts["counted"], counted._solve_readout.kernels)
+        self.assertEqual(counts["counted"], counted.sweep.readout.kernels)
         summary = record["measurements"]["solve_readout"]
         self.assertEqual(summary["readout"], readout)
         # The route record says whether the summary holds skipped solves.
         self.assertEqual(counts["counts_skipped"], not route.get("enters_rowless_worlds"))
         self.assertEqual(summary["skipped"] is not None, counts["counts_skipped"])
         # A parallel tier counts against its own compiled budget, every other sweep against the solver's.
-        budgets = {tier.kernel.key: tier.sweeps for tier in counted._mf_gs_tiers if tier.sweeps}
+        budgets = {tier.kernel.key: tier.sweeps for tier in counted.sweep.tiers if tier.sweeps}
         for slot in summary["slots"]:
             with self.subTest(kernel=slot["kernel"]):
                 budget = budgets.get(slot["kernel"], BUDGET)
@@ -670,7 +670,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_paired_route_counts_without_changing_results(self):
         """Count the paired factor sweep without changing the trajectory, every world-solve once."""
         solver, _, _ = self._lockstep(_paired_route())
-        self.assertIsNotNone(solver._paired_factor_solve_kernel)
+        self.assertIsNotNone(solver.sweep.paired_factor_kernel)
 
     def test_matrix_free_route_counts_without_changing_results(self):
         """Count the matrix-free Gauss-Seidel sweep without changing the trajectory, every world-solve once."""
@@ -697,7 +697,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """
         route = _velocity_limit_route()
         (probe,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
-        self.assertTrue(probe._solve_readout.kernels)
+        self.assertTrue(probe.sweep.readout.kernels)
         for _ in self._steps(route, [probe], 1):
             counts = probe.placement.constraint_count.numpy()
             types = probe.placement.row_type.numpy() & _DENSE_META_ROW_TYPE_MASK
@@ -735,7 +735,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
             (solver,) = self._solvers(
                 route, [{"pgs_solve_readout": "trace", "contact_torsion": True, "dense_max_constraints": 256}]
             )
-        key = solver._pgs_solve_mf_gs_kernel.key
+        key = solver.sweep.mf_gs_kernel.key
         self.assertIn("_torsion", key)
         self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["readout"]["mode"], "trace")
         for _ in self._steps(route, [solver], 2):

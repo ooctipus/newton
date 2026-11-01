@@ -77,7 +77,7 @@ class TestTreeMimicCache(unittest.TestCase):
                 for enabled in (False, True):
                     solver = solver_for(model, enabled)
                     self.assertEqual(solver.factor.held is not None, enabled)
-                    self.assertTrue(solver._sparse_velocity_limits)
+                    self.assertTrue(solver.sweep.sparse_velocity_limits)
                     self.assertEqual(solver.laws.mimic_count, 2)
                     first, second, control = model.state(), model.state(), model.control()
                     newton.eval_fk(model, first.joint_q, first.joint_qd, first)

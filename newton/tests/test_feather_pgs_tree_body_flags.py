@@ -494,8 +494,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         solver = _solver(model, beta, cached)
                         if cached == "auto":
                             self.assertIsInstance(solver.factor.held, HeldTree)
-                            classifier = solver._resolved_worlds_owner
-                            self.assertIsNotNone(classifier, solver._resolved_worlds_reason)
+                            classifier = solver.sweep.resolved_worlds_owner
+                            self.assertIsNotNone(classifier, solver.sweep.resolved_worlds_reason)
                             self.assertTrue(classifier.published)
                             # Patch friction takes the classifier's capacity-bounded decision.
                             self.assertEqual(classifier.row_bound is not None, law == "patch")

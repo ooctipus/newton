@@ -239,8 +239,8 @@ class TestTreeKineticStages(unittest.TestCase):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
-                dataclasses.replace(solver.options, enable_joint_velocity_limits=alternate)
-            )
+                solver.sweep.options
+            ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=alternate)
             owner = HeldTree(solver)
             state, output = model.state(), model.state()
             rng = np.random.default_rng(41)

@@ -70,7 +70,7 @@ class TestFeatherPGSReset(unittest.TestCase):
         solver.factor.fk_id_cache_valid = wp.ones(model.articulation_count, dtype=wp.int32, device=model.device)
         specs = _history_specs(solver)
         _poison(specs)
-        solver._clear_warmstart_history(None)
+        solver.sweep.clear_history(None)
         _assert_worlds(self, specs, (True, True))
         self.assertIs(solver.factor.fk_id_cache_source_state, state)
         np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), [1, 1])

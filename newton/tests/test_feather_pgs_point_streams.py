@@ -58,12 +58,12 @@ _PATCH_ONLY = frozenset(
         "speculative_contact_batches=False)",
         "sweep_routes_diag.sparse_diagonal_kernel(64, 10, 9, '120', contact_units=True, "
         "speculative_contact_batches=True)",
-        "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
+        "sweep_levels._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
         "build_serial_contacts=False, units=True)",
-        "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
+        "sweep_levels._get_build_independent_sparse_contact_groups_kernel(64, 10, '120', "
         "build_serial_contacts=True, units=True)",
-        "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
-        "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
+        "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel(1, '120', units=True)",
+        "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel(2, '120', units=True)",
         # Native sparse sweeps that select patch rings at sweep entry.
         "sweep_routes_sparse.sparse_kernel(48, 18, 12, active_rows=True, linked_rows=True, "
         "use_support_table=False, warm_start=False)",
@@ -376,25 +376,25 @@ def _dense_build_calls():
 
 
 def _solver_factory_calls():
-    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        sweep_levels,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_local,
         sweep_routes_tiers,
     )
 
-    name = "solver_feather_pgs."
+    name = "sweep_levels."
     for triples, batches in itertools.product((False, True), repeat=2):
         kwargs = {"contact_triples": triples, "speculative_contact_batches": batches}
         factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
     for serial in (False, True):
-        factory = solver._get_build_independent_sparse_contact_groups_kernel.__wrapped__
+        factory = sweep_levels._get_build_independent_sparse_contact_groups_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial}
         yield name + "_get_build_independent_sparse_contact_groups_kernel", factory, (64, 10, _ARCH), kwargs
     for dofs in (1, 2):
-        factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
+        factory = sweep_levels._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {}
     # Patch-only unit schedules of the same factories.
     for batches in (False, True):
@@ -402,11 +402,11 @@ def _solver_factory_calls():
         factory = sweep_routes_diag.sparse_diagonal_kernel.__wrapped__
         yield "sweep_routes_diag.sparse_diagonal_kernel", factory, (64, 10, 9, _ARCH), kwargs
     for serial in (False, True):
-        factory = solver._get_build_independent_sparse_contact_groups_kernel.__wrapped__
+        factory = sweep_levels._get_build_independent_sparse_contact_groups_kernel.__wrapped__
         kwargs = {"build_serial_contacts": serial, "units": True}
         yield name + "_get_build_independent_sparse_contact_groups_kernel", factory, (64, 10, _ARCH), kwargs
     for dofs in (1, 2):
-        factory = solver._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
+        factory = sweep_levels._get_mark_independent_sparse_contact_candidates_kernel.__wrapped__
         yield name + "_get_mark_independent_sparse_contact_candidates_kernel", factory, (dofs, _ARCH), {"units": True}
     for skip_rows, limits, coordinates, components in itertools.product((0, 32), *([(False, True)] * 3)):
         kwargs = {
@@ -705,8 +705,8 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "sweep_routes_sparse.sparse_kernel",
             "response_builds_rows.factor_contact_rows_kernel",
             "sweep_routes_diag.sparse_diagonal_kernel",
-            "solver_feather_pgs._get_build_independent_sparse_contact_groups_kernel",
-            "solver_feather_pgs._get_mark_independent_sparse_contact_candidates_kernel",
+            "sweep_levels._get_build_independent_sparse_contact_groups_kernel",
+            "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.parallel_kernel",
             "sweep_routes_local.paired_factor_kernel",
             "keyed_rows.get_parallel_factory",

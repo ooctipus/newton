@@ -414,7 +414,7 @@ class TreeKineticState:
         solver = self.solver
         twists = getattr(solver, "_predicted_twist", None)
         # Publish only when the classifier, built after this owner, consumes them.
-        consumer = getattr(solver, "_resolved_worlds_owner", None)
+        consumer = solver.sweep.resolved_worlds_owner
         return field_group.bind(
             ForceInput,
             solver=solver,

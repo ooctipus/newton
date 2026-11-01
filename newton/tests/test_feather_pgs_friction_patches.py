@@ -1355,14 +1355,14 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 step()
             self.assertGreater(int((patches.current.source.numpy() >= 0).sum()), 0)
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
-                dataclasses.replace(solver.options, contact_friction_gap_threshold=-1.0)
-            )
+                solver.sweep.options
+            ) = dataclasses.replace(solver.options, contact_friction_gap_threshold=-1.0)
             step()
             self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
             self.assertGreater(int(patches.previous.valid.numpy().sum()), 0)
             solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
-                dataclasses.replace(solver.options, contact_friction_gap_threshold=0.001)
-            )
+                solver.sweep.options
+            ) = dataclasses.replace(solver.options, contact_friction_gap_threshold=0.001)
             step()
             weights = patches.view.weight.numpy()
             sources = patches.current.source.numpy()

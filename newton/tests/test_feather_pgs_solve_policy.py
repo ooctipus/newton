@@ -753,8 +753,10 @@ def _sweep_record(**fields):
 def _policy_solver(*, readout="sweeps", skipped=True, **attributes):
     """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
     return SimpleNamespace(
-        _solve_policy=SolvePolicy(readout=readout),
-        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, counts_skipped=skipped),
+        sweep=SimpleNamespace(
+            policy=SolvePolicy(readout=readout),
+            readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, counts_skipped=skipped),
+        ),
         **attributes,
         options=SimpleNamespace(pgs_solve_readout=readout),
     )
@@ -782,7 +784,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
                 readout = path_selection._readout(_policy_solver(skipped=skipped), record)
                 self.assertEqual(readout["counts_skipped"], skipped)
         solver = _policy_solver()
-        solver._solve_readout = SimpleNamespace(kernels={}, counts_skipped=True)
+        solver.sweep.readout = SimpleNamespace(kernels={}, counts_skipped=True)
         self.assertFalse(path_selection._readout(solver, record)["counts_skipped"])
 
 

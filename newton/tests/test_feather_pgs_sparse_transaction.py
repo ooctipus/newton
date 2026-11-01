@@ -663,10 +663,10 @@ class TestContactUnitTwins(unittest.TestCase):
                     solvers[fused] = _make_solver(model, True, **options)
             with self.subTest(law=law):
                 unit, ordinary = solvers["1"], solvers["0"]
-                self.assertIn("_contact_triplets", unit._pgs_solve_sparse_kernel.key)
-                self.assertNotIn("_contact_triplets", ordinary._pgs_solve_sparse_kernel.key)
-                self.assertIn("_contact_records", unit._sparse_contact_response_kernel.key)
-                self.assertNotIn("_contact_records", ordinary._sparse_contact_response_kernel.key)
+                self.assertIn("_contact_triplets", unit.sweep.sparse_kernel.key)
+                self.assertNotIn("_contact_triplets", ordinary.sweep.sparse_kernel.key)
+                self.assertIn("_contact_records", unit.placement.sparse_contact_response_kernel.key)
+                self.assertNotIn("_contact_records", ordinary.placement.sparse_contact_response_kernel.key)
                 width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
                 self.assertEqual(unit.placement.sparse_contact_records.shape, (model.world_count, 32, width))
                 self.assertIsNone(ordinary.placement.sparse_contact_records)

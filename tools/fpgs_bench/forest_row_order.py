@@ -113,7 +113,7 @@ class RowOrder:
         self.arrays = [
             (getattr(solver.placement, name), wp.empty_like(getattr(solver.placement, name))) for name in names
         ]
-        self.solve = solver._launch_matrix_free_gs_solve
+        self.solve = solver.sweep.solve
 
     def __call__(self, *args, **kwargs):
         solver, contacts = self.solver, self.contacts

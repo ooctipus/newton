@@ -347,7 +347,7 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
         factor=SimpleNamespace(
             **{name: getattr(data, field) for name, field in _FACTOR_FIELDS.items()}, L_by_size={6: data.factor}
         ),
-        _mark_independent_sparse_contact_candidates_kernel=object(),
+        sweep=SimpleNamespace(sparse_contact_marker=object()),
         laws=SimpleNamespace(
             **{name: getattr(data, field) for name, field in _LAWS_FIELDS.items()},
             friction_anchors_enabled=anchors,
@@ -641,7 +641,7 @@ def check_compact_records(test, solvers, law):
     records = []
     for solver, arm in zip(solvers, _ARMS, strict=True):
         record = solver.get_path_selection()["routes"]["contact_rows"]
-        marker = solver._mark_independent_sparse_contact_candidates_kernel.key
+        marker = solver.sweep.sparse_contact_marker.key
         if arm == "sparse_diagonal":
             metadata = "prepare_world_contact_rows"
             expected = {
@@ -770,7 +770,7 @@ class TestCompactContact(unittest.TestCase):
                         1.0,
                     )
                     compact.launch_contacts(solver, bound, 16)
-                marker = solver._mark_independent_sparse_contact_candidates_kernel
+                marker = solver.sweep.sparse_contact_marker
                 self.assertEqual(
                     [call.args[0] for call in launch.call_args_list],
                     [compact.clear_contact_response, compact.produce_contacts, marker],
