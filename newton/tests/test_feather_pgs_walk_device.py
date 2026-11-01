@@ -43,7 +43,13 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
 )
-from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, TreeWalk, local_frames
+from newton._src.solvers.feather_pgs.tree_factor import (
+    WALK_COORDINATE,
+    WALK_LINK,
+    WALK_NOW,
+    TreeWalk,
+    local_frames,
+)
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
@@ -60,6 +66,7 @@ from newton.tests.test_feather_pgs_walk import (
     relative,
     run_route,
 )
+from newton.tests.test_feather_pgs_walk_rows import random_tree
 
 UNITS = (1, 2, 3, 4)
 """Rows a lane walks: a limit, a velocity limit's pair, a point contact, a contact with spin."""
@@ -81,18 +88,21 @@ _UP = """    if (tid >= body.shape[0]) return;
     const int n = data.shape[1], bodies = link.shape[1];
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
+    const float* s = now.data + (size_t)tree.data[tid] * n * $now;
+    const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
     float* out = z.data + (size_t)tid * $rows * n;
     const auto sink = [&](int r, int c, float value) { out[(size_t)r * n + c] = value; };
-    float p[6 * $rows];
-    for (int k = 0; k < 6 * $rows; ++k) p[k] = wrench.data[(size_t)tid * 6 * $rows + k];
+    float p[6 * $rows], w[6 * $rows];
+    for (int k = 0; k < 6 * $rows; ++k) p[k] = w[k] = wrench.data[(size_t)tid * 6 * $rows + k];
     int start = top.data[tid];
     if (seeded.data[tid] != 0) {
         float x[$rows];
         for (int r = 0; r < $rows; ++r) x[r] = covector.data[(size_t)tid * $rows + r];
         WALK_SEED(d, start, x, p, sink);
         start -= 1;
+        s = nullptr;
     }
-    WALK_UP(d, l, body.data[tid], start, p, sink);
+    WALK_UP(d, l, s, f, body.data[tid], start, p, w, sink);
 """
 
 _TREE = """    if (tid >= u.shape[0]) return;
@@ -100,12 +110,15 @@ _TREE = """    if (tid >= u.shape[0]) return;
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     WALK_DOWN(d, l, u.data + (size_t)tid * n, qd.data + (size_t)tid * n, twist.data + (size_t)tid * bodies * 6);
-    WALK_TWISTS(d, l, known.data + (size_t)tid * n, known_twist.data + (size_t)tid * bodies * 6);
+    WALK_TWISTS(now.data + (size_t)tree.data[tid] * n * $now, now_link.data + (size_t)tree.data[tid] * bodies * $link,
+                known.data + (size_t)tid * n, known_twist.data + (size_t)tid * bodies * 6);
 """
 
 _UP_PARAMS = params(
     ("data", wp.array3d[float]),
     ("link", wp.array3d[float]),
+    ("now", wp.array3d[float]),
+    ("now_link", wp.array3d[float]),
     ("tree", wp.array[int]),
     ("body", wp.array[int]),
     ("top", wp.array[int]),
@@ -117,6 +130,8 @@ _UP_PARAMS = params(
 _TREE_PARAMS = params(
     ("data", wp.array3d[float]),
     ("link", wp.array3d[float]),
+    ("now", wp.array3d[float]),
+    ("now_link", wp.array3d[float]),
     ("tree", wp.array[int]),
     ("u", wp.array2d[float]),
     ("qd", wp.array2d[float]),
@@ -131,7 +146,7 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
     """The rows kernel (a thread per seed) and the tree kernel (a thread per tree) of one path table."""
     prelude = tree_factor.walk_prelude(*table, rows)
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
-    sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
+    sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
     up = KernelTemplate(
         f"walk_up_{rows}_{tag}", _UP_PARAMS, substitute(_UP, rows=rows, **sizes), THREADS, (prelude,), dual=True
     )
@@ -142,13 +157,18 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
 class DeviceWalk:
     """The device walk of trees of one topology (one path table), their data from their float32 walks."""
 
-    def __init__(self, walks: list, device, rows: int = 3):
+    def __init__(self, walks: list, device, rows: int = 3, step: list | None = None):
         self.walks, self.device, self.rows = walks, device, rows
         self.n, self.bodies = walks[0].s.shape[0], walks[0].parent.size
         self.up_kernel, self.tree_kernel = walk_kernels(walks[0].path_table, rows)
         data, link = zip(*(walk.device_data() for walk in walks), strict=True)
         self.data = wp.array(np.stack(data), dtype=float, device=device)
         self.link = wp.array(np.stack(link), dtype=float, device=device)
+        # The step's geometry (WalkTrees.now, .now_link): the columns and links of the walks' own poses, or of
+        # ``step``'s walks, the same trees at a step's poses after the refresh's.
+        step = walks if step is None else step
+        self.now = wp.array(np.stack([np.asarray(walk.s) for walk in step]), dtype=float, device=device)
+        self.now_link = wp.array(np.stack([walk.device_data()[1] for walk in step]), dtype=float, device=device)
 
     def up(self, tree, body, top, seeded, wrench, covector) -> np.ndarray:
         """Footprints ``[seeds, rows, n]`` of seeds of ``rows`` rows: wrenches ``[seeds, rows, 6]`` at their bodies'
@@ -167,6 +187,8 @@ class DeviceWalk:
             inputs=[
                 self.data,
                 self.link,
+                self.now,
+                self.now_link,
                 array(tree, int),
                 array(body, int),
                 array(top, int),
@@ -194,6 +216,8 @@ class DeviceWalk:
             inputs=[
                 self.data,
                 self.link,
+                self.now,
+                self.now_link,
                 wp.array(np.asarray(tree, dtype=np.int32), dtype=int, device=self.device),
                 wp.array(np.asarray(u, dtype=np.float32), dtype=float, device=self.device),
                 outputs[0],
@@ -204,6 +228,46 @@ class DeviceWalk:
             device=self.device,
         )
         return tuple(array.numpy().astype(np.float64) for array in outputs)
+
+
+def held_step(device) -> dict:
+    """A step between refreshes (``update_mass_matrix_interval > 1``) on random trees of revolute, prismatic and ball
+    joints: the device walk with the refresh's factor (``q_r``) and the step's geometry (``q_t``, every coordinate moved),
+    its contact rows seeded at the step's frames, against ``L_r^-1 P J_t^T`` in float64 (the dense rows' whitening by the
+    held factor), as worst ratios to ``n u kappa``; ``stale`` the same rows whitened with the refresh pose's ``J``, what
+    the walk gave before it took the step's geometry (a root body's rows are the same in both)."""
+    rng = np.random.default_rng(1102)
+    out = {"held": 0.0, "stale": 0.0, "seeds": 0}
+    for bodies in (3, 6, 9, 12):
+        model, q_r = random_tree(rng, bodies)
+        q_t = q_r + rng.normal(size=q_r.shape) * 0.2
+        types, q_start = model.joint_type.numpy(), model.joint_q_start.numpy()
+        for j in np.flatnonzero(types == int(newton.JointType.BALL)):
+            quat = q_t[q_start[j] : q_start[j] + 4]
+            q_t[q_start[j] : q_start[j] + 4] = quat / np.linalg.norm(quat)
+        n = int(model.joint_dof_count)
+        diagonal = rng.uniform(0.0, 0.05, n)
+        walk_r = TreeWalk(*local_frames(model, q_r, 0), diagonal)
+        walk_t = TreeWalk(*local_frames(model, q_t, 0), diagonal)
+        walk32 = TreeWalk(*local_frames(model, q_r, 0), diagonal, dtype=np.float32)
+        kappa = float(np.linalg.cond(factor_matrix(walk_r)))
+        seeds = [(b, contact_wrenches(rng.normal(scale=0.05, size=3), rng.normal(size=3))) for b in range(bodies)]
+        z = DeviceWalk([walk32], device, 3, step=[walk_t]).up(
+            [0] * bodies,
+            [b for b, _ in seeds],
+            [int(walk_t.first[b + 1]) - 1 for b, _ in seeds],
+            [0] * bodies,
+            [w.T for _, w in seeds],
+            np.zeros((bodies, 3)),
+        )
+        for i, (b, w) in enumerate(seeds):
+            held, _ = walk_r.up(covector=jacobian(walk_t, b, w))
+            stale, _ = walk_r.up(covector=jacobian(walk_r, b, w))
+            scale = n * ROUNDING * kappa
+            out["held"] = max(out["held"], relative(z[i].T, held) / scale)
+            out["stale"] = max(out["stale"], relative(stale, held) / scale)
+        out["seeds"] += bodies
+    return out
 
 
 def seed_rows(walk: TreeWalk, rows: int, rng) -> list:
@@ -565,6 +629,16 @@ class TestWalkDevice(unittest.TestCase):
                     self.assertTrue(chain["pivots_positive"])
                     self.assertLess(chain["dv"], 1.0e-5, f"{chain}")
                     self.assertLess(chain["dv"], 10.0 * chain["host_dv"] + 1.0e-6, f"{chain}")
+
+    def test_a_held_factor_whitens_the_steps_J(self):
+        """Between refreshes the factor is the refresh's and ``J`` the step's: the device walk with the step's
+        geometry gives ``L_r^-1 P J_t^T`` within ``BOUND n u kappa``, and the refresh pose's ``J`` misses it by far."""
+        for device in devices():
+            with self.subTest(device=device):
+                result = held_step(device)
+                self.assertGreater(result["seeds"], 0)
+                self.assertLessEqual(result["held"], BOUND, f"{result}")
+                self.assertGreater(result["stale"], 1.0e3 * BOUND, f"{result}")
 
     def test_one_frame_tells_two_apart(self):
         """``long_chain(106)`` as main runs it: the walk's rows with the walk's leave stay within ``BOUND n u`` of

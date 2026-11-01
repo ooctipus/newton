@@ -66,6 +66,7 @@ __all__ = [
     "WALK_COORDINATE",
     "WALK_FRAME",
     "WALK_LINK",
+    "WALK_NOW",
     "WALK_PIVOT",
     "TreeFactor",
     "prepare_augmented_drives",
@@ -718,6 +719,7 @@ class TreeFactor:
             drive_rows_ready = self.prepare_drives(state_in, control, dt, v_hat, v_out)
             qd = self.fk_id(state_in, state_out, step, qd_work)
             self.refresh(drive_rows_ready, step)
+            self.walk_geometry(state_in)
             self.refresh_walk(state_in)
         # joint_tau holds only u0: the predictor adds the current external, control and bias contributions after
         # waiting for the drives.
@@ -924,7 +926,9 @@ class TreeFactor:
         """Hold the walk's data for ``articulations`` (the converted class's, every responding tree): each coordinate's
         :data:`WALK_COORDINATE` floats, each body's :data:`WALK_LINK` floats, inertia scratch and twists, and each
         body's path entry (its parent and first coordinate within its tree, :func:`walk_paths_prelude`). Its refresh
-        runs inside the factor's (:meth:`refresh_walk`), so the walk is the factor ``L`` refreshes, to rounding.
+        runs inside the factor's (:meth:`refresh_walk`), so the walk is the factor ``L`` refreshes, to rounding. The
+        step's geometry (:meth:`walk_geometry`, :data:`WALK_NOW` floats a coordinate and :data:`WALK_LINK` a body) is
+        where the rows' seeds enter, every step.
 
         Raises:
             ValueError: For a tree whose bodies do not come after their parents.
@@ -939,9 +943,12 @@ class TreeFactor:
         joint_of = np.full(max(int(model.body_count), 1), -1, dtype=np.int64)
         joint_of[joint_child[joint_child >= 0]] = np.flatnonzero(joint_child >= 0)
         path = np.zeros((max(int(model.joint_count), 1), 2), dtype=np.int32)
+        join = np.zeros(max(int(model.joint_count), 1), dtype=np.int32)
+        joint_art = np.full(max(int(model.joint_count), 1), -1, dtype=np.int32)
         dof_body = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
         for art in arts.tolist():
             j0, j1 = int(start[art]), int(end[art])
+            joint_art[j0:j1] = art
             for j in range(j0, j1):
                 up = int(joint_of[joint_parent[j]]) if joint_parent[j] >= 0 else -1
                 parent = up - j0 if j0 <= up < j1 else -1
@@ -949,6 +956,8 @@ class TreeFactor:
                     raise ValueError(f"The walk needs every parent before its children (articulation {art})")
                 path[j] = (parent, int(qd_start[j] - qd_start[j0]))
                 dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
+                if parent >= 0 and parent != j - j0 - 1:
+                    join[j0 + parent] = 1
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
         free_host = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(0, dtype=np.int32)
@@ -957,6 +966,7 @@ class TreeFactor:
         self.walk_trees_arts = wp.array(trees if trees.size else np.zeros(1, np.int32), dtype=wp.int32, device=device)
         self.walk_tree_count = int(trees.size)
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
+        self.walk_join = wp.array(join, dtype=wp.int32, device=device)
         self.walk_data = wp.zeros((dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         self.walk_inertia = wp.zeros(joints, dtype=wp.spatial_matrix, device=device)
@@ -965,8 +975,16 @@ class TreeFactor:
         self.walk_armature = wp.zeros(dofs, dtype=wp.float32, device=device)
         if self.armature is not None and self.armature.size:
             self.walk_armature.assign(self.armature.astype(np.float32))
+        # The step's geometry (walk_geometry_kernel, every step): a seed enters as J at the step's poses.
+        walked = np.flatnonzero(joint_art >= 0).astype(np.int32)
+        self.walk_joints = wp.array(walked if walked.size else np.zeros(1, np.int32), dtype=wp.int32, device=device)
+        self.walk_joint_count = int(walked.size)
+        self.walk_joint_art = wp.array(joint_art, dtype=wp.int32, device=device)
+        self.walk_now = wp.zeros((dofs, WALK_NOW), dtype=wp.float32, device=device)
+        self.walk_now_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         view = WalkTrees()
         view.data, view.link, view.path = self.walk_data, self.walk_link, self.walk_path
+        view.now, view.now_link = self.walk_now, self.walk_now_link
         view.twist, view.scratch = self.walk_twist, self.walk_leave_twist
         view.joint_start = model.articulation_start
         view.joint_end = forest.articulation_joint_end
@@ -1040,8 +1058,39 @@ class TreeFactor:
         """The walk's view (:class:`WalkTrees`) the one writer, the leave and the audit read."""
         return self.walk_trees
 
+    def walk_geometry(self, state) -> None:
+        """The step's geometry of every held tree (:func:`walk_geometry_kernel`, a thread per joint, every step): each
+        coordinate's column at its body's frame and each body's frame point at the poses ``state.body_q`` holds, where
+        the rows' seeds enter the walk as ``J``."""
+        if self.walk_arts is None or not self.walk_joint_count:
+            return
+        model = self.model
+        wp.launch(
+            walk_geometry_kernel,
+            dim=self.walk_joint_count,
+            inputs=[
+                self.walk_joints,
+                self.walk_joint_art,
+                model.articulation_start,
+                self.walk_path,
+                model.joint_type,
+                model.joint_dof_dim,
+                model.joint_child,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_X_p,
+                model.joint_axis,
+                state.joint_q,
+                state.body_q,
+                model.body_com,
+            ],
+            outputs=[self.walk_now, self.walk_now_link],
+            device=model.device,
+        )
+
     def twists(self, v_hat: wp.array) -> None:
-        """Every held tree's predicted body twists at its walk frames, from ``v_hat`` (:func:`walk_twists_kernel`)."""
+        """Every held tree's predicted body twists at its frames at the step's poses (:meth:`walk_geometry`), from
+        ``v_hat`` (:func:`walk_twists_kernel`)."""
         if self.walk_arts is None or not self.walk_tree_count:
             return
         wp.launch(
@@ -1053,7 +1102,8 @@ class TreeFactor:
 
     def refresh_walk(self, state) -> None:
         """The device inward pass (:func:`walk_refresh_kernel`) of every held tree the refresh just factored
-        (``mass_update_mask``), at the poses its forward kinematics published in ``state.body_q``."""
+        (``mass_update_mask``), at the poses its forward kinematics published in ``state.body_q``: the step's geometry
+        (:meth:`walk_geometry`, launched before it at the same poses) becomes the factor's frames."""
         if self.walk_arts is None:
             return
         model = self.model
@@ -1066,14 +1116,8 @@ class TreeFactor:
                 model.articulation_start,
                 self.forest.articulation_joint_end,
                 self.walk_path,
-                model.joint_type,
-                model.joint_dof_dim,
                 model.joint_child,
-                model.joint_q_start,
                 model.joint_qd_start,
-                model.joint_X_p,
-                model.joint_axis,
-                state.joint_q,
                 state.body_q,
                 model.body_mass,
                 model.body_com,
@@ -1082,6 +1126,9 @@ class TreeFactor:
                 self.drive_row_by_dof,
                 self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
                 self.walk_trees.free,
+                self.walk_join,
+                self.walk_now,
+                self.walk_now_link,
             ],
             outputs=[self.walk_data, self.walk_link, self.walk_inertia],
             device=model.device,
@@ -1463,7 +1510,12 @@ WALK_PIVOT = 13
 """Where a coordinate's record holds its pivot without ``K`` (:data:`WALK_COORDINATE`)."""
 
 WALK_FRAME = 4
-"""Where a body's record holds its frame's world point (:data:`WALK_LINK`): a row's seed wrench is taken there."""
+"""Where a body's record holds its frame's world point (:data:`WALK_LINK`), at the refresh's poses: the factor's
+inertias are taken there."""
+
+WALK_NOW = 6
+"""Floats per coordinate of the step's columns (:attr:`WalkTrees.now`): ``s`` at its body's frame at the step's poses
+(its links, :attr:`WalkTrees.now_link`, take :data:`WALK_LINK`'s layout)."""
 
 _WALK_TABLE = """    static __constant__ int WALK_PARENT[$bodies] = {$parent};
     static __constant__ int WALK_FIRST[$ends] = {$first};
@@ -1497,18 +1549,30 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     // (WALK_COORDINATE floats), link each body's offset to its parent's frame (WALK_LINK floats), as
     // TreeWalk.device_data and TreeFactor.refresh_walk lay them out.
     //
-    // WALK_UP(data, link, body, top, p, sink): the states of $rows rows, p[6 r + k] the wrench (f, t) of row r at body's
-    // frame, walked up to the root from coordinate top of body (its last for a wrench seed): each coordinate c takes
-    // the footprint z = (s_c . p) / ell_c, given to sink(r, c, z), and passes p - ut_c z; a joint passes t - d x f to
-    // its parent.
-    const auto WALK_UP = [&](const float* data, const float* link, int body, int top, float* p, auto&& sink) {
+    // WALK_UP(data, link, now, now_link, body, top, p, w, sink): the states p of $rows rows, p[6 r + k] the wrench
+    // (f, t) of row r at body's frame, walked up to the root from coordinate top of body (its last for a wrench seed):
+    // each coordinate c takes the footprint z = (s_c . p) / ell_c, given to sink(r, c, z), and passes p - ut_c z; a
+    // joint passes t - d x f to its parent. now (null for rows seeded by covectors alone): the step's geometry, each
+    // coordinate's column at its body's frame at the step's poses (WALK_NOW floats) and each body's link there
+    // (now_link, link's layout), with w[6 r + k] row r's seed wrench at the current body's frame there. A seed enters
+    // as the step's J and the refresh's factor whitens it (a held factor between refreshes, L^-1 P J^T as the dense rows
+    // do): p is the seed's wrench less what the factor has taken, so the footprint takes (s_now_c - s_c) . w and a joint
+    // passes (d - d_now) x f_w more. On a refresh step the two geometries are one and both terms are zero.
+    const auto WALK_UP = [&](const float* data, const float* link, const float* now, const float* now_link, int body,
+                             int top, float* p, float* w, auto&& sink) {
         for (int b = body; b >= 0; b = WALK_PARENT_OF(b)) {
             for (int c = b == body ? top : WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
                 const float* d = data + $coordinate * c;
+                const float* e = now != nullptr ? now + $now * c : nullptr;
                 for (int r = 0; r < $rows; ++r) {
                     float* q = p + 6 * r;
-                    const float z = ((d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5]))
-                                    * d[12];
+                    float x = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) + (d[3] * q[3] + d[4] * q[4] + d[5] * q[5]);
+                    if (e != nullptr) {
+                        const float* v = w + 6 * r;
+                        x += ((e[0] - d[0]) * v[0] + (e[1] - d[1]) * v[1] + (e[2] - d[2]) * v[2])
+                             + ((e[3] - d[3]) * v[3] + (e[4] - d[4]) * v[4] + (e[5] - d[5]) * v[5]);
+                    }
+                    const float z = x * d[12];
                     for (int k = 0; k < 6; ++k) q[k] -= d[6 + k] * z;
                     sink(r, c, z);
                 }
@@ -1521,6 +1585,21 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
                     q[3] -= l[1] * fz - l[2] * fy;
                     q[4] -= l[2] * fx - l[0] * fz;
                     q[5] -= l[0] * fy - l[1] * fx;
+                }
+                if (now != nullptr) {
+                    const float* o = now_link + $link * b;
+                    const float g0 = l[0] - o[0], g1 = l[1] - o[1], g2 = l[2] - o[2];
+                    for (int r = 0; r < $rows; ++r) {
+                        float* q = p + 6 * r;
+                        float* v = w + 6 * r;
+                        const float fx = v[0], fy = v[1], fz = v[2];
+                        q[3] += g1 * fz - g2 * fy;
+                        q[4] += g2 * fx - g0 * fz;
+                        q[5] += g0 * fy - g1 * fx;
+                        v[3] -= o[1] * fz - o[2] * fy;
+                        v[4] -= o[2] * fx - o[0] * fz;
+                        v[5] -= o[0] * fy - o[1] * fx;
+                    }
                 }
             }
         }
@@ -1585,15 +1664,16 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
     };
-    // WALK_TWISTS(data, link, qd, twist): every body's twist from known coordinates qd, root first, V += s_c qd_c: the
-    // writer's prologue (the predicted twists its rows' incident velocities read).
-    const auto WALK_TWISTS = [&](const float* data, const float* link, const float* qd, float* twist) {
+    // WALK_TWISTS(now, now_link, qd, twist): every body's twist at its frame from known coordinates qd, root first, at
+    // the step's poses (WALK_UP's now and now_link): V = V_parent + d x w_parent, then V += s_now_c qd_c. The writer's
+    // prologue: the predicted twists a row's incident velocity reads against its seed's wrench there.
+    const auto WALK_TWISTS = [&](const float* now, const float* now_link, const float* qd, float* twist) {
         for (int b = 0; b < WALK_BODIES; ++b) {
             float V[6];
-            WALK_PARENT_TWIST(link, twist, b, V);
+            WALK_PARENT_TWIST(now_link, twist, b, V);
             for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
-                const float* d = data + $coordinate * c;
-                for (int k = 0; k < 6; ++k) V[k] += d[k] * qd[c];
+                const float* s = now + $now * c;
+                for (int k = 0; k < 6; ++k) V[k] += s[k] * qd[c];
             }
             for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
         }
@@ -1628,7 +1708,7 @@ def walk_prelude(parent: tuple[int, ...], first: tuple[int, ...], rows: int) -> 
         "parent": ", ".join(str(b) for b in parent),
         "first": ", ".join(str(c) for c in first),
     }
-    walk = substitute(_WALK, rows=rows, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    walk = substitute(_WALK, rows=rows, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW)
     return DevicePrelude(
         f"walk_{rows}_{len(parent)}",
         substitute(_WALK_TABLE, table) + "\n" + walk,
@@ -1648,7 +1728,7 @@ def walk_paths_prelude(rows: int) -> DevicePrelude:
     """
     if rows < 1:
         raise ValueError(f"a lane walks at least one row, got {rows}")
-    walk = _WALK_PATHS + "\n" + substitute(_WALK, rows=rows, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    walk = _WALK_PATHS + "\n" + substitute(_WALK, rows=rows, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW)
     return DevicePrelude(f"walk_paths_{rows}", walk, cpu=walk)
 
 
@@ -1664,8 +1744,12 @@ class WalkTrees:
 
     - ``data``, ``link``, ``path``: :data:`WALK_COORDINATE` floats a coordinate, :data:`WALK_LINK` floats a body and
       each body's parent and first coordinate within its tree (:func:`walk_paths_prelude`'s table);
-    - ``twist``: each body's predicted twist at its frame (:meth:`TreeFactor.twists`), which a row's incident reads;
-      ``scratch``: the leave's twists;
+    - ``now``, ``now_link``: each coordinate's column at its body's frame, and each body's link (:data:`WALK_LINK`'s
+      layout: the offset to its parent's frame and its frame point), at the step's poses
+      (:meth:`TreeFactor.walk_geometry`, every step): a seed enters the walk as ``J`` there, so a held factor (a step
+      between refreshes) whitens the step's ``J``;
+    - ``twist``: each body's predicted twist at its frame at the step's poses (:meth:`TreeFactor.twists`), which a
+      row's incident reads; ``scratch``: the leave's twists;
     - each articulation's first joint, joint end, first coordinate and coordinates, and whether it is a free rigid
       body (``free``), whose rows and leave keep its own 6x6 factor (``L6`` at ``group``) until the free bodies
       convert;
@@ -1679,6 +1763,8 @@ class WalkTrees:
     data: wp.array2d[float]
     link: wp.array2d[float]
     path: wp.array[wp.vec2i]
+    now: wp.array2d[float]
+    now_link: wp.array2d[float]
     twist: wp.array[wp.spatial_vector]
     scratch: wp.array[wp.spatial_vector]
     joint_start: wp.array[int]
@@ -1699,7 +1785,7 @@ _TWISTS = """    if (tid >= arts.shape[0]) return;
     const int art = arts.data[tid];
     const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
     WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, walk.dofs.data[art]);
-    WALK_TWISTS(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, qd.data + d0,
+    WALK_TWISTS(walk.now.data + (size_t)d0 * $now, walk.now_link.data + (size_t)j0 * $link, qd.data + d0,
                 reinterpret_cast<float*>(walk.twist.data + j0));
 """
 
@@ -1764,11 +1850,11 @@ def walk_enter_kernel() -> wp.Kernel:
 
 @functools.cache
 def walk_twists_kernel() -> wp.Kernel:
-    """Each held tree's body twists from known coordinates ``qd`` at the walk's frames, a thread per tree
+    """Each held tree's body twists from known coordinates ``qd`` at its frames at the step's poses, a thread per tree
     (``WALK_TWISTS``): the predicted twists every row's incident velocity reads (:meth:`TreeFactor.twists`)."""
     from .kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
 
-    body = substitute(_TWISTS, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    body = substitute(_TWISTS, now=WALK_NOW, link=WALK_LINK)
     return KernelTemplate(
         "walk_twists",
         (("arts", wp.array[int]), ("walk", WalkTrees), ("qd", wp.array[float])),
@@ -1785,15 +1871,18 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
     const float* link = walk.link.data + (size_t)joint0 * $link;
     float* row = out.data + ((size_t)line * out.shape[1] + slot) * out.shape[2] + entry;
     const auto sink = [&](int, int c, float z) { row[c] += z; };
-    float p[6];
-    for (int k = 0; k < 6; ++k) p[k] = wrench[k];
+    float p[6], w[6];
+    for (int k = 0; k < 6; ++k) p[k] = w[k] = wrench[k];
     int top = WALK_FIRST_OF(body + 1) - 1;
+    const float* now = walk.now.data + (size_t)dof0 * $now;
+    const float* now_link = walk.now_link.data + (size_t)joint0 * $link;
     if (coordinate >= 0) {
         const float x[1] = {value};
         WALK_SEED(data, coordinate, x, p, sink);
         top = coordinate - 1;
+        now = nullptr;
     }
-    WALK_UP(data, link, body, top, p, sink);
+    WALK_UP(data, link, now, now_link, body, top, p, w, sink);
 """
 
 
@@ -1802,7 +1891,8 @@ def _walk_into_snippet() -> str:
     from .device_preludes import dual_native  # noqa: PLC0415
 
     return dual_native(
-        substitute(_WALK_INTO, coordinate=WALK_COORDINATE, link=WALK_LINK), preludes=(walk_paths_prelude(1),)
+        substitute(_WALK_INTO, coordinate=WALK_COORDINATE, link=WALK_LINK, now=WALK_NOW),
+        preludes=(walk_paths_prelude(1),),
     )
 
 
@@ -2007,12 +2097,35 @@ def _walk_lift(inertia: wp.spatial_matrix, d: wp.vec3) -> wp.spatial_matrix:
     return wp.mul(wp.mul(wrench, inertia), to)
 
 
+@wp.func
+def _walk_frame(
+    j: int,
+    j0: int,
+    walk_path: wp.array[wp.vec2i],
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+) -> wp.transform:
+    """Joint ``j``'s frame at the poses ``body_q`` holds: its anchor (its parent body's pose times its joint frame, the
+    world's at a root), at a free body's centre of mass for a free joint, with the anchor's rotation."""
+    parent = walk_path[j][0]
+    anchor = joint_X_p[j]
+    if parent >= 0:
+        anchor = wp.transform_multiply(body_q[joint_child[j0 + parent]], joint_X_p[j])
+    kind = joint_type[j]
+    if kind == JointType.FREE or kind == JointType.DISTANCE:
+        child = joint_child[j]
+        return wp.transform(wp.transform_point(body_q[child], body_com[child]), wp.transform_get_rotation(anchor))
+    return anchor
+
+
 @wp.kernel(enable_backward=False)
-def walk_refresh_kernel(
-    arts: wp.array[int],
-    mass_update_mask: wp.array[int],
+def walk_geometry_kernel(
+    joints: wp.array[int],
+    joint_art: wp.array[int],
     articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
     walk_path: wp.array[wp.vec2i],
     joint_type: wp.array[int],
     joint_dof_dim: wp.array2d[int],
@@ -2023,6 +2136,79 @@ def walk_refresh_kernel(
     joint_axis: wp.array[wp.vec3],
     joint_q: wp.array[float],
     body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # outputs
+    walk_now: wp.array2d[float],
+    walk_now_link: wp.array2d[float],
+):
+    """The step's geometry of every held tree, a thread per joint (:meth:`TreeFactor.walk_geometry`), float32, at the
+    poses ``body_q`` holds: the body's frame (its joint's anchor, a free body's centre of mass), its coordinates'
+    columns there in world axes, as :func:`local_frames` takes them (a free joint turns about the articulation's origin,
+    its first body's centre of mass; a D6 joint's turns about the pivot its slides moved), and its link (:data:`WALK_LINK`'s
+    layout: its parent's frame less its own, its frame's world point). The rows' seeds enter the walk here, and the
+    refresh takes its frames from it."""
+    j = joints[wp.tid()]
+    j0 = articulation_start[joint_art[j]]
+    parent = walk_path[j][0]
+    X = _walk_frame(j, j0, walk_path, joint_type, joint_child, joint_X_p, body_q, body_com)
+    R_a = wp.transform_get_rotation(X)
+    frame = wp.transform_get_translation(X)
+    kind = joint_type[j]
+    free = kind == JointType.FREE or kind == JointType.DISTANCE
+    q0 = joint_q_start[j]
+    d0 = joint_qd_start[j]
+    if kind == JointType.REVOLUTE:
+        _walk_column(walk_now, d0, wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, joint_axis[d0])))
+    elif kind == JointType.PRISMATIC:
+        _walk_column(walk_now, d0, wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0]), wp.vec3(0.0)))
+    elif kind == JointType.BALL:
+        for k in range(3):
+            e = wp.vec3(0.0)
+            e[k] = 1.0
+            _walk_column(walk_now, d0 + k, wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, e)))
+    elif free:
+        first = joint_child[j0]
+        origin = wp.transform_point(body_q[first], body_com[first])
+        for k in range(3):
+            e = wp.vec3(0.0)
+            e[k] = 1.0
+            w = wp.quat_rotate(R_a, e)
+            _walk_column(walk_now, d0 + k, wp.spatial_vector(w, wp.vec3(0.0)))
+            # The factor turns a free joint about the articulation's origin: the same twist at the body's frame.
+            _walk_column(walk_now, d0 + 3 + k, wp.spatial_vector(wp.cross(w, frame - origin), w))
+    elif kind == JointType.D6:
+        lin = joint_dof_dim[j, 0]
+        ang = joint_dof_dim[j, 1]
+        slide = wp.vec3(0.0)
+        for k in range(lin):
+            _walk_column(walk_now, d0 + k, wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0 + k]), wp.vec3(0.0)))
+            slide += joint_axis[d0 + k] * joint_q[q0 + k]
+        turned = wp.quat_identity()
+        for k in range(ang):
+            axis = wp.quat_rotate(turned, joint_axis[d0 + lin + k])
+            w = wp.quat_rotate(R_a, axis)
+            # A turn about the pivot the slides moved, at the anchor: v = (R_a slide) x w.
+            _walk_column(walk_now, d0 + lin + k, wp.spatial_vector(wp.cross(wp.quat_rotate(R_a, slide), w), w))
+            turned = wp.quat_from_axis_angle(axis, joint_q[q0 + lin + k]) * turned
+    offset = wp.vec3(0.0)
+    if parent >= 0:
+        up = _walk_frame(j0 + parent, j0, walk_path, joint_type, joint_child, joint_X_p, body_q, body_com)
+        offset = wp.transform_get_translation(up) - frame
+    for k in range(3):
+        walk_now_link[j, k] = offset[k]
+        walk_now_link[j, 4 + k] = frame[k]
+
+
+@wp.kernel(enable_backward=False)
+def walk_refresh_kernel(
+    arts: wp.array[int],
+    mass_update_mask: wp.array[int],
+    articulation_start: wp.array[int],
+    articulation_joint_end: wp.array[int],
+    walk_path: wp.array[wp.vec2i],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    body_q: wp.array[wp.transform],
     body_mass: wp.array[float],
     body_com: wp.array[wp.vec3],
     body_inertia: wp.array[wp.mat33],
@@ -2030,6 +2216,9 @@ def walk_refresh_kernel(
     drive_row_by_dof: wp.array[int],
     row_K: wp.array[float],
     free_rigid: wp.array[int],
+    walk_join: wp.array[int],
+    walk_now: wp.array2d[float],
+    walk_now_link: wp.array2d[float],
     # outputs
     walk_data: wp.array2d[float],
     walk_link: wp.array2d[float],
@@ -2039,107 +2228,57 @@ def walk_refresh_kernel(
     ``P (H + R + K) P^T`` as :class:`TreeWalk` forms it from :func:`local_frames`, at the refresh's poses (``body_q``,
     which the held tree's forward kinematics publishes before any factor read).
 
-    Outward, every parent before its children: a body's frame (its joint's anchor, a free body's centre of mass), its
-    coordinates' columns there in world axes (a free joint turns about the articulation's origin, its first body's
-    centre of mass), its spatial inertia there and its link to its parent's frame. Inward, leaf first: each coordinate
-    takes ``ell = (s^T I s + R + K)^1/2``, ``ut = I s / ell`` and ``P0 = s^T I s + R``, ``I -= ut ut^T``, and the body
-    lifts what is left to its parent. ``R`` is the factor's effective armature and ``K`` each drive's, the diagonal
-    the refresh's ``L`` holds (:meth:`TreeFactor.diagonal`), so the walk and ``L`` are one factor. A free rigid body
-    (``free_rigid``) keeps its 6x6 factor: it takes its columns and frame only."""
+    Outward, every parent before its children: the step's geometry (:func:`walk_geometry_kernel`, at the same poses)
+    becomes the factor's, each coordinate's column and each body's frame and link to its parent's frame. Inward, leaf
+    first: a body's spatial inertia at its frame plus its children's lifts, then each coordinate takes ``ell = (s^T I s
+    + R + K)^1/2``, ``ut = I s / ell`` and ``P0 = s^T I s + R``, ``I -= ut ut^T``, and the body lifts what is left to
+    its parent: in registers when the parent is the next joint inward, through ``walk_inertia`` at a join
+    (``walk_join``: a joint with a child other than the next joint). ``R`` is the factor's effective armature and ``K``
+    each drive's, the diagonal the refresh's ``L`` holds (:meth:`TreeFactor.diagonal`), so the walk and ``L`` are one
+    factor. A free rigid body (``free_rigid``) keeps its 6x6 factor and takes nothing."""
     art = arts[wp.tid()]
-    if mass_update_mask[art] == 0:
+    if mass_update_mask[art] == 0 or free_rigid[art] != 0:
         return
     j0 = articulation_start[art]
     j1 = articulation_joint_end[art]
-    origin = wp.vec3(0.0)
     for j in range(j0, j1):
-        parent = walk_path[j][0]
-        anchor = joint_X_p[j]
-        if parent >= 0:
-            anchor = wp.transform_multiply(body_q[joint_child[j0 + parent]], joint_X_p[j])
-        R_a = wp.transform_get_rotation(anchor)
-        t_a = wp.transform_get_translation(anchor)
-        child = joint_child[j]
-        pose = body_q[child]
-        R_c = wp.transform_get_rotation(pose)
-        centre = wp.transform_point(pose, body_com[child])
-        if j == j0:
-            origin = centre
-        kind = joint_type[j]
-        free = kind == JointType.FREE or kind == JointType.DISTANCE
-        frame = t_a
-        if free:
-            frame = centre
-        q0 = joint_q_start[j]
-        d0 = joint_qd_start[j]
-        if kind == JointType.REVOLUTE:
-            _walk_column(walk_data, d0, wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, joint_axis[d0])))
-        elif kind == JointType.PRISMATIC:
-            _walk_column(walk_data, d0, wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0]), wp.vec3(0.0)))
-        elif kind == JointType.BALL:
-            for k in range(3):
-                e = wp.vec3(0.0)
-                e[k] = 1.0
-                _walk_column(walk_data, d0 + k, wp.spatial_vector(wp.vec3(0.0), wp.quat_rotate(R_a, e)))
-        elif free:
-            for k in range(3):
-                e = wp.vec3(0.0)
-                e[k] = 1.0
-                w = wp.quat_rotate(R_a, e)
-                _walk_column(walk_data, d0 + k, wp.spatial_vector(w, wp.vec3(0.0)))
-                # The factor turns a free joint about the articulation's origin: the same twist at the body's frame.
-                _walk_column(walk_data, d0 + 3 + k, wp.spatial_vector(wp.cross(w, frame - origin), w))
-        elif kind == JointType.D6:
-            lin = joint_dof_dim[j, 0]
-            ang = joint_dof_dim[j, 1]
-            slide = wp.vec3(0.0)
-            for k in range(lin):
-                _walk_column(
-                    walk_data, d0 + k, wp.spatial_vector(wp.quat_rotate(R_a, joint_axis[d0 + k]), wp.vec3(0.0))
-                )
-                slide += joint_axis[d0 + k] * joint_q[q0 + k]
-            turned = wp.quat_identity()
-            for k in range(ang):
-                axis = wp.quat_rotate(turned, joint_axis[d0 + lin + k])
-                w = wp.quat_rotate(R_a, axis)
-                # A turn about the pivot the slides moved, at the anchor: v = (R_a slide) x w.
-                _walk_column(walk_data, d0 + lin + k, wp.spatial_vector(wp.cross(wp.quat_rotate(R_a, slide), w), w))
-                turned = wp.quat_from_axis_angle(axis, joint_q[q0 + lin + k]) * turned
-        r = centre - frame
-        X = wp.skew(r)
-        m = body_mass[child]
-        R = wp.quat_to_matrix(R_c)
-        rotational = R * body_inertia[child] * wp.transpose(R) - m * X * X
-        inertia = wp.spatial_matrix()
-        for a in range(3):
-            inertia[a, a] = m
-            for c in range(3):
-                inertia[a, 3 + c] = -m * X[a, c]
-                inertia[3 + a, c] = m * X[a, c]
-                inertia[3 + a, 3 + c] = rotational[a, c]
-        walk_inertia[j] = inertia
-        offset = wp.vec3(0.0)
-        if parent >= 0:
-            p = j0 + parent
-            offset = wp.vec3(walk_link[p, 4], walk_link[p, 5], walk_link[p, 6]) - frame
+        for dof in range(joint_qd_start[j], joint_qd_start[j + 1]):
+            for k in range(6):
+                walk_data[dof, k] = walk_now[dof, k]
         for k in range(3):
-            walk_link[j, k] = offset[k]
-            walk_link[j, 4 + k] = frame[k]
-    # A free rigid body keeps its 6x6 factor until the free bodies convert: its columns and frame give its rows' J.
-    if free_rigid[art] != 0:
-        return
+            walk_link[j, k] = walk_now_link[j, k]
+            walk_link[j, 4 + k] = walk_now_link[j, 4 + k]
+        if walk_join[j] != 0:
+            # A join gathers the lifted inertias of its children other than the next joint.
+            walk_inertia[j] = wp.spatial_matrix()
+    carry = wp.spatial_matrix()
     for jj in range(j1 - j0):
         jb = j1 - 1 - jj
-        held = walk_inertia[jb]
+        child = joint_child[jb]
+        pose = body_q[child]
+        frame = wp.vec3(walk_now_link[jb, 4], walk_now_link[jb, 5], walk_now_link[jb, 6])
+        X = wp.skew(wp.transform_point(pose, body_com[child]) - frame)
+        m = body_mass[child]
+        R = wp.quat_to_matrix(wp.transform_get_rotation(pose))
+        rotational = R * body_inertia[child] * wp.transpose(R) - m * X * X
+        held = carry
+        for a in range(3):
+            held[a, a] = held[a, a] + m
+            for c in range(3):
+                held[a, 3 + c] = held[a, 3 + c] - m * X[a, c]
+                held[3 + a, c] = held[3 + a, c] + m * X[a, c]
+                held[3 + a, 3 + c] = held[3 + a, 3 + c] + rotational[a, c]
+        if walk_join[jb] != 0:
+            held = held + walk_inertia[jb]
         for cc in range(joint_qd_start[jb + 1] - joint_qd_start[jb]):
             dof = joint_qd_start[jb + 1] - 1 - cc
             s = wp.spatial_vector(
-                walk_data[dof, 0],
-                walk_data[dof, 1],
-                walk_data[dof, 2],
-                walk_data[dof, 3],
-                walk_data[dof, 4],
-                walk_data[dof, 5],
+                walk_now[dof, 0],
+                walk_now[dof, 1],
+                walk_now[dof, 2],
+                walk_now[dof, 3],
+                walk_now[dof, 4],
+                walk_now[dof, 5],
             )
             Is = held * s
             own = wp.dot(s, Is)
@@ -2157,6 +2296,10 @@ def walk_refresh_kernel(
             walk_data[dof, 13] = pivot  # WALK_PIVOT
             held = held - wp.outer(ut, ut)
         up = walk_path[jb][0]
+        carry = wp.spatial_matrix()
         if up >= 0:
-            d = wp.vec3(walk_link[jb, 0], walk_link[jb, 1], walk_link[jb, 2])
-            walk_inertia[j0 + up] = walk_inertia[j0 + up] + _walk_lift(held, d)
+            lifted = _walk_lift(held, wp.vec3(walk_link[jb, 0], walk_link[jb, 1], walk_link[jb, 2]))
+            if j0 + up == jb - 1:
+                carry = lifted
+            else:
+                walk_inertia[j0 + up] = walk_inertia[j0 + up] + lifted

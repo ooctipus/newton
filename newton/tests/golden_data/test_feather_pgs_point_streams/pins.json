@@ -320,10 +320,11 @@
   "sweep_routes_tiers.parallel_kernel(64, 32, 18, '120', inkernel_response=(18, 0, 0, 0), min_rows=32, rows=48, sweeps=24)": "c0551b433ee2dce6519b3ff8ea0523ff09db2cdfc6ef4b609ca01d288cf042f5",
   "sweep_units.stage_slots": "a52b71e6d982987ed6fa26d1d74c96a302fccccd4dae06ce1673ef81540beaa9",
   "tree_factor.prepare_augmented_drives": "9c35f2b30d49952945d1557e05dc08002242cca9157290d434c198750b2a4288",
-  "tree_factor.walk_frame_kernel": "594d968f6e7ce0d444778d1dbc291c3d26964d9749a488f1278b03e658f3de52",
-  "tree_factor.walk_refresh_kernel": "1a4935ec120c2b85dbc65b8918e45819a334d3ae2293c07ac875a65bcb5a3426",
+  "tree_factor.walk_frame_kernel": "3eb340c7b4ef9ebbec69b48bd862123b4bb520dc05ec5f086d6a57abd91aa140",
+  "tree_factor.walk_geometry_kernel": "8b90b4d6c1f11c7cbe9fa69bd62e4c1e6d4c2b6a587349c6c9e15abd1de59a17",
+  "tree_factor.walk_refresh_kernel": "1e982e62832084e670eeebc40d8022ca3114992f6753477acead674d7f201574",
   "walk_rows.write_contact_units": "a848b487c0e4f265420e5f6142103850ca84d4b8822b76d943f8978d7047c2fb",
-  "walk_rows.write_walked_rows": "277fe8a80f2a774d5c018c2f4c0b3816cab8dcc3a95712ff110500d43536696c"
+  "walk_rows.write_walked_rows": "30376d59e47b666ec93d0ba2ffea28b7b981695c6a1b7134e7650e4348dfc211"
  },
  "warp": "1.17.0"
 }

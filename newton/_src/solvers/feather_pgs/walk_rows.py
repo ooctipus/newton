@@ -7,17 +7,19 @@ A dense row of the general placement (case K6) holds its unit source (:func:`.de
 producer records with the row's slot and records, in place of a Jacobian. After the row pass, the writer takes every
 row of a world on the world's lanes (:func:`write_walked_rows`):
 
-- **the seed**, from the row's law (:data:`.dense_rows.UNIT_CONTACT` and the other kinds): a contact row's wrench at
-  each of its bodies, ``(d, (p - o) x d)`` at the body's walk frame ``o`` (its spin row's ``(0, n)``), the second
-  body's negated; a link row's unit wrench at its two pieces' centres of mass, the shadow's negated; a joint limit's
-  and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
+- **the seed**, from the row's law (:data:`.dense_rows.UNIT_CONTACT` and the other kinds): a contact row's wrench on
+  each of its bodies, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (its spin row's ``(0, n)``),
+  the second body's negated; a link row's unit wrench at its two pieces' centres of mass, the shadow's negated; a joint
+  limit's and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
-  side's entries, two seeds on one tree adding where their paths meet. A free rigid body keeps its own 6x6 factor
+  side's entries, two seeds on one tree adding where their paths meet. A wrench enters as ``J`` at the step's frames
+  (:meth:`.tree_factor.TreeFactor.walk_geometry`) and the refresh's factor whitens it, so a step between refreshes
+  whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body keeps its own 6x6 factor
   (:func:`.response_builds_dense.whiten_six` of its six-coordinate ``J``), the frame of its free-body rows and its leave
   until the free bodies convert;
 - **the header**: the diagonal ``|z|^2 + cfm``, the incident velocity ``J v_hat`` (each seed's wrench against its body's
-  predicted twist, :meth:`.tree_factor.TreeFactor.twists`; a covector against ``v_hat``) and the rhs by the row law
-  (:func:`.kernels.row_bias`).
+  predicted twist at its frame, :meth:`.tree_factor.TreeFactor.twists`; a covector against ``v_hat``) and the rhs by
+  the row law (:func:`.kernels.row_bias`).
 
 No ``J`` is formed. The rows and the general sweep's leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``) share
 the walk's one frame (FL3_design §1.2).
@@ -68,7 +70,8 @@ def walk_wrench(
 ) -> float:
     """Walk a row's seed at ``body``, the wrench of ``sign`` along ``direction`` at ``point`` (a pure ``torque`` about
     it), into its side's entries of row ``slot``; return its part of the incident velocity, the wrench against the
-    body's predicted twist (a free rigid body's: its ``J`` against ``v_hat``). A body without response coordinates adds
+    body's predicted twist (a free rigid body's: its ``J`` against ``v_hat``). The wrench is taken at the body's frame at
+    the step's poses, where the walk's columns ``now`` hold the step's ``J``. A body without response coordinates adds
     nothing."""
     if body < 0 or art < 0:
         return 0.0
@@ -76,25 +79,25 @@ def walk_wrench(
         return 0.0
     j = walk.body_joint[body]
     j0 = walk.joint_start[art]
-    frame = wp.vec3(walk.link[j, 4], walk.link[j, 5], walk.link[j, 6])
     d = direction * sign
+    frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
     w = wp.spatial_vector(d, wp.cross(point - frame, d))
     if torque:
         w = wp.spatial_vector(wp.vec3(0.0), d)
     at = jacobian_row(support, 0, art, sides)
     if walk.free[art] != 0:
-        # A free rigid body's own 6x6 factor: its six coordinates' J, whitened; its incident J v_hat.
+        # A free rigid body's own 6x6 factor: its six coordinates' J at the step's poses, whitened; its incident J v_hat.
         d0 = walk.dof_start[art]
         J = _Vec6()
         incident = float(0.0)
         for c in range(6):
             column = wp.spatial_vector(
-                walk.data[d0 + c, 0],
-                walk.data[d0 + c, 1],
-                walk.data[d0 + c, 2],
-                walk.data[d0 + c, 3],
-                walk.data[d0 + c, 4],
-                walk.data[d0 + c, 5],
+                walk.now[d0 + c, 0],
+                walk.now[d0 + c, 1],
+                walk.now[d0 + c, 2],
+                walk.now[d0 + c, 3],
+                walk.now[d0 + c, 4],
+                walk.now[d0 + c, 5],
             )
             J[c] = wp.dot(column, w)
             incident += J[c] * v_hat[d0 + c]
