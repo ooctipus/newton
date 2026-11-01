@@ -341,7 +341,7 @@ class Recorder:
             owner.begin(state, solver.factor, velocity, DT, step == 0)
             self.snapshot(f"{tag}/{step}/begin", groups, extra())
             solver.factor.mass_update_mask.fill_(1)
-            refresh(solver)
+            refresh(solver.factor.mass_update_mask)
             owner.predict(state, solver.factor, control, velocity, DT)
             self.snapshot(f"{tag}/{step}/predict", groups, extra())
             solver.v_out.assign(solver.v_hat)
@@ -362,7 +362,7 @@ class Recorder:
             velocity = scaled if motion else state.joint_qd
             owner.begin(state, solver.factor, velocity, DT, False)
             solver.factor.mass_update_mask.fill_(1)
-            refresh(solver)
+            refresh(solver.factor.mass_update_mask)
             owner.predict(state, solver.factor, control, velocity, DT)
             solver.v_out.assign(solver.v_hat)
             owner.finish(state, solver.factor, output, DT, False)

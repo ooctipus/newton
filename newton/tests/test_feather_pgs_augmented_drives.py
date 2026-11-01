@@ -9,6 +9,8 @@ import warp as wp
 
 import newton
 from newton._src.sim.enums import JointType
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.solver_fields import DriveRows
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 
 
@@ -42,6 +44,20 @@ def _mixed_target_model(coord_layout, device):
     model.joint_target_kd.assign(kd)
     model.joint_effort_limit.fill_(100.0)
     return model, state, control, joints, dofs, coords, targets
+
+
+def _drive_rows(row_K, articulations, dofs, device):
+    """The arrays a prepare kernel writes around ``row_K``, with no last step and no drive at its limit yet."""
+    return field_group.upload(
+        DriveRows,
+        device,
+        row_K=row_K,
+        row_u0=wp.zeros_like(row_K),
+        row_dv=wp.zeros_like(row_K),
+        mass_update_requested=wp.zeros(articulations, dtype=int, device=device),
+        v_out=wp.zeros(dofs, dtype=float, device=device),
+        v_hat=wp.zeros(dofs, dtype=float, device=device),
+    )
 
 
 class TestFeatherPGSAugmentedDrives(unittest.TestCase):
@@ -109,9 +125,10 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         control.joint_target_qd,
                         model.joint_effort_limit,
                         wp.zeros(model.joint_dof_count, dtype=float, device=device),
+                        max_dofs,
                         dt,
                     ],
-                    outputs=[row_K, tau],
+                    outputs=[_drive_rows(row_K, model.articulation_count, model.joint_dof_count, device), tau],
                     device=device,
                 )
                 np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
@@ -133,8 +150,22 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             wp.launch(
                 prepare_augmented_drives,
                 dim=2,
-                inputs=[rows, rows, rows, joint_q, joint_qd, ke, kd, target_q, target_qd, effort_limit, damping, 0.1],
-                outputs=[stiffness, tau],
+                inputs=[
+                    rows,
+                    rows,
+                    rows,
+                    joint_q,
+                    joint_qd,
+                    ke,
+                    kd,
+                    target_q,
+                    target_qd,
+                    effort_limit,
+                    damping,
+                    2,
+                    0.1,
+                ],
+                outputs=[_drive_rows(stiffness, 1, 2, device), tau],
                 device=device,
             )
 

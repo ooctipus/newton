@@ -71,7 +71,13 @@ from .row_laws import (
     velocity_limit_active,
 )
 from .solver_fields import Links, LocalOwners, Mimics
-from .spatial_laws import free_root_transport
+from .spatial_laws import (
+    drive_step_force,
+    free_drive_force,
+    free_root_transport,
+    limited_drive_force,
+    spring_damper_stiffness,
+)
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 # Type 1 was the PhysX drive row; drives fold into the mass matrix.
@@ -833,6 +839,50 @@ def pack_contact_linear_force_as_spatial(
     )
 
 
+@wp.kernel(enable_backward=False)
+def saturate_drive_rows(
+    rows: wp.array[int],
+    max_dofs: int,
+    row_dof_index: wp.array[int],
+    row_u0: wp.array[float],
+    row_H: wp.array[float],
+    row_dv: wp.array[float],
+    joint_qdd: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    passive_damping: wp.array[float],
+    dt: float,
+    # outputs
+    row_K: wp.array[float],
+    tau: wp.array[float],
+    drive_factor_mask: wp.array[int],
+    drive_solve_mask: wp.array[int],
+):
+    """Read the trial solve (:func:`.spatial_laws.drive_step_force`): a drive past its limit becomes the constant
+    ``+-limit`` with no ``K``, which marks its articulation for a new factor, and a drive within it takes back what its
+    limit held off (:func:`.spatial_laws.free_drive_force`). Either marks the articulation for a new solve."""
+    row = rows[wp.tid()]
+    articulation = row // max_dofs
+    dof = row_dof_index[row]
+    limit = joint_effort_limit[dof]
+    passive = spring_damper_stiffness(0.0, passive_damping[dof], 0.0, dt)
+    K = row_K[row] - passive
+    if K <= 0.0 or limit <= 0.0:
+        return
+    u0 = row_u0[row]
+    limited = limited_drive_force(u0, limit)
+    qdd = joint_qdd[dof]
+    inertia = row_H[row] + passive
+    force = drive_step_force(u0, limited, K, qdd, inertia)
+    if wp.abs(force) > limit:
+        row_K[row] = passive
+        tau[dof] = tau[dof] - limited + wp.sign(force) * limit
+        drive_factor_mask[articulation] = 1
+        drive_solve_mask[articulation] = 1
+    elif u0 != limited:
+        tau[dof] = tau[dof] - limited + free_drive_force(u0, limited, K, qdd, row_dv[row] / dt, inertia, limit)
+        drive_solve_mask[articulation] = 1
+
+
 @wp.kernel
 def clear_grouped_jacobian_active_rows(
     group_to_art: wp.array[int],
@@ -868,15 +918,23 @@ def clear_grouped_jacobian_active_rows(
 @wp.kernel
 def build_mass_update_mask(
     global_flag: int,
+    # in/out
     mass_update_requested: wp.array[int],
     # outputs
     mass_update_mask: wp.array[int],
+    drive_solve_mask: wp.array[int],
+    drive_factor_mask: wp.array[int],
 ):
+    """Consume the requests into a step's mask and clear the drives' masks: a request left set changes the factor cadence
+    on subsequent captured steps."""
     tid = wp.tid()
     flag = 1 if global_flag != 0 else 0
     if mass_update_requested[tid] != 0:
         flag = 1
     mass_update_mask[tid] = flag
+    mass_update_requested[tid] = 0
+    drive_solve_mask[tid] = 0
+    drive_factor_mask[tid] = 0
 
 
 # =============================================================================

@@ -163,7 +163,7 @@ class TestMixedTreeCache(unittest.TestCase):
                         lower[index] = np.linalg.cholesky(block + np.diag(solver.factor.R_by_size[n].numpy()[index]))
                         solver.factor.L_by_size[n].assign(lower)
             solver.factor.mass_update_mask.fill_(1)
-            owner.refresh(solver.factor)
+            owner.refresh(solver.factor.mass_update_mask)
             held = {
                 group.layout.dofs: (
                     solver.factor.diagonal_inverse_mass.numpy().copy()
@@ -210,7 +210,7 @@ class TestMixedTreeCache(unittest.TestCase):
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
             solver.factor.mass_update_mask.zero_()
-            owner.refresh(solver.factor)
+            owner.refresh(solver.factor.mass_update_mask)
             for group in owner.groups:
                 value = (
                     solver.factor.diagonal_inverse_mass

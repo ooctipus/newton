@@ -17,7 +17,7 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field, FieldGroup
-from .spatial_laws import inertia_record
+from .spatial_laws import FACTOR_REQUEST, inertia_record, limited_drive_force
 
 ROW_SLOT_UNBOUNDED = 2**31 - 1
 """First rejected slot of a row family that rejected none this step."""
@@ -42,7 +42,11 @@ STAGE3_SNAPSHOTS = FieldGroup(
 
 ARTICULATION_WORK = FieldGroup(
     Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
+    Field("drive_factor_mask", wp.int32, ("articulation",), owner="factor"),
+    Field("drive_solve_mask", wp.int32, ("articulation",), owner="factor"),
 )
+"""A step's masks (:func:`.kernels.build_mass_update_mask`): the articulations whose factor refreshes, and those the drives'
+decision gives a new solve and a new factor."""
 
 BODY_INERTIA = FieldGroup(
     Field("body_X_com", wp.transform, ("body",), fill=None, owner="factor"),
@@ -57,8 +61,41 @@ AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_counts", wp.int32, ("articulation",), owner="factor"),
     Field("aug_row_dof_index", wp.int32, ("drive_row",), owner="factor"),
     Field("aug_row_K", wp.float32, ("drive_row",), owner="factor"),
+    Field("aug_row_H", wp.float32, ("drive_row",), owner="factor"),
+    Field("aug_row_u0", wp.float32, ("drive_row",), owner="factor"),
+    Field("aug_row_dv", wp.float32, ("drive_row",), owner="factor"),
 )
-"""Augmented drive rows, ``max_dofs`` per articulation."""
+"""Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, the ``H_ii`` (armature in, ``K`` out) its factor
+last refreshed from, its unlimited ``u0`` and what last step's rows did to its coordinate, which the step's saturation
+decision reads (:func:`.kernels.saturate_drive_rows`)."""
+
+DRIVE_ROWS = (
+    Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
+    Field("row_u0", wp.float32, ("drive_row",), owner="factor", attr="aug_row_u0"),
+    Field("row_dv", wp.float32, ("drive_row",), owner="factor", attr="aug_row_dv"),
+    Field("mass_update_requested", wp.int32, ("articulation",), owner="factor"),
+    Field("v_out", wp.float32, ("dof",), owner="step"),
+    Field("v_hat", wp.float32, ("dof",), owner="step"),
+)
+"""What a step's drives write on their rows, and last step's velocities (:func:`hold_drive_row`)."""
+
+DriveRows = field_group.struct("DriveRows", DRIVE_ROWS, __name__)
+
+
+@wp.func
+def hold_drive_row(rows: DriveRows, row: int, articulation: int, dof: int, u0: float, K: float, limit: float) -> float:
+    """Hold a drive's ``u0`` and ``K`` on its row and return the limited force the trial solves with. A ``K`` the factor
+    does not hold, a drive that left saturation last step among them, requests the articulation's factor refresh. Only a
+    drive with an excess reads ``row_dv``, last step's ``v_out - v_hat``, what its rows did to the coordinate.
+    """
+    if rows.row_K[row] != K:
+        rows.row_K[row] = K
+        rows.mass_update_requested[articulation] = rows.mass_update_requested[articulation] | FACTOR_REQUEST
+    rows.row_u0[row] = u0
+    limited = limited_drive_force(u0, limit)
+    if limited != u0:
+        rows.row_dv[row] = rows.v_out[dof] - rows.v_hat[dof]
+    return limited
 
 STATE_AUX = FieldGroup(
     Field("joint_qdd", wp.float32, ("dof",), owner="factor"),

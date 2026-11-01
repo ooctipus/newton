@@ -624,13 +624,14 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             wp.copy(inputs[len(launches)], joint_qd)
             launches.append(prescaled_joint_qd)
 
-        def recording_predict(state, augmented, step_control, velocity, dt):
-            # Each substep predicts once, after its own prescale, from the prescaled velocity.
-            self.assertEqual(len(predicted), len(launches) - 1)
+        def recording_predict(state, augmented, step_control, velocity, dt, *, second_solve=False):
+            # Each substep predicts after its own prescale, from the prescaled velocity; the drives' second solve reads it too.
             self.assertIs(velocity, launches[-1])
-            wp.copy(consumed[len(predicted)], velocity)
-            predicted.append(velocity)
-            predict(state, augmented, step_control, velocity, dt)
+            if not second_solve:
+                self.assertEqual(len(predicted), len(launches) - 1)
+                wp.copy(consumed[len(predicted)], velocity)
+                predicted.append(velocity)
+            predict(state, augmented, step_control, velocity, dt, second_solve=second_solve)
 
         solver.factor.prescale_velocity = recording_launch
         solver.factor.held.predict = recording_predict

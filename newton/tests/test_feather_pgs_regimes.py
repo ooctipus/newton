@@ -197,7 +197,6 @@ class TestQ01Drive(unittest.TestCase):
         _q, v, (_rq, rv) = self._drive(1.0e-2, effort=1.0)
         self.assertAlmostEqual(v, rv, delta=0.02 * abs(rv))
 
-    @known_failure("PH1c", "only u0 clamps, K stays in the factor: a saturated joint accelerates at limit / (I + K)")
     def test_saturated_stiff(self):
         """A stiff saturated drive accelerates at ``limit / I``."""
         speeds = {ratio: (self._drive(ratio, effort=1.0)[1], self._drive(ratio, effort=1.0)[2][1]) for ratio in RATIOS}

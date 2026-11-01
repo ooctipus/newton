@@ -407,7 +407,7 @@ class TreeKineticState:
             twists=self._predicts_twists,
         )
 
-    def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
+    def _force_input(self, state_in, state_aug, control, predictor_qd, dt, second_solve):
         """Bind the predictor's inputs (tree_kinetic_state.FORCE_INPUT) for one step."""
         from .tree_kinetic_state import ForceInput  # noqa: PLC0415
 
@@ -428,6 +428,7 @@ class TreeKineticState:
             stage_clocks=cached_state_binding.stage_clocks(solver),
             predicted_twist=self._no_twists if twists is None else twists,
             publish_twists=int(self.publishes_twists and consumer is not None and consumer.published),
+            second_solve=int(second_solve),
         )
 
     def _dimensions(self):
@@ -693,15 +694,16 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic motion velocity overlaps state coordinates or response outputs")
         return state.joint_q.ptr, raw.ptr, velocity.ptr
 
-    def predict(self, state_in, state_aug, control, stage3_qd, dt):
-        """Apply live force buckets through held W with original root transport."""
+    def predict(self, state_in, state_aug, control, stage3_qd, dt, *, second_solve=False):
+        """Apply live force buckets through held W with original root transport; a ``second_solve`` only for the
+        articulations the drive solve mask selects."""
 
         self._validate_call(state_in, state_aug, dt)
         binding = self._validate_motion(state_in, state_aug, stage3_qd)
         if self.motion_velocity and binding != self._motion_binding:
             raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
-        force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
+        force = self._force_input(state_in, state_aug, control, stage3_qd, dt, second_solve)
         wp.launch_tiled(
             self.predictor_kernel,
             dim=[self.launch_count],

@@ -530,6 +530,13 @@ def coordinate_force(
     return -wp.dot(motion, wrench) + force + passive
 
 
+GEOMETRY_REQUEST = wp.constant(1)
+"""A ``mass_update_requested`` bit: the articulation's mass and factor are stale."""
+FACTOR_REQUEST = wp.constant(2)
+"""A ``mass_update_requested`` bit: only its ``K`` changed, so its factor is stale and its geometry is not. The drives set
+it while the held tree's repair reads the other bit on another stream, so a repair never races a saturation change."""
+
+
 @wp.func
 def spring_damper_stiffness(stiffness: float, damping: float, theta: float, dt: float) -> float:
     """Return the ``K = theta k dt^2 + c dt`` a spring and damper add to their coordinate's mass.
@@ -559,12 +566,54 @@ def drive_stiffness(ke: float, kd: float, damping: float, dt: float) -> float:
 
 
 @wp.func
-def drive_force(
-    ke: float, kd: float, q: float, qd: float, q_target: float, qd_target: float, effort_limit: float, dt: float
-) -> float:
-    """Return an augmented drive's explicit force (:func:`spring_damper_force` at ``theta = 1``), clamped to a
-    positive effort limit (the actuator's force range)."""
-    u0 = spring_damper_force(ke, kd, q, qd, q_target, qd_target, 1.0, dt)
+def drive_force(ke: float, kd: float, q: float, qd: float, q_target: float, qd_target: float, dt: float) -> float:
+    """Return an augmented drive's explicit force (:func:`spring_damper_force` at ``theta = 1``), not limited:
+    :func:`drive_step_force` reads the step."""
+    return spring_damper_force(ke, kd, q, qd, q_target, qd_target, 1.0, dt)
+
+
+@wp.func
+def limited_drive_force(u0: float, effort_limit: float) -> float:
+    """Return ``u0`` clamped to a positive effort limit (the actuator's force range), the force the trial solve holds."""
     if effort_limit > 0.0:
-        u0 = wp.clamp(u0, -effort_limit, effort_limit)
+        return wp.clamp(u0, -effort_limit, effort_limit)
     return u0
+
+
+@wp.func
+def drive_step_force(u0: float, limited: float, K: float, qdd: float, inertia: float) -> float:
+    """Return a drive's force on its step, read from a trial solve with every ``K`` in the mass and every force limited.
+
+    An effort limit makes the drive's energy Huber, not quadratic: ``K`` belongs in the mass only while the drive is
+    below its limit, and a saturated drive is a constant force, so the joint accelerates at ``limit / I``, not
+    ``limit / (I + K)``. Past the limit the drive holds no ``K`` and pushes ``+-limit``; the decision is one step.
+
+    The trial is the coupled step: its ``limited - K qdd`` holds the other drives, ``C``, gravity and ``joint_f``, with no
+    drive pushing past what it can. What a drive feels of them is the tree's, not ``H_ii``'s: ``1 / (A^-1)_ii`` falls far
+    below ``H_ii`` where two axes align. Its own excess ``u0 - limited`` adds ``I / (I + K)`` of itself, ``inertia`` being
+    ``I``, which is what the excess alone would add on one coordinate. So on one coordinate, under any other force,
+    this is the exact step's force, and it decides what the limit decides: a stiff drive on a light joint keeps its ``K``
+    at every ``u0`` it meets. Solving with every ``u0`` unlimited instead would charge each drive with its neighbours'
+    forces past their limits, and saturate the free joint beside a saturated one.
+    """
+    return limited - K * qdd + (u0 - limited) * inertia / (inertia + K)
+
+
+@wp.func
+def free_drive_force(
+    u0: float, limited: float, K: float, qdd: float, rows_qdd: float, inertia: float, effort_limit: float
+) -> float:
+    """Return the force of a drive that :func:`drive_step_force` left below its limit, for the solve that follows.
+
+    The excess ``u0 - limited`` is what the exact step asks of a free joint, but the trial solves no rows, and a joint
+    blocked by a contact or a limit moves nowhere: its force is its whole ``u0``. So the excess comes back only as far as
+    it stays within the limit on the step as last step's rows left it, ``qdd + rows_qdd``. With no rows that is all of it,
+    the exact step. Blocked, none: the trial's limited force and ``K`` hold the joint at its limit. ``K`` stays in the
+    mass either way, because taking it out on a lagged reading gives a light joint ``limit / I`` beside a contact that
+    has left, while a force within ``limited`` and ``u0`` costs at most the limited step. A row that arrives this step
+    is read on the next: the drive pushes ``u0`` against it for that one step.
+    """
+    excess = u0 - limited
+    side = wp.sign(excess)
+    room = wp.max(effort_limit - side * (limited - K * (qdd + rows_qdd)), 0.0)
+    return limited + side * wp.min(wp.abs(excess), room * (inertia + K) / inertia)

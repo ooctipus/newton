@@ -132,7 +132,7 @@ class TestTreeForestCache(unittest.TestCase):
                         block + np.diag(solver.factor.R_by_size[count].numpy()[group]), forces[art]
                     )
                 solver.factor.mass_update_mask.fill_(1)
-                operator.refresh(solver.factor)
+                operator.refresh(solver.factor.mass_update_mask)
                 response = force_response(owner, solver, state, control, velocity, dt)
                 np.testing.assert_allclose(response.reshape(arts, count), expected, atol=4e-5, rtol=4e-4)
                 held = operator.data.W.numpy().copy()
@@ -203,7 +203,7 @@ class TestTreeForestCache(unittest.TestCase):
                     )
                     np.testing.assert_array_equal(owner.data.current_valid.numpy(), 1)
                 solver.factor.mass_update_mask.zero_()
-                operator.refresh(solver.factor)
+                operator.refresh(solver.factor.mass_update_mask)
                 np.testing.assert_array_equal(operator.data.W.numpy(), held)
                 np.testing.assert_array_equal(state.joint_qd.numpy(), raw)
                 np.testing.assert_array_equal(owner.status.numpy(), 0)
@@ -249,7 +249,7 @@ class TestTreeForestCache(unittest.TestCase):
         solver.factor.joint_tau.zero_()
         owner.begin(state, solver.factor, state.joint_qd, native.DT, True)
         solver.factor.mass_update_mask.fill_(1)
-        operator.refresh(solver.factor)
+        operator.refresh(solver.factor.mass_update_mask)
         response = force_response(owner, solver, state, control, state.joint_qd, native.DT)
         regularization = np.empty(model.joint_dof_count)
         for group, art in enumerate(operator.plan.group_to_art.numpy()):

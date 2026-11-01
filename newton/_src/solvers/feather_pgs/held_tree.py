@@ -40,6 +40,7 @@ def _diagonal_geometry(
     armature: wp.array2d[float],
     drive_row: wp.array[int],
     drive_k: wp.array[float],
+    row_H: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
@@ -51,8 +52,10 @@ def _diagonal_geometry(
     dof = dof_start[art] + local
     mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
     row = drive_row[dof]
-    if row >= 0 and drive_k[row] > 0.0:
-        mass += drive_k[row]
+    if row >= 0:
+        row_H[row] = mass
+        if drive_k[row] > 0.0:
+            mass += drive_k[row]
     inverse[dof] = 1.0 / mass
 
 
@@ -242,7 +245,7 @@ class TreeSparseOperator:
         )
         self.kinetic_state = None
 
-    def refresh(self, state_aug):
+    def refresh(self, mask):
         """Read cached physical mass terms through the unchanged sparse factor."""
         s, n = self.solver, self.solver.placement.sparse_mass_matrix_size
         wp.launch(
@@ -250,12 +253,13 @@ class TreeSparseOperator:
             dim=s.forest.n_arts_by_size[n] * 32,
             inputs=[
                 s.forest.group_to_art[n],
-                s.factor.mass_update_mask,
+                mask,
                 s.forest.articulation_dof_start,
                 self.kinetic_state.geometric,
                 s.factor.R_by_size[n],
                 s.factor.drive_row_by_dof,
                 s.factor.aug_row_K,
+                s.factor.aug_row_H,
                 s.factor.sparse_mass_matrix_indices,
             ],
             outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
@@ -302,7 +306,7 @@ class TreeHeldOperator:
         """The trees' factors: their range of the size group's."""
         return self.solver.factor.L_by_size[self.size][self.span[0] : self.span[1]]
 
-    def refresh(self, state_aug):
+    def refresh(self, mask):
         """Refresh only original requested factor groups from their current geometry."""
         solver, size = self.solver, self.size
         count = self.span[1] - self.span[0]
@@ -314,13 +318,14 @@ class TreeHeldOperator:
                 inputs=[
                     self.plan.group_to_art,
                     solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
+                    mask,
                     self.geometry_index,
                     self.geometry_group,
                     self.kinetic_state.geometric,
                     armature,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
+                    solver.factor.aug_row_H,
                     size,
                 ],
                 outputs=[solver.factor.diagonal_inverse_mass],
@@ -332,13 +337,14 @@ class TreeHeldOperator:
                 dim=count * 32,
                 inputs=[
                     solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
+                    mask,
                     self.plan.group_to_art,
                     self.geometry_group,
                     self.factor_plan,
                     armature,
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
+                    solver.factor.aug_row_H,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[self._lower],
@@ -386,7 +392,7 @@ class PrescribedRootOperator:
         self.data.inverse = solver._arrays.placeholder(wp.float32, (solver.model.joint_dof_count,))
         self.kinetic_state = None
 
-    def refresh(self, state_aug):
+    def refresh(self, mask):
         """Prescribed roots hold no factor; nothing to refresh."""
 
     def bind_response(self):
@@ -585,7 +591,7 @@ class ForestHeldOperator:
         self.data.factor_index = wp.array(factor_index, dtype=int, device=device)
         self.kinetic_state = None
 
-    def refresh(self, state_aug):
+    def refresh(self, mask):
         """Refresh every root family's dense factor from the forest geometry."""
         solver = self.solver
         for _r, family, kernel, factor_plan, geometry_index, geometry_group in self.families:
@@ -597,13 +603,14 @@ class ForestHeldOperator:
                     inputs=[
                         solver.forest.group_to_art[size],
                         solver.forest.articulation_dof_start,
-                        solver.factor.mass_update_mask,
+                        mask,
                         geometry_index,
                         geometry_group,
                         self.kinetic_state.geometric,
                         solver.factor.R_by_size[size],
                         solver.factor.drive_row_by_dof,
                         solver.factor.aug_row_K,
+                        solver.factor.aug_row_H,
                         size,
                     ],
                     outputs=[solver.factor.diagonal_inverse_mass],
@@ -615,13 +622,14 @@ class ForestHeldOperator:
                 dim=solver.forest.n_arts_by_size[family] * 32,
                 inputs=[
                     solver.forest.articulation_dof_start,
-                    solver.factor.mass_update_mask,
+                    mask,
                     solver.forest.group_to_art[family],
                     geometry_group,
                     factor_plan,
                     solver.factor.R_by_size[family],
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
+                    solver.factor.aug_row_H,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[solver.factor.L_by_size[family]],
@@ -797,16 +805,17 @@ class HeldTree:
         for group in self.groups:
             group.begin(state, augmented, velocity, dt, refresh, state_out=state_out)
 
-    def refresh(self, augmented):
-        """Preserve independent factor masks and numerical representations."""
+    def refresh(self, mask):
+        """Preserve independent numerical representations, refreshing the articulations ``mask`` selects."""
         for group in self.groups:
-            group.sparse.refresh(augmented)
+            group.sparse.refresh(mask)
 
-    def predict(self, state, augmented, control, velocity, dt):
-        """Project current forces and apply each original held response."""
+    def predict(self, state, augmented, control, velocity, dt, *, second_solve=False):
+        """Project current forces and apply each original held response; a ``second_solve`` only for the articulations
+        the drive solve mask selects."""
         for group in self.groups:
             group.sparse.bind_response()
-            group.predict(state, augmented, control, velocity, dt)
+            group.predict(state, augmented, control, velocity, dt, second_solve=second_solve)
 
     def finish(self, state, augmented, output, dt, refresh):
         """Integrate and publish each physical coordinate and body once."""

@@ -1123,7 +1123,7 @@ class SolverFeatherPGS(SolverBase):
 
         # Stages 1-3: the tree factor (FK/ID, drives, mass refresh, factor), then the predictor v_hat.
         stage3_qd, inverse_dynamics_ready = self.factor.factor(
-            state_in, control, state_out, dt, self._step, self.qd_work
+            state_in, control, state_out, dt, self._step, self.qd_work, self.v_hat, self.v_out
         )
         self.factor.predict(state_in, control, stage3_qd, inverse_dynamics_ready, dt, self.v_hat)
         if self._debug_stage3_snapshots:

@@ -2164,7 +2164,10 @@ _FACTOR_ASSEMBLY = """
         if (row == col) {
             value += R_group.data[group * $N + physical_row];
             const int drive = drive_row_by_dof.data[start + physical_row];
-            if (drive >= 0 && row_K.data[drive] > 0.0f) value += row_K.data[drive];
+            if (drive >= 0) {
+                row_H.data[drive] = value;
+                if (row_K.data[drive] > 0.0f) value += row_K.data[drive];
+            }
         }
         factor[entry] = value;
     }
@@ -2209,6 +2212,7 @@ def sparse_factor_kernel(dof_count: int, nonzero_count: int, *, warps_per_block:
             ("R_group", wp.array2d[float]),
             ("drive_row_by_dof", wp.array[int]),
             ("row_K", wp.array[float]),
+            ("row_H", wp.array[float]),
             ("indices", _SparseMassMatrixIndices),
             ("Linv_group", wp.array2d[float]),
             ("status", wp.array[int]),

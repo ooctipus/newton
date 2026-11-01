@@ -431,8 +431,8 @@ class _Pair:
         same(test, head_in.body_q, mine_in.body_q, self.bodies, f"{tag} input body_q")
         same(test, head.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
         same(test, head.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} input origin")
-        head.prepare_drives(head_in, self.controls["head"], DT)
-        held.refresh(head)
+        head.prepare_drives(head_in, self.controls["head"], DT, self.head.v_hat, self.head.v_out)
+        held.refresh(head.mass_update_mask)
         held.predict(head_in, head, self.controls["head"], head_in.joint_qd, DT)
         self.state.predict(mine_in, self.mine.factor, self.controls["mine"], mine_in.joint_qd, DT)
         self.check_inverse_mass(test, mine_in.joint_q.numpy(), tag)
@@ -542,7 +542,7 @@ def check_owner_launches(test, device):
                     owner.begin(state, solver.factor, state.joint_qd, DT, refresh)
                     owner.scalar.launch_other_drives(state, solver.factor, control, DT)
                     solver.factor.mass_update_mask.fill_(1)
-                    owner.refresh(solver.factor)
+                    owner.refresh(solver.factor.mass_update_mask)
                     owner.predict(state, solver.factor, control, state.joint_qd, DT)
                     solver.v_out.assign(solver.v_hat)
                     owner.finish(state, solver.factor, output, DT, refresh)
@@ -949,9 +949,10 @@ class TestScalarBranchKernels(unittest.TestCase):
                 control.joint_target_qd,
                 model.joint_effort_limit,
                 head.factor.passive_joint_damping,
+                head.forest.articulation_max_dofs,
                 DT,
             ],
-            outputs=[head.factor.aug_row_K, head.factor.joint_tau],
+            outputs=[head.factor.drive_rows(head.v_hat, head.v_out), head.factor.joint_tau],
             device=model.device,
         )
         pair.mine.factor.aug_row_K.fill_(-7.0)

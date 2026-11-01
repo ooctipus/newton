@@ -50,13 +50,18 @@ import warp as wp
 
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
+from .solver_fields import DriveRows, hold_drive_row
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
     drive_force,
+    drive_step_force,
     drive_stiffness,
+    free_drive_force,
     joint_frame_pose,
+    limited_drive_force,
     motion_axis,
+    spring_damper_stiffness,
     transform_compose,
     wrench_shift,
 )
@@ -115,31 +120,19 @@ def _drive_terms(
     joint_target_kd: wp.array[float],
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
-    joint_effort_limit: wp.array[float],
     damping: wp.array[float],
 ):
     """Explicit force ``u0`` and implicit stiffness ``K`` of a coordinate's augmented drive
-    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row and a
-    nonpositive ``K`` contribute neither."""
+    (:func:`.spatial_laws.drive_stiffness`, :func:`.spatial_laws.drive_force`): a coordinate without a row or with a
+    nonpositive ``K`` contributes neither."""
     u0 = float(0.0)
     stiffness = float(0.0)
     if drive_row_by_dof[dof] >= 0:
         ke = joint_target_ke[dof]
         kd = joint_target_kd[dof]
         K = drive_stiffness(ke, kd, damping[dof], dt)
-        if K <= 0.0:
-            stiffness = 0.0
-        else:
-            u0 = drive_force(
-                ke,
-                kd,
-                q,
-                qd,
-                joint_target_pos[drive_target_index_by_dof[dof]],
-                joint_target_vel[dof],
-                joint_effort_limit[dof],
-                dt,
-            )
+        if K > 0.0:
+            u0 = drive_force(ke, kd, q, qd, joint_target_pos[drive_target_index_by_dof[dof]], joint_target_vel[dof], dt)
             stiffness = K
     return u0, stiffness
 
@@ -263,8 +256,10 @@ def predict_prismatic_branches(
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
     dt: float,
+    v_out: wp.array[float],
     # in/out
     diagonal_inverse_mass: wp.array[float],
+    row_K: wp.array[float],
     # outputs
     joint_qdd: wp.array[float],
     v_hat: wp.array[float],
@@ -272,7 +267,8 @@ def predict_prismatic_branches(
     """Predict prismatic leaves: the force, the masked inverse-mass refresh, ``qdd`` and ``v_hat``.
 
     A prismatic motion axis has no angular part, so the gravity and external
-    moment arms drop out and the leaf's pose is not read.
+    moment arms drop out and the leaf's pose is not read. A leaf is one coordinate, so it decides saturation here
+    (:func:`.spatial_laws.drive_step_force`) with one more division: its ``K`` changing refreshes its own inverse mass.
     """
     element = wp.tid()
     group = element // n
@@ -288,6 +284,8 @@ def predict_prismatic_branches(
     body_force = -wp.spatial_vector(force, wp.vec3()) - _external_at_origin(child, wp.vec3(), body_f, body_flags)
     q = joint_q[joint_q_start[root_joint] + local]
     qd = joint_qd[dof]
+    linear = wp.spatial_top(motion)
+    leaf_inertia = mass * wp.dot(linear, linear) + armature[group, local]
     u0, stiffness = _drive_terms(
         dof,
         q,
@@ -299,22 +297,39 @@ def predict_prismatic_branches(
         joint_target_kd,
         joint_target_pos,
         joint_target_vel,
-        joint_effort_limit,
         damping,
     )
     value = _leaf_force(motion, body_force, dof, q, qd, joint_f, spring_stiffness, spring_ref, damping)
-    value += u0
+    refresh = mass_update_mask[art] != 0
+    row = drive_row_by_dof[dof]
+    if row >= 0:
+        if row_K[row] != stiffness:
+            refresh = True
     inverse = float(0.0)
-    if mass_update_mask[art] != 0:
-        linear = wp.spatial_top(motion)
-        diagonal = mass * wp.dot(linear, linear) + armature[group, local]
-        if stiffness > 0.0:
-            diagonal += stiffness
-        inverse = 1.0 / diagonal
-        diagonal_inverse_mass[dof] = inverse
+    if refresh:
+        inverse = 1.0 / (leaf_inertia + stiffness)
     else:
         inverse = diagonal_inverse_mass[dof]
-    qdd = value * inverse
+    passive = spring_damper_stiffness(0.0, damping[dof], 0.0, dt)
+    drive = stiffness - passive
+    limit = joint_effort_limit[dof]
+    if drive > 0.0 and limit > 0.0:
+        limited = limited_drive_force(u0, limit)
+        trial = (value + limited) * inverse
+        step_force = drive_step_force(u0, limited, drive, trial, leaf_inertia + passive)
+        if wp.abs(step_force) > limit:
+            u0 = wp.sign(step_force) * limit
+            stiffness = passive
+            inverse = 1.0 / (leaf_inertia + stiffness)
+            refresh = True
+        elif u0 != limited:
+            rows = (v_out[dof] - v_hat[dof]) / dt
+            u0 = free_drive_force(u0, limited, drive, trial, rows, leaf_inertia + passive, limit)
+    if refresh:
+        diagonal_inverse_mass[dof] = inverse
+    if row >= 0:
+        row_K[row] = stiffness
+    qdd = (value + u0) * inverse
     if kinematic_dof_mask[dof] != 0:
         qdd = 0.0
     joint_qdd[dof] = qdd
@@ -404,9 +419,10 @@ def prepare_listed_augmented_drives(
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
     damping: wp.array[float],
+    max_dofs: int,
     dt: float,
     # outputs
-    row_K: wp.array[float],
+    rows: DriveRows,
     drive_tau: wp.array[float],
 ):
     """``tree_factor.prepare_augmented_drives`` over listed DOFs: those whose drives no branch predict folds."""
@@ -426,11 +442,9 @@ def prepare_listed_augmented_drives(
         joint_target_kd,
         joint_target_pos,
         joint_target_vel,
-        joint_effort_limit,
         damping,
     )
-    row_K[row] = stiffness
-    drive_tau[dof] = u0
+    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, stiffness, joint_effort_limit[dof])
 
 
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
@@ -728,21 +742,24 @@ class ScalarBranchState:
                 control.joint_target_qd,
                 model.joint_effort_limit,
                 solver.factor.passive_joint_damping,
+                solver.forest.articulation_max_dofs,
                 dt,
             ],
-            outputs=[solver.factor.aug_row_K, state_aug.joint_tau],
+            outputs=[solver.factor.drive_rows(solver.v_hat, solver.v_out), state_aug.joint_tau],
             block_dim=256,
             device=model.device,
         )
 
-    def refresh(self, state_aug):
+    def refresh(self, mask):
         """Nothing to do here: ``predict`` refreshes the inverse masses the mass mask selects."""
 
     def bind_response(self):
         """The inverse diagonal is the solver's and never rebinds."""
 
-    def predict(self, state_in, state_aug, control, stage3_qd, dt):
-        """Form each leaf's force and refresh, solve and predict its coordinate."""
+    def predict(self, state_in, state_aug, control, stage3_qd, dt, *, second_solve=False):
+        """Form each leaf's force and refresh, solve and predict its coordinate: once, a leaf's decision is its own."""
+        if second_solve:
+            return
         self._validate_call(state_in, state_aug, dt)
         solver, model = self.solver, self.solver.model
         inputs = [
@@ -778,7 +795,9 @@ class ScalarBranchState:
             control.joint_target_qd,
             model.joint_effort_limit,
             dt,
+            solver.v_out,
             solver.factor.diagonal_inverse_mass,
+            solver.factor.aug_row_K,
         ]
         wp.launch(
             self.predictor_kernel,

@@ -83,6 +83,7 @@ $STAGING
             value += R_group.data[group * n + physical];
             const int drive_row = drive_row_by_dof.data[dof_start + physical];
             if (drive_row >= 0) {
+                row_H.data[drive_row] = value;
                 const float K = row_K.data[drive_row];
                 if (K > 0.0f) value += K;
             }
@@ -196,6 +197,7 @@ def dense_factor_kernel(size: int) -> wp.Kernel:
         ("R_group", wp.array2d[float]),
         ("drive_row_by_dof", wp.array[int]),
         ("row_K", wp.array[float]),
+        ("row_H", wp.array[float]),
         ("geometric", wp.array2d[float]),
         ("L_group", wp.array3d[float]),
     )

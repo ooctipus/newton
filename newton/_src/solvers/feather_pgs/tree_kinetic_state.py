@@ -18,6 +18,7 @@ from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
 from .spatial_laws import (
+    GEOMETRY_REQUEST,
     INERTIA_CHANNELS,
     SPATIAL,
     body_wrench,
@@ -120,9 +121,12 @@ FORCE_INPUT = (
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
     Field("predicted_twist", wp.spatial_vector, ("body",), owner="step"),
     Field("publish_twists", wp.int32, owner="step"),
+    Field("drive_solve_mask", wp.int32, ("articulation",), owner="factor"),
+    Field("second_solve", wp.int32, owner="step"),
 )
 """The held-tree predictor's inputs: the step's state and control, the solver's passive and kinematic tables, the
-augmented state it writes, and the step's values."""
+augmented state it writes, and the step's values. A ``second_solve`` repeats the groups of the articulations
+``drive_solve_mask`` selects."""
 
 ForceInput = field_group.struct("ForceInput", FORCE_INPUT, __name__)
 
@@ -590,6 +594,7 @@ _FORCE = cached_force.ForceOperands(
 _PREDICT = r"""    $PHYSICAL_TABLE
 
     const int art=p.group_to_art.data[group];
+    $SECOND_SOLVE
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
@@ -1009,10 +1014,10 @@ def get_state_kernel(
             for root in range(1, wp.static(roots)):
                 valid = wp.min(valid, cache.current_valid[plan.arts[g.group, root]])
         if not wp.static(finish):
-            refresh = int(refresh != 0 or requests[g.art] != 0)
+            refresh = int(refresh != 0 or (requests[g.art] & GEOMETRY_REQUEST) != 0)
             if wp.static(forest):
                 for root in range(1, wp.static(roots)):
-                    refresh = int(refresh != 0 or requests[plan.arts[g.group, root]] != 0)
+                    refresh = int(refresh != 0 or (requests[plan.arts[g.group, root]] & GEOMETRY_REQUEST) != 0)
             source_matches = _same_source(cache, g.group, data.joint_q, data.joint_qd)
             if wp.static(banked):
                 rebind = int(0)
@@ -1424,11 +1429,11 @@ def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int =
         group = block * wp.static(pack) + lanes[2]
         art = p.group_to_art[group]
         valid = cache.current_valid[art]
-        refresh = int(global_refresh != 0 or requests[art] != 0)
+        refresh = int(global_refresh != 0 or (requests[art] & GEOMETRY_REQUEST) != 0)
         if wp.static(forest):
             for root in range(1, wp.static(roots)):
                 valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-                refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
+                refresh = int(refresh != 0 or (requests[plan.arts[group, root]] & GEOMETRY_REQUEST) != 0)
         current = int(valid != 0)
         if current != 0 and refresh != 0:
             current = int(
@@ -1509,11 +1514,11 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
             group = block * wp.static(pack) + sub
             art = p.group_to_art[group]
             valid = cache.current_valid[art]
-            refresh = int(global_refresh != 0 or requests[art] != 0)
+            refresh = int(global_refresh != 0 or (requests[art] & GEOMETRY_REQUEST) != 0)
             if wp.static(forest):
                 for root in range(1, wp.static(roots)):
                     valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-                    refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
+                    refresh = int(refresh != 0 or (requests[plan.arts[group, root]] & GEOMETRY_REQUEST) != 0)
             current = int(valid != 0)
             if current != 0 and refresh != 0:
                 current = int(
@@ -1566,8 +1571,15 @@ def get_predictor_kernel(
             "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
         ),
     )
+    roots = len(layout.roots)
     operations = {
         "PHYSICAL_TABLE": layout.physical_table(),
+        "SECOND_SOLVE": (
+            "if(f.second_solve!=0&&f.drive_solve_mask.data[art]==0)return;"
+            if not layout.forest
+            else f"if(f.second_solve!=0){{int changed=0;for(int r=0;r<{roots};++r)"
+            f"changed|=f.drive_solve_mask.data[plan.arts.data[group*{roots}+r]];if(changed==0)return;}}"
+        ),
         "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
         "SHIFT": cached_force.shift_wrench(
             "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
@@ -1614,7 +1626,6 @@ def get_predictor_kernel(
         # CPU twin keep the serial one-lane law. A prescribed root (family 0)
         # responds with zero and a diagonal-mass root (negative family) with
         # its stored inverse.
-        roots = len(layout.roots)
         if not layout.forest:
             families = [(0, layout.dofs, f"d.lower.data+group*{layout.dofs**2}", layout.dofs)]
         else:

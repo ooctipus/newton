@@ -65,6 +65,7 @@ class TestDenseFactor(unittest.TestCase):
                 array(regularizer),
                 array(drive, int),
                 array(drive_k),
+                array(np.zeros_like(drive_k)),
                 array(geometric),
             ],
             outputs=[output],

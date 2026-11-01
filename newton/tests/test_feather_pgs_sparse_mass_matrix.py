@@ -188,6 +188,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             array(regularizer, float),
             array(drive_map, int),
             array(stiffness, float),
+            array(np.zeros(2 * n, dtype=np.float32), float),
             factor_indices(plan, device),
         ]
         wp.launch(

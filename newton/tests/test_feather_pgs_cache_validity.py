@@ -1546,7 +1546,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                         state, output, velocity = states[source], states[1 - source], velocities[source]
                         owner.begin(state, solver.factor, velocity, DT, refresh)
                         solver.factor.mass_update_mask.fill_(1)
-                        owner.refresh(solver.factor)
+                        owner.refresh(solver.factor.mass_update_mask)
                         owner.predict(state, solver.factor, control, velocity, DT)
                         solver.v_out.assign(solver.v_hat)
                         owner.finish(state, solver.factor, output, DT, refresh)
