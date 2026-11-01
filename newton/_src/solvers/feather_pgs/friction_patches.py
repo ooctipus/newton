@@ -207,6 +207,24 @@ def _local_point(q: wp.array[wp.transform], body: int, point: wp.vec3):
 
 
 @wp.func
+def _surface_gap(q: wp.array[wp.transform], a: int, point_a: wp.vec3, b: int, point_b: wp.vec3, normal: wp.vec3):
+    """The gap along ``normal`` between two points held in their bodies' frames (a static shape's in world
+    coordinates), formed as :func:`.contact_laws.contact_points` forms a contact's: translations apart from the rotated
+    points, so it carries no rounding of world points."""
+    translation_a = point_a
+    offset_a = wp.vec3(0.0)
+    translation_b = point_b
+    offset_b = wp.vec3(0.0)
+    if a >= 0:
+        translation_a = wp.transform_get_translation(q[a])
+        offset_a = wp.quat_rotate(wp.transform_get_rotation(q[a]), point_a)
+    if b >= 0:
+        translation_b = wp.transform_get_translation(q[b])
+        offset_b = wp.quat_rotate(wp.transform_get_rotation(q[b]), point_b)
+    return wp.dot(normal, (translation_a - translation_b) + (offset_a - offset_b))
+
+
+@wp.func
 def _local_surface(q: wp.array[wp.transform], body: int, translation: wp.vec3, offset: wp.vec3):
     """A contact's surface point, ``translation + offset`` (:func:`.contact_laws.contact_points`), in its body's frame
     (a static shape's in world coordinates): the offset rotated back, which carries no rounding of the translation."""
@@ -771,7 +789,7 @@ def _build_pair(
             r = frame.radius[c]
             surface_a = frame.surface_a[c]
             surface_b = frame.surface_b[c]
-            current_gap = wp.dot(_world_point(q, a, surface_a) - _world_point(q, b, surface_b), n)
+            current_gap = _surface_gap(q, a, surface_a, b, surface_b, n)
             chosen = int(-1)
             nearest = float(1.0e30)
             motion = wp.vec3(0.0)
@@ -796,13 +814,12 @@ def _build_pair(
                     continue
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
-                delta = pa - pb
                 offset = 0.5 * (pa + pb) - location
                 distance = wp.length_sq(offset)
                 if not (
                     distance < nearest
                     and distance <= 4.0 * r * r
-                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
+                    and wp.abs(_surface_gap(q, a, prev.anchor_a[p], b, prev.anchor_b[p], n)) <= 0.1 * r
                     and wp.abs(wp.dot(offset, n)) <= 0.05 * r
                 ):
                     continue
@@ -810,7 +827,7 @@ def _build_pair(
                 # valid speculative contacts during a squeeze. Surface
                 # witnesses retain penetration during decompression and
                 # reject rocking beyond the same envelope as fresh contacts.
-                support_gap = wp.dot(_world_point(q, a, prev.surface_a[p]) - _world_point(q, b, prev.surface_b[p]), n)
+                support_gap = _surface_gap(q, a, prev.surface_a[p], b, prev.surface_b[p], n)
                 if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
                     continue
                 error = _carried_displacement(q, prev, p, n)
@@ -863,9 +880,7 @@ def _build_pair(
                         other_normal = prev.normal[partner]
                         if a >= 0:
                             other_normal = wp.transform_vector(q[a], other_normal)
-                        other_gap = wp.dot(
-                            _world_point(q, a, prev.surface_a[partner]) - _world_point(q, b, prev.surface_b[partner]), n
-                        )
+                        other_gap = _surface_gap(q, a, prev.surface_a[partner], b, prev.surface_b[partner], n)
                         if (
                             wp.dot(other_normal, n) < 0.995
                             or other_gap > wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r

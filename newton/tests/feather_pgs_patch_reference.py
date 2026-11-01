@@ -14,8 +14,9 @@ multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported. ``_build``
 follows the builder's current anchor choice (the canonical farthest pair, the
 footprint tolerance, the support-edge members and their carriers), and
-``_prepare`` the contact geometry formed from body-relative points
-(``contact_laws.contact_points``), neither of which is mechanism work. This module holds shared test helpers; it defines no tests.
+``_prepare`` and ``_build`` the gaps formed from body-relative points
+(``contact_laws.contact_points``, ``_surface_gap``), neither of which is
+mechanism work. This module holds shared test helpers; it defines no tests.
 """
 
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _PatchFrame,
     _point_velocity,
     _pose_motion,
+    _surface_gap,
     _world_point,
     patch_normal_load,
     patch_routes,
@@ -420,7 +422,7 @@ def _build(
             r = frame.radius[c]
             surface_a = frame.surface_a[c]
             surface_b = frame.surface_b[c]
-            current_gap = wp.dot(_world_point(q, a, surface_a) - _world_point(q, b, surface_b), n)
+            current_gap = _surface_gap(q, a, surface_a, b, surface_b, n)
             chosen = int(-1)
             nearest = float(1.0e30)
             motion = wp.vec3(0.0)
@@ -445,13 +447,12 @@ def _build(
                     continue
                 pa = _world_point(q, a, prev.anchor_a[p])
                 pb = _world_point(q, b, prev.anchor_b[p])
-                delta = pa - pb
                 offset = 0.5 * (pa + pb) - location
                 distance = wp.length_sq(offset)
                 if not (
                     distance < nearest
                     and distance <= 4.0 * r * r
-                    and wp.abs(wp.dot(delta, n)) <= 0.1 * r
+                    and wp.abs(_surface_gap(q, a, prev.anchor_a[p], b, prev.anchor_b[p], n)) <= 0.1 * r
                     and wp.abs(wp.dot(offset, n)) <= 0.05 * r
                 ):
                     continue
@@ -459,7 +460,7 @@ def _build(
                 # valid speculative contacts during a squeeze. Surface
                 # witnesses retain penetration during decompression and
                 # reject rocking beyond the same envelope as fresh contacts.
-                support_gap = wp.dot(_world_point(q, a, prev.surface_a[p]) - _world_point(q, b, prev.surface_b[p]), n)
+                support_gap = _surface_gap(q, a, prev.surface_a[p], b, prev.surface_b[p], n)
                 if not (support_gap <= wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r):
                     continue
                 error = _carried_displacement(q, prev, p, n)
@@ -513,9 +514,7 @@ def _build(
                         other_normal = prev.normal[partner]
                         if a >= 0:
                             other_normal = wp.transform_vector(q[a], other_normal)
-                        other_gap = wp.dot(
-                            _world_point(q, a, prev.surface_a[partner]) - _world_point(q, b, prev.surface_b[partner]), n
-                        )
+                        other_gap = _surface_gap(q, a, prev.surface_a[partner], b, prev.surface_b[partner], n)
                         if (
                             wp.dot(other_normal, n) < 0.995
                             or other_gap > wp.max(current_gap, frame.support_gap_limit[c]) + 1.0e-5 * r

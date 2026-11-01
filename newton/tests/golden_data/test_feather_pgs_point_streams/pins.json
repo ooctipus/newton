@@ -17,7 +17,7 @@
   "compact_contact.clear_limit_prefix": "540c2032cf4ea3e0621bad2f528736166d64a3020cb3f07f9087d3c983a062af",
   "compact_contact.produce_contacts": "ce8eb98baadb0f13afc0e07f6a7ff534945f1f78bf5cefe3427d6cb538dadea2",
   "device_proof._checksum_words": "539d4dfaf5523eb00eac977262740ec66706aa1a166614751c756013a3e15d62",
-  "friction_patches._build": "7a50d8bad59471c71070d5659314c5cecc4d91100269f8d228f367f34b8aee68",
+  "friction_patches._build": "0fc76a0cd5899642593142033f58311a0d43a286a9872e6408d4259eb7ec2c14",
   "friction_patches._finish_and_store": "c80211a516ac54390c82ea8573524ca1377584456be0431f2833f1ade0e56de1",
   "friction_patches._invalidate_geometry_history": "4d74fee47e8f781f7d15f15ba3ec68da6df8aa8d38d864226ee69305cd69cb12",
   "friction_patches._prepare": "1ed6a1d80dca25c0a2b87de663a053321b493c75175e3649c43b401e84e09a7b",
