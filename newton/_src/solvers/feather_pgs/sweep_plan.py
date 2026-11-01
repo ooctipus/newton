@@ -1292,6 +1292,8 @@ class Sweep:
                 "seeded": self.seeded,
                 "wide_rows": self.placement.packed_dense == packed_rows.WIDE,
                 "walk": bool(self.placement.walks),
+                # The slips' frame in the leave only where a drive can saturate (topology, FL3_design §1.4).
+                "walk_frame": bool(self.placement.walks) and self.factor.walk_slip_capacity > 0,
             }
             mf_gs_shape = (
                 self.placement.dense_max_constraints,

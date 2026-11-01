@@ -146,18 +146,20 @@ class FactorCoordinates:
     }}
 }}"""
 
-    def leave_all(self, dofs: int, thread: str, threads: str, sync: str, *, walk: bool = False) -> str:
+    def leave_all(
+        self, dofs: int, thread: str, threads: str, sync: str, *, walk: bool = False, frame: bool = False
+    ) -> str:
         """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
         general placement's one writer, :mod:`.walk_rows`) a tree leaves by the walk down (``WALK_DOWN`` of
-        :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch), its rows' frame; a free rigid body
-        keeps its 6x6 factor."""
+        :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch), with ``frame`` (a class whose
+        drives can saturate) after its rows' frame; a free rigid body keeps its 6x6 factor."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
         walked = ""
         if walk:
-            walked = f"""        if (walk.free.data[art] == 0) {{
-            const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-            const int slips = walk.slips.data[art];
+            slipped = ""
+            if frame:
+                slipped = f"""            const int slips = walk.slips.data[art];
             if (slips > 0) {{
                 // The slips' frame: du <- F^T du = du + Bh (Ln - I) Bh^T du (tree_factor.walk_frame_kernel).
                 const int width = walk.basis.shape[2], cap = walk.scale.shape[2];
@@ -175,7 +177,10 @@ class FactorCoordinates:
                     for (int c = 0; c < size; ++c) s_v[d + c] += shift * basis[j * width + c];
                 }}
             }}
-            WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, size);
+"""
+            walked = f"""        if (walk.free.data[art] == 0) {{
+            const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+{slipped}            WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, size);
             WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},
                       &s_v[d], &s_v[d], reinterpret_cast<float*>(walk.scratch.data + j0));
             continue;
@@ -644,6 +649,7 @@ def mf_gs_source(
     seeded: bool = False,
     wide_rows: bool = False,
     walk: bool = False,
+    walk_frame: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep: a world's dense rows (:func:`packed_operator`, packed
     whitened rows of ``max_row_dofs`` entries, by default as many as the world's coordinates) and its free-body rows
@@ -860,7 +866,7 @@ def mf_gs_source(
 {end_first_warp}{sweep_vote}{sweep_end}    }}
 
     {barrier}
-{indent(bodies.leave_all(D, thread, threads, sync, walk=walk), "    ")}
+{indent(bodies.leave_all(D, thread, threads, sync, walk=walk, frame=walk_frame), "    ")}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0{owned}) v_out.data[global_dof] += s_v[d];
@@ -911,6 +917,7 @@ def mf_gs_kernel(
     seeded: bool = False,
     wide_rows: bool = False,
     walk: bool = False,
+    walk_frame: bool = False,
 ) -> wp.Kernel:
     """The matrix-free Gauss-Seidel sweep kernel of a thread mapping (:func:`mf_gs_source`): the warp's launches a
     warp per world item (one thread on the CPU, :func:`.launch.device_lanes`) and takes :data:`MF_GS_ABI`
@@ -939,6 +946,7 @@ def mf_gs_kernel(
         seeded=seeded,
         wide_rows=wide_rows,
         walk=walk,
+        walk_frame=walk_frame,
     )
     colored = mapping == "colored"
     staging.check(f"the {mapping} matrix-free sweep", arch_budget(device_arch))
@@ -959,6 +967,7 @@ def mf_gs_kernel(
         + ("_seeded" if seeded else "")
         + ("_wide" if wide_rows else "")
         + ("_walk" if walk else "")
+        + ("frame" if walk_frame else "")
         + solve_policy.suffix
     )
     return KernelTemplate.from_abi(
