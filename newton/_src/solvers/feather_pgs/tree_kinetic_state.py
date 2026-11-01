@@ -20,7 +20,7 @@ from . import (
     sparse_factor,
 )
 from . import tree_scan as ts
-from .device_preludes import CUDA_ONLY, device_branches, substitute
+from .device_preludes import CUDA_ONLY, DevicePrelude, device_branches, substitute
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
@@ -618,7 +618,7 @@ _FORCE = cached_force.ForceOperands(
     dt="f.dt",
 )
 
-_SOLVE = r"""    for(int i=lane;i<$DOFS;i+=stride) {
+_FORCE_STAGE = r"""    for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
         float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
         if(nonzero){$PROJECT}
@@ -628,7 +628,11 @@ _SOLVE = r"""    for(int i=lane;i<$DOFS;i+=stride) {
 #if defined(__CUDA_ARCH__)
     SYNC();
 #endif
-$START_FORWARD    $FORWARD_STAGE
+"""
+"""The predictor's force on each coordinate, ``s[$SIX_BODIES + i]``: bias, joint and control forces, the body wrenches
+projected (``s[6 body + k]``, dead once projected) and the passive springs."""
+
+_RESPONSE_STAGE = r"""$START_FORWARD    $FORWARD_STAGE
 $START_RESPONSE    for(int col=lane;col<$DOFS;col+=stride) {
         $TRANSPOSE_ACTION
         const int dof=ds+$RESPONSE_PHYSICAL;
@@ -648,6 +652,7 @@ $START_RESPONSE    for(int col=lane;col<$DOFS;col+=stride) {
     SYNC();
 #endif
 """
+_SOLVE = _FORCE_STAGE + _RESPONSE_STAGE
 """A tree's solve, written twice in a predictor (:data:`_PREDICT`). A loop around one copy would be a back edge: it keeps
 every array it hoists in registers across the stages, from 72 to 134 on a dense tree, and occupancy pays for those
 registers in every world of every launch. Text the rare branch holds costs its code and no registers."""
@@ -731,11 +736,11 @@ SATURATE_DRIVES = r"""    for(int i=lane;i<$DOFS;i+=stride) {
             const float force=Spatial::drive_step_force(u0,limited,K,qdd,inertia);
             if(wp::abs(force)>limit) {
                 decided=passive;
-                f.u0.data[dof]=f.u0.data[dof]-limited+wp::sign(force)*limit;
+                ${U0_OPEN}f.u0.data[dof]-limited+wp::sign(force)*limit${U0_CLOSE}
                 MOVE(1|(256<<root));
             } else if(u0!=limited) {
                 const float rows=f.row_dv.data[row]/f.dt;
-                f.u0.data[dof]=f.u0.data[dof]-limited+Spatial::free_drive_force(u0,limited,K,qdd,rows,inertia,limit);
+                ${U0_OPEN}f.u0.data[dof]-limited+Spatial::free_drive_force(u0,limited,K,qdd,rows,inertia,limit)${U0_CLOSE}
             }
         }
         if(decided!=(((held>>root)&1)?f.row_Kd.data[row]:all))MOVE(2<<root);
@@ -1979,6 +1984,116 @@ def _solve_operations(layout: TreeLayout, response: str, *, trial: bool) -> tupl
     return "\n    ".join(declarations), {name: substitute(text, layout.sizes()) for name, text in solve.items()}
 
 
+_WALK_TREE = """    // WALK_UP_TREE(data, link, x, u, state): u = L^-1 P x, a covector x on every coordinate of the tree WALK_TREE set
+    // (tree_factor.TreeWalk.up(covector=x)), leaf first: coordinate c takes z_c = (x_c + s_c . p) / ell_c and passes
+    // p - ut_c z_c, p its body's state, and a joint passes t - d x f to its parent. The transpose structure of
+    // WALK_DOWN: a chain carries its state in registers, a join adds it into the parent's six words of state.
+    const auto WALK_UP_TREE = [&](const float* data, const float* link, const float* x, float* u, float* state) {
+        for (int k = 0; k < 6 * WALK_BODIES; ++k) state[k] = 0.0f;
+        float p[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int b = WALK_BODIES - 1; b >= 0; --b) {
+            for (int k = 0; k < 6; ++k) p[k] += state[6 * b + k];
+            for (int c = WALK_FIRST_OF(b + 1) - 1; c >= WALK_FIRST_OF(b); --c) {
+                const float* d = data + $coordinate * c;
+                const float z = (x[c] + ((d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) + (d[3] * p[3] + d[4] * p[4] + d[5] * p[5])))
+                                * d[12];
+                for (int k = 0; k < 6; ++k) p[k] -= d[6 + k] * z;
+                u[c] = z;
+            }
+            const int up = WALK_PARENT_OF(b);
+            if (up >= 0) {
+                const float* l = link + $link * b;
+                const float fx = p[0], fy = p[1], fz = p[2];
+                p[3] -= l[1] * fz - l[2] * fy;
+                p[4] -= l[2] * fx - l[0] * fz;
+                p[5] -= l[0] * fy - l[1] * fx;
+            }
+            if (up != b - 1) {
+                if (up >= 0)
+                    for (int k = 0; k < 6; ++k) state[6 * up + k] += p[k];
+                for (int k = 0; k < 6; ++k) p[k] = 0.0f;
+            }
+        }
+    };
+    // WALK_DOWN_TREE(data, link, u, qd, twist): WALK_DOWN, the leave P^T L^-T u root first, with a chain's twist carried
+    // in registers: a body reads its parent's twist from twist (six words a body) only at a join. u == qd allowed.
+    const auto WALK_DOWN_TREE = [&](const float* data, const float* link, const float* u, float* qd, float* twist) {
+        float V[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int b = 0; b < WALK_BODIES; ++b) {
+            const int up = WALK_PARENT_OF(b);
+            if (up < 0) {
+                for (int k = 0; k < 6; ++k) V[k] = 0.0f;
+            } else {
+                if (up != b - 1)
+                    for (int k = 0; k < 6; ++k) V[k] = twist[6 * up + k];
+                const float* l = link + $link * b;
+                V[0] += l[1] * V[5] - l[2] * V[4];
+                V[1] += l[2] * V[3] - l[0] * V[5];
+                V[2] += l[0] * V[4] - l[1] * V[3];
+            }
+            for (int c = WALK_FIRST_OF(b); c < WALK_FIRST_OF(b + 1); ++c) {
+                const float* d = data + $coordinate * c;
+                const float q = (u[c] - ((d[6] * V[0] + d[7] * V[1] + d[8] * V[2]) + (d[9] * V[3] + d[10] * V[4] + d[11] * V[5])))
+                                * d[12];
+                qd[c] = q;
+                for (int k = 0; k < 6; ++k) V[k] += d[k] * q;
+            }
+            for (int k = 0; k < 6; ++k) twist[6 * b + k] = V[k];
+        }
+    };"""
+
+
+@functools.cache
+def walk_tree_prelude() -> DevicePrelude:
+    """The predictor's walk of a whole tree, for both devices: :func:`.tree_factor.walk_paths_prelude`'s table and walk,
+    and ``WALK_UP_TREE``, the leaf-first pass of a covector on every coordinate with its joins, beside ``WALK_DOWN``'s
+    register-carried twin. It lives with the predictor until the walk text (``tree_factor._WALK``) takes it (Z4)."""
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, walk_paths_prelude  # noqa: PLC0415
+
+    walk, tree = walk_paths_prelude(1), substitute(_WALK_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK)
+    return DevicePrelude("walk_tree", walk.source + "\n" + tree, cpu=walk.cpu + "\n" + tree)
+
+
+def _walk_roots(layout: TreeLayout, response: str) -> list[tuple[int, int, int]]:
+    """``(root, coordinate offset, family)`` of each root a predictor's walk solves: one tree, or each root of a forest
+    (a prescribed root, family 0, responds with zero)."""
+    if response == "cholesky" and layout.forest:
+        return list(zip(range(len(layout.roots)), layout.root_offsets, layout.root_families, strict=True))
+    return [(0, 0, layout.dofs)]
+
+
+def walk_solve(layout: TreeLayout, response: str) -> str:
+    """Native statements of the walk's response (Z4.0): lane 0 walks each root's tree, ``WALK_UP_TREE`` of the force
+    ``s[$SIX_BODIES + i]`` into the whitened words ``s[$WHITE + i]``, then ``WALK_DOWN_TREE`` in place, its join states
+    in the block's first words (the body wrenches, dead once the force is projected): ``qdd = P^T L^-T L^-1 P f`` on the
+    all-``K`` walk (:class:`.tree_factor.WalkTrees`, bound as ``walk``), with no factor array read and no word added."""
+    blocks = []
+    for r, offset, family in _walk_roots(layout, response):
+        if family == 0:
+            blocks.append(f"for(int k=0;k<{layout.root_coordinates[r]};++k)s[$WHITE+{offset}+k]=0.0f;")
+            continue
+        blocks.append(
+            "{\n"
+            f"            const int a={_root_articulation(layout, r)};\n"
+            "            const int j0=walk.joint_start.data[a],d0=walk.dof_start.data[a];\n"
+            "            WALK_TREE(reinterpret_cast<const int*>(walk.path.data+j0),walk.joint_end.data[a]-j0,"
+            "walk.dofs.data[a]);\n"
+            "            const float* const data=walk.data.data+(size_t)d0*$WALK_COORDINATE;\n"
+            "            const float* const link=walk.link.data+(size_t)j0*$WALK_LINK;\n"
+            f"            WALK_UP_TREE(data,link,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);\n"
+            f"            WALK_DOWN_TREE(data,link,s+$WHITE+{offset},s+$WHITE+{offset},s);\n"
+            "        }"
+        )
+    from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
+
+    text = (
+        "if(lane==0) {\n        "
+        + "\n        ".join(blocks)
+        + "\n    }\n#if defined(__CUDA_ARCH__)\n    SYNC();\n#endif\n"
+    )
+    return substitute(text, layout.sizes(), WALK_COORDINATE=WALK_COORDINATE, WALK_LINK=WALK_LINK)
+
+
 @functools.cache
 def get_predictor_kernel(
     schedules: HeldSchedules,
@@ -1987,12 +2102,16 @@ def get_predictor_kernel(
     response="sparse",
     clocked: bool = False,
     twists: bool,
+    walk: bool = False,
 ):
     """Apply current external/control force and both unchanged W actions.
 
     ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``clocked`` adds the
     predictor stage counters (see :func:`get_helpers`);
-    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds.
+    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``walk`` solves the trial
+    by the walk (:func:`walk_solve`, the tree factor's walk bound as ``walk``) and the decided step from the trial's force
+    plus the decision's change of it, not a second projection: the walk's response beside the factor's (Z4.0), which no
+    route selects.
     """
     reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
     operations = {
@@ -2020,9 +2139,30 @@ def get_predictor_kernel(
     clocks = _native_clocks(clocked, "f", stages=5, column=8)
     trial_factors, trial_solve = _solve_operations(layout, response, trial=True)
     _, step_solve = _solve_operations(layout, response, trial=False)
+    preludes = SPATIAL.preludes()
+    second = _SOLVE
+    u0 = {"U0_OPEN": "f.u0.data[dof]=", "U0_CLOSE": ";"}
+    if walk:
+        trial_factors = ""
+        trial_solve.update(
+            FORWARD_STAGE=walk_solve(layout, response),
+            TRANSPOSE_ACTION="float value=s[$WHITE+col];",
+            RESPONSE_PHYSICAL="col",
+        )
+        preludes = (*preludes, walk_tree_prelude())
+        second = _RESPONSE_STAGE
+        step_solve = {
+            name: text for name, text in step_solve.items() if name not in ("PROJECT", "SPRING_GUARD", "PASSIVE")
+        }
+        u0 = {
+            "U0_OPEN": "{const float drive_u0=",
+            "U0_CLOSE": substitute(
+                ";s[$SIX_BODIES+i]+=drive_u0-f.u0.data[dof];f.u0.data[dof]=drive_u0;}", layout.sizes()
+            ),
+        }
     source = layout.native(
         _PREDICT,
-        preludes=SPATIAL.preludes(),
+        preludes=preludes,
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
         HELD=_held(layout, response),
         TRIAL_FACTORS=substitute(trial_factors, layout.sizes()),
@@ -2034,9 +2174,9 @@ def get_predictor_kernel(
             START_RESPONSE=clocks["CLOCK3"],
             DECIDE=QUIET_DRIVE,
         ),
-        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
+        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout), **u0),
         RELEASE=release(layout, response),
-        SECOND_SOLVE=substitute(_SOLVE, layout.sizes(), **step_solve, START_FORWARD="", START_RESPONSE="", DECIDE=""),
+        SECOND_SOLVE=substitute(second, layout.sizes(), **step_solve, START_FORWARD="", START_RESPONSE="", DECIDE=""),
         RECORD=_record(layout, response),
         **operations,
         **{name: text for name, text in clocks.items() if name not in ("CLOCK2", "CLOCK3")},
@@ -2051,15 +2191,21 @@ def get_predictor_kernel(
     name += schedules.tag
     if response != "sparse":
         name += "_" + response
+    params = (
+        ("p", sparse_factor.SparsePlan),
+        ("d", data_type),
+        ("plan", HeldPlan),
+        ("cache", KineticData),
+        ("f", ForceInput),
+    )
+    if walk:
+        from .tree_factor import WalkTrees  # noqa: PLC0415
+
+        name += "_walk"
+        params = (*params, ("walk", WalkTrees))
     return KernelTemplate(
         name,
-        (
-            ("p", sparse_factor.SparsePlan),
-            ("d", data_type),
-            ("plan", HeldPlan),
-            ("cache", KineticData),
-            ("f", ForceInput),
-        ),
+        params,
         source,
         # A packed group of trees per block: the block's group and this thread's tree in it.
         Dispatch(

@@ -399,12 +399,15 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             clocked=self.clocked,
         )
+        # The test pin walk_predictor solves the trial by the walk (Z4.0): no route selects it.
+        self.walk_predictor = bool(self.solver._route_pins.get("walk_predictor", False))
         self.predictor_kernel = native.get_predictor_kernel(
             self.schedules,
             layout=layout,
             response=self._response,
             clocked=self.clocked,
             twists=self._predicts_twists,
+            walk=self.walk_predictor,
         )
 
     def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
@@ -702,10 +705,13 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
+        inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
+        if self.walk_predictor:
+            inputs.append(solver.factor.walk_view())
         wp.launch_tiled(
             self.predictor_kernel,
             dim=[self.launch_count],
-            inputs=[self.sparse.plan, self.sparse.data, self.plan, self.data, force],
+            inputs=inputs,
             block_dim=self.block_dim,
             device=solver.model.device,
         )

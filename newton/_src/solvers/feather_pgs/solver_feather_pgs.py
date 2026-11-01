@@ -734,8 +734,9 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
-        if general or self.placement.ink_skip_rows():
-            # Every responding tree; the keyed tiers walk their keyed rows in the kernel.
+        # Every responding tree; the keyed tiers walk their keyed rows in the kernel, and the test pin walk_predictor
+        # solves the predictor's trial by the walk (Z4.0).
+        if general or self.placement.ink_skip_rows() or self._route_pins.get("walk_predictor", False):
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
         elif diagonal:
             self.factor.plan_walk(self.placement.sparse_diagonal_dense_arts_host)
