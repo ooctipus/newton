@@ -323,17 +323,16 @@ def _linked_sweep_calls():
         yield "sweep_routes_sparse.sparse_kernel", factory, (48, 18, 12), kwargs
 
 
-def _sparse_contact_calls():
-    from newton._src.solvers.feather_pgs.response_builds_rows import factor_contact_rows_kernel  # noqa: PLC0415
+def _support_writer_calls():
+    """The support placement's writer and leave (case K1, walk_rows.py) on a branched tree of a free root and three
+    limbs, under each record and torsion law."""
+    from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
-    factory = factor_contact_rows_kernel.__wrapped__
-    for dofs, prepare, table in itertools.product((8, 18), (False, True), (False, True)):
-        kwargs = {"prepare_rows": prepare, "use_support_table": table}
-        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
-    # The block records of the sparse sweep's contact units, under either law.
-    for dofs in (8, 18, 25):
-        kwargs = {"prepare_rows": True, "use_support_table": True, "contact_records": True}
-        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
+    tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
+    for records, torsion in ((False, False), (True, False), (True, True)):
+        kwargs = {"records": records, "torsion": torsion}
+        yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
+    yield "walk_rows.support_publish_kernel", walk_rows.support_publish_kernel.__wrapped__, tree, {}
 
 
 def _dense_build_calls():
@@ -514,11 +513,6 @@ def _suite_shape_calls():
     factory = response_builds_rows.sparse_factor_kernel.__wrapped__
     for size in ((6, 21), (9, 44), (14, 81), (18, 117), (18, 135), (25, 194), (27, 243), (43, 434)):
         yield "response_builds_rows.sparse_factor_kernel", factory, size, {}
-    # 18 coordinates with a support table are pinned with the patch-varied factories.
-    factory = response_builds_rows.factor_contact_rows_kernel.__wrapped__
-    for dofs, table in ((6, True), (9, False), (14, True), (25, True), (27, True), (43, False)):
-        kwargs = {"prepare_rows": True, "use_support_table": table}
-        yield "response_builds_rows.factor_contact_rows_kernel", factory, (dofs,), kwargs
     yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
     components = response_builds_rows.paired_components_kernel.__wrapped__
     yield "response_builds_rows.paired_components_kernel", components, (23, 6), {}
@@ -547,7 +541,7 @@ def _factory_kernels():
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
         _linked_sweep_calls(),
-        _sparse_contact_calls(),
+        _support_writer_calls(),
         _dense_build_calls(),
         _solver_factory_calls(),
         _spliced_sweep_calls(),
@@ -690,7 +684,7 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         families = {name.split("(", 1)[0] for name in self.current}
         for family in (
             "sweep_routes_sparse.sparse_kernel",
-            "response_builds_rows.factor_contact_rows_kernel",
+            "walk_rows.support_rows_kernel",
             "sweep_routes_diag.sparse_diagonal_kernel",
             "sweep_levels._get_build_independent_sparse_contact_groups_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",

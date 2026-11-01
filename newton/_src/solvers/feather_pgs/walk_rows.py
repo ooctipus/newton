@@ -27,6 +27,13 @@ the rhs.
 
 No ``J`` is formed. The rows and the sweeps' leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``; the paired
 factor sweep's) share the walk's one frame (FL3_design §1.2).
+
+**The support placement (case K1, FL3.4)** writes the same rows into its support sink (:func:`support_rows_kernel`):
+a world's lane group strides over its units, a lane walks a unit's rows together (a contact's 1, 3 or 4, a joint row's
+1) through the class's path table in constant memory, and stores each footprint at its rank in the row's support
+(factor coordinates), the unit's Gram, its records and its header from the same walk. A slipping drive's ``K`` leaves
+the rows and the leave by its release along its path (:func:`.tree_factor.walk_release_tree`): the block primitive with
+the path's coordinate basis, which keeps every row inside its support. The leave is :func:`support_publish_kernel`.
 """
 
 from __future__ import annotations
@@ -50,18 +57,37 @@ from .dense_rows import (
     jacobian_row,
     unit_source,
 )
-from .device_preludes import dual_native, lane_group
+from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
 from .friction_patches import PatchRowLaw
-from .kernel_template import python_kernel
+from .kernel_template import THREADS, KernelTemplate, python_kernel
 from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
+from .projection_laws import friction_pair_metric
 from .response_builds_rows import close_block, close_row, free_body_row_header
 from .row_build import write_contact_row
 from .row_laws import LINK_ROWS
 from .solver_fields import Preelim
-from .tree_factor import WalkSlips, WalkTrees, release_path, walk_into, walk_release_tree
+from .sparse_mass_matrix import _SparseRowSupport
+from .tree_factor import (
+    WALK_COORDINATE,
+    WALK_FRAME,
+    WALK_LINK,
+    WALK_NOW,
+    WalkRelease,
+    WalkSlips,
+    WalkTrees,
+    release_path,
+    walk_into,
+    walk_prelude,
+    walk_release_tree,
+)
 
 __all__ = [
+    "SupportSink",
+    "SupportUnit",
     "free_body_headers_kernel",
+    "support_publish_kernel",
+    "support_rows_kernel",
+    "walk_release_kernel",
     "walked_rows_kernel",
     "write_contact_units",
     "write_free_body_rows",
@@ -640,3 +666,517 @@ def writer_kernel(solver) -> wp.Kernel:
     return walked_rows_kernel(
         factor.walk_slip_capacity > 0, blocks, bool(blocks and solver.options.enable_bilateral_preelimination)
     )
+# ---------------------------------------------------------------------------------------------------------------------
+# The support placement (case K1, FL3.4): the support sink, a lane per unit, the release and the leave
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def walk_release_kernel(arts: wp.array[int], walk: WalkTrees, slips: WalkSlips, v_hat: wp.array[float]):
+    """The support placement's release (case K1), a thread per tree: each walked tree's slips released
+    (:func:`.tree_factor.walk_release_tree`, the builder the general placement's one writer runs in its first phase)."""
+    walk_release_tree(arts[wp.tid()], walk, slips, v_hat)
+
+
+_SUPPORT_TABLE = """    static __constant__ int SUPPORT_NODE[$n] = {$node};"""
+_SUPPORT_TABLE_CPU = """    static const int SUPPORT_NODE[$n] = {$node};"""
+
+_SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_rows_kernel): its seeds walked through the class's
+    // path table (WALK_UP, WALK_SEED), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
+    // coordinate's factor coordinate, the support mask's bit), the unit's Gram and incident from the same walk.
+    const auto POPC = [](unsigned long long bits) -> int {
+#if defined(__CUDA_ARCH__)
+        return __popcll(bits);
+#else
+        return __builtin_popcountll(bits);
+#endif
+    };
+    const auto LOW = [](unsigned long long bits) -> int {
+#if defined(__CUDA_ARCH__)
+        return __ffsll(bits) - 1;
+#else
+        return __builtin_ctzll(bits);
+#endif
+    };
+    const auto& walk = sink.walk;
+    const auto& release = sink.release;
+    const auto& support = sink.support;
+    const int rows = unit.rows, art_a = unit.art_a, art_b = unit.art_b, body_a = unit.body_a, body_b = unit.body_b;
+    const int dof0 = unit.dof0, dof1 = unit.dof1;
+    const int S = sink.row_factor.shape[2];
+    const int row0 = unit.line * sink.row_factor.shape[1] + unit.slot;
+    float* const Z = sink.row_factor.data + (size_t)row0 * S;
+    const bool covector = dof0 >= 0;
+    float incident[$rows], norm[$rows], zc[$rows], cross[6];
+    for (int r = 0; r < $rows; ++r) incident[r] = norm[r] = zc[r] = 0.0f;
+    for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+    const auto gram = [&]() {
+        if ($rows >= 3) {
+            cross[0] += zc[0] * zc[1];
+            cross[1] += zc[0] * zc[2];
+            cross[2] += zc[1] * zc[2];
+        }
+        if ($rows >= 4) {
+            cross[3] += zc[0] * zc[$last];
+            cross[4] += zc[1] * zc[$last];
+            cross[5] += zc[2] * zc[$last];
+        }
+    };
+    unsigned long long masks[2] = {0ull, 0ull};
+    int bases[2] = {0, 0};
+    int count = 0;
+    bool reread = false;
+    for (int side = 0; side < 2; ++side) {
+        const int art = side == 0 ? art_a : art_b;
+        if (art < 0 || (side == 1 && art == art_a) || sink.response_dofs.data[art] <= 0) continue;
+        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+        unsigned long long mask = 0ull;
+        int seeds = 0;
+        if (covector) {
+            mask = sink.dof_mask.data[dof0 - d0];
+            seeds = 1;
+            if (dof1 >= 0) {
+                mask |= sink.dof_mask.data[dof1 - d0];
+                seeds = 2;
+            }
+        } else {
+            if (body_a >= 0 && art_a == art) {
+                mask |= sink.body_mask.data[body_a];
+                ++seeds;
+            }
+            if (body_b >= 0 && art_b == art) {
+                mask |= sink.body_mask.data[body_b];
+                ++seeds;
+            }
+        }
+        if (mask == 0ull) continue;
+        const int base = count;
+        masks[side] = mask;
+        bases[side] = base;
+        count += POPC(mask);
+        // Two seeds on one tree add where their paths meet: their side is cleared, then re-read for the Gram.
+        const bool add = seeds > 1;
+        if (add) {
+            reread = true;
+            for (int r = 0; r < rows; ++r)
+                for (int e = base; e < count; ++e) Z[r * S + e] = 0.0f;
+        }
+        const float* data = walk.data.data + (size_t)d0 * $coordinate;
+        const float* link = walk.link.data + (size_t)j0 * $link;
+        const float* now = walk.now.data + (size_t)d0 * $now;
+        const float* now_link = walk.now_link.data + (size_t)j0 * $link;
+        const float* vh = sink.v_hat.data + d0;
+        const auto rank = [&](int c) -> int { return base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull)); };
+        const auto store = [&](int r, int c, float z, float) {
+            if (r >= rows) return;
+            float* entry = Z + r * S + rank(c);
+            if (add) {
+                *entry += z;
+                return;
+            }
+            *entry = z;
+            norm[r] += z * z;
+            zc[r] = z;
+            if (r == $last) gram();
+        };
+        float p[6 * $rows], w[6 * $rows];
+        if (covector) {
+            for (int k = 0; k < seeds; ++k) {
+                const int c = (k == 0 ? dof0 : dof1) - d0;
+                float x[$rows];
+                for (int r = 0; r < $rows; ++r) x[r] = 0.0f;
+                x[0] = k == 0 ? unit.value0 : unit.value1;
+                // A covector enters at its coordinate: its body's coordinates after it (below it in factor order) are
+                // the row's zeros.
+                if (!add)
+                    for (int e = base; e < rank(c); ++e) Z[e] = 0.0f;
+                for (int i = 0; i < 6 * $rows; ++i) p[i] = w[i] = 0.0f;
+                WALK_SEED(data, c, x, p, store);
+                WALK_UP(data, link, nullptr, now_link, walk.dof_body.data[d0 + c], c - 1, p, w, store);
+                incident[0] += x[0] * vh[c];
+            }
+        } else {
+            for (int k = 0; k < 2; ++k) {
+                const int body = k == 0 ? body_a : body_b;
+                if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
+                const float sign = k == 0 ? 1.0f : -1.0f;
+                const int j = walk.body_joint.data[body];
+                // The seeds' wrenches at the body's frame at the step's poses, where the walk's columns are J's.
+                const float* o = walk.now_link.data + (size_t)j * $link + $frame;
+                for (int r = 0; r < $rows; ++r) {
+                    float* q = p + 6 * r;
+                    const float* d = unit.frame.data[r == 1 || r == 2 ? r : 0];
+                    const auto& at = r == 0 ? unit.point : unit.friction_point;
+                    const float f[3] = {sign * d[0], sign * d[1], sign * d[2]};
+                    const float l[3] = {at[0] - o[0], at[1] - o[1], at[2] - o[2]};
+                    if (r >= rows) {
+                        for (int i = 0; i < 6; ++i) q[i] = 0.0f;
+                    } else if ($spin && r == 3) {
+                        q[0] = q[1] = q[2] = 0.0f;
+                        q[3] = f[0];
+                        q[4] = f[1];
+                        q[5] = f[2];
+                    } else {
+                        q[0] = f[0];
+                        q[1] = f[1];
+                        q[2] = f[2];
+                        q[3] = l[1] * f[2] - l[2] * f[1];
+                        q[4] = l[2] * f[0] - l[0] * f[2];
+                        q[5] = l[0] * f[1] - l[1] * f[0];
+                    }
+                    for (int i = 0; i < 6; ++i) w[6 * r + i] = q[i];
+                }
+                // The step's J entry of each footprint against v_hat: the rows' incident velocity.
+                const auto sink = [&](int r, int c, float z, float j) {
+                    if (r < rows) incident[r] += j * vh[c];
+                    store(r, c, z, j);
+                };
+                const int local = j - j0;
+                WALK_UP(data, link, now, now_link, local, WALK_FIRST_OF(local + 1) - 1, p, w, sink);
+            }
+        }
+        // A slipping tree's release (walk_release_kernel), root-most slip first, on the side's entries along each
+        // slip's path: entries off the row's support stay zero, so the side keeps its support.
+        const int slips = release.count.data[art];
+        if (slips > 0) {
+            reread = true;
+            const int cap = release.dof.shape[1], width = release.b.shape[2];
+            for (int j = 0; j < slips; ++j) {
+                const int i = release.dof.data[art * cap + j];
+                const size_t at = ((size_t)art * cap + j) * width;
+                const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+                float s[$rows];
+                for (int r = 0; r < $rows; ++r) s[r] = 0.0f;
+                // The path, leaf first (step t); a coordinate off the row's support holds zero and leaves s at zero.
+                for (int body = walk.dof_body.data[d0 + i], c = i, t = 0; body >= 0;) {
+                    for (; c >= WALK_FIRST_OF(body); --c, ++t) {
+                        if (((mask >> SUPPORT_NODE[c]) & 1ull) == 0ull) continue;
+                        float* entry = Z + rank(c);
+                        for (int r = 0; r < rows; ++r) {
+                            const float u = entry[r * S] - b[t] * s[r];
+                            s[r] += a[t] * u;
+                            entry[r * S] = g[t] * u;
+                        }
+                    }
+                    body = WALK_PARENT_OF(body);
+                    if (body >= 0) c = WALK_FIRST_OF(body + 1) - 1;
+                }
+            }
+        }
+    }
+    // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
+    for (int r = 0; r < rows; ++r)
+        for (int e = count; e < S; ++e) Z[r * S + e] = 0.0f;
+    if (support.enabled == 0) {
+        int* const D = sink.row_dof.data + (size_t)row0 * S;
+        for (int side = 0; side < 2; ++side) {
+            if (masks[side] == 0ull) continue;
+            int e = bases[side];
+            const int offset = sink.world_offset.data[side == 0 ? art_a : art_b];
+            for (unsigned long long bits = masks[side]; bits != 0ull; bits &= bits - 1ull, ++e)
+                for (int r = 0; r < rows; ++r) D[r * S + e] = offset + LOW(bits);
+        }
+        for (int r = 0; r < rows; ++r)
+            for (int e = count; e < S; ++e) D[r * S + e] = -1;
+    } else {
+        int cls = 0;
+        if (covector) {
+            cls = support.limit_class.data[dof0 - walk.dof_start.data[art_a]];
+        } else {
+            const auto side_of = [&](int body, int art) {
+                return body >= 0 && art >= 0 && sink.response_dofs.data[art] > 0 && sink.body_mask.data[body] != 0ull;
+            };
+            const bool a = side_of(body_a, art_a), b = side_of(body_b, art_b);
+            const int class_a = a ? support.body_class.data[body_a] : 0;
+            const int class_b = b ? support.body_class.data[body_b] : 0;
+            cls = support.pair_class.data[class_a * support.pair_class.shape[1] + class_b];
+        }
+        for (int r = 0; r < rows; ++r) support.row_class.data[row0 + r] = cls;
+    }
+    if (reread) {
+        for (int r = 0; r < $rows; ++r) norm[r] = zc[r] = 0.0f;
+        for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+        for (int e = 0; e < count; ++e) {
+            for (int r = 0; r < rows; ++r) {
+                zc[r] = Z[r * S + e];
+                norm[r] += zc[r] * zc[r];
+            }
+            if (rows == $rows) gram();
+        }
+    }
+    for (int r = 0; r < rows; ++r) {
+        sink.diag.data[row0 + r] = norm[r] + sink.row_cfm.data[row0 + r];
+        sink.row_incident.data[row0 + r] = incident[r];
+    }
+$record"""
+"""The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
+
+_SUPPORT_RECORD = """    // A full unit's block record from its Gram (sparse_contact.CONTACT_RECORD_FLOATS): its couplings W_nt1, W_nt2,
+    // W_t1t2 and 1 / W_nn, then the spin row's couplings W_ns, W_t1s, W_t2s (contact torsion) or, written by the
+    // kernel from these, the tangent pair's metric (projection_laws.friction_pair_metric).
+    if (rows == $rows) {
+        float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
+                        * sink.records.shape[2];
+        record[0] = cross[0];
+        record[1] = cross[1];
+        record[2] = cross[2];
+        record[3] = 1.0f / (norm[0] + sink.row_cfm.data[row0]);
+$tail
+    }
+"""
+_SPIN_TAIL = """        record[4] = cross[3];
+        record[5] = cross[4];
+        record[6] = cross[5];"""
+
+
+@cache
+def _support_table(node: tuple[int, ...]) -> DevicePrelude:
+    """The class's factor coordinate of each tree coordinate, in constant memory: the support mask's bit."""
+    values = {"n": len(node), "node": ", ".join(str(int(k)) for k in node)}
+    return DevicePrelude(
+        f"support_table_{len(node)}", substitute(_SUPPORT_TABLE, values), cpu=substitute(_SUPPORT_TABLE_CPU, values)
+    )
+
+
+def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool) -> str:
+    record = ""
+    if records:
+        record = substitute(_SUPPORT_RECORD, rows=rows, tail=_SPIN_TAIL if spin else "")
+    body = substitute(
+        _SUPPORT,
+        rows=rows,
+        last=rows - 1,
+        coordinate=WALK_COORDINATE,
+        link=WALK_LINK,
+        now=WALK_NOW,
+        frame=WALK_FRAME,
+        spin=int(spin),
+        record=record,
+    )
+    return dual_native(body, preludes=(walk_prelude(parent, first, rows), _support_table(node)))
+
+
+@wp.struct
+class SupportSink:
+    """What the support placement's writer reads and writes besides a unit's seeds (:func:`support_rows_kernel`): the
+    walk and its release, the support table, each body's and coordinate's support mask (factor coordinates), each
+    articulation's first world coordinate and response coordinates, the predictor ``v_hat``, and the rows' ``cfm``,
+    entries, coordinates, incident velocities, diagonals and block records."""
+
+    walk: WalkTrees
+    release: WalkRelease
+    support: _SparseRowSupport
+    body_mask: wp.array[wp.uint64]
+    dof_mask: wp.array[wp.uint64]
+    world_offset: wp.array[int]
+    response_dofs: wp.array[int]
+    v_hat: wp.array[float]
+    row_cfm: wp.array2d[float]
+    row_factor: wp.array3d[float]
+    row_dof: wp.array3d[int]
+    row_incident: wp.array2d[float]
+    diag: wp.array2d[float]
+    records: wp.array3d[float]
+
+
+@wp.struct
+class SupportUnit:
+    """One unit's rows (``line``, ``slot``, ``rows``) and seeds: a contact's two bodies and their articulations with its
+    frame's rows (the normal, then the tangents) at its ``point`` and ``friction_point``, or a joint row's covectors
+    ``value e_dof`` (``dof0 >= 0``; a mimic's second at ``dof1``) on articulation ``art_a``."""
+
+    line: int
+    slot: int
+    rows: int
+    art_a: int
+    body_a: int
+    art_b: int
+    body_b: int
+    frame: wp.mat33
+    point: wp.vec3
+    friction_point: wp.vec3
+    dof0: int
+    value0: float
+    dof1: int
+    value1: float
+
+
+@cache
+def support_rows_kernel(
+    parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...], *, records: bool, torsion: bool
+) -> wp.Kernel:
+    """The support placement's one writer (case K1): ``dim = (worlds, lanes)``, a world's lane group striding over its
+    rows, a lane per unit (a contact's rows from its first, a joint row alone).
+
+    The class's tree (``parent``, ``first``: :func:`.tree_factor.walk_prelude`'s table) and each coordinate's factor
+    coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
+    under contact ``torsion``) is walked together and its Gram writes its block record where ``records`` (the
+    triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. Each
+    row's records and unit source are the producers' (:func:`write_contact_units`, the limit, velocity-limit and
+    mimic producers); the writer stores its footprints at their ranks in its support (``row_factor``, with the
+    coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``, its incident ``J v_hat``
+    and its rhs by the row law (:func:`.kernels.row_bias`).
+    """
+    unit_rows = 4 if torsion else 3
+
+    def walker(rows: int, with_records: bool):
+        """The unit walker of ``rows`` rows (:data:`_SUPPORT`): a native function of its own name."""
+
+        def native(sink: SupportSink, unit: SupportUnit): ...
+
+        native.__name__ = native.__qualname__ = f"support_walk_{rows}"
+        return wp.func_native(_support_snippet(parent, first, node, rows, with_records, torsion and rows == 4))(native)
+
+    walk_one = walker(1, False)
+    walk_unit = walker(unit_rows, records)
+
+    def kernel(
+        rows: DenseRows,
+        sources: wp.array2d[int],
+        counts: wp.array[int],
+        lanes: int,
+        data: ContactInput,
+        law: PatchRowLaw,
+        sink: SupportSink,
+        mimic_dof0: wp.array[int],
+        mimic_dof1: wp.array[int],
+        mimic_coef1: wp.array[float],
+        velocity_limit_sign: wp.array[float],
+        dt: float,
+        contact_speculative_scale: float,
+        contact_w: float,
+        restitution_velocity_threshold: float,
+        weighted: int,
+        material: int,
+    ):
+        world, lane = wp.tid()
+        line = rows.first[world]
+        count = wp.min(counts[world], sink.row_factor.shape[1])
+        for slot in range(lane, count, lanes):
+            source = sources[line, slot]
+            kind = source >> UNIT_SHIFT
+            index = source & ((1 << UNIT_SHIFT) - 1)
+            unit = SupportUnit()
+            unit.line = line
+            unit.slot = slot
+            unit.rows = 1
+            unit.art_b = -1
+            unit.body_a = -1
+            unit.body_b = -1
+            unit.dof0 = -1
+            unit.dof1 = -1
+            if kind == UNIT_CONTACT:
+                c = index // 4
+                if index - 4 * c != 0:
+                    continue  # the unit's first row's lane writes it
+                unit.rows = wp.min(data.slots_needed[c], wp.static(unit_rows))
+                body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+                unit.art_a = data.art0[c]
+                unit.body_a = body_a
+                unit.art_b = data.art1[c]
+                unit.body_b = body_b
+                unit.frame = wp.matrix_from_rows(normal, tangent0, tangent1)
+                unit.point = point
+                unit.friction_point = friction_point
+            elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY or kind == UNIT_MIMIC:
+                unit.art_a = rows.sides[line, slot][0]
+                unit.dof0 = index // 2
+                unit.value0 = 1.0 - 2.0 * float(index - 2 * unit.dof0)
+                if kind == UNIT_VELOCITY:
+                    unit.value0 = velocity_limit_sign[index]
+                if kind == UNIT_MIMIC:
+                    unit.dof0 = mimic_dof0[index]
+                    unit.value0 = 1.0
+                    unit.dof1 = mimic_dof1[index]
+                    unit.value1 = -mimic_coef1[index]
+            else:
+                continue
+            if unit.rows == 1:
+                walk_one(sink, unit)
+            else:
+                walk_unit(sink, unit)
+                if wp.static(records and not torsion):
+                    if unit.rows == 3:
+                        # The friction pair's metric of the diagonals as written, which the triplet sweeps reuse.
+                        k = slot // 3
+                        coupling = sink.records[line, k, 2]
+                        _scale, largest, smallest, axis = friction_pair_metric(
+                            sink.diag[line, slot + 1], coupling, sink.diag[line, slot + 2]
+                        )
+                        sink.records[line, k, 4] = largest
+                        sink.records[line, k, 5] = smallest
+                        sink.records[line, k, 6] = axis[0]
+                        sink.records[line, k, 7] = axis[1]
+            for r in range(unit.rows):
+                incident = sink.row_incident[line, slot + r]
+                row_bias(
+                    rows, line, slot + r, incident, dt, contact_speculative_scale, contact_w,
+                    restitution_velocity_threshold, weighted, material,
+                )  # fmt: skip
+
+    name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
+    name += ("_records" if records else "") + ("_torsion" if torsion else "")
+    # Two blocks of 256 a multiprocessor within the register file (128 registers): the four-row walker holds 166
+    # unbounded, and the bound costs it 16 B of stack (sm_120, ptxas).
+    return python_kernel(kernel, name, launch_bounds=(256, 2))
+
+
+_PUBLISH = """    if (tid >= arts.shape[0]) return;
+    const int art = arts.data[tid];
+    const int world = art_to_world.data[art], offset = world_offset.data[art];
+    if (world < 0 || offset < 0) return;
+    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+    float u[$n];
+    const float* du = delta.data + (size_t)world * delta.shape[1] + offset;
+    for (int c = 0; c < $n; ++c) u[c] = du[SUPPORT_NODE[c]];
+    // The release's transpose, the last slip first: along each path, root first (walk_rows.walk_release_kernel).
+    const int slips = release.count.data[art];
+    const int cap = release.dof.shape[1], width = release.b.shape[2];
+    for (int j = slips - 1; j >= 0; --j) {
+        const int i = release.dof.data[art * cap + j];
+        const size_t at = ((size_t)art * cap + j) * width;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        int path[$n], length = 0;
+        for (int body = walk.dof_body.data[d0 + i], c = i; body >= 0;) {
+            for (; c >= WALK_FIRST_OF(body); --c) path[length++] = c;
+            body = WALK_PARENT_OF(body);
+            if (body >= 0) c = WALK_FIRST_OF(body + 1) - 1;
+        }
+        float t = 0.0f;
+        for (int k = length - 1; k >= 0; --k) {
+            const int c = path[k];
+            const float x = g[k] * u[c] + a[k] * t;
+            u[c] = x;
+            t -= b[k] * x;
+        }
+    }
+    WALK_DOWN(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, u, u,
+              reinterpret_cast<float*>(walk.scratch.data + j0));
+    for (int c = 0; c < $n; ++c) v_out.data[d0 + c] = v_hat.data[d0 + c] + u[c];
+"""
+
+
+@cache
+def support_publish_kernel(parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...]) -> wp.Kernel:
+    """The support placement's leave (case K1), a thread per tree: ``v = v_hat + P^T L^-T R^T du`` from a world's
+    velocity change in factor coordinates (``delta``, by the support's coordinates): the release's transpose, then the
+    walk down (``WALK_DOWN``) in the rows' frame."""
+    body = substitute(_PUBLISH, n=len(node), coordinate=WALK_COORDINATE, link=WALK_LINK)
+    return KernelTemplate(
+        f"support_publish_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}",
+        (
+            ("arts", wp.array[int]),
+            ("walk", WalkTrees),
+            ("release", WalkRelease),
+            ("art_to_world", wp.array[int]),
+            ("world_offset", wp.array[int]),
+            ("delta", wp.array2d[float]),
+            ("v_hat", wp.array[float]),
+            ("v_out", wp.array[float]),
+        ),
+        body,
+        THREADS,
+        preludes=(walk_prelude(parent, first, 1), _support_table(node)),
+        dual=True,
+        native_name="support_publish_native",
+    ).kernel()

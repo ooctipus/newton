@@ -10,7 +10,6 @@ row-by-row updates, so its CUDA twins match the ordinary sweep and the physical 
 import re
 import unittest
 from itertools import product
-from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -19,20 +18,13 @@ import newton
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
-from newton._src.solvers.feather_pgs.response_builds_rows import factor_contact_rows_kernel
 from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import row_supports
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
-from newton.tests.feather_pgs_law_harness import group_rows
-from newton.tests.feather_pgs_patch_parity import row_law, standing_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_path_selection import _cpu_model
-from newton.tests.test_feather_pgs_sparse_contacts import _contact_input, _fixture
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
-from newton.tests.test_feather_pgs_sparse_solver import _make_solver
 
 TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
 # Row capacities of the suite's two launch-bound families: shared memory admits 12 blocks of 256 rows on the
@@ -92,172 +84,6 @@ def _ring_members(parents, normal):
 
 class TestContactRecordBuilder(unittest.TestCase):
     """The sparse contact builder writes each contact triplet's block record beside its rows."""
-
-    def _build(self, device, records, patch, *, lanes=8, workers=1, width=CONTACT_RECORD_FLOATS):
-        """Run the prepared support-table builder on the two-branch fixture; return its outputs.
-
-        ``lanes`` per contact and ``workers`` lane groups share the three contacts; ``width`` is
-        the record stride, wider for a linked sweep's ring members.
-        """
-
-        def array(value, dtype=float):
-            return wp.array(value, dtype=dtype, device=device)
-
-        def full(shape, value, dtype=float):
-            return wp.full(shape, value, dtype=dtype, device=device)
-
-        f = _fixture(device)
-        plan = f["plan"]
-        # A separately prescribed articulation on contact zero, as in the builder's preparation test.
-        f["shape_body"] = array([1, 2, 3, -1, 0], int)
-        f["shape1"] = array([4, 1, 3], int)
-        f["art_b"] = array([1, 0, -1], int)
-        f["group"] = array([0, 0], int)
-        f["start"] = array([0, 6], int)
-        f["origin"] = array([[0.3, -0.4, 0.7], [-0.2, 0.1, 0.4]], wp.vec3)
-        f["patches"].phi = array([[0.01, -0.02], [-0.03, 0.04], [0.0, 0.0]], wp.vec2)
-        f["patches"].enabled = patch
-        response_dofs = array([6, 0], int)
-        law = {
-            "body_v": array(np.zeros((4, 6), dtype=np.float32), wp.spatial_vector),
-            "prescribed": array([0, 1], int),
-            "material_mu": array([0.8, 0.5, 0.3, 0.6, 0.4]),
-            "material_restitution": array([0.4, 0.2, 0.5, 0.8, 0.6]),
-            "beta": 0.05,
-            "cfm": 0.03,
-            "speculative_scale": 0.65,
-            "restitution_threshold": 0.1,
-            "dt": 0.01,
-        }
-        for name in ("row_type", "row_parent"):
-            law[name] = full((1, 9), -9, int)
-        for name in ("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution", "rhs"):
-            law[name] = full((1, 9), -9.0)
-        support_plan = f["tree"].support_classes(plan.joint_ancestor_mask, 6)
-        support = row_supports(support_plan, 1, 9, device)
-        dense = full((1, 9, 6), 0.0)
-        compact = _contact_input(
-            f,
-            device,
-            response_dofs=response_dofs,
-            body_mask=f["physical_mask"],
-        )
-        wp.launch(
-            populate_world_J_for_compact_size,
-            dim=(1, 32),
-            inputs=[compact, 1, 6, f["group"], row_law(f["patches"]), group_rows(device)],
-            outputs=[dense],
-            device=device,
-        )
-        options = {"prepare_rows": True, "use_support_table": True}
-        if records:
-            options["contact_records"] = True
-        record = full((1, 3, width), -7.0)
-        outputs = {
-            "row_factor": full((1, 9, 6), -9.0),
-            "incident": full((1, 9), -9.0),
-            "diagonal": full((1, 9), -9.0),
-        }
-        data = _contact_input(
-            f,
-            device,
-            response_dofs=response_dofs,
-            diag=outputs["diagonal"],
-            **law,
-        )
-        wp.launch(
-            factor_contact_rows_kernel(6, lanes_per_contact=lanes, **options),
-            dim=workers * lanes,
-            inputs=[
-                data,
-                workers,
-                f["group"],
-                full(response_dofs.shape, 0, int),
-                full(response_dofs.shape, 0, int),
-                f["sparse_mask"],
-                row_law(f["patches"], 0.23),
-                f["indices"].permutation,
-                f["indices"].row_offsets,
-                f["packed"],
-                array(np.eye(6)[None]),
-            ],
-            outputs=[
-                full((1, 1, 1), -9, int),
-                outputs["row_factor"],
-                record if records else full((1, 9, 12), -9.0),
-                outputs["incident"],
-                support,
-            ],
-            block_dim=128,
-            device=device,
-        )
-        # The independent oracle: dense contact rows through the inverse factor, with the rows' CFM.
-        expected = dense.numpy()[0, :7][:, plan.permutation] @ f["inverse"].T
-        results = {name: value.numpy() for name, value in outputs.items()}
-        results["rhs"] = law["rhs"].numpy()
-        return results, record.numpy(), expected, law["cfm"]
-
-    def _check_records(self, device, *, lanes=8, workers=1):
-        """Check the records of the two full triplets against NumPy blocks, and the rows against the plain builder."""
-        widths = (CONTACT_RECORD_FLOATS, CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS)
-        for patch, width in product((0, 1), widths):
-            with self.subTest(patch=patch, width=width):
-                options = {"lanes": lanes, "workers": workers}
-                results, record, expected, cfm = self._build(device, True, patch, width=width, **options)
-                plain, _, _, _ = self._build(device, False, patch, **options)
-                for name, value in results.items():
-                    np.testing.assert_array_equal(value, plain[name], err_msg=name)
-                for triplet, row in ((0, 0), (1, 3)):
-                    block = expected[row : row + 3] @ expected[row : row + 3].T + cfm * np.eye(3)
-                    np.testing.assert_allclose(
-                        record[0, triplet, :4],
-                        (block[0, 1], block[0, 2], block[1, 2], 1.0 / block[0, 0]),
-                        rtol=2.0e-5,
-                        atol=2.0e-6,
-                    )
-                    # The eigenbasis relative to the larger tangent diagonal: largest along (vx, vy).
-                    tangents = block[1:, 1:] / max(block[1, 1], block[2, 2])
-                    largest, smallest, vx, vy = record[0, triplet, 4:8]
-                    np.testing.assert_allclose(
-                        (largest, smallest, vx, vy),
-                        triplets.pair_metric(block[1, 1], block[1, 2], block[2, 2]),
-                        rtol=2.0e-5,
-                        atol=2.0e-6,
-                    )
-                    np.testing.assert_allclose(sorted((smallest, largest)), np.linalg.eigvalsh(tangents), atol=2e-6)
-                    np.testing.assert_allclose(tangents @ (vx, vy), largest * np.array((vx, vy)), atol=2e-6)
-                    self.assertGreater(abs(block[0, 1]) + abs(block[0, 2]), 1e-3)
-                np.testing.assert_array_equal(record[0, 2], -7.0)
-                # The builder leaves a linked sweep's ring members to the sweep.
-                np.testing.assert_array_equal(record[0, :, CONTACT_RECORD_FLOATS:], -7.0)
-
-    def test_records_hold_each_triplets_block_cpu(self):
-        """Write W_nt1, W_nt2, W_t1t2, 1/W_nn and the pair law's tangent eigenbasis for every full triplet.
-
-        Contacts at rows 0 and 3 carry three rows, records 0 and 1; the one-row contact at
-        row 6 writes nothing. The rows the builder writes are those of the plain builder.
-        """
-        self._check_records("cpu")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Cooperative contact construction requires CUDA")
-    def test_records_hold_each_triplets_block_cuda(self):
-        """Reduce the cross terms in each lane group and write every record as the CPU builder does.
-
-        On CUDA the lanes of a contact's group reduce the three cross products with shuffles and
-        lane 0 writes the record; the rows stay bitwise those of the plain CUDA builder, across
-        group widths and grid strides.
-        """
-        for lanes, workers in ((8, 1), (8, 2), (16, 2), (32, 2)):
-            with self.subTest(lanes=lanes, workers=workers):
-                self._check_records("cuda:0", lanes=lanes, workers=workers)
-
-    def test_records_require_prepared_support_rows_cpu(self):
-        """Build records only beside prepared rows with the support table, whose routes leave the slot free."""
-        for options in ({"use_support_table": True}, {"prepare_rows": True}, {}):
-            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "records"):
-                factor_contact_rows_kernel(6, contact_records=True, **options)
-        kernel = factor_contact_rows_kernel(6, prepare_rows=True, use_support_table=True, contact_records=True)
-        self.assertTrue(kernel.key.endswith("_prepared_support_table_contact_records"))
 
 
 class TestContactUnits(unittest.TestCase):
@@ -641,51 +467,6 @@ class TestContactUnitTwins(unittest.TestCase):
                 live = np.flatnonzero(data["world_constraint_count"])
                 np.testing.assert_array_equal(impulses[live, row], initial[live, row])
                 self.assertTrue(np.all(moved[live, row] > 1.0e-3))
-
-    def test_solver_steps_match_the_ordinary_sweep_cuda(self):
-        """Build records in the contact builder and step with them as the ordinary sweep steps, both laws.
-
-        One solve from the same state matches the ordinary sweep's impulses to rounding, through
-        the builder's records; a resting and a sliding biped then keep the same trajectory,
-        within bounds that leave room for rounding to grow through contact switches. The first
-        solve must also differ from the ordinary one in some bit: a bitwise match would mean
-        nothing was fused.
-        """
-        model = standing_model("cuda:0", worlds=2)
-        for law in ("patch", "point"):
-            solvers = {}
-            for fused in ("1", "0"):
-                options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
-                if law == "point":
-                    options["friction_anchor_beta"] = 0.0
-                pins = {} if fused == "1" else {"contact_units": None}
-                with mock.patch.dict(SolverFeatherPGS._route_pins, pins):
-                    solvers[fused] = _make_solver(model, True, **options)
-            with self.subTest(law=law):
-                unit, ordinary = solvers["1"], solvers["0"]
-                self.assertIn("_contact_triplets", unit.sweep.sparse_kernel.key)
-                self.assertNotIn("_contact_triplets", ordinary.sweep.sparse_kernel.key)
-                self.assertIn("_contact_records", unit.placement.sparse_contact_response_kernel.key)
-                self.assertNotIn("_contact_records", ordinary.placement.sparse_contact_response_kernel.key)
-                width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
-                self.assertEqual(unit.placement.sparse_contact_records.shape, (model.world_count, 32, width))
-                self.assertIsNone(ordinary.placement.sparse_contact_records)
-                record = unit.get_path_selection()["routes"]["sparse_mass_matrix"]
-                self.assertNotIn("contact_transaction", record)
-                self.assertEqual(record["launch_bounds"], [64, 16])
-                trajectories = {name: self._rollout(solver, model) for name, solver in solvers.items()}
-                # Each step holds (first solve's impulses, body_q, body_qd).
-                first_unit, first_ordinary = trajectories["1"][0][0], trajectories["0"][0][0]
-                magnitude = float(np.max(np.abs(first_ordinary)))
-                self.assertGreater(magnitude, 0.0)
-                np.testing.assert_allclose(first_unit, first_ordinary, rtol=1e-4, atol=1e-4 * magnitude)
-                self.assertFalse(np.array_equal(first_unit, first_ordinary))
-                for (_, q_unit, qd_unit), (_, q_ordinary, qd_ordinary) in zip(
-                    trajectories["1"][1:], trajectories["0"][1:], strict=True
-                ):
-                    self.assertTrue(np.isfinite(q_unit).all() and np.isfinite(qd_unit).all())
-                    np.testing.assert_allclose(q_unit, q_ordinary, atol=1e-3)
-                    np.testing.assert_allclose(qd_unit, qd_ordinary, atol=5e-2)
 
     @staticmethod
     def _rollout(solver, model, *, steps=20, dt=1.0 / 400.0):

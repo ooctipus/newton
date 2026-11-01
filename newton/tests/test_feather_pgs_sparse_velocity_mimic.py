@@ -13,17 +13,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import dense_rows, field_group, response_builds_rows, sparse_contact
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as MIMIC
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
-from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
-from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
 
 
@@ -39,133 +35,6 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
             self.assertRaises(_TopologyReached),
         ):
             Sweep.admit_packed(solver, model, None)
-
-
-class TestSparseVelocityMimicRows(unittest.TestCase):
-    def _check_rows(self, device):
-        """Project the union of sibling supports and retain bilateral ERP for either sign."""
-        plan = TreePlan.build([-1, 0, 0], [2, 2, 2]).factor
-        indices = factor_indices(plan, device)
-        dofs = plan.dof_count
-        rng = np.random.default_rng(451)
-        lower = np.zeros((dofs, dofs))
-        lower[plan.entry_rows, plan.columns] = rng.normal(scale=0.06, size=plan.nonzero_count)
-        lower[np.diag_indices(dofs)] = 1.8
-        inverse = np.linalg.inv(lower)
-        packed = np.stack([scale * inverse[plan.entry_rows, plan.columns] for scale in (1.0, 1.3)])
-        velocity = np.linspace(-0.7, 0.8, 2 * dofs, dtype=np.float32)
-        position = np.zeros(2 * dofs, np.float32)
-        position[2], position[4] = 0.12, -0.2
-        union = int(plan.ancestor_mask[2]) | int(plan.ancestor_mask[4])
-        self.assertGreater(union.bit_count(), max(int(plan.ancestor_mask[i]).bit_count() for i in (2, 4)))
-
-        def array(value, dtype=float):
-            return wp.array(value, dtype=dtype, device=device)
-
-        def full(shape, value, dtype=float):
-            return wp.full(shape, value, dtype=dtype, device=device)
-
-        for offset, scale in ((0.03, -0.5), (-0.04, 1.7), (0.03, 0.0)):
-            with self.subTest(offset=offset, scale=scale):
-                kinds, parents = [full((2, 2), -9, int) for _ in range(2)]
-                mu, beta, cfm, phi, target, incident, diagonal = [full((2, 2), -9.0) for _ in range(7)]
-                row_dof = full((2, 2, dofs), -9, int)
-                factors = full((2, 2, dofs), -9.0)
-                wp.launch(
-                    response_builds_rows.factor_mimic_rows_kernel,
-                    dim=64,
-                    block_dim=128,
-                    device=device,
-                    inputs=[
-                        array([1, 0], int),
-                        array([0, 1], int),
-                        array([0, 0], int),
-                        array([0, dofs], int),
-                        array([0, -1], int),
-                        array([0, 1, 2], int),
-                        array([0, 1], int),
-                        array([2, dofs + 2], int),
-                        array([4, dofs + 4], int),
-                        array([2, dofs + 2], int),
-                        array([4, dofs + 4], int),
-                        array([offset, 0.02]),
-                        array([scale, -2.0]),
-                        array(position),
-                        0.07,
-                        2e-4,
-                        indices.ancestor_mask,
-                        indices.inverse_permutation,
-                        indices.lookup,
-                        array(packed),
-                        array(velocity),
-                    ],
-                    outputs=[
-                        field_group.upload(
-                            dense_rows.DenseRows,
-                            device,
-                            row_type=kinds,
-                            row_parent=parents,
-                            row_mu=mu,
-                            row_beta=beta,
-                            row_cfm=cfm,
-                            phi=phi,
-                            target=target,
-                            diag=diagonal,
-                            first=row_lines(device),
-                        ),
-                        row_dof,
-                        factors,
-                        incident,
-                    ],
-                )
-                for output in (kinds, parents, mu, beta, cfm, phi, target, row_dof, factors, incident, diagonal):
-                    np.testing.assert_array_equal(output.numpy()[1], -9)
-                    np.testing.assert_array_equal(output.numpy()[0, 1], -9)
-                columns = row_dof.numpy()[0, 0]
-                valid = columns >= 0
-                self.assertEqual(int(valid.sum()), union.bit_count())
-                expected = 1.3 * (
-                    inverse[:, plan.inverse_permutation[2]] - scale * inverse[:, plan.inverse_permutation[4]]
-                )
-                actual = np.zeros(dofs)
-                actual[columns[valid]] = factors.numpy()[0, 0, valid]
-                np.testing.assert_allclose(actual, expected, atol=2e-7, rtol=2e-6)
-                self.assertEqual(kinds.numpy()[0, 0], MIMIC)
-                self.assertEqual(parents.numpy()[0, 0], -1)
-                self.assertAlmostEqual(incident.numpy()[0, 0], velocity[2] - scale * velocity[4], places=6)
-                expected_phi = float(position[2]) - offset - scale * float(position[4])
-                self.assertAlmostEqual(phi.numpy()[0, 0], expected_phi, places=6)
-                rows = field_group.upload(
-                    dense_rows.DenseRows,
-                    device,
-                    row_type=kinds,
-                    phi=phi,
-                    row_beta=beta,
-                    row_cfm=cfm,
-                    target=target,
-                    rhs=full((2, 2), -9.0),
-                    diag=diagonal,
-                    first=row_lines(device),
-                )
-                wp.launch(
-                    sparse_contact.finalize_sparse_joint_limit_rows,
-                    dim=2,
-                    inputs=[array([[0, 1], [0, 0]], int), array([1, 0], int), rows, 0.0123],
-                    device=device,
-                )
-                self.assertAlmostEqual(diagonal.numpy()[0, 0], expected @ expected + 2e-4, places=6)
-                self.assertAlmostEqual(rows.rhs.numpy()[0, 0], 0.07 * expected_phi / 0.0123, places=6)
-                np.testing.assert_array_equal(rows.rhs.numpy()[1], -9)
-                self.assertEqual(rows.rhs.numpy()[0, 1], -9)
-
-    def test_union_response_and_bilateral_bias_cpu(self):
-        """Match nonunit, negative and zero-scale mimic rows on CPU."""
-        self._check_rows("cpu")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_union_response_and_bilateral_bias_cuda(self):
-        """Match the same row and CFM law across cooperative CUDA lanes."""
-        self._check_rows("cuda:0")
 
 
 def _model(offset, scale, error, device="cuda:0"):

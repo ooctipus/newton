@@ -31,7 +31,6 @@ from . import (
     field_group,
     host_index,
     packed_rows,
-    response_builds_rows,
     route_table,
     sweep_routes,
     sweep_routes_diag,
@@ -39,6 +38,7 @@ from . import (
     sweep_routes_sparse,
     sweep_routes_tiers,
     sweep_units,
+    walk_rows,
 )
 from .contact_input import bind_routes as bind_contact_routes
 from .dense_rows import bind as bind_dense_rows
@@ -531,7 +531,7 @@ class Sweep:
         """Select sparse articulation factors with independent rigid-body response blocks."""
         self.placement.sparse_mass_matrix_size = None
         self.sparse_velocity_limits = False
-        self.placement.sparse_prepare_contacts = False
+        self.support_rows = self.support_publish = self._support_sink = None
         self.placement.sparse_row_support = _SparseRowSupport()
         self.sparse_contact_triplets = False
         # Route details for get_path_selection(), set where the sparse owner is admitted.
@@ -749,8 +749,6 @@ class Sweep:
         self.sparse_local_factors = local_factors
         self.placement.sparse_max_row_support = int(max_support)
         self.sparse_velocity_limits = velocity_candidate
-        # The sparse response kernel prepares the contact rows' metadata, CFM, bias and restitution.
-        self.placement.sparse_prepare_contacts = True
         self.factor.allocate_sparse(plan, self.forest.n_arts_by_size[size])
         self.placement.sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         if use_support_table:
@@ -775,22 +773,8 @@ class Sweep:
             support=max_support,
             world_dof=self.forest.max_world_dofs,
         )
-        # The response kernel's free-body response output, where no contact records take
-        # it, and its free-body factor: placeholders, since native sparse factors decline
-        # free rigid bodies.
-        self.placement.sparse_row_free_response = self.placement.arrays.placeholder(wp.float32, (1, 1, 1))
-        self.placement.sparse_free_factor_dummy = self.placement.arrays.placeholder(wp.float32, (1, 6, 6))
-        self.placement.sparse_contact_lanes = 8
         # Contact torsion: each friction contact's spin row is the fourth of its unit.
         torsion = {"torsion": True} if self.laws.contact_torsion_enabled else {}
-        self.placement.sparse_contact_response_kernel = response_builds_rows.factor_contact_rows_kernel(
-            size,
-            lanes_per_contact=self.placement.sparse_contact_lanes,
-            prepare_rows=True,
-            use_support_table=use_support_table,
-            **({"contact_records": True} if self.placement.sparse_contact_records is not None else {}),
-            **torsion,
-        )
         self.sparse_kernel = self.kernel(
             "sparse_pgs",
             sweep_routes_sparse.sparse_kernel,
@@ -804,6 +788,79 @@ class Sweep:
             device_arch=model.device.arch,
             weighted=self.laws.set.weighted,
             **torsion,
+        )
+
+    def plan_support_walk(self) -> None:
+        """Case K1 on the walk (FL3.4): the class's writer, release and leave, once the factor holds the walk
+        (:meth:`.tree_factor.TreeFactor.plan_walk`).
+
+        The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
+        the support masks' bit, are baked into the writer (:func:`.walk_rows.support_rows_kernel`) and the leave
+        (:func:`.walk_rows.support_publish_kernel`). The writer's lane group is the smallest power of two at or above a
+        world's unit bound (its internal rows and a contact unit per three rows of the rest of its capacity), at most a
+        warp. The release is the factor's (:attr:`.tree_factor.WalkTrees.release`), built by
+        :func:`.walk_rows.walk_release_kernel`.
+
+        Raises:
+            ValueError: For a factored size whose articulations do not share one tree.
+        """
+        model, forest, factor = self.model, self.forest, self.factor
+        size = self.placement.sparse_mass_matrix_size
+        arts = forest.group_to_art_host[size]
+        start, end = model.articulation_start.numpy(), forest.articulation_joint_end_host
+        path = factor.walk_path_host
+        tables = {tuple(map(tuple, path[start[art] : end[art]])) for art in arts.tolist()}
+        if len(tables) != 1:
+            raise ValueError("The native sparse factor's articulations must share one tree")
+        table = next(iter(tables))
+        parent = tuple(int(p) for p, _ in table)
+        first = (*(int(f) for _, f in table), int(size))
+        node = tuple(int(k) for k in factor.sparse_mass_matrix_plan.inverse_permutation)
+        self.support_rows = walk_rows.support_rows_kernel(
+            parent,
+            first,
+            node,
+            records=self.placement.sparse_contact_records is not None,
+            torsion=bool(self.laws.contact_torsion_enabled),
+        )
+        self.support_publish = walk_rows.support_publish_kernel(parent, first, node)
+        capacity = int(self.placement.dense_max_constraints)
+        internal = min(int(self.placement.internal_rows_per_world(model)), capacity)
+        units = max(internal + (capacity - internal + 2) // 3, 1)
+        self.support_lanes = min(32, 1 << (units - 1).bit_length())
+
+    def support_sink(self, v_hat: wp.array) -> walk_rows.SupportSink:
+        """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.SupportSink`), bound
+        once: every array is the placement's for the solver's life."""
+        if self._support_sink is None:
+            placement, factor, forest = self.placement, self.factor, self.forest
+            sink = walk_rows.SupportSink()
+            walk = factor.walk_view()
+            sink.walk, sink.release, sink.support = walk, walk.release, placement.sparse_row_support
+            sink.body_mask = placement.sparse_body_dof_mask
+            sink.dof_mask = factor.sparse_mass_matrix_indices.ancestor_mask
+            sink.world_offset = forest.articulation_world_dof_offset
+            sink.response_dofs = forest.articulation_response_dof_count
+            sink.v_hat, sink.row_cfm, sink.diag = v_hat, placement.row_cfm, placement.diag
+            sink.row_factor, sink.row_dof = placement.sparse_row_factor, placement.sparse_row_dof
+            sink.row_incident = placement.row_incident
+            records = placement.sparse_contact_records
+            sink.records = records if records is not None else placement.sparse_row_factor
+            self._support_sink = sink
+        return self._support_sink
+
+    def release_walk(self, v_hat: wp.array) -> None:
+        """Case K1: the release of every tree whose predictor decided a set this step (:func:`.walk_rows.walk_release_kernel`),
+        before the writer reads it; nothing where no drive can slip."""
+        factor = self.factor
+        if not factor.walk_slip_capacity:
+            return
+        size = self.placement.sparse_mass_matrix_size
+        wp.launch(
+            walk_rows.walk_release_kernel,
+            dim=self.forest.n_arts_by_size[size],
+            inputs=[self.forest.group_to_art[size], factor.walk_view(), factor.walk_slips(), v_hat],
+            device=self.model.device,
         )
 
     def admit_paired(self) -> None:
@@ -1645,13 +1702,22 @@ class Sweep:
             support=placement.sparse_row_support,
             contact_records=placement.sparse_contact_records,
         )
-        self.factor.leave(
-            operands["v_out"],
-            size=placement.sparse_mass_matrix_size,
-            indices=self.factor.sparse_mass_matrix_indices,
-            Linv=self.factor.sparse_Linv,
-            delta=placement.sparse_factor_velocity_delta,
-            base=operands["v_hat"],
+        # The leave in the rows' frame: the release's transpose, then the walk down (walk_rows.support_publish_kernel).
+        size = placement.sparse_mass_matrix_size
+        wp.launch(
+            self.support_publish,
+            dim=self.forest.n_arts_by_size[size],
+            inputs=[
+                self.forest.group_to_art[size],
+                self.factor.walk_view(),
+                self.factor.walk_view().release,
+                self.forest.art_to_world,
+                self.forest.articulation_world_dof_offset,
+                placement.sparse_factor_velocity_delta,
+                operands["v_hat"],
+                operands["v_out"],
+            ],
+            device=self.model.device,
         )
 
     def _solve_diagonal(self, operands: dict) -> None:

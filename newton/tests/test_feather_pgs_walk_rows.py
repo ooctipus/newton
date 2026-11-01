@@ -385,6 +385,114 @@ class TestLocalSlipFrame(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# The release (case K1): the decided factor's rows from the all-K walk, each inside its support
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def release_path(path: np.ndarray, n: int, dof_body: np.ndarray, i: int) -> list:
+    """Coordinate ``i``'s path in its tree, leaf first: its body's coordinates from ``i`` down, then each ancestor's
+    from its last (``path``: each body's parent and first coordinate)."""
+    out, body, c = [], int(dof_body[i]), i
+    while body >= 0:
+        while c >= int(path[body][1]):
+            out.append(c)
+            c -= 1
+        body = int(path[body][0])
+        if body >= 0:
+            c = (int(path[body + 1][1]) if body + 1 < path.shape[0] else n) - 1
+    return out
+
+
+def release_rows(release, art: int, n: int, path: np.ndarray, dof_body: np.ndarray, Z: np.ndarray) -> np.ndarray:
+    """The release of :func:`.walk_rows.walk_release_kernel` (its device data, by path step) applied to the columns of
+    ``Z`` (by tree coordinate), slip by slip as the writer applies it: ``u = z - b s``, ``s += a u``, ``z = g u``."""
+    Z = Z.astype(np.float64).copy()
+    b, a, g = (getattr(release, k).numpy()[art].astype(np.float64) for k in ("b", "a", "g"))
+    for j in range(int(release.count.numpy()[art])):
+        steps = release_path(path, n, dof_body, int(release.dof.numpy()[art, j]))
+        s = np.zeros(Z.shape[1])
+        for t, c in enumerate(steps):
+            u = Z[c] - b[j, t] * s
+            s = s + a[j, t] * u
+            Z[c] = g[j, t] * u
+    return Z
+
+
+def released(solver, joint_q: np.ndarray, art: int = 0):
+    """The solver's release of ``art``'s slipping drives this step (the factor's :attr:`.tree_factor.WalkTrees.release`)
+    on its walk, and the float64 walk's columns ``B = L^-1`` (by coordinate), the all-``K`` operator ``A = (B^T B)^-1``
+    and the released stiffness of each coordinate."""
+    factor, forest = solver.factor, solver.forest
+    n = int(forest.articulation_dof_count_host[art])
+    release = factor.walk_view().release
+    status = int(factor.walk_release_status.numpy()[0])
+    walk = factor.walk(joint_q, art)
+    B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
+    K = factor.aug_row_K.numpy()[:n].astype(np.float64)
+    Kd = factor.aug_row_Kd.numpy()[:n].astype(np.float64)
+    j0 = int(solver.model.articulation_start.numpy()[art])
+    path = factor.walk_path_host[j0 : j0 + int(forest.articulation_joint_end_host[art]) - j0]
+    d0 = int(forest.articulation_dof_start_host[art])
+    dof_body = factor.walk_view().dof_body.numpy()[d0 : d0 + n]
+    return release, status, B, np.linalg.inv(B.T @ B), K - Kd, path, dof_body
+
+
+class TestSupportSlipRelease(unittest.TestCase):
+    """The release of H7's decided set on the all-``K`` walk (case K1's slips): ``R L^-1`` is the decided factor's
+    inverse, its Gram the decided operator, and it keeps every column inside its path (the support sink's rows)."""
+
+    def test_release_is_the_decided_factor(self):
+        model, control = slipping_hinges("cpu")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=30, enable_joint_limits=True)
+        state, out = model.state(), model.state()
+        joint_q = state.joint_q.numpy().astype(np.float64)
+        solver.step(state, out, control, None, 1.0 / 60.0)
+        release, status, B, A, slip_K, path, dof_body = released(solver, joint_q)
+        self.assertEqual(status, 0)
+        self.assertEqual(int(release.count.numpy()[0]), 3)
+        n = B.shape[0]
+        B_F = release_rows(release, 0, n, path, dof_body, B)
+        decided = np.linalg.inv(A - np.diag(slip_K))
+        scale = np.linalg.norm(decided)
+        self.assertLess(np.linalg.norm(B_F.T @ B_F - decided) / scale, 1.0e-5)
+        self.assertGreater(np.linalg.norm(B.T @ B - decided) / scale, 1.0e-1)
+        # The release keeps each column inside its path: R L^-1 is the decided factor's L_F^-1, of L's pattern.
+        self.assertTrue(np.all(B_F[np.abs(B) == 0.0] == 0.0))
+        # The leave takes the release's transpose (walk_rows.support_publish_kernel): dv = L^-T R^T du, the decided
+        # factor's leave, against the float64 walk of R^T du.
+        from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
+
+        path_table = tuple(int(p) for p, _ in path)
+        first = (*(int(f) for _, f in path), n)
+        publish = walk_rows.support_publish_kernel(path_table, first, tuple(range(n)))
+        du = np.random.default_rng(5).normal(size=(1, n)).astype(np.float32)
+        v_hat = wp.zeros(n, dtype=float, device="cpu")
+        v_out = wp.zeros(n, dtype=float, device="cpu")
+        forest = solver.forest
+        wp.launch(
+            publish,
+            dim=1,
+            inputs=[
+                wp.array([0], dtype=wp.int32, device="cpu"),
+                solver.factor.walk_view(),
+                release,
+                forest.art_to_world,
+                forest.articulation_world_dof_offset,
+                wp.array(du, device="cpu"),
+                v_hat,
+                v_out,
+            ],
+            device="cpu",
+        )
+        R = release_rows(release, 0, n, path, dof_body, np.eye(n))
+        walk = solver.factor.walk(joint_q, 0)
+        expected = walk.down(R.T @ du[0].astype(np.float64))[0]
+        self.assertLess(np.linalg.norm(v_out.numpy() - expected) / np.linalg.norm(expected), 1.0e-5)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # One frame per placement: the walked rows and the leave of the general worlds
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -623,6 +731,178 @@ class TestPairedPlacement(unittest.TestCase):
                 self.assertLess(worst["rows"], BOUND, worst)
                 self.assertLess(worst["free_rows"], BOUND, worst)
                 self.assertLess(worst["leave"], BOUND, worst)
+# ---------------------------------------------------------------------------------------------------------------------
+# The support placement (case K1, CUDA): its rows from the support sink, one frame with its leave, the release
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def support_rows(solver) -> dict:
+    """Case K1's rows from its support sink, by ``(world, row)``: each side's footprints by tree coordinate
+    ``{art: z}``, read through the support table or the explicit coordinates (factor coordinates, the plan's
+    ``permutation`` back to the tree's)."""
+    forest, placement, factor = solver.forest, solver.placement, solver.factor
+    perm = np.asarray(factor.sparse_mass_matrix_plan.permutation)
+    size = int(placement.sparse_mass_matrix_size)
+    Z = placement.sparse_row_factor.numpy().astype(np.float64)
+    table = bool(placement.sparse_row_support.enabled)
+    if table:
+        row_class = placement.sparse_row_support.row_class.numpy()
+        class_dof = placement.sparse_row_support.class_dof.numpy()
+    else:
+        row_dof = placement.sparse_row_dof.numpy()
+    offsets = forest.articulation_world_dof_offset.numpy()
+    art_world = forest.art_to_world.numpy()
+    arts = forest.group_to_art_host[size]
+    counts, first = placement.constraint_count.numpy(), placement.dense_first.numpy()
+    out = {}
+    for world in range(int(forest.world_count)):
+        line = int(first[world])
+        mine = [int(a) for a in arts if art_world[a] == world]
+        for row in range(min(int(counts[world]), Z.shape[1])):
+            sides = {}
+            for e in range(Z.shape[2]):
+                coordinate = int(class_dof[row_class[line, row], e] if table else row_dof[line, row, e])
+                if coordinate < 0:
+                    continue
+                for art in mine:
+                    local = coordinate - int(offsets[art])
+                    if 0 <= local < size:
+                        sides.setdefault(art, np.zeros(size))[perm[local]] = Z[line, row, e]
+            out[(world, row)] = sides
+    return out
+
+
+def support_frames(solver, joint_q: np.ndarray) -> dict:
+    """Case K1's rows against their physical ``J v_hat`` and its leave against the float64 walk's, as
+    :func:`walked_frames` reads the general placement's. A slipping tree's rows are the release ``R`` of the walk's
+    (:func:`.tree_factor.walk_release_tree`, its device data): ``z . R^-T u_hat`` is ``J v_hat`` and the leave is the
+    walk down of ``R^T du``."""
+    forest, placement, factor = solver.forest, solver.placement, solver.factor
+    size = int(placement.sparse_mass_matrix_size)
+    starts = forest.articulation_dof_start.numpy()
+    joint_start = solver.model.articulation_start.numpy()
+    release = solver.factor.walk_view().release
+    incident = placement.row_incident.numpy().astype(np.float64)
+    impulses = placement.impulses.numpy().astype(np.float64)
+    first = placement.dense_first.numpy()
+    dof_body = factor.walk_view().dof_body.numpy()
+    v_hat, v_out = solver.v_hat.numpy().astype(np.float64), solver.v_out.numpy().astype(np.float64)
+    trees, out = {}, {"rows": 0.0, "leave": 0.0, "rows_checked": 0, "trees": 0, "rows_seen": 0, "slipping": 0}
+    du = {}
+
+    def tree_of(art):
+        """The float64 walk at the step's coordinates, its ``u_hat = L^T P v_hat`` and the release ``R``."""
+        if art not in trees:
+            walk = factor.walk(joint_q, art)
+            inverse, _ = walk.up(covector=np.eye(size))
+            u_hat = np.linalg.solve(inverse.T, v_hat[int(starts[art]) : int(starts[art]) + size])
+            j0, d0 = int(joint_start[art]), int(starts[art])
+            path = factor.walk_path_host[j0 : j0 + int(forest.articulation_joint_end_host[art]) - j0]
+            R = release_rows(release, art, size, path, dof_body[d0 : d0 + size], np.eye(size))
+            trees[art] = (walk, u_hat, R)
+            out["slipping"] += int(release.count.numpy()[art] > 0)
+        return trees[art]
+
+    for (world, row), sides in support_rows(solver).items():
+        line = int(first[world])
+        out["rows_seen"] += 1
+        term, zz, uu = 0.0, 0.0, 0.0
+        for art, z in sides.items():
+            _, u_hat, R = tree_of(art)
+            u = np.linalg.solve(R.T, u_hat)
+            term += z @ u
+            zz, uu = zz + z @ z, uu + u @ u
+            du[art] = du.get(art, np.zeros(size)) + z * impulses[line, row]
+        bound = size * ROUNDING * np.sqrt(zz * uu) + ROUNDING * abs(incident[line, row])
+        if sides and bound > 0.0:
+            out["rows"] = max(out["rows"], abs(term - incident[line, row]) / bound)
+            out["rows_checked"] += 1
+    for art, delta in du.items():
+        if not np.any(delta):
+            continue
+        walk, _, R = tree_of(art)
+        dofs = int(starts[art]) + np.arange(size)
+        expected = walk.down(R.T @ delta)[0]
+        inverse, _ = walk.up(covector=np.eye(size))
+        kappa = float(np.linalg.cond(inverse))
+        published = 2.0 * ROUNDING * (np.linalg.norm(v_out[dofs]) + np.linalg.norm(v_hat[dofs]))
+        bound = size * ROUNDING * kappa * np.linalg.norm(expected) + published
+        out["leave"] = max(out["leave"], np.linalg.norm(v_out[dofs] - v_hat[dofs] - expected) / bound)
+        out["trees"] += 1
+    return out
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "native sparse factors (case K1) run on CUDA")
+class TestSupportPlacement(unittest.TestCase):
+    """Case K1 on the walk (FL3.4): the support sink's rows and the walk's leave in one frame, and a slipping drive's
+    release on its rows."""
+
+    def test_one_frame_on_the_support_placement(self):
+        from newton.tests import feather_pgs_sparse_scene as scene  # noqa: PLC0415
+
+        worst, rows, trees, seen = {"rows": 0.0, "leave": 0.0}, 0, 0, []
+        # Every step refreshes, so the float64 walk at the step's coordinates is the device's factor.
+        for shape, options in (
+            ({}, {"update_mass_matrix_interval": 1}),
+            ({"foot": "box"}, {"friction_anchor_beta": 0.2, "update_mass_matrix_interval": 1}),
+            ({"floating": False, "depth": 3}, {"update_mass_matrix_interval": 1}),
+        ):
+            with self.subTest(shape=shape, options=options):
+                case = scene.make_case(True, options=options, **shape)
+                solver = case[1]
+                self.assertEqual(solver.routes.case, "K1")
+                # Every step: a bouncing foot holds rows on some steps only.
+                for _ in range(6):
+                    joint_q = solver.cut.mirror(case[2]).joint_q.numpy().astype(np.float64)
+                    scene.step(case)
+                    result = support_frames(solver, joint_q)
+                    rows, trees = rows + result["rows_checked"], trees + result["trees"]
+                    seen.append((result["rows_seen"], result["slipping"]))
+                    for key, value in worst.items():
+                        worst[key] = max(value, result[key])
+        self.assertGreater(rows, 0, seen)
+        self.assertGreater(trees, 0, seen)
+        self.assertLess(worst["rows"], BOUND, worst)
+        self.assertLess(worst["leave"], BOUND, worst)
+
+    def test_rows_take_the_decided_operator(self):
+        model, control = slipping_hinges("cuda:0")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Velocity rows admit native sparse factors on a chain.
+            solver = SolverFeatherPGS(
+                model,
+                angular_damping=0.0,
+                pgs_iterations=30,
+                enable_joint_limits=True,
+                enable_joint_velocity_limits=True,
+            )
+        self.assertEqual(solver.routes.case, "K1")
+        state, out = model.state(), model.state()
+        joint_q = state.joint_q.numpy().astype(np.float64)
+        solver.step(state, out, control, None, 1.0 / 60.0)
+        release = solver.factor.walk_view().release
+        self.assertEqual(int(release.count.numpy()[0]), 3)
+        walk = solver.factor.walk(joint_q, 0)
+        n = walk.s.shape[0]
+        B = np.stack([walk.up(covector=np.eye(n)[i])[0] for i in range(n)], axis=1)
+        K = solver.factor.aug_row_K.numpy()[:n].astype(np.float64)
+        Kd = solver.factor.aug_row_Kd.numpy()[:n].astype(np.float64)
+        path = solver.factor.walk_path_host[:3]
+        dof_body = solver.factor.walk_view().dof_body.numpy()[:n]
+        R = release_rows(release, 0, n, path, dof_body, np.eye(n))
+        sides = [z for (_, _), z in sorted(support_rows(solver).items())]
+        Z = np.array([z[0] for z in sides if 0 in z])
+        self.assertGreater(Z.shape[0], 0)
+        # A stored row is z = R B J^T: J = Z R^-T B^-T; its Gram is the decided operator's, not the all-K one's.
+        J = Z @ np.linalg.inv(R).T @ np.linalg.inv(B).T
+        A = np.linalg.inv(B.T @ B)
+        W_rows = Z @ Z.T
+        W_decided = J @ np.linalg.solve(A - np.diag(K - Kd), J.T)
+        W_all = J @ np.linalg.solve(A, J.T)
+        scale_W = np.linalg.norm(W_decided)
+        self.assertLess(np.linalg.norm(W_rows - W_decided) / scale_W, 1.0e-4)
+        self.assertGreater(np.linalg.norm(W_all - W_decided) / scale_W, 1.0e-1)
 
 
 if __name__ == "__main__":

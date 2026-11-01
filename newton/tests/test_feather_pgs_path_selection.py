@@ -174,11 +174,9 @@ def _plan_stand_in(law, sizes=(108, 6), case="K6", **attributes):
         "keyed_rows": None,
         "compact_contact_boundary": False,
         "sparse_mass_matrix_size": None,
-        "sparse_prepare_contacts": False,
         "sparse_diagonal_response_size": None,
         "sparse_diagonal_contact_triples": False,
         "sparse_diagonal_contact_units": False,
-        "sparse_contact_response_kernel": None,
         "walks": False,
     }
     for name, value in attributes.items():
@@ -559,7 +557,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
-        response = SimpleNamespace(key="factor_contact_rows_stand_in")
+        response = SimpleNamespace(key="support_rows_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
         per_contact = ["populate_world_J_for_size"]
         named, methods = set(), set()
@@ -572,7 +570,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 "sweep": SimpleNamespace(sparse_contact_marker=marker),
             }
             schedule = {"sparse_diagonal_contact_triples": point, "sparse_diagonal_contact_units": not point}
-            sparse = {"case": "K1", "sparse_mass_matrix_size": 18, "sparse_contact_response_kernel": response}
+            sparse = {
+                "case": "K1",
+                "sparse_mass_matrix_size": 18,
+                "walks": True,
+                "sweep": SimpleNamespace(support_rows=response),
+            }
 
             def same(sizes, method, kernels):
                 return dict.fromkeys(sizes, (method, kernels))
@@ -600,12 +603,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         6: ("compact_contact_boundary", ["clear_contact_response", "produce_contacts"]),
                     },
                 ),
-                (
-                    {**sparse, "sparse_prepare_contacts": True},
-                    (18,),
-                    "sparse_contact_response",
-                    {18: ("sparse_response", [response.key])},
-                ),
+                (sparse, (18,), "walk", {18: ("walk", ["write_contact_units", response.key])}),
                 (
                     {**diagonal, **schedule},
                     (108, 6),
@@ -1054,11 +1052,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(record["law"], law)
                     assert_row_builders_named(self, record, keys)
                     if name == "sparse" and law == "point":
-                        # Point friction takes the tripod's native sparse factors, which prepare its rows.
-                        self.assertEqual(record["producer"], "sparse_contact_response")
+                        # Point friction takes the tripod's native sparse factors: the one writer into their sink.
+                        self.assertEqual(record["producer"], "walk")
                         (entry,) = record["builder_by_dof"].values()
-                        self.assertEqual(entry["method"], "sparse_response")
-                        self.assertEqual(entry["kernels"], [solver.placement.sparse_contact_response_kernel.key])
+                        self.assertEqual(entry["method"], "walk")
+                        self.assertEqual(entry["kernels"], ["write_contact_units", solver.sweep.support_rows.key])
                     if name == "compact_jacobian":
                         # A class of the local owners walks through the one writer (FL3.6); one that keeps the compact
                         # Jacobian names its builders.

@@ -82,7 +82,6 @@ from .solver_fields import (
     Mimics,
     Preelim,
 )
-from .sparse_contact import finalize_sparse_joint_limit_rows
 
 __all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_prescale_launch"]
 
@@ -628,44 +627,6 @@ class RowLaws:
                 if size not in self.mimic_sizes:
                     continue
                 n_arts = solver.forest.n_arts_by_size[size]
-                if solver.sweep.sparse_velocity_limits and size == solver.placement.sparse_mass_matrix_size:
-                    indices = solver.factor.sparse_mass_matrix_indices
-                    wp.launch(
-                        response_builds_rows.factor_mimic_rows_kernel,
-                        dim=n_arts * 32,
-                        inputs=[
-                            solver.forest.group_to_art[size],
-                            solver.forest.art_to_world,
-                            solver.forest.articulation_world_dof_offset,
-                            solver.forest.articulation_dof_start,
-                            self.mimic_slot,
-                            self._mimic_art_start,
-                            self._mimic_art_list,
-                            self._mimic_dof0,
-                            self._mimic_dof1,
-                            self._mimic_q0,
-                            self._mimic_q1,
-                            model.constraint_mimic_coef0,
-                            model.constraint_mimic_coef1,
-                            state_in.joint_q,
-                            solver.options.pgs_beta,
-                            solver.options.pgs_cfm,
-                            indices.ancestor_mask,
-                            indices.inverse_permutation,
-                            indices.lookup,
-                            solver.factor.sparse_Linv,
-                            solver.v_hat,
-                        ],
-                        outputs=[
-                            dense_rows,
-                            solver.placement.sparse_row_dof,
-                            solver.placement.sparse_row_factor,
-                            solver.placement.row_incident,
-                        ],
-                        block_dim=128,
-                        device=model.device,
-                    )
-                    continue
                 wp.launch(
                     populate_mimic_J_for_size,
                     dim=n_arts,
@@ -760,33 +721,6 @@ class RowLaws:
                 if size not in self.joint_limit_sizes or size in solver.placement.fused_diagonal_joint_limit_sizes:
                     continue
                 n_arts = solver.forest.n_arts_by_size[size]
-                if size == solver.placement.sparse_mass_matrix_size:
-                    indices = solver.factor.sparse_mass_matrix_indices
-                    wp.launch(
-                        response_builds_rows.factor_limit_rows_kernel,
-                        dim=n_arts * 32,
-                        inputs=[
-                            solver.forest.group_to_art[size],
-                            solver.forest.art_to_world,
-                            solver.forest.articulation_world_dof_offset,
-                            solver.forest.articulation_dof_start,
-                            law,
-                            indices.ancestor_mask,
-                            indices.inverse_permutation,
-                            indices.lookup,
-                            solver.factor.sparse_Linv,
-                            solver.v_hat,
-                        ],
-                        outputs=[
-                            solver.placement.sparse_row_dof,
-                            solver.placement.sparse_row_factor,
-                            solver.placement.row_incident,
-                            solver.placement.sparse_row_support,
-                        ],
-                        block_dim=128,
-                        device=model.device,
-                    )
-                    continue
                 warp_kernel = self.joint_limit_warp_kernels.get(size)
                 if warp_kernel is not None:
                     wp.launch_tiled(
@@ -895,37 +829,6 @@ class RowLaws:
         ):
             for size in solver.forest.size_groups:
                 n_arts = solver.forest.n_arts_by_size[size]
-                if solver.sweep.sparse_velocity_limits and size == solver.placement.sparse_mass_matrix_size:
-                    indices = solver.factor.sparse_mass_matrix_indices
-                    wp.launch(
-                        response_builds_rows.factor_velocity_limit_rows_kernel,
-                        dim=n_arts * 32,
-                        inputs=[
-                            solver.forest.group_to_art[size],
-                            solver.forest.art_to_world,
-                            solver.forest.articulation_world_dof_offset,
-                            solver.forest.articulation_dof_start,
-                            model.joint_velocity_limit,
-                            self.velocity_limit_slot,
-                            self.velocity_limit_sign,
-                            solver.options.pgs_cfm,
-                            indices.ancestor_mask,
-                            indices.inverse_permutation,
-                            indices.lookup,
-                            solver.factor.sparse_Linv,
-                            solver.v_hat,
-                        ],
-                        outputs=[
-                            dense_rows,
-                            solver.placement.sparse_row_dof,
-                            solver.placement.sparse_row_factor,
-                            solver.placement.row_incident,
-                            solver.placement.sparse_row_support,
-                        ],
-                        block_dim=128,
-                        device=model.device,
-                    )
-                    continue
                 wp.launch(
                     populate_joint_velocity_limit_J_for_size,
                     dim=n_arts * int(size) * 2,
@@ -1037,45 +940,6 @@ class RowLaws:
                 contact_jacobian_workers = min(rows, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in solver.forest.size_groups:
                     method = plan.methods[size]
-                    if method == "sparse_response":
-                        indices = solver.factor.sparse_mass_matrix_indices
-                        sparse_contact_workers = min(
-                            contact_build_threads,
-                            contact_jacobian_workers * 32 // solver.placement.sparse_contact_lanes,
-                        )
-                        pool.launch(
-                            solver.placement.sparse_contact_response_kernel,
-                            sparse_contact_workers * solver.placement.sparse_contact_lanes,
-                            inputs=[
-                                contact_input,
-                                sparse_contact_workers,
-                                solver.forest.art_group_idx,
-                                solver.forest.is_free_rigid,
-                                solver.forest.articulation_world_dof_offset,
-                                solver.placement.sparse_body_dof_mask,
-                                law,
-                                indices.permutation,
-                                indices.row_offsets,
-                                solver.factor.sparse_Linv,
-                                solver.placement.sparse_free_factor_dummy,
-                            ],
-                            outputs=[
-                                solver.placement.sparse_row_dof,
-                                solver.placement.sparse_row_factor,
-                                # The record builder writes the triplet records in the free-response
-                                # slot, which the support table's routes leave unused.
-                                solver.placement.sparse_row_free_response
-                                if solver.placement.sparse_contact_records is None
-                                else solver.placement.sparse_contact_records,
-                                solver.placement.row_incident,
-                                solver.placement.sparse_row_support,
-                            ],
-                            extent=count,
-                            scale=solver.placement.sparse_contact_lanes,
-                            clamp=True,
-                            block_dim=128,
-                        )
-                        continue
                     if method == "sparse_diagonal":
                         continue  # sparse_pair_contact_rows_kernel below writes these rows.
                     pool.launch(
@@ -1352,13 +1216,6 @@ class RowLaws:
             outputs=[solver.placement.constraint_count, solver.placement.constraint_capacity_status],
             device=model.device,
         )
-        if solver.placement.sparse_prepare_contacts:
-            wp.launch(
-                finalize_sparse_joint_limit_rows,
-                dim=solver.forest.world_count,
-                inputs=[solver.placement.dense_phase_bounds, solver.placement.constraint_count, dense_rows, dt],
-                device=model.device,
-            )
         if solver.placement.keyed_rows is not None:
             solver.placement.keyed_rows.finish_rows()
         # The patch link runs after every row producer: the keyed rows' general worlds take their records last.
@@ -1370,8 +1227,7 @@ class RowLaws:
     def write_rhs(self, solver, dt: float) -> None:
         """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``)."""
         if (
-            solver.placement.sparse_prepare_contacts
-            or solver.placement.row_packets is not None
+            solver.placement.row_packets is not None
             or solver.placement.keyed_rows is not None
             or solver.placement.walks
         ):
@@ -1398,10 +1254,14 @@ class RowLaws:
         )
 
     def write_walked(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
-        """The general placement's one writer (:func:`.walk_rows.walked_rows_kernel`), once the predictor's ``v_hat`` and
-        its decided set are known: a world's lanes release its trees' slips, write and close its bilateral blocks, then
-        walk every other row into the packed rows with its diagonal, incident velocity and rhs, corrected on the blocks
-        it touches."""
+        """The one writer: every dense row's seed walked into its placement's sink, its diagonal, incident velocity and
+        rhs, once the predictor's ``v_hat`` and its decided set are known. The general placement's
+        (:func:`.walk_rows.walked_rows_kernel`): a world's lanes release its trees' slips, write and close its bilateral
+        blocks, then walk every other row into the packed rows, corrected on the blocks it touches. The support
+        placement's (case K1, :meth:`write_support`)."""
+        if solver.routes.case == "K1":
+            self.write_support(solver, state_in, contacts, dt)
+            return
         placement, factor, model = solver.placement, solver.factor, solver.model
         # Without contacts no row is a contact's: the writer reads no contact input.
         contact_input = (
@@ -1450,6 +1310,43 @@ class RowLaws:
             inputs=inputs,
             outputs=[placement.packed_Z, placement.row_incident],
             block_dim=walk_rows.WRITER_THREADS,
+            device=model.device,
+        )
+
+    def write_support(self, solver, state_in, contacts: Contacts | None, dt: float) -> None:
+        """Case K1's writer (:func:`.walk_rows.support_rows_kernel`), after the release of this step's slipping drives
+        (:meth:`.sweep_plan.SweepPlan.release_walk`): a world's lane group over its units, into the support sink."""
+        placement, model, sweep = solver.placement, solver.model, solver.sweep
+        sweep.release_walk(solver.v_hat)
+        contact_input = (
+            bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
+            if contacts is not None
+            else ContactInput()
+        )
+        mimics = self.mimic_count > 0
+        dummy_int, dummy_float = placement.dummy_is_free_rigid, placement.contact_row_eps_dummy.flatten()
+        wp.launch(
+            sweep.support_rows,
+            dim=(solver.forest.world_count, sweep.support_lanes),
+            inputs=[
+                bind_dense_rows(placement),
+                placement.unit_source,
+                placement.constraint_count,
+                sweep.support_lanes,
+                contact_input,
+                patch_row_law(solver),
+                sweep.support_sink(solver.v_hat),
+                self._mimic_dof0 if mimics else dummy_int,
+                self._mimic_dof1 if mimics else dummy_int,
+                model.constraint_mimic_coef1 if mimics else dummy_float,
+                self.velocity_limit_sign if self.velocity_limit_slot is not None else dummy_float,
+                dt,
+                solver.options.contact_speculative_scale,
+                self.contact_w,
+                self.effective_restitution_velocity_threshold,
+                int(self.set.weighted),
+                int(solver.options.contact_compliance),
+            ],
             device=model.device,
         )
 

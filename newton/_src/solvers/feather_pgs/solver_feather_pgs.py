@@ -715,8 +715,9 @@ class SolverFeatherPGS(SolverBase):
         # writer and the sweeps' leaves read it. The local owners' packets walk their seeds in their kernel and the one
         # writer their general worlds' rows; every local kernel leaves by the walk. Rows that the tiers sweep (case K4,
         # their keyed rows) keep the old pack until their owner converts (FL3.7): its sweep whitens its worlds' J in the
-        # kernel.
-        self.placement.walks = bool(
+        # kernel. The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support
+        # sink.
+        self.placement.walks = self.routes.case == "K1" or bool(
             self.routes.case in ("K6", "K5", "K3")
             and self.placement.mf_sweeps
             and self.placement.keyed_rows is None
@@ -733,6 +734,8 @@ class SolverFeatherPGS(SolverBase):
         if self.placement.walks:
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
             self.placement.hold_units()
+            if self.routes.case == "K1":
+                self.sweep.plan_support_walk()
         self.sweep.build()
         self.sweep.open_streams(overlap=not _FPGS_SYNC_TIMINGS)
         self.placement.allocate_placeholders()

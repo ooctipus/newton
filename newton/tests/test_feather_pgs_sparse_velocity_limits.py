@@ -13,20 +13,16 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, response_builds_rows
-from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
-from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
-from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import unpacked_rows
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -82,136 +78,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
                 Sweep.admit_packed(solver, model, None)
                 self.assertFalse(solver.sparse_velocity_limits)
                 self.assertIsNone(solver.placement.sparse_mass_matrix_size)
-
-
-class TestSparseVelocityLimitRows(unittest.TestCase):
-    def _check_rows(self, device):
-        """Project signed columns with permuted groups, empty worlds and bounded slots."""
-        for counts in ((2, 2, 2), (2, 19, 19)):
-            for capacity, table in ((4, False), (5, False), (9, False), (4, True), (5, True), (9, True)):
-                with self.subTest(counts=counts, capacity=capacity, table=table):
-                    tree = TreePlan.build([-1, 0, 0], counts)
-                    plan = tree.factor
-                    dofs = plan.dof_count
-                    width = max(int(mask).bit_count() for mask in plan.ancestor_mask)
-                    rng = np.random.default_rng(932)
-                    lower = np.zeros((dofs, dofs))
-                    lower[plan.entry_rows, plan.columns] = rng.normal(scale=0.04, size=plan.nonzero_count)
-                    lower[np.diag_indices(dofs)] = 1.7
-                    inverse = np.linalg.inv(lower)
-                    packed = np.stack([scale * inverse[plan.entry_rows, plan.columns] for scale in (1.0, 1.3)])
-                    indices = factor_indices(plan, device)
-
-                    def array(values, dtype=float):
-                        return wp.array(values, dtype=dtype, device=device)
-
-                    def full(shape, value, dtype=float):
-                        return wp.full(shape, value, dtype=dtype, device=device)
-
-                    slots = np.full(4 * dofs, -1, np.int32)
-                    signs = np.zeros(4 * dofs, np.float32)
-                    limits = np.full(2 * dofs, 0.25, np.float32)
-                    velocity = rng.normal(size=2 * dofs).astype(np.float32)
-                    live = []
-                    # Articulation zero belongs to factor group one; articulation one stays empty.
-                    # Capacity four retains only the lower side of the middle DOF's pair.
-                    for dof in (0, dofs // 2, dofs - 1):
-                        for side, sign in enumerate((1.0, -1.0)):
-                            row = 1 + len(live)
-                            live.append((row, dof, sign))
-                            if row < capacity:
-                                slots[2 * dof + side] = row
-                                signs[2 * dof + side] = sign
-                    limits[dofs // 2] = np.inf  # Preserve the existing fraction-zero allocation law.
-                    support = _SparseRowSupport()
-                    support_plan = None
-                    if table:
-                        support_plan = tree.support_classes(np.zeros(0, np.uint64), width)
-                        self.assertIsNotNone(support_plan)
-                        support = row_supports(support_plan, 2, capacity, device)
-                        support.row_class.fill_(-9)
-                    kinds, parents = [full((2, capacity), -9, int) for _ in range(2)]
-                    mu, beta, cfm, phi, target, incident, diagonal = [full((2, capacity), -9.0) for _ in range(7)]
-                    row_dof = full((1, 1, 1) if table else (2, capacity, width), -9, int)
-                    factors = full((2, capacity, width), -9.0)
-                    wp.launch(
-                        response_builds_rows.factor_velocity_limit_rows_kernel,
-                        dim=64,
-                        block_dim=128,
-                        device=device,
-                        inputs=[
-                            array([1, 0], int),
-                            array([0, 1], int),
-                            array([0, 0], int),
-                            array([0, dofs], int),
-                            array(limits),
-                            array(slots, int),
-                            array(signs),
-                            2e-4,
-                            indices.ancestor_mask,
-                            indices.inverse_permutation,
-                            indices.lookup,
-                            array(packed),
-                            array(velocity),
-                        ],
-                        outputs=[
-                            field_group.upload(
-                                DenseRows,
-                                device,
-                                row_type=kinds,
-                                row_parent=parents,
-                                row_mu=mu,
-                                row_beta=beta,
-                                row_cfm=cfm,
-                                phi=phi,
-                                target=target,
-                                diag=diagonal,
-                                first=row_lines(device),
-                            ),
-                            row_dof,
-                            factors,
-                            incident,
-                            support,
-                        ],
-                    )
-                    outputs = [
-                        a.numpy() for a in (kinds, parents, mu, beta, cfm, phi, target, factors, incident, diagonal)
-                    ]
-                    for values in outputs:
-                        np.testing.assert_array_equal(values[1], -9)
-                        np.testing.assert_array_equal(values[0, 0], -9)
-                        np.testing.assert_array_equal(values[0, 7:], -9)
-                    dof_values = row_dof.numpy()
-                    if table:
-                        np.testing.assert_array_equal(dof_values, -9)
-                        classes = support.row_class.numpy()
-                        np.testing.assert_array_equal(classes[1], -9)
-                    for row, dof, sign in live:
-                        if row >= capacity:
-                            continue
-                        columns = support_plan.class_dof[classes[0, row]] if table else dof_values[0, row]
-                        actual = np.zeros(dofs)
-                        valid = columns >= 0
-                        actual[columns[valid]] = outputs[7][0, row, valid]
-                        expected = sign * 1.3 * inverse[:, plan.inverse_permutation[dof]]
-                        np.testing.assert_allclose(actual, expected, atol=2e-7, rtol=2e-6)
-                        self.assertEqual(outputs[0][0, row], VELOCITY_LIMIT)
-                        self.assertEqual(outputs[1][0, row], -1)
-                        for index in (2, 3, 5):
-                            self.assertEqual(outputs[index][0, row], 0.0)
-                        self.assertAlmostEqual(outputs[4][0, row], 2e-4, places=9)
-                        self.assertEqual(outputs[6][0, row], -limits[dof])
-                        self.assertAlmostEqual(outputs[8][0, row], sign * velocity[dof], places=6)
-                        self.assertAlmostEqual(outputs[9][0, row], expected @ expected, places=6)
-
-    def test_response_rows_cpu(self):
-        """Match an independent inverse-factor column oracle on CPU."""
-        self._check_rows("cpu")
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_response_rows_cuda(self):
-        """Match the same producer law across cooperative CUDA lanes."""
-        self._check_rows("cuda:0")
 
 
 def _physical_sweep(jacobian, response, initial, bias, diagonal, kinds, parents, mu, impulses, *, iterations, omega):

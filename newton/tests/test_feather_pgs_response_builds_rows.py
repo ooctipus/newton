@@ -180,12 +180,7 @@ class TestNativeBuildsAssemble(unittest.TestCase):
     def test_native_builds_assemble_without_spills(self):
         builds = {
             "free-body words": lambda: FreeBodyZ.build().meta(64, "sm_120"),
-            "limit rows": lambda: SparseFactor.build().limit_rows,
-            "mimic rows": lambda: SparseFactor.build().mimic_rows,
             "factor": lambda: SparseFactor.build().factor(12, 30),
-            "contact rows": lambda: SparseFactor.build().contact_rows(
-                12, prepare_rows=True, use_support_table=True, contact_records=True
-            ),
             "paired components": lambda: FactorRows.build().components(22),
         }
         for name, build in builds.items():

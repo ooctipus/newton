@@ -355,8 +355,10 @@ def _row_builder(solver, plan, size, source) -> dict:
     if method == "walk":
         from . import walk_rows  # noqa: PLC0415 - the one writer's module
 
-        # The row pass writes the records and unit sources; the one writer walks every row (walk_rows).
-        kernels = (walk_rows.write_contact_units, walk_rows.writer_kernel(solver))
+        # The row pass writes the records and unit sources; the one writer walks every row (walk_rows): the general
+        # placement's into its packed rows, the support placement's (K1) into its support sink.
+        writer = solver.sweep.support_rows if solver.routes.case == "K1" else walk_rows.writer_kernel(solver)
+        kernels = (walk_rows.write_contact_units, writer)
     elif method == "local_packets":
         from . import row_packets, walk_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
 
@@ -378,8 +380,6 @@ def _row_builder(solver, plan, size, source) -> dict:
             kernels = (*produce, solver.sweep.sparse_contact_marker)
         else:
             kernels = (compact_contact.clear_contact_response, *produce)
-    elif method == "sparse_response":
-        kernels = (*prepare, solver.placement.sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
         kernels = (*prepare, response_builds_rows.sparse_pair_contact_rows_kernel)
         if solver.placement.sparse_diagonal_contact_triples or solver.placement.sparse_diagonal_contact_units:
@@ -515,7 +515,8 @@ def _sparse_mass_matrix(solver) -> dict:
                 "solve_lanes": int(solver.sweep.sparse_solve_lanes),
                 "local_factors": bool(solver.sweep.sparse_local_factors),
                 "factor_warps_per_block": int(solver.factor.sparse_factor_warps_per_block),
-                "contact_response_kernel": _key(solver.placement.sparse_contact_response_kernel),
+                "writer_kernel": _key(solver.sweep.support_rows),
+                "leave_kernel": _key(solver.sweep.support_publish),
                 "sweep_kernel": _key(solver.sweep.sparse_kernel),
                 # The sweep's launch bounds from its shared memory and register budget (threads, minimum blocks).
                 "launch_bounds": json_value(solver.sweep.sparse_kernel.options.get("launch_bounds")),

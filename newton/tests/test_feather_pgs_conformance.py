@@ -1443,7 +1443,7 @@ SPARSE = Route(
     pins={"contact_units": None},
     expect={
         "sweep.route": "sparse_pgs",
-        "contact_rows.producer": "sparse_contact_response",
+        "contact_rows.producer": "walk",
         "held_tree.owner": "tree",
         "held_tree.groups.0.operator": "TreeSparseOperator",
         "sparse_mass_matrix.contact_triplets": False,

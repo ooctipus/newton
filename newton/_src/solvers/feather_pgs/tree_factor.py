@@ -15,8 +15,8 @@ velocities (BACKBONE §2).
 
 Its evaluator is the held tree (:mod:`.held_tree`). A step calls :meth:`TreeFactor.factor` (FK/ID, the drives' K and
 u0, the mass-update mask, the factor refresh), :meth:`TreeFactor.predict` (``v_hat`` and the drives' saturation),
-:meth:`TreeFactor.leave` (``v = v_hat + P^T L^-T du``, where the sweep stores ``du``) and :meth:`TreeFactor.finish`
-(``qdd``, integrate, publish).
+and :meth:`TreeFactor.finish` (``qdd``, integrate, publish); the walk's rows and leaves read its walk
+(:meth:`TreeFactor.plan_walk`).
 """
 
 from __future__ import annotations
@@ -877,31 +877,6 @@ class TreeFactor:
                 device=model.device,
             )
 
-    def leave(self, velocity: wp.array, *, size: int, indices, Linv: wp.array, delta: wp.array, base: wp.array) -> None:
-        """``v = base + P^T L^-T du`` through the native sparse factor (:func:`.response_builds_rows.factor_publish_kernel`).
-
-        A sweep that keeps ``du`` in shared memory leaves in its kernel, with the same text: this is the publication of
-        the one that stores it.
-        """
-        forest = self.forest
-        wp.launch(
-            response_builds_rows.factor_publish_kernel,
-            dim=(forest.n_arts_by_size[size], size),
-            inputs=[
-                forest.group_to_art[size],
-                forest.art_to_world,
-                forest.articulation_world_dof_offset,
-                forest.articulation_dof_start,
-                indices.permutation,
-                indices.lookup,
-                Linv,
-                delta,
-                base,
-            ],
-            outputs=[velocity],
-            device=self.model.device,
-        )
-
     def finish(self, state_in, state_out, dt: float, step: int) -> None:
         """Stage 7: ``qdd`` from the solved velocity, integrate the coordinates and publish the output state."""
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self.nvtx, synchronize=False):
@@ -970,6 +945,7 @@ class TreeFactor:
         self.walk_path = wp.array(path, dtype=wp.vec2i, device=device)
         # Each joint's parent body (-1 at a root): the step's geometry reads its pose in one load.
         self.walk_parent_body = wp.array(parent_body, dtype=wp.int32, device=device)
+        self.walk_path_host = path
         self.walk_data = wp.zeros((dofs, WALK_COORDINATE), dtype=wp.float32, device=device)
         self.walk_link = wp.zeros((joints, WALK_LINK), dtype=wp.float32, device=device)
         self.walk_inertia = wp.zeros(joints, dtype=wp.spatial_matrix, device=device)

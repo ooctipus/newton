@@ -3,10 +3,10 @@
 
 """The native sparse PGS sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
-The sweep solves a world's rows in factor coordinates: row ``i`` is ``Z_i = L^-1 P J_i^T``, packed as the
-coordinates and values of its support (:class:`.response_operator.SparseFactor`), and the velocity it acts on is
-the factor-coordinate delta from ``v_hat``, staged per world and published once (``factor_velocity_delta``); the
-caller decodes it. A configuration chooses:
+The sweep solves a world's rows in factor coordinates: row ``i`` is ``Z_i = L^-1 P J_i^T``, the walk's footprints
+packed as the coordinates and values of its support (:func:`.walk_rows.support_rows_kernel`), and the velocity it
+acts on is the factor-coordinate delta from ``v_hat``, staged per world and published once
+(``factor_velocity_delta``); the walk down decodes it (:func:`.walk_rows.support_publish_kernel`). A configuration chooses:
 
 - the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads, with launch bounds
   from the data (:func:`launch_bounds`);
@@ -655,7 +655,7 @@ const int row_type = r == 0 ? {CONTACT} : {FRICTION};"""
     rows_text = contact_unit(ctx, laws, rows="3", declare=declare, parent="head", check=None, held=True, pad="        ")
     held = "\n".join(unit_held_loads(ctx, name, "head", "        ", torsion=torsion) for name in UNIT_HELD)
     # Under contact torsion the quad's spin row: its guards, record couplings and staged values (its record's second
-    # half holds W_ns, W_t1s and W_t2s, :func:`.response_builds_rows.factor_contact_rows_kernel`).
+    # half holds W_ns, W_t1s and W_t2s, :func:`.walk_rows.support_rows_kernel`).
     spin = {
         "last": "i + 3" if torsion else "i + 2",
         "type": f" & (s_type[i + 3] == {TORSION})" if torsion else "",
