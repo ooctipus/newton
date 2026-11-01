@@ -2958,24 +2958,6 @@ def compact_local_pair_candidates(
         active_secondary_articulations[active_index] = candidate_secondary_articulations[candidate]
 
 
-@wp.kernel
-def clear_local_solve_diag(
-    dense_first: wp.array[int],
-    world_constraint_count: wp.array[int],
-    local_solve_owner: wp.array[int],
-    max_constraints: int,
-    # output
-    world_diag: wp.array2d[float],
-):
-    """Discard stale response diagonals for locally owned worlds."""
-    tid = wp.tid()
-    row = tid % max_constraints
-    world = tid // max_constraints
-    line = dense_first[world]
-    if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL and row < world_constraint_count[world]:
-        world_diag[line, row] = 0.0
-
-
 # =============================================================================
 # Tiled kernels for homogenous multi-articulation support
 # =============================================================================

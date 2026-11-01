@@ -1091,10 +1091,7 @@ class Sweep:
         return None
 
     def build(self) -> None:
-        """Build the paired response and the sweeps.
-
-        The factor, stage-3 and stage-4 kernels follow the step plan (:meth:`.placement.Placement.build_response_kernels`).
-        """
+        """Build the paired response and the sweeps."""
         model = self.model
         device_arch = model.device.arch
         from . import paired_components  # noqa: PLC0415

@@ -502,8 +502,8 @@ class SolverFeatherPGS(SolverBase):
                 or matrix-free row family exceeds its configured per-world capacity. The warning
                 reports the world, requested rows, row limit, and dropped contact/friction rows without a host
                 synchronization, so it remains compatible with CUDA graph capture. Defaults to True.
-            mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world.
-                Packed metadata on CUDA supports at most 65535 rows. Defaults to 512.
+            mf_max_constraints (int, optional): Maximum number of matrix-free (free-body) rows per world, at
+                least 1. Packed metadata on CUDA supports at most 65535 rows. Defaults to 512.
             enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
                 ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
@@ -619,13 +619,6 @@ class SolverFeatherPGS(SolverBase):
 
         self.sweep.admit_diagonal(diagonal_decline)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
-        self.placement.hinv_jt_computes_diag = not self.factor.eliminates
-        self.placement.hinv_jt_diag_sizes = frozenset(
-            size
-            for size in self.forest.size_groups
-            if self.placement.hinv_jt_computes_diag
-            and (self._execution_plan.use_diagonal_mass(size) or self._execution_plan.use_tiled_hinv_jt(size))
-        )
         self.sweep.admit_local()
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
@@ -634,17 +627,14 @@ class SolverFeatherPGS(SolverBase):
         self._compact_diagonal_mass_size = self.placement.sparse_diagonal_response_size
         self.placement.row_watermark = bool(row_watermark)
         self.sweep.admit_packed(model, functools.partial(held_tree.sparse_decline, self))
-        # The matrix-free sweeps read the dense rows packed (packed_rows): decided before the buffers, since that
-        # placement allocates neither a size group's response nor the world layout.
+        # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
+        # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
+        # group's Jacobian.
         self.placement.mf_sweeps = bool(
-            self.routes.case not in ("K1", "K2")
-            and self.forest.world_count > 0
-            and self.forest.max_world_dofs > 0
-            and self.placement.mf_max_constraints > 0
+            self.routes.case not in ("K1", "K2") and self.forest.world_count > 0 and self.forest.max_world_dofs > 0
         )
         if self.placement.mf_sweeps:
             self.placement.jy_world_aliased = False
-            self.placement.hinv_jt_diag_sizes = frozenset()
         # The compact boundary owns the rows and response of every world the sparse-diagonal owner pairs with a
         # six-coordinate dense articulation (decided before the buffers: it clears its own rows, so their Jacobian
         # needs no second buffer). It writes every contact row law: point and patch friction, contact torsion's spin
@@ -671,8 +661,6 @@ class SolverFeatherPGS(SolverBase):
             not self.placement.hinv_jt_writes_world or self.options.pgs_warmstart
         )
         self.sweep.admit_paired()
-        if not self.placement.hinv_jt_writes_world and self.sweep.paired_response_primary_size is None:
-            self.placement.hinv_jt_diag_sizes = frozenset()
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.build_body_factors()
@@ -762,7 +750,6 @@ class SolverFeatherPGS(SolverBase):
         )
         # The step's per-stage dispatch tables, which step() and the route record read, and the kernels they launch.
         self._plan = StepPlan.build(route, self)
-        self.placement.build_response_kernels(self._plan, self._execution_plan, self.tile_threads)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
 
@@ -1156,14 +1143,11 @@ class SolverFeatherPGS(SolverBase):
                 self.sweep.resolved_worlds_owner.classify(state_in, state_aug, contacts, dt)
             self.laws.write(self, state_in, state_aug, contacts, dt)
 
-        # The response Y = H^-1 J^T of each size that builds one, the diagonals (from J Y, or the packed rows'
-        # |Z|^2) and the bias (the sweeps compute J v each iteration).
+        # The diagonals (the packed rows' |Z|^2 + cfm, the sparse diagonal's) and the bias (the sweeps compute J v
+        # each iteration).
         with wp.ScopedTimer("S4_HinvJt_Diag_RHS", print=False, use_nvtx=self._nvtx, synchronize=False):
-            for size in self.forest.size_groups:
-                self.placement.response(size, self._plan.response[size].name)
             packed_diag = self.placement.diagonals(self.v_hat)
             self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
-            self.placement.add_cfm()
             self.laws.write_rhs(self, dt)
 
         # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities

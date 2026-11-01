@@ -3,8 +3,8 @@
 
 """The step's plan: what each stage launches, decided once at construction.
 
-Every stage whose work depends on the articulation size (the factor and the stage-4
-contact response) has one table: each size's route and the reason for it. The solve of stages 5 and 6 has one
+Every stage whose work depends on the articulation size (the factor and where stage 4
+whitens the rows) has one table: each size's route and the reason for it. The solve of stages 5 and 6 has one
 entry: the rows its sweep solves and what drives the sweep. ``step()`` launches through these tables,
 the route record (:mod:`.path_selection`) reports them, and construction builds
 exactly the kernels they name, so the three cannot disagree.
@@ -25,8 +25,6 @@ from ...sim import ModelFlags
 from .route_table import RouteRow
 
 __all__ = ["Route", "SolveRoute", "StepPlan", "TopologyPin", "first_failed"]
-
-_GROUPED_VERIFIED_DOFS = 32
 
 
 def first_failed(checks) -> str | None:
@@ -95,9 +93,8 @@ class StepPlan:
     factor: Mapping[int, Route]
     """Per size: ``none`` (no dense factor) or ``held`` (the held tree refreshes the factor)."""
     response: Mapping[int, Route]
-    """Stage 4, per size: ``owner`` (a contact owner publishes the response), ``sparse_diagonal``,
-    ``packed`` (only the packed rows' build: none reads the response), ``diagonal``, ``grouped``, ``tiles``,
-    ``lanes`` or ``rows``."""
+    """Stage 4, per size, where its rows are whitened: ``owner`` (a contact owner publishes the response),
+    ``sparse_diagonal`` or ``packed`` (the packed rows' build)."""
     solve: SolveRoute
     jacobian_clear_sizes: tuple[int, ...]
     """The sizes whose rows of the last step are cleared before the producers write the next: none under the
@@ -135,13 +132,6 @@ class StepPlan:
         }
 
 
-def _route(solver, size: int, kernel: str, name: str, reason: str) -> Route:
-    """A route whose reason leads with the kernel choice (explicit, automatic, private override, CPU) and the size's
-    resource rule (execution_plan) for ``kernel``."""
-    resource = solver._execution_plan.selection_reasons(size).get(kernel, "")
-    return Route(name, " ".join(part for part in (solver._kernel_choice_reasons[kernel], resource, reason) if part))
-
-
 def _factor(row: RouteRow, solver) -> dict[int, Route]:
     routes = {}
     for size in solver.forest.size_groups:
@@ -155,50 +145,26 @@ def _factor(row: RouteRow, solver) -> dict[int, Route]:
 
 
 def _response(row: RouteRow, solver) -> dict[int, Route]:
-    plan = solver._execution_plan
-    sizes = solver.forest.size_groups
+    """Where each size's rows are whitened: by a contact owner (native sparse factors, case K1, or the compact
+    boundary), in place by the sparse diagonal (case K2's pair) or in the packed rows' build (every other class)."""
     owner = row.producer == "compact_contact_boundary" or row.case == "K1"
     routes = {}
-    for size in sizes:
-        route = None
+    for size in solver.forest.size_groups:
         if owner:
-            route = Route("owner", "The contact owner and the bounded limit prefix publish the complete response.")
+            routes[size] = Route(
+                "owner", "The contact owner and the bounded limit prefix publish the complete response."
+            )
         elif row.case == "K2" and size in (row.sizes["diagonal"], row.sizes["dense"]):
-            route = Route(
+            routes[size] = Route(
                 "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."
             )
         elif row.packed:
-            route = Route(
+            routes[size] = Route(
                 "packed", "The matrix-free sweeps read the rows packed by support; no route reads this response."
             )
-        if route is None and plan.use_diagonal_mass(size):
-            route = _route(solver, size, "hinv_jt_kernel", "diagonal", "")
-        if route is None:
-            grouped, reason = _grouped(row, size) if solver.placement.grouped_response else (False, "")
-            if grouped:
-                name = "grouped"
-            elif plan.use_tiled_hinv_jt(size):
-                name = "tiles"
-            elif row.case == "K3":
-                name, reason = "lanes", f"{reason} A warp per articulation, skipping the worlds local owners solve."
-            else:
-                name = "rows"
-            route = _route(solver, size, "hinv_jt_kernel", name, reason.strip())
-        routes[size] = route
+        else:
+            raise RuntimeError(f"No placement whitens the rows of size {size}: {row}")
     return routes
-
-
-def _grouped(row: RouteRow, size: int) -> tuple[bool, str]:
-    """Whether the grouped response solve (a warp per articulation, a lane per row) serves a size, and why.
-
-    The data choose it: where the in-kernel tiers own rows, the response must skip each world's tier rows,
-    which only the grouped kernel does. It solves the planned kernels' response, summed in its own order.
-    """
-    if int(size) > _GROUPED_VERIFIED_DOFS:
-        return False, f"The grouped response solve is verified up to {_GROUPED_VERIFIED_DOFS} DOFs only."
-    if row.tier_rows > 0:
-        return True, "Grouped: the in-kernel tiers need the grouped kernel's per-world row skip."
-    return False, "No in-kernel tier rows to skip: the planned response kernel."
 
 
 def _solve(row: RouteRow) -> SolveRoute:

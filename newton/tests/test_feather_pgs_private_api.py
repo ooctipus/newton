@@ -9,11 +9,7 @@ _FEATHER_PGS = Path(__file__).parents[1] / "_src" / "solvers" / "feather_pgs"
 
 # Kernel factories: cached, so that a variant is built once per process.
 _KERNEL_FACTORIES = {
-    "response_builds_dense.py": (
-        "dense_factor_kernel",
-        "response_warps_kernel",
-        "response_tiles_kernel",
-    ),
+    "response_builds_dense.py": ("dense_factor_kernel",),
     "response_builds_rows.py": (
         "free_body_meta_kernel",
         "factor_contact_rows_kernel",
@@ -62,28 +58,6 @@ class TestFeatherPGSPrivateApi(unittest.TestCase):
                     self.assertIn(name, functions)
                     decorators = {ast.unparse(decorator) for decorator in functions[name].decorator_list}
                     self.assertTrue(decorators & {"cache", "functools.cache"}, decorators)
-
-    def test_plain_response_tiles_kernel_omits_diagonal_output(self):
-        factory = _top_level_functions("response_builds_dense.py")["response_tiles_kernel"]
-        templates = {node.name: node for node in factory.body if isinstance(node, ast.FunctionDef)}
-        diagonal_branch = next(
-            node for node in factory.body if isinstance(node, ast.If) and ast.unparse(node.test) == "compute_diag"
-        )
-        diagonal_template = next(node for node in diagonal_branch.body if isinstance(node, ast.FunctionDef))
-        plain_template = templates["hinv_jt_plain_template"]
-
-        factory_parameters = {argument.arg for argument in factory.args.args}
-        plain_parameters = {argument.arg for argument in plain_template.args.args}
-        diagonal_parameters = {argument.arg for argument in diagonal_template.args.args}
-        plain_names = {node.id for node in ast.walk(plain_template) if isinstance(node, ast.Name)}
-        diagonal_names = {node.id for node in ast.walk(diagonal_branch) if isinstance(node, ast.Name)}
-
-        self.assertNotIn("diag_group", plain_parameters)
-        self.assertNotIn("diag_tile", plain_names)
-        self.assertIn("compute_diag", factory_parameters)
-        self.assertIn("COMPUTE_DIAG", diagonal_names)
-        self.assertIn("diag_group", diagonal_parameters)
-        self.assertIn("diag_tile", diagonal_names)
 
     @staticmethod
     def _references_dense_max_constraints(node):

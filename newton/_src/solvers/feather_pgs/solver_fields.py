@@ -85,10 +85,6 @@ SIZE_FACTORS = FieldGroup(
 """One size group's mass factor and armature (the tree factor's); compact and sparse sizes keep (1, 1, 1)
 placeholders of the factor."""
 
-SIZE_RESPONSE = FieldGroup(Field("Y", wp.float32, ("y_art", "y_row", "y_size")))
-"""One size group's response; compact and sparse sizes keep a (1, 1, 1) placeholder, and so do the matrix-free
-sweeps, which read the packed rows."""
-
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
 their Jacobian is a (1, 1, 1) placeholder."""
@@ -124,11 +120,6 @@ law) or a material contact's ``d / (d + eps)``."""
 DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
 """Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
 
-WORLD_RESPONSE = FieldGroup(
-    Field("J_world", wp.float32, ("world", "row", "world_dof"), owner="placement"),
-    Field("Y_world", wp.float32, ("world", "row", "world_dof"), owner="placement"),
-)
-"""World-indexed Jacobian and response of the CUDA (matrix-free) route."""
 
 DENSE_WARMSTART = FieldGroup(
     Field("ws_prev_dense_impulses", wp.float32, ("world", "row"), owner="placement"),

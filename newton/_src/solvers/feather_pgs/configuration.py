@@ -38,6 +38,9 @@ _NUMBER_RULES = (
     ("restitution_velocity_threshold", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("pgs_warmstart_decay", float, _finite_nonnegative, "must be finite and non-negative", True),
     ("dense_max_constraints", int, lambda value: value >= 1, "must be positive", False),
+    # The free bodies' rows per world. Every class but native sparse factors and the sparse diagonal runs the
+    # matrix-free sweeps, whatever this capacity: none selects a route.
+    ("mf_max_constraints", int, lambda value: value >= 1, "must be positive", False),
 )
 # Each option with a fixed set of values.
 _CHOICE_RULES = (("pgs_solve_readout", SOLVE_READOUTS),)
@@ -129,7 +132,6 @@ def check_options(options: Mapping[str, Any]) -> Options:
             "larger values are not numerically useful in the float32 solve"
         )
     checked.update({name: bool(options[name]) for name in _BOOLEANS})
-    checked["mf_max_constraints"] = int(options["mf_max_constraints"])
     return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})
 
 

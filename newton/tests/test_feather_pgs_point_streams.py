@@ -337,18 +337,7 @@ def _sparse_contact_calls():
 
 
 def _dense_build_calls():
-    """The dense response builds without variants (response_builds_dense.py): every stage the dense routes run."""
-    from newton._src.solvers.feather_pgs import response_builds_dense  # noqa: PLC0415
-
-    for name in (
-        "response_rows_kernel",
-        "response_lanes_kernel",
-        "response_diagonal_kernel",
-        "diagonal_rows_kernel",
-        "diagonal_groups_kernel",
-        "cfm_worlds_kernel",
-    ):
-        yield f"response_builds_dense.{name}", getattr(response_builds_dense, name).__wrapped__, (), {}
+    """The dense rows' builds without variants: their packed build and the bilateral elimination."""
     from newton._src.solvers.feather_pgs import packed_rows  # noqa: PLC0415
 
     # The dense rows packed by support: their build (by the side sizes it whitens), the velocity of their impulses

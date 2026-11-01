@@ -18,7 +18,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw
-from newton._src.solvers.feather_pgs.response_builds_dense import cfm_worlds_kernel
 from newton._src.solvers.feather_pgs.response_builds_rows import (
     factor_contact_rows_kernel,
     factor_limit_rows_kernel,
@@ -34,6 +33,15 @@ from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 def _array(value, dtype=float):
     return wp.array(value, dtype=dtype, device="cpu")
+
+
+def _cfm_added(diag, cfm, counts) -> np.ndarray:
+    """``diag`` with each world's first ``counts`` rows' cfm added, in float32: the canonical diagonal's cfm."""
+    out = np.array(diag, dtype=np.float32, copy=True)
+    cfm = np.asarray(cfm, dtype=np.float32)
+    for world, count in enumerate(counts):
+        out[world, :count] += cfm[world, :count]
+    return out
 
 
 def _full(shape, value, dtype=float):
@@ -511,14 +519,11 @@ class TestSparseContacts(unittest.TestCase):
                     )
                     count = array([7], int)
                     reference_diag = array(
-                        np.pad(np.sum(expected**2, axis=1)[None], ((0, 0), (0, 2)), constant_values=-9)
-                    )
-                    wp.launch(
-                        cfm_worlds_kernel(),
-                        dim=1,
-                        inputs=[count, row_lines(device), reference[4], array([0], int), 0],
-                        outputs=[reference_diag],
-                        device=device,
+                        _cfm_added(
+                            np.pad(np.sum(expected**2, axis=1)[None], ((0, 0), (0, 2)), constant_values=-9),
+                            reference[4].numpy(),
+                            (7,),
+                        )
                     )
                     reference_rhs = full((1, 9), -9.0)
                     reference_rows = field_group.upload(
@@ -627,7 +632,6 @@ class TestSparseContacts(unittest.TestCase):
             first=row_lines(device),
         )
         diagonal = rows.diag
-        reference_diag = array(initial_diag)
         reference_rhs = array(np.full(shape, -9.0))
         prefix_count = array([4, 2, 0], int)
         wp.launch(
@@ -636,13 +640,7 @@ class TestSparseContacts(unittest.TestCase):
             inputs=[array([[0, 4], [0, 3], [0, 0]], int), array([6, 2, 5], int), rows, 0.0123],
             device=device,
         )
-        wp.launch(
-            cfm_worlds_kernel(),
-            dim=3,
-            inputs=[prefix_count, row_lines(device), rows.row_cfm, array([0, 0, 0], int), 0],
-            outputs=[reference_diag],
-            device=device,
-        )
+        reference_diag = _cfm_added(initial_diag, rows.row_cfm.numpy(), (4, 2, 0))
         wp.launch(
             compute_world_contact_bias,
             dim=(3, 6),
@@ -661,7 +659,7 @@ class TestSparseContacts(unittest.TestCase):
             ],
             device=device,
         )
-        np.testing.assert_array_equal(diagonal.numpy(), reference_diag.numpy())
+        np.testing.assert_array_equal(diagonal.numpy(), reference_diag)
         np.testing.assert_allclose(rows.rhs.numpy(), reference_rhs.numpy(), atol=2.0e-7, rtol=2.0e-6)
 
     def test_joint_limit_rows_and_capacity(self):

@@ -284,13 +284,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         _, solver, state, *_ = case
         size = solver.placement.sparse_mass_matrix_size
         self.assertEqual(size, 9)
-        for array in (
-            solver.placement.J_world,
-            solver.placement.Y_world,
-            solver.placement.J_by_size[size],
-            solver.placement.Y_by_size[size],
-            solver.factor.L_by_size[size],
-        ):
+        for array in (solver.placement.J_by_size[size], solver.factor.L_by_size[size]):
             self.assertEqual(array.shape, (1, 1, 1))  # Only argument stand-ins remain.
         np.testing.assert_array_equal(solver.factor.sparse_mass_matrix_status.numpy(), 0)
         self.assertFalse(solver.placement.constraint_overflow.numpy().any())

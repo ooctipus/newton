@@ -1,12 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The dense response builds on their own: the kit's factor against NumPy, its text, and the operators' registry of
-builds by stage and mapping."""
+"""The dense kit on its own: its triangular solves' text and the static shared-memory budget."""
 
 import unittest
 
-from newton._src.solvers.feather_pgs import response_builds_dense as builds
 from newton._src.solvers.feather_pgs.response_operator import CholeskySolve
 from newton._src.solvers.feather_pgs.staging import STATIC_SHARED_BUDGETS, STATIC_SHARED_BYTES, static_budget
 
@@ -45,20 +43,6 @@ class TestStaticBudget(unittest.TestCase):
             self.assertEqual(static_budget(12345), 81724)
         finally:
             del STATIC_SHARED_BUDGETS[12345]
-
-
-class TestRegistry(unittest.TestCase):
-    """The operators' builds by stage and mapping."""
-
-    def test_dense(self):
-        tiles = builds.DENSE_JY_BUILDS["response", "tiles"](
-            n_dofs=18, max_constraints=32, tile_threads=64, compute_diag=True
-        )
-        self.assertEqual((tiles.block_dim, tiles.tiled, tiles.grid), (64, True, ("articulations", "row chunks")))
-        levels = builds.DENSE_JY_BUILDS["factor", "levels"](size=9)
-        self.assertEqual((levels.kernel, levels.tiled), (builds.dense_factor_kernel(9), False))
-        for stage, _mapping in builds.DENSE_JY_BUILDS:
-            self.assertIn(stage, builds.STAGES)
 
 
 if __name__ == "__main__":

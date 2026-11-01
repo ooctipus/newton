@@ -27,7 +27,6 @@ from newton._src.solvers.feather_pgs import (
 )
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.step_plan import StepPlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import recomputing
 from newton.tests.feather_pgs_patch_parity import (
@@ -475,24 +474,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(point["routes"]["friction"]["reason"], "friction_anchor_beta passed explicitly.")
         self.assertEqual(point["routes"]["contact_rows"]["law"], "point")
 
-    def test_cpu_grouped_record_follows_the_response_dispatch(self):
-        """Label the sizes the grouped response serves from the data, with their reasons, from the step plan's table:
-        every size up to 32 coordinates whose worlds' in-kernel tier rows it skips, and no other."""
-        solver = SolverFeatherPGS(_cpu_free_body_model())
-        # A stand-in for the CUDA-only grouped response of a row that builds responses (no packed rows): the plan
-        # reads host state only, and the record its table.
-        solver.placement.grouped_response = True
-        for skip, route in ((0, "rows"), (8, "grouped")):
-            with self.subTest(skip_rows=skip):
-                row = dataclasses.replace(solver.routes.row, tier_rows=skip, packed=False)
-                solver._plan = StepPlan.build(row, solver)
-                selected = solver.get_path_selection()
-                json.dumps(selected, allow_nan=False)
-                response = selected["routes"]["stages"]["response"]
-                self.assertEqual({entry["route"] for entry in response.values()}, {route})
-                reason = "in-kernel tiers need the grouped kernel" if skip else "No in-kernel tier rows to skip"
-                self.assertTrue(all(reason in entry["reason"] for entry in response.values()), response)
-
     def test_cpu_route_record_matches_launched_kernels(self):
         """Tie the record's sweep and row builders to the kernels one CPU step launches."""
         for name, model in (
@@ -928,8 +909,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(routes["sweep"]["route"], "sparse_pgs")
                     self.assertTrue(routes["sweep"]["sparse"].endswith("_warm_start"))
                     self.assertEqual(routes["sparse_mass_matrix"]["velocity_limits"], bool(options))
-                    # A placeholder stands in for the dense response that the install would read.
-                    self.assertEqual(solver.placement.Y_by_size[9].shape, (1, 1, 1))
                     # Contact warm start carries impulses by matched contact identity.
                     keys = _launched_kernel_keys(model, solver, contact_matching="latest")
                     self.assertIn(routes["sweep"]["sparse"], keys)

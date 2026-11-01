@@ -6,17 +6,16 @@
 
 :class:`Placement` owns what the rows are stored in across a step:
 
-- the dense rows and their records, the free-body rows, the sparse placements' rows, the packed rows (Z by support) and
-  each size group's response;
+- the dense rows and their records, the free-body rows, the sparse placements' rows and the packed rows (Z by
+  support);
 - the per-contact buffers of the contact pool (each contact's world, slot and path) and the carry's row tables;
 - the capacities, the slot counters, the row-family bounds and the sorted placement of contact rows;
 - the status: the per-world overflow latch, the sticky flags, dropped rows, warnings and watermarks.
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
 (:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
-:meth:`Placement.response`, :meth:`Placement.diagonals` and :meth:`Placement.pack_rows` (``Z = L^-1 P J^T`` with
-``|Z|^2``), :meth:`Placement.add_cfm`, :meth:`Placement.whiten_free_bodies`, :meth:`Placement.prepare_impulses` and
-:meth:`Placement.pack_free_body_meta`.
+:meth:`Placement.diagonals` and :meth:`Placement.pack_rows` (``Z = L^-1 P J^T`` with ``|Z|^2 + cfm``),
+:meth:`Placement.whiten_free_bodies`, :meth:`Placement.prepare_impulses` and :meth:`Placement.pack_free_body_meta`.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair, the row producers and
 the local owners' per-world claim. The row pass and the sweeps read its fields.
@@ -31,7 +30,7 @@ from ...core.contact_pool import ContactField, model_contact_pool
 from ...sim import Contacts
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import JointType
-from . import host_index, packed_rows, response_builds_dense, response_builds_rows
+from . import host_index, packed_rows, response_builds_rows
 from .dense_rows import RowSupport
 from .dense_rows import bind_mf as bind_mf_rows
 from .field_group import SolverArrays
@@ -39,7 +38,6 @@ from .kernels import (
     LINK_ROWS,
     RIGID_SPEED_ROWS,
     clear_grouped_jacobian_active_rows,
-    clear_local_solve_diag,
     place_world_contact_runs,
     prepare_world_impulses,
     record_world_contact_runs,
@@ -62,11 +60,9 @@ from .solver_fields import (
     ROW_SLOT_UNBOUNDED,
     ROW_WATERMARKS,
     SIZE_JACOBIAN,
-    SIZE_RESPONSE,
     SPARSE_CONTACT_GROUPS,
     SPARSE_CONTACT_SERIAL,
     SPARSE_DIAGONAL_ROWS,
-    WORLD_RESPONSE,
     WORLD_ROW_STATE,
 )
 
@@ -229,8 +225,8 @@ class Placement:
     Built in the solver's construction order: the capacities and placeholders here, then
     :meth:`allocate_size_groups`, :meth:`allocate_contact_rows`, :meth:`allocate_world_rows`,
     :meth:`allocate_sparse_diagonal_rows`, :meth:`allocate_free_body_rows`, :meth:`allocate_packed_rows`,
-    :meth:`allocate_placeholders`, :meth:`allocate_status`, :meth:`place_dense_response` and
-    :meth:`build_response_kernels`. The native sparse route allocates its rows on :attr:`arrays` as it admits them.
+    :meth:`allocate_placeholders`, :meth:`allocate_status` and :meth:`place_dense_response`. The native sparse route
+    allocates its rows on :attr:`arrays` as it admits them.
 
     Args:
         model: The solver's model.
@@ -254,11 +250,6 @@ class Placement:
         # Launches over the contact capacity (the force export, the warm-start snapshot and gathers, the keyed-row key
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
-        # The grouped response solve, for the sizes StepPlan gives it from the data.
-        self.grouped_response = bool(model.device.is_cuda and model.articulation_count > 0)
-        self.grouped_dummy_diag = (
-            wp.zeros((1, 1), dtype=wp.float32, device=model.device) if self.grouped_response else None
-        )
         # A link's rows are the closure's: they come on top of the rows the option gives the world's contacts.
         self.dense_max_constraints = options.dense_max_constraints + laws.link_rows_per_world
         self.mf_max_constraints = options.mf_max_constraints
@@ -278,8 +269,6 @@ class Placement:
         self.contact_row_eps_dummy = self.arrays.placeholder(wp.float32, (1, 1))
         self.row_eps = self.mf_row_eps = self.contact_row_eps_dummy
         self.J_by_size: dict[int, wp.array] = {}
-        self.Y_by_size: dict[int, wp.array] = {}
-        self.diag_by_size: dict[int, wp.array] = {}
 
     # ---------------------------------------------------------------------------------------------------------------
     # Construction
@@ -407,14 +396,11 @@ class Placement:
         arrays.allocate(CONTACT_RUNS, world=self.forest.world_count, run_block=run_blocks)
 
     def allocate_size_groups(self) -> None:
-        """Each size group's response, Jacobian and diagonal."""
+        """Each size group's Jacobian: the sparse diagonal's dense part (case K2); a placeholder elsewhere."""
         if not self.model.articulation_count:
-            self.dummy_hinv_diag = None
             return
 
-        device = self.model.device
         arrays = self.arrays
-        self.dummy_hinv_diag = wp.zeros((1, 1), dtype=wp.float32, device=device)
         for size in self.forest.size_groups:
             n_arts = self.forest.n_arts_by_size[size]
             sparse_response = self.sparse_mass_matrix_size is not None or (
@@ -422,27 +408,14 @@ class Placement:
             )
             # The matrix-free sweeps' producers write the packed rows (jacobian_rows): no size group's Jacobian.
             response = 1 if sparse_response or self.mf_sweeps else 0
-            # The matrix-free sweeps read the packed rows and the sparse-diagonal owner whitens its dense rows in place
-            # (SparsePairZ): no route reads a size group's response.
-            whitened = self.sparse_diagonal_contact_solve and size == self.sparse_diagonal_dense_size
-            y = 1 if sparse_response or self.mf_sweeps or whitened else 0
             sizes = {
                 "art": n_arts,
                 "size": size,
                 "response_art": response or n_arts,
                 "response_row": response or self.dense_max_constraints,
                 "response_size": response or size,
-                "y_art": y or n_arts,
-                "y_row": y or self.dense_max_constraints,
-                "y_size": y or size,
             }
-            self.Y_by_size[size] = arrays.allocate(SIZE_RESPONSE, owner={}, **sizes)["Y"]
             self.J_by_size[size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
-            self.diag_by_size[size] = (
-                wp.zeros((n_arts, self.dense_max_constraints), dtype=wp.float32, device=device)
-                if size in self.hinv_jt_diag_sizes and not sparse_response
-                else self.dummy_hinv_diag
-            )
 
     def clears_jacobian(self, size: int) -> bool:
         """Whether a size group's rows of the last step are cleared before the producers write the next: not under the
@@ -495,24 +468,6 @@ class Placement:
         # The widest world's DOFs exist where a world response mapping was built (the routes that read them).
         world_dof = self.forest.max_world_dofs
         sizes = {"world": self.forest.world_count, "row": self.dense_max_constraints, "world_dof": world_dof}
-        # The world-indexed J and Y of the routes that build a response in the world layout.
-        if self.sparse_diagonal_contact_solve or self.sparse_mass_matrix_size is not None:
-            arrays.allocate(WORLD_RESPONSE, world=1, row=1, world_dof=1)
-        elif self.mf_sweeps:
-            # The matrix-free sweeps read the packed rows (place_dense_response): no world layout.
-            arrays.release(WORLD_RESPONSE)
-        elif self.jy_world_aliased:
-            # The world gather (gather_coordinates_kernel) is an element-for-element identity copy for
-            # this model layout (one articulation per world, single size
-            # group, matching dof offsets): alias the world-indexed views
-            # directly onto the group buffers and skip the gather launch
-            # plus the duplicate (world, max_constraints, dofs) storage.
-            size = self.forest.size_groups[0]
-            self.J_world = self.J_by_size[size]
-            self.Y_world = self.Y_by_size[size]
-        else:
-            arrays.allocate(WORLD_RESPONSE, **sizes)
-
         arrays.allocate(DENSE_ROWS, **sizes)
         # Dense identity-matched warm-start carry buffers. Allocated here (not in the MF
         # buffer path) so scenes WITHOUT free rigid bodies still get them —
@@ -664,8 +619,7 @@ class Placement:
         """Where the dense rows' response lives (``packed_response`` and ``packed_response_reason``).
 
         The matrix-free sweeps, and every route beside them, read the dense rows packed by support
-        (:mod:`.packed_rows`): the packed build alone serves the step, the response stage builds nothing and the world
-        layout and the size groups' responses are not kept.
+        (:mod:`.packed_rows`): the packed build alone serves the step.
         """
         self.packed_response_reason = None if self.mf_sweeps else "No matrix-free sweep reads packed rows."
         self.packed_response = self.packed_response_reason is None
@@ -679,12 +633,6 @@ class Placement:
             raise RuntimeError("The paired factor-coordinate sweep reads packed rows at their world coordinates")
         self.hinv_jt_writes_world = False
         self.jy_world_aliased = False
-        self.arrays.release(WORLD_RESPONSE)
-        placeholder = self.arrays.placeholder(wp.float32, (1, 1, 1))
-        for size in self.forest.size_groups:
-            self.Y_by_size[size] = placeholder
-            self.diag_by_size[size] = self.dummy_hinv_diag
-        self.hinv_jt_diag_sizes = frozenset()
 
     def inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
         """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.
@@ -767,47 +715,6 @@ class Placement:
         self.dummy_contact_count = placeholder(wp.int32, (1,))
         self.reset_dummy_mf_row_type = placeholder(wp.int32, (1, 1), -1)
         self.reset_dummy_mf_row_parent = placeholder(wp.int32, (1, 1), -1)
-
-    def build_response_kernels(self, plan, execution_plan, tile_threads: int) -> None:
-        """Build the stage-4 kernels the plan's response table launches, and only those (one entry per size)."""
-        self.tile_threads = threads = tile_threads
-        rows = self.dense_max_constraints
-        sizes = self.forest.size_groups
-
-        def routed(stage, size, route):
-            entry = getattr(plan, stage).get(size)
-            return entry is not None and entry.name == route
-
-        self.hinv_jt_kernels_by_size = {}
-        self.hinv_jt_chunk_count_by_size = {}
-        for size in sizes:
-            chunk = execution_plan.hinv_jt_chunk_size(size) if routed("response", size, "tiles") else None
-            self.hinv_jt_chunk_count_by_size[size] = 0 if chunk is None else (rows + chunk - 1) // chunk
-            self.hinv_jt_kernels_by_size[size] = (
-                None
-                if chunk is None
-                else response_builds_dense.response_tiles_kernel(
-                    size,
-                    rows,
-                    threads,
-                    constraint_chunk_size=chunk,
-                    write_world=self.hinv_jt_writes_world,
-                    write_group=self.hinv_jt_tiled_writes_group,
-                    compute_diag=size in self.hinv_jt_diag_sizes,
-                )
-            )
-        # Sizes the plan routes to the per-row kernel (e.g. free bodies) consume the group-layout response (diag
-        # from J.Y, world impulse apply), so the grouped kernel writes the group copy for them.
-        self.grouped_kernels_by_size = {
-            size: response_builds_dense.response_warps_kernel(
-                size,
-                int(rows),
-                write_world=bool(self.hinv_jt_writes_world),
-                write_group=bool(self.hinv_jt_tiled_writes_group) or not execution_plan.use_tiled_hinv_jt(size),
-                compute_diag=size in self.hinv_jt_diag_sizes,
-            )
-            for size in plan.sizes("response", "grouped")
-        }
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the rows' slots, counts and status
@@ -1130,159 +1037,8 @@ class Placement:
         }
 
     # ---------------------------------------------------------------------------------------------------------------
-    # Step: the response, the whitening and the diagonals
+    # Step: the whitening and the diagonals
     # ---------------------------------------------------------------------------------------------------------------
-
-    def _response_targets(self, size: int) -> tuple:
-        """The world-layout J and Y a size's response writes (its group buffers where none is allocated) and the
-        DOF offsets it writes them at."""
-        J_world = self.J_world if self.J_world is not None else self.J_by_size[size]
-        Y_world = self.Y_world if self.Y_world is not None else self.Y_by_size[size]
-        offsets = (
-            self.forest.articulation_world_dof_offset if self.hinv_jt_writes_world else self.forest.group_to_art[size]
-        )
-        return J_world, Y_world, offsets
-
-    def response(self, size: int, route: str) -> None:
-        """Build one size's contact response along the plan's stage-4 route (none where an owner publishes it)."""
-        if route == "diagonal":
-            self._response_diagonal(size)
-        elif route == "grouped":
-            self._response_grouped(size)
-        elif route == "tiles":
-            self._response_tiled(size)
-        elif route == "lanes":
-            self._response_lanes(size)
-        elif route == "rows":
-            self._response_rows(size)
-
-    def _response_grouped(self, size: int) -> None:
-        """The grouped response solve (grouped dynamics), a warp per articulation; verified up to 32 DOFs."""
-        n_arts = self.forest.n_arts_by_size[size]
-        J_world, Y_world, world_dof_offset = self._response_targets(size)
-        diag_out = self.diag_by_size[size] if size in self.hinv_jt_diag_sizes else self.grouped_dummy_diag
-        wpb = 4
-        wp.launch_tiled(
-            self.grouped_kernels_by_size[size],
-            dim=[(n_arts + wpb - 1) // wpb],
-            inputs=[
-                wpb,
-                n_arts,
-                self.factor.L_by_size[size],
-                self.J_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                world_dof_offset,
-                self.constraint_count,
-                self.Y_by_size[size],
-                J_world,
-                Y_world,
-                diag_out,
-                self.mf_count_or_dummy(),
-                int(self.ink_skip_rows()),
-            ],
-            outputs=[],
-            block_dim=32 * wpb,
-            device=self.model.device,
-        )
-
-    def _response_tiled(self, size: int):
-        model = self.model
-        n_arts = self.forest.n_arts_by_size[size]
-        J_world, Y_world, world_dof_offset = self._response_targets(size)
-        outputs = [self.Y_by_size[size], J_world, Y_world]
-        if size in self.hinv_jt_diag_sizes:
-            outputs.append(self.diag_by_size[size])
-        wp.launch_tiled(
-            self.hinv_jt_kernels_by_size[size],
-            dim=[n_arts, self.hinv_jt_chunk_count_by_size[size]],
-            inputs=[
-                self.factor.L_by_size[size],
-                self.J_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                world_dof_offset,
-                self.constraint_count,
-            ],
-            outputs=outputs,
-            block_dim=self.tile_threads,
-            device=model.device,
-        )
-
-    def _response_diagonal(self, size: int) -> None:
-        """Apply diagonal generalized inertia to the active response rows."""
-        n_arts = self.forest.n_arts_by_size[size]
-        J_world, Y_world, world_dof_offset = self._response_targets(size)
-        wp.launch(
-            response_builds_dense.response_diagonal_kernel(),
-            dim=n_arts * self.dense_max_constraints,
-            inputs=[
-                self.factor.L_by_size[size],
-                self.J_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                world_dof_offset,
-                self.constraint_count,
-                size,
-                self.dense_max_constraints,
-                n_arts,
-                int(self.hinv_jt_tiled_writes_group),
-                int(self.hinv_jt_writes_world),
-                int(size in self.hinv_jt_diag_sizes),
-            ],
-            outputs=[self.Y_by_size[size], J_world, Y_world, self.diag_by_size[size]],
-            device=self.model.device,
-        )
-
-    def _response_lanes(self, size: int) -> None:
-        """The response a warp per articulation, skipping the worlds the local owners solve (route ``lanes``)."""
-        n_arts = self.forest.n_arts_by_size[size]
-        J_world, Y_world, world_dof_offset = self._response_targets(size)
-        wp.launch(
-            response_builds_dense.response_lanes_kernel(),
-            dim=n_arts * 32,
-            inputs=[
-                self.factor.L_by_size[size],
-                self.J_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                world_dof_offset,
-                self.constraint_count,
-                self.local_solve_owner,
-                self.row_restitution,
-                self.dense_first,
-                size,
-                self.dense_max_constraints,
-                n_arts,
-                int(self.hinv_jt_writes_world),
-            ],
-            outputs=[self.Y_by_size[size], J_world, Y_world],
-            device=self.model.device,
-            block_dim=256,
-        )
-
-    def _response_rows(self, size: int) -> None:
-        """The response a thread per row (route ``rows``)."""
-        n_arts = self.forest.n_arts_by_size[size]
-        J_world, Y_world, world_dof_offset = self._response_targets(size)
-        wp.launch(
-            response_builds_dense.response_rows_kernel(),
-            dim=n_arts * self.dense_max_constraints,
-            inputs=[
-                self.factor.L_by_size[size],
-                self.J_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                world_dof_offset,
-                self.constraint_count,
-                size,
-                self.dense_max_constraints,
-                n_arts,
-                int(self.hinv_jt_writes_world),
-            ],
-            outputs=[self.Y_by_size[size], J_world, Y_world],
-            device=self.model.device,
-        )
 
     def pack_rows(self, v_hat: wp.array, *, write_diag: int) -> None:
         """Pack and whiten every world's dense rows and store the general worlds' diagonals as ``write_diag`` asks
@@ -1319,9 +1075,9 @@ class Placement:
         )
 
     def diagonals(self, v_hat: wp.array) -> int:
-        """The dense rows' diagonals of the matrix-free route, by their owner; what the packed rows' build owes
-        (:meth:`pack_rows`, :func:`.packed_rows.pack_kernel`'s ``write_diag``): 0 nothing, 1 ``|Z|^2``, 2
-        ``|Z|^2 + cfm``."""
+        """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`: the packed
+        rows, the sparse diagonal or native sparse factors); what the packed rows' build owes (:meth:`pack_rows`,
+        :func:`.packed_rows.pack_kernel`'s ``write_diag``): 0 nothing, 2 ``|Z|^2 + cfm``."""
         if self.packed_response:
             # The packed rows' build stores |Z|^2 + cfm in the general worlds; local row packets keep their worlds'
             # private seeds.
@@ -1358,94 +1114,8 @@ class Placement:
                 device=self.model.device,
             )
             return 0
-        if self.sparse_mass_matrix_size is not None:
-            # Sparse producers write the diagonal; unfused controls add CFM separately.
-            return 0
-        self.diag.zero_()
-        if self.hinv_jt_diag_sizes:
-            for size in self.forest.size_groups:
-                if size in self.hinv_jt_diag_sizes:
-                    self._accumulate_response_diagonal(size)
-                else:
-                    self._diagonal_from_JY(size)
-        elif self.hinv_jt_writes_world:
-            # The packed rows' build stores the diagonal (pack_rows); the CFM pass adds CFM after.
-            return 1
-        else:
-            for size in self.forest.size_groups:
-                self._diagonal_from_JY(size)
-        if self.local_internal_fast_path and not self.hinv_jt_writes_world:
-            wp.launch(
-                clear_local_solve_diag,
-                dim=self.forest.world_count * self.dense_max_constraints,
-                inputs=[self.dense_first, self.constraint_count, self.local_solve_owner, self.dense_max_constraints],
-                outputs=[self.diag],
-                device=self.model.device,
-            )
+        # Native sparse factors (case K1): their producers write the diagonal with its CFM.
         return 0
-
-    def _diagonal_from_JY(self, size: int):
-        n_arts = self.forest.n_arts_by_size[size]
-        wp.launch(
-            response_builds_dense.diagonal_rows_kernel(),
-            dim=n_arts * self.dense_max_constraints,
-            inputs=[
-                self.J_by_size[size],
-                self.Y_by_size[size],
-                self.forest.group_to_art[size],
-                self.forest.art_to_world,
-                self.constraint_count,
-                self.dense_first,
-                size,
-                self.dense_max_constraints,
-                n_arts,
-                self.mf_count_or_dummy(),
-                int(self.ink_skip_rows()),
-            ],
-            outputs=[self.diag],
-            device=self.model.device,
-        )
-
-    def _accumulate_response_diagonal(self, size: int):
-        wp.launch(
-            response_builds_dense.diagonal_groups_kernel(),
-            dim=self.forest.world_count * self.dense_max_constraints,
-            inputs=[
-                self.diag_by_size[size],
-                self.forest.world_response_group_art_start[size],
-                self.forest.world_response_group_to_art[size],
-                self.forest.art_group_idx,
-                self.constraint_count,
-                self.dense_first,
-                self.dense_max_constraints,
-                self.mf_count_or_dummy(),
-                int(self.ink_skip_rows()),
-            ],
-            outputs=[self.diag],
-            device=self.model.device,
-        )
-
-    def add_cfm(self):
-        if self.packed_response:
-            return  # The packed rows' build adds CFM with the diagonal.
-        if self.sparse_prepare_contacts:
-            return  # Contact and limit producers add CFM exactly once.
-        if self.sparse_diagonal_contact_solve:
-            return  # The sparse-diagonal owner adds its rows' CFM with their diagonals.
-        model = self.model
-        wp.launch(
-            response_builds_dense.cfm_worlds_kernel(),
-            dim=self.forest.world_count,
-            inputs=[
-                self.constraint_count,
-                self.dense_first,
-                self.row_cfm,
-                self.mf_count_or_dummy(),
-                int(self.ink_skip_rows()),
-            ],
-            outputs=[self.diag],
-            device=model.device,
-        )
 
     def whiten_free_bodies(self, v_hat: wp.array, dt: float):
         """MF PGS setup: whiten the free-body rows through each body's held factor, their diagonals and RHS."""
