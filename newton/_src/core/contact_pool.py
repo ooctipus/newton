@@ -341,6 +341,7 @@ def _record_demand(
     passes: wp.array[wp.int32],
     forecast_slots: wp.array[wp.int64],
     forecast_on: wp.array[wp.int32],
+    tally: wp.array[wp.int32],
     mirror: wp.array[wp.int32],
     rows_used: wp.array[wp.int32],
     status: wp.array[wp.int32],
@@ -368,12 +369,21 @@ def _record_demand(
         else:
             forecast_on[0] = 0
         if record_drops != 0:
-            # A pass that cannot grow its rows and run again: its fill, and the contacts it dropped.
-            fill = wp.int64(demand) * wp.int64(FILL_SCALE) / wp.int64(wp.max(rows, 1))
-            mirror[7] = wp.max(mirror[7], wp.int32(wp.min(fill, wp.int64(INDEX_LIMIT))))
+            # A pass that cannot grow its rows and run again: its fill, and the contacts it dropped. The running
+            # values live on the device; the pinned record only receives them (a device read of pinned memory
+            # crosses the bus).
+            fill = wp.int32(
+                wp.min(wp.int64(demand) * wp.int64(FILL_SCALE) / wp.int64(wp.max(rows, 1)), wp.int64(INDEX_LIMIT))
+            )
+            if fill > tally[0]:
+                tally[0] = fill
+                mirror[7] = fill
             if demand > rows:
-                mirror[4] = wp.int32(wp.min(wp.int64(mirror[4]) + wp.int64(demand - rows), wp.int64(INDEX_LIMIT)))
-                mirror[5] = mirror[5] + 1
+                dropped = wp.int32(wp.min(wp.int64(tally[1]) + wp.int64(demand - rows), wp.int64(INDEX_LIMIT)))
+                tally[1] = dropped
+                tally[2] = tally[2] + 1
+                mirror[4] = dropped
+                mirror[5] = tally[2]
                 mirror[6] = passed
     held = wp.min(demand, rows)
     if rows_used.shape[0] > 0:
@@ -850,6 +860,7 @@ class ContactPool:
         # reservations and by following its leader.
         self._high_water = None
         self._passes = None
+        self._tally = None
         self._high_water_host = None
         self.forecast_slots = None
         """Contacts the model's pairs may make within the horizon, summed by the broad phase of a forecast pass
@@ -893,6 +904,8 @@ class ContactPool:
             self.rows_used = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._passes = wp.zeros(1, dtype=wp.int32, device=self.device)
+            # The record's running fill and drop counts, which it copies into the pinned record.
+            self._tally = wp.zeros(3, dtype=wp.int32, device=self.device)
             self.forecast_slots = wp.zeros(FORECAST_SLOTS, dtype=wp.int64, device=self.device)
             self.forecast_reach = wp.zeros(1, dtype=wp.vec2, device=self.device)
             # A pass forecasts once a host asks or the record's beat picks it.
@@ -1245,6 +1258,7 @@ class ContactPool:
                 empty if self._high_water is None else self._passes,
                 wp.empty(0, dtype=wp.int64, device=self.device) if self._high_water is None else self.forecast_slots,
                 empty if self._high_water is None else self.forecast_on,
+                empty if self._high_water is None else self._tally,
                 empty if self._high_water is None else self._high_water_mirror,
                 empty if self.rows_used is None else self.rows_used,
                 empty if status is None else status,
