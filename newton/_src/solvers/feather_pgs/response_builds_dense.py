@@ -61,7 +61,9 @@ def _element(array: str, *indices: str) -> str:
 # leaves its reciprocal at the end of its row, in the upper triangle. Up to STAGED_FACTOR_SIZE the working L is in shared
 # memory and only the pattern's entries are published; past it L is factored in place in global memory, and the
 # reciprocals stay above the diagonal, which no reader of L reads. The CPU runs a warp's lanes on its first thread. A
-# structural zero of L stays the array's zero.
+# structural zero of L stays the array's zero. Last, each drive's pivot without its K, row_P: its H_ii less the same
+# squares, which the factor's own pivot subtracts after adding K, so that pivot keeps its order (a release's pivot,
+# tree_kinetic_state.release).
 DENSE_FACTOR_BODY = """
     for (int entry = LANE; entry < plan.entry_count; entry += STRIDE) {
         const int row = plan.rows.data[entry], col = plan.columns.data[entry];
@@ -112,6 +114,17 @@ DENSE_FACTOR_BODY = """
         }
         SYNC();
     }
+    for (int col = LANE; col < n; col += STRIDE) {
+        const int drive_row = drive_row_by_dof.data[dof_start + n - 1 - col];
+        if (drive_row < 0) continue;
+        const float* own = L + col * n;
+        float pivot = row_H.data[drive_row];
+        for (int entry = plan.row_offsets.data[col]; entry < plan.row_offsets.data[col + 1] - 1; ++entry) {
+            const float term = own[plan.columns.data[entry]];
+            pivot -= term * term;
+        }
+        row_P.data[drive_row] = pivot;
+    }
 """
 
 _DENSE_FACTOR = """
@@ -152,9 +165,12 @@ DENSE_FACTOR_PLAN = (
     Field("factor_level_columns", wp.int32, ("dof",)),
     Field("factor_level_entry_offsets", wp.int32, ("level_bound",)),
     Field("factor_level_entries", wp.int32, ("entry",)),
+    Field("column_offsets", wp.int32, ("dof_bound",)),
+    Field("column_rows", wp.int32, ("entry",)),
 )
 """The lower pattern of a dense factor in leaf-first coordinates, fill included: each entry's row, column and geometry slot
-(``-1`` on fill), and the level schedule (:func:`.tree_plan.level_schedule`)."""
+(``-1`` on fill), the level schedule (:func:`.tree_plan.level_schedule`), and each column's rows below its diagonal in
+order: its path to the root, which a release walks (:func:`.tree_kinetic_state.release`)."""
 
 DenseFactorPlan = field_group.struct("DenseFactorPlan", DENSE_FACTOR_PLAN, __name__)
 
@@ -171,6 +187,13 @@ def dense_factor_plan(physical_lookup, device) -> DenseFactorPlan:
         present[np.ix_(below, below)] = True
     rows, cols = np.nonzero(np.tril(present))
     schedule = level_schedule(rows, cols, n)
+    below = np.flatnonzero(rows > cols)
+    below = below[np.lexsort((rows[below], cols[below]))]
+    # A release walks column i's rows as its path to the root (tree_kinetic_state.RELEASE_DENSE): every column's rows are its
+    # parent and the parent's rows. A tree's coupling in reversed topological order has it, and a filled pattern keeps it.
+    column = {c: rows[below][cols[below] == c].tolist() for c in range(n)}
+    if any(column[c] and column[c][1:] != column[column[c][0]] for c in range(n)):
+        raise ValueError("A dense factor's pattern must hold each column's whole path to the root")
     return field_group.upload(
         DenseFactorPlan,
         device,
@@ -181,6 +204,8 @@ def dense_factor_plan(physical_lookup, device) -> DenseFactorPlan:
         geometry=index[rows, cols].astype(np.int32),
         row_offsets=offsets(np.bincount(rows, minlength=n), np.int32),
         columns=cols.astype(np.int32),
+        column_offsets=offsets(np.bincount(cols[below], minlength=n), np.int32),
+        column_rows=rows[below].astype(np.int32),
         **schedule,
     )
 
@@ -202,6 +227,7 @@ def dense_factor_kernel(size: int) -> wp.Kernel:
         ("drive_row_by_dof", wp.array[int]),
         ("row_K", wp.array[float]),
         ("row_H", wp.array[float]),
+        ("row_P", wp.array[float]),
         ("geometric", wp.array2d[float]),
         ("L_group", wp.array3d[float]),
     )

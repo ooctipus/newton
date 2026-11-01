@@ -16,7 +16,6 @@ from . import (
     field_group,
     kernels,
     response_builds_dense,
-    response_builds_rows,
     response_operator,
     sparse_factor,
 )
@@ -114,11 +113,7 @@ class HeldResponse:
     trial2: wp.array3d[float]
     trial3: wp.array3d[float]
     inverse_trial: wp.array[float]
-    # What each root's second factor reads (:func:`_second_factor`).
-    armature: wp.array2d[float]
-    armature1: wp.array2d[float]
-    armature2: wp.array2d[float]
-    armature3: wp.array2d[float]
+    # The pattern each root's release walks (:func:`release`).
     factor_plans: wp.array[response_builds_dense.DenseFactorPlan]
 
 
@@ -151,6 +146,7 @@ FORCE_INPUT = (
     Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
     Field("row_Kd", wp.float32, ("drive_row",), owner="factor", attr="aug_row_Kd"),
     Field("row_H", wp.float32, ("drive_row",), owner="factor", attr="aug_row_H"),
+    Field("row_P", wp.float32, ("drive_row",), owner="factor", attr="aug_row_P"),
     Field("row_dv", wp.float32, ("drive_row",), owner="factor", attr="aug_row_dv"),
     Field("decided", wp.int32, ("articulation",), owner="factor", attr="aug_decided"),
     Field("mask", wp.int32, ("articulation",), owner="factor", attr="mass_update_mask"),
@@ -700,7 +696,7 @@ $CLOCK1$REDUCE
     $TRIAL
 $CLOCK4    if(moved!=0||held!=0) {
     $SATURATE
-    $SECOND_FACTOR
+    $RELEASE
     if(moved&1) {
     $SECOND_SOLVE
     }
@@ -754,7 +750,7 @@ decided set differs from the one its step factor holds asks for a new step facto
 so a world with nothing to do pays its :data:`QUIET_DRIVE` tests and no launch, and a captured graph has nothing to skip.
 ``moved``: bit 0, a new solve; bit ``1 + r``, root ``r``'s step factor changes; bit ``8 + r``, root ``r`` holds a
 saturated drive. ``held``: bit ``r``, root ``r``'s step factor holds last step's decided set, which its trial did not
-read (:func:`_second_factor`)."""
+read (:func:`release`)."""
 
 
 def _root(layout: TreeLayout) -> str:
@@ -798,40 +794,163 @@ def _record(layout: TreeLayout, response: str) -> str:
     )
 
 
-def _copy_pattern(target: str, source: str) -> str:
-    """Native loop copying a dense factor's pattern entries from ``source`` to ``target`` (``plan`` and ``n`` in scope)."""
+RELEASE_DENSE = r"""            float* const w=s+$PRED_SCRATCH+$WORK;
+            float* const walk=w+n;
+            int* const path=reinterpret_cast<int*>(walk+5);
+            int* const released_row=path+n;
+            for(int physical=lane;physical<n;physical+=stride) {
+                const int row=f.drive_row.data[dof_start+physical];
+                released_row[physical]=row>=0&&f.row_Kd.data[row]!=f.row_K.data[row]?row:-1;
+            }
+            SYNC();
+            for(int physical=0;physical<n;++physical) {
+                const int row=released_row[physical];
+                if(row<0)continue;
+                const int i=n-1-physical,first=plan.column_offsets.data[i]-1;
+                const int length=plan.column_offsets.data[i+1]-first;
+                for(int k=lane;k<length;k+=stride) {
+                    const int j=k==0?i:plan.column_rows.data[first+k];
+                    path[k]=j;
+                    w[j]=k==0?1.0f:0.0f;
+                }
+                if(lane==0)walk[0]=f.row_Kd.data[row]-f.row_K.data[row];
+                for(int k=0;k<length;++k) {
+                    SYNC();
+                    const int j=path[k];
+                    if(lane==0) {
+                        const float p=w[j],own=L[j*n+j],pivot=own*own,alpha=walk[0];
+                        const float released=k==0?f.row_P.data[row]+f.row_Kd.data[row]:pivot+alpha*p*p;
+                        const float root=sqrtf(released);
+                        walk[0]=alpha*pivot/released;
+                        walk[1]=p;walk[2]=alpha*p/released;walk[3]=1.0f/own;walk[4]=root;
+                        L[j*n+j]=root;
+                    }
+                    SYNC();
+                    for(int m=k+1+lane;m<length;m+=stride) {
+                        const int r=path[m];
+                        const float l=L[r*n+j]*walk[3];
+                        const float x=w[r]-walk[1]*l;
+                        w[r]=x;
+                        L[r*n+j]=(l+walk[2]*x)*walk[4];
+                    }
+                }
+                SYNC();
+            }
+"""
+"""The release on a dense factor ``L`` (Cholesky, leaf-first, ``n`` coordinates, ``plan`` its pattern): every drive of
+the root whose decided ``K`` (``row_Kd``) is below its trial's (``row_K``) takes ``K - Kd`` out of ``L L^T``, root-most
+first, by the rank-1 downdate of Gill, Golub, Murray and Saunders (1974, C1) along its path ``i, parent(i), ...,
+root``, column ``i``'s rows below its diagonal (the plan's columns hold their whole paths): ``w`` the forward image of
+``e_i``, ``alpha`` the update's weight, and only the path's triangle changes. The released pivot is ``P_i + Kd``, the
+pivot the factor launch kept without ``K`` (``row_P``), never ``L_ii^2 - K``, which loses ``log10(K / P_i)`` digits;
+every other pivot changes by the physical drop of its articulated inertia, ``alpha p^2``, as a refactor's Schur
+complement would. Root-most first, no release changes the pivot of a drive released after it, so each reads its ``P_i``
+as the factor left it. The lanes stage which drives release and each one's path, then along it lane 0 takes each
+column's pivot and the lanes its rows: ``walk`` holds the column's ``alpha``, ``p``, ``beta``, ``1 / L_jj`` and new
+``L_jj``, then the path and each coordinate's released row. A scan or a path read item by item from global memory waits
+on it at every step (g1's lone world spent 30k cycles so), and one lane's whole walk holds more registers than the
+predictor's other stages, which every world would pay."""
+
+RELEASE_SPARSE = r"""            const auto& indices=d.indices;
+            float* const path=s+$PRED_SCRATCH+$NNZ;
+            int* const steps=reinterpret_cast<int*>(path);
+            int* const released_row=steps+6*$INVERSE_WIDTH;
+            for(int i=lane;i<$DOFS;i+=stride) {
+                const int row=f.drive_row.data[ds+indices.permutation.data[i]];
+                released_row[i]=row>=0&&f.row_Kd.data[row]!=f.row_K.data[row]?row:-1;
+            }
+            SYNC();
+            #pragma unroll 1
+            for(int i=$DOFS-1;i>=0;--i) {
+                const int row=released_row[i];
+                if(row<0)continue;
+                const float Kd=f.row_Kd.data[row],released_K=Kd-f.row_K.data[row];
+                const int begin=indices.column_offsets.data[i],length=indices.column_offsets.data[i+1]-begin;
+                for(int k=lane;k<length;k+=stride) {
+                    const int entry=indices.column_entries.data[begin+k],r=indices.entry_rows.data[entry];
+                    const int diagonal=indices.row_offsets.data[r+1]-1,first=r-(diagonal-indices.row_offsets.data[r]);
+                    const float scale=1.0f/inverse[diagonal];
+                    steps[k]=r;steps[$INVERSE_WIDTH+k]=first;steps[2*$INVERSE_WIDTH+k]=diagonal-r;
+                    path[3*$INVERSE_WIDTH+k]=inverse[entry];path[4*$INVERSE_WIDTH+k]=scale;
+                }
+                SYNC();
+                if(lane==0) {
+                    float alpha=released_K;
+                    for(int k=0;k<length;++k) {
+                        const float scale=path[4*$INVERSE_WIDTH+k],pivot=scale*scale,t=path[3*$INVERSE_WIDTH+k]*scale;
+                        const float released=k==0?f.row_P.data[row]+Kd:pivot+alpha*t*t;
+                        if(!(released>0.0f)||!wp::isfinite(released))d.status.data[group]=1;
+                        const float beta=alpha*t/released;
+                        alpha=alpha*pivot/released;
+                        path[4*$INVERSE_WIDTH+k]=beta*scale;
+                        path[5*$INVERSE_WIDTH+k]=scale/sqrtf(released);
+                    }
+                }
+                SYNC();
+                for(int c=lane;c<$DOFS;c+=stride) {
+                    float sum=0.0f;
+                    for(int k=0;k<length;++k) {
+                        if(c>steps[k]||c<steps[$INVERSE_WIDTH+k])continue;
+                        float* const x=inverse+steps[2*$INVERSE_WIDTH+k]+c;
+                        const float u=*x-path[3*$INVERSE_WIDTH+k]*sum;
+                        sum+=path[4*$INVERSE_WIDTH+k]*u;
+                        *x=path[5*$INVERSE_WIDTH+k]*u;
+                    }
+                }
+                SYNC();
+            }
+"""
+"""The release on a sparse factor's stored inverse ``W = L^-1`` (leaf-first; ``inverse`` its working copy in the
+predictor's block, which the walks read at shared memory's latency): the downdate of :data:`RELEASE_DENSE` without ``L``.
+Along drive ``i``'s path, column ``i`` of ``W`` gives ``t_r = W_ri / W_rr`` and the pivots ``d_r = W_rr^-2``; lane 0 runs the recurrence (``beta_r``, the new pivots, the released one ``P_i + Kd``); then
+``W <- Dbar^-1/2 G^-1 D^1/2 W`` changes only the path's rows, ``G = I + tril(t beta^T, -1)``, each lane one column alone
+(``u_r = W_rc - W_ri s``, ``s += beta_r d_r^1/2 u_r``, ``W_rc = (d_r / dbar_r)^1/2 u_r``, over the path rows that hold
+``c``, a range ending at the row). ``path`` holds ``$INVERSE_WIDTH`` words of each per path step: the row, the first
+column it holds, its entry offset, ``W_ri``, then ``beta_r d_r^1/2`` and ``(d_r / dbar_r)^1/2``; after them each
+coordinate's released row, staged by the lanes. A pivot that is not positive sets the factor's status, as a factor
+would."""
+
+
+def _release_diagonal(layout: TreeLayout, r: int, offset: int, count: int) -> str:
+    """Native statements releasing root ``r``'s compact diagonal, coordinates ``offset`` to ``offset + count``: each
+    coordinate is its own path, so a released drive's inverse is ``1 / (P_i + Kd)``, and every other takes the trial's."""
     return (
-        "for(int entry=lane;entry<plan.entry_count;entry+=stride){"
-        f"const int e=plan.rows.data[entry]*n+plan.columns.data[entry];{target}[e]={source}[e];}}"
+        f"if(moved&{2 << r}) {{\n"
+        f"        for(int i={offset}+lane;i<{offset + count};i+=stride) {{\n"
+        "            const int dof=ds+i;\n"
+        f"            if(!(held&{1 << r}))d.inverse_trial.data[dof]=d.inverse.data[dof];\n"
+        "            const int row=f.drive_row.data[dof];\n"
+        "            const bool released=row>=0&&f.row_Kd.data[row]!=f.row_K.data[row];\n"
+        f"            d.inverse.data[dof]=(moved&{256 << r})&&released?1.0f/(f.row_P.data[row]+f.row_Kd.data[row])"
+        ":d.inverse_trial.data[dof];\n"
+        "        }\n"
+        "        SYNC();\n"
+        "    }\n"
     )
 
 
-def _second_factor(layout: TreeLayout, response: str) -> str:
-    """Native statements of a tree's step factors for the bits of ``moved``. A root whose decided set holds a saturated
-    drive refactors its step factor from the geometry its refresh read, with the texts of the factor kernels on the
-    predictor's lanes, after keeping every drive's ``K`` in its trial factor if the step factor held them; a root whose
-    set emptied takes its trial factor back. A working factor sits in the predictor's block after its scratch, past
-    :data:`.response_builds_dense.STAGED_FACTOR_SIZE` in place in global memory, with a sparse ``L^-1`` in place; a compact
-    diagonal's inverses are the division of ``held_tree._diagonal_geometry`` from the ``H_ii`` of its rows."""
-    drive_rows = "const auto& drive_row_by_dof=f.drive_row;const auto& row_K=f.row_Kd;const auto& row_H=f.row_H;"
+def release(layout: TreeLayout, response: str) -> str:
+    """Native statements making each root's step factor hold its decided set, for the bits of ``moved``: the release. A
+    root whose set changed takes the trial factor (every drive's ``K``) into its step factor, keeping it first in its
+    trial array where the step factor held it, and releases each saturated drive's ``K`` along its path
+    (:data:`RELEASE_DENSE`, :data:`RELEASE_SPARSE`; a compact diagonal's path is its coordinate). No geometry is read and
+    no factor runs: the step factor is the trial released, so a set that empties is the trial. The working factor sits in
+    the predictor's block after its scratch, a dense one past :data:`.response_builds_dense.STAGED_FACTOR_SIZE` in place
+    in global memory, where a path's every step would wait on it."""
     if response == "sparse":
         return (
             "if(moved&2) {\n"
-            "        float* inverse=d.W.data+group*$NNZ;float* const kept=d.W_trial.data+group*$NNZ;\n"
-            "        if(moved&256) {\n"
-            "        if(!(held&1))for(int entry=lane;entry<$NNZ;entry+=stride)kept[entry]=inverse[entry];\n"
-            f"        {drive_rows}\n"
-            "        const auto& indices=d.indices;const auto& status=d.status;const auto& geometric=cache.geometric;\n"
-            "        const auto& R_group=d.armature;\n"
-            "        const int start=ds;\n"
-            "        float* factor=s+$PRED_SCRATCH;\n"
-            + response_builds_rows.sparse_factor_body(layout.dofs, layout.entries)
-            + "        SYNC();\n"
-            "        if(status.data[group]!=0)for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=NAN;\n"
-            "        } else {\n"
-            "        for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=kept[entry];\n"
+            "        float* const decided=d.W.data+group*$NNZ;float* const kept=d.W_trial.data+group*$NNZ;\n"
+            "        float* const inverse=s+$PRED_SCRATCH;\n"
+            "        if(held&1)for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=kept[entry];\n"
+            "        else for(int entry=lane;entry<$NNZ;entry+=stride){const float value=decided[entry];kept[entry]=value;"
+            "inverse[entry]=value;}\n"
             "        if(lane==0)d.status.data[group]=0;\n"
-            "        }\n"
+            "        SYNC();\n"
+            "        if(moved&256) {\n" + substitute(RELEASE_SPARSE, layout.sizes()) + "        }\n"
+            "        if(d.status.data[group]!=0)for(int entry=lane;entry<$NNZ;entry+=stride)inverse[entry]=NAN;\n"
+            "        SYNC();\n"
+            "        for(int entry=lane;entry<$NNZ;entry+=stride)decided[entry]=inverse[entry];\n"
             "        SYNC();\n"
             "    }\n"
         )
@@ -842,58 +961,53 @@ def _second_factor(layout: TreeLayout, response: str) -> str:
         if family == 0:
             continue
         if family < 0:
-            offset = layout.root_offsets[r]
-            blocks.append(
-                f"if(moved&{2 << r}) {{\n"
-                f"        for(int i={offset}+lane;i<{offset - family};i+=stride) {{\n"
-                "            const int dof=ds+i;\n"
-                f"            if(!(moved&{256 << r})){{d.inverse.data[dof]=d.inverse_trial.data[dof];continue;}}\n"
-                f"            if(!(held&{1 << r}))d.inverse_trial.data[dof]=d.inverse.data[dof];\n"
-                "            const int row=f.drive_row.data[dof];\n"
-                "            if(row<0)continue;\n"
-                "            const float K=f.row_Kd.data[row],H=f.row_H.data[row];\n"
-                "            d.inverse.data[dof]=1.0f/(K>0.0f?H+K:H);\n"
-                "        }\n"
-                "        SYNC();\n"
-                "    }\n"
-            )
+            blocks.append(_release_diagonal(layout, r, layout.root_offsets[r], -family))
             continue
+        staged = family <= response_builds_dense.STAGED_FACTOR_SIZE
         factor_group = f"d.factor_index.data[group*{roots}+{r}]" if layout.forest else "group"
         blocks.append(
             f"if(moved&{2 << r}) {{\n"
             f"        const int root_art={_root_articulation(layout, r)},factor_group={factor_group};\n"
-            f"        const auto& plan=d.factor_plans.data[{r}];const auto& R_group=d.{root_field('armature', r)};\n"
-            f"        {drive_rows}\n"
+            f"        const auto& plan=d.factor_plans.data[{r}];\n"
             "        const int n=plan.size,dof_start=p.art_dof_start.data[root_art];\n"
-            "        const float* mass=cache.geometric.data+group*$NNZ;\n"
-            f"        const auto& L_group=d.{root_field('lower', r)};\n"
-            "        float* const decided_factor=L_group.data+factor_group*n*n;\n"
+            f"        float* const decided_factor=d.{root_field('lower', r)}.data+factor_group*n*n;\n"
             f"        float* const kept=d.{root_field('trial', r)}.data+factor_group*n*n;\n"
-            f"        if(moved&{256 << r}) {{\n"
-            f"        if(!(held&{1 << r})){{{_copy_pattern('kept', 'decided_factor')}}}\n"
-            "        SYNC();\n"
-            + (
-                "        float* L=s+$PRED_SCRATCH;\n"
-                + response_builds_dense.DENSE_FACTOR_BODY
-                + response_builds_dense.DENSE_FACTOR_PUBLISH
-                if family <= response_builds_dense.STAGED_FACTOR_SIZE
-                else "        float* L=decided_factor;\n" + response_builds_dense.DENSE_FACTOR_BODY
-            )
-            + "        } else {\n"
-            f"        {_copy_pattern('decided_factor', 'kept')}\n"
+            f"        float* const L={'s+$PRED_SCRATCH' if staged else 'decided_factor'};\n"
+            "        for(int entry=lane;entry<plan.entry_count;entry+=stride) {\n"
+            "            const int e=plan.rows.data[entry]*n+plan.columns.data[entry];\n"
+            f"            const float value=(held&{1 << r})?kept[e]:decided_factor[e];\n"
+            f"            if(!(held&{1 << r}))kept[e]=value;\n"
+            f"            {'L[e]=value;' if staged else f'if(held&{1 << r})L[e]=value;'}\n"
             "        }\n"
             "        SYNC();\n"
-            "    }\n"
+            f"        if(moved&{256 << r}) {{\n"
+            + substitute(RELEASE_DENSE, layout.sizes(), WORK=family * family if staged else 0)
+            + "        SYNC();\n"
+            "        }\n"
+            + (
+                "        for(int entry=lane;entry<plan.entry_count;entry+=stride) {\n"
+                "            const int e=plan.rows.data[entry]*n+plan.columns.data[entry];\n"
+                "            decided_factor[e]=L[e];\n"
+                "        }\n"
+                "        SYNC();\n"
+                if staged
+                else ""
+            )
+            + "    }\n"
         )
     return "\n".join(blocks)
 
 
 def predict_words(layout: TreeLayout, response: str) -> int:
-    """Words of the predictor's block: its scratch, and a second factor's working factor where it fits shared memory."""
-    work = layout.entries if response == "sparse" else 0
+    """Words of the predictor's block: its scratch, and what a release works in (:func:`release`): a sparse factor's
+    working ``L^-1``, six words a path step and a word a coordinate, a dense one's working factor where it fits shared
+    memory, its path vector, the walk's five scalars, its path and a word a coordinate."""
+    work = layout.entries + 6 * layout.inverse_width + layout.dofs if response == "sparse" else 0
     if response == "cholesky":
-        staged = (f for f in layout.root_families if 0 < f <= response_builds_dense.STAGED_FACTOR_SIZE)
-        work = max((f * f for f in staged), default=0)
+        dense = [f for f in layout.root_families if f > 0]
+        work = max(
+            ((f * f if f <= response_builds_dense.STAGED_FACTOR_SIZE else 0) + 3 * f + 5 for f in dense), default=0
+        )
     return 6 * layout.bodies + 2 * layout.dofs + work
 
 
@@ -1969,7 +2083,7 @@ def get_predictor_kernel(
             DECIDE=QUIET_DRIVE,
         ),
         SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
-        SECOND_FACTOR=_second_factor(layout, response),
+        RELEASE=release(layout, response),
         SECOND_SOLVE=substitute(_SOLVE, layout.sizes(), **step_solve, START_FORWARD="", START_RESPONSE="", DECIDE=""),
         RECORD=_record(layout, response),
         **operations,

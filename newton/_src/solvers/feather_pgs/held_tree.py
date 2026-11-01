@@ -41,6 +41,7 @@ def _diagonal_geometry(
     drive_row: wp.array[int],
     drive_k: wp.array[float],
     row_H: wp.array[float],
+    row_P: wp.array[float],
     n: int,
     inverse: wp.array[float],
 ):
@@ -53,7 +54,9 @@ def _diagonal_geometry(
     mass = geometric[geometry_group[group], geometry_index[local]] + armature[group, local]
     row = drive_row[dof]
     if row >= 0:
+        # A diagonal pivot is its own H_ii: without K it is the H_ii (tree_kinetic_state.release).
         row_H[row] = mass
+        row_P[row] = mass
         if drive_k[row] > 0.0:
             mass += drive_k[row]
     inverse[dof] = 1.0 / mass
@@ -261,6 +264,7 @@ class TreeSparseOperator:
                 s.factor.drive_row_by_dof,
                 s.factor.aug_row_K,
                 s.factor.aug_row_H,
+                s.factor.aug_row_P,
                 s.factor.sparse_mass_matrix_indices,
             ],
             outputs=[s.factor.sparse_Linv, s.factor.sparse_mass_matrix_status],
@@ -269,10 +273,8 @@ class TreeSparseOperator:
         )
 
     def bind_response(self):
-        """Bind what the predictor's trial and second factor read."""
-        n = self.solver.placement.sparse_mass_matrix_size
+        """Bind what the predictor's trial and release read."""
         self.data.W_trial = self.solver.factor.sparse_Linv_trial
-        self.data.armature = self.solver.factor.R_by_size[n]
         self.data.indices = self.solver.factor.sparse_mass_matrix_indices
 
 
@@ -344,6 +346,7 @@ class TreeHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
+                    solver.factor.aug_row_P,
                     size,
                 ],
                 outputs=[solver.factor.diagonal_inverse_mass],
@@ -363,6 +366,7 @@ class TreeHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
+                    solver.factor.aug_row_P,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[self._lower],
@@ -378,7 +382,6 @@ class TreeHeldOperator:
         else:
             self.data.lower = self._lower
             self.data.trial = self._trial
-            self.data.armature = self.solver.factor.R_by_size[self.size][self.span[0] : self.span[1]]
 
 
 class PrescribedRootOperator:
@@ -641,6 +644,7 @@ class ForestHeldOperator:
                         solver.factor.drive_row_by_dof,
                         solver.factor.aug_row_K,
                         solver.factor.aug_row_H,
+                        solver.factor.aug_row_P,
                         size,
                     ],
                     outputs=[solver.factor.diagonal_inverse_mass],
@@ -660,6 +664,7 @@ class ForestHeldOperator:
                     solver.factor.drive_row_by_dof,
                     solver.factor.aug_row_K,
                     solver.factor.aug_row_H,
+                    solver.factor.aug_row_P,
                     self.kinetic_state.geometric,
                 ],
                 outputs=[solver.factor.L_by_size[family]],
@@ -673,7 +678,6 @@ class ForestHeldOperator:
             if family > 0:
                 setattr(self.data, root_field("lower", r), self.solver.factor.L_by_size[family])
                 setattr(self.data, root_field("trial", r), self.solver.factor.T_by_size[family])
-                setattr(self.data, root_field("armature", r), self.solver.factor.R_by_size[family])
 
 
 class HeldTree:

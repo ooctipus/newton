@@ -53,6 +53,7 @@ class TestDenseFactor(unittest.TestCase):
             return wp.array(value, dtype=dtype, device=device)
 
         output = wp.zeros((groups, size, size), device=device)
+        pivots = wp.zeros(drive_k.size, device=device)
         wp.launch(
             dense_factor_kernel(size),
             dim=groups * 32,
@@ -66,6 +67,7 @@ class TestDenseFactor(unittest.TestCase):
                 array(drive, int),
                 array(drive_k),
                 array(np.zeros_like(drive_k)),
+                pivots,
                 array(geometric),
             ],
             outputs=[output],
@@ -81,6 +83,14 @@ class TestDenseFactor(unittest.TestCase):
             leaf_first = expected[group][::-1, ::-1]
             np.testing.assert_allclose(lower, np.linalg.cholesky(leaf_first), atol=2e-3, rtol=2e-4)
             np.testing.assert_allclose(lower @ lower.T, leaf_first, atol=2e-3, rtol=5e-5)
+            # A drive's pivot without its K: its own pivot less the K the diagonal took (a release's pivot).
+            rows = drive[articulation * size : (articulation + 1) * size][::-1]
+            held = rows >= 0
+            pivot = np.diag(lower).astype(np.float64) ** 2
+            added = np.maximum(drive_k[rows[held]], 0.0)
+            np.testing.assert_allclose(
+                pivots.numpy()[rows[held]], pivot[held] - added, rtol=0.0, atol=2e-5 * float(pivot.max(initial=1.0))
+            )
 
     def test_any_size_and_pattern(self):
         """Factor every pattern, fill included, with the drives on the diagonal, and leave inactive articulations."""

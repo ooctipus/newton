@@ -593,7 +593,7 @@ class TestDriveSaturation(unittest.TestCase):
         np.testing.assert_array_equal(out.body_q.numpy(), state.body_q.numpy())
 
     def test_a_step_at_a_limit_launches_what_a_quiet_step_does(self):
-        """The decision, the second factor and the second solve are the predictor's: no launch of their own, so a world
+        """The decision, the release and the second solve are the predictor's: no launch of their own, so a world
         with nothing to do pays no launch and a launch does not wait on another for its slowest world."""
         launches, moved = [], []
         for limit in (1.0e6, 0.5):
@@ -608,6 +608,23 @@ class TestDriveSaturation(unittest.TestCase):
             self.assertEqual(sum(name.startswith(stage) for name in launches[0]), 1, stage)
         self.assertEqual(moved[0].size, 0)
         self.assertLess(float(moved[1].min()), 1.0e-6)
+
+    def test_a_stiff_drive_releases_without_losing_digits(self):
+        """A saturated drive's ``K`` leaves the step factor by a release whose pivot is the factor's own pivot without
+        ``K``, never ``L_ii^2 - K``: at ``K`` of 5e5 times the light mode's inertia, where that subtraction keeps about
+        one digit in float32, the released factor is a refresh's to rounding."""
+        for saturated in ((1.0e4, -1.0e4), (1.0e4, 0.0)):
+            with self.subTest(targets=saturated):
+                model, control = _driven_hinges((0.02, 0.8), ke=0.0, kd=6.0e5, effort=1.0, target=[0.0, 0.0])
+                control.joint_target_qd.assign(np.asarray(saturated, dtype=np.float32))
+                _, solver = _drive_roll(model, control, 3, update_mass_matrix_interval=2)
+                decided = _decided_K(solver)
+                self.assertEqual(int((decided < 1.0e-6).sum()), int(np.count_nonzero(saturated)))
+                held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
+                _refresh_decided(solver)
+                for size, factor in solver.factor.L_by_size.items():
+                    fresh = np.tril(factor.numpy())
+                    np.testing.assert_allclose(held[size], fresh, rtol=0.0, atol=4.0e-6 * float(np.abs(fresh).max()))
 
     def test_a_saturation_change_refreshes_a_stale_factor(self):
         """Hold ``update_mass_matrix_interval=2`` to the every-step result where ``H`` is constant: only ``K`` moves."""
@@ -899,7 +916,7 @@ def _refresh_decided(solver) -> None:
 
 @unittest.skipUnless(wp.is_cuda_available(), "the held tree's natives run on CUDA")
 class TestDriveSaturationOnRoutes(unittest.TestCase):
-    """The decision on each evaluator of the trees: a second factor and solve that reach the right articulations."""
+    """The decision on each evaluator of the trees: a release and a second solve that reach the right articulations."""
 
     def _roll(self, device, pins, *, scene=_driven_forest, **options):
         with conformance.route_context(conformance.Route("drives", device.split(":")[0], pins=pins)):
@@ -935,9 +952,10 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
         np.testing.assert_allclose(history[:20], reference[:20], rtol=0.0, atol=2.0e-2)
 
-    def test_a_second_factor_is_the_factor_kernels(self):
-        """The factor the predictor made for the ``K`` it left is the one a refresh makes from the same geometry and
-        ``K``."""
+    def test_a_release_is_the_factor_kernels(self):
+        """The factor the predictor released to the ``K`` it left is, to rounding, the one a refresh makes from the same
+        geometry and ``K``: a float32 factor's rounding at its scale, since the two take different sums (the CUDA refresh
+        sums each pivot across its lanes)."""
         for device, pins in (("cpu", {}), ("cuda:0", {}), ("cuda:0", {"grouping": "forest"})):
             with self.subTest(device=device, pins=pins):
                 _, solver = self._roll(device, pins)
@@ -946,7 +964,8 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
                 held = {size: np.tril(factor.numpy()) for size, factor in solver.factor.L_by_size.items()}
                 _refresh_decided(solver)
                 for size, factor in solver.factor.L_by_size.items():
-                    np.testing.assert_allclose(held[size], np.tril(factor.numpy()), rtol=2.0e-6, atol=1.0e-7)
+                    fresh = np.tril(factor.numpy())
+                    np.testing.assert_allclose(held[size], fresh, rtol=0.0, atol=4.0e-6 * float(np.abs(fresh).max()))
 
     def test_a_captured_graph_decides_like_an_eager_step(self):
         """The decision in a graph: steps at their limits, then quiet steps, then at their limits again."""
@@ -1007,7 +1026,7 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
         arms = [self._sparse_roll(dense, 60, 1)[0] for dense in (False, True)]
         np.testing.assert_allclose(arms[1], arms[0], rtol=0.0, atol=2.0e-2)
 
-    def test_a_sparse_second_factor_is_the_factor_kernels(self):
+    def test_a_sparse_release_is_the_factor_kernels(self):
         """``L^-1`` included. An odd step count: the last finish left the geometry the step's factors read."""
         _, solver = self._sparse_roll(False, 5, 2)
         held = solver.factor.sparse_Linv.numpy().copy()

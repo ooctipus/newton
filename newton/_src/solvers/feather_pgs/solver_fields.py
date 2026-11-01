@@ -59,13 +59,15 @@ AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_K", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_Kd", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_H", wp.float32, ("drive_row",), owner="factor"),
+    Field("aug_row_P", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_dv", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_drive", wp.vec4, ("dof",), owner="factor"),
     Field("aug_decided", wp.int32, ("articulation",), owner="factor"),
 )
 """Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, which the trial factor holds; the ``K`` the step's
 factor holds once the saturation decision has taken some out (``aug_row_Kd``, the passive damper's on a saturated drive);
-the ``H_ii`` (armature in, ``K`` out) its factor last refreshed from and what last step's rows did to its coordinate;
+the ``H_ii`` (armature in, ``K`` out) its factor last refreshed from; its pivot there without its ``K`` (``aug_row_P``),
+which a release of the drive pivots on (:func:`.tree_kinetic_state.release`); what last step's rows did to its coordinate;
 per coordinate, what the step's saturation decision reads on every drive
 (:data:`.tree_kinetic_state.SATURATE_DRIVES`): ``aug_drive``, the drive's own ``K``, the passive damper's, the effort limit
 and the unlimited ``u0``, one read of one record; and per articulation whether its step factor holds a decided set

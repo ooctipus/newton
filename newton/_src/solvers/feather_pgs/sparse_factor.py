@@ -57,7 +57,6 @@ class SparseData:
     W_trial: wp.array2d[float]
     valid: wp.array[int]
     status: wp.array[int]
-    armature: wp.array2d[float]
     indices: _SparseMassMatrixIndices
     Z: wp.array3d[float]
     support: wp.array2d[int]
