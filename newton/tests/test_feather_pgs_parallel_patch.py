@@ -562,8 +562,8 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
 def _tier_texts(rows: int):
     """The emitter's text of a ``rows``-row tier's pair projections, point and pooled, and of its isotropic step."""
     store = emitter.JacobiRows(rows, 32 * ((rows + 31) // 32))
-    point = emitter._jacobi_projection(store, pooled=False, pad="        ")
-    pooled = emitter._jacobi_projection(store, pooled=True, pad="        ")
+    point = emitter._jacobi_projection(store, pooled=False, pad="            ")
+    pooled = emitter._jacobi_projection(store, pooled=True, pad="            ")
     return point, pooled, emitter.isotropic_friction_step(store, "    ")
 
 
@@ -745,7 +745,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(text.count("const float r_vlim = s_rhs[i] + part;"), 1)
                 # The pass runs between the final sweep and the velocity reconstruction.
                 self.assertLess(text.index("const float r_vlim"), text.index("v_out.data[global_dof] ="))
-                self.assertGreater(text.index("const float r_vlim"), text.index("for (int sweep = 0;"))
+                self.assertGreater(text.index("const float r_vlim"), text.index("for (; sweep <"))
 
     def test_solver_builds_the_pass_for_limited_linked_tiers(self):
         """Build the last-word pass exactly for linked tiers with joint velocity limits."""

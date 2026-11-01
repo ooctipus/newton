@@ -1531,25 +1531,23 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
 
 
 def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
-    """Rows that leave idleness join the steps' bound, after the sweep's vote: an idle row whose residual turned negative
-    kept its zero impulse in that sweep, voted loud and raised ``s_joined`` (:func:`_jacobi_step`); every admitted row's
-    step is then set again on the rows that can now move (:meth:`~.ResponseOperator.jacobi_steps`, then the friction
-    blocks' isotropy), the extrapolation is dropped and the momentum restarts in the new metric, so the row moves from
-    the next sweep under a bound that counts it: no row ever moves outside the bound. The vote that ended the sweep is
-    the block's barrier, so the flag is read alike by every lane and costs no barrier of its own."""
+    """Rows that left idleness join the steps' bound, between two epochs of sweeps: an idle row whose residual turned
+    negative kept its zero impulse in its sweep, voted loud and raised ``s_joined`` (:func:`_jacobi_step`), which ended
+    the epoch after that sweep's vote; every admitted row's step is set again on the rows that can now move
+    (:meth:`~.ResponseOperator.jacobi_steps`, then the friction blocks' isotropy), the extrapolation is dropped and the
+    momentum restarts in the new metric, so the row moves from the next sweep under a bound that counts it: no row ever
+    moves outside the bound. Out of the sweep loop, the join costs the sweeps nothing until it runs."""
     lines = [
-        "if (s_joined[0]) {",
-        "    SYNC();",
-        "    if (lane == 0) s_joined[0] = 0;",
-        op.jacobi_steps(scale, "    ", counted=rows.counted),
-        isotropic_friction_step(rows, "    "),
-        f"    row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
-        "    row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
-        "    row_share = row_diag * row_step;",
-        f"    if (lane < {rows.rows}) s_y[lane] = s_x[lane];",
-        "    t_k = 1.0f;",
-        "    SYNC();",
-        "}",
+        "SYNC();",
+        "if (lane == 0) s_joined[0] = 0;",
+        op.jacobi_steps(scale, "", counted=rows.counted),
+        isotropic_friction_step(rows, ""),
+        f"row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
+        "row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
+        "row_share = row_diag * row_step;",
+        f"if (lane < {rows.rows}) s_y[lane] = s_x[lane];",
+        "t_k = 1.0f;",
+        "SYNC();",
     ]
     return indent("\n".join(lines), pad)
 
@@ -1779,6 +1777,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
             stored = row_weight(stored, "world_row_eps.data[off_dense + lane]", "row_diag")
         weight = f"{pad}const float row_w = (row_contact && regularize) ? {stored} : 1.0f;"
     inner = pad + "    "
+    hot = inner + "    "
     change = Change("x_new - x_from", "row_bound", "s_type[i]" if rows.types else "-1", "row_inv_step")
     block = rows.threads > 32
     lines = [
@@ -1793,24 +1792,28 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{pad}float row_share = row_diag * row_step;",
         weight,
         f"{pad}float t_k = 1.0f;",
-        f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
-        op.gather(inner),
-        _jacobi_step(rows, op, laws, inner),
-        f"{inner}int iteration_changed = 0;",
-        _jacobi_projection(rows, pooled=pooled, pad=inner),
-        _jacobi_momentum(rows, pad=inner),
-        f"{inner}{{",
-        f"{inner}    const int i = lane;",
-        f"{inner}    if (i < {rows.rows}) {{",
-        f"{inner}        s_x[i] = x_new;",
-        f"{inner}        s_y[i] = x_new + beta * (x_new - x_old);",
-        f"{inner}        if (row_joins) iteration_changed = 1;",
-        f"{inner}        if (x_new != x_from) {{",
-        change_vote(laws, (change,), inner + "            "),
-        f"{inner}        }}",
-        f"{inner}    }}",
-        f"{inner}}}",
-        f"{inner}SYNC();",
+        # The sweeps run in epochs of one metric: a row that joins the steps' bound ends its epoch after its sweep's
+        # vote (the flag it raised is read alike by every lane), and the join sets the next epoch's steps.
+        f"{pad}int sweep = 0;",
+        f"{pad}for (;;) {{",
+        f"{inner}for (; sweep < {sweeps}; ++sweep) {{",
+        op.gather(hot),
+        _jacobi_step(rows, op, laws, hot),
+        f"{hot}int iteration_changed = 0;",
+        _jacobi_projection(rows, pooled=pooled, pad=hot),
+        _jacobi_momentum(rows, pad=hot),
+        f"{hot}{{",
+        f"{hot}    const int i = lane;",
+        f"{hot}    if (i < {rows.rows}) {{",
+        f"{hot}        s_x[i] = x_new;",
+        f"{hot}        s_y[i] = x_new + beta * (x_new - x_old);",
+        f"{hot}        if (row_joins) iteration_changed = 1;",
+        f"{hot}        if (x_new != x_from) {{",
+        change_vote(laws, (change,), hot + "            "),
+        f"{hot}        }}",
+        f"{hot}    }}",
+        f"{hot}}}",
+        f"{hot}SYNC();",
         end_sweep(
             policy,
             iteration="sweep",
@@ -1818,6 +1821,9 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
             iterations=str(int(sweeps)),
             argmax="BLOCK_ARGMAX" if block else "ARGMAX",
         ).rstrip("\n"),
+        f"{hot}if (s_joined[0]) {{ ++sweep; break; }}",
+        f"{inner}}}",
+        f"{inner}if (sweep >= {sweeps} || !s_joined[0]) break;",
         _jacobi_join(rows, op, scale, inner),
         f"{pad}}}",
     ]
