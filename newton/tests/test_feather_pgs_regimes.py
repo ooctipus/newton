@@ -1811,13 +1811,12 @@ class TestQ20WorldOffset(unittest.TestCase):
     Isaac Lab simulates each world at its env origin (``builder.replicate(..., xforms=env origins)``) and Newton's state
     holds float32 world positions. At the benchmark's farthest origin (:data:`FAR`) a coordinate's spacing is 15.3 um:
 
-    - a body's step ``v h`` under half of it rounds away: at 1/240 s a slide slower than 1.8 mm/s does not move;
-    - a contact's gap ``n . (p_a - p_b)`` is formed from rounded world points (``contact_laws.contact_points``), so a row
-      whose normal is horizontal holds a ``b`` off by up to a spacing over ``h``: 2.2e-3 m/s on the gripper's pads,
-      against bodies and static shapes alike.
-
-    A normal along z reads only heights, so resting, stacking and walking on the ground hold. The fix is the owner's: a
-    world simulated in its own frame, with env origins applied at the observation and render boundary.
+    - a contact's gap subtracts its endpoints' translations before their offsets (``contact_laws.contact_points``), so
+      it carries no rounding of world points: a row whose normal is horizontal holds the ``b`` it holds at the origin
+      (formed from rounded world points, the gripper's pads held one off by 2.2e-3 m/s);
+    - a body's step ``v h`` under half the spacing rounds away: at 1/240 s a slide slower than 1.8 mm/s does not move.
+      The fix is the owner's: a world simulated in its own frame, with env origins applied at the observation and
+      render boundary.
     """
 
     CREEP = 1.0e-3
@@ -1833,11 +1832,6 @@ class TestQ20WorldOffset(unittest.TestCase):
         ]
         check_regular_scenes(self, entries, conformance.CPU, DEVICE, count=2)
 
-    @known_failure(
-        LIMIT,
-        "float32 world positions: a contact's gap is formed from rounded world points, so a horizontal normal holds a b "
-        "off by up to ulp(|x|) / h, 2.2e-3 m/s at 159 m",
-    )
     def test_horizontal_normals_far_from_the_origin(self):
         """The gripper's pads, normals across x, hold the stated ``b`` at :data:`FAR` as they do at the origin."""
         with wp.ScopedDevice(DEVICE):

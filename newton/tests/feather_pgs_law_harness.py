@@ -354,7 +354,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
     if name == "contact_tangent_basis":
         return {"n": unit_vectors(rng, n)}
     if name == "contact_point":
-        return {"point_a": vec(), "point_b": vec()}
+        return {"translation_a": vec(3.0), "offset_a": vec(0.3), "separation": vec(0.01)}
     if name == "contact_row_frame":
         return {
             "row": ints(0, 4),

@@ -4,10 +4,11 @@
 """The contact-row producers against the contact laws they compose.
 
 Geometry, materials, row frames, prescribed targets and Jacobian entries: each
-producer's rows equal the laws' composition written out in this module. The two
-arithmetic contracts kept as modes are tested with their consumers (endpoint-relative
-in ``test_feather_pgs_resolved_worlds``, the torsion oracle in
-``test_feather_pgs_torsion_device``).
+producer's rows equal the laws' composition written out in this module. The gap's
+precision far from the origin is tested with its consumers (the resolved-world
+classifier in ``test_feather_pgs_resolved_worlds``, the rows in
+``test_feather_pgs_regimes`` Q20), the torsion oracle in
+``test_feather_pgs_torsion_device``.
 """
 
 import unittest
@@ -123,7 +124,7 @@ def _law_contact_rows(
     target_out: wp.array[wp.vec3],
 ):
     c = wp.tid()
-    body_a, body_b, normal, point_a, point_b, phi = contact_laws.contact_geometry(
+    body_a, body_b, normal, point, phi = contact_laws.contact_geometry(
         c,
         contact_shape0,
         contact_shape1,
@@ -139,7 +140,6 @@ def _law_contact_rows(
         contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    point = contact_laws.contact_point(point_a, point_b)
     friction_point = point
     if friction_patches.enabled != 0:
         friction_point = friction_patches.point[c]
@@ -343,7 +343,7 @@ def _law_compact_jacobian(
     if row >= contact_slots_needed[c]:
         return
     body_a, body_b = contact_laws.contact_bodies(contact_shape0[c], contact_shape1[c], shape_body)
-    normal, point_a, point_b, _phi = contact_laws.contact_points(
+    normal, translation_a, offset_a, _translation_b, _offset_b, separation, _phi = contact_laws.contact_points(
         contact_normal[c],
         contact_point0[c],
         contact_point1[c],
@@ -354,7 +354,7 @@ def _law_compact_jacobian(
         body_q,
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    point = contact_laws.contact_point(point_a, point_b)
+    point = contact_laws.contact_point(translation_a, offset_a, separation)
     friction_point = point
     if friction_patches.enabled != 0:
         friction_point = friction_patches.point[c]
@@ -482,7 +482,7 @@ def _law_mf_jacobian(
     if row >= contact_slots_needed[c]:
         return
     body_a, body_b = contact_laws.contact_bodies(contact_shape0[c], contact_shape1[c], shape_body)
-    normal, point_a, point_b, phi = contact_laws.contact_points(
+    normal, translation_a, offset_a, _translation_b, _offset_b, separation, phi = contact_laws.contact_points(
         contact_normal[c],
         contact_point0[c],
         contact_point1[c],
@@ -496,7 +496,7 @@ def _law_mf_jacobian(
         contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
     )
     tangent0, tangent1 = contact_laws.contact_tangent_basis(normal)
-    point = contact_laws.contact_point(point_a, point_b)
+    point = contact_laws.contact_point(translation_a, offset_a, separation)
     friction_point = point
     if friction_patches.enabled != 0:
         friction_point = friction_patches.point[c]
@@ -625,7 +625,7 @@ def _law_contact_admission(
     )
     if not responds or world < 0:
         return
-    _normal, _point_a, _point_b, phi = contact_laws.contact_points(
+    _normal, _translation_a, _offset_a, _translation_b, _offset_b, _separation, phi = contact_laws.contact_points(
         contact_normal[c],
         contact_point0[c],
         contact_point1[c],

@@ -248,7 +248,7 @@ ${PREFIX}
         const int sa = c.shape0.data[contact], sb = c.shape1.data[contact];
         const auto [ba, bb] = ContactLaw::contact_bodies(sa, sb, c.shape_body);
         const int aa = c.art0.data[contact], ab = c.art1.data[contact];
-        const auto [normal, pa, pb, separation] = ContactLaw::contact_points(
+        const auto [normal, ta, oa, tb, ob, separation, gap] = ContactLaw::contact_points(
             c.normal.data[contact], c.point0.data[contact], c.point1.data[contact],
             c.margin0.data[contact], c.margin1.data[contact], ba, bb, c.body_q);
         wp::vec3 t0(0.0f), t1(0.0f);
@@ -257,13 +257,13 @@ ${PREFIX}
             t0 = basis.v0;
             t1 = basis.v1;
         }
-        const wp::vec3 point = ContactLaw::contact_point(pa, pb);
+        const wp::vec3 point = ContactLaw::contact_point(ta, oa, separation);
         ${FRICTION_LOCATION}
         const auto [direction, row_point] = ContactLaw::contact_row_frame(r, normal, t0, t1, point, friction_point);
         const float target = ${TARGET};
 ${MATERIALS}
 ${PROJECTION}
-        const float phi = r == 0 ? separation : ${TANGENT_PHI};
+        const float phi = r == 0 ? gap : ${TANGENT_PHI};
         const float normal_beta = r == 0 ? RowLaw::contact_capped_beta(phi, c.beta, RowLaw::contact_depenetration_cap(
             aa >= 0 && c.response_dofs.data[aa] > 0 ? ba : -1, ab >= 0 && c.response_dofs.data[ab] > 0 ? bb : -1,
             c.max_depenetration_velocity), c.dt) : 0.0f;

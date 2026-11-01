@@ -24,7 +24,6 @@ from .contact_laws import (
     contact_endpoints,
     contact_geometry,
     contact_materials,
-    contact_point,
     contact_points,
     contact_responds,
     contact_row_frame,
@@ -1423,7 +1422,7 @@ def _admit_contact(
     phi = float(0.0)
     admitted = responds and world >= 0
     if admitted:
-        _normal, _point_a, _point_b, phi = contact_points(
+        _normal, _translation_a, _offset_a, _translation_b, _offset_b, _separation, phi = contact_points(
             data.normal[c],
             data.point0[c],
             data.point1[c],
@@ -1869,7 +1868,7 @@ def populate_world_J_for_compact_size(
     for c in range(worker, total_contacts, total_num_workers):
         if data.path[c] != 0 or data.slot[c] < 0 or row >= data.slots_needed[c]:
             continue
-        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
+        body_a, body_b, normal, point, _phi = contact_geometry(
             c,
             data.shape0,
             data.shape1,
@@ -1886,7 +1885,6 @@ def populate_world_J_for_compact_size(
         tangent1 = wp.vec3(0.0)
         if row > 0:
             tangent0, tangent1 = contact_tangent_basis(normal)
-        point = contact_point(point_a, point_b)
         friction_point = point
         if law.patches.enabled != 0:
             friction_point = patch_friction_location(law.patches, c)

@@ -8,11 +8,9 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 * endpoints: :func:`contact_bodies` (shape to body), :func:`contact_endpoints`
   (to articulation and world) and :func:`contact_responds`;
 * geometry: :func:`contact_geometry` reads a contact from the collision arrays;
-  :func:`contact_points` gives the normal from body B to body A, the
-  world contact points offset by the shapes' margins along it, and the gap
-  ``phi = n . (p_a - p_b)``. A second arithmetic contract is kept as an explicit
-  mode: :func:`contact_points_endpoint_relative` subtracts body translations
-  apart from the rotated offsets (the resolved-world classifier's rounding);
+  :func:`contact_points` gives the normal from body B to body A, each surface
+  point as a translation and an offset, and the gap ``phi`` formed from
+  translations and offsets apart, never from rounded world points;
 * materials: :func:`contact_materials`, the friction coefficient
   (:func:`contact_friction`, also the torsional one's combination) and the
   restitution (:func:`contact_restitution`) averaged over the present shapes;
@@ -120,23 +118,34 @@ def contact_points(
     body_a: int,
     body_b: int,
     body_q: wp.array[wp.transform],
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
-    """Return a contact's normal from B to A, its world points on each surface and its gap ``phi``.
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, float]:
+    """Return a contact's normal from B to A, each surface point as a translation and an offset, and its gap.
 
-    The collision pipeline stores the normal from A to B and each witness point in
-    its body's frame (in world coordinates for a static shape). Each point moves to
-    its shape's surface by its margin along the normal; ``phi = n . (p_a - p_b)`` is
-    negative in penetration.
+    ``(normal, translation_a, offset_a, translation_b, offset_b, separation, phi)``. The collision pipeline stores the
+    normal from A to B and each witness point in its body's frame (in world coordinates for a static shape). A body's
+    surface point is its pose's translation plus the witness point rotated into world axes, moved to the surface by
+    its margin along the normal; a static shape's witness point is its own translation, the margin its offset. The
+    gap is ``phi = n . separation`` with ``separation = (translation_a - translation_b) + (offset_a - offset_b)``,
+    negative in penetration: the large parts subtract first, so the gap does not carry the rounding of world
+    points, a spacing of the coordinate far from the origin (Q20). Each world surface point is
+    ``translation + offset``; the rows act at :func:`contact_point`.
     """
     normal = -normal_ab
-    point_a = point0 - margin0 * normal
-    point_b = point1 + margin1 * normal
+    translation_a = point0
+    translation_b = point1
+    offset_a = -margin0 * normal
+    offset_b = margin1 * normal
     if body_a >= 0:
-        point_a = wp.transform_point(body_q[body_a], point0) - margin0 * normal
+        pose_a = body_q[body_a]
+        translation_a = wp.transform_get_translation(pose_a)
+        offset_a = wp.quat_rotate(wp.transform_get_rotation(pose_a), point0) - margin0 * normal
     if body_b >= 0:
-        point_b = wp.transform_point(body_q[body_b], point1) + margin1 * normal
-    phi = wp.dot(normal, point_a - point_b)
-    return normal, point_a, point_b, phi
+        pose_b = body_q[body_b]
+        translation_b = wp.transform_get_translation(pose_b)
+        offset_b = wp.quat_rotate(wp.transform_get_rotation(pose_b), point1) + margin1 * normal
+    separation = (translation_a - translation_b) + (offset_a - offset_b)
+    phi = wp.dot(normal, separation)
+    return normal, translation_a, offset_a, translation_b, offset_b, separation, phi
 
 
 @CONTACT_LAW.law
@@ -151,54 +160,18 @@ def contact_geometry(
     margin1: wp.array[float],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
-) -> tuple[int, int, wp.vec3, wp.vec3, wp.vec3, float]:
-    """Return contact ``c``'s bodies and geometry from the contact arrays: ``(body_a, body_b, normal, p_a, p_b, phi)``.
+) -> tuple[int, int, wp.vec3, wp.vec3, float]:
+    """Return contact ``c``'s bodies, normal, the point its rows act at and its gap from the contact arrays:
+    ``(body_a, body_b, normal, point, phi)``.
 
-    :func:`contact_bodies` then :func:`contact_points`, for the producers that read a
-    contact straight from the collision pipeline's arrays.
+    :func:`contact_bodies`, :func:`contact_points` and :func:`contact_point`, for the producers that read a contact
+    straight from the collision pipeline's arrays.
     """
     body_a, body_b = contact_bodies(shape0[c], shape1[c], shape_body)
-    n, point_a, point_b, phi = contact_points(
+    n, translation_a, offset_a, _translation_b, _offset_b, separation, phi = contact_points(
         normal[c], point0[c], point1[c], margin0[c], margin1[c], body_a, body_b, body_q
     )
-    return body_a, body_b, n, point_a, point_b, phi
-
-
-@CONTACT_LAW.law
-def contact_points_endpoint_relative(
-    normal_ab: wp.vec3,
-    point0: wp.vec3,
-    point1: wp.vec3,
-    margin0: float,
-    margin1: float,
-    body_a: int,
-    body_b: int,
-    body_q: wp.array[wp.transform],
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3, float]:
-    """Return the contact geometry with body translations kept apart from the rotated offsets.
-
-    ``(normal, translation_a, offset_a, translation_b, offset_b, separation, phi)``,
-    with ``p = translation + offset`` on each side and
-    ``separation = (translation_a - translation_b) + (offset_a - offset_b)``: the
-    gap and lever arms avoid subtracting rounded large world points (the
-    resolved-world classifier's arithmetic contract).
-    """
-    normal = -normal_ab
-    translation_a = wp.vec3(0.0)
-    translation_b = wp.vec3(0.0)
-    offset_a = point0 - margin0 * normal
-    offset_b = point1 + margin1 * normal
-    if body_a >= 0:
-        pose_a = body_q[body_a]
-        translation_a = wp.transform_get_translation(pose_a)
-        offset_a = wp.quat_rotate(wp.transform_get_rotation(pose_a), point0) - margin0 * normal
-    if body_b >= 0:
-        pose_b = body_q[body_b]
-        translation_b = wp.transform_get_translation(pose_b)
-        offset_b = wp.quat_rotate(wp.transform_get_rotation(pose_b), point1) + margin1 * normal
-    separation = (translation_a - translation_b) + (offset_a - offset_b)
-    phi = wp.dot(normal, separation)
-    return normal, translation_a, offset_a, translation_b, offset_b, separation, phi
+    return body_a, body_b, n, contact_point(translation_a, offset_a, separation), phi
 
 
 @CONTACT_LAW.law
@@ -263,10 +236,11 @@ def contact_tangent_basis(n: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
 
 
 @CONTACT_LAW.law
-def contact_point(point_a: wp.vec3, point_b: wp.vec3) -> wp.vec3:
-    """Return the one point a contact's rows act at: the midpoint of its surface points. Equal and opposite impulses
-    at one point put no torque on the pair, so a contact conserves angular momentum."""
-    return 0.5 * (point_a + point_b)
+def contact_point(translation_a: wp.vec3, offset_a: wp.vec3, separation: wp.vec3) -> wp.vec3:
+    """Return the one point a contact's rows act at: the midpoint of its surface points, A's surface point less half
+    the separation (:func:`contact_points`). Equal and opposite impulses at one point put no torque on the pair, so a
+    contact conserves angular momentum."""
+    return translation_a + (offset_a - 0.5 * separation)
 
 
 @CONTACT_LAW.law

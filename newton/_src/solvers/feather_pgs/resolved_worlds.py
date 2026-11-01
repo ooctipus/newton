@@ -22,7 +22,7 @@ import numpy as np
 import warp as wp
 
 from . import field_group
-from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
+from .contact_laws import contact_points, contact_responds, contact_restitution, jacobian_entry
 from .field_group import Field, FieldGroup, SolverArrays
 from .joint_table import JOINTS
 from .row_laws import (
@@ -467,8 +467,8 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if not valid:
         wp.atomic_max(scratch.rejected, world, 1)
         return
-    # Endpoint-relative gap/lever arithmetic avoids subtracting rounded large world points.
-    _normal, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points_endpoint_relative(
+    # The rows' gap (contact_points); the lever arms, like it, subtract no rounded world points.
+    _normal, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points(
         raw.normal[c], raw.point0[c], raw.point1[c], raw.margin0[c], raw.margin1[c], body_a, body_b, data.body_q
     )
     lever_a = offset_a

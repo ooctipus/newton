@@ -55,7 +55,7 @@ from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from . import field_group
 from .contact_filters import contact_normal_gap_limit
-from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
+from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
 from .field_group import Field
 from .projection_laws import disk
 from .spatial_laws import point_velocity
@@ -206,6 +206,16 @@ def _local_point(q: wp.array[wp.transform], body: int, point: wp.vec3):
     return result
 
 
+@wp.func
+def _local_surface(q: wp.array[wp.transform], body: int, translation: wp.vec3, offset: wp.vec3):
+    """A contact's surface point, ``translation + offset`` (:func:`.contact_laws.contact_points`), in its body's frame
+    (a static shape's in world coordinates): the offset rotated back, which carries no rounding of the translation."""
+    result = translation + offset
+    if body >= 0:
+        result = wp.quat_rotate_inv(wp.transform_get_rotation(q[body]), offset)
+    return result
+
+
 @wp.struct
 class _PatchContacts:
     """The contacts a frame build reads and the gates it applies, which :func:`_prepare` and :func:`_prepare_frame`
@@ -259,9 +269,11 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
         ka = inputs.q.shape[0] + (sa if sa >= 0 else inputs.shape_body.shape[0]) + 1
     if b < 0:
         kb = inputs.q.shape[0] + (sb if sb >= 0 else inputs.shape_body.shape[0]) + 1
-    n, pa, pb, gap = contact_points(
+    n, translation_a, offset_a, translation_b, offset_b, separation, gap = contact_points(
         inputs.normal[c], inputs.point0[c], inputs.point1[c], inputs.margin0[c], inputs.margin1[c], a, b, inputs.q
     )
+    surface_a = _local_surface(inputs.q, a, translation_a, offset_a)
+    surface_b = _local_surface(inputs.q, b, translation_b, offset_b)
     art_a = int(-1)
     art_b = int(-1)
     if a >= 0 and a < inputs.body_to_articulation.shape[0]:
@@ -306,9 +318,9 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
     frame.shape_a[c] = sa
     frame.shape_b[c] = sb
     frame.flipped[c] = flip
-    frame.surface_a[c] = _local_point(inputs.q, a, pb if flip != 0 else pa)
-    frame.surface_b[c] = _local_point(inputs.q, b, pa if flip != 0 else pb)
-    frame.center[c] = 0.5 * (pa + pb)
+    frame.surface_a[c] = surface_b if flip != 0 else surface_a
+    frame.surface_b[c] = surface_a if flip != 0 else surface_b
+    frame.center[c] = contact_point(translation_a, offset_a, separation)
     frame.normal[c] = n
     mu_a = float(0.0)
     mu_b = float(0.0)

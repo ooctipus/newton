@@ -13,8 +13,9 @@ of ``assert_same_patches``, because NVRTC may contract this module's
 multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported. ``_build``
 follows the builder's current anchor choice (the canonical farthest pair, the
-footprint tolerance, the support-edge members and their carriers), which is
-not mechanism work. This module holds shared test helpers; it defines no tests.
+footprint tolerance, the support-edge members and their carriers), and
+``_prepare`` the contact geometry formed from body-relative points
+(``contact_laws.contact_points``), neither of which is mechanism work. This module holds shared test helpers; it defines no tests.
 """
 
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.contact_filters import contact_normal_gap_limit
-from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
+from newton._src.solvers.feather_pgs.contact_laws import contact_point, contact_points, contact_tangent_basis
 from newton._src.solvers.feather_pgs.friction_patches import (
     _FOOTPRINT_TOLERANCE,
     FrictionPatches,
@@ -31,6 +32,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _compatible,
     _geometry_adjacent,
     _local_point,
+    _local_surface,
     _PatchFrame,
     _point_velocity,
     _pose_motion,
@@ -122,10 +124,11 @@ def _prepare(
         ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
     if b < 0:
         kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
-    n = -normal[c]
-    pa = _world_point(q, a, point0[c]) - margin0[c] * n
-    pb = _world_point(q, b, point1[c]) + margin1[c] * n
-    gap = wp.dot(n, pa - pb)
+    n, translation_a, offset_a, translation_b, offset_b, separation, gap = contact_points(
+        normal[c], point0[c], point1[c], margin0[c], margin1[c], a, b, q
+    )
+    surface_a = _local_surface(q, a, translation_a, offset_a)
+    surface_b = _local_surface(q, b, translation_b, offset_b)
     art_a = int(-1)
     art_b = int(-1)
     if a >= 0 and a < body_to_articulation.shape[0]:
@@ -171,9 +174,9 @@ def _prepare(
     frame.shape_a[c] = sa
     frame.shape_b[c] = sb
     frame.flipped[c] = flip
-    frame.surface_a[c] = _local_point(q, a, pb if flip != 0 else pa)
-    frame.surface_b[c] = _local_point(q, b, pa if flip != 0 else pb)
-    frame.center[c] = 0.5 * (pa + pb)
+    frame.surface_a[c] = surface_b if flip != 0 else surface_a
+    frame.surface_b[c] = surface_a if flip != 0 else surface_b
+    frame.center[c] = contact_point(translation_a, offset_a, separation)
     frame.normal[c] = n
     mu_a = float(0.0)
     mu_b = float(0.0)

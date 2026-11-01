@@ -382,7 +382,7 @@ def produce_contacts(
         tangent0 = wp.vec3()
         tangent1 = wp.vec3()
         if lane == 0:
-            normal, point_a, point_b, _phi = contact_points(
+            normal, translation_a, offset_a, _translation_b, _offset_b, separation, _phi = contact_points(
                 data.normal[contact],
                 data.point0[contact],
                 data.point1[contact],
@@ -392,7 +392,7 @@ def produce_contacts(
                 body1,
                 data.body_q,
             )
-            point = contact_point(point_a, point_b)
+            point = contact_point(translation_a, offset_a, separation)
             tangent0, tangent1 = contact_tangent_basis(normal)
         normal = warp_broadcast(normal)
         point = warp_broadcast(point)

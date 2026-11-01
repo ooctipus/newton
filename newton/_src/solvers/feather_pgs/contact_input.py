@@ -14,7 +14,7 @@ law with beta 0 and a disabled view). Its rows' records come from :func:`.row_bu
 import warp as wp
 
 from . import dense_rows, field_group
-from .contact_laws import contact_geometry, contact_point, contact_tangent_basis
+from .contact_laws import contact_geometry, contact_tangent_basis
 from .field_group import Field, FieldGroup
 from .friction_patches import PatchRowLaw, patch_friction_location
 
@@ -84,11 +84,11 @@ ContactRoutes = field_group.struct(
 def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
     """Return contact ``c``'s front end: ``(body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point)``.
 
-    The bodies, normal and gap of :func:`.contact_laws.contact_geometry`, the one point the contact's rows act at
-    (:func:`.contact_laws.contact_point`), the tangent basis and the friction location: the patch's under persistent
+    The bodies, normal, the one point the contact's rows act at and the gap of
+    :func:`.contact_laws.contact_geometry`, the tangent basis and the friction location: the patch's under persistent
     patches, else that point.
     """
-    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
+    body_a, body_b, normal, point, phi = contact_geometry(
         c,
         data.shape0,
         data.shape1,
@@ -101,7 +101,6 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int):
         data.body_q,
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
-    point = contact_point(point_a, point_b)
     friction_point = point
     if law.patches.enabled != 0:
         friction_point = patch_friction_location(law.patches, c)
