@@ -294,12 +294,7 @@ class TreeKineticState:
             free_root_local=free_root_local,
             free_root_dof=free_root_dof,
             dof_passive=dof_passive,
-            scratch=np.zeros(
-                self.group_count * max(self.layout.total, native.predict_words(self.layout, response))
-                if self.layout.global_block
-                else 1,
-                np.float32,
-            ),
+            scratch=np.zeros(self.group_count * self.layout.total if self.layout.global_block else 1, np.float32),
         )
         groups = self.group_count
         self.data = native.KineticData()
