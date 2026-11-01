@@ -863,3 +863,338 @@ class TreeFactor:
             next_refresh = ((step + 1) % self.options.update_mass_matrix_interval) == 0
             self.held.finish(state_in, self, state_out, dt, next_refresh)
             self.fk_id_cache_source_state = state_out
+
+    def diagonal(self, articulation: int) -> np.ndarray:
+        """What this factor adds to ``articulation``'s mass matrix: each coordinate's effective armature ``R``
+        (conditioning and kinematic coordinates included) and the drive stiffness ``K`` it last refreshed with."""
+        qd_start = self.model.joint_qd_start.numpy()
+        joints = self.model.articulation_start.numpy()[articulation : articulation + 2]
+        dofs = np.arange(qd_start[joints[0]], qd_start[joints[1]])
+        added = self.armature[dofs].astype(np.float64)
+        rows = self.drive_row_by_dof.numpy()[dofs] if dofs.size else dofs
+        if np.any(rows >= 0):
+            stiffness = self.aug_row_K.numpy().astype(np.float64)
+            added += np.where(rows >= 0, np.maximum(stiffness[np.maximum(rows, 0)], 0.0), 0.0)
+        return added
+
+    def walk(self, joint_q: np.ndarray, articulation: int, *, dtype=np.float64) -> TreeWalk:
+        """The walk of ``articulation``'s factor ``P (H + R + K) P^T`` at the coordinates ``joint_q``
+        (:class:`TreeWalk`): its local frames from the model in float64 (:func:`local_frames`), its diagonal this
+        factor's (:meth:`diagonal`), its inward pass in ``dtype``. No step calls it: the tests hold it to the factor
+        (Z_UNION §6, Z0)."""
+        frames = local_frames(self.model, joint_q, articulation)
+        return TreeWalk(*frames, self.diagonal(articulation), dtype=dtype)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The walk (Z_UNION §1.2): the factor as a six-number state's steps along the tree, in local frames
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _cross(d: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """``d x v`` for a 3-vector ``d`` and ``v`` of shape ``(3, ...)``, in their dtype."""
+    return np.stack((d[1] * v[2] - d[2] * v[1], d[2] * v[0] - d[0] * v[2], d[0] * v[1] - d[1] * v[0]))
+
+
+def _rotation(quaternion) -> np.ndarray:
+    """The rotation matrix of a unit quaternion ``(x, y, z, w)``, in float64."""
+    x, y, z, w = np.asarray(quaternion, dtype=np.float64)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def _turn(axis, angle) -> np.ndarray:
+    """The rotation of ``angle`` about the unit ``axis``, in float64."""
+    k = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    return np.eye(3) + np.sin(angle) * k + (1.0 - np.cos(angle)) * k @ k
+
+
+def local_frames(model, joint_q: np.ndarray, articulation: int, poses: np.ndarray | None = None) -> tuple:
+    """One articulation's tree in local frames at the coordinates ``joint_q``, in float64 from the model's data.
+
+    A body's frame sits at its joint's anchor (the parent's joint frame), with world axes; a free body's at its centre
+    of mass. Its coordinates' columns are the factor's (:func:`.spatial_laws.joint_motion`: a free joint's turn about
+    the articulation's origin, its first root's centre of mass) moved to that frame, and its spatial inertia is
+    taken there, in Newton's ``(v, w)`` layout. Nothing is held farther than one link from its frame.
+
+    Args:
+        model: The model.
+        joint_q: The coordinates.
+        articulation: The articulation.
+        poses: The bodies' world poses ``[bodies, 7]`` to read instead of composing them in float64 from ``joint_q``
+            (a float32 forward kinematics', say).
+
+    Returns:
+        ``(parent, first, columns, inertia, offset)`` for :class:`TreeWalk`: each body's parent (-1: the world), each
+        body's first coordinate (and the count after the last), each coordinate's column ``[n, 6]``, each body's
+        inertia ``[bodies, 6, 6]`` and each body's parent's frame less its own ``[bodies, 3]`` (zero at a root).
+    """
+    start = model.articulation_start.numpy()
+    joints = np.arange(start[articulation], start[articulation + 1])
+    kinds, dims = model.joint_type.numpy()[joints], model.joint_dof_dim.numpy()[joints]
+    parent_body, child_body = model.joint_parent.numpy()[joints], model.joint_child.numpy()[joints]
+    q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+    X_p, X_c = model.joint_X_p.numpy().astype(np.float64), model.joint_X_c.numpy().astype(np.float64)
+    axes = model.joint_axis.numpy().astype(np.float64)
+    mass, com = model.body_mass.numpy().astype(np.float64), model.body_com.numpy().astype(np.float64)
+    body_inertia = model.body_inertia.numpy().astype(np.float64)
+    local = {int(body): index for index, body in enumerate(child_body)}
+    if len(local) < len(joints) or any(body >= 0 and int(body) not in local for body in parent_body):
+        raise ValueError("The articulation's joints are not a tree: walk the solver's model, whose loops are cut")
+    parent = np.array([local[int(body)] if body >= 0 else -1 for body in parent_body], dtype=np.int64)
+    first = np.append(qd_start[joints], qd_start[joints[-1] + 1]) - qd_start[joints[0]]
+    count = len(joints)
+    rotation, position, frame = np.zeros((count, 3, 3)), np.zeros((count, 3)), np.zeros((count, 3))
+    columns, inertia = np.zeros((int(first[-1]), 6)), np.zeros((count, 6, 6))
+    origin = None
+    for b, joint in enumerate(joints):
+        p = parent[b]
+        R_p, t_p = (rotation[p], position[p]) if p >= 0 else (np.eye(3), np.zeros(3))
+        R_a, t_a = R_p @ _rotation(X_p[joint, 3:]), t_p + R_p @ X_p[joint, :3]
+        q = np.asarray(joint_q[q_start[joint] : q_start[joint + 1]], dtype=np.float64)
+        lin, ang = int(dims[b, 0]), int(dims[b, 1])
+        axis = axes[qd_start[joint] : qd_start[joint + 1]]
+        kind = int(kinds[b])
+        # The joint's motion (rotation, translation) and its columns at the anchor, world axes.
+        own = []
+        if kind == int(JointType.REVOLUTE):
+            motion = (_turn(axis[0], q[0]), np.zeros(3))
+            own.append(np.r_[0.0, 0.0, 0.0, R_a @ axis[0]])
+        elif kind == int(JointType.PRISMATIC):
+            motion = (np.eye(3), axis[0] * q[0])
+            own.append(np.r_[R_a @ axis[0], 0.0, 0.0, 0.0])
+        elif kind == int(JointType.BALL):
+            motion = (_rotation(q[:4]), np.zeros(3))
+            own += [np.r_[0.0, 0.0, 0.0, R_a @ e] for e in np.eye(3)]
+        elif kind in (int(JointType.FREE), int(JointType.DISTANCE)):
+            motion = (_rotation(q[3:7]), q[:3])
+            own += [np.r_[R_a @ e, 0.0, 0.0, 0.0] for e in np.eye(3)]
+            own += [np.r_[0.0, 0.0, 0.0, R_a @ e] for e in np.eye(3)]
+        elif kind == int(JointType.D6):
+            slide = sum((axis[k] * q[k] for k in range(lin)), np.zeros(3))
+            own += [np.r_[R_a @ axis[k], 0.0, 0.0, 0.0] for k in range(lin)]
+            turned = np.eye(3)
+            for k in range(ang):
+                w = R_a @ (turned @ axis[lin + k])
+                # A turn about the pivot the slides moved, at the anchor: v = (R_a slide) x w.
+                own.append(np.r_[np.cross(R_a @ slide, w), w])
+                turned = _turn(turned @ axis[lin + k], q[lin + k]) @ turned
+            motion = (turned, slide)
+        elif kind == int(JointType.FIXED):
+            motion = (np.eye(3), np.zeros(3))
+        else:
+            raise ValueError(f"No walk of joint type {kind}")
+        R_c = R_a @ motion[0] @ _rotation(X_c[joint, 3:]).T
+        t_c = t_a + R_a @ motion[1] - R_c @ X_c[joint, :3]
+        if poses is not None:
+            pose = np.asarray(poses[child_body[b]], dtype=np.float64)
+            R_c, t_c = _rotation(pose[3:]), pose[:3]
+        rotation[b], position[b] = R_c, t_c
+        centre = t_c + R_c @ com[child_body[b]]
+        if origin is None:
+            origin = centre
+        free = kind in (int(JointType.FREE), int(JointType.DISTANCE))
+        frame[b] = centre if free else t_a
+        if free:
+            # The factor turns a free joint about the articulation's origin: the same twists at the body's frame.
+            for column in own[3:]:
+                column[:3] += np.cross(column[3:], frame[b] - origin)
+        if own:
+            columns[first[b] : first[b + 1]] = np.stack(own)
+        r = centre - frame[b]
+        cross = np.array([[0.0, -r[2], r[1]], [r[2], 0.0, -r[0]], [-r[1], r[0], 0.0]])
+        m = mass[child_body[b]]
+        inertia[b, :3, :3] = m * np.eye(3)
+        inertia[b, :3, 3:] = -m * cross
+        inertia[b, 3:, :3] = m * cross
+        inertia[b, 3:, 3:] = R_c @ body_inertia[child_body[b]] @ R_c.T - m * cross @ cross
+    offset = np.where(parent[:, None] >= 0, frame[np.maximum(parent, 0)] - frame, 0.0)
+    return parent, first, columns, inertia, offset
+
+
+class TreeWalk:
+    """One articulation's tree factor as a walk (Z_UNION §1.2, Theorem A), in local frames (:func:`local_frames`).
+
+    The inward pass eliminates the coordinates leaf first, one at a time, from each body's own inertia plus what its
+    children pass up,
+
+        ell_c = (s_c^T I s_c + D_c)^1/2,    ut_c = I s_c / ell_c,    I <- I - ut_c ut_c^T,
+
+    ``D`` the coordinates' armature and drive stiffness, and then moves the body's remaining inertia one link up. Its
+    data ``(s, ut, ell)`` is the leaf-first factor ``P (H + D) P^T = L L^T`` (``L_cc = ell_c``, and ``L`` is
+    ``s_a^T ut_c`` for ``a`` an ancestor coordinate of ``c``), so:
+
+    - :meth:`up` is ``Z = L^-1 P J^T``, a row's footprints: its seed, a wrench at a body or a covector on the
+      coordinates, walked up to the root, each coordinate taking ``e_c^T p`` of the state ``p`` and passing
+      ``p - ut_c z_c``, the wrench it cannot feel;
+    - :meth:`down` is the leave ``P^T L^-T u``, the walk run back down; its state at a body is the body's twist;
+    - :meth:`meet` is ``Z_k^T Z_l``: two walks carried to their lowest common ancestor, met through its Gram.
+
+    A footprint ``z_c`` sits at its coordinate ``c`` (the kit's entry ``c`` of a side). The arithmetic runs in
+    ``dtype``; a negative pivot leaves NaN, as the factor would. The step calls none of it.
+
+    Args:
+        parent: Each body's parent (-1: the world), every parent before its children.
+        first: Each body's first coordinate, and the count after the last.
+        columns: Each coordinate's motion column at its body's frame, ``[n, 6]``.
+        inertia: Each body's spatial inertia at its frame, ``[bodies, 6, 6]``.
+        offset: Each body's parent's frame less its own, ``[bodies, 3]``.
+        diagonal: Each coordinate's armature and drive stiffness.
+        dtype: The walk's arithmetic.
+    """
+
+    def __init__(self, parent, first, columns, inertia, offset, diagonal, *, dtype=np.float64):
+        self.dtype = np.dtype(dtype)
+        self.parent = np.asarray(parent, dtype=np.int64)
+        self.first = np.asarray(first, dtype=np.int64)
+        if np.any(self.parent >= np.arange(self.parent.size)):
+            raise ValueError("The walk needs every parent before its children")
+        self.s = np.asarray(columns, dtype=self.dtype)
+        self.offset = np.asarray(offset, dtype=self.dtype)
+        held = np.asarray(inertia, dtype=self.dtype).copy()
+        added = np.asarray(diagonal, dtype=self.dtype)
+        self.ell = np.zeros(self.s.shape[0], dtype=self.dtype)
+        self.ut = np.zeros_like(self.s)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for b in range(self.parent.size - 1, -1, -1):
+                I = held[b]
+                for c in range(self.first[b + 1] - 1, self.first[b] - 1, -1):
+                    Is = I @ self.s[c]
+                    self.ell[c] = np.sqrt(self.s[c] @ Is + added[c])
+                    self.ut[c] = Is / self.ell[c]
+                    I = I - np.outer(self.ut[c], self.ut[c])
+                if self.parent[b] >= 0:
+                    held[self.parent[b]] += self._lift(I, self.offset[b])
+
+    @property
+    def pivots(self) -> np.ndarray:
+        """Each coordinate's pivot ``ell_c^2``."""
+        return self.ell * self.ell
+
+    def _lift(self, inertia: np.ndarray, d: np.ndarray) -> np.ndarray:
+        """``inertia`` at a body's frame, taken at its parent's (``d`` = the parent's frame less the body's)."""
+        D = np.array([[0.0, -d[2], d[1]], [d[2], 0.0, -d[0]], [-d[1], d[0], 0.0]], dtype=self.dtype)
+        to = np.eye(6, dtype=self.dtype)
+        to[:3, 3:] = D  # a twist at the parent's frame, taken at the body's: v + d x w
+        wrench = np.eye(6, dtype=self.dtype)
+        wrench[3:, :3] = -D  # a wrench at the body's frame, taken at the parent's: t - d x f
+        return wrench @ inertia @ to
+
+    def _step(self, b: int, p: np.ndarray, x: np.ndarray | None, z: np.ndarray | None) -> np.ndarray:
+        """Walk body ``b``'s coordinates, leaf first, from the state ``p`` at its frame: store the footprints in
+        ``z`` (when given), with ``x`` a covector's own entries, and return the state its joint passes."""
+        for c in range(self.first[b + 1] - 1, self.first[b] - 1, -1):
+            footprint = self.s[c] @ p if x is None else x[c] + self.s[c] @ p
+            footprint = footprint / self.ell[c]
+            if z is not None:
+                z[c] = footprint
+            p = p - np.multiply.outer(self.ut[c], footprint)
+        return p
+
+    def _carry(self, p: np.ndarray, b: int) -> np.ndarray:
+        """The state ``p`` passed by body ``b``'s joint, at the parent's frame: ``t - d x f``."""
+        d = self.offset[b]
+        return np.concatenate((p[:3], p[3:] - _cross(d, p[:3])))
+
+    def up(self, body=None, wrench=None, covector=None) -> tuple[np.ndarray, np.ndarray]:
+        """Footprints ``Z = L^-1 P J^T`` of rows seeded by ``wrench`` at ``body`` (a wrench ``(f, t)`` at the body's
+        frame, ``[6]`` or one column per row ``[6, m]``, with ``body`` one body or one per row) and by ``covector`` on
+        the coordinates (``[n]`` or ``[n, m]``): a limit's, a mimic's, or any row's ``J``.
+
+        Returns:
+            The footprints ``[n]`` or ``[n, m]`` by coordinate, and the state each root passes to the world
+            ``[bodies, 6, ...]`` (zero above a free root).
+        """
+        batch = () if wrench is None and covector is None else None
+        if wrench is not None:
+            wrench = np.asarray(wrench, dtype=self.dtype)
+            batch = wrench.shape[1:]
+        if covector is not None:
+            covector = np.asarray(covector, dtype=self.dtype)
+            batch = covector.shape[1:]
+        count = self.parent.size
+        state = np.zeros((count, 6, *batch), dtype=self.dtype)
+        active = np.zeros(count, dtype=bool)
+        if wrench is not None:
+            if np.ndim(body) == 0:
+                state[int(body)] += wrench
+                active[int(body)] = True
+            else:
+                for row, b in enumerate(np.asarray(body).tolist()):
+                    state[b, :, row] += wrench[:, row]
+                    active[b] = True
+        if covector is not None:
+            touched = np.flatnonzero(np.any(covector.reshape(covector.shape[0], -1) != 0.0, axis=1))
+            for c in touched:
+                active[np.searchsorted(self.first, c, side="right") - 1] = True
+        z = np.zeros((self.s.shape[0], *batch), dtype=self.dtype)
+        for b in range(count - 1, -1, -1):
+            if not active[b]:
+                continue
+            state[b] = self._step(b, state[b], covector, z)
+            if self.parent[b] >= 0:
+                state[self.parent[b]] += self._carry(state[b], b)
+                active[self.parent[b]] = True
+                state[b] = 0.0
+        return z, state
+
+    def down(self, u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The leave ``P^T L^-T u`` of ``u`` (``[n]`` or ``[n, m]``, by coordinate as :meth:`up` returns them).
+
+        Returns:
+            The joint velocities ``[n, ...]`` and each body's twist ``(v, w)`` at its frame ``[bodies, 6, ...]``.
+        """
+        u = np.asarray(u, dtype=self.dtype)
+        count = self.parent.size
+        twist = np.zeros((count, 6, *u.shape[1:]), dtype=self.dtype)
+        qd = np.zeros_like(u)
+        for b in range(count):
+            p = self.parent[b]
+            if p >= 0:
+                # The parent's twist at this body's frame: v + d x w, d = the parent's frame less this one.
+                V = twist[p]
+                V = np.concatenate((V[:3] + _cross(self.offset[b], V[3:]), V[3:]))
+            else:
+                V = twist[b]
+            for c in range(self.first[b], self.first[b + 1]):
+                qd[c] = (u[c] - self.ut[c] @ V) / self.ell[c]
+                V = V + np.multiply.outer(self.s[c], qd[c])
+            twist[b] = V
+        return qd, twist
+
+    def ancestors(self, b: int) -> list[int]:
+        """``b`` and its ancestors, ``b`` first."""
+        path = []
+        while b >= 0:
+            path.append(int(b))
+            b = int(self.parent[b])
+        return path
+
+    def carry(self, body: int, wrench: np.ndarray, to: int) -> np.ndarray:
+        """``wrench`` at ``body`` walked up to its ancestor ``to``: the state that reaches ``to``'s frame, before its
+        coordinates (``Psi`` of Z_UNION §1.2)."""
+        p = np.asarray(wrench, dtype=self.dtype)
+        b = body
+        while b != to:
+            if b < 0:
+                raise ValueError(f"Body {to} is not an ancestor of body {body}")
+            p = self._carry(self._step(b, p, None, None), b)
+            b = int(self.parent[b])
+        return p
+
+    def meet(self, k: int, w_k: np.ndarray, l: int, w_l: np.ndarray) -> np.ndarray:
+        """``Z_k^T Z_l`` of the rows seeded by ``w_k`` at ``k`` and ``w_l`` at ``l`` (``[6]`` or ``[6, m]``): both
+        walks carried to their lowest common ancestor ``c``, met through ``Gamma_c^T Gamma_c``, the Gram of the
+        footprints of ``c``'s six unit wrenches (never the 6x6 recurrence, which loses float32 on deep chains)."""
+        path = set(self.ancestors(l))
+        c = next((b for b in self.ancestors(k) if b in path), -1)
+        w_k, w_l = np.asarray(w_k, dtype=self.dtype), np.asarray(w_l, dtype=self.dtype)
+        if c < 0:
+            return np.zeros((*w_k.shape[1:], *w_l.shape[1:]), dtype=self.dtype)
+        gamma, _ = self.up(c, np.eye(6, dtype=self.dtype))
+        return self.carry(k, w_k, c).T @ (gamma.T @ gamma) @ self.carry(l, w_l, c)
