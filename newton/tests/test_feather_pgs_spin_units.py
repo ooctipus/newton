@@ -24,6 +24,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
 WORLDS, CONTACTS, PRIMARY, SECONDARY = 8, 3, 7, 6
@@ -80,6 +81,8 @@ def _solve(fixture, schedule, device, iterations):
     values = {
         "world_count": WORLDS,
         "world_constraint_count": array(np.full(WORLDS, CAPACITY, np.int32)),
+        # The row table: each world's rows on its own line.
+        "dense_first": row_lines(device),
         # The prefix is the limit row; the contact quads follow it.
         "dense_phase_bounds": array(np.tile(np.array([1, 1], np.int32), (WORLDS, 1))),
         "world_dof_indices": array(np.arange(WORLDS * DOFS, dtype=np.int32).reshape(WORLDS, DOFS)),
