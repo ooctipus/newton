@@ -1737,13 +1737,17 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
         self._placements("point", True, 1)
 
     @known_failure(
-        "E2: the Jacobi tiers (K4)",
-        "on legged's regular patterns the tiers stop short at their default budget (seed 1: 6.2e-4 m/s, G 1.0e-6) and "
-        "do not converge on others even pinned (seed 34: 5.0e-4 at 1024 sweeps, 1.9e-3 at 4096, G 9.1e-6 to 1.8e-5); "
-        "Gauss-Seidel returns both within 3.1e-7",
+        "E2: the Jacobi tiers' momentum on a sliding Coulomb face (K4)",
+        "seed 34 cycles: a sliding pair's radius moves with its normal's impulse, which makes the tier's linearization "
+        "non-normal, and Nesterov's momentum loses its slow complex pair (0.9865 +- 0.0112i) above beta 0.92, which "
+        "its schedule passes about 37 sweeps after each restart; Gauss-Seidel returns it within 3.1e-7",
     )
     def test_tiers_return_the_solution(self):
-        """At their default budget and exit law, as users run them, the tiers return the solution on legged too."""
+        """At their default budget and exit law, as users run them, the tiers return the solution on legged too.
+
+        Legged's worlds hold sixteen joint-limit rows far from their limits beside their contacts. The tiers leave such
+        idle rows out of every contact's step bound; counted, they cut the contacts' steps about tenfold and seed 1
+        stopped short at 6.2e-4 m/s."""
         build, settle, loaded, _names = self.PLACEMENTS[1]
         wrong = {}
         for name in self.TIERS:

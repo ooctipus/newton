@@ -228,9 +228,9 @@ def parallel_source(
     }}
     SYNC();
 
-{op.jacobi_stage(store.padding(), scale, "    ")}
+{op.jacobi_stage(store.padding(), scale, "    ", idle=store.idle(), counted=store.counted)}
 
-{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows))}
+{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows), scale=scale)}
 
 {last_word}
 {op.publish(indent="    ", applied=lambda row: f"s_x[{row}]")}

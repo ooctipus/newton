@@ -27,10 +27,17 @@ from newton._src.solvers.feather_pgs.sweep import (
     JacobiRows,
     RowLaws,
     end_sweep,
+    jacobi_scale,
     jacobi_sweeps,
 )
 
 _TIER = sweep_routes_tiers.parallel_kernel.__wrapped__
+
+
+def _scale(aii, bound, pad):
+    """The tiers' step scale (:func:`jacobi_scale`), with the rows' cfm read as the tiers read it."""
+    return jacobi_scale(aii, bound, cfm="world_row_cfm.data[off_dense + i]", pad=pad)
+
 
 # The exit of a warp's sweep and of a block's, without readout: stop a quiet sweep once friction is active.
 _EXIT = "const bool sweep_stop = BALLOT(iteration_changed != 0) == 0u;"
@@ -152,9 +159,9 @@ class TestJacobiLaw(unittest.TestCase):
         Gauss-Seidel step, ``A_ii s_i``)."""
         rows = JacobiRows(32, 32)
         op = _operator()
-        text = jacobi_sweeps(rows, op, RowLaws(regularize=False), sweeps=1, pooled=False)
+        text = jacobi_sweeps(rows, op, RowLaws(regularize=False), sweeps=1, pooled=False, scale=_scale)
         self.assertNotIn("if (x_new != x_old) {", text)
-        self.assertIn("const float row_share = row_diag * row_step;", text)
+        self.assertIn("float row_share = row_diag * row_step;", text)
         self.assertIn(
             f"row_bound = {bound('row_rhs', 'fabsf((r) - (row_rhs))', 'row_share * xi', step='row_step')};", text
         )
@@ -163,7 +170,7 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn("(!(fabsf(x_new - x_from) <= row_bound))", text)
         typed = JacobiRows(32, 32, types=True)
         traced = RowLaws(regularize=False, policy=SolvePolicy(readout="trace"))
-        text = jacobi_sweeps(typed, op, traced, sweeps=7, pooled=False)
+        text = jacobi_sweeps(typed, op, traced, sweeps=7, pooled=False, scale=_scale)
         self.assertIn("solve_trace_change(fabsf(x_new - x_from) * (row_inv_step), s_type[i]);", text)
         self.assertIn("sweep + 1 == 7", text)
 
@@ -177,10 +184,20 @@ class TestJacobiLaw(unittest.TestCase):
         op = _operator()
         with self.assertRaisesRegex(ValueError, "staged types"):
             jacobi_sweeps(
-                rows, op, RowLaws(regularize=False, policy=SolvePolicy(readout="trace")), sweeps=1, pooled=False
+                rows,
+                op,
+                RowLaws(regularize=False, policy=SolvePolicy(readout="trace")),
+                sweeps=1,
+                pooled=False,
+                scale=_scale,
             )
         counted = jacobi_sweeps(
-            rows, op, RowLaws(regularize=False, policy=SolvePolicy(readout="sweeps")), sweeps=3, pooled=False
+            rows,
+            op,
+            RowLaws(regularize=False, policy=SolvePolicy(readout="sweeps")),
+            sweeps=3,
+            pooled=False,
+            scale=_scale,
         )
         self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 

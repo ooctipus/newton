@@ -119,11 +119,15 @@ def parallel_sweep_reference(
     of their positive steps (a tangent that moves nothing takes its sibling's),
     unless the sibling is not an admitted friction row of the same normal;
     ``"per_row"`` keeps each row's own step, the retired law that turns a sliding
-    pair's friction. Every sweep steps all rows from the extrapolated impulses, clamps
-    normal and limit rows, scales each tangent pair into its disk (the ring's
-    pooled normal load when ``linked``), restarts momentum against the last step
-    and stops once no row changes. ``velocity_limit_pass`` then pushes every
-    violated velocity-limit row onto its limit, in row order.
+    pair's friction. The bound counts the rows that can move: a unilateral row at zero
+    impulse whose residual at zero impulse is non-negative is idle and out of it, until
+    its residual at the extrapolated impulses turns negative; it then keeps its impulse for
+    that sweep and joins after it: every step is set again, the extrapolation dropped and
+    the momentum restarted, and it moves from the next sweep. Every sweep steps all rows from the extrapolated
+    impulses, clamps normal and limit rows, scales each tangent pair into its disk (the
+    ring's pooled normal load when ``linked``), restarts momentum against the last step
+    and stops once no row changes. ``velocity_limit_pass`` then pushes every violated
+    velocity-limit row onto its limit, in row order.
     """
     J, Y, Z = case["J"], case["Y"], case["Z"]
     kinds, parents, mu = case["kinds"], case["parents"], case["mu"]
@@ -137,26 +141,33 @@ def parallel_sweep_reference(
         P, Q = J, Y
     kinds = np.where((kinds >= 0) & ((diag > 0.0) | (kinds == 1)), kinds, -1)
     admitted = kinds >= 0
-    if matrix_free and not exact:
-        bound = np.abs(P) @ np.abs(Q[admitted]).sum(axis=0)
-    else:
-        bound = np.abs(A[:, admitted]).sum(axis=1)
-    weight = np.where(bound > 0.0, np.minimum(np.diag(A) / np.where(bound > 0.0, bound, 1.0), 1.0), 0.0)
-    step = np.where(admitted, weight * omega / np.where(diag > 0.0, diag, 1.0), 0.0)
-    if pair_step == "isotropic":
-        for row in np.flatnonzero(kinds == 1):
-            parent, sibling = parents[row], row + 1
-            if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
-                continue
-            positive = [value for value in (step[row], step[sibling]) if value > 0.0]
-            if positive:
-                step[row] = step[sibling] = min(positive)
     b = case["rhs"] + J @ v - A @ lam0
+    idle = (kinds == 0) & (lam0 == 0.0) & (b >= 0.0)
+
+    def steps(counted):
+        if matrix_free and not exact:
+            bound = np.abs(P) @ np.abs(Q[counted]).sum(axis=0)
+        else:
+            bound = np.abs(A[:, counted]).sum(axis=1)
+        weight = np.where(bound > 0.0, np.minimum(np.diag(A) / np.where(bound > 0.0, bound, 1.0), 1.0), 0.0)
+        step = np.where(admitted, weight * omega / np.where(diag > 0.0, diag, 1.0), 0.0)
+        if pair_step == "isotropic":
+            for row in np.flatnonzero(kinds == 1):
+                parent, sibling = parents[row], row + 1
+                if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
+                    continue
+                positive = [value for value in (step[row], step[sibling]) if value > 0.0]
+                if positive:
+                    step[row] = step[sibling] = min(positive)
+        return step
+
+    step = steps(admitted & ~idle)
     x, y, t = lam0.copy(), lam0.copy(), 1.0
     for _ in range(sweeps):
         residual = b + A @ y
+        joins = idle & (residual < 0.0)
         stepped = x.copy()
-        for row in np.flatnonzero(admitted):
+        for row in np.flatnonzero(admitted & ~joins):
             value = y[row] - step[row] * residual[row]
             if kinds[row] == 0:
                 value = max(value, 0.0)
@@ -170,15 +181,19 @@ def parallel_sweep_reference(
                 projected[row] = 0.0
             elif magnitude > radius:
                 projected[row] = stepped[row] * radius / magnitude
+        changed = joins.any() or np.any(np.abs(projected - x) > tol * (np.abs(projected) + tol))
         if np.dot(y - projected, projected - x) > 0.0:
             t = 1.0
         t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
         beta = (t - 1.0) / t_next if nesterov else 0.0
         t = t_next
-        changed = np.any(np.abs(projected - x) > tol * (np.abs(projected) + tol))
         x, y = projected, projected + beta * (projected - x)
         if not changed:
             break
+        if joins.any():
+            idle &= ~joins
+            step = steps(admitted & ~idle)
+            t, y = 1.0, x.copy()
     if velocity_limit_pass:
         x = x.copy()
         for row in np.flatnonzero((kinds == 0) & (case["types"] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)):

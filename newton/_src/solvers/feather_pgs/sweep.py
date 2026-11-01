@@ -21,9 +21,10 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
   (:func:`contact_unit`, :class:`UnitOperator`): the placement reduces the unit's terms once and applies its changes
   once, the pair's terms moved by the normal's change;
 - the **Jacobi law** steps every row of a world at once instead, a lane each (:class:`JacobiRows`,
-  :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, isotropic in each friction block's scaled
-  coordinates, the radial projection of each block onto its disk or ball, Nesterov's momentum with adaptive restart
-  and the relative change vote, the operator forming each row's residual from the impulses;
+  :func:`jacobi_sweeps`): the scaled step from the extrapolated impulses, bounded over the rows that can move (an idle
+  row joins when its residual turns negative), isotropic in each friction block's scaled coordinates, the radial
+  projection of each block onto its disk or ball, Nesterov's momentum with adaptive restart and the relative change
+  vote, the operator forming each row's residual from the impulses;
 - the **exit** is the exit law (:mod:`.solve_policy`): each change votes against the rounding floor of its update
   (:func:`change_vote`) and the end of the sweep stops a world none of whose updates was loud (:func:`end_sweep`);
 - the **publication** writes the impulses and velocities back.
@@ -1301,10 +1302,12 @@ def dense_tier_world(
 # The Jacobi law: every row of a world at once, from the extrapolated impulses, with momentum
 # ---------------------------------------------------------------------------------------------------------------------
 
-JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_FROZEN = 0, 1, 2, -1
+JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_IDLE, JACOBI_FROZEN = 0, 1, 2, 3, -1
 """The kinds of a Jacobi row (``s_kind``): its projection, decoded from its type once at staging. A unilateral row
 (contact normals, position limits, velocity limits) clamps at zero, a friction row's pair projects on its
-disk and a bilateral row takes its step; a frozen row keeps its warm start."""
+disk and a bilateral row takes its step; a frozen row keeps its warm start. An idle row is a unilateral row at zero
+impulse whose residual keeps it there: it cannot move, so it is out of the steps' bound until its residual turns
+negative and it becomes unilateral again (:meth:`JacobiRows.idle`, :func:`jacobi_sweeps`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1347,7 +1350,9 @@ class JacobiRows:
         state = (Buffer("s_x", "float", AM, align=16), Buffer("s_y", "float", AM, align=16))
         floats = (Buffer(name, "float", AM) for name in ("s_rhs", "s_step", "s_mu"))
         ints = ("s_parent", "s_kind", *(("s_vlim",) if self.limits else ()), *(("s_type",) if self.types else ()))
-        return (*state, *floats, *(Buffer(name, "int", AM) for name in ints))
+        # Whether a row left idleness this sweep (:func:`jacobi_sweeps` sets the steps again after the sweep's vote).
+        joined = Buffer("s_joined", "int", 1)
+        return (*state, *floats, *(Buffer(name, "int", AM) for name in ints), joined)
 
     def loads(
         self,
@@ -1396,6 +1401,27 @@ class JacobiRows:
         """Freeze the rows whose formed diagonal is not positive, after the staging's barrier; synchronized."""
         return f"{pad}if (frozen) s_kind[lane] = {JACOBI_FROZEN};\n{pad}SYNC();"
 
+    def idle(self, pad: str = "") -> str:
+        """Mark each unilateral row at zero impulse with a non-negative residual at zero impulse idle, once the staging
+        has formed ``s_rhs`` (each lane its own rows: no barrier). Its update clamps it at zero, so it moves nothing
+        until its residual turns negative (:func:`jacobi_sweeps`)."""
+        test = f"s_kind[i] == {JACOBI_UNILATERAL} && s_x[i] == 0.0f && s_rhs[i] >= 0.0f"
+        return indent(
+            f"for (int i = lane; i < {self.rows}; i += {self.threads})\n    if ({test}) s_kind[i] = {JACOBI_IDLE};\n"
+            "if (lane == 0) s_joined[0] = 0;",
+            pad,
+        )
+
+    @staticmethod
+    def counted(row: str) -> str:
+        """Whether row ``row`` counts in the steps' bound: admitted and not idle."""
+        return f"(s_kind[{row}] >= 0 && s_kind[{row}] != {JACOBI_IDLE})"
+
+    @staticmethod
+    def clamps(row: str) -> str:
+        """Whether row ``row`` clamps at zero: unilateral or idle."""
+        return f"(s_kind[{row}] == {JACOBI_UNILATERAL} || s_kind[{row}] == {JACOBI_IDLE})"
+
     def padding(self) -> str:
         """Zero the impulses past the rows, up to a multiple of four rows (the float4 reads of ``s_y``)."""
         rows = self.rows
@@ -1423,10 +1449,13 @@ class JacobiRows:
 
 def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
     """Set admitted row ``i``'s Jacobi step: ``omega w_i / (A_ii + cfm)`` with ``w_i = min(A_ii / bound, 1)`` (zero
-    for a zero bound), ``bound`` a bound of the row's absolute sum ``sum_j |A_ij|``.
+    for a zero bound), ``bound`` a bound of the row's absolute sum ``sum_j |A_ij|`` over the rows that can move.
 
     ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
-    the simultaneous steps from diverging where many rows couple through one body. The diagonal ``A_ii + cfm`` (the
+    the simultaneous steps from diverging where many rows couple through one body: with ``S = diag(step)``,
+    ``S^-1 - A`` is diagonally dominant on the moving rows, so ``S^-1 >= A`` there. An idle row moves nothing and is
+    out of the sum (:meth:`JacobiRows.counted`); counted, the joint limits' rows of a tree, far from their limits,
+    took most of its contacts' steps. The diagonal ``A_ii + cfm`` (the
     row's compliance) is formed here and a row without a positive one is marked for freezing (``frozen``,
     :meth:`JacobiRows.freeze`: the other lanes are still reading the kinds), but for a friction row: a tangent that
     moves nothing takes its block's step (:func:`isotropic_friction_step`) and still spends its share of the disk on
@@ -1501,6 +1530,30 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
     return indent("\n".join(lines), pad)
 
 
+def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
+    """Rows that leave idleness join the steps' bound, after the sweep's vote: an idle row whose residual turned negative
+    kept its zero impulse in that sweep, voted loud and raised ``s_joined`` (:func:`_jacobi_step`); every admitted row's
+    step is then set again on the rows that can now move (:meth:`~.ResponseOperator.jacobi_steps`, then the friction
+    blocks' isotropy), the extrapolation is dropped and the momentum restarts in the new metric, so the row moves from
+    the next sweep under a bound that counts it: no row ever moves outside the bound. The vote that ended the sweep is
+    the block's barrier, so the flag is read alike by every lane and costs no barrier of its own."""
+    lines = [
+        "if (s_joined[0]) {",
+        "    SYNC();",
+        "    if (lane == 0) s_joined[0] = 0;",
+        op.jacobi_steps(scale, "    ", counted=rows.counted),
+        isotropic_friction_step(rows, "    "),
+        f"    row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
+        "    row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
+        "    row_share = row_diag * row_step;",
+        f"    if (lane < {rows.rows}) s_y[lane] = s_x[lane];",
+        "    t_k = 1.0f;",
+        "    SYNC();",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
 def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     """Row ``i``'s update ``x_new`` from the extrapolated impulses (``x_old``: its impulse), on its lane.
 
@@ -1514,10 +1567,16 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
         step = "value = s_y[i] + ProjectionLaw::regularized_delta(-row_step * r, row_w, row_share * s_y[i]);"
     update = [
         step,
-        f"if (s_kind[i] == {JACOBI_UNILATERAL}) value = ProjectionLaw::unilateral(value);",
+        f"if {rows.clamps('i')} value = ProjectionLaw::unilateral(value);",
+        # An idle row whose residual turned negative joins the bound after the sweep (_jacobi_join) and moves from the
+        # next: it keeps its zero impulse now, its lane loud so that the world cannot stop before it has moved.
+        f"if (s_kind[i] == {JACOBI_IDLE} && r < 0.0f) {{",
+        f"    value = xi; row_joins = 1; s_kind[i] = {JACOBI_UNILATERAL}; s_joined[0] = 1;",
+        "}",
     ]
     lines = [
         "float x_new = 0.0f, x_old = 0.0f, x_from = 0.0f, row_bound = 0.0f;",
+        "int row_joins = 0;",
         "{",
         "    const int i = lane;",
         f"    if (i < {rows.rows}) {{",
@@ -1687,15 +1746,17 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, pad: str = "    ") -> str:
+def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, scale, pad: str = "    ") -> str:
     """The Jacobi sweeps of a world's rows over the response operator ``op`` (its Jacobi actions), at most ``sweeps``.
 
     The rows of each friction block first take one step, isotropic in the block's scaled coordinates
     (:func:`isotropic_friction_step`). Each sweep, every admitted row steps at once from the extrapolated impulses
     ``y``: its residual ``r = b' + (A y)_i`` (:meth:`~.ResponseOperator.jacobi_residual`, after the operator's
-    :meth:`~.ResponseOperator.gather`), then ``y_i - s_step_i r`` clamped at zero for a unilateral row, or zero for a
-    friction row while friction is delayed. Each friction block is then projected radially onto its disk, or under
-    torsion its ball (``pooled``: on its patch ring's pooled normal load), the impulses advance with Nesterov's
+    :meth:`~.ResponseOperator.gather`); then ``y_i - s_step_i r`` clamped at zero for a unilateral or idle row (an idle
+    row whose residual turned negative stays at zero, votes loud and joins the steps' bound after the sweep's vote,
+    :func:`_jacobi_join`, the steps set again by ``scale`` as the staging set them). Each friction block is then
+    projected radially onto its disk, or under torsion its ball (``pooled``: on its patch ring's pooled normal load), the
+    impulses advance with Nesterov's
     momentum and adaptive restart, each row votes its change under the exit law (:func:`change_vote`:
     its step from the extrapolated impulse over its step size, which is the row's residual there for an unclamped row,
     against its floor; the trace names it by the row's staged type, :attr:`JacobiRows.types`), and the sweep ends
@@ -1723,12 +1784,13 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     lines = [
         rows.freeze(pad),
         isotropic_friction_step(rows, pad),
-        # The lane's row: its residual at zero impulse and its step size, fixed through the sweeps.
+        # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a
+        # row joins the steps' bound.
         f"{pad}const float row_rhs = lane < {rows.rows} ? s_rhs[lane] : 0.0f;",
-        f"{pad}const float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
-        f"{pad}const float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
+        f"{pad}float row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
+        f"{pad}float row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
         # The step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the step's units.
-        f"{pad}const float row_share = row_diag * row_step;",
+        f"{pad}float row_share = row_diag * row_step;",
         weight,
         f"{pad}float t_k = 1.0f;",
         f"{pad}for (int sweep = 0; sweep < {sweeps}; ++sweep) {{",
@@ -1742,6 +1804,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{inner}    if (i < {rows.rows}) {{",
         f"{inner}        s_x[i] = x_new;",
         f"{inner}        s_y[i] = x_new + beta * (x_new - x_old);",
+        f"{inner}        if (row_joins) iteration_changed = 1;",
         f"{inner}        if (x_new != x_from) {{",
         change_vote(laws, (change,), inner + "            "),
         f"{inner}        }}",
@@ -1755,6 +1818,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
             iterations=str(int(sweeps)),
             argmax="BLOCK_ARGMAX" if block else "ARGMAX",
         ).rstrip("\n"),
+        _jacobi_join(rows, op, scale, inner),
         f"{pad}}}",
     ]
     return "\n".join(line for line in lines if line)
@@ -1780,7 +1844,7 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         op.push_prologue("    "),
         "    if (lane < 32) {",
         f"        for (int i = 0; i < {rows.rows}; ++i) {{",
-        f"            if (s_kind[i] != {JACOBI_UNILATERAL} || s_vlim[i] == 0) continue;",
+        f"            if (!{rows.clamps('i')} || s_vlim[i] == 0) continue;",
         op.push_velocity("part", warp, body),
         "            const float r_vlim = s_rhs[i] + part;",
         f"            const float diag_vlim = {op.push_diagonal()};",

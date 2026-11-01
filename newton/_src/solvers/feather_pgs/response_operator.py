@@ -572,11 +572,25 @@ class ResponseOperator:
         """Declare the lanes' row registers (nothing by default)."""
         return ""
 
-    def jacobi_stage(self, padding: str, scale: Callable[[str, str, str], str], indent: str) -> str:
-        """Stage the operator, set each row's ``s_rhs`` to ``b'_i`` and each admitted row's step (``scale(aii, bound,
-        indent)``: from ``A_ii`` and its row's absolute sum ``sum_j |A_ij|`` or a bound of it); ``padding`` zeroes
-        the rows' padded impulses ahead of the last barrier."""
+    def jacobi_stage(
+        self,
+        padding: str,
+        scale: Callable[[str, str, str], str],
+        indent: str,
+        *,
+        idle: str,
+        counted: Callable[[str], str],
+    ) -> str:
+        """Stage the operator, set each row's ``s_rhs`` to ``b'_i``, run ``idle`` (statements that read ``s_rhs``:
+        the row store's marks of the rows that cannot move) and set each admitted row's step (:meth:`jacobi_steps`);
+        ``padding`` zeroes the rows' padded impulses ahead of the last barrier."""
         raise self._lacks("Jacobi staging")
+
+    def jacobi_steps(self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str]) -> str:
+        """Set each admitted row's step, ``scale(aii, bound, indent)``: from ``A_ii`` and a bound of its absolute sum
+        ``sum_j |A_ij|`` over the rows ``counted(j)`` names (those that can move); synchronized. Run at staging and
+        whenever a row joins the counted rows."""
+        raise self._lacks("Jacobi steps")
 
     def gather(self, indent: str) -> str:
         """Per sweep, before the rows update: the products every row's residual reads (nothing by default)."""
@@ -1216,8 +1230,9 @@ class TransposedResponse(ResponseOperator):
     groups (``chunks`` of them, as many as the lanes cover), four accumulators
     joined pairwise, the chunks summed in order; a row's residual is then
     ``b'_i + Z_i w`` in coordinate order. The step scale's bound is the
-    column-sum bound ``sum_d |Z_id| sum_j |Z_jd|``, the bound the tiers' sweep
-    budget was fit with (:data:`.sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION`).
+    column-sum bound ``sum_d |Z_id| sum_j |Z_jd|`` over the rows that can move
+    (:meth:`jacobi_steps`), the bound the tiers' sweep budget was fit with
+    (:data:`.sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION`).
     """
 
     dofs: int
@@ -1260,10 +1275,18 @@ class TransposedResponse(ResponseOperator):
         D = self.dofs
         return f"{indent}float Jr[{D}];\n{indent}#pragma unroll\n{indent}for (int d = 0; d < {D}; ++d) Jr[d] = 0.0f;"
 
-    def jacobi_stage(self, padding: str, scale: Callable[[str, str, str], str], indent: str) -> str:
-        """Whiten and stage the rows and set each step scale: ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the
-        row's residual ``b'_i`` at zero impulse; ``padding`` pads the rows' impulses. ``scale(aii, bound, indent)`` sets
-        an admitted row's step.
+    def jacobi_stage(
+        self,
+        padding: str,
+        scale: Callable[[str, str, str], str],
+        indent: str,
+        *,
+        idle: str,
+        counted: Callable[[str], str],
+    ) -> str:
+        """Whiten and stage the rows, mark the rows that cannot move (``idle``) and set each step scale
+        (:meth:`jacobi_steps`): ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the row's residual ``b'_i`` at
+        zero impulse; ``padding`` pads the rows' impulses.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
         stage = [self.whitened.stage("s_Yt", indent=indent)]
@@ -1273,11 +1296,27 @@ class TransposedResponse(ResponseOperator):
             f"    const int j = {rows} + (e & 3);",
             f"    if (j < {AM}) {self._yt('j', 'd')} = 0.0f;",
             "}",
+            idle,
             "SYNC();",
+            *self._jacobi_steps(scale, counted),
+            padding,
+            "SYNC();",
+        ]
+        return "\n".join([*stage, _lines(lines, indent)])
+
+    def jacobi_steps(self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str]) -> str:
+        """Set each admitted row's step from the column-sum bound over the counted rows; synchronized."""
+        return _lines([*self._jacobi_steps(scale, counted), "SYNC();"], indent)
+
+    def _jacobi_steps(self, scale: Callable[[str, str, str], str], counted: Callable[[str], str]) -> list[str]:
+        """The column sums over the counted rows, then each admitted row's ``A_ii``, bound and step (lane ``i``'s row
+        in its registers)."""
+        lane, width, D, rows = self.lanes.lane, self.lanes.width, self.dofs, self.rows
+        return [
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
             "    float csum = 0.0f;",
             f"    for (int j = 0; j < {rows}; ++j)",
-            f"        if (s_kind[j] >= 0) csum += fabsf({self._yt('j', 'd')});",
+            f"        if ({counted('j')}) csum += fabsf({self._yt('j', 'd')});",
             "    s_colsum[d] = csum;",
             "}",
             "SYNC();",
@@ -1293,10 +1332,7 @@ class TransposedResponse(ResponseOperator):
             scale("aii", "bound", "        "),
             "    }",
             "}",
-            padding,
-            "SYNC();",
         ]
-        return "\n".join([*stage, _lines(lines, indent)])
 
     def gather(self, indent: str) -> str:
         """``w = Y^T y`` (``s_dv``): a lane per coordinate and chunk of float4 row groups, four accumulators joined
