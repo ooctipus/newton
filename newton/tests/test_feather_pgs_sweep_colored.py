@@ -38,6 +38,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
+from newton.tests.feather_pgs_law_harness import row_lines
 
 
 def tray(*, mu: float = 0.6, grid: int = 3, layers: int = 2) -> scenes.Scene:
@@ -195,6 +196,7 @@ class TestStageSlots(unittest.TestCase):
             sweep_units.stage_slots,
             dim=records.shape[:2],
             inputs=[
+                row_lines(device),
                 wp.array(np.arange(self.WORLDS), dtype=wp.int32, device=device),
                 wp.ones(self.WORLDS, dtype=wp.int32, device=device),
                 wp.array([len(world) for world in units], dtype=wp.int32, device=device),

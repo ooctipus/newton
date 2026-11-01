@@ -23,6 +23,7 @@ from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_solver, _TopologyReached
 
 
@@ -110,6 +111,7 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
                             phi=phi,
                             target=target,
                             diag=diagonal,
+                            first=row_lines(device),
                         ),
                         row_dof,
                         factors,
@@ -143,6 +145,7 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
                     target=target,
                     rhs=full((2, 2), -9.0),
                     diag=diagonal,
+                    first=row_lines(device),
                 )
                 wp.launch(
                     sparse_contact.finalize_sparse_joint_limit_rows,

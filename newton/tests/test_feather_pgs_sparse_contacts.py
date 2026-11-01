@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.response_builds_rows import (
 from newton._src.solvers.feather_pgs.sparse_contact import finalize_sparse_joint_limit_rows
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
-from newton.tests.feather_pgs_law_harness import group_rows, row_velocity
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines, row_velocity
 from newton.tests.feather_pgs_patch_parity import row_law
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
@@ -71,7 +71,7 @@ def _contact_input(f, device="cpu", **fields):
     if "row_type" in values and "sides" not in values:
         # The contact rows record their sides (the packed placement's).
         values["sides"] = wp.zeros(values["row_type"].shape, dtype=wp.vec2i, device=device)
-    return field_group.upload(ContactInput, device, **values)
+    return field_group.upload(ContactInput, device, **values, first=row_lines(device))
 
 
 def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
@@ -225,6 +225,7 @@ class TestSparseContacts(unittest.TestCase):
             incident=array(velocity),
             dt=0.01,
             diag=diagonal,
+            first=row_lines(device),
         )
         wp.launch(
             factor_contact_rows_kernel(dofs, lanes_per_contact=lanes),
@@ -515,7 +516,7 @@ class TestSparseContacts(unittest.TestCase):
                     wp.launch(
                         cfm_worlds_kernel(),
                         dim=1,
-                        inputs=[count, reference[4], array([0], int), 0],
+                        inputs=[count, row_lines(device), reference[4], array([0], int), 0],
                         outputs=[reference_diag],
                         device=device,
                     )
@@ -526,6 +527,7 @@ class TestSparseContacts(unittest.TestCase):
                         **{field.name: value for field, value in zip(dense_rows.RECORDS, reference, strict=False)},
                         rhs=reference_rhs,
                         row_w=full((1, 9), -9.0),
+                        first=row_lines(device),
                     )
                     incident = array(row_velocity(dense.numpy(), f["velocity"].numpy()))
 
@@ -621,6 +623,7 @@ class TestSparseContacts(unittest.TestCase):
             target=np.linspace(-0.3, 0.4, 18).reshape(shape),
             rhs=np.full(shape, -9.0),
             diag=initial_diag,
+            first=row_lines(device),
         )
         diagonal = rows.diag
         reference_diag = array(initial_diag)
@@ -635,7 +638,7 @@ class TestSparseContacts(unittest.TestCase):
         wp.launch(
             cfm_worlds_kernel(),
             dim=3,
-            inputs=[prefix_count, rows.row_cfm, array([0, 0, 0], int), 0],
+            inputs=[prefix_count, row_lines(device), rows.row_cfm, array([0, 0, 0], int), 0],
             outputs=[reference_diag],
             device=device,
         )
@@ -699,6 +702,7 @@ class TestSparseContacts(unittest.TestCase):
                             phi=phi,
                             target=target,
                             diag=diagonal,
+                            first=row_lines("cpu"),
                         ),
                         indices.ancestor_mask,
                         indices.inverse_permutation,
@@ -802,6 +806,7 @@ class TestSparseContacts(unittest.TestCase):
                     phi=phi,
                     target=target,
                     diag=diagonal,
+                    first=row_lines(device),
                 ),
                 indices.ancestor_mask,
                 indices.inverse_permutation,
@@ -903,6 +908,7 @@ class TestSparseContacts(unittest.TestCase):
                         restitution=_array([[coefficient] * row_count]),
                         rhs=rhs,
                         row_w=_full((1, row_count), 1.0),
+                        first=row_lines("cpu"),
                     ),
                     incident,
                     count,

@@ -689,6 +689,8 @@ def _light_update_qdd_from_velocity(
 
 @wp.func
 def _contact_linear_force(
+    dense_first: wp.array[int],
+    mf_first: wp.array[int],
     routes: ContactRoutes,
     c: int,
     world_impulses: wp.array2d[wp.float32],
@@ -715,6 +717,8 @@ def _contact_linear_force(
 
     if slot >= 0 and path >= 0 and inv_dt > 0.0:
         world = routes.world[c]
+        mf_line = mf_first[world]
+        line = dense_first[world]
         # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
         # solves along the opposite direction internally, which corresponds to the
         # force on shape/body 0 from shape/body 1.
@@ -724,31 +728,31 @@ def _contact_linear_force(
         lam_t0 = 0.0
         lam_t1 = 0.0
         if path == 0:
-            lam_n = world_impulses[world, slot]
+            lam_n = world_impulses[line, slot]
             count = world_constraint_count[world]
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and world_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[world, slot + 1] == slot
-                and world_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and world_row_parent[world, slot + 2] == slot
+                and world_row_type[line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[line, slot + 1] == slot
+                and world_row_type[line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and world_row_parent[line, slot + 2] == slot
             ):
-                lam_t0 = world_impulses[world, slot + 1]
-                lam_t1 = world_impulses[world, slot + 2]
+                lam_t0 = world_impulses[line, slot + 1]
+                lam_t1 = world_impulses[line, slot + 2]
         elif path == 1:
-            lam_n = mf_impulses[world, slot]
+            lam_n = mf_impulses[mf_line, slot]
             count = mf_constraint_count[world]
             if (
                 enable_friction != 0
                 and slot + 2 < count
-                and mf_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and mf_row_parent[world, slot + 1] == slot
-                and mf_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and mf_row_parent[world, slot + 2] == slot
+                and mf_row_type[mf_line, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
+                and mf_row_parent[mf_line, slot + 1] == slot
+                and mf_row_type[mf_line, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
+                and mf_row_parent[mf_line, slot + 2] == slot
             ):
-                lam_t0 = mf_impulses[world, slot + 1]
-                lam_t1 = mf_impulses[world, slot + 2]
+                lam_t0 = mf_impulses[mf_line, slot + 1]
+                lam_t1 = mf_impulses[mf_line, slot + 2]
 
         force = lam_n * normal
         if enable_friction != 0:
@@ -761,6 +765,8 @@ def _contact_linear_force(
 
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
+    dense_first: wp.array[int],
+    mf_first: wp.array[int],
     routes: ContactRoutes,
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
@@ -777,6 +783,8 @@ def compute_contact_linear_force_from_impulses(
 ):
     "Convert solved FeatherPGS contact impulses into world-frame forces."
     _contact_linear_force(
+        dense_first,
+        mf_first,
         routes,
         wp.tid(),
         world_impulses,
@@ -899,6 +907,7 @@ def build_joint_limit_rows_for_size(
     world = joints.art_to_world[art]
     if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
+    line = rows.first[world]
     dof_start = joints.articulation_dof_start[art]
 
     for j in range(joints.articulation_start[art], joints.articulation_start[art + 1]):
@@ -931,14 +940,14 @@ def build_joint_limit_rows_for_size(
                 at = jacobian_row(support, group_idx, art, wp.vec2i(art, -1))
                 clear_side(support, J_group, at, slot, art)
                 J_group[at[0], slot, at[1] + local_dof] = sign
-                rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
-                rows.sides[world, slot] = wp.vec2i(art, -1)
-                rows.row_parent[world, slot] = -1
-                rows.row_mu[world, slot] = 0.0
-                rows.row_beta[world, slot] = pgs_beta
-                rows.row_cfm[world, slot] = pgs_cfm
-                rows.phi[world, slot] = phi
-                rows.target[world, slot] = 0.0
+                rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
+                rows.sides[line, slot] = wp.vec2i(art, -1)
+                rows.row_parent[line, slot] = -1
+                rows.row_mu[line, slot] = 0.0
+                rows.row_beta[line, slot] = pgs_beta
+                rows.row_cfm[line, slot] = pgs_cfm
+                rows.phi[line, slot] = phi
+                rows.target[line, slot] = 0.0
 
 
 # =============================================================================
@@ -1006,6 +1015,7 @@ def populate_mimic_J_for_size(
     group_idx = wp.tid()
     art = group_to_art[group_idx]
     world = joints.art_to_world[art]
+    line = rows.first[world]
     dof_start = joints.articulation_dof_start[art]
 
     for m in range(mimics.art_start[art], mimics.art_start[art + 1]):
@@ -1024,14 +1034,14 @@ def populate_mimic_J_for_size(
         J_group[at[0], slot, at[1] + mimics.dof0[k] - dof_start] = 1.0
         J_group[at[0], slot, at[1] + mimics.dof1[k] - dof_start] = -c1
 
-        rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_MIMIC
-        rows.sides[world, slot] = wp.vec2i(art, -1)
-        rows.row_parent[world, slot] = -1
-        rows.row_mu[world, slot] = 0.0
-        rows.row_beta[world, slot] = pgs_beta
-        rows.row_cfm[world, slot] = pgs_cfm
-        rows.phi[world, slot] = mimic_phi(joint_q[mimics.q0[k]], joint_q[mimics.q1[k]], c0, c1)
-        rows.target[world, slot] = 0.0
+        rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_MIMIC
+        rows.sides[line, slot] = wp.vec2i(art, -1)
+        rows.row_parent[line, slot] = -1
+        rows.row_mu[line, slot] = 0.0
+        rows.row_beta[line, slot] = pgs_beta
+        rows.row_cfm[line, slot] = pgs_cfm
+        rows.phi[line, slot] = mimic_phi(joint_q[mimics.q0[k]], joint_q[mimics.q1[k]], c0, c1)
+        rows.target[line, slot] = 0.0
 
 
 @wp.kernel
@@ -1151,6 +1161,7 @@ def write_link_rows(
     art_p, art_s = body_to_articulation[primary], body_to_articulation[shadow]
     sides = row_sides(art_p, art_s, support.dofs)
     world = links.world[k]
+    line = rows.first[world]
     for row in range(LINK_ROWS):
         slot = base + row
         for side in range(2):
@@ -1194,14 +1205,14 @@ def write_link_rows(
             slot,
             J,
         )
-        rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_LINK
-        rows.sides[world, slot] = sides
-        rows.row_parent[world, slot] = -1
-        rows.row_mu[world, slot] = 0.0
-        rows.row_beta[world, slot] = pgs_beta
-        rows.row_cfm[world, slot] = pgs_cfm
-        rows.phi[world, slot] = turn[axis] if angular else gap[axis]
-        rows.target[world, slot] = 0.0
+        rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_LINK
+        rows.sides[line, slot] = sides
+        rows.row_parent[line, slot] = -1
+        rows.row_mu[line, slot] = 0.0
+        rows.row_beta[line, slot] = pgs_beta
+        rows.row_cfm[line, slot] = pgs_cfm
+        rows.phi[line, slot] = turn[axis] if angular else gap[axis]
+        rows.target[line, slot] = 0.0
 
 
 # =============================================================================
@@ -1356,6 +1367,7 @@ def populate_joint_velocity_limit_J_for_size(
     slot = velocity_limit_slot[row_idx]
     if slot < 0:
         return
+    line = rows.first[world]
     qdot_max = joints.joint_velocity_limit[dof]
     sign = velocity_limit_sign[row_idx]
 
@@ -1363,14 +1375,14 @@ def populate_joint_velocity_limit_J_for_size(
     clear_side(support, J_group, at, slot, art)
     J_group[at[0], slot, at[1] + local_dof] = sign
 
-    rows.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-    rows.sides[world, slot] = wp.vec2i(art, -1)
-    rows.row_parent[world, slot] = -1
-    rows.row_mu[world, slot] = 0.0
-    rows.row_beta[world, slot] = 0.0
-    rows.row_cfm[world, slot] = pgs_cfm
-    rows.phi[world, slot] = 0.0
-    rows.target[world, slot] = -qdot_max
+    rows.row_type[line, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+    rows.sides[line, slot] = wp.vec2i(art, -1)
+    rows.row_parent[line, slot] = -1
+    rows.row_mu[line, slot] = 0.0
+    rows.row_beta[line, slot] = 0.0
+    rows.row_cfm[line, slot] = pgs_cfm
+    rows.phi[line, slot] = 0.0
+    rows.target[line, slot] = -qdot_max
 
 
 # =============================================================================
@@ -1922,15 +1934,17 @@ def populate_world_J_for_compact_size(
 
 @wp.kernel
 def clear_sparse_diagonal_response_prefix(
+    dense_first: wp.array[int],
     dense_phase_bounds: wp.array2d[int],
     # in/out
     sparse_row_dof: wp.array3d[int],
 ):
     """Remove stale sparse entries from the non-contact row prefix."""
     world = wp.tid()
+    line = dense_first[world]
     for row in range(dense_phase_bounds[world, 1]):
-        sparse_row_dof[world, row, 0] = -1
-        sparse_row_dof[world, row, 1] = -1
+        sparse_row_dof[line, row, 0] = -1
+        sparse_row_dof[line, row, 1] = -1
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2183,32 +2197,34 @@ def compute_world_contact_bias(
     i = tid - world * max_constraints
     if i >= world_constraint_count[world]:
         return
-    kind = rows.row_type[world, i]
+    line = rows.first[world]
+    kind = rows.row_type[line, i]
     if material != 0 and kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        if rows.row_eps[world, i] > 0.0:
+        if rows.row_eps[line, i] > 0.0:
             return
     inv_dt = 1.0 / dt
-    phi = rows.phi[world, i]
-    target = rows.target[world, i]
+    phi = rows.phi[line, i]
+    target = rows.target[line, i]
     rhs, row_w = row_rhs(
-        kind, phi, rows.row_beta[world, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
+        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, contact_speculative_scale, 1.0, contact_w
     )
     if kind == PGS_CONSTRAINT_TYPE_CONTACT:
-        restitution = rows.restitution[world, i]
+        restitution = rows.restitution[line, i]
         if restitution > 0.0:
             fires, bounce = contact_restitution_rhs(
-                phi, row_incident[world, i] - target, target, restitution, dt, restitution_velocity_threshold
+                phi, row_incident[line, i] - target, target, restitution, dt, restitution_velocity_threshold
             )
             if fires:
                 rhs = bounce
                 row_w = 1.0
-    rows.rhs[world, i] = rhs
+    rows.rhs[line, i] = rhs
     if weighted != 0:
-        rows.row_w[world, i] = row_w
+        rows.row_w[line, i] = row_w
 
 
 @wp.kernel
 def prepare_world_impulses(
+    dense_first: wp.array[int],
     world_constraint_count: wp.array[int],
     max_constraints: int,
     warmstart: int,
@@ -2224,6 +2240,7 @@ def prepare_world_impulses(
     need to clear the current active prefix.
     """
     world = wp.tid()
+    line = dense_first[world]
     m = world_constraint_count[world]
 
     # Cold-started solves consume only the current active prefix. Rows outside
@@ -2235,11 +2252,13 @@ def prepare_world_impulses(
         clear_count = m
 
     for i in range(clear_count):
-        world_impulses[world, i] = 0.0
+        world_impulses[line, i] = 0.0
 
 
 @wp.kernel
 def reset_world_warmstart_buffers(
+    dense_first: wp.array[int],
+    mf_first: wp.array[int],
     world_mask: wp.array[wp.bool],
     dense_impulses: wp.array2d[float],
     prev_mf_impulses: wp.array2d[float],
@@ -2250,19 +2269,21 @@ def reset_world_warmstart_buffers(
     world = wp.tid()
     if world_mask and not world_mask[world]:
         return
+    mf_line = mf_first[world]
+    line = dense_first[world]
 
     if world < dense_impulses.shape[0]:
         for row in range(dense_impulses.shape[1]):
-            dense_impulses[world, row] = 0.0
+            dense_impulses[line, row] = 0.0
     if world < prev_mf_impulses.shape[0]:
         for row in range(prev_mf_impulses.shape[1]):
-            prev_mf_impulses[world, row] = 0.0
+            prev_mf_impulses[mf_line, row] = 0.0
     if world < prev_mf_row_type.shape[0]:
         for row in range(prev_mf_row_type.shape[1]):
-            prev_mf_row_type[world, row] = -1
+            prev_mf_row_type[mf_line, row] = -1
     if world < prev_mf_row_parent.shape[0]:
         for row in range(prev_mf_row_parent.shape[1]):
-            prev_mf_row_parent[world, row] = -1
+            prev_mf_row_parent[mf_line, row] = -1
 
 
 @wp.kernel
@@ -2315,6 +2336,7 @@ def build_mf_contact_rows(
         if data.path[c] != 1 or slot < 0:
             continue
         world = data.world[c]
+        mf_line = mf.first[world]
         art_a = data.art0[c]
         art_b = data.art1[c]
         body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
@@ -2348,37 +2370,37 @@ def build_mf_contact_rows(
                 if spin:
                     J_a = free_body_spin_jacobian(normal)
                 for k in range(6):
-                    mf.Z_a[world, row_idx, k] = J_a[k]
+                    mf.Z_a[mf_line, row_idx, k] = J_a[k]
             if response_body_b >= 0:
                 J_b = free_body_jacobian(direction, row_point, data.origin[art_b])
                 if spin:
                     J_b = free_body_spin_jacobian(normal)
                 for k in range(6):
-                    mf.Z_b[world, row_idx, k] = -J_b[k]
-            mf.body_a[world, row_idx] = response_body_a
-            mf.body_b[world, row_idx] = response_body_b
+                    mf.Z_b[mf_line, row_idx, k] = -J_b[k]
+            mf.body_a[mf_line, row_idx] = response_body_a
+            mf.body_b[mf_line, row_idx] = response_body_b
             if row == 0:
-                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
-                mf.row_parent[world, row_idx] = -1
-                mf.row_mu[world, row_idx] = mu
-                mf.phi[world, row_idx] = phi
-                mf.restitution[world, row_idx] = restitution
+                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+                mf.row_parent[mf_line, row_idx] = -1
+                mf.row_mu[mf_line, row_idx] = mu
+                mf.phi[mf_line, row_idx] = phi
+                mf.restitution[mf_line, row_idx] = restitution
             elif spin:
-                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
-                mf.row_parent[world, row_idx] = slot
-                mf.row_mu[world, row_idx] = contact_torsion_mu(data, c)
-                mf.phi[world, row_idx] = 0.0
-                mf.restitution[world, row_idx] = 0.0
+                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
+                mf.row_parent[mf_line, row_idx] = slot
+                mf.row_mu[mf_line, row_idx] = contact_torsion_mu(data, c)
+                mf.phi[mf_line, row_idx] = 0.0
+                mf.restitution[mf_line, row_idx] = 0.0
             else:
                 tangent_phi, beta = patch_tangent_row(law, c, row)
                 friction_mu = mu
                 if stiffness > 0.0 and data.friction_weight[c] > 0.0:
                     friction_mu *= data.friction_weight[c]
-                mf.row_type[world, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
-                mf.row_parent[world, row_idx] = slot
-                mf.row_mu[world, row_idx] = friction_mu
-                mf.phi[world, row_idx] = beta * tangent_phi
-                mf.restitution[world, row_idx] = 0.0
+                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+                mf.row_parent[mf_line, row_idx] = slot
+                mf.row_mu[mf_line, row_idx] = friction_mu
+                mf.phi[mf_line, row_idx] = beta * tangent_phi
+                mf.restitution[mf_line, row_idx] = 0.0
             target = float(0.0)
             if has_target_velocity != 0:
                 target = prescribed_target(
@@ -2386,13 +2408,13 @@ def build_mf_contact_rows(
                 )
                 if spin:
                     target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
-                mf.target[world, row_idx] = target
+                mf.target[mf_line, row_idx] = target
             if data.material != 0:
                 eps = float(0.0)
                 if row == 0 and stiffness > 0.0:
                     material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
-                    mf.rhs[world, row_idx] = material_rhs
-                mf.eps[world, row_idx] = eps
+                    mf.rhs[mf_line, row_idx] = material_rhs
+                mf.eps[mf_line, row_idx] = eps
 
 
 @wp.func
@@ -2500,6 +2522,7 @@ def gather_mf_warmstart(
     count = mf_constraint_count[world]
     if new_slot >= count:
         return
+    mf_line = mf.first[world]
 
     mi = match_index[c]
     matched = mi >= 0
@@ -2512,10 +2535,10 @@ def gather_mf_warmstart(
         matched
         and prev_slot >= 0
         and prev_slot < mf_max_c
-        and mf.row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
-        and prev_mf_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and mf.row_type[mf_line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and prev_mf_row_type[mf_line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        mf_impulses[world, new_slot] = decay * dt_scale * prev_mf_impulses[world, prev_slot]
+        mf_impulses[mf_line, new_slot] = decay * dt_scale * prev_mf_impulses[mf_line, prev_slot]
     # else: leave 0 (already memset)
 
     # Friction rows (offsets 1..2): only if THIS step allocated them here and
@@ -2523,16 +2546,19 @@ def gather_mf_warmstart(
     for r in range(1, 3):
         new_r = new_slot + r
         if new_r < count and new_r < mf_max_c:
-            if mf.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and mf.row_parent[world, new_r] == new_slot:
+            if (
+                mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                and mf.row_parent[mf_line, new_r] == new_slot
+            ):
                 prev_r = prev_slot + r
                 if (
                     matched
                     and prev_slot >= 0
                     and prev_r < mf_max_c
-                    and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                    and prev_mf_row_parent[world, prev_r] == prev_slot
+                    and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_mf_row_parent[mf_line, prev_r] == prev_slot
                 ):
-                    mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
+                    mf_impulses[mf_line, new_r] = decay * dt_scale * prev_mf_impulses[mf_line, prev_r]
                 # else: leave 0
     # The spin row (contact torsion): carried as the friction rows are.
     new_r = new_slot + CONTACT_SPIN_ROW
@@ -2543,18 +2569,18 @@ def gather_mf_warmstart(
         and new_r < count
         and new_r < mf_max_c
         and prev_r < mf_max_c
-        and mf.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and mf.row_parent[world, new_r] == new_slot
-        and prev_mf_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and prev_mf_row_parent[world, prev_r] == prev_slot
+        and mf.row_type[mf_line, new_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and mf.row_parent[mf_line, new_r] == new_slot
+        and prev_mf_row_type[mf_line, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and prev_mf_row_parent[mf_line, prev_r] == prev_slot
     ):
-        mf_impulses[world, new_r] = decay * dt_scale * prev_mf_impulses[world, prev_r]
+        mf_impulses[mf_line, new_r] = decay * dt_scale * prev_mf_impulses[mf_line, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < mf_max_c:
         _transport_warmstart_contact(
             routes.normal[c],
             previous_normal[mi],
-            world,
+            mf_line,
             new_slot,
             count,
             mf.row_type,
@@ -2630,6 +2656,7 @@ def gather_dense_warmstart(
     count = world_constraint_count[world]
     if new_slot >= count:
         return
+    line = rows.first[world]
 
     mi = match_index[c]
     matched = mi >= 0
@@ -2642,28 +2669,25 @@ def gather_dense_warmstart(
         matched
         and prev_slot >= 0
         and prev_slot < max_constraints
-        and prev_dense_row_type[world, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
+        and prev_dense_row_type[line, prev_slot] == PGS_CONSTRAINT_TYPE_CONTACT
     ):
-        if rows.row_type[world, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
-            world_impulses[world, new_slot] = decay * dt_scale * prev_dense_impulses[world, prev_slot]
+        if rows.row_type[line, new_slot] == PGS_CONSTRAINT_TYPE_CONTACT:
+            world_impulses[line, new_slot] = decay * dt_scale * prev_dense_impulses[line, prev_slot]
 
     # Friction rows (offsets 1, 2): only if THIS step allocated them here.
     for r in range(1, 3):
         new_r = new_slot + r
         if new_r < count and new_r < max_constraints:
-            if (
-                rows.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                and rows.row_parent[world, new_r] == new_slot
-            ):
+            if rows.row_type[line, new_r] == PGS_CONSTRAINT_TYPE_FRICTION and rows.row_parent[line, new_r] == new_slot:
                 prev_r = prev_slot + r
                 if (
                     matched
                     and prev_slot >= 0
                     and prev_r < max_constraints
-                    and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
-                    and prev_dense_row_parent[world, prev_r] == prev_slot
+                    and prev_dense_row_type[line, prev_r] == PGS_CONSTRAINT_TYPE_FRICTION
+                    and prev_dense_row_parent[line, prev_r] == prev_slot
                 ):
-                    world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
+                    world_impulses[line, new_r] = decay * dt_scale * prev_dense_impulses[line, prev_r]
     # The spin row (contact torsion): carried as the friction rows are.
     new_r = new_slot + CONTACT_SPIN_ROW
     prev_r = prev_slot + CONTACT_SPIN_ROW
@@ -2673,18 +2697,18 @@ def gather_dense_warmstart(
         and new_r < count
         and new_r < max_constraints
         and prev_r < max_constraints
-        and rows.row_type[world, new_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and rows.row_parent[world, new_r] == new_slot
-        and prev_dense_row_type[world, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
-        and prev_dense_row_parent[world, prev_r] == prev_slot
+        and rows.row_type[line, new_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and rows.row_parent[line, new_r] == new_slot
+        and prev_dense_row_type[line, prev_r] == PGS_CONSTRAINT_TYPE_TORSION
+        and prev_dense_row_parent[line, prev_r] == prev_slot
     ):
-        world_impulses[world, new_r] = decay * dt_scale * prev_dense_impulses[world, prev_r]
+        world_impulses[line, new_r] = decay * dt_scale * prev_dense_impulses[line, prev_r]
 
     if mi >= 0 and prev_slot >= 0 and prev_slot < max_constraints:
         _transport_warmstart_contact(
             routes.normal[c],
             previous_normal[mi],
-            world,
+            line,
             new_slot,
             count,
             rows.row_type,
@@ -2791,6 +2815,7 @@ def populate_rigid_velocity_limit_rows(
     world = bodies.art_to_world[art]
     if world < 0:
         return
+    mf_line = mf.first[world]
 
     base = RIGID_SPEED_ROWS * candidate
     for speed_axis in range(RIGID_SPEED_ROWS):
@@ -2803,18 +2828,18 @@ def populate_rigid_velocity_limit_rows(
 
         # The axis stays unwhitened: the speed law reads the body's velocity through its factor, not a row.
         for k in range(6):
-            mf.Z_a[world, slot, k] = 0.0
-            mf.Z_b[world, slot, k] = 0.0
-        mf.Z_a[world, slot, 3 * speed_axis] = 1.0
+            mf.Z_a[mf_line, slot, k] = 0.0
+            mf.Z_b[mf_line, slot, k] = 0.0
+        mf.Z_a[mf_line, slot, 3 * speed_axis] = 1.0
 
-        mf.body_a[world, slot] = body
-        mf.body_b[world, slot] = -1
-        mf.row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-        mf.row_parent[world, slot] = -1
-        mf.row_mu[world, slot] = 0.0
+        mf.body_a[mf_line, slot] = body
+        mf.body_b[mf_line, slot] = -1
+        mf.row_type[mf_line, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+        mf.row_parent[mf_line, slot] = -1
+        mf.row_mu[mf_line, slot] = 0.0
         # For velocity-limit rows mf_phi stores the speed limit; contact rows
         # use it as geometric gap. Row type disambiguates the meaning.
-        mf.phi[world, slot] = limit
+        mf.phi[mf_line, slot] = limit
 
 
 @wp.kernel
@@ -2864,6 +2889,7 @@ def classify_local_solve_worlds(
 ):
     """Assign exact solver ownership and compact active general worlds."""
     world = wp.tid()
+    mf_line = mf.first[world]
     row_count = world_constraint_count[world]
     mf_count = mf_constraint_count[world]
     primary_articulation = owners.primary_articulation[world]
@@ -2874,15 +2900,15 @@ def classify_local_solve_worlds(
     local_mf = mf_count > 0 and mf_count <= owners.residual_mf_max_rows and residual_pair_articulation >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        body_a = mf.body_a[world, mf_row]
-        body_b = mf.body_b[world, mf_row]
+        body_a = mf.body_a[mf_line, mf_row]
+        body_b = mf.body_b[mf_line, mf_row]
         if body_a >= 0 and body_to_articulation[body_a] != residual_pair_articulation:
             local_mf = False
         if body_b >= 0 and body_to_articulation[body_b] != residual_pair_articulation:
             local_mf = False
         # Free-body velocity-limit rows are speed rows (projection_laws.speed_row), which the residual local loop
         # does not implement: keep such worlds on the general owner.
-        if mf.row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        if mf.row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             local_mf = False
         mf_row += 1
 
@@ -2932,6 +2958,7 @@ def compact_local_pair_candidates(
 
 @wp.kernel
 def clear_local_solve_diag(
+    dense_first: wp.array[int],
     world_constraint_count: wp.array[int],
     local_solve_owner: wp.array[int],
     max_constraints: int,
@@ -2942,8 +2969,9 @@ def clear_local_solve_diag(
     tid = wp.tid()
     row = tid % max_constraints
     world = tid // max_constraints
+    line = dense_first[world]
     if local_solve_owner[world] != PGS_LOCAL_SOLVE_OWNER_GENERAL and row < world_constraint_count[world]:
-        world_diag[world, row] = 0.0
+        world_diag[line, row] = 0.0
 
 
 # =============================================================================

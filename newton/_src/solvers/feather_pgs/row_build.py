@@ -369,6 +369,7 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     art_a = data.art0[c]
     art_b = data.art1[c]
     world = data.world[c]
+    line = data.first[world]
     slot = data.slot[c]
     mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
     stiffness = float(0.0)
@@ -385,46 +386,46 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
     r = slot + row
     normal_beta = float(0.0)
     if row == CONTACT_SPIN_ROW:
-        data.row_type[world, r] = ROW_TORSION
-        data.row_parent[world, r] = slot
-        data.row_mu[world, r] = contact_torsion_mu(data, c)
-        data.row_beta[world, r] = 0.0
-        data.phi[world, r] = 0.0
-        data.restitution[world, r] = 0.0
+        data.row_type[line, r] = ROW_TORSION
+        data.row_parent[line, r] = slot
+        data.row_mu[line, r] = contact_torsion_mu(data, c)
+        data.row_beta[line, r] = 0.0
+        data.phi[line, r] = 0.0
+        data.restitution[line, r] = 0.0
     elif row == 0:
         normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
-        data.row_type[world, r] = ROW_CONTACT
-        data.row_parent[world, r] = -1
-        data.row_mu[world, r] = mu
-        data.row_beta[world, r] = normal_beta
-        data.phi[world, r] = phi
-        data.restitution[world, r] = restitution
+        data.row_type[line, r] = ROW_CONTACT
+        data.row_parent[line, r] = -1
+        data.row_mu[line, r] = mu
+        data.row_beta[line, r] = normal_beta
+        data.phi[line, r] = phi
+        data.restitution[line, r] = restitution
     else:
         tangent_phi, beta = patch_tangent_row(law, c, row)
         friction_mu = mu
         if stiffness > 0.0 and data.friction_weight[c] > 0.0:
             friction_mu *= data.friction_weight[c]
-        data.row_type[world, r] = ROW_FRICTION
-        data.row_parent[world, r] = slot
-        data.row_mu[world, r] = friction_mu
-        data.row_beta[world, r] = beta
-        data.phi[world, r] = tangent_phi
-        data.restitution[world, r] = 0.0
+        data.row_type[line, r] = ROW_FRICTION
+        data.row_parent[line, r] = slot
+        data.row_mu[line, r] = friction_mu
+        data.row_beta[line, r] = beta
+        data.phi[line, r] = tangent_phi
+        data.restitution[line, r] = 0.0
     if data.material != 0:
         eps = float(0.0)
         if row == 0 and stiffness > 0.0:
             material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
-            data.rhs[world, r] = material_rhs
-        data.row_eps[world, r] = eps
-    data.row_cfm[world, r] = data.cfm
-    data.target[world, r] = target
-    data.sides[world, r] = row_sides(art_a, art_b, data.response_dofs)
+            data.rhs[line, r] = material_rhs
+        data.row_eps[line, r] = eps
+    data.row_cfm[line, r] = data.cfm
+    data.target[line, r] = target
+    data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
     if with_rhs:
         inv_dt = 1.0 / data.dt
         rhs = float(0.0)
         weight = float(1.0)
         if row == 0 and stiffness > 0.0:
-            rhs = data.rhs[world, r]
+            rhs = data.rhs[line, r]
         elif row == 0:
             rhs, weight = contact_rhs(
                 phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w
@@ -444,8 +445,8 @@ def write_contact_row(data: ContactInput, law: PatchRowLaw, c: int, row: int, wi
         else:
             tangent_phi, beta = patch_tangent_row(law, c, row)
             rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
-        data.rhs[world, slot + row] = rhs
-        data.diag[world, slot + row] = data.cfm
+        data.rhs[line, slot + row] = rhs
+        data.diag[line, slot + row] = data.cfm
         if data.contact_w < 1.0:
-            data.row_w[world, slot + row] = weight
+            data.row_w[line, slot + row] = weight
     return body_a, body_b, direction, row_point

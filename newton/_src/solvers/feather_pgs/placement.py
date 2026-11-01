@@ -114,6 +114,7 @@ def _accumulate_row_capacity_telemetry(
 
 @wp.kernel
 def _clear_dense_row_state(
+    mf_first: wp.array[int],
     slot_counter: wp.array[int],
     dropped: wp.array2d[int],
     dense_first_rejected_slot: wp.array[int],
@@ -125,6 +126,7 @@ def _clear_dense_row_state(
 ):
     """Clear allocation state, row-loss counters and free-body row state in one launch."""
     world, column = wp.tid()
+    mf_line = mf_first[world]
     if column == 0:
         slot_counter[world] = 0
         for family in range(2):
@@ -135,7 +137,7 @@ def _clear_dense_row_state(
             mf_first_rejected_slot[world] = _ROW_SLOT_UNBOUNDED
             mf_constraint_count[world] = 0
     if has_free_rigid != 0:
-        mf_impulses[world, column] = 0.0
+        mf_impulses[mf_line, column] = 0.0
 
 
 @wp.kernel
@@ -245,6 +247,10 @@ class Placement:
         self.laws = laws
         self.factor = factor
         self.arrays = SolverArrays(self, model.device)
+        # The line of its family's store where each world's rows start: a world's rows are contiguous from it.
+        worlds = np.arange(forest.world_count, dtype=np.int32)
+        self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)
+        self.mf_first = wp.array(worlds, dtype=wp.int32, device=model.device)
         # Launches over the contact capacity (the force export, the warm-start snapshot and gathers, the keyed-row key
         # scatters) grid-stride over about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
@@ -837,6 +843,7 @@ class Placement:
             _clear_dense_row_state,
             dim=(self.forest.world_count, self.mf_impulses.shape[1] if mf_active else 1),
             inputs=[
+                self.mf_first,
                 self.slot_counter,
                 self.row_dropped_all,
                 self.dense_first_rejected_slot,
@@ -1093,6 +1100,7 @@ class Placement:
         support.world = self.forest.art_to_world if self.mf_sweeps else self.dummy_is_free_rigid
         support.dense = int(self.packed_dense)
         support.packed = int(self.mf_sweeps)
+        support.first = self.dense_first
         return support
 
     def jacobian_rows(self, size: int) -> wp.array:
@@ -1242,6 +1250,7 @@ class Placement:
                 self.constraint_count,
                 self.local_solve_owner,
                 self.row_restitution,
+                self.dense_first,
                 size,
                 self.dense_max_constraints,
                 n_arts,
@@ -1295,6 +1304,7 @@ class Placement:
                 self.forest.articulation_world_dof_offset,
                 self.forest.articulation_dof_start,
                 self.constraint_count,
+                self.dense_first,
                 self.mf_count_or_dummy(),
                 int(self.ink_skip_rows()),
                 self.local_solve_owner,
@@ -1332,6 +1342,7 @@ class Placement:
                     self.sparse_diagonal_dense_offsets,
                     self.forest.world_dof_indices,
                     self.constraint_count,
+                    self.dense_first,
                     self.dense_phase_bounds,
                     int(self.compact_contact_boundary),
                     rows,
@@ -1367,7 +1378,7 @@ class Placement:
             wp.launch(
                 clear_local_solve_diag,
                 dim=self.forest.world_count * self.dense_max_constraints,
-                inputs=[self.constraint_count, self.local_solve_owner, self.dense_max_constraints],
+                inputs=[self.dense_first, self.constraint_count, self.local_solve_owner, self.dense_max_constraints],
                 outputs=[self.diag],
                 device=self.model.device,
             )
@@ -1384,6 +1395,7 @@ class Placement:
                 self.forest.group_to_art[size],
                 self.forest.art_to_world,
                 self.constraint_count,
+                self.dense_first,
                 size,
                 self.dense_max_constraints,
                 n_arts,
@@ -1404,6 +1416,7 @@ class Placement:
                 self.forest.world_response_group_to_art[size],
                 self.forest.art_group_idx,
                 self.constraint_count,
+                self.dense_first,
                 self.dense_max_constraints,
                 self.mf_count_or_dummy(),
                 int(self.ink_skip_rows()),
@@ -1423,7 +1436,13 @@ class Placement:
         wp.launch(
             response_builds_dense.cfm_worlds_kernel(),
             dim=self.forest.world_count,
-            inputs=[self.constraint_count, self.row_cfm, self.mf_count_or_dummy(), int(self.ink_skip_rows())],
+            inputs=[
+                self.constraint_count,
+                self.dense_first,
+                self.row_cfm,
+                self.mf_count_or_dummy(),
+                int(self.ink_skip_rows()),
+            ],
             outputs=[self.diag],
             device=model.device,
         )
@@ -1462,6 +1481,7 @@ class Placement:
             response_builds_rows.free_body_coordinates_kernel,
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
+                self.mf_first,
                 self.mf_constraint_count,
                 self.mf_body_a,
                 self.mf_body_b,
@@ -1485,6 +1505,7 @@ class Placement:
             dim=[self.forest.world_count],
             inputs=[
                 self.mf_constraint_count,
+                self.mf_first,
                 self.mf_dof_a,
                 self.mf_dof_b,
                 self.mf_eff_mass_inv,
@@ -1504,6 +1525,7 @@ class Placement:
             prepare_world_impulses,
             dim=self.forest.world_count,
             inputs=[
+                self.dense_first,
                 self.constraint_count,
                 self.dense_max_constraints,
                 warmstart_flag,

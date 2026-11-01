@@ -110,7 +110,7 @@ _PHASE = """    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
         float phi = 0.0f, target = 0.0f, beta = 0.0f, w0 = 0.0f, w1 = 0.0f;
 $LOCALS$EVALUATE        $SLOT
         if (active && slot < LAW::row_type.shape[1]) {
-            const int at = world * LAW::row_type.shape[1] + slot;
+            const int at = prefix_line * LAW::row_type.shape[1] + slot;
             LAW::row_type.data[at] = type;
             LAW::row_parent.data[at] = -1;
             LAW::row_mu.data[at] = 0.0f;
@@ -165,7 +165,9 @@ def prefix_rows(
         else "const unsigned votes = BALLOT(active != 0);\n"
         f"        const int slot = RESERVE(&{law}slot_counter.data[world], COUNT(votes)) + BELOW(votes);"
     )
-    source = "    int base = 0;\n" if ordered else ""
+    source = f"    const int prefix_line = {law}first.data[world];\n    __builtin_assume(prefix_line >= 0);\n" + (
+        "    int base = 0;\n" if ordered else ""
+    )
     for phase, families in enumerate(phases):
         start, evaluate = 0, ""
         for count, declaration, evaluation in families:

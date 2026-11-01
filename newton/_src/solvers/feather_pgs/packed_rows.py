@@ -116,6 +116,7 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
         ("articulation_world_dof_offset", wp.array[int]),
         ("articulation_dof_start", wp.array[int]),
         ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
         ("mf_constraint_count", wp.array[int]),
         ("skip_rows_le", int),
         ("local_solve_owner", wp.array[int]),
@@ -194,7 +195,10 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
     if (world >= world_constraint_count.shape[0] || slot >= world_constraint_count.data[world]) return;
     const bool keeps = {_kept("world")};
     if (keeps && rows_elsewhere != 0) return;
-    const wp::vec2i sides = row_sides.data[tid];
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int at = line * capacity + slot;
+    const wp::vec2i sides = row_sides.data[at];
     const int support = packed_Z.shape[2];
     // Each side's entries [first, first + n): after the previous side's, or at its coordinates (dense).
     int first[2] = {{0, 0}}, count[2] = {{0, 0}};
@@ -208,17 +212,17 @@ def pack_kernel(sizes: tuple[int, ...]) -> wp.Kernel:
         const int start = articulation_dof_start.data[art];
         count[side] = n;
         first[side] = dense != 0 ? offset : side == 0 ? 0 : count[0];
-        const size_t base = (size_t)tid * support + first[side];
+        const size_t base = (size_t)at * support + first[side];
 {sides}
     }}
-    row_incident.data[tid] = incident;
+    row_incident.data[at] = incident;
     if (keeps) return;
     for (int e = 0; e < support; ++e) {{
         if ((e >= first[0] && e < first[0] + count[0]) || (e >= first[1] && e < first[1] + count[1])) continue;
-        packed_Z.data[(size_t)tid * support + e] = 0.0f;
+        packed_Z.data[(size_t)at * support + e] = 0.0f;
     }}
     if (write_diag != 0 && local_solve_owner.data[world] == {PGS_LOCAL_SOLVE_OWNER_GENERAL})
-        world_diag.data[tid] = write_diag == 2 ? norm + world_row_cfm.data[tid] : norm;
+        world_diag.data[at] = write_diag == 2 ? norm + world_row_cfm.data[at] : norm;
 """
     name = "pack_dense_rows" + "".join(f"_{n}" for n in sizes)
     return KernelTemplate(

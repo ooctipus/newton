@@ -1418,6 +1418,7 @@ class Sweep:
                 dim=self.forest.world_count * 32,
                 inputs=[
                     self.placement.constraint_count,
+                    self.placement.dense_first,
                     self.placement.dense_phase_bounds,
                     *unit_rows,
                 ],
@@ -1495,8 +1496,8 @@ class Sweep:
         if self.laws.friction_anchors_enabled and self.patch_frame_built(contacts):
             ratio = dt / self.prev_dt if self.prev_dt > 0.0 else 1.0
             seeded = [
-                (route, parents, mu, impulses, decay * ratio)
-                for route, parents, mu, impulses, decay in self.patch_row_arrays()
+                (route, parents, mu, impulses, decay * ratio, first)
+                for route, parents, mu, impulses, decay, first in self.patch_row_arrays()
                 if decay > 0.0
             ]
             if seeded:
@@ -1515,6 +1516,7 @@ class Sweep:
         placement, forest = self.placement, self.forest
         return {
             "world_constraint_count": placement.constraint_count,
+            "dense_first": placement.dense_first,
             "dense_phase_bounds": placement.dense_phase_bounds,
             "local_solve_owner": placement.local_solve_owner,
             "world_dof_indices": forest.world_dof_indices,
@@ -1533,6 +1535,7 @@ class Sweep:
             "world_row_parent": placement.row_parent,
             "world_row_mu": placement.row_mu,
             "mf_constraint_count": placement.mf_constraint_count,
+            "mf_first": placement.mf_first,
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             "mf_meta": placement.mf_meta_packed,
             "mf_impulses": placement.mf_impulses,
@@ -1833,6 +1836,7 @@ class Sweep:
                 self.placement.row_mu,
                 self.placement.impulses,
                 self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
+                self.placement.dense_first,
             )
         if self.forest.has_free_rigid_bodies:
             yield (
@@ -1841,6 +1845,7 @@ class Sweep:
                 self.placement.mf_row_mu,
                 self.placement.mf_impulses,
                 self.options.pgs_warmstart_decay if self.options.pgs_warmstart else 0.0,
+                self.placement.mf_first,
             )
 
     def carry(self, state_in, state_out, contacts, dt: float) -> None:
@@ -1914,7 +1919,15 @@ class Sweep:
         wp.launch(
             reset_world_warmstart_buffers,
             dim=self.forest.world_count,
-            inputs=[world_mask, dense_impulses, prev_mf_impulses, prev_mf_row_type, prev_mf_row_parent],
+            inputs=[
+                self.placement.dense_first,
+                self.placement.mf_first,
+                world_mask,
+                dense_impulses,
+                prev_mf_impulses,
+                prev_mf_row_type,
+                prev_mf_row_parent,
+            ],
             device=self.model.device,
         )
         if self.options.pgs_warmstart and self.placement.ws_prev_dense_impulses is not None:
@@ -1925,6 +1938,8 @@ class Sweep:
                 reset_world_warmstart_buffers,
                 dim=self.forest.world_count,
                 inputs=[
+                    self.placement.dense_first,
+                    self.placement.mf_first,
                     world_mask,
                     self.placement.dummy_contact_impulses,
                     self.placement.ws_prev_dense_impulses,
@@ -1947,6 +1962,8 @@ class Sweep:
             compute_contact_linear_force_from_impulses,
             rows,
             inputs=[
+                self.placement.dense_first,
+                self.placement.mf_first,
                 bind_contact_routes(self, contacts),
                 self.placement.impulses,
                 self.placement.mf_impulses,

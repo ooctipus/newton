@@ -47,7 +47,7 @@ from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
@@ -851,6 +851,7 @@ def _general_bias(solver, rows, dt):
         restitution=wp.zeros_like(rhs),
         rhs=rhs,
         row_w=wp.zeros_like(rhs),
+        first=row_lines(device),
     )
     wp.launch(
         compute_world_contact_bias,

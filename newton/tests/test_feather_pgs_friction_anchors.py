@@ -14,6 +14,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     BodyFactors,
     compute_world_contact_bias,
 )
+from newton.tests.feather_pgs_law_harness import row_lines
 
 _MU_JAW, _MU_BOX = 5.0, 0.5
 _BOX_HALF, _JAW_HALF_T, _GAP0 = 0.02, 0.005, 0.001
@@ -356,6 +357,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
             restitution=zeros3(),
             rhs=rhs,
             row_w=zeros3(),
+            first=row_lines(device),
         )
         inputs = [rows, zeros3(), count, 3, dt, 1.0, 1.0, 0.0, 0, 0]
         wp.launch(compute_world_contact_bias, dim=3, inputs=inputs, device=device)
@@ -377,6 +379,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, device="cpu"):
                     restitution=zeros3(),
                     incident=zeros3(),
                     rhs=rhs,
+                    first=row_lines(device),
                 ),
                 count,
                 BodyFactors(),

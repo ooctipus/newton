@@ -45,7 +45,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import local_packed_rows
+from newton.tests.feather_pgs_law_harness import local_packed_rows, row_lines
 
 SWEEPS = SolvePolicy(readout="sweeps")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -135,7 +135,8 @@ class _SparseCase:
         self.initial = padded(impulses)
         self.impulses = wp.clone(self.initial)
         self.delta = wp.full((worlds, dofs), float("nan"), device=device)
-        self.head = [worlds, wp.array([count, 0, count], dtype=int, device=device), padded(bias), padded(diagonal)]
+        counts = wp.array([count, 0, count], dtype=int, device=device)
+        self.head = [worlds, counts, row_lines(device), padded(bias), padded(diagonal)]
         self.tail = [
             wp.array(row_dof, device=device),
             wp.array(row_factor, device=device),
@@ -214,6 +215,7 @@ class _LocalCase:
             # World 1 belongs to another owner: its solve returns before any sweep.
             wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
             wp.array([2, 1], dtype=wp.int32, device=device),
+            row_lines(device),
             lower_group,
             lower_group,
             *local_packed_rows(device, [0, 1], jacobian),
@@ -222,6 +224,7 @@ class _LocalCase:
             wp.full((2, rows), -1, dtype=wp.int32, device=device),
             wp.zeros((2, rows), dtype=wp.float32, device=device),
             wp.zeros(2, dtype=wp.int32, device=device),
+            row_lines(device),
             wp.zeros((2, 4), dtype=wp.int32, device=device),
             wp.zeros((2, 1), dtype=wp.float32, device=device),
             *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(2)],

@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     gather_mf_warmstart,
     prepare_world_impulses,
 )
+from newton.tests.feather_pgs_law_harness import row_lines
 
 
 def _build_press():
@@ -125,6 +126,7 @@ def _gather_dense_rows(
                 row_type=[current_types],
                 row_parent=[current_parents],
                 row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32, device="cpu"),
+                first=row_lines("cpu"),
             ),
             wp.array(match_indices, dtype=wp.int32, device="cpu"),
             wp.array(prev_slots, dtype=wp.int32, device="cpu"),
@@ -151,6 +153,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             prepare_world_impulses,
             dim=1,
             inputs=[
+                row_lines("cpu"),
                 wp.array([4], dtype=wp.int32, device="cpu"),
                 4,
                 1,
@@ -247,6 +250,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                     row_type=current_types,
                     row_parent=current_parents,
                     row_mu=wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
+                    first=row_lines("cpu"),
                 ),
                 match_indices,
                 prev_slots,

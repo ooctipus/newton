@@ -616,6 +616,17 @@ STRUCT_ARGUMENTS = {
 """The scenes' field names of each struct a kernel takes in place of separate arguments."""
 
 
+_ROW_LINES = {}
+
+
+def row_lines(device) -> wp.array:
+    """The row table of a hand-built scene, read by world: its worlds keep their rows on their own lines."""
+    key = str(device)
+    if key not in _ROW_LINES:
+        _ROW_LINES[key] = wp.array(np.arange(1 << 14), dtype=wp.int32, device=device)
+    return _ROW_LINES[key]
+
+
 def bind_struct(struct_type, values, device):
     """An instance of ``struct_type`` from a scene's values by the scenes' names (host values go to ``device``).
 
@@ -634,6 +645,9 @@ def bind_struct(struct_type, values, device):
     if "sides" in fields and "sides" not in bound and "row_type" in bound:
         # The producers record each row's sides (the packed placement's); a scene without them reads none back.
         bound["sides"] = wp.zeros(bound["row_type"].shape, dtype=wp.vec2i, device=device)
+    for name in ("first", "mf_first"):
+        if name in fields and name not in bound:
+            bound[name] = row_lines(device)
     instance = field_group.upload(struct_type, device, **bound)
     return instance, {
         arguments[name]: value for name, value in bound.items() if isinstance(value, wp.array) and name in arguments
@@ -658,6 +672,7 @@ def row_support(sides, dofs, offsets, dense, device, worlds=None) -> RowSupport:
     support.world = wp.array(worlds, dtype=wp.int32, device=device)
     support.dense = int(dense)
     support.packed = 1
+    support.first = row_lines(device)
     return support
 
 

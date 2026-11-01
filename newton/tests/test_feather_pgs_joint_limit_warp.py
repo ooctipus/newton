@@ -14,7 +14,7 @@ from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.prefix_rows import PrefixLaw
 from newton._src.solvers.feather_pgs.rows import joint_limit_warp_kernel
-from newton.tests.feather_pgs_law_harness import group_rows
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 
 
 def _outputs(articulation_count: int, max_constraints: int, size: int, device):
@@ -35,7 +35,9 @@ def _dense_rows(outputs, device):
     """The row records of ``outputs`` (after the counter and the Jacobian), as the kernels' DenseRows."""
     names = ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target")
     sides = wp.zeros(outputs[3].shape, dtype=wp.vec2i, device=device)
-    return field_group.upload(DenseRows, device, **dict(zip(names, outputs[2:], strict=True)), sides=sides)
+    return field_group.upload(
+        DenseRows, device, **dict(zip(names, outputs[2:], strict=True)), sides=sides, first=row_lines(device)
+    )
 
 
 def _problem(device, articulation_count=257, size=6):
@@ -120,6 +122,7 @@ def _warp_rows(problem, resolved=None, warps_per_block=4):
         slot_counter=outputs[0],
         **dict(zip(names, outputs[2:], strict=True)),
         sides=wp.zeros(outputs[2].shape, dtype=wp.vec2i, device=problem.device),
+        first=row_lines(problem.device),
     )
     wp.launch_tiled(
         joint_limit_warp_kernel(problem.size, warps_per_block),

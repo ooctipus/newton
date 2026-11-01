@@ -332,7 +332,7 @@ class TreeFactor:
         )
         self._no_slots = self._arrays.placeholder(wp.int32)
 
-    def eliminate(self, *, Z, sides, counts, owners, cfm, rhs, incident, diag, impulses) -> None:
+    def eliminate(self, *, first, Z, sides, counts, owners, cfm, rhs, incident, diag, impulses) -> None:
         """Make each block's rows orthonormal, then correct every other row, its right-hand side and its diagonal, and
         give the block's rows the projection's impulses, which the sweep seeds
         (:func:`.response_builds_rows.elimination`). Runs once the right-hand sides are final (bias and restitution)."""
@@ -341,6 +341,7 @@ class TreeFactor:
             self.elimination.setup,
             dim=self.block_count,
             inputs=[
+                first,
                 block,
                 self._no_slots if self.laws.mimic_slot is None else self.laws.mimic_slot,
                 self._no_slots if self.laws.link_slot is None else self.laws.link_slot,
@@ -353,14 +354,14 @@ class TreeFactor:
         wp.launch(
             self.elimination.correct,
             dim=sides.shape[0] * sides.shape[1],
-            inputs=[block, sides, counts, owners, cfm],
+            inputs=[first, block, sides, counts, owners, cfm],
             outputs=[Z, rhs, diag],
             device=self.model.device,
         )
         wp.launch(
             self.elimination.weights,
             dim=self.block_count,
-            inputs=[block, rhs],
+            inputs=[first, block, rhs],
             outputs=[impulses],
             device=self.model.device,
         )

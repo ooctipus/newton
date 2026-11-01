@@ -174,6 +174,7 @@ SLOT_FIELDS = FieldGroup(
 
 @wp.kernel(enable_backward=False)
 def stage_slots(
+    mf_first: wp.array[int],
     slot_world: wp.array[wp.int32],
     world_colored: wp.array[wp.int32],
     unit_count: wp.array[wp.int32],
@@ -199,30 +200,31 @@ def stage_slots(
     world = slot_world[slot]
     if world_colored[world] == 0 or p >= unit_count[world]:
         return
+    mf_line = mf_first[world]
     row = color_slot[slot, p, 0]
     rows = color_slot[slot, p, 1] & 7
     for r in range(4):
         if r < rows:
             for k in range(6):
-                slot_data[slot, r * 12 + k, p] = mf_Z_a[world, row + r, k]
-                slot_data[slot, r * 12 + 6 + k, p] = mf_Z_b[world, row + r, k]
-            slot_words[slot, r * 3, p] = mf_meta[world, (row + r) * 4 + 1]
-            slot_words[slot, r * 3 + 1, p] = mf_meta[world, (row + r) * 4 + 2]
-            slot_words[slot, r * 3 + 2, p] = mf_meta[world, (row + r) * 4 + 3]
+                slot_data[slot, r * 12 + k, p] = mf_Z_a[mf_line, row + r, k]
+                slot_data[slot, r * 12 + 6 + k, p] = mf_Z_b[mf_line, row + r, k]
+            slot_words[slot, r * 3, p] = mf_meta[mf_line, (row + r) * 4 + 1]
+            slot_words[slot, r * 3 + 1, p] = mf_meta[mf_line, (row + r) * 4 + 2]
+            slot_words[slot, r * 3 + 2, p] = mf_meta[mf_line, (row + r) * 4 + 3]
     entries = layout_rows * 12
     mu = float(0.0)
     if rows >= 3:
-        mu = mf_row_mu[world, row + 1]
+        mu = mf_row_mu[mf_line, row + 1]
     slot_data[slot, entries, p] = mu
     weight = float(1.0)
     if regularize != 0:
-        weight = mf_row_w[world, row]
+        weight = mf_row_w[mf_line, row]
     slot_data[slot, entries + 1, p] = weight
     if layout_rows > 3:
         # The spin row's torsional coefficient (contact torsion).
         spin_mu = float(0.0)
         if rows > 3:
-            spin_mu = mf_row_mu[world, row + 3]
+            spin_mu = mf_row_mu[mf_line, row + 3]
         slot_data[slot, entries + 2, p] = spin_mu
     if rows >= 3:
         # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
@@ -230,7 +232,7 @@ def stage_slots(
         members = int(0)
         hop = int(0)
         rows_cap = mf_meta.shape[1] // 4
-        link = (mf_meta[world, row * 4 + 3] >> 16) & 0xFFFF
+        link = (mf_meta[mf_line, row * 4 + 3] >> 16) & 0xFFFF
         r = wp.where(link == 0xFFFF, -1, link)
         while r >= 0 and r != row and hop < rows_cap:
             if members == _RING_MEMBERS:
@@ -243,7 +245,7 @@ def stage_slots(
                 words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
             members += 1
             hop += 1
-            link = (mf_meta[world, r * 4 + 3] >> 16) & 0xFFFF
+            link = (mf_meta[mf_line, r * 4 + 3] >> 16) & 0xFFFF
             r = wp.where(link == 0xFFFF, -1, link)
         ring = layout_rows * 3
         for k in range(_RING_MEMBERS // 2):
@@ -315,7 +317,9 @@ SHARED_DECLARATIONS
     const int warp = tid >> 5;
     const int m_mf = min(mf_constraint_count.data[world], MF_ROWS);
     const int end = min(mf_contact_rows_end.data[world], m_mf);
-    const int off_meta = world * MF_ROWS * 4;
+    const int mf_line = mf_first.data[world];
+    __builtin_assume(mf_line >= 0);
+    const int off_meta = mf_line * MF_ROWS * 4;
     // The world's slot holds its units and colors; a world without one, or with fewer contact rows than the rule's
     // units, keeps the one-warp sweep: no units.
     const int slot = world_slot.data[world];
@@ -574,6 +578,7 @@ def build_units_kernel(
     )
     params = kernel_template.params(
         ("mf_constraint_count", wp.array[int]),
+        ("mf_first", wp.array[int]),
         ("mf_contact_rows_end", wp.array[int]),
         ("mf_meta", wp.array2d[int]),
         *WORLD_FIELDS,
@@ -653,6 +658,7 @@ class ColoredUnits:
     def build(
         self,
         mf_constraint_count,
+        mf_first,
         mf_contact_rows_end,
         mf_meta,
         mf_Z_a,
@@ -667,7 +673,7 @@ class ColoredUnits:
         wp.launch_tiled(
             self.build_kernel,
             dim=[self.world_count],
-            inputs=[mf_constraint_count, mf_contact_rows_end, mf_meta],
+            inputs=[mf_constraint_count, mf_first, mf_contact_rows_end, mf_meta],
             outputs=[*(units[field.name] for field in (*WORLD_FIELDS, *UNIT_FIELDS)), self.status],
             block_dim=32 * BUILD_WARPS,
             device=self.device,
@@ -676,6 +682,7 @@ class ColoredUnits:
             stage_slots,
             dim=(self.slot_count, self.unit_capacity),
             inputs=[
+                mf_first,
                 self.slot_world,
                 units["world_colored"],
                 units["unit_count"],

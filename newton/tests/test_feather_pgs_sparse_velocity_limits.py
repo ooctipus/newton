@@ -26,7 +26,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
-from newton.tests.feather_pgs_law_harness import unpacked_rows
+from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -166,6 +166,7 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                                 phi=phi,
                                 target=target,
                                 diag=diagonal,
+                                first=row_lines(device),
                             ),
                             row_dof,
                             factors,

@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     gather_mf_warmstart,
 )
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 
@@ -88,6 +89,7 @@ def test_warm_carry_kernel_scales_rows_exactly(test: unittest.TestCase, device):
                     row_type=current_types,
                     row_parent=current_parents,
                     row_mu=wp.full((1, max_c), 100.0, dtype=wp.float32),
+                    first=row_lines(device),
                 ),
                 wp.array([0], dtype=wp.int32),  # current -> previous contact
                 wp.array([4], dtype=wp.int32),  # previous base slot

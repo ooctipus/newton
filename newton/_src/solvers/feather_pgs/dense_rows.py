@@ -30,6 +30,7 @@ RECORDS = (
     Field("row_w", wp.float32, ("world", "row"), owner="placement"),
     Field("row_eps", wp.float32, ("world", "row"), owner="placement"),
     Field("sides", wp.vec2i, ("world", "row"), attr="row_sides", owner="placement"),
+    Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
 )
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
 compliance ``row_eps`` among them), and its sides (the articulations whose response coordinates it touches:
@@ -86,6 +87,7 @@ class RowSupport:
     world: wp.array[int]
     dense: int
     packed: int
+    first: wp.array[int]
 
 
 @wp.func
@@ -96,12 +98,12 @@ def jacobian_row(support: RowSupport, group: int, art: int, sides: wp.vec2i) -> 
     group's rows at its group, from entry 0."""
     if support.packed == 0:
         return wp.vec2i(group, 0)
-    world = support.world[art]
+    line = support.first[support.world[art]]
     if support.dense != 0:
-        return wp.vec2i(world, support.offset[art])
+        return wp.vec2i(line, support.offset[art])
     if art == sides[0]:
-        return wp.vec2i(world, 0)
-    return wp.vec2i(world, support.dofs[sides[0]])
+        return wp.vec2i(line, 0)
+    return wp.vec2i(line, support.dofs[sides[0]])
 
 
 @wp.func
@@ -135,6 +137,7 @@ MF_RECORDS = (
     ),
     Field("target", wp.float32, ("world", "mf_row"), attr="mf_target_velocity", owner="placement"),
     Field("eps", wp.float32, ("world", "mf_row"), attr="mf_row_eps", owner="placement"),
+    Field("first", wp.int32, ("world",), attr="mf_first", owner="placement"),
 )
 """Each matrix-free row's bodies, coordinates and per-body blocks (the writers' ``J``, whitened in place to ``Z``
 by the rows' build), and the dense records' kind, friction parent, coefficient, gap, restitution, incident velocity

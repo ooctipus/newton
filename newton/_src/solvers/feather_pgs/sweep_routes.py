@@ -56,6 +56,7 @@ _MF_ADMISSION = f"if (mf_rt == {VELOCITY_LIMIT}) continue;"
 MF_GS_ABI = kernel_template.params(
     ("world", int),
     ("world_constraint_count", wp.array[int]),
+    ("dense_first", wp.array[int]),
     ("dense_phase_bounds", wp.array2d[int]),
     ("local_solve_owner", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
@@ -73,6 +74,7 @@ MF_GS_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
+    ("mf_first", wp.array[int]),
     ("mf_contact_rows_end", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
     ("mf_impulses", wp.array2d[float]),
@@ -785,11 +787,15 @@ def mf_gs_source(
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;{mapped}
 
     int dof_map_base = world * {D};
-    int off_dense = world * {M_D};
-    int off_mf = world * {M_MF};
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int mf_line = mf_first.data[world];
+    __builtin_assume(mf_line >= 0);
+    int off_dense = line * {M_D};
+    int off_mf = mf_line * {M_MF};
     int off_meta = off_mf * 4;{component}
-    const size_t packed_base = (size_t)world * {M_D * int(max_row_dofs)};
-    int mf6_base = world * {M_MF} * 6;{offsets}
+    const size_t packed_base = (size_t)line * {M_D * int(max_row_dofs)};
+    int mf6_base = mf_line * {M_MF} * 6;{offsets}
 
 {staging.declarations("    ")}
 {free.declaration()}{trace_reduction}

@@ -65,6 +65,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     patch_routes,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes, store_frame
 from newton.tests.feather_pgs_patch_reference import link_patch_rows as reference_link_patch_rows
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
@@ -627,7 +628,7 @@ class _Rows:
         return scale
 
     def arrays(self):
-        """Return device copies: contact maps and ``(route, parents, mu, impulses, decay)`` rows."""
+        """Return device copies: contact maps and ``(route, parents, mu, impulses, decay, first)`` rows."""
         device = self.scene.device
         maps = [wp.array(values.astype(np.int32), dtype=int, device=device) for values in self.maps]
         parents, mu, impulses = self.values
@@ -638,6 +639,7 @@ class _Rows:
                 wp.array(mu[r].astype(np.float32), dtype=float, device=device),
                 wp.array(impulses[r].astype(np.float32), dtype=float, device=device),
                 float(self.decay[r]),
+                row_lines(device),
             )
             for r in self.routes
         ]
@@ -1823,6 +1825,7 @@ def run_ring_links(test, device, seed):
                 wp.array(mu[route], dtype=float, device=device),
                 wp.zeros(mu[route].shape, dtype=float, device=device),
                 0.0,
+                row_lines(device),
             )
             for route in range(3)
         ]
@@ -1835,7 +1838,7 @@ def run_ring_links(test, device, seed):
                 )
 
     expected = rows()
-    for route, route_parents, route_mu, _, _ in expected:
+    for route, route_parents, route_mu, _, _, _ in expected:
         wp.launch(
             reference_link_patch_rows,
             dim=contacts,

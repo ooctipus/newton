@@ -31,6 +31,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
     _get_build_independent_sparse_contact_groups_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
 )
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_compact_contact import (
     build_solver_fixture,
     compact_boundary,
@@ -341,8 +342,10 @@ def _triple_twin_rows():
 def _builder_arrays(rows, device, *, units):
     """Return the builder's inputs and outputs, in launch order, as device copies of the rows."""
     inputs = ("row_count", "bounds", *(("row_type", "row_parent") if units else ()))
+    arrays = [wp.array(rows[name], dtype=wp.int32, device=device) for name in inputs]
+    arrays.insert(1, row_lines(device))
     return (
-        [wp.array(rows[name], dtype=wp.int32, device=device) for name in inputs],
+        arrays,
         {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in _OUTPUTS},
     )
 
@@ -405,7 +408,7 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
             mf_max_constraints=64,
             **({} if anchors else {"friction_anchor_beta": 0.0}),
         )
-    names = ("row_count", "bounds", *(("row_type", "row_parent") if anchors else ()), *_OUTPUTS)
+    names = ("row_count", "first", "bounds", *(("row_type", "row_parent") if anchors else ()), *_OUTPUTS)
     records = []
     launch = wp.launch
 
@@ -477,6 +480,7 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
             _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu"),
             dim=4,
             inputs=[
+                row_lines(device),
                 field_group.upload(
                     ContactInput,
                     device,
@@ -488,6 +492,7 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                     path=wp.zeros(4, dtype=wp.int32, device=device),
                     slots_needed=wp.full(4, 3, dtype=wp.int32, device=device),
                     response_dofs=wp.array((108, 6), dtype=wp.int32, device=device),
+                    first=row_lines(device),
                 ),
                 4,
             ],

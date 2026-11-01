@@ -24,7 +24,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
 
 PATH_DENSE = 0
@@ -92,6 +92,7 @@ def _launch_contact_allocator(
                 art1=outputs["art_b"],
                 path=outputs["path"],
                 slots_needed=outputs["slots_needed"],
+                first=row_lines(device),
             ),
             1,
             wp.array([0], dtype=wp.int32, device=device),
@@ -168,6 +169,7 @@ def _launch_articulation_pair_contact_allocator(
                 art1=wp.full((1,), -9, dtype=wp.int32, device=device),
                 path=contact_path,
                 slots_needed=contact_slots_needed,
+                first=row_lines(device),
             ),
             1,
             wp.array(body_to_articulation, dtype=wp.int32, device=device),
@@ -215,6 +217,7 @@ def _dense_speculative_rhs(scale: float) -> float:
         restitution=[[0.0]],
         rhs=rhs,
         row_w=[[0.0]],
+        first=row_lines("cpu"),
     )
     wp.launch(
         compute_world_contact_bias,
@@ -245,6 +248,7 @@ def _mf_speculative_rhs(scale: float) -> float:
                 restitution=[[0.0]],
                 incident=[[0.0]],
                 rhs=rhs,
+                first=row_lines("cpu"),
             ),
             wp.array([1], dtype=wp.int32, device="cpu"),
             BodyFactors(),
@@ -374,6 +378,7 @@ def _launch_dense_contact_builders(device: str = "cpu") -> tuple[dict[str, wp.ar
             target=rows["target_velocity"],
             restitution=rows["row_restitution"],
             sides=rows["sides"],
+            first=row_lines(device),
         )
 
     serial = _contact_row_outputs(device)
@@ -426,6 +431,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             compute_contact_linear_force_from_impulses,
             dim=1,
             inputs=[
+                row_lines(device),
+                row_lines(device),
                 field_group.upload(
                     ContactRoutes,
                     device,

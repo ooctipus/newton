@@ -30,7 +30,7 @@ from newton._src.solvers.feather_pgs.sweep_levels import (
 from newton._src.solvers.feather_pgs.sweep_routes_diag import sparse_diagonal_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_local import paired_factor_kernel, paired_factor_source
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import row_velocity
+from newton.tests.feather_pgs_law_harness import row_lines, row_velocity
 
 
 def _build_mixed_response_model(
@@ -462,6 +462,7 @@ def _mark_patch_units(rows, device):
             marker,
             dim=count,
             inputs=[
+                row_lines(device),
                 field_group.upload(
                     ContactInput,
                     device,
@@ -473,6 +474,7 @@ def _mark_patch_units(rows, device):
                     path=wp.zeros(count, dtype=wp.int32, device=device),
                     slots_needed=wp.array(contacts["slots_needed"], dtype=wp.int32, device=device),
                     response_dofs=wp.array((rows["diagonal"], rows["dense"]), dtype=wp.int32, device=device),
+                    first=row_lines(device),
                 ),
                 count,
             ],
@@ -732,6 +734,7 @@ def _launch_paired_factor_solve(kernel, rows, device, *, primary, components, it
         inputs=[
             worlds,
             array(rows["row_count"], wp.int32),
+            row_lines(device),
             array(rows["bounds"], wp.int32),
             array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), wp.int32),
             array(rows["rhs"], wp.float32),
@@ -930,6 +933,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             dim=[1],
             inputs=[
                 wp.array((3,), dtype=wp.int32, device=device),
+                row_lines(device),
                 wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
                 wp.array(rhs, device=device),
                 wp.array(np.pad(row_velocity(jacobian[None], initial_velocity), ((0, 0), (0, 5))), device=device),
@@ -1033,6 +1037,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             dim=[1],
             inputs=[
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
+                row_lines(device),
                 wp.array(np.arange(world_dofs, dtype=np.int32)[None, :], device=device),
                 wp.array(rhs, device=device),
                 wp.array(row_velocity(jacobian[None], initial_velocity), device=device),
@@ -1100,6 +1105,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             marker,
             dim=contact_count,
             inputs=[
+                row_lines(device),
                 field_group.upload(
                     ContactInput,
                     device,
@@ -1111,6 +1117,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                     path=wp.zeros(contact_count, dtype=wp.int32, device=device),
                     slots_needed=wp.full(contact_count, 3, dtype=wp.int32, device=device),
                     response_dofs=wp.array((sparse_response_dofs, 6), dtype=wp.int32, device=device),
+                    first=row_lines(device),
                 ),
                 contact_count,
             ],
@@ -1125,6 +1132,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             dim=32,
             inputs=[
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
+                row_lines(device),
                 wp.zeros((1, 2), dtype=wp.int32, device=device),
             ],
             outputs=[sparse_row_dof, group_count, group_heads, serial_count, serial_normals],
@@ -1159,6 +1167,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 marker,
                 dim=3,
                 inputs=[
+                    row_lines(device),
                     field_group.upload(
                         ContactInput,
                         device,
@@ -1170,6 +1179,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         path=wp.array((0, 0, 1, 0, 0, 0, 0), dtype=wp.int32, device=device),
                         slots_needed=wp.array((3, 1, 3, 3, 2, 3, 1), dtype=wp.int32, device=device),
                         response_dofs=wp.array((108, 6), dtype=wp.int32, device=device),
+                        first=row_lines(device),
                     ),
                     3,
                 ],
@@ -1260,6 +1270,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         dim=worlds * 32,
                         inputs=[
                             wp.array(rows["row_count"], device=device),
+                            row_lines(device),
                             wp.array(rows["bounds"], device=device),
                             wp.array(rows["row_type"], device=device),
                             wp.array(rows["row_parent"], device=device),
@@ -1321,6 +1332,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         dim=[worlds],
                         inputs=[
                             wp.array(rows["row_count"], device=device),
+                            row_lines(device),
                             wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device=device),
                             wp.array(rows["rhs"], device=device),
                             wp.array(rows["row_incident"], device=device),
@@ -1872,6 +1884,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 group_to_art,
                 group_to_art,
                 constraint_count,
+                row_lines(device),
                 max_constraints,
                 wp.zeros(2, dtype=wp.int32, device=device),
                 0,

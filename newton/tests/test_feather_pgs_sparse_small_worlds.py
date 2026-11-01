@@ -56,7 +56,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                     if not table:
                         solve.support.enabled = 0
                         row_indices = np.broadcast_to(indices, data["row_factor"].shape).copy()
-                        solve.inputs[5] = wp.array(row_indices, dtype=int, device=solve.device)
+                        solve.inputs[6] = wp.array(row_indices, dtype=int, device=solve.device)
 
                     def launch(solve=solve, lanes=lanes, worlds=worlds):
                         groups = 64 // lanes

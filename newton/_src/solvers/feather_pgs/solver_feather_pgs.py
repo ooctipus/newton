@@ -1237,6 +1237,7 @@ class SolverFeatherPGS(SolverBase):
                 # Bilateral elimination: the other rows take the closed-loop response, their right-hand sides
                 # and diagonals (the rows' closed-loop inertia).
                 self.factor.eliminate(
+                    first=self.placement.dense_first,
                     Z=self.placement.packed_Z,
                     sides=self.placement.row_sides,
                     counts=self.placement.constraint_count,
@@ -1257,6 +1258,7 @@ class SolverFeatherPGS(SolverBase):
                 # The colored worlds' units and colors follow the rows the pack just published.
                 self.sweep.colored_units.build(
                     self.placement.mf_constraint_count,
+                    self.placement.mf_first,
                     self.placement.mf_contact_rows_end,
                     self.placement.mf_meta_packed,
                     self.placement.mf_Z_a,
@@ -1452,6 +1454,7 @@ class SolverFeatherPGS(SolverBase):
                 clear_limit_prefix,
                 dim=(self.forest.world_count, 12),
                 inputs=[
+                    self.placement.dense_first,
                     self.placement.sparse_diagonal_dense_groups,
                     self.placement.J_by_size[6],
                     self.placement.sparse_diagonal_row_dof,
@@ -1747,7 +1750,7 @@ class SolverFeatherPGS(SolverBase):
             wp.launch(
                 clear_sparse_diagonal_response_prefix,
                 dim=self.forest.world_count,
-                inputs=[self.placement.dense_phase_bounds],
+                inputs=[self.placement.dense_first, self.placement.dense_phase_bounds],
                 outputs=[self.placement.sparse_diagonal_row_dof],
                 device=model.device,
             )
@@ -1949,6 +1952,7 @@ class SolverFeatherPGS(SolverBase):
                         response_builds_rows.sparse_pair_contact_rows_kernel,
                         sparse_contact_response_workers,
                         inputs=[
+                            self.placement.dense_first,
                             contact_input,
                             sparse_contact_response_workers,
                             self.placement.sparse_diagonal_response_size,
@@ -1965,7 +1969,7 @@ class SolverFeatherPGS(SolverBase):
                         pool.launch(
                             self.sweep.sparse_contact_marker,
                             contact_build_threads,
-                            inputs=[contact_input, contact_build_threads],
+                            inputs=[self.placement.dense_first, contact_input, contact_build_threads],
                             outputs=[self.placement.sparse_diagonal_row_dof],
                             extent=count,
                             clamp=True,

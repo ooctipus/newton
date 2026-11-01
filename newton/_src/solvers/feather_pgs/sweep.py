@@ -1283,7 +1283,7 @@ def dense_tier_world(
     ``off_dense``, and the world's first packed row entry ``packed_base`` (rows of ``support`` entries:
     :mod:`.packed_rows`).
     """
-    base = f"const size_t packed_base = (size_t)world * {max_constraints * int(support)};"
+    base = f"const size_t packed_base = (size_t)line * {max_constraints * int(support)};"
     return f"""{pad}int m_dense = world_constraint_count.data[world];
 {pad}const int m_mf = mf_constraint_count.data[world];
 {pad}if (m_dense == 0 || m_mf != 0) return;
@@ -1291,7 +1291,9 @@ def dense_tier_world(
 
 {pad}const int {rows} = m_dense;
 {pad}const int dof_map_base = world * {dofs};
-{pad}const int off_dense = world * {max_constraints};
+{pad}const int line = dense_first.data[world];
+{pad}__builtin_assume(line >= 0);
+{pad}const int off_dense = line * {max_constraints};
 {pad}{base}"""
 
 

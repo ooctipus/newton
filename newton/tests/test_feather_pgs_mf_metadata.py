@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, 
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton._src.solvers.feather_pgs.kernels import BodyFactors
 from newton._src.solvers.feather_pgs.placement import Placement
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
@@ -94,6 +95,7 @@ def _pack_state(has_free_rigid_bodies):
         forest=SimpleNamespace(has_free_rigid_bodies=has_free_rigid_bodies, world_count=7),
     )
     for name in (
+        "mf_first",
         "mf_constraint_count",
         "mf_dof_a",
         "mf_dof_b",
@@ -295,6 +297,8 @@ def _solve_parent_rows(device, parents):
             jacobian[world, row, axis] = 1.0
     values.update(
         world_constraint_count=wp.zeros(worlds, dtype=int, device=device),
+        dense_first=row_lines(device),
+        mf_first=row_lines(device),
         mf_constraint_count=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_contact_rows_end=wp.array(np.asarray(parents) + 3, dtype=int, device=device),
         mf_meta=wp.array(metadata, dtype=int, device=device),
@@ -355,7 +359,7 @@ def _record_pack_launches(solver):
 
     def record(kernel, *args, **kwargs):
         if kernel is solver.placement.pack_mf_meta_kernel:
-            packed.append(kwargs["inputs"][4])
+            packed.append(kwargs["inputs"][5])
         return launch_tiled(kernel, *args, **kwargs)
 
     return packed, patch.object(fpgs.wp, "launch_tiled", record)

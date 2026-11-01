@@ -70,6 +70,7 @@ LOCAL_ABI = kernel_template.params(
     ("articulation_dof_start", wp.array[int]),
     ("local_solve_owner", wp.array[int]),
     ("world_constraint_count", wp.array[int]),
+    ("dense_first", wp.array[int]),
     ("L_group", wp.array3d[float]),
     ("secondary_L_group", wp.array3d[float]),
     ("packed_Z", wp.array3d[float]),
@@ -82,6 +83,7 @@ LOCAL_ABI = kernel_template.params(
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
     ("mf_constraint_count", wp.array[int]),
+    ("mf_first", wp.array[int]),
     ("mf_meta", wp.array2d[int]),
     ("mf_impulses", wp.array2d[float]),
     ("mf_Z_a", wp.array3d[float]),
@@ -261,9 +263,11 @@ def local_owned_source(
         mf_setup = f"""
     int mf_count = mf_constraint_count.data[world];
     if (mf_count > {MFR}) mf_count = {MFR};
-    const int off_mf = world * {MFS};
+    const int mf_line = mf_first.data[world];
+    __builtin_assume(mf_line >= 0);
+    const int off_mf = mf_line * {MFS};
     const int off_meta = off_mf * 4;
-    const int mf6_base = world * {MFS * 6};"""
+    const int mf6_base = mf_line * {MFS * 6};"""
         mf_load = (
             f"\n    for (int row = lane; row < mf_count; row += {L}) s_mf_lam[row] = mf_impulses.data[off_mf + row];"
         )
@@ -280,7 +284,9 @@ def local_owned_source(
     const int row_count = world_constraint_count.data[world];
     if (row_count == 0 || row_count > {R}) return;
 
-    const int world_row_base = world * {M};
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int world_row_base = line * {M};
     const int group_l_base = group * {P * P};{pair}
 {staging.declarations("    ")}{mf_setup}
 
@@ -503,6 +509,7 @@ def local_owned_kernel(
 PAIRED_FACTOR_ABI = kernel_template.params(
     ("world", int),
     ("world_constraint_count", wp.array[int]),
+    ("dense_first", wp.array[int]),
     ("dense_phase_bounds", wp.array2d[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
@@ -642,7 +649,9 @@ def paired_factor_source(
     if (m > {M}) m = {M};
     {world_rows}
 
-    const int off = world * {M};
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int off = line * {M};
     const int row_base = off * {D};
     const int dof_map_base = world * {D};
     const int primary_group = primary_group_by_world.data[world];

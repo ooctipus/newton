@@ -53,6 +53,7 @@ from .sweep import (
 
 SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("world_constraint_count", wp.array[int]),
+    ("dense_first", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
     ("row_incident", wp.array2d[float]),
@@ -549,10 +550,12 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     sweep_end = end_sweep(solve_policy, iteration="iteration")
     # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
     contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
-    body = f"""    const int lane = LANE;
+    body = f"""    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int row_base = line * {M};
+    const int lane = LANE;
     int row_count = world_constraint_count.data[world];
     if (row_count > {M}) row_count = {M};
-    const int row_base = world * {M};
     const int off_dense = row_base;
     const int dof_map_base = world * {D};
     const int dense_offset = dense_offsets.data[world];

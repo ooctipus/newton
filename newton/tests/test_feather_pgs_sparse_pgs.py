@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
+from newton.tests.feather_pgs_law_harness import row_lines
 
 _SWEEP_OMEGAS = (1.0, 0.7, 1.2)
 
@@ -527,6 +528,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                         "inputs": [
                             worlds,
                             wp.array([count, 0, count], dtype=int, device=device),
+                            row_lines(device),
                             padded(bias),
                             padded(diag),
                             actual_impulses,
@@ -589,12 +591,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             linked_rows=linked_rows,
                         )
                         wp.copy(actual_impulses, initial_impulses)
-                        launch_args["inputs"][5] = wp.array(row_dof, device=device)
+                        launch_args["inputs"][6] = wp.array(row_dof, device=device)
                         launch_args["outputs"][1] = _SparseRowSupport()
                         wp.launch_tiled(packed_kernel, **launch_args)
                         np.testing.assert_array_equal(delta.numpy(), actual)
                         np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
-                        launch_args["inputs"][5] = packed_indices
+                        launch_args["inputs"][6] = packed_indices
                         launch_args["outputs"][1] = row_support
                         with wp.ScopedCapture(device=device) as capture:
                             wp.copy(actual_impulses, initial_impulses)

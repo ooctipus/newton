@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     build_joint_limit_rows_for_size,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 
 
 def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, resolved: bool = False):
@@ -78,6 +78,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
                 phi=world_phi,
                 target=world_target_velocity,
                 sides=wp.zeros(world_row_type.shape, dtype=wp.vec2i, device=device),
+                first=row_lines(device),
             ),
         ],
         device=device,

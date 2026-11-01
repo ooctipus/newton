@@ -29,6 +29,8 @@ PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),
     Field("counts", wp.int32, ("world",), attr="constraint_count", owner="placement"),
     Field("mf_counts", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
+    Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
+    Field("mf_first", wp.int32, ("world",), owner="placement"),
     Field("primary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_offsets_by_world"),
     Field("secondary_offset", wp.int32, ("world",), owner="sweep", attr="paired_factor_secondary_offsets_by_world"),
     Field("primary_group", wp.int32, ("world",), owner="sweep", attr="paired_factor_primary_groups_by_world"),

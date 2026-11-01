@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_world_contact_bias,
 )
 from newton.tests.feather_pgs_free_body_rows import sweep_free_body_rows
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
@@ -326,6 +327,7 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
             restitution=[[0.0]],
             rhs=[[0.0]],
             row_w=row_w,
+            first=row_lines(device),
         )
         wp.launch(
             compute_world_contact_bias,

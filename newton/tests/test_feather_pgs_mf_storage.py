@@ -27,6 +27,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     BodyFactors,
 )
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -605,6 +606,8 @@ def _bind_rows(host, device):
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
         factors=_body_factors(host, device),
+        dense_first=row_lines(device),
+        mf_first=row_lines(device),
     )
     return values
 
@@ -972,6 +975,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         _, arrays = solve_fixture(device)
         values = dict(arrays)
         values.update(
+            dense_first=row_lines(device),
+            mf_first=row_lines(device),
             general_world_grid_stride=5,
             use_general_world_queue=0,
             iterations=8,

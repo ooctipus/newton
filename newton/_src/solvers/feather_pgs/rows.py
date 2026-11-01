@@ -125,7 +125,7 @@ def joint_limit_warp_kernel(size: int, warps_per_block: int) -> wp.Kernel:
     if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
     const int first_dof = articulation_dof_start.data[art];
     // The rows' first index and the side's first entry (dense_rows.jacobian_row; one side).
-    const int row_index = support.packed != 0 ? world : group;
+    const int row_index = support.packed != 0 ? support.first.data[world] : group;
     const int first = support.packed != 0 && support.dense != 0 ? support.offset.data[art] : 0;
 {rows}#endif
 """

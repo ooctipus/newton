@@ -70,7 +70,7 @@ class TestSparseVelocityPhase(unittest.TestCase):
                         if not table:
                             solve.support.enabled = 0
                             row_indices = np.broadcast_to(data["support_class_dof"][0], data["row_factor"].shape).copy()
-                            solve.inputs[5] = wp.array(row_indices, dtype=int, device=solve.device)
+                            solve.inputs[6] = wp.array(row_indices, dtype=int, device=solve.device)
                         solve.launch()
                         delta, impulses = solve.result()
                         for world in (0, 2):

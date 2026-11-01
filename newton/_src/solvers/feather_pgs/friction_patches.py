@@ -1627,22 +1627,26 @@ class _PatchRoutes:
     impulses0: wp.array2d[float]
     impulses1: wp.array2d[float]
     impulses2: wp.array2d[float]
+    first0: wp.array[int]
+    first1: wp.array[int]
+    first2: wp.array[int]
 
 
 def patch_routes(rows):
-    """Pack ``(route, parents, mu, impulses, scale)`` rows into one launch argument.
+    """Pack ``(route, parents, mu, impulses, scale, first)`` rows into one launch argument.
 
     Routes absent from ``rows`` stay disabled, and no launch reads their arrays.
     """
     routes = _PatchRoutes()
     enabled = [0, 0, 0]
     scale = [0.0, 0.0, 0.0]
-    for route, parents, mu, impulses, decay in rows:
+    for route, parents, mu, impulses, decay, first in rows:
         enabled[route] = 1
         scale[route] = decay
         setattr(routes, f"parents{route}", parents)
         setattr(routes, f"mu{route}", mu)
         setattr(routes, f"impulses{route}", impulses)
+        setattr(routes, f"first{route}", first)
     routes.enabled = wp.vec3i(*enabled)
     routes.scale = wp.vec3(*scale)
     return routes
@@ -1657,6 +1661,15 @@ def _contact_route(routes: _PatchRoutes, slot: wp.array[int], path: wp.array[int
         if route < 0 or route > 2 or routes.enabled[route] == 0:
             route = -1
     return route
+
+
+@wp.func
+def _route_first(routes: _PatchRoutes, route: int):
+    if route == 1:
+        return routes.first1
+    if route == 2:
+        return routes.first2
+    return routes.first0
 
 
 @wp.func
@@ -1697,6 +1710,7 @@ def _link_contact(
     route: int,
     parents: wp.array2d[int],
     mu: wp.array2d[float],
+    first: wp.array[int],
 ):
     """Link only allocated rows and divide the Coulomb budget among surviving anchors.
 
@@ -1710,7 +1724,7 @@ def _link_contact(
     if row == c:
         # A one-contact region's normal row closes its own ring, and its budget
         # stays whole: the general path divides it by one anchor or not at all.
-        parents[world[c], slot[c]] = slot[c]
+        parents[first[world[c]], slot[c]] = slot[c]
         return
     next_slot = slot[c]
     anchors = int(patches.weight[c] > 0.0 and slots_needed[c] >= 3)
@@ -1723,11 +1737,11 @@ def _link_contact(
             if patches.weight[c] == 0.0:
                 break
         row = patches.next_contact[row]
-    parents[world[c], slot[c]] = next_slot
+    parents[first[world[c]], slot[c]] = next_slot
     if patches.weight[c] > 0.0 and slots_needed[c] >= 3 and anchors > 0:
         # The pair's and, with contact torsion, the spin row's coefficients: the region's capacity is shared once.
         for t in range(1, slots_needed[c]):
-            mu[world[c], slot[c] + t] /= float(anchors)
+            mu[first[world[c]], slot[c] + t] /= float(anchors)
 
 
 @wp.kernel(enable_backward=False)
@@ -1752,7 +1766,8 @@ def link_patch_routes(
         if route >= 0:
             parents = _route_parents(routes, route)
             mu = _route_mu(routes, route)
-            _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu)
+            first = _route_first(routes, route)
+            _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu, first)
 
 
 @wp.func
@@ -1767,6 +1782,7 @@ def _seed_contact(
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
     scale: float,
+    first: wp.array[int],
 ):
     """Transport cached patch impulses after all contact normals have been seeded.
 
@@ -1785,7 +1801,7 @@ def _seed_contact(
         tangent = -tangent
     t0, t1 = contact_tangent_basis(n)
     value = wp.vec2(wp.dot(tangent, t0), wp.dot(tangent, t1))
-    w = world[c]
+    w = first[world[c]]
     s = slot[c]
     radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
     value = disk(value, radius)
@@ -1818,7 +1834,8 @@ def seed_patch_routes(
             parents = _route_parents(routes, route)
             mu = _route_mu(routes, route)
             impulses = _route_impulses(routes, route)
-            _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, routes.scale[route])
+            first = _route_first(routes, route)
+            _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, routes.scale[route], first)
 
 
 @wp.func
@@ -1846,13 +1863,14 @@ def _finish_contact(
     mu: wp.array2d[float],
     impulses: wp.array2d[float],
     dt: float,
+    first: wp.array[int],
 ):
     """Cache solved friction and release saturated anchors with tangential motion.
 
     The tolerance is relative to geometry and timestep. Merely resting at the
     Coulomb limit does not prove sliding, so it must not erase static history.
     """
-    w = world[c]
+    w = first[world[c]]
     s = slot[c]
     load = patch_normal_load(parents, impulses, w, s)
     if load <= 0.0:
@@ -1933,7 +1951,20 @@ def _finish_and_store(
                     mu = _route_mu(routes, route)
                     impulses = _route_impulses(routes, route)
                     _finish_contact(
-                        c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt
+                        c,
+                        frame,
+                        q,
+                        q_out,
+                        qd_out,
+                        com,
+                        world,
+                        slot,
+                        slots_needed,
+                        parents,
+                        mu,
+                        impulses,
+                        dt,
+                        _route_first(routes, route),
                     )
         _store_contact(c, q, body_world, frame, prev, previous_world, previous_q)
 

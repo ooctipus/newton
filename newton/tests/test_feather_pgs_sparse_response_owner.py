@@ -15,7 +15,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import dense_rows, field_group, kernels, response_builds_rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_law_harness import contact_input, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
 
 
@@ -33,7 +33,7 @@ def _launch_workers(capacity):
     # A launch through the contact pool takes its dimension as the second positional argument.
     dimension = next((item.value for item in call.keywords if item.arg == "dim"), None) or call.args[1]
     arguments = next(item.value for item in call.keywords if item.arg == "inputs")
-    if ast.dump(dimension) != ast.dump(arguments.elts[1]):
+    if ast.dump(dimension) != ast.dump(arguments.elts[2]):
         raise AssertionError("launch dimension and device stride must agree")
     values = {
         "contacts": SimpleNamespace(rigid_contact_max=capacity),
@@ -114,7 +114,13 @@ def _fixture(device, capacity=4353):
 def _launch(values, workers, device):
     """Launch the unchanged source kernel with the selected complete-prefix owner."""
     data, _arrays = contact_input(values, device)
-    values = {**values, "data": data, "total_num_workers": workers, "law": row_law(values["friction_patches"])}
+    values = {
+        **values,
+        "dense_first": row_lines(device),
+        "data": data,
+        "total_num_workers": workers,
+        "law": row_law(values["friction_patches"]),
+    }
     kernel = response_builds_rows.sparse_pair_contact_rows_kernel
     arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
     wp.launch(kernel, dim=workers, inputs=arguments, device=device)
@@ -218,6 +224,7 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
                 wp.array(offsets, device="cpu"),
                 wp.array(np.arange(worlds * dofs, dtype=np.int32).reshape(worlds, dofs), device="cpu"),
                 counts,
+                row_lines("cpu"),
                 wp.zeros((worlds, 2), dtype=wp.int32, device="cpu"),
                 0,
                 rows,
@@ -243,6 +250,7 @@ class TestSparseDiagonalWhitenedRows(unittest.TestCase):
             restitution=np.full((worlds, rows), 0.5, np.float32),
             rhs=rhs,
             row_w=np.ones((worlds, rows), np.float32),
+            first=row_lines("cpu"),
         )
         wp.launch(
             kernels.compute_world_contact_bias,

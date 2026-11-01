@@ -29,6 +29,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     finalize_constraint_counts_with_status,
 )
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_sparse_solver import _build_model
 
 _UNBOUNDED = 2**31 - 1
@@ -94,6 +95,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
                 art1=wp.full((contact_count,), -1, dtype=wp.int32, device=device),
                 path=contact_path,
                 slots_needed=slots_needed,
+                first=row_lines(device),
             ),
             contact_count,
             wp.zeros((1,), dtype=wp.int32, device=device),

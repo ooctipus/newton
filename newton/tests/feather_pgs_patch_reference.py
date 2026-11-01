@@ -805,7 +805,7 @@ class ReferencePatches:
     Construction, geometry updates, :meth:`build` and :meth:`store` copy
     ``_FrictionPatchState`` with patches enabled. :meth:`link`, :meth:`seed`,
     :meth:`finish` and :meth:`reset` launch the per-route kernels and the history
-    reset as the solver did. ``routes`` holds ``(route, parents, mu, impulses,
+    reset as the solver did. ``routes`` holds ``(route, parents, mu, impulses, first,
     scale)`` tuples; only :meth:`seed` reads ``scale``, its warm-start decay.
     """
 
@@ -981,7 +981,7 @@ class ReferencePatches:
 
     def link(self, contacts, world, slot, path, slots_needed, routes):
         """Link each route's normal rows, one launch per route."""
-        for route, parents, mu, _impulses, _scale in routes:
+        for route, parents, mu, _impulses, _scale, _first in routes:
             wp.launch(
                 link_patch_rows,
                 dim=contacts.rigid_contact_max,
@@ -991,7 +991,7 @@ class ReferencePatches:
 
     def seed(self, contacts, state, world, slot, path, slots_needed, routes):
         """Seed carried tangent impulses on the routes with a warm-start decay."""
-        for route, parents, mu, impulses, scale in routes:
+        for route, parents, mu, impulses, scale, _first in routes:
             if scale > 0.0:
                 wp.launch(
                     seed_patch_impulses,
@@ -1019,7 +1019,7 @@ class ReferencePatches:
         if contacts is None:
             self.previous.valid.zero_()
             return
-        for route, parents, mu, impulses, _scale in routes:
+        for route, parents, mu, impulses, _scale, _first in routes:
             wp.launch(
                 finish_patch_impulses,
                 dim=contacts.rigid_contact_max,

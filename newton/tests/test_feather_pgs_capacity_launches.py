@@ -15,6 +15,7 @@ from newton._src.sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_bl
 from newton._src.solvers.feather_pgs import field_group, kernels, keyed_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_patch_parity import point_row_law
 
 # Every launch over the contact capacity that grid-strides over the capped grid.
@@ -82,6 +83,8 @@ def _export_inputs(device, capacity, count, rng):
         path=path,
     )
     return [
+        row_lines(device),
+        row_lines(device),
         routes,
         floats((worlds, rows)),
         floats((worlds, rows)),
@@ -113,7 +116,9 @@ def _scatter(anchors, device, count, path, max_blocks):
     data.row_type = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
     data.row_parent = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
     data.row_mu = wp.full((_SCATTER_WORLDS, rows), -9.0, dtype=float, device=device)
+    data.first = row_lines(device)
     z = keyed_rows.KineticRows()
+    z.first = row_lines(device)
     z.rowkeys = wp.full((_SCATTER_WORLDS, rows), -9, dtype=int, device=device)
     law = point_row_law(device, _SCATTER_CAPACITY)
     law.patches.enabled = int(anchors)
@@ -154,7 +159,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     wp.launch(
                         kernels.pack_contact_linear_force_as_spatial,
                         dim=capacity,
-                        inputs=[inputs[0].count, force],
+                        inputs=[inputs[2].count, force],
                         outputs=[spatial],
                         device=device,
                         max_blocks=max_blocks,

@@ -24,17 +24,18 @@ def finalize_sparse_joint_limit_rows(
 ):
     """Finish the internal-constraint prefix with each row's law; contacts are already complete."""
     world = wp.tid()
+    line = rows.first[world]
     for row in range(wp.min(phase_bounds[world, 1], constraint_count[world])):
         rhs, _row_w = row_rhs(
-            rows.row_type[world, row],
-            rows.phi[world, row],
-            rows.row_beta[world, row],
-            rows.target[world, row],
+            rows.row_type[line, row],
+            rows.phi[line, row],
+            rows.row_beta[line, row],
+            rows.target[line, row],
             1.0 / dt,
             1.0,
             0.0,
             1.0,
             1.0,
         )
-        rows.diag[world, row] += rows.row_cfm[world, row]
-        rows.rhs[world, row] = rhs
+        rows.diag[line, row] += rows.row_cfm[line, row]
+        rows.rhs[line, row] = rhs

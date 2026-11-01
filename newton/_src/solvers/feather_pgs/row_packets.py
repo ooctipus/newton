@@ -105,6 +105,7 @@ QUEUE = (
     Field("secondary", wp.int32, ("articulation",), owner="sweep", attr="local_pair_articulation"),
     Field("residual_secondary", wp.int32, ("articulation",), owner="sweep", attr="local_residual_pair_articulation"),
     Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count", owner="placement"),
+    Field("mf_first", wp.int32, ("world",), owner="placement"),
     Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a", owner="placement"),
     Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b", owner="placement"),
     Field("mf_row_type", wp.int32, ("world", "mf_row"), owner="placement"),
@@ -270,6 +271,7 @@ def finalize_and_queue(
 ):
     """Fuse the dense-count clamp, the local ownership decision and the two queues."""
     world = wp.tid()
+    mf_line = queue.mf_first[world]
     rows = reserved_count(
         prefix.slot_counter, world, prefix.row_type.shape[1], prefix.first_rejected_slot, queue.status, 0
     )
@@ -282,12 +284,12 @@ def finalize_and_queue(
     local_mf = mf_count > 0 and mf_count <= residual_mf_rows and residual_secondary >= 0
     mf_row = int(0)
     while mf_row < mf_count and local_mf:
-        body0, body1 = queue.mf_body0[world, mf_row], queue.mf_body1[world, mf_row]
+        body0, body1 = queue.mf_body0[mf_line, mf_row], queue.mf_body1[mf_line, mf_row]
         if body0 >= 0 and queue.body_art[body0] != residual_secondary:
             local_mf = False
         if body1 >= 0 and queue.body_art[body1] != residual_secondary:
             local_mf = False
-        if queue.mf_row_type[world, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        if queue.mf_row_type[mf_line, mf_row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
             local_mf = False
         mf_row += 1
     owner = int(0)

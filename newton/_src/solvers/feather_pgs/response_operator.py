@@ -1097,10 +1097,10 @@ class WhitenedRows:
         coordinate ``q``), coordinate ``q`` at ``Zi[q * ZS]``: each articulation's entries where it is a side of the
         row (the build leaves these worlds' rows unpadded)."""
         lines = [
-            "const wp::vec2i sides_i = row_sides.data[(size_t)world * row_sides.shape[1] + i];",
+            "const wp::vec2i sides_i = row_sides.data[(size_t)dense_first.data[world] * row_sides.shape[1] + i];",
             "const int first_0 = sides_i[0] >= 0 ? articulation_world_dof_offset.data[sides_i[0]] : -1;",
             "const int first_1 = sides_i[1] >= 0 ? articulation_world_dof_offset.data[sides_i[1]] : -1;",
-            f"const float* J_row = &packed_Z.data[((size_t)world * {self.capacity} + i) * packed_Z.shape[2]];",
+            f"const float* J_row = &packed_Z.data[((size_t)dense_first.data[world] * {self.capacity} + i) * packed_Z.shape[2]];",
         ]
         for art in self.articulations:
             read = [

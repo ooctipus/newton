@@ -265,16 +265,17 @@ def free_body_rows_kernel(
     i = tid % mf_max_constraints
     if i >= mf_constraint_count[world]:
         return
-    body_a = mf.body_a[world, i]
-    body_b = mf.body_b[world, i]
-    row_type = mf.row_type[world, i]
-    restitution = mf.restitution[world, i]
+    mf_line = mf.first[world]
+    body_a = mf.body_a[mf_line, i]
+    body_b = mf.body_b[mf_line, i]
+    row_type = mf.row_type[mf_line, i]
+    restitution = mf.restitution[mf_line, i]
     incident = float(0.0)
     if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         incident = free_body_jacobian_velocity(
             mf.Z_a,
             mf.Z_b,
-            world,
+            mf_line,
             i,
             body_a,
             body_b,
@@ -282,19 +283,21 @@ def free_body_rows_kernel(
             factors.dof_start,
             incident_velocity,
         )
-    mf.incident[world, i] = incident
-    mf_eff_mass_inv[world, i] = free_body_response(mf.Z_a, mf.Z_b, world, i, body_a, body_b, row_type, factors, pgs_cfm)
+    mf.incident[mf_line, i] = incident
+    mf_eff_mass_inv[mf_line, i] = free_body_response(
+        mf.Z_a, mf.Z_b, mf_line, i, body_a, body_b, row_type, factors, pgs_cfm
+    )
     if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        if mf.eps[world, i] > 0.0:
+        if mf.eps[mf_line, i] > 0.0:
             return
     target = float(0.0)
     if has_target_velocity != 0:
-        target = mf.target[world, i]
+        target = mf.target[mf_line, i]
     rhs, row_w = free_body_row_rhs(
         body_a,
         body_b,
         row_type,
-        mf.phi[world, i],
+        mf.phi[mf_line, i],
         target,
         restitution,
         incident,
@@ -305,13 +308,14 @@ def free_body_rows_kernel(
         contact_speculative_scale,
         restitution_velocity_threshold,
     )
-    mf.rhs[world, i] = rhs
+    mf.rhs[mf_line, i] = rhs
     if weighted != 0:
-        mf_row_w[world, i] = row_w
+        mf_row_w[mf_line, i] = row_w
 
 
 @wp.kernel(enable_backward=False)
 def free_body_coordinates_kernel(
+    mf_first: wp.array[int],
     mf_constraint_count: wp.array[int],
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -328,8 +332,9 @@ def free_body_coordinates_kernel(
     c = tid % mf_max_constraints
     if c >= mf_constraint_count[world]:
         return
-    mf_dof_a[world, c] = body_coordinate(mf_body_a[world, c], body_to_articulation, articulation_world_dof_offset)
-    mf_dof_b[world, c] = body_coordinate(mf_body_b[world, c], body_to_articulation, articulation_world_dof_offset)
+    mf_line = mf_first[world]
+    mf_dof_a[mf_line, c] = body_coordinate(mf_body_a[mf_line, c], body_to_articulation, articulation_world_dof_offset)
+    mf_dof_b[mf_line, c] = body_coordinate(mf_body_b[mf_line, c], body_to_articulation, articulation_world_dof_offset)
 
 
 @cache
@@ -343,7 +348,9 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
     _validate_mf_metadata_encoding(mf_max_constraints)
     word = FreeBodyZ().pack("packed", "da", "db", "diag", "rhs_val", "rt", "par", "        ")
     body = f"""    int m_mf = mf_constraint_count.data[world];
-    int off_mf = world * {mf_max_constraints};
+    const int mf_line = mf_first.data[world];
+    __builtin_assume(mf_line >= 0);
+    int off_mf = mf_line * {mf_max_constraints};
     int off_meta = off_mf * 4;
 
     for (int i = LANE; i < m_mf; i += STRIDE) {{
@@ -362,6 +369,7 @@ def free_body_meta_kernel(mf_max_constraints: int, device_arch: str) -> wp.Kerne
         f"free_body_meta_{mf_max_constraints}",
         kernel_template.params(
             ("mf_constraint_count", wp.array[int]),
+            ("mf_first", wp.array[int]),
             ("mf_dof_a", wp.array2d[int]),
             ("mf_dof_b", wp.array2d[int]),
             ("mf_eff_mass_inv", wp.array2d[float]),
@@ -422,6 +430,7 @@ COMPACT_BOUNDARY = (
     Field("Z", wp.float32, ("group", "row", 6), owner="six"),
     Field("sparse_dof", wp.int32, ("world", "row", 2), attr="sparse_diagonal_row_dof", owner="placement"),
     Field("sparse_z", wp.float32, ("world", "row", 2), attr="sparse_diagonal_row_z", owner="placement"),
+    Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
     Field("row_incident", wp.float32, ("world", "row"), owner="placement"),
 )
 """What the compact boundary producer writes besides the contact input's row records: each row's whitened dense-six
@@ -551,6 +560,7 @@ def sparse_pair_dense(factor: wp.array3d[float], group: int, jacobian: _Vec6):
 
 @wp.kernel(enable_backward=False)
 def sparse_pair_contact_rows_kernel(
+    dense_first: wp.array[int],
     data: ContactInput,
     total_num_workers: int,
     target_size: int,
@@ -575,6 +585,7 @@ def sparse_pair_contact_rows_kernel(
             continue
         body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
         world = data.world[c]
+        line = dense_first[world]
         art_a = data.art0[c]
         art_b = data.art1[c]
         rows = data.slots_needed[c]
@@ -601,10 +612,10 @@ def sparse_pair_contact_rows_kernel(
                 data.origin,
             )
             output_row = slot + row
-            sparse_row_dof[world, output_row, 0] = coord_a
-            sparse_row_dof[world, output_row, 1] = coord_b
-            sparse_row_z[world, output_row, 0] = value_a
-            sparse_row_z[world, output_row, 1] = value_b
+            sparse_row_dof[line, output_row, 0] = coord_a
+            sparse_row_dof[line, output_row, 1] = coord_b
+            sparse_row_z[line, output_row, 0] = value_a
+            sparse_row_z[line, output_row, 1] = value_b
 
 
 @wp.func
@@ -648,6 +659,7 @@ def sparse_pair_row_response(
     The dense Jacobian sums both endpoints' entries per coordinate of the six-coordinate articulation (each where
     the body's coordinate mask holds the coordinate), then is whitened in registers.
     """
+    line = boundary.first[world]
     diagonal = float(0.0)
     incident = float(0.0)
     if has_dense:
@@ -689,16 +701,16 @@ def sparse_pair_row_response(
         data.motion,
         data.origin,
     )
-    boundary.sparse_dof[world, output_row, 0] = coord0
-    boundary.sparse_dof[world, output_row, 1] = coord1
-    boundary.sparse_z[world, output_row, 0] = value0
-    boundary.sparse_z[world, output_row, 1] = value1
+    boundary.sparse_dof[line, output_row, 0] = coord0
+    boundary.sparse_dof[line, output_row, 1] = coord1
+    boundary.sparse_z[line, output_row, 0] = value0
+    boundary.sparse_z[line, output_row, 1] = value1
     sparse = sparse_pair_diagonal(coord0, value0, coord1, value1)
-    data.diag[world, output_row] = (diagonal + sparse) + data.cfm
+    data.diag[line, output_row] = (diagonal + sparse) + data.cfm
     single_dof, inverse_mass = boundary.body_single_dof, boundary.inverse_mass
     incident += sparse_pair_slot_velocity(coord0, value0, body0, single_dof, inverse_mass, data.incident)
     incident += sparse_pair_slot_velocity(coord1, value1, body1, single_dof, inverse_mass, data.incident)
-    boundary.row_incident[world, output_row] = incident
+    boundary.row_incident[line, output_row] = incident
 
 
 @cache
@@ -724,12 +736,14 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
     if (end > max_constraints) end = max_constraints;
     if (prefix_only != 0 && dense_phase_bounds.data[world * 2 + 1] < end) end = dense_phase_bounds.data[world * 2 + 1];
     if (sparse_row >= end) return;
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
     const int group = dense_groups.data[world];
     float* whitened_row = &{_element("Z_group", "group", "sparse_row", "n_dofs - 1")};
     float incident = 0.0f;
-    const int dense_first = world * world_dof_indices.shape[1] + dense_offsets.data[world];
+    const int dense_start = world * world_dof_indices.shape[1] + dense_offsets.data[world];
     for (int i = 0; i < n_dofs; ++i) {{
-        const int global_dof = world_dof_indices.data[dense_first + i];
+        const int global_dof = world_dof_indices.data[dense_start + i];
         if (global_dof >= 0) incident += {_element("Z_group", "group", "sparse_row", "i")} * v_hat.data[global_dof];
     }}
     {{
@@ -741,9 +755,9 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
         diagonal += z * z;
     }}
     for (int slot = 0; slot < 2; ++slot) {{
-        const int world_dof = {_element("sparse_row_dof", "world", "sparse_row", "slot")};
+        const int world_dof = {_element("sparse_row_dof", "line", "sparse_row", "slot")};
         if (world_dof >= 0) {{
-            const float z = {_element("sparse_row_z", "world", "sparse_row", "slot")};
+            const float z = {_element("sparse_row_z", "line", "sparse_row", "slot")};
             diagonal += z * z;
             const int global_dof = world_dof_indices.data[world * world_dof_indices.shape[1] + world_dof];
             if (global_dof >= 0) {{
@@ -752,8 +766,8 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
             }}
         }}
     }}
-    {_element("world_diag", "world", "sparse_row")} = diagonal + {_element("row_cfm", "world", "sparse_row")};
-    {_element("row_incident", "world", "sparse_row")} = incident;
+    {_element("world_diag", "line", "sparse_row")} = diagonal + {_element("row_cfm", "line", "sparse_row")};
+    {_element("row_incident", "line", "sparse_row")} = incident;
 """
     return KernelTemplate(
         "sparse_pair_whiten",
@@ -763,6 +777,7 @@ def sparse_pair_whiten_kernel() -> wp.Kernel:
             ("dense_offsets", wp.array[int]),
             ("world_dof_indices", wp.array2d[int]),
             ("world_constraint_count", wp.array[int]),
+            ("dense_first", wp.array[int]),
             ("dense_phase_bounds", wp.array2d[int]),
             ("prefix_only", int),
             ("rows", int),
@@ -905,6 +920,7 @@ def elimination(rows: int) -> BilateralElimination:
     """The bilateral elimination of the packed rows for blocks of up to ``rows`` rows (see the section's comment)."""
 
     def setup(
+        dense_first: wp.array[int],
         preelim: Preelim,
         mimic_slot: wp.array[int],
         link_slot: wp.array[int],
@@ -922,20 +938,21 @@ def elimination(rows: int) -> BilateralElimination:
         pe = wp.tid()
         base = pe * wp.static(rows)
         world = preelim.world[pe]
+        line = dense_first[world]
         entries = packed_Z.shape[2]
         m = bilateral_rows(pe, base, preelim, mimic_slot, link_slot)
         kept = int(0)
         for p in range(m):
             row = preelim.slots[base + p]
             # The row's incident velocity joins its right-hand side: both follow the row through the transform.
-            world_rhs[world, row] += world_incident[world, row]
-            world_incident[world, row] = 0.0
+            world_rhs[line, row] += world_incident[line, row]
+            world_incident[line, row] = 0.0
             own = wide_product(packed_Z, world, row, row, entries)
             for q in range(kept):
                 other = preelim.slots[base + q]
                 along = wide_product(packed_Z, world, other, row, entries)
                 subtract_row(packed_Z, world, row, along, other, entries)
-                world_rhs[world, row] -= along * world_rhs[world, other]
+                world_rhs[line, row] -= along * world_rhs[line, other]
             rest = wide_product(packed_Z, world, row, row, entries)
             scale = float(0.0)
             if rest > BILATERAL_PIVOT * own:
@@ -943,14 +960,15 @@ def elimination(rows: int) -> BilateralElimination:
                 preelim.slots[base + kept] = row
                 kept += 1
             scale_row(packed_Z, world, row, scale, entries)
-            world_rhs[world, row] *= scale
+            world_rhs[line, row] *= scale
             if local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
-                world_diag[world, row] = scale * scale * rest + world_row_cfm[world, row]
+                world_diag[line, row] = scale * scale * rest + world_row_cfm[line, row]
         for p in range(kept, wp.static(rows)):
             preelim.slots[base + p] = -1
         preelim.nB[pe] = kept
 
     def correct(
+        dense_first: wp.array[int],
         preelim: Preelim,
         row_sides: wp.array2d[wp.vec2i],
         constraint_count: wp.array[int],
@@ -972,7 +990,8 @@ def elimination(rows: int) -> BilateralElimination:
         row = tid - world * capacity
         if world >= constraint_count.shape[0] or row >= constraint_count[world]:
             return
-        sides = row_sides[world, row]
+        line = dense_first[world]
+        sides = row_sides[line, row]
         entries = packed_Z.shape[2]
         touched = int(0)
         last = int(-1)
@@ -995,11 +1014,12 @@ def elimination(rows: int) -> BilateralElimination:
                 along = wide_product(packed_Z, world, other, row, entries)
                 if along != 0.0:
                     subtract_row(packed_Z, world, row, along, other, entries)
-                    world_rhs[world, row] -= along * world_rhs[world, other]
+                    world_rhs[line, row] -= along * world_rhs[line, other]
         if touched != 0 and local_solve_owner[world] == PGS_LOCAL_SOLVE_OWNER_GENERAL:
-            world_diag[world, row] = wide_product(packed_Z, world, row, row, entries) + world_row_cfm[world, row]
+            world_diag[line, row] = wide_product(packed_Z, world, row, row, entries) + world_row_cfm[line, row]
 
     def weights(
+        dense_first: wp.array[int],
         preelim: Preelim,
         world_rhs: wp.array2d[float],
         # outputs
@@ -1009,9 +1029,10 @@ def elimination(rows: int) -> BilateralElimination:
         pe = wp.tid()
         base = pe * wp.static(rows)
         world = preelim.world[pe]
+        line = dense_first[world]
         for p in range(preelim.nB[pe]):
             slot = preelim.slots[base + p]
-            world_impulses[world, slot] = -world_rhs[world, slot]
+            world_impulses[line, slot] = -world_rhs[line, slot]
 
     return BilateralElimination(
         rows,
@@ -1178,6 +1199,8 @@ _GROUP_ARTICULATION = """
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
     const int capacity = ${ROWS}row_type.shape[1];
+    const int line = ${ROWS}first.data[world];
+    __builtin_assume(line >= 0);
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];"""
 """A warp per articulation of the factor group (``tid >> 5``; the CPU runs a warp's work on its first thread), and
@@ -1200,7 +1223,7 @@ _LIMIT_WALK = """        // Visit the ballot in lane order: the rows' slots, in 
             const float sign = READ(w0, source);
             const int column = inverse_permutation.data[selected_dof];
             const unsigned long long support_mask = dof_mask.data[selected_dof];
-            const int row_offset = world * capacity + row;
+            const int row_offset = line * capacity + row;
             const int response_offset = row_offset * support_capacity;
 $WALK
             if (LANE == 0) {
@@ -1228,8 +1251,8 @@ _VELOCITY_LIMIT_ROWS = """$ARTICULATION
         const float upper_sign = write_upper ? velocity_limit_sign.data[2 * dof + 1] : 0.0f;
         const int column = inverse_permutation.data[local_dof];
         const unsigned long long support_mask = dof_mask.data[local_dof];
-        const int lower_offset = (world * capacity + lower) * support_capacity;
-        const int upper_offset = (world * capacity + upper) * support_capacity;
+        const int lower_offset = (line * capacity + lower) * support_capacity;
+        const int upper_offset = (line * capacity + upper) * support_capacity;
         const int dof_offset = articulation_world_dof_offset.data[art];
 $WALK
         if (LANE == 0) {
@@ -1239,7 +1262,7 @@ $WALK
                 const int row = side == 0 ? lower : upper;
                 if (row < 0 || row >= capacity) continue;
                 const float sign = side == 0 ? lower_sign : upper_sign;
-                const int row_offset = world * capacity + row;
+                const int row_offset = line * capacity + row;
                 if (support.enabled)
                     support.row_class.data[row_offset] = support.limit_class.data[local_dof];
                 row_incident.data[row_offset] = sign * incident;
@@ -1264,7 +1287,7 @@ _MIMIC_ROWS = """$ARTICULATION
         const float coefficient = mimic_coef1.data[k];
         // Keep both structural supports even when the live coefficient is zero.
         const unsigned long long support_mask = dof_mask.data[local0] | dof_mask.data[local1];
-        const int row_offset = world * capacity + row;
+        const int row_offset = line * capacity + row;
         const int response_offset = row_offset * support_capacity;
 $WALK
         if (LANE == 0) {
@@ -1453,7 +1476,7 @@ _TRIPLET_RECORD = """
         SUM($CHANNELS);
         if (LANE == 0) {
             float* record = row_free_response.data
-                + (world * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
+                + (line * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
             record[0] = cross.c[0];
             record[1] = cross.c[1];
             record[2] = cross.c[2];
@@ -1497,7 +1520,7 @@ _CONTACT_ROWS = """
     unsigned long long mask_a = 0, mask_b = 0;
     if (body_a >= 0 && art_a >= 0) mask_a = body_dof_mask.data[body_a];
     if (body_b >= 0 && art_b >= 0) mask_b = body_dof_mask.data[body_b];
-    const int row_offset = world * row_factor.shape[1] + slot;
+    const int row_offset = line * row_factor.shape[1] + slot;
     const int support_capacity = row_factor.shape[2];
     int count = 0;
     auto norm = $VEC(0.0f);
@@ -1802,6 +1825,7 @@ def factor_contact_rows_kernel(
         art_a: int,
         art_b: int,
         world: int,
+        line: int,
         slot: int,
         row_count: int,
         angular_a: wp.mat33,
@@ -1863,6 +1887,7 @@ def factor_contact_rows_kernel(
             if wp.static(prepare_rows):
                 if lane < row_count:
                     world = data.world[c]
+                    line = data.first[world]
                     slot = data.slot[c] + lane
                     direction, row_point = contact_row_frame(lane, normal, tangent0, tangent1, point, friction_point)
                     target = prescribed_target(
@@ -1914,22 +1939,22 @@ def factor_contact_rows_kernel(
                         row_type, phi, beta, target, 1.0 / data.dt, 1.0, data.speculative_scale, 0.0, data.contact_w
                     )
                     if data.contact_w < 1.0:
-                        data.row_w[world, slot] = row_w
+                        data.row_w[line, slot] = row_w
                     if data.material != 0:
                         eps = float(0.0)
                         if lane == 0 and stiffness > 0.0:
                             rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
-                        data.row_eps[world, slot] = eps
-                    data.row_type[world, slot] = row_type
-                    data.row_parent[world, slot] = parent
-                    data.row_mu[world, slot] = mu
+                        data.row_eps[line, slot] = eps
+                    data.row_type[line, slot] = row_type
+                    data.row_parent[line, slot] = parent
+                    data.row_mu[line, slot] = mu
                     # Bias and CFM are already applied; only normal restitution reads row records after the
                     # response projection.
                     if lane == 0:
-                        data.phi[world, slot] = phi
-                        data.target[world, slot] = target
-                        data.restitution[world, slot] = restitution
-                    data.rhs[world, slot] = rhs
+                        data.phi[line, slot] = phi
+                        data.target[line, slot] = target
+                        data.restitution[line, slot] = restitution
+                    data.rhs[line, slot] = rhs
 
             # Fixed component constructors avoid materializing dynamically indexed matrices in local memory during
             # geometry assembly.
@@ -1967,6 +1992,7 @@ def factor_contact_rows_kernel(
                 art_a,
                 art_b,
                 data.world[c],
+                data.first[data.world[c]],
                 data.slot[c],
                 row_count,
                 angular_a,
@@ -1995,24 +2021,25 @@ def factor_contact_rows_kernel(
             if wp.static(prepare_rows):
                 if lane == 0:
                     world = data.world[c]
+                    line = data.first[world]
                     slot = data.slot[c]
                     # Only a restitutive contact reads its row back for the rebound law.
-                    row_restitution = data.restitution[world, slot]
+                    row_restitution = data.restitution[line, slot]
                     if row_restitution > 0.0:
-                        target = data.target[world, slot]
+                        target = data.target[line, slot]
                         fires, bounce = contact_restitution_rhs(
-                            data.phi[world, slot],
-                            row_incident[world, slot] - target,
+                            data.phi[line, slot],
+                            row_incident[line, slot] - target,
                             target,
                             row_restitution,
                             data.dt,
                             data.restitution_threshold,
                         )
                         if fires:
-                            data.rhs[world, slot] = bounce
+                            data.rhs[line, slot] = bounce
                             # An impact is impulsive, not a spring: keep the rebound exact.
                             if data.contact_w < 1.0:
-                                data.row_w[world, slot] = 1.0
+                                data.row_w[line, slot] = 1.0
 
     name = f"factor_contact_rows_{n}_{lanes}_{warps}"
     if prepare_rows:
@@ -2259,7 +2286,7 @@ _PAIRED_COMPONENTS = r"""
             valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
         }
         for (int row = LANE; row < m; row += STRIDE) {
-            const int r = world * M + row;
+            const int r = data.first.data[world] * M + row;
             const int type = data.row_type.data[r];
             const float diag = data.diag.data[r];
             const float mu = data.mu.data[r];
@@ -2270,7 +2297,7 @@ _PAIRED_COMPONENTS = r"""
                 const int p = data.row_parent.data[r];
                 if (p < 0 || p + 2 >= m || (row != p + 1 && row != p + 2)) valid = 0;
                 else {
-                    const int base = world * M + p;
+                    const int base = data.first.data[world] * M + p;
                     valid &= data.row_type.data[base] == 0
                         && data.row_type.data[base + 1] == 2 && data.row_type.data[base + 2] == 2
                         && data.row_parent.data[base + 1] == p && data.row_parent.data[base + 2] == p;
@@ -2283,7 +2310,7 @@ _PAIRED_COMPONENTS = r"""
             }
         }
         for (int row = LANE; row < mf; row += STRIDE) {
-            const int r = world * F + row;
+            const int r = data.mf_first.data[world] * F + row;
             const int packed = data.mf_meta.data[r * 4];
             const int a = packed >> 16, b = static_cast<int>(static_cast<short>(packed & 65535));
             const int tp = data.mf_meta.data[r * 4 + 3], type = tp & 65535;
@@ -2300,7 +2327,7 @@ _PAIRED_COMPONENTS = r"""
                 const int p = encoded_parent == 65535 ? -1 : encoded_parent;
                 if (p < 0 || p + 2 >= mf || (row != p + 1 && row != p + 2)) valid = 0;
                 else {
-                    const int base = (world * F + p) * 4 + 3;
+                    const int base = (data.mf_first.data[world] * F + p) * 4 + 3;
                     const int t1 = data.mf_meta.data[base + 4], t2 = data.mf_meta.data[base + 8];
                     valid &= (data.mf_meta.data[base] & 65535) == 0
                         && (t1 & 65535) == 2 && (t2 & 65535) == 2

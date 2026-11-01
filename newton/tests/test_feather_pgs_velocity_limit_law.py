@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import articulation_factor, whitened_rows
+from newton.tests.feather_pgs_law_harness import articulation_factor, row_lines, whitened_rows
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, law sites).
 # Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
@@ -177,6 +177,8 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "general_world_grid_stride": 1,
         "use_general_world_queue": 0,
         "world_constraint_count": array([count], wp.int32),
+        "dense_first": row_lines(device),
+        "mf_first": row_lines(device),
         # Every row is in the velocity-limit segment.
         "dense_phase_bounds": array([[0, count]], wp.int32),
         "local_solve_owner": zero_int,

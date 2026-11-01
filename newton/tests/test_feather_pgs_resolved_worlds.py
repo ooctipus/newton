@@ -21,7 +21,7 @@ from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import contact_input
+from newton.tests.feather_pgs_law_harness import contact_input, row_lines
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.feather_pgs_scenes import plain_laws
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
@@ -434,7 +434,7 @@ class TestResolvedWorlds(unittest.TestCase):
         parents = wp.array([[-1, 0, 0, -1, 3, 3, -1, -1]], dtype=int, device="cpu")
         mu = wp.full((1, 8), 0.5, dtype=float, device="cpu")
         impulses = wp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=float, device="cpu")
-        routes = patch_routes(((0, parents, mu, impulses, 0.0),))
+        routes = patch_routes(((0, parents, mu, impulses, 0.0, row_lines(parents.device)),))
         for label, finish_routes, expected in (
             ("finish", routes, [0, 1, 1, 0]),
             ("store only", patch_routes(()), [1, 1, 1, 1]),

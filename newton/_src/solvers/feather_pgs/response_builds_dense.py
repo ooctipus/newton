@@ -384,7 +384,7 @@ def response_lanes_kernel() -> wp.Kernel:
     publish = _publish_row(
         "J_world", "Y_world", "J_group", "Y_group", "group_index", "world", "constraint", "dof_offset", "n_dofs"
     )
-    restitution = _element("world_row_restitution", "world", "constraint")
+    restitution = _element("world_row_restitution", "dense_first.data[world]", "constraint")
     respond = _respond_in_place("L_group", "J_group", "Y_group", "group_index", "constraint", "n_dofs")
     body = f"""    const int group_index = tid / 32;
     const int lane = tid % 32;
@@ -417,6 +417,7 @@ def response_lanes_kernel() -> wp.Kernel:
         *ROWS_ABI[:6],
         ("local_solve_owner", wp.array[int]),
         ("world_row_restitution", wp.array2d[float]),
+        ("dense_first", wp.array[int]),
         *ROWS_ABI[6:],
     )
     return _kernel("dense_response_lanes", params, body)
@@ -727,7 +728,7 @@ def diagonal_rows_kernel() -> wp.Kernel:
     if (c >= m) return;
     if ({_skips("m", "world")}) return;
 {_indent(dot("val", "n_dofs", J, Y), "    ")}
-    if (val != 0.0f) wp::atomic_add(&{_element("world_diag", "world", "c")}, val);
+    if (val != 0.0f) wp::atomic_add(&{_element("world_diag", "dense_first.data[world]", "c")}, val);
 """
     params = kernel_template.params(
         ("J_group", wp.array3d[float]),
@@ -735,6 +736,7 @@ def diagonal_rows_kernel() -> wp.Kernel:
         ("group_to_art", wp.array[int]),
         ("art_to_world", wp.array[int]),
         ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
         ("n_dofs", int),
         ("max_constraints", int),
         ("n_arts", int),
@@ -761,7 +763,7 @@ def diagonal_groups_kernel() -> wp.Kernel:
         const int art = world_group_to_art.data[offset];
         value += {_element("group_diag", "art_group_idx.data[art]", "c")};
     }}
-    if (value != 0.0f) wp::atomic_add(&{_element("world_diag", "world", "c")}, value);
+    if (value != 0.0f) wp::atomic_add(&{_element("world_diag", "dense_first.data[world]", "c")}, value);
 """
     params = kernel_template.params(
         ("group_diag", wp.array2d[float]),
@@ -769,6 +771,7 @@ def diagonal_groups_kernel() -> wp.Kernel:
         ("world_group_to_art", wp.array[int]),
         ("art_group_idx", wp.array[int]),
         ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
         ("max_constraints", int),
         ("mf_constraint_count", wp.array[int]),
         ("skip_rows_le", int),
@@ -784,10 +787,13 @@ def cfm_worlds_kernel() -> wp.Kernel:
     body = f"""    const int world = tid;
     const int m = world_constraint_count.data[world];
     if ({_skips("m", "world")}) return;
-    for (int i = 0; i < m; ++i) wp::atomic_add(&{_element("world_diag", "world", "i")}, {_element("world_row_cfm", "world", "i")});
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    for (int i = 0; i < m; ++i) wp::atomic_add(&{_element("world_diag", "line", "i")}, {_element("world_row_cfm", "line", "i")});
 """
     params = kernel_template.params(
         ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
         ("world_row_cfm", wp.array2d[float]),
         ("mf_constraint_count", wp.array[int]),
         ("skip_rows_le", int),

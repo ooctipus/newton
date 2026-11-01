@@ -66,6 +66,7 @@ KINETIC_ROWS = (
     Field("maps", RowMaps),
     Field("prefix", PrefixInput),
     Field("contact", ContactInput),
+    Field("first", wp.int32, ("world",)),
 )
 """The keyed kernels' input: each dense row's key, the maps, the prefix input and the contact input."""
 
@@ -86,9 +87,10 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
     if contact < data.count[0]:
         if data.path[contact] == 0 and data.slot[contact] >= 0:
             world = data.world[contact]
+            line = data.first[world]
             slot = data.slot[contact]
             for direction in range(data.slots_needed[contact]):
-                z.rowkeys[world, slot + direction] = contact * 4 + direction
+                z.rowkeys[line, slot + direction] = contact * 4 + direction
             if law.patches.enabled != 0:
                 mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
                 friction = mu
@@ -98,17 +100,17 @@ def scatter_contact_keys(data: ContactInput, z: KineticRows, law: PatchRowLaw):
                 for direction in range(data.slots_needed[contact]):
                     row = slot + direction
                     if direction == 0:
-                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
-                        data.row_parent[world, row] = -1
-                        data.row_mu[world, row] = mu
+                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_CONTACT
+                        data.row_parent[line, row] = -1
+                        data.row_mu[line, row] = mu
                     elif direction == CONTACT_SPIN_ROW:
-                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_TORSION
-                        data.row_parent[world, row] = slot
-                        data.row_mu[world, row] = contact_torsion_mu(data, contact)
+                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_TORSION
+                        data.row_parent[line, row] = slot
+                        data.row_mu[line, row] = contact_torsion_mu(data, contact)
                     else:
-                        data.row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
-                        data.row_parent[world, row] = slot
-                        data.row_mu[world, row] = friction
+                        data.row_type[line, row] = PGS_CONSTRAINT_TYPE_FRICTION
+                        data.row_parent[line, row] = slot
+                        data.row_mu[line, row] = friction
 
 
 ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
@@ -236,7 +238,7 @@ def _row_source(*, layout, patch=False, weighted=False, torsion=False):
         )
     return substitute(
         r"""
-    const int at = world * z.rowkeys.shape[1] + row;
+    const int at = z.first.data[world] * z.rowkeys.shape[1] + row;
     const int key = z.rowkeys.data[at];
     if (key < 0) {
 ${PREFIX}
@@ -324,19 +326,20 @@ def materialize_general_rows(
     count = counts[world]
     if count <= parallel_rows and mf_counts[world] == 0:
         return
+    line = data.first[world]
     dofs = primary + secondary
     for coefficient in range(lane, count * dofs, warp_stride()):
         row, q = coefficient // dofs, coefficient % dofs
         size, local = primary, q - primary_offset
         if q < primary_offset or q >= primary_offset + primary:
             size, local = secondary, q - secondary_offset
-        key = z.rowkeys[world, row]
+        key = z.rowkeys[line, row]
         value = float(0.0)
         if key < 0:
             token = -1 - key
             if q == token // 2:
                 value = wp.where(token % 2 == 0, 1.0, -1.0)
-                data.sides[world, row] = wp.vec2i(z.maps.arts[world, wp.where(size == primary, 0, 1)], -1)
+                data.sides[line, row] = wp.vec2i(z.maps.arts[world, wp.where(size == primary, 0, 1)], -1)
         else:
             c, r = key // 4, key % 4
             body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
@@ -441,6 +444,7 @@ class KeyedRows:
         self.prefix_layout = self.layout
         dev, worlds, capacity = solver.model.device, solver.forest.world_count, solver.placement.dense_max_constraints
         self.data, self.prefix = KineticRows(), PrefixInput()
+        self.data.first = solver.placement.dense_first
         self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
         self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts, arts=arts)
         self.contact_input = None

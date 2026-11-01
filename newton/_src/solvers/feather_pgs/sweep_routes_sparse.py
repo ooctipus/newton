@@ -77,6 +77,7 @@ over 16 blocks of 64 threads. Every sparse configuration compiles within it with
 SPARSE_ABI = kernel_template.params(
     ("world", int),
     ("world_constraint_count", wp.array[int]),
+    ("dense_first", wp.array[int]),
     ("rhs_bias", wp.array2d[float]),
     ("world_diag", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
@@ -518,7 +519,7 @@ class _SpinUnitFactor(ReducedPairCoupling, _UnitFactor):
 
 def _record(width: int, row: str) -> str:
     """The address of the contact record of the triplet that holds row ``row``."""
-    return f"contact_records.data + (static_cast<size_t>(world) * contact_records.shape[1] + {row} / 3) * {width}"
+    return f"contact_records.data + (static_cast<size_t>(line) * contact_records.shape[1] + {row} / 3) * {width}"
 
 
 def contact_units(sweep: SparseSweep, rows: SparseRows, op: SparseFactor, laws: RowLaws, pad: str) -> tuple[str, str]:
@@ -800,7 +801,9 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
     exit_ = end_sweep(sweep.policy, iteration="iter", violation=active_violation(sweep, op) if sweep.active else None)
     body = f"""    const int lane = LANE;
-    const int offset = world * {M};
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int offset = line * {M};
     const int row_base = offset * {S};
     const int count = min(world_constraint_count.data[world], {M});
 {staging.declarations("    ")}

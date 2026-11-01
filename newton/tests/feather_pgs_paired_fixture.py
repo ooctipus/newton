@@ -16,6 +16,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import paired_components as components
 from newton._src.solvers.feather_pgs import response_builds_rows, sweep_routes, sweep_routes_local
 from newton._src.solvers.feather_pgs.kernels import BodyFactors
+from newton.tests.feather_pgs_law_harness import row_lines
 
 
 def pack_endpoints(a, b):
@@ -89,6 +90,7 @@ def bind_components(host, device="cpu"):
         if name != "J":  # Only the whitened rows are stored.
             dtype = wp.int32 if value.dtype == np.int32 else wp.float32
             setattr(data, name, wp.array(value, dtype=dtype, device=device))
+    data.first = data.mf_first = row_lines(device)
     return data
 
 
@@ -255,6 +257,8 @@ def solve_pair_launches(data, arrays, *, enabled, arch, iterations=8):
     With ``enabled`` the components' selector, which :func:`launch_components` publishes, picks the worlds."""
     values = dict(arrays)
     values.update(
+        dense_first=data.first,
+        mf_first=data.mf_first,
         world_count=5,
         general_world_grid_stride=5,
         use_general_world_queue=0,

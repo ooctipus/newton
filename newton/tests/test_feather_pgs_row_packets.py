@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import group_rows, row_velocity
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines, row_velocity
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -133,6 +133,7 @@ def _patch_fixture(device="cpu"):
     view.phi = array(rng.normal(0.0, 0.02, (count, 2)).astype(np.float32), wp.vec2)
 
     data = rp.ContactInput()
+    data.first = row_lines(device)
     data.count = array([count], int)
     data.point0 = array(rng.normal(0.0, 0.1, (count, 3)).astype(np.float32), wp.vec3)
     data.point1 = array(rng.normal(0.0, 0.1, (count, 3)).astype(np.float32), wp.vec3)
@@ -220,7 +221,7 @@ def _run_general(data, layout, beta):
     for w in range(WORLDS):
         world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
         world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
-    records = field_group.upload(DenseRows, device, **vars(rows), sides=sides)
+    records = field_group.upload(DenseRows, device, **vars(rows), sides=sides, first=row_lines(device))
     incident = wp.array(row_velocity(world_jacobian, data.incident.numpy()), dtype=float, device=device)
 
     def right_hand_sides(threshold):
@@ -289,7 +290,7 @@ def _link(data, layout, rows):
     live = min(int(data.count.numpy()[0]), contacts)
     routing = (data.world, data.slot, data.path, data.slots_needed)
     # The dense route's rows; linking reads no impulses.
-    routes = patch_routes(((0, rows.row_parent, rows.row_mu, None, 0.0),))
+    routes = patch_routes(((0, rows.row_parent, rows.row_mu, None, 0.0, row_lines(rows.row_parent.device)),))
     wp.launch(
         link_patch_routes,
         dim=contacts,
@@ -360,7 +361,7 @@ def _owner_solver(device, *, anchors, beta=0.0):
             "local_general_worlds",
         )
     }
-    rows = {name: ints(worlds) for name in ("mf_constraint_count", "constraint_count", "local_solve_owner")}
+    rows = {name: ints(worlds) for name in ("mf_constraint_count", "mf_first", "constraint_count", "local_solve_owner")}
 
     def active():
         return SimpleNamespace(

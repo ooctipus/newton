@@ -40,13 +40,16 @@ def supported(solver) -> bool:
 
 
 @wp.kernel
-def clear_limit_prefix(dense_groups: wp.array[int], J: wp.array3d[float], sparse_dof: wp.array3d[int]):
+def clear_limit_prefix(
+    dense_first: wp.array[int], dense_groups: wp.array[int], J: wp.array3d[float], sparse_dof: wp.array3d[int]
+):
     """Clear every possible dense-six limit row before partial limit writers run."""
     world, row = wp.tid()
+    line = dense_first[world]
     for dof in range(6):
         J[dense_groups[world], row, dof] = 0.0
-    sparse_dof[world, row, 0] = -1
-    sparse_dof[world, row, 1] = -1
+    sparse_dof[line, row, 0] = -1
+    sparse_dof[line, row, 1] = -1
 
 
 @wp.kernel
@@ -142,7 +145,7 @@ def launch_contacts(solver, data, workers):
     pool.launch(
         solver.sweep.sparse_contact_marker,
         workers,
-        inputs=[data, workers],
+        inputs=[solver.placement.dense_first, data, workers],
         outputs=[solver.placement.sparse_diagonal_row_dof],
         extent=count,
         clamp=True,

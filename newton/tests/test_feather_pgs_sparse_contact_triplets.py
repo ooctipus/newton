@@ -26,6 +26,7 @@ from newton._src.solvers.feather_pgs.staging import arch_budget
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import sparse_kernel, sparse_staging
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.test_feather_pgs_sparse_pgs import _problem, _sweep
 from newton.tests.test_feather_pgs_sparse_research_admission import _branched_model
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
@@ -196,6 +197,7 @@ class DeviceSolve:
         self.inputs = [
             self.worlds,
             array(data["world_constraint_count"], int),
+            row_lines(self.device),
             array(data["rhs_bias"]),
             array(data["diagonal"]),
             self.impulses,
@@ -618,9 +620,9 @@ class TestSparseContactTriplets(unittest.TestCase):
             for runner in (control, candidate):
                 for slot, key in (
                     (1, "world_constraint_count"),
-                    (3, "diagonal"),
-                    (6, "row_factor"),
-                    (7, "row_incident"),
+                    (4, "diagonal"),
+                    (7, "row_factor"),
+                    (8, "row_incident"),
                 ):
                     runner.inputs[slot].assign(data[key])
                 # The contact builder rewrites the records with the rows each step.

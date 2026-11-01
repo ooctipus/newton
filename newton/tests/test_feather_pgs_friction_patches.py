@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
 )
 from newton.tests.feather_pgs_free_body_rows import free_body_jacobians
+from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
 
@@ -478,7 +479,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         velocity = wp.zeros(2, dtype=wp.spatial_vector, device="cpu")
         solved = SimpleNamespace(body_q=state.body_q, body_qd=velocity)
         com = wp.zeros(2, dtype=wp.vec3, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
+        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
 
         def finish():
             patches.finish(state, solved, com, zeros, zeros, zeros, lengths, routes, 0.005)
@@ -570,7 +571,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         parents = wp.array([[-1, 0, 0, -1, -1, 4, 4]], dtype=int, device="cpu")
         mu = wp.array([[0.5] * 7], dtype=float, device="cpu")
         impulses = wp.array([[0, 0, 0, 4, 0, 0, 0]], dtype=float, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
+        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
         patches.link(worlds, slots, paths, lengths, routes)
         patches.seed(state, worlds, slots, paths, lengths, routes)
         result = impulses.numpy()[0]
@@ -587,7 +588,14 @@ class TestFrictionPatchHistory(unittest.TestCase):
         mu = wp.array([[0.5, 0.25, 0.25] + [0.0] * 5], dtype=float, device="cpu")
         seeded = [1.0, 0.3, -0.2] + [0.0] * 5
         impulses = wp.array([seeded], dtype=float, device="cpu")
-        patches.seed(state, slots, slots, slots, lengths, patch_routes([(0, parents, mu, impulses, 1.0)]))
+        patches.seed(
+            state,
+            slots,
+            slots,
+            slots,
+            lengths,
+            patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))]),
+        )
         np.testing.assert_array_equal(impulses.numpy()[0], np.array(seeded, dtype=np.float32))
 
     def test_anchors_without_rows_keep_history(self):
@@ -600,7 +608,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         impulses = wp.zeros((1, 8), dtype=float, device="cpu")
         solved = SimpleNamespace(body_q=state.body_q, body_qd=wp.zeros(2, dtype=wp.spatial_vector, device="cpu"))
         com = wp.zeros(2, dtype=wp.vec3, device="cpu")
-        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
+        routes = patch_routes([(0, parents, mu, impulses, 1.0, row_lines(parents.device))])
         for slot, length, load, retained in ((-1, 3, 0.0, 1), (0, 1, 2.0, 1), (0, 1, 0.0, 0)):
             with self.subTest(slot=slot, slots_needed=length):
                 impulses.assign([[load] + [0.0] * 7])

@@ -22,7 +22,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_fields import LocalOwners
 from newton._src.solvers.feather_pgs.sweep_routes_local import local_owned_kernel
-from newton.tests.feather_pgs_law_harness import local_packed_rows
+from newton.tests.feather_pgs_law_harness import local_packed_rows, row_lines
 
 
 class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
@@ -30,6 +30,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
     def _empty_mf_inputs(world_count: int, device: str | wp.Device) -> list:
         return [
             wp.zeros(world_count, dtype=wp.int32, device=device),
+            row_lines(device),
             wp.zeros((world_count, 4), dtype=wp.int32, device=device),
             wp.zeros((world_count, 1), dtype=wp.float32, device=device),
             wp.zeros((world_count, 1, 6), dtype=wp.float32, device=device),
@@ -67,7 +68,9 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
             classify_local_solve_worlds,
             dim=8,
             inputs=[
-                field_group.upload(MfRows, device, body_a=mf_body_a, body_b=mf_body_b, row_type=mf_row_type),
+                field_group.upload(
+                    MfRows, device, body_a=mf_body_a, body_b=mf_body_b, row_type=mf_row_type, first=row_lines(device)
+                ),
                 field_group.upload(
                     LocalOwners,
                     device,
@@ -167,6 +170,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array([0, 3], dtype=wp.int32, device=device),
                 wp.array([1, 0], dtype=wp.int32, device=device),
                 wp.array([2, 1], dtype=wp.int32, device=device),
+                row_lines(device),
                 lower_group,
                 lower_group,
                 *local_packed_rows(device, [0, 1], jacobian),
@@ -237,6 +241,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                     wp.array([0, 3], dtype=wp.int32, device=device),
                     wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE] * 2, dtype=wp.int32, device=device),
                     wp.array([2, 1], dtype=wp.int32, device=device),
+                    row_lines(device),
                     lower_group,
                     lower_group,
                     *local_packed_rows(device, [0, 1], jacobian),
@@ -320,6 +325,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
                 wp.array([max_constraints], dtype=wp.int32, device=device),
+                row_lines(device),
                 lower,
                 lower,
                 *local_packed_rows(device, [0], jacobian.numpy()),
@@ -447,6 +453,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.array([0, primary_dofs], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL], dtype=wp.int32, device=device),
                 wp.array([1], dtype=wp.int32, device=device),
+                row_lines(device),
                 wp.array(np.stack([np.eye(primary_dofs, dtype=np.float32)] * 2), device=device),
                 wp.array(np.stack([np.eye(secondary_dofs, dtype=np.float32)] * 2), device=device),
                 *local_packed_rows(device, [0, 0], [primary_jacobian[0], secondary_jacobian[1]]),
@@ -455,6 +462,7 @@ class TestFeatherPGSLocalInternalSolve(unittest.TestCase):
                 wp.full((1, max_constraints), -1, dtype=wp.int32, device=device),
                 wp.zeros((1, max_constraints), dtype=wp.float32, device=device),
                 wp.array([mf_count], dtype=wp.int32, device=device),
+                row_lines(device),
                 wp.array(packed_meta, device=device),
                 mf_impulses,
                 wp.zeros_like(wp.array(mf_jacobian, device=device)),
@@ -558,6 +566,7 @@ def _patch_ring_solves(device, load):
                 wp.array([0], dtype=wp.int32, device=device),
                 wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE], dtype=wp.int32, device=device),
                 wp.array([max_constraints], dtype=wp.int32, device=device),
+                row_lines(device),
                 lower,
                 lower,
                 *local_packed_rows(device, [0], jacobian.numpy()),

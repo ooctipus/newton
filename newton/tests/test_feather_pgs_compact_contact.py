@@ -22,7 +22,7 @@ from newton._src.solvers.feather_pgs import (
 )
 from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton.tests.feather_pgs_law_harness import group_rows
+from newton.tests.feather_pgs_law_harness import group_rows, row_lines
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
     assert_history_close,
@@ -72,6 +72,7 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), rows=(3,) * 8):
     rng = np.random.default_rng(191)
     # Every field of the producer's two structs (contact input and compact boundary), unused ones empty.
     data = SimpleNamespace(**{field.name: None if field.dims else 0 for field in _FIELDS})
+    data.first = row_lines(device)
 
     def array(values, dtype):
         return wp.array(values, dtype=dtype, device=device)
@@ -161,6 +162,7 @@ def whiten_inputs(data, aux, *, prefix_only=1, rows=12):
         wp.zeros(2, dtype=int, device=aux.device),
         data.world_dof_indices,
         aux.counts,
+        row_lines(aux.device),
         aux.bounds,
         prefix_only,
         rows,
@@ -181,7 +183,10 @@ def install_prefix(data, aux):
     """Use the real bounded clear, then emulate only original unit-row limit stores (their ``J``, which the build
     whitens in place)."""
     wp.launch(
-        compact.clear_limit_prefix, dim=(2, 12), inputs=[data.dense_group, data.Z, data.sparse_dof], device=aux.device
+        compact.clear_limit_prefix,
+        dim=(2, 12),
+        inputs=[row_lines(aux.device), data.dense_group, data.Z, data.sparse_dof],
+        device=aux.device,
     )
     J = data.Z.numpy()
     types = data.row_type.numpy()
@@ -278,6 +283,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
     }
 
     values["support"] = group_rows(aux.device)
+    values["dense_first"] = values["mf_first"] = row_lines(aux.device)
 
     def launch(kernel, dim):
         args = [values[name] for name in inspect.signature(kernel.func).parameters]

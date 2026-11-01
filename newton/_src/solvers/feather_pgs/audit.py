@@ -98,13 +98,14 @@ def row_compliance(kind: int, weight: float, eps: float, diagonal: float) -> flo
 @wp.func
 def with_compliance(a: AuditRows, world: int, i: int, term: float) -> float:
     """A dense row's velocity term ``term`` plus ``eps_i lambda_i``."""
+    line = a.rows.first[world]
     weight = float(1.0)
     if a.weighted != 0:
-        weight = a.rows.row_w[world, i]
+        weight = a.rows.row_w[line, i]
     eps = float(0.0)
     if a.material != 0:
-        eps = a.rows.row_eps[world, i]
-    return term + row_compliance(a.rows.row_type[world, i], weight, eps, a.rows.diag[world, i]) * a.impulses[world, i]
+        eps = a.rows.row_eps[line, i]
+    return term + row_compliance(a.rows.row_type[line, i], weight, eps, a.rows.diag[line, i]) * a.impulses[line, i]
 
 
 @wp.func
@@ -155,12 +156,13 @@ def enter(
 def packed_dot(support: RowSupport, entries: wp.array3d[float], x: wp.array2d[float], world: int, i: int) -> float:
     """One packed row against its world's coordinates, side by side (:mod:`.packed_rows`)."""
     out = float(0.0)
+    line = support.first[world]
     if support.dense == WIDE:
         for e in range(entries.shape[2]):
             if e < x.shape[1]:
-                out += entries[world, i, e] * x[world, e]
+                out += entries[line, i, e] * x[world, e]
         return out
-    sides = support.sides[world, i]
+    sides = support.sides[line, i]
     first = int(0)
     for side in range(2):
         art = sides[side]
@@ -171,7 +173,7 @@ def packed_dot(support: RowSupport, entries: wp.array3d[float], x: wp.array2d[fl
             if support.dense != 0:
                 at = offset
             for e in range(n):
-                out += entries[world, i, at + e] * x[world, offset + e]
+                out += entries[line, i, at + e] * x[world, offset + e]
             first += n
     return out
 
@@ -196,7 +198,7 @@ def packed_rows(
             term = packed_dot(support, J, coordinates, world, i)
         else:
             term = (
-                incident[world, i]
+                incident[a.rows.first[world], i]
                 + packed_dot(support, Z, coordinates, world, i)
                 - packed_dot(support, Z, hat, world, i)
             )
@@ -216,16 +218,17 @@ def sparse_rows(
     """One thread per world: each native sparse row's ``J_i v_hat + Z_i^T du + eps_i lambda_i``, entries through the
     shared support table or explicit coordinates (:func:`.sweep_routes_sparse.factor_operator`)."""
     world = wp.tid()
+    line = a.rows.first[world]
     for i in range(wp.min(a.counts[world], a.capacity)):
-        term = row_incident[world, i]
+        term = row_incident[line, i]
         for e in range(row_factor.shape[2]):
             coordinate = int(-1)
             if support.enabled != 0:
-                coordinate = support.class_dof[support.row_class[world, i], e]
+                coordinate = support.class_dof[support.row_class[line, i], e]
             else:
-                coordinate = row_dof[world, i, e]
+                coordinate = row_dof[line, i, e]
             if coordinate >= 0:
-                term += row_factor[world, i, e] * delta[world, coordinate]
+                term += row_factor[line, i, e] * delta[world, coordinate]
         velocity[world, i] = with_compliance(a, world, i, term)
 
 
@@ -250,6 +253,7 @@ def diagonal_rows(
     world = wp.tid()
     offset = dense_offsets[world]
     group = dense_groups[world]
+    line = a.rows.first[world]
     for i in range(wp.min(a.counts[world], a.capacity)):
         term = float(0.0)
         for k in range(dense_dofs):
@@ -260,13 +264,13 @@ def diagonal_rows(
                     u += dense_L[group, j, k] * v[dof]
             term += dense_Z[group, i, dense_dofs - 1 - k] * u
         for slot in range(2):
-            world_dof = sparse_row_dof[world, i, slot]
+            world_dof = sparse_row_dof[line, i, slot]
             if world_dof >= 0:
                 dof = world_dof_indices[world, world_dof]
                 if dof >= 0:
                     scale = wp.sqrt(inverse_mass[dof])
                     if scale > 0.0:
-                        term += sparse_row_z[world, i, slot] * (v[dof] / scale)
+                        term += sparse_row_z[line, i, slot] * (v[dof] / scale)
         velocity[world, i] = with_compliance(a, world, i, term)
 
 
@@ -305,7 +309,7 @@ def limit_row(total: wp.vec3, impulse: float, term: float, bias: float) -> wp.ve
 
 @wp.func
 def free_side(
-    Z: wp.array3d[float], world: int, row: int, body: int, factors: BodyFactors, velocity: wp.array[float]
+    Z: wp.array3d[float], line: int, row: int, body: int, factors: BodyFactors, velocity: wp.array[float]
 ) -> float:
     """``Z_side^T (L^T P v)``: one side of a whitened free-body row over the published velocity."""
     if body < 0:
@@ -318,7 +322,7 @@ def free_side(
         u = float(0.0)
         for j in range(k, 6):
             u += factors.L[factor, j, k] * velocity[start + 5 - j]
-        out += Z[world, row, 5 - k] * u
+        out += Z[line, row, 5 - k] * u
     return out
 
 
@@ -337,32 +341,34 @@ def free_rows(
     coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``, its bias the limit
     (:func:`.projection_laws.speed_row`)."""
     world = wp.tid()
+    line = mf.first[world]
     for i in range(a.mf_counts[world]):
-        kind = mf.row_type[world, i]
-        body = mf.body_a[world, i]
+        kind = mf.row_type[line, i]
+        body = mf.body_a[line, i]
         if kind == ROW_JOINT_VELOCITY_LIMIT:
             start = factors.dof_start[factors.body_to_articulation[body]]
-            if mf.Z_a[world, i, 3] != 0.0:
+            if mf.Z_a[line, i, 3] != 0.0:
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = free_side(mf.Z_a, world, i, body, factors, v)
-        term += free_side(mf.Z_b, world, i, mf.body_b[world, i], factors, v)
-        inverse = inverse_diagonals[world, i]
+        term = free_side(mf.Z_a, line, i, body, factors, v)
+        term += free_side(mf.Z_b, line, i, mf.body_b[line, i], factors, v)
+        inverse = inverse_diagonals[line, i]
         if inverse > 0.0:
             weight = float(1.0)
             if a.weighted != 0:
-                weight = weights[world, i]
+                weight = weights[line, i]
             eps = float(0.0)
             if a.material != 0:
-                eps = mf.eps[world, i]
-            term += row_compliance(kind, weight, eps, 1.0 / inverse) * impulses[world, i]
+                eps = mf.eps[line, i]
+            term += row_compliance(kind, weight, eps, 1.0 / inverse) * impulses[line, i]
         velocity[world, i] = term
 
 
 @wp.func
 def audit_store(
     world: int,
+    line: int,
     count: int,
     kinds: wp.array2d[int],
     parents: wp.array2d[int],
@@ -377,24 +383,24 @@ def audit_store(
     violation = float(0.0)
     work = float(0.0)
     for i in range(count):
-        kind = kinds[world, i]
-        impulse = impulses[world, i]
-        bias = rhs[world, i]
+        kind = kinds[line, i]
+        impulse = impulses[line, i]
+        bias = rhs[line, i]
         residual = velocity[world, i] + bias
         work -= impulse * bias
         if kind == ROW_FRICTION or kind == ROW_TORSION:
-            if kind == ROW_FRICTION and parents[world, i] == i - 1:
-                second = velocity[world, i + 1] + rhs[world, i + 1]
+            if kind == ROW_FRICTION and parents[line, i] == i - 1:
+                second = velocity[world, i + 1] + rhs[line, i + 1]
                 spin = float(0.0)
                 spin_scale = float(0.0)
-                term = impulse * residual + impulses[world, i + 1] * second
+                term = impulse * residual + impulses[line, i + 1] * second
                 if i + 2 < count:
-                    if kinds[world, i + 2] == ROW_TORSION:
-                        spin = velocity[world, i + 2] + rhs[world, i + 2]
-                        spin_scale = mus[world, i + 2]
-                        term += impulses[world, i + 2] * spin
-                scaled = wp.vec3(mus[world, i] * residual, mus[world, i + 1] * second, spin_scale * spin)
-                term += patch_normal_load(parents, impulses, world, i - 1) * wp.length(scaled)
+                    if kinds[line, i + 2] == ROW_TORSION:
+                        spin = velocity[world, i + 2] + rhs[line, i + 2]
+                        spin_scale = mus[line, i + 2]
+                        term += impulses[line, i + 2] * spin
+                scaled = wp.vec3(mus[line, i] * residual, mus[line, i + 1] * second, spin_scale * spin)
+                term += patch_normal_load(parents, impulses, line, i - 1) * wp.length(scaled)
                 gap += wp.abs(term)
             continue
         gap += wp.abs(impulse * residual)
@@ -424,9 +430,19 @@ def audit_world(
         return
     rows = a.rows
     count = wp.min(a.counts[world], a.capacity)
-    dense = audit_store(world, count, rows.row_type, rows.row_parent, rows.row_mu, a.impulses, rows.rhs, velocity)
+    dense = audit_store(
+        world, rows.first[world], count, rows.row_type, rows.row_parent, rows.row_mu, a.impulses, rows.rhs, velocity
+    )
     free = audit_store(
-        world, a.mf_counts[world], mf.row_type, mf.row_parent, mf.row_mu, mf_impulses, mf.rhs, mf_velocity
+        world,
+        mf.first[world],
+        a.mf_counts[world],
+        mf.row_type,
+        mf.row_parent,
+        mf.row_mu,
+        mf_impulses,
+        mf.rhs,
+        mf_velocity,
     )
     extra = fused[world]
     gap = dense[0] + free[0] + extra[0]

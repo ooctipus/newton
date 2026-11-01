@@ -39,6 +39,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         raise ValueError("sparse response DOFs must be positive")
 
     def mark_independent_sparse_contact_units_template(
+        dense_first: wp.array[int],
         data: ContactInput,
         total_num_workers: int,
         sparse_row_dof: wp.array3d[int],
@@ -64,12 +65,13 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
                 continue
 
             world = data.world[contact]
-            coord_0 = sparse_row_dof[world, slot, 0]
-            coord_1 = sparse_row_dof[world, slot, 1]
+            line = dense_first[world]
+            coord_0 = sparse_row_dof[line, slot, 0]
+            coord_1 = sparse_row_dof[line, slot, 1]
             if coord_0 >= 0 and coord_1 < 0:
-                sparse_row_dof[world, slot, 1] = -2
+                sparse_row_dof[line, slot, 1] = -2
             elif coord_1 >= 0 and coord_0 < 0:
-                sparse_row_dof[world, slot, 0] = -2
+                sparse_row_dof[line, slot, 0] = -2
 
     suffix = "_torsion" if torsion else ""
     if units:
@@ -77,6 +79,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         return python_kernel(mark_independent_sparse_contact_units_template, name)
 
     def mark_independent_sparse_contact_candidates_template(
+        dense_first: wp.array[int],
         data: ContactInput,
         total_num_workers: int,
         sparse_row_dof: wp.array3d[int],
@@ -101,12 +104,13 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
                 continue
 
             world = data.world[contact]
-            coord_0 = sparse_row_dof[world, slot, 0]
-            coord_1 = sparse_row_dof[world, slot, 1]
+            line = dense_first[world]
+            coord_0 = sparse_row_dof[line, slot, 0]
+            coord_1 = sparse_row_dof[line, slot, 1]
             if coord_0 >= 0 and coord_1 < 0:
-                sparse_row_dof[world, slot, 1] = -2
+                sparse_row_dof[line, slot, 1] = -2
             elif coord_1 >= 0 and coord_0 < 0:
-                sparse_row_dof[world, slot, 0] = -2
+                sparse_row_dof[line, slot, 0] = -2
 
     name = f"mark_independent_sparse_contact_candidates_{sparse_size}{suffix}"
     return python_kernel(mark_independent_sparse_contact_candidates_template, name)
@@ -154,7 +158,9 @@ def _get_build_independent_sparse_contact_groups_kernel(
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];
     const int contact_end = world_constraint_count.data[world];
     const int head_base = world * {D};
-    const int sparse_world_base = world * {M} * 2;
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int sparse_world_base = line * {M} * 2;
     const unsigned earlier_lanes = (1u << lane) - 1u;
     // The contact segment's whole triples.
     const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / {R} : 0;
@@ -202,6 +208,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
         name,
         kernel_template.params(
             ("world_constraint_count", wp.array[int]),
+            ("dense_first", wp.array[int]),
             ("dense_phase_bounds", wp.array2d[int]),
             ("sparse_row_dof", wp.array3d[int]),
             ("group_count", wp.array[int]),
@@ -421,8 +428,10 @@ def _build_independent_sparse_contact_units_kernel(
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];
     const int contact_end = world_constraint_count.data[world];
     const int head_base = world * {D};
-    const int row_base = world * {M};
-    const int sparse_world_base = world * {M} * 2;
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int row_base = line * {M};
+    const int sparse_world_base = line * {M} * 2;
     const unsigned earlier_lanes = (1u << lane) - 1u;
     for (int coordinate = lane; coordinate < {D}; coordinate += 32)
         group_heads.data[head_base + coordinate] = -1;
@@ -485,6 +494,7 @@ def _build_independent_sparse_contact_units_kernel(
         name,
         kernel_template.params(
             ("world_constraint_count", wp.array[int]),
+            ("dense_first", wp.array[int]),
             ("dense_phase_bounds", wp.array2d[int]),
             ("world_row_type", wp.array2d[int]),
             ("world_row_parent", wp.array2d[int]),

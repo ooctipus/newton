@@ -19,6 +19,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.paired_components import PairedComponentData
 from newton._src.solvers.feather_pgs.response_operator import FactorRows, FreeBodyZ, SparseFactor
+from newton.tests.feather_pgs_law_harness import row_lines
 
 DEVICE = "cpu"
 
@@ -132,6 +133,8 @@ def _components_data(P, rng, *, qualified=True):
         mf_Z_a=rng.normal(size=(2, F, 6)).astype(np.float32),
         mf_Z_b=rng.normal(size=(2, F, 6)).astype(np.float32),
         mf_mu=np.full((2, F), 0.5, np.float32),
+        first=row_lines(DEVICE),
+        mf_first=row_lines(DEVICE),
     )
 
 
