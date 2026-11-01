@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import dense_rows, field_group, kernels, response_builds_rows
-from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
+from newton._src.solvers.feather_pgs import rows as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.tests.feather_pgs_law_harness import contact_input, row_lines
 from newton.tests.feather_pgs_patch_parity import row_law
@@ -21,7 +21,7 @@ from newton.tests.feather_pgs_patch_parity import row_law
 
 def _launch_workers(capacity):
     """Evaluate the actual sparse launch's host-only worker selection."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(implementation.SolverFeatherPGS._stage4_build_rows)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(implementation.RowLaws.write)))
     call = next(
         node
         for node in ast.walk(tree)

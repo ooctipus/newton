@@ -151,7 +151,7 @@ def route_selection(solver) -> dict:
     The owners' records take whether they hold the class, their sizes and their reasons from the solver's route
     (``routes.row``, :class:`.route_table.RouteRow`); the rest of each record is the owner's own structure.
     """
-    from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time flags
+    from . import rows as source  # noqa: PLC0415 - the row pass's kernels, as it launches them
 
     row = solver.routes.row
 
@@ -329,7 +329,7 @@ def _kernel_names(kernels) -> list:
 
 
 def _general_kernels(method, source) -> tuple:
-    """The general builder's kernels for one method, in launch order (_stage4_build_rows)."""
+    """The general builder's kernels for one method, in launch order (:meth:`.rows.RowLaws.write`)."""
     if method in ("masked", "masked_combined"):
         return (source.contact_row_prelude, source.populate_world_J_masked)
     if method == "per_contact":
@@ -340,7 +340,7 @@ def _general_kernels(method, source) -> tuple:
 def _row_builder(solver, plan, size, source) -> dict:
     """Name the kernels that build one DOF size's dense contact rows outside the sweep, and their law.
 
-    Mirrors the producers' launches, in launch order: _stage4_build_rows for the shared-metadata
+    Mirrors the producers' launches, in launch order: RowLaws.write for the shared-metadata
     and general builders, compact_contact.launch_contacts, LocalRowPackets.produce_contacts and
     finish_rows, and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes
     (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
@@ -391,7 +391,7 @@ def _row_builder(solver, plan, size, source) -> dict:
 def _contact_rows(solver, source) -> dict:
     row = solver.routes.row
     point = bool(row.laws.point)
-    # The plan _stage4_build_rows dispatches on: the route's producer writes every contact row.
+    # The plan the row pass (RowLaws.write) dispatches on: the route's producer writes every contact row.
     plan = contact_row_plan(solver)
     methods = None
     if plan.producer == "general":
@@ -703,7 +703,7 @@ def _velocity_limits(solver) -> dict:
         "prescale_lanes": int(solver.laws.velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.options.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
-        # Mirrors Placement.allocate_free_body_rows and the row allocation of _stage4_build_rows (both modes). At an
+        # Mirrors Placement.allocate_free_body_rows and the row allocation of RowLaws.write (both modes). At an
         # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver.forest.free_rigid_body_count > 0),
     }

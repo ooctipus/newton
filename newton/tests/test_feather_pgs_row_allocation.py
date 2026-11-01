@@ -21,7 +21,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, kernels, solver_feather_pgs
+from newton._src.solvers.feather_pgs import field_group, kernels, rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
@@ -158,7 +158,7 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic)
     contacts = pipeline.contacts()
     control = model.control()
-    cap = solver_feather_pgs._CONTACT_BUILD_THREAD_CAP if threads is None else threads
+    cap = rows._CONTACT_BUILD_THREAD_CAP if threads is None else threads
     launch = wp.launch
 
     def record_launch(kernel, *args, **kwargs):
@@ -168,7 +168,7 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
 
     records = []
     with (
-        mock.patch.object(solver_feather_pgs, "_CONTACT_BUILD_THREAD_CAP", cap),
+        mock.patch.object(rows, "_CONTACT_BUILD_THREAD_CAP", cap),
         mock.patch.object(wp, "launch", record_launch),
     ):
         for _ in range(steps):

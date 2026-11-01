@@ -12,8 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import path_selection
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs import path_selection, rows
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -67,7 +66,7 @@ def _rows(solver, contacts):
     return contact_rows(solver, contacts, jacobian=True, every_row=True)
 
 
-_PLAN = solver_module.contact_row_plan
+_PLAN = rows.contact_row_plan
 
 
 def _per_contact_plan(solver):
@@ -83,7 +82,7 @@ def _builder(masked):
         yield
         return
     with (
-        mock.patch.object(solver_module, "contact_row_plan", _per_contact_plan),
+        mock.patch.object(rows, "contact_row_plan", _per_contact_plan),
         mock.patch.object(path_selection, "contact_row_plan", _per_contact_plan),
     ):
         yield

@@ -14,8 +14,9 @@
 - :attr:`RowLaws.set`, the route table's laws axis (:class:`.route_table.Laws`), once the bilateral pre-elimination
   is decided.
 
-The device law functions stay in :mod:`.row_laws`, :mod:`.row_build` and :mod:`.prefix_rows`; the row passes that
-write the rows stay in the solver's step until they join one row pass.
+:meth:`RowLaws.write` is the step's one row pass: every row producer of every placement, in the launch order that
+fixes the slot order, and :meth:`RowLaws.write_rhs` the dense rows' right-hand sides once their diagonals are known.
+The device law functions stay in :mod:`.row_laws`, :mod:`.row_build` and :mod:`.prefix_rows`.
 """
 
 from __future__ import annotations
@@ -27,17 +28,48 @@ from functools import cache
 import numpy as np
 import warp as wp
 
-from ...sim import Model
+from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
-from . import host_index, prefix_rows
+from . import field_group, host_index, prefix_rows, response_builds_rows
 from .configuration import Options
+from .contact_input import bind as bind_contact_input
+from .contact_input import bind_routes as bind_contact_routes
+from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .dense_rows import RowSupport
+from .dense_rows import bind as bind_dense_rows
+from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import lane_group
 from .field_group import SolverArrays
 from .forest_plan import ForestPlan
 from .friction_patches import _FrictionPatchState as FrictionPatchState
+from .friction_patches import patch_row_law
+from .joint_table import bind as bind_joint_table
+from .joint_table import bind_free_bodies
 from .kernel_template import KernelTemplate, params
+from .kernels import (
+    allocate_joint_velocity_limit_slots,
+    allocate_link_slots,
+    allocate_mimic_slots,
+    allocate_rigid_velocity_limit_slots,
+    allocate_world_contact_slots,
+    build_joint_limit_rows_for_size,
+    build_mf_contact_rows,
+    clear_sparse_diagonal_response_prefix,
+    compute_world_contact_bias,
+    finalize_constraint_counts_with_status,
+    gather_mf_warmstart,
+    populate_joint_velocity_limit_J_for_size,
+    populate_mimic_J_for_size,
+    populate_rigid_velocity_limit_rows,
+    populate_world_J_for_compact_size,
+    populate_world_J_for_size,
+    prepare_fused_diagonal_joint_limits,
+    prepare_world_contact_rows,
+    snapshot_dense_phase_bound,
+    write_link_rows,
+)
 from .route_table import Laws
+from .row_build import contact_row_prelude, populate_world_J_masked
 from .row_laws import LINK_ROWS, ROW_LAW
 from .solver_fields import (
     LINK_PLAN,
@@ -45,7 +77,10 @@ from .solver_fields import (
     MIMIC_PLAN,
     MIMIC_SLOTS,
     VELOCITY_LIMIT_SLOTS,
+    Links,
+    Mimics,
 )
+from .sparse_contact import finalize_sparse_joint_limit_rows
 
 __all__ = ["RowLaws", "joint_limit_warp_kernel", "velocity_prescale_launch"]
 
@@ -54,6 +89,14 @@ _CALLER = 4
 which runs inside the keyword-only shim (deprecate_nonkeyword_arguments)."""
 
 JOINT_LIMIT_WARPS_PER_BLOCK = 4
+
+_CONTACT_BUILD_THREAD_CAP = 65536
+# The masked row builder's thread budget, in multiples of the contact-build cap.
+_ROWS_THREADS_X = 4
+_CONTACT_JACOBIAN_WORKER_CAP = 4096
+
+BIAS_LANES = 256
+"""The most threads a world's rows get in the bias launch (:func:`.kernels.compute_world_contact_bias`): a block."""
 
 
 def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
@@ -484,3 +527,867 @@ class RowLaws:
         if patches is None or not patches.reuse_frames:
             return None
         return patches.frame_status
+
+    # --- the row pass ---------------------------------------------------------------------------------------------------
+    def write(self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float) -> None:
+        """The step's row pass: every row of every placement, with its records, its slot and its phase bounds.
+
+        The launch order is the slot order: the allocators reserve slots with atomics, in the order mimic, link,
+        joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are glued
+        to that sequence. The pass then finalizes the counts with status, links the friction patches after every
+        producer and claims the sweep's rows.
+
+        Args:
+            solver: The solver whose step this is: its model, options, plan and primitives.
+            state_in: The step's input state.
+            state_aug: The step's dynamics (the tree factor).
+            contacts: The step's contacts, or ``None``.
+            dt: The step size.
+        """
+        model = solver.model
+        max_constraints = solver.placement.dense_max_constraints
+        # Every row producer writes the dense row records through one struct, and the joint row producers read
+        # the joint table through another, both bound for this step.
+        dense_rows = bind_dense_rows(solver.placement)
+        joints = bind_joint_table(solver)
+        mf_active = solver.forest.has_free_rigid_bodies
+        if solver.forest.has_prescribed_response:
+            solver.placement.mf_target_velocity.zero_()
+
+        solver.placement.begin(solver._plan.jacobian_clear_sizes)
+
+        has_free_rigid_flag = 1 if mf_active else 0
+        # Dummy arrays when MF is not active (kernel still needs valid pointers).
+        # Preallocated in __init__: a per-step wp.zeros here would add an
+        # allocation + memset every step and, under CUDA graph capture, leave
+        # the graph holding a pointer to a freed temporary.
+        is_free_rigid = (
+            solver.forest.is_free_rigid
+            if solver.forest.is_free_rigid is not None
+            else solver.placement.dummy_is_free_rigid
+        )
+        mf_slot_counter = solver.placement.mf_slot_counter if mf_active else solver.placement.dummy_mf_slot_counter
+        dense_dropped_rows = solver.placement.row_dropped_dense
+        mf_dropped_rows = solver.placement.row_dropped_mf
+        mf_first_rejected_slot = (
+            solver.placement.mf_first_rejected_slot if mf_active else solver.placement.dummy_mf_slot_counter
+        )
+        support = solver.placement.row_support()
+        if solver.placement.compact_contact_boundary:
+            from .compact_contact import clear_limit_prefix  # noqa: PLC0415
+
+            wp.launch(
+                clear_limit_prefix,
+                dim=(solver.forest.world_count, 12),
+                inputs=[
+                    solver.placement.dense_first,
+                    solver.placement.sparse_diagonal_dense_groups,
+                    solver.placement.J_by_size[6],
+                    solver.placement.sparse_diagonal_row_dof,
+                ],
+                device=model.device,
+            )
+        if solver.placement.row_packets is not None:
+            solver.placement.row_packets.prepare_prefix(state_in, dt)
+        if solver.placement.keyed_rows is not None:
+            solver.placement.keyed_rows.begin_rows(state_in, state_aug, dt)
+
+        # ── Dense row-family layout ──────────────────────────────────────
+        # Slots are handed out in the order [mimic][joint-limit]
+        # [joint-velocity-limit][contact/friction], so each family owns one
+        # contiguous dense row range:
+        #   mimic and position limits: [0, bounds[0])
+        #   velocity limits:           [bounds[0], bounds[1])
+        #   contacts and friction:     [bounds[1], m_dense)
+        # The two snapshot_dense_phase_bound launches below record the family
+        # boundaries and must stay glued to this allocation sequence
+        # (slot_counter is zeroed at the top of this method). Mimic rows come
+        # first, ahead of the (activation-gated, flickering) limit family, so
+        # warm-started mimic lambdas keep a stable slot index across steps.
+
+        # Mimic (joint coupling) equality rows — static count per model.
+        if self.mimic_count > 0 and solver.placement.row_packets is None:
+            wp.launch(
+                allocate_mimic_slots,
+                dim=self.mimic_count,
+                inputs=[field_group.bind(Mimics, laws=self, model=model), max_constraints],
+                outputs=[
+                    solver.placement.slot_counter,
+                    solver.placement.dense_first_rejected_slot,
+                ],
+                device=model.device,
+            )
+            for size in solver.forest.size_groups:
+                if size not in self.mimic_sizes:
+                    continue
+                n_arts = solver.forest.n_arts_by_size[size]
+                if solver.sweep.sparse_velocity_limits and size == solver.placement.sparse_mass_matrix_size:
+                    indices = solver.factor.sparse_mass_matrix_indices
+                    wp.launch(
+                        response_builds_rows.factor_mimic_rows_kernel,
+                        dim=n_arts * 32,
+                        inputs=[
+                            solver.forest.group_to_art[size],
+                            solver.forest.art_to_world,
+                            solver.forest.articulation_world_dof_offset,
+                            solver.forest.articulation_dof_start,
+                            self.mimic_slot,
+                            self._mimic_art_start,
+                            self._mimic_art_list,
+                            self._mimic_dof0,
+                            self._mimic_dof1,
+                            self._mimic_q0,
+                            self._mimic_q1,
+                            model.constraint_mimic_coef0,
+                            model.constraint_mimic_coef1,
+                            state_in.joint_q,
+                            solver.options.pgs_beta,
+                            solver.options.pgs_cfm,
+                            indices.ancestor_mask,
+                            indices.inverse_permutation,
+                            indices.lookup,
+                            solver.factor.sparse_Linv,
+                            solver.v_hat,
+                        ],
+                        outputs=[
+                            dense_rows,
+                            solver.placement.sparse_row_dof,
+                            solver.placement.sparse_row_factor,
+                            solver.placement.row_incident,
+                        ],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
+                wp.launch(
+                    populate_mimic_J_for_size,
+                    dim=n_arts,
+                    inputs=[
+                        field_group.bind(Mimics, laws=self, model=model),
+                        joints,
+                        solver.forest.group_to_art[size],
+                        state_in.joint_q,
+                        solver.options.pgs_beta,
+                        solver.options.pgs_cfm,
+                        support,
+                    ],
+                    outputs=[solver.placement.jacobian_rows(size), dense_rows],
+                    device=model.device,
+                )
+
+        # The links' rows: static per model, their sides the trees of the link's two pieces.
+        if self.link_count > 0:
+            links = field_group.bind(Links, laws=self)
+            wp.launch(
+                allocate_link_slots,
+                dim=self.link_count,
+                inputs=[links, max_constraints],
+                outputs=[solver.placement.slot_counter, solver.placement.dense_first_rejected_slot],
+                device=model.device,
+            )
+            wp.launch(
+                write_link_rows,
+                dim=self.link_count,
+                inputs=[
+                    joints,
+                    links,
+                    state_in.body_q,
+                    model.body_com,
+                    solver.forest.body_to_joint,
+                    solver.forest.body_to_articulation,
+                    model.joint_ancestor,
+                    state_aug.joint_S_s,
+                    solver.factor.articulation_origin,
+                    solver.options.pgs_beta,
+                    solver.options.pgs_cfm,
+                    support,
+                ],
+                outputs=[solver.placement.packed_Z, dense_rows],
+                device=model.device,
+            )
+
+        if solver.placement.fused_diagonal_joint_limits:
+            wp.launch(
+                prepare_fused_diagonal_joint_limits,
+                dim=solver.forest.world_count * solver.forest.max_world_dofs,
+                inputs=[
+                    joints,
+                    solver.forest.world_dof_indices,
+                    solver.forest.max_world_dofs,
+                    solver.placement.fused_diagonal_limit_dof_mask,
+                    self.joint_limit_q_index,
+                    state_in.joint_q,
+                    solver.options.joint_limit_activation_gap,
+                    solver.options.pgs_beta,
+                    dt,
+                    solver.v_hat,
+                ],
+                outputs=[
+                    solver.placement.fused_diagonal_limit_active,
+                    solver.placement.fused_diagonal_limit_lower_rhs,
+                    solver.placement.fused_diagonal_limit_upper_rhs,
+                ],
+                device=model.device,
+            )
+
+        # Allocate and populate joint-limit rows per response-size group.
+        if (
+            solver.options.enable_joint_limits
+            and self.joint_limit_sizes
+            and solver.placement.row_packets is None
+            and solver.placement.keyed_rows is None
+        ):
+            # The native limit rows (prefix_rows) read the law and write the records through one struct.
+            law = field_group.bind(
+                prefix_rows.PrefixLaw,
+                solver=solver,
+                placement=solver.placement,
+                factor=solver.factor,
+                laws=self,
+                options=solver.options,
+                model=model,
+                state_in=state_in,
+                dt=dt,
+            )
+            for size in solver.forest.size_groups:
+                if size not in self.joint_limit_sizes or size in solver.placement.fused_diagonal_joint_limit_sizes:
+                    continue
+                n_arts = solver.forest.n_arts_by_size[size]
+                if size == solver.placement.sparse_mass_matrix_size:
+                    indices = solver.factor.sparse_mass_matrix_indices
+                    wp.launch(
+                        response_builds_rows.factor_limit_rows_kernel,
+                        dim=n_arts * 32,
+                        inputs=[
+                            solver.forest.group_to_art[size],
+                            solver.forest.art_to_world,
+                            solver.forest.articulation_world_dof_offset,
+                            solver.forest.articulation_dof_start,
+                            law,
+                            indices.ancestor_mask,
+                            indices.inverse_permutation,
+                            indices.lookup,
+                            solver.factor.sparse_Linv,
+                            solver.v_hat,
+                        ],
+                        outputs=[
+                            solver.placement.sparse_row_dof,
+                            solver.placement.sparse_row_factor,
+                            solver.placement.row_incident,
+                            solver.placement.sparse_row_support,
+                        ],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
+                warp_kernel = self.joint_limit_warp_kernels.get(size)
+                if warp_kernel is not None:
+                    wp.launch_tiled(
+                        warp_kernel,
+                        dim=[(n_arts + JOINT_LIMIT_WARPS_PER_BLOCK - 1) // JOINT_LIMIT_WARPS_PER_BLOCK],
+                        inputs=[
+                            n_arts,
+                            solver.forest.articulation_dof_start,
+                            solver.forest.art_to_world,
+                            solver.forest.group_to_art[size],
+                            solver.sweep.resolved_worlds,
+                            law,
+                            support,
+                        ],
+                        outputs=[solver.placement.jacobian_rows(size)],
+                        block_dim=32 * JOINT_LIMIT_WARPS_PER_BLOCK,
+                        device=model.device,
+                    )
+                else:
+                    wp.launch(
+                        build_joint_limit_rows_for_size,
+                        dim=n_arts,
+                        inputs=[
+                            joints,
+                            state_in.joint_q,
+                            solver.options.joint_limit_activation_gap,
+                            solver.forest.group_to_art[size],
+                            max_constraints,
+                            solver.options.pgs_beta,
+                            solver.options.pgs_cfm,
+                            solver.sweep.resolved_worlds,
+                            support,
+                        ],
+                        outputs=[
+                            solver.placement.slot_counter,
+                            solver.placement.dense_first_rejected_slot,
+                            solver.placement.jacobian_rows(size),
+                            dense_rows,
+                        ],
+                        device=model.device,
+                    )
+
+        # Unconditional: the first boundary must include position-limit
+        # rows and remain valid when that family is disabled (when it is just
+        # the current watermark at the start of the velocity-limit segment).
+        if solver.placement.row_packets is None and solver.placement.keyed_rows is None:
+            wp.launch(
+                snapshot_dense_phase_bound,
+                dim=solver.forest.world_count,
+                inputs=[solver.placement.slot_counter, 0],
+                outputs=[solver.placement.dense_phase_bounds],
+                device=model.device,
+            )
+
+        # Allocate + populate joint velocity-limit rows (per-DOF clamp on
+        # |qdot_i| against model.joint_velocity_limit). Dense contact rows
+        # are allocated after this block so contact/friction rows form the
+        # trailing per-world slot segment; the sweeps visit velocity-limit
+        # rows in a dedicated final pass regardless of slot order.
+        if (
+            solver.options.enable_joint_velocity_limits
+            and self.velocity_limit_slot is not None
+            and solver.placement.keyed_rows is None
+        ):
+            wp.launch(
+                allocate_joint_velocity_limit_slots,
+                dim=model.articulation_count,
+                inputs=[
+                    joints,
+                    solver.v_hat,
+                    solver.options.velocity_limit_activation_fraction,
+                    max_constraints,
+                ],
+                outputs=[
+                    self.velocity_limit_slot,
+                    self.velocity_limit_sign,
+                    solver.placement.slot_counter,
+                    solver.placement.dense_first_rejected_slot,
+                ],
+                device=model.device,
+            )
+
+        # Unconditional velocity-limit boundary snapshot; dense contact rows start here.
+        if solver.placement.row_packets is None and solver.placement.keyed_rows is None:
+            wp.launch(
+                snapshot_dense_phase_bound,
+                dim=solver.forest.world_count,
+                inputs=[solver.placement.slot_counter, 1],
+                outputs=[solver.placement.dense_phase_bounds],
+                device=model.device,
+            )
+
+        if solver.placement.sparse_diagonal_contact_solve:
+            wp.launch(
+                clear_sparse_diagonal_response_prefix,
+                dim=solver.forest.world_count,
+                inputs=[solver.placement.dense_first, solver.placement.dense_phase_bounds],
+                outputs=[solver.placement.sparse_diagonal_row_dof],
+                device=model.device,
+            )
+
+        if (
+            solver.options.enable_joint_velocity_limits
+            and self.velocity_limit_slot is not None
+            and solver.placement.keyed_rows is None
+        ):
+            for size in solver.forest.size_groups:
+                n_arts = solver.forest.n_arts_by_size[size]
+                if solver.sweep.sparse_velocity_limits and size == solver.placement.sparse_mass_matrix_size:
+                    indices = solver.factor.sparse_mass_matrix_indices
+                    wp.launch(
+                        response_builds_rows.factor_velocity_limit_rows_kernel,
+                        dim=n_arts * 32,
+                        inputs=[
+                            solver.forest.group_to_art[size],
+                            solver.forest.art_to_world,
+                            solver.forest.articulation_world_dof_offset,
+                            solver.forest.articulation_dof_start,
+                            model.joint_velocity_limit,
+                            self.velocity_limit_slot,
+                            self.velocity_limit_sign,
+                            solver.options.pgs_cfm,
+                            indices.ancestor_mask,
+                            indices.inverse_permutation,
+                            indices.lookup,
+                            solver.factor.sparse_Linv,
+                            solver.v_hat,
+                        ],
+                        outputs=[
+                            dense_rows,
+                            solver.placement.sparse_row_dof,
+                            solver.placement.sparse_row_factor,
+                            solver.placement.row_incident,
+                            solver.placement.sparse_row_support,
+                        ],
+                        block_dim=128,
+                        device=model.device,
+                    )
+                    continue
+                wp.launch(
+                    populate_joint_velocity_limit_J_for_size,
+                    dim=n_arts * int(size) * 2,
+                    inputs=[
+                        joints,
+                        self.velocity_limit_slot,
+                        self.velocity_limit_sign,
+                        solver.forest.group_to_art[size],
+                        solver.options.pgs_cfm,
+                        int(size),
+                        support,
+                    ],
+                    outputs=[solver.placement.jacobian_rows(size), dense_rows],
+                    device=model.device,
+                )
+
+        if (
+            contacts is not None
+            and getattr(contacts, "rigid_contact_count", None) is not None
+            and contacts._rigid_contact_rows > 0
+        ):
+            enable_friction_flag = 1 if solver.options.enable_contact_friction else 0
+            pool = solver.placement.contact_pool
+            count = contacts.rigid_contact_count
+            # Sized for the bound in a capture whose launches bind: every replay runs them at the live
+            # count and strides with the captured threads (ContactPool.launch); otherwise for the ready rows.
+            rows = pool.launch_rows()
+            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP)
+
+            self._build_friction_patches(solver, state_in, contacts)
+
+            # The allocator and the producers read the contacts, the bodies and the row law, and write the
+            # contacts' allocation records and their row records, through one struct
+            # (contact_input.ContactInput), bound for this step.
+            contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
+            # The friction row law every producer writes: point friction is the patch law with beta 0.
+            law = patch_row_law(solver)
+
+            # Under persistent patch friction, contacts of resolved worlds that the complete path would
+            # give rows are marked so the patch finish releases their anchors (kernels.py).
+            pool.launch(
+                allocate_world_contact_slots,
+                contact_build_threads,
+                inputs=[
+                    contact_input,
+                    contact_build_threads,
+                    solver.forest.body_to_articulation,
+                    solver.forest.art_to_world,
+                    model.body_flags,
+                    solver.forest.body_has_response_dofs,
+                    is_free_rigid,
+                    has_free_rigid_flag,
+                    solver.options.contact_gap_gate,
+                    solver.options.same_articulation_contact_gap_gate,
+                    solver.options.articulation_pair_contact_gap_gate,
+                    max_constraints,
+                    solver.placement.mf_max_constraints,
+                    enable_friction_flag,
+                    solver.options.contact_friction_gap_threshold,
+                    1,
+                    self.friction_patches.view,
+                    solver.sweep.resolved_worlds,
+                ],
+                outputs=[
+                    solver.placement.slot_counter,
+                    mf_slot_counter,
+                    dense_dropped_rows,
+                    mf_dropped_rows,
+                    solver.placement.dense_first_rejected_slot,
+                    mf_first_rejected_slot,
+                ],
+                extent=count,
+                clamp=True,
+            )
+            if contacts.rigid_contacts_pair_sorted:
+                solver.placement.place_sorted_contact_rows(
+                    contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot
+                )
+
+            # The class's case names the producer that writes every contact row (contact_row_plan):
+            # get_path_selection() records the same plan (routes.contact_rows).
+            plan = contact_row_plan(solver)
+            if plan.producer == "local_packets":
+                solver.placement.row_packets.produce_contacts(contact_input)
+            elif plan.producer == "keyed_rows":
+                solver.placement.keyed_rows.produce_contacts(contact_input)
+            elif plan.producer == "compact_contact_boundary":
+                from .compact_contact import launch_contacts  # noqa: PLC0415
+
+                launch_contacts(solver, contact_input, contact_build_threads)
+            elif plan.producer in SHARED_METADATA_PRODUCERS:
+                if plan.metadata_launch:
+                    pool.launch(
+                        prepare_world_contact_rows,
+                        contact_build_threads,
+                        inputs=[contact_input, contact_build_threads, law],
+                        extent=count,
+                        clamp=True,
+                    )
+                contact_jacobian_workers = min(rows, _CONTACT_JACOBIAN_WORKER_CAP)
+                for size in solver.forest.size_groups:
+                    method = plan.methods[size]
+                    if method == "sparse_response":
+                        indices = solver.factor.sparse_mass_matrix_indices
+                        sparse_contact_workers = min(
+                            contact_build_threads,
+                            contact_jacobian_workers * 32 // solver.placement.sparse_contact_lanes,
+                        )
+                        pool.launch(
+                            solver.placement.sparse_contact_response_kernel,
+                            sparse_contact_workers * solver.placement.sparse_contact_lanes,
+                            inputs=[
+                                contact_input,
+                                sparse_contact_workers,
+                                solver.forest.art_group_idx,
+                                solver.forest.is_free_rigid,
+                                solver.forest.articulation_world_dof_offset,
+                                solver.placement.sparse_body_dof_mask,
+                                law,
+                                indices.permutation,
+                                indices.row_offsets,
+                                solver.factor.sparse_Linv,
+                                solver.placement.sparse_free_factor_dummy,
+                            ],
+                            outputs=[
+                                solver.placement.sparse_row_dof,
+                                solver.placement.sparse_row_factor,
+                                # The record builder writes the triplet records in the free-response
+                                # slot, which the support table's routes leave unused.
+                                solver.placement.sparse_row_free_response
+                                if solver.placement.sparse_contact_records is None
+                                else solver.placement.sparse_contact_records,
+                                solver.placement.row_incident,
+                                solver.placement.sparse_row_support,
+                            ],
+                            extent=count,
+                            scale=solver.placement.sparse_contact_lanes,
+                            clamp=True,
+                            block_dim=128,
+                        )
+                        continue
+                    if method == "sparse_diagonal":
+                        continue  # sparse_pair_contact_rows_kernel below writes these rows.
+                    pool.launch(
+                        populate_world_J_for_compact_size,
+                        (contact_jacobian_workers, 32),
+                        inputs=[
+                            contact_input,
+                            contact_jacobian_workers,
+                            size,
+                            solver.forest.art_group_idx,
+                            law,
+                            support,
+                        ],
+                        outputs=[solver.placement.jacobian_rows(size)],
+                        extent=count,
+                        clamp=True,
+                    )
+                if plan.producer == "sparse_diagonal":
+                    # The dense builder has 32 lanes per worker. Give the scalar
+                    # builder the contact-build thread budget; its live-prefix
+                    # stride covers larger counts without visiting unused slots.
+                    sparse_contact_response_workers = contact_build_threads
+                    pool.launch(
+                        response_builds_rows.sparse_pair_contact_rows_kernel,
+                        sparse_contact_response_workers,
+                        inputs=[
+                            solver.placement.dense_first,
+                            contact_input,
+                            sparse_contact_response_workers,
+                            solver.placement.sparse_diagonal_response_size,
+                            solver.forest.articulation_world_dof_offset,
+                            solver.forest.body_single_response_dof,
+                            solver.factor.diagonal_inverse_mass,
+                            law,
+                        ],
+                        outputs=[solver.placement.sparse_diagonal_row_dof, solver.placement.sparse_diagonal_row_z],
+                        extent=count,
+                        clamp=True,
+                    )
+                    if (
+                        solver.placement.sparse_diagonal_contact_triples
+                        or solver.placement.sparse_diagonal_contact_units
+                    ):
+                        pool.launch(
+                            solver.sweep.sparse_contact_marker,
+                            contact_build_threads,
+                            inputs=[solver.placement.dense_first, contact_input, contact_build_threads],
+                            outputs=[solver.placement.sparse_diagonal_row_dof],
+                            extent=count,
+                            clamp=True,
+                        )
+            else:
+                # The masked builder: a prelude writes the row records and per-contact flags, then one
+                # thread per (contact, DOF) writes the Jacobian; one launch pair serves the combined sizes.
+                flags = solver.placement.rows_prelude_flags
+                rows_threads = min(rows, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
+                combined_done = False
+                for size in solver.forest.size_groups:
+                    method = plan.methods[size]
+                    if method in ("masked_combined", "masked"):
+                        if method == "masked_combined":
+                            if combined_done:
+                                continue
+                            combined_done = True
+                            size_a = plan.combined[0]
+                            size_b = plan.combined[1] if len(plan.combined) > 1 else -1
+                            lanes = max(size_a, size_b)
+                            jacobian_threads = rows_threads * lanes
+                        else:
+                            size_a, size_b, lanes, jacobian_threads = size, -1, size, rows_threads * 32
+                        J_a = solver.placement.jacobian_rows(size_a)
+                        J_b = solver.placement.jacobian_rows(size_b) if size_b > 0 else J_a
+                        pool.launch(
+                            contact_row_prelude,
+                            rows_threads * 3,
+                            inputs=[contact_input, rows_threads * 3, size_a, size_b, law],
+                            outputs=[flags],
+                            extent=count,
+                            scale=3,
+                            clamp=True,
+                        )
+                        pool.launch(
+                            populate_world_J_masked,
+                            jacobian_threads,
+                            inputs=[
+                                contact_input,
+                                jacobian_threads,
+                                size_a,
+                                size_b,
+                                solver.forest.art_group_idx,
+                                law,
+                                flags,
+                                support,
+                            ],
+                            outputs=[J_a, J_b],
+                            extent=count,
+                            scale=lanes,
+                            clamp=True,
+                        )
+                        continue
+                    pool.launch(
+                        populate_world_J_for_size,
+                        contact_build_threads,
+                        inputs=[
+                            contact_input,
+                            contact_build_threads,
+                            size,
+                            solver.forest.art_group_idx,
+                            solver.forest.body_to_joint,
+                            model.joint_ancestor,
+                            model.joint_qd_start,
+                            law,
+                            support,
+                        ],
+                        outputs=[solver.placement.jacobian_rows(size)],
+                        extent=count,
+                        clamp=True,
+                    )
+
+            # Build MF contact rows
+            if mf_active:
+                pool.launch(
+                    build_mf_contact_rows,
+                    contact_build_threads,
+                    inputs=[
+                        bind_mf_rows(solver.placement),
+                        contact_input,
+                        contact_build_threads,
+                        int(solver.forest.has_prescribed_response),
+                        law,
+                    ],
+                    extent=count,
+                    clamp=True,
+                )
+
+            if mf_active:
+                wp.launch(
+                    finalize_constraint_counts_with_status,
+                    dim=solver.forest.world_count,
+                    inputs=[
+                        solver.placement.mf_slot_counter,
+                        solver.placement.mf_max_constraints,
+                        1,
+                        solver.placement.mf_first_rejected_slot,
+                    ],
+                    outputs=[solver.placement.mf_constraint_count, solver.placement.constraint_capacity_status],
+                    device=model.device,
+                )
+
+                # ── MF warm-start seed ────────────────────────────────────
+                # contact_slot + mf_row_type are now populated for THIS step.
+                # mf_impulses was already memset at the top of this method
+                # (covers vel-limit rows, padding tail, and any contact that
+                # returns early in the gather); here we gather matched contacts'
+                # previous impulses into their current slots by identity. The
+                # carry itself lives in ws_prev_mf_impulses.
+                if solver.options.pgs_warmstart:
+                    match_index = getattr(contacts, "rigid_contact_match_index", None)
+                    if match_index is None:
+                        raise NotImplementedError(
+                            "FeatherPGS mf_warmstart=True requires the Contacts buffer to be "
+                            "created with contact_matching enabled (rigid_contact_match_index "
+                            "is None). Build the CollisionPipeline / Contacts with "
+                            'contact_matching="latest" (or "sticky").'
+                        )
+                    pool.launch(
+                        gather_mf_warmstart,
+                        rows,
+                        inputs=[
+                            bind_contact_routes(solver, contacts),
+                            bind_mf_rows(solver.placement),
+                            match_index,
+                            solver.placement.ws_prev_slot_sorted,
+                            solver.placement.ws_prev_mf_impulses,
+                            solver.placement.ws_prev_mf_row_type,
+                            solver.placement.ws_prev_mf_row_parent,
+                            solver.placement.mf_constraint_count,
+                            solver.placement.ws_prev_contact_normal,
+                            solver.options.pgs_warmstart_decay,
+                            # Carried support impulses are proportional to dt, so
+                            # rescale by the exact step-size ratio (1 at fixed dt).
+                            dt / solver.sweep.prev_dt if solver.sweep.prev_dt > 0.0 else 1.0,
+                            solver.placement.mf_max_constraints,
+                        ],
+                        outputs=[solver.placement.mf_impulses],
+                        extent=count,
+                        max_blocks=solver.placement.contact_capacity_blocks,
+                    )
+
+        # Rigid-body velocity limits are matrix-free rows, not post-solve
+        # clamps, in the MF path. Allocate after contacts so they occupy the
+        # last MF slots; the fused PGS kernel also solves row_type=4 in a
+        # final phase so articulated and rigid velocity-limit rows are both
+        # visited after drive/contact/friction/position-limit rows.
+        if mf_active:
+            # Contact/friction rows all precede velocity-limit rows in the MF
+            # slot space (the classifier completes before the vlim allocation
+            # below). Record the partition boundary so the GS kernels can loop
+            # only the contact prefix in contact phases and only the vlim tail
+            # in velocity-limit phases instead of scanning all rows.
+            wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
+        if mf_active and solver.placement.rigid_velocity_limit_slot is not None:
+            # Dummy when no articulation metadata exists; the kernel only
+            # reads it for free-rigid roots, which then cannot occur.
+            root_dof_start = (
+                solver.forest.articulation_root_dof_start
+                if solver.forest.articulation_root_dof_start is not None
+                else wp.zeros((1,), dtype=wp.int32, device=model.device)
+            )
+            wp.launch(
+                allocate_rigid_velocity_limit_slots,
+                dim=solver.forest.free_rigid_body_count,
+                inputs=[
+                    bind_free_bodies(solver),
+                    model.body_flags,
+                    root_dof_start,
+                    solver.v_hat,
+                    solver.options.velocity_limit_activation_fraction,
+                    solver.placement.mf_max_constraints,
+                    solver.sweep.resolved_worlds,
+                ],
+                outputs=[
+                    solver.placement.rigid_velocity_limit_slot,
+                    solver.placement.mf_slot_counter,
+                    solver.placement.mf_first_rejected_slot,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                populate_rigid_velocity_limit_rows,
+                dim=solver.forest.free_rigid_body_count,
+                inputs=[
+                    bind_free_bodies(solver),
+                    bind_mf_rows(solver.placement),
+                    solver.placement.rigid_velocity_limit_slot,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                finalize_constraint_counts_with_status,
+                dim=solver.forest.world_count,
+                inputs=[
+                    solver.placement.mf_slot_counter,
+                    solver.placement.mf_max_constraints,
+                    1,
+                    solver.placement.mf_first_rejected_slot,
+                ],
+                outputs=[solver.placement.mf_constraint_count, solver.placement.constraint_capacity_status],
+                device=model.device,
+            )
+
+        if solver.placement.row_packets is not None:
+            solver.placement.row_packets.finish_rows()
+        wp.launch(
+            finalize_constraint_counts_with_status,
+            dim=solver.forest.world_count,
+            inputs=[solver.placement.slot_counter, max_constraints, 0, solver.placement.dense_first_rejected_slot],
+            outputs=[solver.placement.constraint_count, solver.placement.constraint_capacity_status],
+            device=model.device,
+        )
+        if solver.placement.sparse_prepare_contacts:
+            wp.launch(
+                finalize_sparse_joint_limit_rows,
+                dim=solver.forest.world_count,
+                inputs=[solver.placement.dense_phase_bounds, solver.placement.constraint_count, dense_rows, dt],
+                device=model.device,
+            )
+        if solver.placement.keyed_rows is not None:
+            solver.placement.keyed_rows.finish_rows()
+        # The patch link runs after every row producer: the keyed rows' general worlds take their records last.
+        self._link_friction_patches(solver, contacts)
+        solver.placement.latch_status(contacts)
+        solver.sweep.claim()
+        solver.placement.warn_overflow()
+
+    def write_rhs(self, solver, dt: float) -> None:
+        """Each dense row's rhs: its bias, or a bouncing contact's rebound (``compute_world_contact_bias``)."""
+        if (
+            solver.placement.sparse_prepare_contacts
+            or solver.placement.row_packets is not None
+            or solver.placement.keyed_rows is not None
+        ):
+            return  # These rows write their own right-hand sides.
+        # A world's lanes: its capacity, up to a block.
+        lanes = min(solver.placement.dense_max_constraints, BIAS_LANES)
+        wp.launch(
+            compute_world_contact_bias,
+            dim=(solver.forest.world_count, lanes),
+            inputs=[
+                bind_dense_rows(solver.placement),
+                solver.placement.row_incident,
+                solver.placement.constraint_count,
+                solver.placement.dense_max_constraints,
+                lanes,
+                dt,
+                solver.options.contact_speculative_scale,
+                self.contact_w,
+                self.effective_restitution_velocity_threshold,
+                int(self.set.weighted),
+                int(solver.options.contact_compliance),
+            ],
+            device=solver.model.device,
+        )
+
+    def _build_friction_patches(self, solver, state_in, contacts):
+        """Construct the shared contact law independently of the dynamics owner."""
+        if self.friction_anchors_enabled and contacts is not None:
+            self.friction_patches.build(
+                solver.model,
+                state_in,
+                contacts,
+                body_to_articulation=solver.forest.body_to_articulation,
+                is_free_rigid=solver.forest.is_free_rigid
+                if solver.forest.is_free_rigid is not None
+                else solver.placement.dummy_is_free_rigid,
+                contact_gap_gate=solver.options.contact_gap_gate,
+                same_articulation_gap_gate=solver.options.same_articulation_contact_gap_gate,
+                articulation_pair_gap_gate=solver.options.articulation_pair_contact_gap_gate,
+                friction_gap=solver.options.contact_friction_gap_threshold,
+            )
+
+    def _link_friction_patches(self, solver, contacts):
+        """Link shared normal loads before any consumer packs row metadata."""
+        if self.friction_anchors_enabled and solver.sweep.patch_frame_built(contacts):
+            self.friction_patches.link(
+                solver.placement.contact_world,
+                solver.placement.contact_slot,
+                solver.placement.contact_path,
+                solver.placement.contact_slots_needed,
+                solver.sweep.patch_routes(),
+            )

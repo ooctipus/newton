@@ -18,8 +18,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, friction_patches, path_selection, sweep_routes_tiers
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs import (
+    environment_flags,
+    friction_patches,
+    path_selection,
+    rows,
+    sweep_routes_tiers,
+)
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.step_plan import StepPlan
@@ -646,9 +651,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 with self.subTest(producer, law=law, attributes=sorted(attributes)):
                     stand_in = _plan_stand_in(law, sizes, **attributes)
                     plan = contact_row_plan(stand_in)
-                    builders = {
-                        size: path_selection._row_builder(stand_in, plan, size, solver_module) for size in plan.methods
-                    }
+                    builders = {size: path_selection._row_builder(stand_in, plan, size, rows) for size in plan.methods}
                     self.assertEqual(plan.producer, producer)
                     self.assertEqual(
                         {size: (entry["method"], entry["kernels"]) for size, entry in builders.items()}, expected
@@ -690,9 +693,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         combined masked rows, substituted in both, makes the record name the per-contact builder and the row
         build launch it, so neither can follow a decision of its own.
         """
-        self.assertIs(path_selection.contact_row_plan, solver_module.contact_row_plan)
+        self.assertIs(path_selection.contact_row_plan, rows.contact_row_plan)
         model = _cpu_free_body_model()
-        plan_rows = solver_module.contact_row_plan
+        plan_rows = rows.contact_row_plan
 
         def per_contact(solver):
             plan = plan_rows(solver)
@@ -702,7 +705,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         record = solver.get_path_selection()["routes"]["contact_rows"]
         masked = _launched_kernel_keys(model, solver)
         with (
-            patch.object(solver_module, "contact_row_plan", per_contact),
+            patch.object(rows, "contact_row_plan", per_contact),
             patch.object(path_selection, "contact_row_plan", per_contact),
         ):
             forced_record = solver.get_path_selection()["routes"]["contact_rows"]

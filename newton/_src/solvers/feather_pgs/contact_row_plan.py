@@ -3,9 +3,10 @@
 
 """Which producer writes a FeatherPGS solver's contact rows, and which builder each DOF size takes.
 
-The plan reads host state only and launches nothing. ``_stage4_build_rows``
-dispatches on it and ``get_path_selection()`` records it under
-``routes.contact_rows``, so the record names the builders that launch.
+The plan reads host state only and launches nothing. The row pass
+(:meth:`.rows.RowLaws.write`) dispatches on it and ``get_path_selection()``
+records it under ``routes.contact_rows``, so the record names the builders
+that launch.
 """
 
 import dataclasses
