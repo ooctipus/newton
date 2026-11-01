@@ -28,8 +28,8 @@ from .contact_laws import (
     contact_responds,
     contact_row_frame,
     contact_tangent_basis,
-    free_body_jacobian,
-    free_body_spin_jacobian,
+    contact_seed,
+    spin_seed,
     jacobian_entry,
     prescribed_spin_target,
     prescribed_target,
@@ -2498,18 +2498,18 @@ def build_mf_contact_rows(
         for row in range(rows):
             row_idx = slot + row
             direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
-            # A free body's row about its articulation origin: J = [d, r x d], opposite on body B; a spin row's
-            # [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
+            # A free body's row about its articulation origin: its seed against its six unit columns, J = [d, r x d],
+            # opposite on body B; a spin row's [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
             if response_body_a >= 0:
-                J_a = free_body_jacobian(direction, row_point, data.origin[art_a])
+                J_a = contact_seed(direction, row_point - data.origin[art_a])
                 if row == CONTACT_SPIN_ROW:
-                    J_a = free_body_spin_jacobian(normal)
+                    J_a = spin_seed(normal)
                 for k in range(6):
                     mf.Z_a[mf_line, row_idx, k] = J_a[k]
             if response_body_b >= 0:
-                J_b = free_body_jacobian(direction, row_point, data.origin[art_b])
+                J_b = contact_seed(direction, row_point - data.origin[art_b])
                 if row == CONTACT_SPIN_ROW:
-                    J_b = free_body_spin_jacobian(normal)
+                    J_b = spin_seed(normal)
                 for k in range(6):
                     mf.Z_b[mf_line, row_idx, k] = -J_b[k]
             free_body_contact_records(

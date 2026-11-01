@@ -20,10 +20,15 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 * :func:`prescribed_target`, the row target that prescribed bodies' motion
   imposes, and the spin row's, :func:`prescribed_spin_target`;
 * :func:`jacobian_entry`, ``J = d . (S_lin + S_ang x (p - o))`` for one motion
-  subspace column ``S`` of a body whose twists are taken about ``o``, and its
-  closed form for a free body's six unit columns, :func:`free_body_jacobian`;
-  the spin row's (contact torsion, :data:`CONTACT_SPIN_ROW`), ``J = n . S_ang``,
-  :func:`spin_entry` and :func:`free_body_spin_jacobian`.
+  subspace column ``S`` of a body whose twists are taken about ``o``, and the
+  spin row's (contact torsion, :data:`CONTACT_SPIN_ROW`), ``J = n . S_ang``,
+  :func:`spin_entry`;
+* the seed: :func:`contact_seed`, a row's wrench ``(d, r x d)`` at one of its
+  bodies, ``r`` the lever arm from the body's frame to the row's point, and the
+  spin row's torque, :func:`spin_seed`. The walk takes the seed up the body's
+  tree (:mod:`.walk_rows`); against a free body's six unit columns it is the
+  body's Jacobian row. A law takes the lever arm, not the two points, so it is
+  formed where the points are, body-relative where they are (FL33_interfaces §6).
 """
 
 import warp as wp
@@ -283,9 +288,11 @@ def jacobian_entry(motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3
 
 
 @CONTACT_LAW.law
-def free_body_jacobian(direction: wp.vec3, point: wp.vec3, origin: wp.vec3) -> wp.spatial_vector:
-    """Return a free body's Jacobian row ``[d, (p - o) x d]``: :func:`jacobian_entry` over its six unit columns."""
-    return wp.spatial_vector(direction, wp.cross(point - origin, direction))
+def contact_seed(direction: wp.vec3, lever: wp.vec3) -> wp.spatial_vector:
+    """Return a row's seed at one of its bodies: the wrench ``(d, r x d)`` of a unit force along ``direction`` whose
+    point lies at the lever arm ``lever`` from the body's frame (the second body's is negated). Against a free body's
+    six unit columns at its frame it is the body's Jacobian row, :func:`jacobian_entry` over each column."""
+    return wp.spatial_vector(direction, wp.cross(lever, direction))
 
 
 @CONTACT_LAW.law
@@ -296,8 +303,9 @@ def spin_entry(motion: wp.spatial_vector, normal: wp.vec3) -> float:
 
 
 @CONTACT_LAW.law
-def free_body_spin_jacobian(normal: wp.vec3) -> wp.spatial_vector:
-    """Return a free body's spin row ``[0, n]``: :func:`spin_entry` over its six unit columns."""
+def spin_seed(normal: wp.vec3) -> wp.spatial_vector:
+    """Return a spin row's seed at one of its bodies, the torque ``(0, n)`` about the normal, wherever the body's frame
+    is: against a free body's six unit columns, :func:`spin_entry` over each column."""
     return wp.spatial_vector(wp.vec3(0.0), normal)
 
 

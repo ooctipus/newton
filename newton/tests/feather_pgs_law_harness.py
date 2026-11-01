@@ -371,11 +371,11 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "point": vec(3.0),
             "origin": vec(3.0),
         }
-    if name == "free_body_jacobian":
-        return {"direction": unit_vectors(rng, n), "point": vec(3.0), "origin": vec(3.0)}
+    if name == "contact_seed":
+        return {"direction": unit_vectors(rng, n), "lever": vec(3.0)}
     if name == "spin_entry":
         return {"motion": rng.normal(size=(n, 6)).astype(np.float32), "normal": unit_vectors(rng, n)}
-    if name == "free_body_spin_jacobian":
+    if name == "spin_seed":
         return {"normal": unit_vectors(rng, n)}
     if name == "prescribed_spin_target":
         return {

@@ -34,7 +34,7 @@ from __future__ import annotations
 import warp as wp
 
 from .contact_input import ContactInput, contact_frame
-from .contact_laws import CONTACT_SPIN_ROW, contact_row_frame
+from .contact_laws import CONTACT_SPIN_ROW, contact_row_frame, contact_seed, spin_seed
 from .dense_rows import (
     UNIT_CONTACT,
     UNIT_LIMIT,
@@ -89,14 +89,15 @@ def walk_wrench(
 
 @wp.func
 def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, torque: bool) -> wp.spatial_vector:
-    """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), as a wrench
-    at the body's frame at the step's poses (:attr:`.tree_factor.WalkTrees.now_link`), where the walk's columns
-    ``now`` hold the step's ``J``: ``(d, (p - o) x d)``, or ``(0, d)``."""
+    """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), by the
+    contact law (:func:`.contact_laws.contact_seed`, :func:`.contact_laws.spin_seed`): a wrench at the body's frame at
+    the step's poses (:attr:`.tree_factor.WalkTrees.now_link`), where the walk's columns ``now`` hold the step's
+    ``J``. The lever arm is the world points' difference here; the law takes it from wherever it is formed."""
     if torque:
-        return wp.spatial_vector(wp.vec3(0.0), direction)
+        return spin_seed(direction)
     j = walk.body_joint[body]
     frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
-    return wp.spatial_vector(direction, wp.cross(point - frame, direction))
+    return contact_seed(direction, point - frame)
 
 
 @wp.func

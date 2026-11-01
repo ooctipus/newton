@@ -505,11 +505,11 @@ def _law_mf_jacobian(
     art_a = contact_art_a[c]
     art_b = contact_art_b[c]
     if body_a >= 0 and art_a >= 0 and articulation_response_dof_count[art_a] > 0:
-        J = contact_laws.free_body_jacobian(direction, row_point, articulation_origin[art_a])
+        J = contact_laws.contact_seed(direction, row_point - articulation_origin[art_a])
         for k in range(6):
             mf_Z_a[0, slot, k] = J[k]
     if body_b >= 0 and art_b >= 0 and articulation_response_dof_count[art_b] > 0:
-        J = contact_laws.free_body_jacobian(direction, row_point, articulation_origin[art_b])
+        J = contact_laws.contact_seed(direction, row_point - articulation_origin[art_b])
         for k in range(6):
             mf_Z_b[0, slot, k] = -J[k]
     if row == 0:
@@ -525,7 +525,7 @@ def _law_mf_jacobian(
     )
 
 
-def test_free_body_jacobian_matches_mf_contact_rows(test, device):
+def test_contact_seed_matches_mf_contact_rows(test, device):
     """Equal ``build_mf_contact_rows`` bitwise: free-body Jacobians, gaps, coefficients and targets of every row."""
     rng = np.random.default_rng(33)
     contacts = 256

@@ -54,7 +54,7 @@ from .contact_laws import (
     contact_restitution,
     contact_row_entry,
     contact_row_frame,
-    free_body_jacobian,
+    contact_seed,
     prescribed_spin_target,
     prescribed_target,
 )
@@ -2012,16 +2012,16 @@ def factor_contact_rows_kernel(
                 # Jacobian [d, (p - o) x d], whose product with a motion column is that column's Jacobian entry.
                 if art_a >= 0 and data.response_dofs[art_a] > 0:
                     origin_a = data.origin[art_a]
-                    normal_a = wp.spatial_bottom(free_body_jacobian(normal, point, origin_a))
+                    normal_a = wp.spatial_bottom(contact_seed(normal, point - origin_a))
                     if row_count > 1:
-                        tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point, origin_a))
-                        tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point, origin_a))
+                        tangent0_a = wp.spatial_bottom(contact_seed(tangent0, friction_point - origin_a))
+                        tangent1_a = wp.spatial_bottom(contact_seed(tangent1, friction_point - origin_a))
                 if art_b >= 0 and data.response_dofs[art_b] > 0:
                     origin_b = data.origin[art_b]
-                    normal_b = wp.spatial_bottom(free_body_jacobian(normal, point, origin_b))
+                    normal_b = wp.spatial_bottom(contact_seed(normal, point - origin_b))
                     if row_count > 1:
-                        tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point, origin_b))
-                        tangent1_b = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point, origin_b))
+                        tangent0_b = wp.spatial_bottom(contact_seed(tangent0, friction_point - origin_b))
+                        tangent1_b = wp.spatial_bottom(contact_seed(tangent1, friction_point - origin_b))
                 angular_a = wp.matrix_from_rows(normal_a, tangent0_a, tangent1_a)
                 angular_b = wp.matrix_from_rows(normal_b, tangent0_b, tangent1_b)
                 directions = wp.matrix_from_rows(normal, tangent0, tangent1)
