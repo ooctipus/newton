@@ -410,9 +410,8 @@ def forecast_pair(
 
 
 @wp.func
-def forecast_add(
+def forecast_count(
     forecast: ShapeForecast,
-    thread: int,
     shape_a: int,
     shape_b: int,
     box_lower: wp.array[wp.vec3],
@@ -420,18 +419,55 @@ def forecast_add(
     shape_body: wp.array[int],
     body_flags: wp.array[int],
     include_static_kinematic_pairs: bool,
-):
-    """On a forecasting pass, add a pair's forecast contacts (:func:`forecast_pair`) to the counter of ``thread``'s
-    warp (one address a warp, which the hardware adds once), under the immovable-pair rule its broad phase applies to
-    an overlapping pair."""
+) -> wp.int64:
+    """A pair's forecast contacts (:func:`forecast_pair`) on a forecasting pass, zero otherwise, under the
+    immovable-pair rule its broad phase applies to an overlapping pair. A thread sums the pairs it tests and adds the
+    sum once (:func:`forecast_flush`)."""
     if not forecasting(forecast):
-        return
+        return wp.int64(0)
     contacts = forecast_pair(shape_a, shape_b, box_lower, box_upper, forecast)
     if contacts == 0:
-        return
+        return wp.int64(0)
     if is_shape_pair_immovable_filtered(shape_a, shape_b, shape_body, body_flags, include_static_kinematic_pairs):
-        return
-    wp.atomic_add(forecast.slots, (thread >> 5) % forecast.slots.shape[0], wp.int64(contacts))
+        return wp.int64(0)
+    return wp.int64(contacts)
+
+
+_FORECAST_FLUSH = r"""
+#if defined(__CUDA_ARCH__)
+    // A full warp whose lanes each hold under 2^26 contacts sums them in one 32-bit reduction and lane 0 adds the
+    // sum; any other warp (a grid's tail, a lane with more) adds lane by lane.
+    const unsigned active = __activemask();
+    long long value = (long long)contacts;
+    if (active == 0xffffffffu && __all_sync(0xffffffffu, value >= 0 && value < (1ll << 26))) {
+        unsigned sum = (unsigned)value;
+#if __CUDA_ARCH__ >= 800
+        sum = __reduce_add_sync(0xffffffffu, sum);
+#else
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+#endif
+        value = (threadIdx.x & 31) == 0 ? (long long)sum : 0ll;
+    }
+    if (value != 0)
+        atomicAdd((unsigned long long*)&slots.data[(thread >> 5) % slots.shape[0]], (unsigned long long)value);
+#else
+    if (contacts != 0)
+        slots.data[(thread >> 5) % slots.shape[0]] += contacts;
+#endif
+"""
+
+
+@wp.func_native(_FORECAST_FLUSH)
+def _forecast_flush(slots: wp.array[wp.int64], thread: int, contacts: wp.int64): ...
+
+
+@wp.func
+def forecast_flush(forecast: ShapeForecast, thread: int, contacts: wp.int64):
+    """On a forecasting pass, add the forecast contacts ``thread`` summed (:func:`forecast_count`) to its warp's counter,
+    once a warp. Every thread of the launch calls it at one point of its kernel, before any return."""
+    if forecasting(forecast):
+        _forecast_flush(forecast.slots, thread, contacts)
 
 
 # Collision filtering

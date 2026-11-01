@@ -137,8 +137,9 @@ broad phase's own pass on the largest suite task (keyboard-so101, 59M pairs). On
 of its step. The horizon counts the passes between (:meth:`ContactPool.horizon`)."""
 
 FORECAST_SLOTS = 16
-"""Counters the broad phase adds a forecast into, by warp: the record sums them in one unrolled loop, and no counter
-sees every warp's atomic."""
+"""Counters the broad phase adds a forecast into, by warp: every broad phase adds once a warp (a thread sums the pairs
+it tests, a warp sums its threads), the record sums the counters in one unrolled loop, and no counter sees every warp's
+atomic."""
 
 FILL_SCALE = 10000
 """Units of the record's fill: the largest demand of a pass over its ready rows, times this."""

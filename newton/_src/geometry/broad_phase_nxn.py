@@ -29,7 +29,8 @@ from .broad_phase_common import (
     FORECAST_TERRAIN,
     ShapeForecast,
     check_aabb_overlap_moving,
-    forecast_add,
+    forecast_count,
+    forecast_flush,
     forecasting,
     is_pair_excluded,
     is_shape_pair_immovable_filtered,
@@ -102,22 +103,25 @@ def _nxn_broadphase_precomputed_pairs_forecast(
     max_candidate_pair: int,
     forecast: ShapeForecast,
 ):
-    """:func:`_nxn_broadphase_precomputed_pairs` on a forecasting pass, which adds each pair's forecast."""
+    """:func:`_nxn_broadphase_precomputed_pairs` on a forecasting pass, which adds the pairs' forecast once a warp."""
     elementid = wp.tid()
 
     pair = nxn_shape_pair[elementid]
     shape1 = pair[0]
     shape2 = pair[1]
-    forecast_add(
+    forecast_flush(
         forecast,
         elementid,
-        shape1,
-        shape2,
-        shape_bounding_box_lower,
-        shape_bounding_box_upper,
-        shape_body,
-        body_flags,
-        include_static_kinematic_pairs,
+        forecast_count(
+            forecast,
+            shape1,
+            shape2,
+            shape_bounding_box_lower,
+            shape_bounding_box_upper,
+            shape_body,
+            body_flags,
+            include_static_kinematic_pairs,
+        ),
     )
 
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
@@ -698,27 +702,31 @@ def _nxn_broadphase_kernel(
     # Skip pairs where both geometries are global (world -1), unless we're in the dedicated -1 segment
     # The dedicated -1 segment is the last segment (world_id >= num_regular_worlds)
     is_dedicated_minus_one_segment = world_id >= num_regular_worlds
-    if world1 == -1 and world2 == -1 and not is_dedicated_minus_one_segment:
-        return
-
+    tested = not (world1 == -1 and world2 == -1 and not is_dedicated_minus_one_segment)
     # Check both world and collision groups
-    if not test_world_and_group_pair(world1, world2, collision_group1, collision_group2):
-        return
+    if tested:
+        tested = test_world_and_group_pair(world1, world2, collision_group1, collision_group2)
 
-    if forecasting(forecast) and (
-        num_filter_pairs == 0 or not is_pair_excluded(wp.vec2i(shape1, shape2), filter_pairs, num_filter_pairs)
-    ):
-        forecast_add(
-            forecast,
-            tid,
-            shape1,
-            shape2,
-            shape_bounding_box_lower,
-            shape_bounding_box_upper,
-            shape_body,
-            body_flags,
-            include_static_kinematic_pairs,
-        )
+    # A forecasting pass adds its pairs' forecast once a warp: every thread gets here before returning.
+    if forecasting(forecast):
+        contacts = wp.int64(0)
+        if tested and (
+            num_filter_pairs == 0 or not is_pair_excluded(wp.vec2i(shape1, shape2), filter_pairs, num_filter_pairs)
+        ):
+            contacts = forecast_count(
+                forecast,
+                shape1,
+                shape2,
+                shape_bounding_box_lower,
+                shape_bounding_box_upper,
+                shape_body,
+                body_flags,
+                include_static_kinematic_pairs,
+            )
+        forecast_flush(forecast, tid, contacts)
+
+    if not tested:
+        return
 
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
