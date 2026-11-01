@@ -14,7 +14,6 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.held_tree import TreeSparseOperator
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
@@ -58,10 +57,7 @@ def fixture(floating, device, *, permuted=True, motion=False):
     count = model.joint_dof_count // arts
     mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver.placement.sparse_mass_matrix_size = count
-    solver.factor.sparse_mass_matrix_plan = mass
-    solver.factor.sparse_mass_matrix_indices = factor_indices(mass, device)
-    solver.factor.sparse_Linv = wp.zeros((arts, mass.nonzero_count), dtype=float, device=device)
-    solver.factor.sparse_mass_matrix_status = wp.zeros(arts, dtype=int, device=device)
+    solver.factor.allocate_sparse(mass, arts)
     solver.factor.sparse_factor_warps_per_block = 4
     groups = np.array([3, 0, 5, 1, 4, 2] if permuted else list(range(arts)), np.int32)
     solver.forest.group_to_art[count].assign(groups)
