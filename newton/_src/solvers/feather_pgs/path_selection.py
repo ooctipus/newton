@@ -346,8 +346,8 @@ def _row_builder(solver, plan, size, source) -> dict:
     (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
     of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
     build in the sweep (``direct_rows`` points to routes.sweep.tiers), and the free-body matrix-free
-    rows, which build_mf_contact_rows writes for the contacts the allocation routes to them
-    (routes.free_rigid_bodies).
+    rows, which build_mf_contact_rows (or, where the placement walks, walk_rows.write_free_body_rows) writes for the
+    contacts the allocation routes to them (routes.free_rigid_bodies).
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"

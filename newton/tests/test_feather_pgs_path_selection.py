@@ -980,7 +980,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """A branched arm with a free body per world stays dense with the tree cache, under patch friction too.
 
         Sparse factors admit the arm alone. On the dense route patch friction keeps the bundle that makes
-        it worth taking: contact units in the paired factor sweep, masked rows and the resolved-world classifier.
+        it worth taking: contact units in the paired factor sweep, the one writer's walked rows (case K5 walks,
+        FL3.3) and the resolved-world classifier.
         """
         model = _branched_arm_and_box()
         for law, beta in (("patch", None), ("point", 0.0)):
@@ -993,16 +994,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertIn("free rigid bodies", selected["reasons"]["sparse_mass_matrix"])
                 self.assertEqual(selected["cached_prediction"], "tree")
                 self.assertTrue(routes["paired_response"]["factor_coordinates"])
-                # Masked rows build both sizes in one launch pair, under either friction law.
-                kernels = ["contact_row_prelude", "populate_world_J_masked"]
-                builder = {"method": "masked_combined", "kernels": kernels, "law": law}
+                # The one writer walks both sizes' rows, under either friction law.
+                kernels = ["write_contact_units", "write_walked_rows"]
+                builder = {"method": "walk", "kernels": kernels, "law": law}
+                self.assertEqual(routes["contact_rows"]["producer"], "walk")
                 self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"18": builder, "6": builder})
                 if law == "patch":
                     self.assertTrue(routes["paired_response"]["contact_units"])
-                    self.assertEqual(
-                        routes["contact_rows"]["general_method_by_dof"],
-                        {"18": "masked_combined", "6": "masked_combined"},
-                    )
                     self.assertTrue(routes["resolved_worlds"]["enabled"], routes["resolved_worlds"]["reason"])
                     self.assertIn("patch-friction rows", routes["resolved_worlds"]["reason"])
 
@@ -1010,7 +1008,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_route_record_names_every_launched_row_builder(self):
         """Name in builder_by_dof exactly the contact-row builders one CUDA step launches, under both laws.
 
-        Native sparse factors, the compact Jacobian and combined masked rows on the dense route. The compact contact
+        Native sparse factors, the compact Jacobian and the one writer of a tree beside its body (case K5). The
+        masked builders' plan-to-record mapping is checked on host stand-ins. The compact contact
         boundary and the sparse-diagonal owner (both laws), local row packets and keyed rows (both
         laws) are checked in their own modules, keyed rows also on CPU stand-ins
         (test_cpu_record_names_every_launched_row_builder), and every producer's plan-to-record
@@ -1029,12 +1028,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 dict.fromkeys(("6", "1"), "compact_jacobian"),
             ),
             (
-                "masked_combined",
+                "walk",
                 arm,
                 {},
                 lambda beta: _make_solver(arm, True, friction_anchor_beta=beta, dense_max_constraints=96),
-                "general",
-                dict.fromkeys(("18", "6"), "masked_combined"),
+                "walk",
+                dict.fromkeys(("18", "6"), "walk"),
             ),
         )
         for name, model, environment, build, producer, methods in cases:

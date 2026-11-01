@@ -1131,16 +1131,23 @@ class Placement:
         return 0
 
     def whiten_free_bodies(self, v_hat: wp.array, dt: float):
-        """MF PGS setup: whiten the free-body rows through each body's held factor, their diagonals and RHS."""
+        """MF PGS setup: the free-body rows' diagonals and RHS, each row whitened through its body's held factor, or
+        by the walk where the placement walks (:func:`.walk_rows.free_body_headers_kernel`: the writer walked them)."""
         model = self.model
         self.mf_eff_mass_inv.zero_()
+        if self.walks:
+            from .walk_rows import free_body_headers_kernel  # noqa: PLC0415
+
+            build, operands = free_body_headers_kernel, (self.factor.walk_view(), self.forest.body_to_articulation)
+        else:
+            build, operands = response_builds_rows.free_body_rows_kernel, (self.factor.view(),)
         wp.launch(
-            response_builds_rows.free_body_rows_kernel,
+            build,
             dim=self.forest.world_count * self.mf_max_constraints,
             inputs=[
                 bind_mf_rows(self),
                 self.mf_constraint_count,
-                self.factor.view(),
+                *operands,
                 int(self.forest.has_prescribed_response),
                 v_hat,
                 self.laws.rigid_body_max_depenetration_velocity,

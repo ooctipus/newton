@@ -356,7 +356,8 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
                     met = walk.meet(k, w_k, l, w_l)
                     out.meet = max(out.meet, abs(met - z_k @ z_l) / (np.linalg.norm(z_k) * np.linalg.norm(z_l)))
     body_art = forest.body_to_articulation.numpy()
-    if capture.mf is not None:
+    # The walked free-body rows form no J (walk_rows): test_feather_pgs_walk_rows holds them to their J v_hat.
+    if capture.mf is not None and not getattr(solver.placement, "walks", False):
         (J_a, J_b), (Z_a, Z_b) = capture.mf
         _, _, _, counts, body_a, body_b, _, _, kinds = capture.mf_final
         for world, count in enumerate(counts):

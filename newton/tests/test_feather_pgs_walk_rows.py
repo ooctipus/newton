@@ -23,6 +23,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.tree_factor import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_walk import BOUND, ROUNDING, catalogue, run_route
@@ -312,30 +313,39 @@ class TestSlipRelease(unittest.TestCase):
 
 
 def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
-    """The general worlds' walked rows against their physical ``J v_hat`` and the step's leave against the float64
-    walk's, as ratios to their rounding: ``n u |Z_i| |u_hat|`` (and ``u`` of the incident velocity), and ``n u kappa
-    |dv|`` (FL3.1's leave bound) with the publication's rounding of ``v_hat`` and ``v_out``. A free rigid body (its own 6x6 factor until the free
-    bodies convert), a tree whose drives slip this step (its rows carry the release, :class:`TestSlipRelease`) and the
-    closure's corrected rows (``test_feather_pgs_preelim``) are left to their own checks."""
+    """The general worlds' walked rows, the dense rows and the free bodies' (the bodies sink), against their physical
+    ``J v_hat`` and the step's leave against the float64 walk's, as ratios to their rounding: ``n u |Z_i| |u_hat|``
+    (and ``u`` of the incident velocity), and ``n u kappa |dv|`` (FL3.1's leave bound) with the publication's rounding
+    of ``v_hat`` and ``v_out``. A free rigid body is a one-body tree of six coordinates. A tree whose drives slip this
+    step (its rows carry the release, :class:`TestSlipRelease`), the closure's corrected rows (``test_feather_pgs_preelim``)
+    and a world whose speed ball acted (its ``du`` is a law's, not ``sum Z lambda``) are left to their own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
-    out = {"rows": 0.0, "leave": 0.0, "worlds": 0}
+    out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0}
     sizes = forest.articulation_response_dof_count.numpy()
     offsets = forest.articulation_world_dof_offset.numpy()
     starts = forest.articulation_dof_start.numpy()
     art_world = forest.art_to_world.numpy()
-    free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(sizes.size, dtype=np.int32)
+    body_art = forest.body_to_articulation.numpy()
     slips = factor.walk_view().release.count.numpy()
     dense = bool(placement.packed_dense)
     incident = placement.row_incident.numpy().astype(np.float64)
     sides_all = placement.row_sides.numpy()
     counts = placement.constraint_count.numpy()
     first = placement.dense_first.numpy()
-    walks = {}
+    walks, hats = {}, {}
 
     def walk_of(art):
         if art not in walks:
             walks[art] = factor.walk(joint_q, art)
         return walks[art]
+
+    def u_hat_of(art):
+        """``u_hat = L^T P v_hat`` by the float64 walk: the coordinates an articulation's rows read."""
+        if art not in hats:
+            n = int(sizes[art])
+            inverse, _ = walk_of(art).up(covector=np.eye(n))
+            hats[art] = np.linalg.solve(inverse.T, capture.v_hat[int(starts[art]) : int(starts[art]) + n])
+        return hats[art]
 
     for world in range(int(forest.world_count)):
         line, count = int(first[world]), int(counts[world])
@@ -351,14 +361,10 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                 n, offset = int(sizes[art]), int(offsets[art])
                 entries = slice(offset if dense else at, (offset if dense else at) + n)
                 at += n
-                if free[art] or slips[art] or solver.factor.eliminates:
+                if slips[art] or solver.factor.eliminates:
                     skip = True
                     break
-                walk = walk_of(art)
-                v_hat = capture.v_hat[int(starts[art]) : int(starts[art]) + n]
-                # u_hat = L^T P v_hat by the float64 walk: the coordinates its rows read.
-                inverse, _ = walk.up(covector=np.eye(n))
-                u_hat = np.linalg.solve(inverse.T, v_hat)
+                u_hat = u_hat_of(art)
                 Z = capture.Z_final[line, row, entries]
                 term += Z @ u_hat
                 scale_z, scale_u = scale_z + Z @ Z, scale_u + u_hat @ u_hat
@@ -369,13 +375,38 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
             if bound > 0.0:
                 out["rows"] = max(out["rows"], abs(term - incident[line, row]) / bound)
         out["worlds"] += 1
+    # The free bodies' rows: each side a six-step walk, against the incident velocity the writer summed.
+    ball = np.zeros(int(forest.world_count), dtype=bool)
+    free_du = {}
+    if capture.mf_final is not None:
+        Z_a, Z_b, lam, mf_counts, body_a, body_b, _dof_a, _dof_b, kinds = capture.mf_final
+        mf_incident = placement.mf_row_incident.numpy().astype(np.float64)
+        for world, count in enumerate(mf_counts):
+            line = int(capture.mf_first[world])
+            for row in range(int(count)):
+                if kinds[line, row] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                    ball[world] |= lam[line, row] != 0.0
+                    continue
+                term, scale_z, scale_u = 0.0, 0.0, 0.0
+                for body, Z in ((body_a, Z_a), (body_b, Z_b)):
+                    if body[line, row] < 0:
+                        continue
+                    art = int(body_art[body[line, row]])
+                    z, u_hat = Z[line, row], u_hat_of(art)
+                    term += z @ u_hat
+                    scale_z, scale_u = scale_z + z @ z, scale_u + u_hat @ u_hat
+                    free_du[art] = free_du.get(art, 0.0) + z * lam[line, row]
+                incident_row = mf_incident[line, row]
+                bound = 6 * ROUNDING * np.sqrt(scale_z * scale_u) + ROUNDING * abs(incident_row)
+                if bound > 0.0:
+                    out["free_rows"] = max(out["free_rows"], abs(term - incident_row) / bound)
     # The leave: the published dv against the float64 walk's leave of the step's du (the final rows' Z lambda).
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
-        if world < 0 or n == 0 or free[art] or slips[art] or solver.factor.eliminates:
+        if world < 0 or n == 0 or slips[art] or solver.factor.eliminates or ball[world]:
             continue
         line, count = int(first[world]), int(counts[world])
-        du = np.zeros(n)
+        du = np.zeros(n) + free_du.get(art, 0.0)
         for row in range(count):
             at = 0
             for side in sides_all[line, row]:
@@ -388,6 +419,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
                     du += capture.Z_final[line, row, start : start + m] * capture.impulses[line, row]
         if not np.any(du):
             continue
+        out["free_bodies"] += int(art in free_du)
         dofs = int(starts[art]) + np.arange(n)
         dv = capture.v_out[dofs] - capture.v_hat[dofs]
         walk = walk_of(art)
@@ -404,19 +436,23 @@ class TestWalkedPlacement(unittest.TestCase):
     """Every walked row of the CPU catalogue's general worlds against its physical ``J``, and the leave in its frame."""
 
     def test_one_frame_on_the_cpu_catalogue(self):
-        worst = {"rows": 0.0, "leave": 0.0}
-        worlds = 0
+        worst = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0}
+        worlds = free_bodies = 0
         for physics, route in catalogue():
             solver, joint_q, capture = run_route(physics, route, device="cpu", steps=4)
             if not solver.placement.walks:
                 continue
             result = walked_frames(solver, joint_q, capture)
             worlds += result["worlds"]
+            free_bodies += result["free_bodies"]
             for key, value in worst.items():
                 worst[key] = max(value, result[key])
         # FL3.1 measured the walk's rows at 1.68 and its leave at 2.30 of their rounding (n u kappa).
         self.assertGreater(worlds, 0)
+        # The free bodies walk too: their rows and leave are held to the same rounding.
+        self.assertGreater(free_bodies, 0)
         self.assertLess(worst["rows"], BOUND, worst)
+        self.assertLess(worst["free_rows"], BOUND, worst)
         self.assertLess(worst["leave"], BOUND, worst)
 
 

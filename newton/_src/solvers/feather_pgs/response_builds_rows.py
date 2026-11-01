@@ -232,6 +232,57 @@ def free_body_row_rhs(
     return rhs, row_w
 
 
+@wp.func
+def free_body_row_header(
+    mf: MfRows,
+    line: int,
+    i: int,
+    incident: float,
+    inverse: float,
+    has_target_velocity: int,
+    rigid_body_max_depenetration_velocity: wp.array[float],
+    pgs_beta: float,
+    contact_w: float,
+    dt: float,
+    contact_speculative_scale: float,
+    restitution_velocity_threshold: float,
+    weighted: int,
+    material: int,
+    mf_eff_mass_inv: wp.array2d[float],
+    mf_row_w: wp.array2d[float],
+):
+    """Free-body row ``i``'s header from its incident velocity ``J v_hat`` and stored inverse diagonal ``1 / A_ii``:
+    both stored, then its ``rhs`` (:func:`free_body_row_rhs`). ``weighted`` rows store their relative regularization
+    weight; a material contact (``material``: its writer stored its rhs and compliance ``eps``) keeps its rhs."""
+    row_type = mf.row_type[line, i]
+    mf.incident[line, i] = incident
+    mf_eff_mass_inv[line, i] = inverse
+    if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        if mf.eps[line, i] > 0.0:
+            return
+    target = float(0.0)
+    if has_target_velocity != 0:
+        target = mf.target[line, i]
+    rhs, row_w = free_body_row_rhs(
+        mf.body_a[line, i],
+        mf.body_b[line, i],
+        row_type,
+        mf.phi[line, i],
+        target,
+        mf.restitution[line, i],
+        incident,
+        rigid_body_max_depenetration_velocity,
+        pgs_beta,
+        contact_w,
+        dt,
+        contact_speculative_scale,
+        restitution_velocity_threshold,
+    )
+    mf.rhs[line, i] = rhs
+    if weighted != 0:
+        mf_row_w[line, i] = row_w
+
+
 @wp.kernel(enable_backward=False)
 def free_body_rows_kernel(
     mf: MfRows,
@@ -253,12 +304,11 @@ def free_body_rows_kernel(
     mf_eff_mass_inv: wp.array2d[float],
     mf_row_w: wp.array2d[float],
 ):
-    """Whiten each free-body row (:func:`free_body_response`) and form its ``rhs`` (:func:`free_body_row_rhs`).
+    """Whiten each free-body row (:func:`free_body_response`) and store its header (:func:`free_body_row_header`).
 
-    One thread per row slot (``world * mf_max_constraints + row``). A row first stores its incident velocity
-    ``J v_hat`` from the writers' ``J`` (a speed row, which carries no ``J``, zero). ``weighted`` rows store their
-    relative regularization weight; a material contact (``material``: its writer stored its rhs and compliance
-    ``eps``) keeps its rhs.
+    One thread per row slot (``world * mf_max_constraints + row``). A row's incident velocity ``J v_hat`` comes from
+    the writers' ``J`` (a speed row, which carries no ``J``, zero). A class whose placement walks writes its rows by
+    the walk and builds them with :func:`.walk_rows.free_body_headers_kernel`.
     """
     tid = wp.tid()
     world = tid // mf_max_constraints
@@ -269,7 +319,6 @@ def free_body_rows_kernel(
     body_a = mf.body_a[mf_line, i]
     body_b = mf.body_b[mf_line, i]
     row_type = mf.row_type[mf_line, i]
-    restitution = mf.restitution[mf_line, i]
     incident = float(0.0)
     if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
         incident = free_body_jacobian_velocity(
@@ -283,34 +332,25 @@ def free_body_rows_kernel(
             factors.dof_start,
             incident_velocity,
         )
-    mf.incident[mf_line, i] = incident
-    mf_eff_mass_inv[mf_line, i] = free_body_response(
-        mf.Z_a, mf.Z_b, mf_line, i, body_a, body_b, row_type, factors, pgs_cfm
-    )
-    if material != 0 and row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        if mf.eps[mf_line, i] > 0.0:
-            return
-    target = float(0.0)
-    if has_target_velocity != 0:
-        target = mf.target[mf_line, i]
-    rhs, row_w = free_body_row_rhs(
-        body_a,
-        body_b,
-        row_type,
-        mf.phi[mf_line, i],
-        target,
-        restitution,
+    inverse = free_body_response(mf.Z_a, mf.Z_b, mf_line, i, body_a, body_b, row_type, factors, pgs_cfm)
+    free_body_row_header(
+        mf,
+        mf_line,
+        i,
         incident,
+        inverse,
+        has_target_velocity,
         rigid_body_max_depenetration_velocity,
         pgs_beta,
         contact_w,
         dt,
         contact_speculative_scale,
         restitution_velocity_threshold,
+        weighted,
+        material,
+        mf_eff_mass_inv,
+        mf_row_w,
     )
-    mf.rhs[mf_line, i] = rhs
-    if weighted != 0:
-        mf_row_w[mf_line, i] = row_w
 
 
 @wp.kernel(enable_backward=False)

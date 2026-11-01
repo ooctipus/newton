@@ -93,6 +93,44 @@ MF_GS_ABI = kernel_template.params(
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch)."""
 
 
+def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") -> str:
+    """Articulation ``art``'s tree leaves the walk's coordinates in place on its ``size`` values at the native pointer
+    ``values``: ``dv = P^T L^-T R^T du``, the slips' release transposed first where the class can slip (``frame``,
+    :func:`.tree_factor.walk_release_kernel`), then the walk down (``WALK_DOWN`` of
+    :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch). Every placement that walks its rows
+    leaves by it, so the rows and the leave share one frame (FL3_design §1.2)."""
+    slipped = ""
+    if frame:
+        slipped = f"""{{
+    // The slips' release: du <- R^T du, the last slip first, each along its path root first
+    // (tree_factor.walk_release_kernel).
+    const auto& release = walk.release;
+    const int slips = release.count.data[{art}];
+    const int cap = release.b.shape[1], steps = release.b.shape[2];
+    for (int j = slips - 1; j >= 0; --j) {{
+        const size_t at = ((size_t){art} * cap + j) * steps;
+        const int* coordinate = release.coordinate.data + at;
+        const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
+        float t = 0.0f;
+        for (int k = steps - 1; k >= 0; --k) {{
+            const int c = coordinate[k];
+            if (c < 0) continue;
+            const float x = g[k] * {values}[c] + a[k] * t;
+            {values}[c] = x;
+            t -= b[k] * x;
+        }}
+    }}
+}}
+"""
+    text = f"""{{
+const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];
+{slipped}WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0, {size});
+WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK}, {values}, {values},
+          reinterpret_cast<float*>(walk.scratch.data + j0));
+}}"""
+    return indent(text, pad)
+
+
 class FactorCoordinates:
     """The articulations a matrix-free sweep's velocity change touches, and their way back (native).
 
@@ -119,6 +157,29 @@ class FactorCoordinates:
     def factor(self, first: str) -> str:
         """The native index in ``factors.L`` of the free body whose first world coordinate is ``first``."""
         return f"{self.op.factors}.dof_factor.data[world_dof_indices.data[dof_map_base + {first}]]"
+
+    def _walked(self, first: str, call: str) -> str:
+        """``call`` (a walk of :func:`.tree_factor.walk_paths_prelude` on ``data``, ``link`` and ``twist``) on the tree
+        whose first world coordinate is ``first``."""
+        return f"""{{
+    const int body_art = {self.op.factors}.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
+    const int j0 = walk.joint_start.data[body_art], d0 = walk.dof_start.data[body_art];
+    const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
+    const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
+    float twist[6];
+    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[body_art] - j0,
+              walk.dofs.data[body_art]);
+    {call};
+}}"""
+
+    def walk_leave(self, first: str, values: str) -> str:
+        """The walk down of the free body (a one-body tree) whose first world coordinate is ``first``, in place on its
+        six ``values``: ``v = P^T L^-T u``."""
+        return self._walked(first, f"WALK_DOWN(data, link, {values}, {values}, twist)")
+
+    def walk_enter(self, first: str, velocity: str, out: str) -> str:
+        """The walk in of that free body: ``out = L^T P velocity``."""
+        return self._walked(first, f"WALK_ENTER(data, link, {velocity}, {out}, twist)")
 
     @classmethod
     def clear(cls, dofs: int, lane: str) -> str:
@@ -150,44 +211,21 @@ class FactorCoordinates:
         self, dofs: int, thread: str, threads: str, sync: str, *, walk: bool = False, frame: bool = False
     ) -> str:
         """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
-        general placement's one writer, :mod:`.walk_rows`) a tree leaves by the walk down (``WALK_DOWN`` of
-        :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch), with ``frame`` (a class whose
-        drives can saturate) after its rows' release's transpose ``R^T``; a free rigid body keeps its 6x6 factor."""
+        general placement's one writer, :mod:`.walk_rows`) every tree, a free rigid body's six coordinates too, leaves
+        by the walk down (``WALK_DOWN`` of :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch),
+        with ``frame`` (a class whose drives can saturate) after its rows' frame."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731
-        walked = ""
-        if walk:
-            slipped = ""
-            if frame:
-                slipped = """            {
-                // The slips' release: du <- R^T du, the last slip first, each along its path root first
-                // (tree_factor.walk_release_kernel).
-                const auto& release = walk.release;
-                const int slips = release.count.data[art];
-                const int cap = release.b.shape[1], steps = release.b.shape[2];
-                for (int j = slips - 1; j >= 0; --j) {
-                    const size_t at = ((size_t)art * cap + j) * steps;
-                    const int* coordinate = release.coordinate.data + at;
-                    const float *b = release.b.data + at, *a = release.a.data + at, *g = release.g.data + at;
-                    float t = 0.0f;
-                    for (int k = steps - 1; k >= 0; --k) {
-                        const int c = coordinate[k];
-                        if (c < 0) continue;
-                        const float x = g[k] * s_v[d + c] + a[k] * t;
-                        s_v[d + c] = x;
-                        t -= b[k] * x;
-                    }
-                }
-            }
-"""
-            walked = f"""        if (walk.free.data[art] == 0) {{
-            const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
-{slipped}            WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, size);
-            WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},
-                      &s_v[d], &s_v[d], reinterpret_cast<float*>(walk.scratch.data + j0));
-            continue;
+        # The factor's way back: the walk down, or the leaf-first L^-T (a free body's six coordinates unrolled).
+        leave = f"""        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
+        if (size == 6) {{
+{indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
+        }} else {{
+{indent(CholeskySolve("size", "factor").leave(coordinates, coordinates), "            ")}
         }}
 """
+        if walk:
+            leave = walk_leave("art", "(&s_v[d])", "size", frame=frame, pad="        ") + "\n"
         return f"""for (int w = {thread}; w < {self.words(dofs)}; w += {threads}) {{
     unsigned bits = s_factor_marks[w];
     while (bits != 0u) {{
@@ -195,13 +233,7 @@ class FactorCoordinates:
         bits &= bits - 1u;
         const int art = {factors}.first_art.data[world_dof_indices.data[dof_map_base + d]];
         const int size = {factors}.size.data[art];
-{walked}        const float* factor = reinterpret_cast<const float*>({factors}.address.data[art]);
-        if (size == 6) {{
-{indent(CholeskySolve(6, "factor", unroll=True).leave(coordinates, coordinates), "            ")}
-        }} else {{
-{indent(CholeskySolve("size", "factor").leave(coordinates, coordinates), "            ")}
-        }}
-    }}
+{leave}    }}
 }}
 {sync}"""
 
@@ -694,6 +726,9 @@ def mf_gs_source(
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows)
     bodies = FACTOR_COORDINATES
     free_op = FreeBodyZ(row_lanes, factor=bodies.factor)
+    if walk:
+        # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows).
+        free_op = dataclasses.replace(free_op, walk_leave=bodies.walk_leave, walk_enter=bodies.walk_enter)
     staging = mf_gs_staging(
         M_D,
         M_MF,

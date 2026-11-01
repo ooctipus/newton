@@ -327,6 +327,28 @@ def free_side(
     return out
 
 
+@wp.func
+def walked_side(
+    Z: wp.array3d[float],
+    line: int,
+    row: int,
+    body: int,
+    factors: BodyFactors,
+    world: int,
+    world_offset: wp.array[int],
+    coordinates: wp.array2d[float],
+) -> float:
+    """``Z_side^T u``: one side of a walked free-body row over the walk's coordinates of the published velocity
+    (:func:`.tree_factor.walk_enter_kernel`)."""
+    if body < 0:
+        return 0.0
+    start = world_offset[factors.body_to_articulation[body]]
+    out = float(0.0)
+    for k in range(6):
+        out += Z[line, row, k] * coordinates[world, start + k]
+    return out
+
+
 @wp.kernel(enable_backward=False)
 def free_rows(
     a: AuditRows,
@@ -336,11 +358,15 @@ def free_rows(
     weights: wp.array2d[float],
     inverse_diagonals: wp.array2d[float],
     v: wp.array[float],
+    walked: int,
+    world_offset: wp.array[int],
+    coordinates: wp.array2d[float],
     velocity: wp.array2d[float],
 ):
-    """One thread per world: each free-body row's ``J_i v+ + eps_i lambda_i``. A speed row's term is ``-|v|`` of the
-    coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``, its bias the limit
-    (:func:`.projection_laws.speed_row`)."""
+    """One thread per world: each free-body row's ``J_i v+ + eps_i lambda_i``, its sides in the held factor's
+    coordinates, or with ``walked`` (a placement that walks) the walk's (``coordinates``, by world coordinate). A speed
+    row's term is ``-|v|`` of the coordinates its unwhitened axis marks, linear from ``e_0`` or angular from ``e_3``,
+    its bias the limit (:func:`.projection_laws.speed_row`)."""
     world = wp.tid()
     line = mf.first[world]
     for i in range(a.mf_counts[world]):
@@ -352,8 +378,13 @@ def free_rows(
                 start += 3
             velocity[world, i] = -wp.length(wp.vec3(v[start], v[start + 1], v[start + 2]))
             continue
-        term = free_side(mf.Z_a, line, i, body, factors, v)
-        term += free_side(mf.Z_b, line, i, mf.body_b[line, i], factors, v)
+        term = float(0.0)
+        if walked != 0:
+            term = walked_side(mf.Z_a, line, i, body, factors, world, world_offset, coordinates)
+            term += walked_side(mf.Z_b, line, i, mf.body_b[line, i], factors, world, world_offset, coordinates)
+        else:
+            term = free_side(mf.Z_a, line, i, body, factors, v)
+            term += free_side(mf.Z_b, line, i, mf.body_b[line, i], factors, v)
         inverse = inverse_diagonals[line, i]
         if inverse > 0.0:
             weight = float(1.0)
@@ -598,6 +629,9 @@ class Audit:
                 solver.placement.mf_row_w,
                 solver.placement.mf_eff_mass_inv,
                 v,
+                int(solver.placement.walks),
+                forest.articulation_world_dof_offset,
+                self.coordinates,
             ]
             wp.launch(free_rows, dim=worlds, inputs=inputs, outputs=[self.mf_velocity], device=device)
         inputs = [a, mf, solver.placement.mf_impulses, self.velocity, self.mf_velocity, self.fused]

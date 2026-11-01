@@ -656,6 +656,13 @@ class FreeBodyZ(ResponseOperator):
     k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
     factors: str = "factors"
     factor: Callable[[str], str] | None = None
+    walk_leave: Callable[[str, str], str] | None = None
+    """Where the bodies leave by the walk (a placement that walks, :mod:`.walk_rows`): the code mapping the six
+    values ``values`` of the body whose first coordinate is ``first`` back in place, ``walk_leave(first, values)``,
+    ``v = P^T L^-T u`` by the walk down, in place of the held factor's solve (:meth:`leave`)."""
+    walk_enter: Callable[[str, str, str], str] | None = None
+    """With ``walk_leave``: the code giving ``u = L^T P v`` of the six values ``velocity`` in ``out``,
+    ``walk_enter(first, velocity, out)``."""
     name = "free_body_z"
 
     def __post_init__(self):
@@ -883,11 +890,14 @@ class FreeBodyZ(ResponseOperator):
         (:meth:`leave`) on the predictor, which ``v_out`` holds through the sweep, and the magnitude, the squares added
         in coordinate order. The lanes then synchronize, so :meth:`scale_speed` may write ``u``.
         """
-        factor = self.factor(body)
+        if self.walk_leave is not None:
+            leave = self.walk_leave(body, "speed_v")
+        else:
+            leave = self.leave(lambda k: f"speed_v[{k}]", self.factor(body))
         lines = [
             "float speed_v[6];",
             "for (int k = 0; k < 6; ++k) speed_v[k] = " + self._v(body, "k") + ";",
-            self.leave(lambda k: f"speed_v[{k}]", factor),
+            leave,
             f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
             f"const float {out} = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
             f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
@@ -898,15 +908,23 @@ class FreeBodyZ(ResponseOperator):
 
     def scale_speed(self, scale: str, body: str, axis: str, indent: str) -> str:
         """``v += scale v`` on the coordinates :meth:`speed` read, as ``u += L^T dv`` (one thread, or the first lane)."""
-        factor = self.factor(body)
         lines = [
             "float speed_dv[6];",
             f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? {scale} * speed_v[k] : 0.0f;",
-            CholeskySolve(6, self.lower(factor), unroll=True).enter(
-                lambda k: f"speed_dv[{k}]", lambda k: f"speed_dv[{k}]"
-            ),
-            "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_dv[k];",
         ]
+        if self.walk_enter is not None:
+            lines += [
+                "float speed_du[6];",
+                self.walk_enter(body, "speed_dv", "speed_du"),
+                "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_du[k];",
+            ]
+        else:
+            lines += [
+                CholeskySolve(6, self.lower(self.factor(body)), unroll=True).enter(
+                    lambda k: f"speed_dv[{k}]", lambda k: f"speed_dv[{k}]"
+                ),
+                "for (int k = 0; k < 6; ++k) " + self._v(body, "k") + " += speed_dv[k];",
+            ]
         text = "\n".join(lines)
         if self.lanes.parallel:
             text = f"if ({self.lanes.lane} == 0) {{\n{text}\n}}"

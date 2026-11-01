@@ -14,15 +14,19 @@ row of a world on the world's lanes (:func:`write_walked_rows`):
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
   side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as ``J`` at the
   step's frames (:meth:`.tree_factor.TreeFactor.walk_step`) and the refresh's factor whitens it, so a step between
-  refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body keeps its own 6x6
-  factor (:func:`.response_builds_dense.whiten_six` of its six-coordinate ``J``), the frame of its free-body rows and
-  its leave until the free bodies convert;
+  refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body is a one-body tree:
+  its side is a six-step walk;
 - **the header**: the diagonal ``|z|^2 + cfm`` (the walks' sums of squares, or the row's entries where two seeds share
   a side or a side slips), the incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes, against
   ``v_hat``; a free rigid body's six) and the rhs by the row law (:func:`.kernels.row_bias`).
 
-No ``J`` is formed. The rows and the general sweep's leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``) share
-the walk's one frame (FL3_design §1.2).
+The free bodies' rows (the bodies sink, ``mf_Z_a`` and ``mf_Z_b``) take the same seeds and walks
+(:func:`write_free_body_rows`): each contact row's records by the contact law, its two sides' six-step walks and its
+incident velocity; the rows' build (:func:`.response_builds_rows.free_body_rows_kernel`) then stores the diagonal and
+the rhs.
+
+No ``J`` is formed. The rows and the sweeps' leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``; the paired
+factor sweep's) share the walk's one frame (FL3_design §1.2).
 """
 
 from __future__ import annotations
@@ -39,18 +43,19 @@ from .dense_rows import (
     UNIT_SHIFT,
     UNIT_VELOCITY,
     DenseRows,
+    MfRows,
     RowSupport,
     jacobian_row,
     unit_source,
 )
 from .friction_patches import PatchRowLaw
-from .kernels import row_bias
-from .response_builds_dense import _Vec6, whiten_six
+from .kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, free_body_contact, free_body_contact_records, row_bias
+from .response_builds_rows import free_body_row_header
 from .row_build import write_contact_row
 from .row_laws import LINK_ROWS
 from .tree_factor import WalkTrees, release_path, walk_into
 
-__all__ = ["write_contact_units", "write_walked_rows"]
+__all__ = ["free_body_headers_kernel", "write_contact_units", "write_free_body_rows", "write_walked_rows"]
 
 
 @wp.func
@@ -71,62 +76,62 @@ def walk_wrench(
 ) -> wp.vec2:
     """Walk a row's seed at ``body``, the wrench of ``sign`` along ``direction`` at ``point`` (a pure ``torque`` about
     it), into its side's entries of row ``slot``: stored, or added with ``add`` (a second seed on the same side). Return
-    its part of the incident velocity ``J v_hat`` (the step's ``J`` entries the walk passes; a free rigid body's six
-    against ``v_hat``) and the sum of its footprints' squares. The wrench is taken at the body's frame at the step's
-    poses, where the walk's columns ``now`` hold the step's ``J``. A body without response coordinates adds nothing."""
+    its part of the incident velocity ``J v_hat`` (the step's ``J`` entries the walk passes) and the sum of its
+    footprints' squares. A body without response coordinates adds nothing."""
     if body < 0 or art < 0:
         return wp.vec2(0.0)
     if support.dofs[art] <= 0:
         return wp.vec2(0.0)
-    j = walk.body_joint[body]
-    j0 = walk.joint_start[art]
-    d = direction * sign
-    frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
-    w = wp.spatial_vector(d, wp.cross(point - frame, d))
-    if torque:
-        w = wp.spatial_vector(wp.vec3(0.0), d)
     at = jacobian_row(support, 0, art, sides)
-    if walk.free[art] != 0:
-        # A free rigid body's own 6x6 factor: its six coordinates' J at the step's poses, whitened; its incident J v_hat.
-        d0 = walk.dof_start[art]
-        J = _Vec6()
-        incident = float(0.0)
-        for c in range(6):
-            column = wp.spatial_vector(
-                walk.now[d0 + c, 0],
-                walk.now[d0 + c, 1],
-                walk.now[d0 + c, 2],
-                walk.now[d0 + c, 3],
-                walk.now[d0 + c, 4],
-                walk.now[d0 + c, 5],
-            )
-            J[c] = wp.dot(column, w)
-            incident += J[c] * v_hat[d0 + c]
-        z = whiten_six(walk.L6, walk.group[art], J)
-        squares = float(0.0)
-        for c in range(6):
-            if add != 0:
-                packed_Z[at[0], slot, at[1] + c] += z[c]
-            else:
-                packed_Z[at[0], slot, at[1] + c] = z[c]
-            squares += z[c] * z[c]
-        return wp.vec2(incident, squares)
+    wrench = body_wrench(walk, body, sign * direction, point, torque)
+    return walk_body(walk, art, body, wrench, v_hat, add, packed_Z, at[0], slot, at[1])
+
+
+@wp.func
+def body_wrench(walk: WalkTrees, body: int, direction: wp.vec3, point: wp.vec3, torque: bool) -> wp.spatial_vector:
+    """The seed of a row acting on ``body`` along ``direction`` at ``point`` (a pure ``torque`` about it), as a wrench
+    at the body's frame at the step's poses (:attr:`.tree_factor.WalkTrees.now_link`), where the walk's columns
+    ``now`` hold the step's ``J``: ``(d, (p - o) x d)``, or ``(0, d)``."""
+    if torque:
+        return wp.spatial_vector(wp.vec3(0.0), direction)
+    j = walk.body_joint[body]
+    frame = wp.vec3(walk.now_link[j, 4], walk.now_link[j, 5], walk.now_link[j, 6])
+    return wp.spatial_vector(direction, wp.cross(point - frame, direction))
+
+
+@wp.func
+def walk_body(
+    walk: WalkTrees,
+    art: int,
+    body: int,
+    wrench: wp.spatial_vector,
+    v_hat: wp.array[float],
+    add: int,
+    sink: wp.array3d[float],
+    line: int,
+    slot: int,
+    entry: int,
+) -> wp.vec2:
+    """Walk ``wrench`` at ``body``'s frame up articulation ``art``'s tree into ``sink[line, slot, entry + c]``
+    (:func:`.tree_factor.walk_into`): the packed rows' sides and the free bodies' six entries take their footprints
+    from here."""
+    j0 = walk.joint_start[art]
     return walk_into(
         walk,
         j0,
         walk.dof_start[art],
         walk.joint_end[art] - j0,
         walk.dofs[art],
-        j - j0,
-        w,
+        walk.body_joint[body] - j0,
+        wrench,
         -1,
         0.0,
         v_hat,
         add,
-        packed_Z,
-        at[0],
+        sink,
+        line,
         slot,
-        at[1],
+        entry,
     )
 
 
@@ -206,6 +211,160 @@ def write_contact_units(data: ContactInput, total_threads: int, law: PatchRowLaw
             continue
         write_contact_row(data, law, c, r, False)
         units[data.first[data.world[c]], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+
+
+@wp.kernel(enable_backward=False)
+def write_free_body_rows(
+    mf: MfRows,
+    data: ContactInput,
+    total_threads: int,
+    has_target_velocity: int,
+    law: PatchRowLaw,
+    walk: WalkTrees,
+    v_hat: wp.array[float],
+):
+    """The bodies sink: each free-body contact row (``path`` 1, grid-stride over the contacts) by its law, its records
+    (:func:`.kernels.free_body_contact_records`), each responding body's seed walked into its six entries (``mf_Z_a``,
+    ``mf_Z_b``; the second body's negated, a spin row a torque about the normal) and its incident velocity ``J v_hat``.
+    The rows' build stores their diagonals and rhs (:func:`.response_builds_rows.free_body_rows_kernel`)."""
+    for c in range(wp.tid(), data.count[0], total_threads):
+        slot = data.slot[c]
+        if data.path[c] != 1 or slot < 0:
+            continue
+        mf_line = mf.first[data.world[c]]
+        art_a = data.art0[c]
+        art_b = data.art1[c]
+        body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
+        response_a, response_b, mu, restitution, stiffness, rows = free_body_contact(data, c, body_a, body_b)
+        for row in range(rows):
+            direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
+            spin = row == CONTACT_SPIN_ROW
+            incident = float(0.0)
+            if response_a >= 0:
+                wrench = body_wrench(walk, response_a, direction, row_point, spin)
+                incident += walk_body(walk, art_a, response_a, wrench, v_hat, 0, mf.Z_a, mf_line, slot + row, 0)[0]
+            if response_b >= 0:
+                wrench = body_wrench(walk, response_b, -direction, row_point, spin)
+                incident += walk_body(walk, art_b, response_b, wrench, v_hat, 0, mf.Z_b, mf_line, slot + row, 0)[0]
+            mf.incident[mf_line, slot + row] = incident
+            free_body_contact_records(
+                mf,
+                data,
+                law,
+                has_target_velocity,
+                c,
+                slot,
+                row,
+                body_a,
+                body_b,
+                response_a,
+                response_b,
+                normal,
+                phi,
+                direction,
+                row_point,
+                mu,
+                restitution,
+                stiffness,
+            )
+
+
+@wp.kernel(enable_backward=False)
+def free_body_headers_kernel(
+    mf: MfRows,
+    mf_constraint_count: wp.array[int],
+    walk: WalkTrees,
+    body_to_articulation: wp.array[int],
+    has_target_velocity: int,
+    v_hat: wp.array[float],
+    rigid_body_max_depenetration_velocity: wp.array[float],
+    pgs_cfm: float,
+    pgs_beta: float,
+    contact_w: float,
+    dt: float,
+    contact_speculative_scale: float,
+    restitution_velocity_threshold: float,
+    mf_max_constraints: int,
+    weighted: int,
+    material: int,
+    # outputs
+    mf_eff_mass_inv: wp.array2d[float],
+    mf_row_w: wp.array2d[float],
+):
+    """The walked free-body rows' build, one thread per row slot: each row's header
+    (:func:`.response_builds_rows.free_body_row_header`) from the incident velocity its walks summed
+    (:func:`write_free_body_rows`) and its diagonal ``A_ii = cfm + |Z_a|^2 + |Z_b|^2``. A speed row keeps its axis
+    ``e_k`` unwhitened (its law reads the body's velocity, :meth:`.response_operator.FreeBodyZ.speed`): its diagonal
+    takes the walk of the covector ``e_k``, ``|L^-1 P e_k|^2``, and its incident is zero."""
+    tid = wp.tid()
+    world = tid // mf_max_constraints
+    i = tid % mf_max_constraints
+    if i >= mf_constraint_count[world]:
+        return
+    line = mf.first[world]
+    body_a = mf.body_a[line, i]
+    body_b = mf.body_b[line, i]
+    diagonal = pgs_cfm
+    incident = float(0.0)
+    if mf.row_type[line, i] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+        if body_a >= 0:
+            art = body_to_articulation[body_a]
+            j0 = walk.joint_start[art]
+            d0 = walk.dof_start[art]
+            k = int(0)
+            if mf.Z_a[line, i, 3] != 0.0:
+                k = 3
+            seed = walk_into(
+                walk,
+                j0,
+                d0,
+                walk.joint_end[art] - j0,
+                walk.dofs[art],
+                walk.dof_body[d0 + k],
+                wp.spatial_vector(),
+                k,
+                1.0,
+                v_hat,
+                -1,
+                mf.Z_a,
+                line,
+                i,
+                0,
+            )
+            diagonal += seed[1]
+    else:
+        incident = mf.incident[line, i]
+        if body_a >= 0:
+            squares = float(0.0)
+            for k in range(6):
+                squares += mf.Z_a[line, i, k] * mf.Z_a[line, i, k]
+            diagonal += squares
+        if body_b >= 0:
+            squares = float(0.0)
+            for k in range(6):
+                squares += mf.Z_b[line, i, k] * mf.Z_b[line, i, k]
+            diagonal += squares
+    inverse = float(0.0)
+    if diagonal > 0.0:
+        inverse = 1.0 / diagonal
+    free_body_row_header(
+        mf,
+        line,
+        i,
+        incident,
+        inverse,
+        has_target_velocity,
+        rigid_body_max_depenetration_velocity,
+        pgs_beta,
+        contact_w,
+        dt,
+        contact_speculative_scale,
+        restitution_velocity_threshold,
+        weighted,
+        material,
+        mf_eff_mass_inv,
+        mf_row_w,
+    )
 
 
 @wp.kernel(enable_backward=False)

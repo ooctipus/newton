@@ -5,9 +5,11 @@
 
 The rows' build whitens each side, ``Z = L^-1 P J^T`` with the body's held leaf-first factor ``L`` (``L_by_size[6]``
 at its articulation's group index, ``P`` the coordinates reversed; factor coordinate ``i`` of ``Z`` at position
-``5 - i``), so a test that checks a row against physical velocities recovers ``J = P^T L Z``. A speed row keeps its
-unwhitened axis. :func:`sweep_free_body_rows` runs rows a test writes through the general sweep. The module defines
-no tests.
+``5 - i``), so a test that checks a row against physical velocities recovers ``J = P^T L Z``. Where the placement
+walks (:mod:`.walk_rows`) a side is the walk of the body's seed, ``z_c = (J_c - sum_{k > c} (s_c . ut_k) z_k) /
+ell_c`` over its six coordinates from the last, so ``J_c = ell_c z_c + sum_{k > c} (s_c . ut_k) z_k`` from the walk's
+data. A speed row keeps its unwhitened axis. :func:`sweep_free_body_rows` runs rows a test writes through the general
+sweep. The module defines no tests.
 """
 
 import inspect
@@ -27,10 +29,23 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     """
     Z_a = solver.placement.mf_Z_a.numpy() if Z_a is None else np.asarray(Z_a)
     Z_b = solver.placement.mf_Z_b.numpy() if Z_b is None else np.asarray(Z_b)
-    factors = solver.factor.L_by_size[6].numpy().astype(np.float64)
     articulation = solver.forest.body_to_articulation.numpy()
     group = solver.forest.art_group_idx.numpy()
     row_type = solver.placement.mf_row_type.numpy()
+    if getattr(solver.placement, "walks", False):
+        data = solver.factor.walk_view().data.numpy().astype(np.float64)
+        starts = solver.forest.articulation_dof_start.numpy()
+
+        def physical(art, z):
+            d = data[starts[art] : starts[art] + 6]
+            return np.array([z[c] / d[c, 12] + sum(d[c, :6] @ d[k, 6:12] * z[k] for k in range(c + 1, 6)) for c in range(6)])
+
+    else:
+        factors = solver.factor.L_by_size[6].numpy().astype(np.float64)
+
+        def physical(art, z):
+            return (factors[group[art]] @ z[::-1])[::-1]
+
     jacobians = []
     for Z, bodies in ((Z_a, solver.placement.mf_body_a.numpy()), (Z_b, solver.placement.mf_body_b.numpy())):
         J = Z.astype(np.float64).copy()
@@ -38,7 +53,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
             (bodies[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
         )
         for world, row in zip(worlds, rows, strict=True):
-            J[world, row] = (factors[group[articulation[bodies[world, row]]]] @ J[world, row][::-1])[::-1]
+            J[world, row] = physical(articulation[bodies[world, row]], J[world, row])
         jacobians.append(J)
     return tuple(jacobians)
 

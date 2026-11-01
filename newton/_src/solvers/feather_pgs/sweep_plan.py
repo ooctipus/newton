@@ -828,6 +828,8 @@ class Sweep:
         self.paired_factor_secondary_groups_by_world = None
         self.paired_factor_primary_offsets_by_world = None
         self.paired_factor_secondary_offsets_by_world = None
+        self.paired_factor_primary_arts_by_world = None
+        self.paired_factor_secondary_arts_by_world = None
         if self.paired_factor_coordinates:
             primary_arts = self.forest.group_to_art_host[response_pair[0]]
             secondary_arts = self.forest.group_to_art_host[response_pair[1]]
@@ -835,6 +837,9 @@ class Sweep:
             secondary_groups = np.empty(self.forest.world_count, dtype=np.int32)
             primary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
             secondary_offsets = np.empty(self.forest.world_count, dtype=np.int32)
+            # Each world's two articulations: where the walk's leave finds their trees (sweep_routes_local).
+            primary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
+            secondary_by_world = np.full(self.forest.world_count, -1, dtype=np.int32)
             articulation_world = self.forest.articulation_world
             articulation_dof_start = self.forest.articulation_dof_start_host
             for primary_group, primary_art in enumerate(primary_arts):
@@ -843,6 +848,8 @@ class Sweep:
                 secondary_art = int(secondary_arts[secondary_group])
                 primary_groups[world] = primary_group
                 secondary_groups[world] = secondary_group
+                primary_by_world[world] = int(primary_art)
+                secondary_by_world[world] = secondary_art
                 primary_first = articulation_dof_start[primary_art] < articulation_dof_start[secondary_art]
                 primary_offsets[world] = 0 if primary_first else response_pair[1]
                 secondary_offsets[world] = response_pair[0] if primary_first else 0
@@ -853,6 +860,10 @@ class Sweep:
             self.paired_factor_primary_offsets_by_world = wp.array(primary_offsets, dtype=wp.int32, device=model.device)
             self.paired_factor_secondary_offsets_by_world = wp.array(
                 secondary_offsets, dtype=wp.int32, device=model.device
+            )
+            self.paired_factor_primary_arts_by_world = wp.array(primary_by_world, dtype=wp.int32, device=model.device)
+            self.paired_factor_secondary_arts_by_world = wp.array(
+                secondary_by_world, dtype=wp.int32, device=model.device
             )
 
     def plan_tier_rows(self) -> None:
@@ -1117,6 +1128,9 @@ class Sweep:
                 contact_units=self.factor_coordinate_contact_units,
                 weighted=self.laws.set.weighted,
                 torsion=self.laws.contact_torsion_enabled,
+                # The rows the one writer walked leave by the walk, the slips' release where a drive can saturate.
+                walk=bool(self.placement.walks),
+                walk_frame=bool(self.placement.walks) and self.factor.walk_slip_capacity > 0,
             )
             if self.paired_factor_coordinates
             else None
@@ -1695,6 +1709,14 @@ class Sweep:
             wp.get_stream(self.model.device).record_event(self.paired_general_ready)
             factor_stream.wait_event(self.paired_general_ready)
 
+        walked = {}
+        if factor_kernel is not None and self.placement.walks:
+            walked = {
+                "walk": self.factor.walk_view(),
+                "primary_art_by_world": self.paired_factor_primary_arts_by_world,
+                "secondary_art_by_world": self.paired_factor_secondary_arts_by_world,
+            }
+
         def launch_factor_solve():
             with self.timed(f"factor_pgs_iters{iterations}"):
                 self._launch(
@@ -1715,6 +1737,7 @@ class Sweep:
                     secondary_group_by_world=self.paired_factor_secondary_groups_by_world,
                     primary_offset_by_world=self.paired_factor_primary_offsets_by_world,
                     secondary_offset_by_world=self.paired_factor_secondary_offsets_by_world,
+                    **walked,
                 )
 
         if factor_kernel is not None and factor_stream is None:

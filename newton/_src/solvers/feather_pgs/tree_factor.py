@@ -987,11 +987,6 @@ class TreeFactor:
         body_joint = np.full(max(int(model.body_count), 1), -1, dtype=np.int32)
         body_joint[: joint_of.size] = joint_of[: body_joint.size]
         view.body_joint = wp.array(body_joint, dtype=wp.int32, device=device)
-        free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(1, dtype=np.int32)
-        view.free = wp.array(np.asarray(free, dtype=np.int32), dtype=wp.int32, device=device)
-        view.group = forest.art_group_idx
-        six = self.L_by_size.get(6)
-        view.L6 = six if six is not None and six.shape[1] == 6 else wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
         # The slips' release (walk_release_kernel): as many slips per tree as it has limited, driven coordinates (from
         # the model's gains and effort limits, data-sized), at most RELEASE_SLIPS; none without a limited drive. Each
         # slip's release is stored by its path's steps, leaf first, as deep as the class's deepest root path.
@@ -1063,7 +1058,7 @@ class TreeFactor:
         tree published in ``state.body_q``: every tree's step geometry, each coordinate's column at its body's frame and
         each body's link and frame point, where the rows' seeds enter as ``J``; and on the trees the refresh just
         factored (``mass_update_mask``), the inward pass, so the step's geometry becomes the factor's frames. A free
-        rigid body takes its geometry only (it keeps its 6x6 factor)."""
+        rigid body is a one-body tree: its walk is its six coordinates' factor."""
         if self.walk_arts is None:
             return
         model = self.model
@@ -1094,7 +1089,6 @@ class TreeFactor:
                 self.walk_armature,
                 self.drive_row_by_dof,
                 self.aug_row_K if self.parallel_drives else self._arrays.placeholder(wp.float32),
-                self.walk_trees.free,
             ],
             outputs=[self.walk_now, self.walk_now_link, self.walk_data, self.walk_link, self.walk_inertia],
             block_dim=WALK_STEP_THREADS,
@@ -1725,9 +1719,8 @@ class WalkTrees:
       (:meth:`TreeFactor.walk_step`, every step): a seed enters the walk as ``J`` there, so a held factor (a step
       between refreshes) whitens the step's ``J``, and a row's incident ``J v_hat`` is summed along its walk;
     - ``scratch``: the leave's and the audit's twists;
-    - each articulation's first joint, joint end, first coordinate and coordinates, and whether it is a free rigid
-      body (``free``), whose rows and leave keep its own 6x6 factor (``L6`` at ``group``) until the free bodies
-      convert;
+    - each articulation's first joint, joint end, first coordinate and coordinates (a free rigid body is a one-body
+      tree of six coordinates);
     - ``dof_body``: each coordinate's body within its tree; ``body_joint``: each body's joint;
     - ``release``: the slips' release of each tree (the block primitive's first phase, :class:`WalkRelease`), so that
       the rows take ``R``, the leave ``R^T`` and the audit's coordinates ``R^-T``.
@@ -1745,15 +1738,11 @@ class WalkTrees:
     dofs: wp.array[int]
     dof_body: wp.array[int]
     body_joint: wp.array[int]
-    free: wp.array[int]
-    group: wp.array[int]
-    L6: wp.array3d[float]
     release: WalkRelease
 
 
 _ENTER = """    if (tid >= arts.shape[0]) return;
     const int art = arts.data[tid];
-    if (walk.free.data[art] != 0) return;
     const int world = art_to_world.data[art], offset = world_offset.data[art];
     if (world < 0 || offset < 0) return;
     const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
@@ -1784,8 +1773,7 @@ _ENTER = """    if (tid >= arts.shape[0]) return;
 @functools.cache
 def walk_enter_kernel() -> wp.Kernel:
     """Each held tree's coordinates of a velocity in the walk's frame, ``u = L^T P v`` (``WALK_ENTER``), a thread per
-    tree, at its world coordinates: what the audit reads the walked rows against (:mod:`.audit`). A free rigid body
-    keeps its 6x6 factor's."""
+    tree, at its world coordinates: what the audit reads the walked rows against (:mod:`.audit`)."""
     from .kernel_template import THREADS, KernelTemplate  # noqa: PLC0415
 
     return KernelTemplate(
@@ -1813,9 +1801,9 @@ _WALK_INTO = """    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + join
     const float* v = qd.data + dof0;
     float incident = 0.0f, squares = 0.0f;
     const auto sink = [&](int, int c, float z, float j) {
-        if (add != 0)
+        if (add > 0)
             row[c] += z;
-        else
+        else if (add == 0)
             row[c] = z;
         squares += z * z;
         incident += j * v[c];
@@ -1866,9 +1854,9 @@ def walk_into(
 ) -> wp.vec2:
     """Walk one row's seed into ``out[line, slot, entry + c]``: a wrench at local ``body``'s frame at the step's poses
     (``coordinate`` -1), or the covector ``value e_coordinate`` (``body`` its local body, ``wrench`` zero), on the tree
-    of articulation-local path table ``joint0``. Stores the footprints (adds them with ``add``: a second seed on one
-    tree) and returns the seed's incident ``J qd`` (the step's ``J`` entries the walk passes, against ``qd``) and the
-    sum of its footprints' squares."""
+    of articulation-local path table ``joint0``. Stores the footprints (adds them with ``add`` 1: a second seed on one
+    tree; stores none with ``add`` -1) and returns the seed's incident ``J qd`` (the step's ``J`` entries the walk
+    passes, against ``qd``) and the sum of its footprints' squares."""
     ...
 
 
@@ -2324,7 +2312,6 @@ def walk_step_kernel(
     armature: wp.array[float],
     drive_row_by_dof: wp.array[int],
     row_K: wp.array[float],
-    free_rigid: wp.array[int],
     # outputs
     walk_now: wp.array2d[float],
     walk_now_link: wp.array2d[float],
@@ -2339,15 +2326,15 @@ def walk_step_kernel(
     body's centre of mass), its coordinates' columns there in world axes, as :func:`local_frames` takes them (a free
     joint turns about the articulation's origin, its first body's centre of mass; a D6 joint's turns about the pivot
     its slides moved), and its link (:data:`WALK_LINK`'s layout: its parent's frame less its own, its frame's world
-    point). The rows' seeds enter the walk here. On a tree the refresh just factored (``mass_update_mask``; a free rigid
-    body keeps its 6x6 factor), the same geometry becomes the factor's frames, with each body's spatial inertia at its
+    point). The rows' seeds enter the walk here. On a tree the refresh just factored (``mass_update_mask``), the same
+    geometry becomes the factor's frames, with each body's spatial inertia at its
     frame and each coordinate's ``R`` and ``R + K`` (the diagonal the refresh's ``L`` holds, :meth:`TreeFactor.diagonal`),
     and the group runs the inward pass (:func:`walk_inward`), so the walk and ``L`` are one factor."""
     tree, lane = wp.tid()
     art = arts[tree]
     j0 = articulation_start[art]
     j1 = articulation_joint_end[art]
-    refresh = mass_update_mask[art] != 0 and free_rigid[art] == 0
+    refresh = mass_update_mask[art] != 0
     for j in range(j0 + lane, j1, lanes):
         X = _walk_frame(j, walk_parent_body[j], joint_type, joint_child, joint_X_p, body_q, body_com)
         R_a = wp.transform_get_rotation(X)

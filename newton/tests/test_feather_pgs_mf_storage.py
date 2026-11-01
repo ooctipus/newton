@@ -29,9 +29,70 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_law_harness import row_lines
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
-from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+def _add_chain(builder, cfg, parent, links, half_width):
+    """Append revolute links given as (axis, offset) and a box foot under the last; return the joints."""
+    joints = []
+    for axis, offset in links:
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=body,
+                axis=axis,
+                parent_xform=wp.transform(wp.vec3(*offset), wp.quat_identity()),
+                target_ke=400.0,
+                target_kd=20.0,
+            )
+        )
+        parent = body
+    foot = wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity())
+    builder.add_shape_box(parent, xform=foot, hx=0.06, hy=half_width, hz=0.03, cfg=cfg)
+    return joints
+
+
+def _add_robot(builder, cfg):
+    """Stand a floating torso on two legs of three joints (12 DOFs), each box foot on its four corners at z = 0."""
+    torso = builder.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.48), wp.quat_identity()),
+        mass=2.0,
+        inertia=wp.mat33(np.eye(3) * 0.1),
+        lock_inertia=True,
+    )
+    joints = [builder.add_joint_free(child=torso)]
+    for side in (-1.0, 1.0):
+        # Hip roll and pitch, then the knee.
+        hip, knee = (0.0, 0.15 * side, 0.0), (0.0, 0.0, -0.25)
+        legs = ((newton.Axis.X, hip), (newton.Axis.Y, (0.0, 0.0, 0.0)), (newton.Axis.Y, knee))
+        joints += _add_chain(builder, cfg, torso, legs, 0.03)
+    builder.add_articulation(joints)
+
+
+def _three_size_model(device, worlds=2):
+    """Per world, a standing robot (12 DOFs), a fixed arm resting its tip on the ground (2) and a free box (6): three
+    size groups of at most 32 DOFs. The robot's 12 DOFs keep CUDA off the compact contact producer (up to 10 DOFs)."""
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, 0.8
+    for _ in range(worlds):
+        builder.begin_world()
+        _add_robot(builder, cfg)
+        # A two-joint arm on a fixed shoulder, its tip box resting on the ground.
+        arm = ((newton.Axis.Y, (0.6, 0.0, 0.33)), (newton.Axis.Y, (0.0, 0.0, -0.1)))
+        builder.add_articulation(_add_chain(builder, cfg, -1, arm, 0.06))
+        box = builder.add_link(
+            xform=wp.transform(wp.vec3(-0.6, 0.0, 0.05), wp.quat_identity()),
+            mass=0.5,
+            inertia=wp.mat33(np.eye(3) * 0.01),
+        )
+        builder.add_shape_box(box, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
+        builder.end_world()
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
+
 
 # A large streamed-metadata shape without velocity-limit rows: 2304 dense and matrix-free rows over 75 coordinates.
 _LARGE_STREAMED_SHAPE = {

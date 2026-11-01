@@ -2368,6 +2368,104 @@ def invalidate_articulation_fk_id_cache(
 # =============================================================================
 
 
+@wp.func
+def free_body_contact(data: ContactInput, c: int, body_a: int, body_b: int):
+    """Free-body contact ``c``'s responding bodies (-1 for none: a zero-DOF articulation contributes collision geometry
+    but owns no generalized response, so its rows treat it like ground), its friction and restitution coefficients, its
+    material stiffness (zero without a material: then a restitutive contact keeps its restitution) and its rows (the
+    allocation's extent: recomputing eligibility can cross a floating-point threshold and overwrite the following
+    contact)."""
+    art_a = data.art0[c]
+    art_b = data.art1[c]
+    response_body_a = -1
+    response_body_b = -1
+    if body_a >= 0 and art_a >= 0 and data.response_dofs[art_a] > 0:
+        response_body_a = body_a
+    if body_b >= 0 and art_b >= 0 and data.response_dofs[art_b] > 0:
+        response_body_b = body_b
+    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
+    stiffness = float(0.0)
+    if data.material != 0:
+        stiffness = data.stiffness[c]
+    if stiffness > 0.0:
+        restitution = 0.0
+    rows = 1
+    if data.slots_needed[c] >= 3:
+        rows = data.slots_needed[c]
+    return response_body_a, response_body_b, mu, restitution, stiffness, rows
+
+
+@wp.func
+def free_body_contact_records(
+    mf: MfRows,
+    data: ContactInput,
+    law: PatchRowLaw,
+    has_target_velocity: int,
+    c: int,
+    slot: int,
+    row: int,
+    body_a: int,
+    body_b: int,
+    response_body_a: int,
+    response_body_b: int,
+    normal: wp.vec3,
+    phi: float,
+    direction: wp.vec3,
+    row_point: wp.vec3,
+    mu: float,
+    restitution: float,
+    stiffness: float,
+):
+    """Row ``row`` of free-body contact ``c``'s records at slot ``slot + row`` (:func:`free_body_contact`): its bodies,
+    kind, friction parent, coefficient and gap, restitution and target, and a material contact's rhs and compliance
+    (:func:`.row_laws.contact_material_rhs`; its tangents take the contact's friction scale), as
+    :func:`.row_build.write_contact_row` writes a dense row's. A tangent row folds the row law's beta into its gap
+    (matrix-free rows keep no beta)."""
+    mf_line = mf.first[data.world[c]]
+    row_idx = slot + row
+    spin = row == CONTACT_SPIN_ROW
+    art_a = data.art0[c]
+    art_b = data.art1[c]
+    mf.body_a[mf_line, row_idx] = response_body_a
+    mf.body_b[mf_line, row_idx] = response_body_b
+    if row == 0:
+        mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
+        mf.row_parent[mf_line, row_idx] = -1
+        mf.row_mu[mf_line, row_idx] = mu
+        mf.phi[mf_line, row_idx] = phi
+        mf.restitution[mf_line, row_idx] = restitution
+    elif spin:
+        mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
+        mf.row_parent[mf_line, row_idx] = slot
+        mf.row_mu[mf_line, row_idx] = contact_torsion_mu(data, c)
+        mf.phi[mf_line, row_idx] = 0.0
+        mf.restitution[mf_line, row_idx] = 0.0
+    else:
+        tangent_phi, beta = patch_tangent_row(law, c, row)
+        friction_mu = mu
+        if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+            friction_mu *= data.friction_weight[c]
+        mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
+        mf.row_parent[mf_line, row_idx] = slot
+        mf.row_mu[mf_line, row_idx] = friction_mu
+        mf.phi[mf_line, row_idx] = beta * tangent_phi
+        mf.restitution[mf_line, row_idx] = 0.0
+    target = float(0.0)
+    if has_target_velocity != 0:
+        target = prescribed_target(
+            body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
+        )
+        if spin:
+            target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
+        mf.target[mf_line, row_idx] = target
+    if data.material != 0:
+        eps = float(0.0)
+        if row == 0 and stiffness > 0.0:
+            material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
+            mf.rhs[mf_line, row_idx] = material_rhs
+        mf.eps[mf_line, row_idx] = eps
+
+
 @wp.kernel
 def build_mf_contact_rows(
     mf: MfRows,
@@ -2376,103 +2474,64 @@ def build_mf_contact_rows(
     has_target_velocity: int,
     law: PatchRowLaw,
 ):
-    """Build matrix-free rows for contacts between free rigid bodies / ground, with a capacity-independent launch.
+    """Build matrix-free rows for contacts between free rigid bodies / ground, with a capacity-independent launch: each
+    row's records (:func:`free_body_contact_records`) and each side's Jacobian, which the rows' build whitens in place
+    (``Z = L^-1 J^T``). A class whose placement walks writes these rows by the walk instead
+    (:func:`.walk_rows.write_free_body_rows`).
 
     For root free joints, the internal qd used here stores the COM-point linear
     term and angular velocity, i.e. `qd = [v_com_point, omega]`, where the COM
     point is the root body's world-space COM position. The MF contact Jacobian
     uses contact position relative to that point:
         J = [d, r x d]   (r = p_contact - p_com_world)
-    A tangent row folds the row law's beta into its gap (matrix-free rows keep no beta). A material contact
-    (``contact_compliance``, positive stiffness) writes its normal's rhs and compliance
-    (:func:`.row_laws.contact_material_rhs`) and takes no restitution, its tangents the contact's friction scale, as
-    :func:`.row_build.write_contact_row` does.
     """
     total_contacts = data.count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
         slot = data.slot[c]
         if data.path[c] != 1 or slot < 0:
             continue
-        world = data.world[c]
-        mf_line = mf.first[world]
+        mf_line = mf.first[data.world[c]]
         art_a = data.art0[c]
         art_b = data.art1[c]
         body_a, body_b, normal, point, phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
-        # Zero-DOF articulations contribute collision geometry but own no
-        # generalized response: their rows treat them like ground.
-        response_body_a = -1
-        response_body_b = -1
-        if body_a >= 0 and art_a >= 0 and data.response_dofs[art_a] > 0:
-            response_body_a = body_a
-        if body_b >= 0 and art_b >= 0 and data.response_dofs[art_b] > 0:
-            response_body_b = body_b
-        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-        stiffness = float(0.0)
-        if data.material != 0:
-            stiffness = data.stiffness[c]
-        if stiffness > 0.0:
-            restitution = 0.0
-        # Allocation owns the row extent; recomputing eligibility can cross a
-        # floating-point threshold and overwrite the following contact.
-        rows = 1
-        if data.slots_needed[c] >= 3:
-            rows = data.slots_needed[c]
+        response_body_a, response_body_b, mu, restitution, stiffness, rows = free_body_contact(data, c, body_a, body_b)
         for row in range(rows):
             row_idx = slot + row
             direction, row_point = contact_row_frame(row, normal, tangent0, tangent1, point, friction_point)
-            spin = row == CONTACT_SPIN_ROW
             # A free body's row about its articulation origin: J = [d, r x d], opposite on body B; a spin row's
             # [0, n]. The rows' build whitens it in place (Z = L^-1 J^T).
             if response_body_a >= 0:
                 J_a = free_body_jacobian(direction, row_point, data.origin[art_a])
-                if spin:
+                if row == CONTACT_SPIN_ROW:
                     J_a = free_body_spin_jacobian(normal)
                 for k in range(6):
                     mf.Z_a[mf_line, row_idx, k] = J_a[k]
             if response_body_b >= 0:
                 J_b = free_body_jacobian(direction, row_point, data.origin[art_b])
-                if spin:
+                if row == CONTACT_SPIN_ROW:
                     J_b = free_body_spin_jacobian(normal)
                 for k in range(6):
                     mf.Z_b[mf_line, row_idx, k] = -J_b[k]
-            mf.body_a[mf_line, row_idx] = response_body_a
-            mf.body_b[mf_line, row_idx] = response_body_b
-            if row == 0:
-                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_CONTACT
-                mf.row_parent[mf_line, row_idx] = -1
-                mf.row_mu[mf_line, row_idx] = mu
-                mf.phi[mf_line, row_idx] = phi
-                mf.restitution[mf_line, row_idx] = restitution
-            elif spin:
-                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_TORSION
-                mf.row_parent[mf_line, row_idx] = slot
-                mf.row_mu[mf_line, row_idx] = contact_torsion_mu(data, c)
-                mf.phi[mf_line, row_idx] = 0.0
-                mf.restitution[mf_line, row_idx] = 0.0
-            else:
-                tangent_phi, beta = patch_tangent_row(law, c, row)
-                friction_mu = mu
-                if stiffness > 0.0 and data.friction_weight[c] > 0.0:
-                    friction_mu *= data.friction_weight[c]
-                mf.row_type[mf_line, row_idx] = PGS_CONSTRAINT_TYPE_FRICTION
-                mf.row_parent[mf_line, row_idx] = slot
-                mf.row_mu[mf_line, row_idx] = friction_mu
-                mf.phi[mf_line, row_idx] = beta * tangent_phi
-                mf.restitution[mf_line, row_idx] = 0.0
-            target = float(0.0)
-            if has_target_velocity != 0:
-                target = prescribed_target(
-                    body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
-                )
-                if spin:
-                    target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
-                mf.target[mf_line, row_idx] = target
-            if data.material != 0:
-                eps = float(0.0)
-                if row == 0 and stiffness > 0.0:
-                    material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
-                    mf.rhs[mf_line, row_idx] = material_rhs
-                mf.eps[mf_line, row_idx] = eps
+            free_body_contact_records(
+                mf,
+                data,
+                law,
+                has_target_velocity,
+                c,
+                slot,
+                row,
+                body_a,
+                body_b,
+                response_body_a,
+                response_body_b,
+                normal,
+                phi,
+                direction,
+                row_point,
+                mu,
+                restitution,
+                stiffness,
+            )
 
 
 @wp.func

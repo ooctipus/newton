@@ -709,21 +709,19 @@ class SolverFeatherPGS(SolverBase):
                 if self.placement.keyed_rows is not None
                 else "Keyed rows need the Jacobi tiers (routes.sweep.tiers) and a plain matrix-free policy."
             )
-        # The general placement (case K6) whitens and leaves its rows by the walk (FL3.3): the factor holds the walk's
-        # data for every responding tree, and the one writer and the sweep's leave read it. Rows that an in-kernel owner
-        # sweeps (local owners, tiers, their packets and keyed rows) keep the old pack until their owners convert
-        # (FL3.6, FL3.7): their sweeps whiten their worlds' J in the kernel.
-        free = self.forest.is_free_rigid_host if self.forest.is_free_rigid is not None else 0
+        # The general placement (case K6) and the paired factor coordinates (case K5, a tree beside one free body)
+        # whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data for every responding tree,
+        # a free rigid body's six coordinates included, and the one writer, the free bodies' writer and the sweeps'
+        # leaves read it. Rows that an in-kernel owner sweeps (local owners, tiers, their packets and keyed rows) keep
+        # the old pack until their owners convert (FL3.6, FL3.7): their sweeps whiten their worlds' J in the kernel.
         self.placement.walks = bool(
-            self.routes.case == "K6"
+            self.routes.case in ("K6", "K5")
             and self.placement.mf_sweeps
             and self.placement.row_packets is None
             and self.placement.keyed_rows is None
             and not self.placement.ink_skip_rows()
             and not self.placement.local_internal_fast_path
-            # Free rigid bodies keep their 6x6 factor until they convert (stage two): a class of them alone holds no
-            # tree to walk and no dense row.
-            and np.any((self.forest.response_dof_count > 0) & (np.asarray(free) == 0))
+            and np.any(self.forest.response_dof_count > 0)
         )
         if self.placement.walks:
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))

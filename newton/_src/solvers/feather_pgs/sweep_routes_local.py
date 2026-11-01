@@ -29,6 +29,7 @@ from .law_source import law_preludes
 from .packed_rows import PACKED_SIDES
 from .projection_laws import CONE_LAW, PROJECTION_LAW
 from .response_operator import CholeskySolve, FactorComponent, FactorRows, FreeBodyZ, Lanes, LocalBlock
+from .row_inputs import RowArgument
 from .row_metadata import _mf_parent_expression
 from .solve_policy import DEFAULT_POLICY, SolvePolicy
 from .staging import Buffer, Staging, arch_budget
@@ -55,6 +56,8 @@ from .sweep import (
     unit_held_loads,
     weight_arguments,
 )
+from .sweep_routes import walk_leave
+from .tree_factor import WalkTrees, walk_paths_prelude
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The local owners: a lane group per articulation (and its free body), the response block built in the kernel
@@ -549,6 +552,8 @@ def paired_factor_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    walk: bool = False,
+    walk_frame: bool = False,
 ) -> tuple[str, Staging]:
     """The native body of the paired factor sweep: a world's rows in the factor coordinates of its articulation and
     free body (:class:`.FactorRows`), a warp per world, the velocity change from the predictor, ``u = L^T dv``, from
@@ -562,6 +567,10 @@ def paired_factor_source(
     anchor) as a contact unit (:func:`_contact_unit`: a loaded unit on its Gram block, one ladder and one apply). With
     ``independent_components`` a world whose signed free-body row count is negative solves only its articulation's
     coordinates (its free body's rows run in the matrix-free sweep).
+
+    With ``walk`` (a class whose placement walks its rows, :mod:`.walk_rows`) each component leaves by the walk down
+    in the rows' frame (:func:`.sweep_routes.walk_leave`, the slips' release transposed first with ``walk_frame``):
+    the velocity change is staged in shared memory the sweep is done with, and a lane walks each component's tree.
 
     Returns the body and its staging.
     """
@@ -584,6 +593,9 @@ def paired_factor_source(
         lanes,
         diagonal=lambda row: f"s_diag[{row}]",
     )
+    # The walk's leave stages the velocity change in the rhs the sweep is done with, or its own buffer when the rows
+    # are fewer than the coordinates.
+    walk_stage = "s_rhs" if M >= D else "s_walk"
     staging = Staging(
         (
             Buffer("s_lam", "float", M),
@@ -591,6 +603,7 @@ def paired_factor_source(
             Buffer("s_diag", "float", M),
             Buffer("s_type", "unsigned char", M),
             *((Buffer("s_contact_mu", "float", (M + stride - 1) // stride),) if contact_triples else ()),
+            *((Buffer("s_walk", "float", D),) if walk and M < D else ()),
         ),
         groups=_PAIRED_WORLDS_PER_BLOCK,
         threads=32 * _PAIRED_WORLDS_PER_BLOCK,
@@ -643,6 +656,26 @@ def paired_factor_source(
         mu_load = f"""
     for (int contact = lane; contact < contact_count; contact += 32)
         s_contact_mu[contact] = world_row_mu.data[off + contact_start + contact * {stride} + 1];"""
+    leave = f"""    // Back to physical coordinates, dv = L^-T u per component.
+{op.leave("physical_output", "    ")}
+    if ({write}) v_out.data[global_dof] += physical_output;
+    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];"""
+    if walk:
+        walked = walk_leave("art", "u", "walk.dofs.data[art]", frame=walk_frame, pad="        ")
+        leave = f"""    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
+    // Back to physical coordinates by the walk, in the rows' frame: the velocity change staged, each component's tree
+    // walked down on a lane of its own (lane 0 the articulation, lane 1 the free body), each lane's coordinate read back.
+    SYNC();
+    if (lane < {D}) {walk_stage}[lane] = {op.velocity};
+    SYNC();
+    if (lane < 2) {{
+        const int art = lane == 0 ? primary_art_by_world.data[world] : secondary_art_by_world.data[world];
+        float* u = &{walk_stage}[lane == 0 ? primary_offset : secondary_offset];
+{walked}
+    }}
+    SYNC();
+    const float physical_output = lane < {D} ? {walk_stage}[lane] : 0.0f;
+    if ({write}) v_out.data[global_dof] += physical_output;"""
     body = f"""{staging.declarations("    ")}
     const int lane = LANE;
     int m = world_constraint_count.data[world];
@@ -681,15 +714,19 @@ def paired_factor_source(
 {indent(schedule, "        ")}
 {end_sweep(solve_policy, iteration="iter")}    }}
 
-    // Back to physical coordinates, dv = L^-T u per component.
-{op.leave("physical_output", "    ")}
-    if ({write}) v_out.data[global_dof] += physical_output;
-    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
+{leave}
 {staging.undefine()}
 #endif
 """
     cone = (CONE_LAW,) if torsion else ()
-    preludes = (lane_group(32), SHARED_STORAGE, RING, *law_preludes(PROJECTION_LAW, *cone), *solve_policy.preludes)
+    preludes = (
+        lane_group(32),
+        SHARED_STORAGE,
+        RING,
+        *law_preludes(PROJECTION_LAW, *cone),
+        *solve_policy.preludes,
+        *((walk_paths_prelude(1),) if walk else ()),
+    )
     return cuda_native(body, preludes=preludes), staging
 
 
@@ -922,9 +959,12 @@ def paired_factor_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    walk: bool = False,
+    walk_frame: bool = False,
 ) -> wp.Kernel:
     """The paired factor sweep kernel; weighted rows' and material contacts' operands (:func:`.sweep.weight_arguments`,
-    :func:`.sweep.material_arguments`) and a readout's operand follow ``v_out``."""
+    :func:`.sweep.material_arguments`), a readout's operand and, with ``walk``, the walk's view and each world's two
+    articulations follow ``v_out``."""
     snippet, staging = paired_factor_source(
         max_constraints,
         max_world_dofs,
@@ -937,6 +977,8 @@ def paired_factor_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        walk=walk,
+        walk_frame=walk_frame,
     )
     staging.check("the paired factor sweep", arch_budget(device_arch))
     name = (
@@ -947,14 +989,23 @@ def paired_factor_kernel(
         + ("_weighted" if weighted else "")
         + ("_material" if material else "")
         + ("_torsion" if torsion else "")
+        + ("_walk" if walk else "")
+        + ("frame" if walk_frame else "")
         + solve_policy.suffix
     )
+    walked = ()
+    if walk:
+        walked = (
+            RowArgument("walk", WalkTrees),
+            RowArgument("primary_art_by_world", wp.array[int]),
+            RowArgument("secondary_art_by_world", wp.array[int]),
+        )
     return KernelTemplate.from_abi(
         name,
         PAIRED_FACTOR_ABI,
         snippet,
         kernel_template.tiles(_PAIRED_WORLDS_PER_BLOCK, 32),
-        extra=(*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments),
+        extra=(*weight_arguments(weighted), *material_arguments(material), *solve_policy.arguments, *walked),
         composed=True,
         native_name="sweep_paired_factor_native",
     ).kernel()

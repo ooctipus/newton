@@ -1194,8 +1194,24 @@ class RowLaws:
                         clamp=True,
                     )
 
-            # Build MF contact rows
-            if mf_active:
+            # The free bodies' contact rows: by the walk where the placement walks (walk_rows), else as J.
+            if mf_active and solver.placement.walks:
+                pool.launch(
+                    walk_rows.write_free_body_rows,
+                    contact_build_threads,
+                    inputs=[
+                        bind_mf_rows(solver.placement),
+                        contact_input,
+                        contact_build_threads,
+                        int(solver.forest.has_prescribed_response),
+                        law,
+                        solver.factor.walk_view(),
+                        solver.v_hat,
+                    ],
+                    extent=count,
+                    clamp=True,
+                )
+            elif mf_active:
                 pool.launch(
                     build_mf_contact_rows,
                     contact_build_threads,
