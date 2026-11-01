@@ -4,13 +4,14 @@
 """The walk on the device (FL3.1): the tree factor's walk as the native functions FL3's one writer will call.
 
 :func:`.tree_factor.walk_prelude` declares the walk for both devices: the class's path table in constant memory, a lane
-per seed walking its rows up (``WALK_UP``, ``WALK_SEED``) into the caller's sink, and a lane per tree walking down (the
-leave, ``WALK_DOWN``, and the twists of known coordinates, ``WALK_TWISTS``). No step launches it. These tests run it on
+per seed walking its rows up (``WALK_UP``, ``WALK_SEED``) into the caller's sink, with the step's ``J`` entry each
+footprint whitens, and a lane per tree walking down (the leave, ``WALK_DOWN``). These tests run it on
 the CPU and, where there is one, on a CUDA device, against the float64 walk (:class:`.tree_factor.TreeWalk`, which
 :mod:`.test_feather_pgs_walk` holds to the factor), and hold every placement to one frame:
 
 - **F1, the device walk**, on every catalogue model: rows of every unit (1 to 4 rows a lane) from wrench and covector
-  seeds, the leave and the twists, within ``BOUND n u kappa`` of the float64 walk;
+  seeds, their ``J`` entries (a row's incident is their sum against ``v_hat``), the leave and its twists, within
+  ``BOUND n u kappa`` of the float64 walk;
 - **F2 on the device**: ``long_chain(N)`` without armature, N = 8 to 1,000: a tip impulse's response, rows up and leave
   down in float32, against the float64 truth;
 - **one frame per placement**: whitening and the leave of ``du`` share one factorization, so ``|J dv - Z^T du|`` stays
@@ -91,7 +92,11 @@ _UP = """    if (tid >= body.shape[0]) return;
     const float* s = now.data + (size_t)tree.data[tid] * n * $now;
     const float* f = now_link.data + (size_t)tree.data[tid] * bodies * $link;
     float* out = z.data + (size_t)tid * $rows * n;
-    const auto sink = [&](int r, int c, float value) { out[(size_t)r * n + c] = value; };
+    float* entries = jz.data + (size_t)tid * $rows * n;
+    const auto sink = [&](int r, int c, float value, float j) {
+        out[(size_t)r * n + c] = value;
+        entries[(size_t)r * n + c] = j;
+    };
     float p[6 * $rows], w[6 * $rows];
     for (int k = 0; k < 6 * $rows; ++k) p[k] = w[k] = wrench.data[(size_t)tid * 6 * $rows + k];
     int start = top.data[tid];
@@ -110,8 +115,6 @@ _TREE = """    if (tid >= u.shape[0]) return;
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
     WALK_DOWN(d, l, u.data + (size_t)tid * n, qd.data + (size_t)tid * n, twist.data + (size_t)tid * bodies * 6);
-    WALK_TWISTS(now.data + (size_t)tree.data[tid] * n * $now, now_link.data + (size_t)tree.data[tid] * bodies * $link,
-                known.data + (size_t)tid * n, known_twist.data + (size_t)tid * bodies * 6);
 """
 
 _UP_PARAMS = params(
@@ -126,18 +129,15 @@ _UP_PARAMS = params(
     ("wrench", wp.array3d[float]),
     ("covector", wp.array2d[float]),
     ("z", wp.array3d[float]),
+    ("jz", wp.array3d[float]),
 )
 _TREE_PARAMS = params(
     ("data", wp.array3d[float]),
     ("link", wp.array3d[float]),
-    ("now", wp.array3d[float]),
-    ("now_link", wp.array3d[float]),
     ("tree", wp.array[int]),
     ("u", wp.array2d[float]),
     ("qd", wp.array2d[float]),
     ("twist", wp.array3d[float]),
-    ("known", wp.array2d[float]),
-    ("known_twist", wp.array3d[float]),
 )
 
 
@@ -150,7 +150,14 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
     up = KernelTemplate(
         f"walk_up_{rows}_{tag}", _UP_PARAMS, substitute(_UP, rows=rows, **sizes), THREADS, (prelude,), dual=True
     )
-    tree = KernelTemplate(f"walk_tree_{tag}", _TREE_PARAMS, substitute(_TREE, **sizes), THREADS, (prelude,), dual=True)
+    tree = KernelTemplate(
+        f"walk_tree_{tag}",
+        _TREE_PARAMS,
+        substitute(_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK),
+        THREADS,
+        (prelude,),
+        dual=True,
+    )
     return up.kernel(), tree.kernel()
 
 
@@ -170,11 +177,13 @@ class DeviceWalk:
         self.now = wp.array(np.stack([np.asarray(walk.s) for walk in step]), dtype=float, device=device)
         self.now_link = wp.array(np.stack([walk.device_data()[1] for walk in step]), dtype=float, device=device)
 
-    def up(self, tree, body, top, seeded, wrench, covector) -> np.ndarray:
+    def up(self, tree, body, top, seeded, wrench, covector, entries: bool = False):
         """Footprints ``[seeds, rows, n]`` of seeds of ``rows`` rows: wrenches ``[seeds, rows, 6]`` at their bodies'
-        frames from coordinate ``top``, plus covectors ``[seeds, rows]`` at ``top`` where ``seeded``."""
+        frames from coordinate ``top``, plus covectors ``[seeds, rows]`` at ``top`` where ``seeded``; with ``entries``,
+        also the step's ``J`` entries the sink received beside each footprint."""
         count = len(body)
         z = wp.zeros((count, self.rows, self.n), dtype=float, device=self.device)
+        jz = wp.zeros((count, self.rows, self.n), dtype=float, device=self.device)
 
         def array(values, dtype):
             return wp.array(
@@ -196,18 +205,19 @@ class DeviceWalk:
                 array(np.reshape(wrench, (count, self.rows, 6)), float),
                 array(np.reshape(covector, (count, self.rows)), float),
                 z,
+                jz,
             ],
             device=self.device,
         )
+        if entries:
+            return z.numpy().astype(np.float64), jz.numpy().astype(np.float64)
         return z.numpy().astype(np.float64)
 
-    def down(self, tree, u, known) -> tuple:
-        """The leave of ``u`` ``[cases, n]`` (joint velocities and body twists) and the twists of ``known`` coordinates,
-        a thread per case of tree ``tree``."""
+    def down(self, tree, u) -> tuple:
+        """The leave of ``u`` ``[cases, n]``: joint velocities and body twists, a thread per case of tree ``tree``."""
         count = len(tree)
         outputs = (
             wp.zeros((count, self.n), dtype=float, device=self.device),
-            wp.zeros((count, self.bodies, 6), dtype=float, device=self.device),
             wp.zeros((count, self.bodies, 6), dtype=float, device=self.device),
         )
         wp.launch(
@@ -216,14 +226,10 @@ class DeviceWalk:
             inputs=[
                 self.data,
                 self.link,
-                self.now,
-                self.now_link,
                 wp.array(np.asarray(tree, dtype=np.int32), dtype=int, device=self.device),
                 wp.array(np.asarray(u, dtype=np.float32), dtype=float, device=self.device),
                 outputs[0],
                 outputs[1],
-                wp.array(np.asarray(known, dtype=np.float32), dtype=float, device=self.device),
-                outputs[2],
             ],
             device=self.device,
         )
@@ -307,11 +313,12 @@ def catalogue_walks() -> tuple:
 
 
 def device_f1(device, units=UNITS, rng=None) -> dict:
-    """F1 of the device walk on every catalogue model: each unit's rows, the leave and the twists against the float64
-    walk, as worst ratios to ``n u kappa``, and its own rows and leave in one frame, ``|J dv - Z^T du|`` over ``n u |Z|
-    |du|`` (pass: at most ``BOUND``), with the counts behind them."""
+    """F1 of the device walk on every catalogue model: each unit's rows and their ``J`` entries (``entries``: what a
+    row's incident sums against ``v_hat``), the leave and its twists against the float64 walk, as worst ratios to ``n u
+    kappa``, and its own rows and leave in one frame, ``|J dv - Z^T du|`` over ``n u |Z| |du|`` (pass: at most
+    ``BOUND``), with the counts behind them."""
     rng = np.random.default_rng(1101) if rng is None else rng
-    worst = {"rows": 0.0, "leave": 0.0, "twist": 0.0, "known": 0.0, "frame": 0.0, "seeds": 0, "trees": 0}
+    worst = {"rows": 0.0, "entries": 0.0, "leave": 0.0, "twist": 0.0, "frame": 0.0, "seeds": 0, "trees": 0}
     for _scene, _art, walk, walk32, kappa in catalogue_walks():
         n = walk.s.shape[0]
         scale = n * ROUNDING * kappa
@@ -319,31 +326,32 @@ def device_f1(device, units=UNITS, rng=None) -> dict:
             device_walk = DeviceWalk([walk32], device, rows)
             seeds = seed_rows(walk, rows, rng)
             body, top, seeded, wrench, covector = zip(*seeds, strict=True)
-            z = device_walk.up([0] * len(seeds), body, top, seeded, wrench, covector)
+            z, j = device_walk.up([0] * len(seeds), body, top, seeded, wrench, covector, entries=True)
             for i, (b, c, is_covector, w, x) in enumerate(seeds):
                 if is_covector:
                     X = np.zeros((n, rows))
                     X[c] = x
                     z64, _ = walk.up(covector=X)
+                    j64 = X
                 else:
                     z64, _ = walk.up(b, w.T)
+                    j64 = jacobian(walk, b, w.T)
                 worst["rows"] = max(worst["rows"], relative(z[i].T, z64) / scale)
+                worst["entries"] = max(worst["entries"], relative(j[i].T, j64) / scale)
             worst["seeds"] += len(seeds)
         u = rng.normal(size=(2, n))
         reference = [walk.down(case) for case in u]
-        known = np.stack([qd for qd, _ in reference])
-        qd, twist, known_twist = DeviceWalk([walk32], device).down([0, 0], u, known)
+        qd, twist = DeviceWalk([walk32], device).down([0, 0], u)
         for case, (qd64, twist64) in enumerate(reference):
             worst["leave"] = max(worst["leave"], relative(qd[case], qd64) / scale)
             worst["twist"] = max(worst["twist"], relative(twist[case], twist64) / scale)
-            worst["known"] = max(worst["known"], relative(known_twist[case], twist64) / scale)
         # One frame: the device walk's rows of the contact seeds and its leave of a du, J dv against Z^T du.
         contacts = [seed for seed in seed_rows(walk, 3, rng) if not seed[2]]
         body, top, seeded, wrench, covector = zip(*contacts, strict=True)
         Z = DeviceWalk([walk32], device, 3).up([0] * len(contacts), body, top, seeded, wrench, covector)
         J = np.stack([jacobian(walk, b, w.T).T for b, _, _, w, _ in contacts])
         du = rng.normal(size=n)
-        dv = DeviceWalk([walk32], device).down([0], du[None], du[None])[0][0]
+        dv = DeviceWalk([walk32], device).down([0], du[None])[0][0]
         worst["frame"] = max(
             worst["frame"], frame_residual(J.reshape(-1, n), Z.reshape(-1, n), du, dv) / (n * ROUNDING)
         )
@@ -380,7 +388,7 @@ def chain_on_device(links: int, device) -> dict:
     dv64 = np.stack([truth.down(z64[:, r])[0] for r in range(3)], axis=1)
     device_walk = DeviceWalk([walk32], device)
     z = device_walk.up([0], [body], [int(truth.first[body + 1]) - 1], [0], [W.T], [np.zeros(3)])[0].T
-    dv = device_walk.down([0, 0, 0], z.T, z.T)[0].T
+    dv = device_walk.down([0, 0, 0], z.T)[0].T
     host32, _ = walk32.up(body, W.astype(np.float32))
     return {
         "links": links,
@@ -412,7 +420,7 @@ def frames_on_chain(links: int, device) -> dict:
     device_walk = DeviceWalk([walk32], device)
     Z = device_walk.up([0], [body], [int(walk.first[body + 1]) - 1], [0], [W.T], [np.zeros(3)])[0]
     du = Z.sum(axis=0)
-    dv_walk = device_walk.down([0], du[None], du[None])[0][0]
+    dv_walk = device_walk.down([0], du[None])[0][0]
     from scipy.linalg import solve_triangular
 
     dv_main = solve_triangular(L32, du[::-1], lower=True, trans=1, check_finite=False)[::-1]
@@ -610,13 +618,13 @@ class TestWalkDevice(unittest.TestCase):
     """F1 and F2 of the device walk, and one frame per placement, on the CPU and the CUDA device."""
 
     def test_f1_device_walk_on_the_catalogue(self):
-        """Every unit's rows, the leave and the twists within ``BOUND n u kappa`` of the float64 walk, and the device
-        walk's own rows and leave in one frame."""
+        """Every unit's rows and their ``J`` entries, the leave and its twists within ``BOUND n u kappa`` of the float64
+        walk, and the device walk's own rows and leave in one frame."""
         for device in devices():
             with self.subTest(device=device):
                 worst = device_f1(device)
                 self.assertGreater(worst["seeds"], 0)
-                for name in ("rows", "leave", "twist", "known", "frame"):
+                for name in ("rows", "entries", "leave", "twist", "frame"):
                     self.assertLessEqual(worst[name], BOUND, f"{name}: {worst}")
 
     def test_f2_on_the_device(self):

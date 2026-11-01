@@ -12,14 +12,14 @@ row of a world on the world's lanes (:func:`write_walked_rows`):
   the second body's negated; a link row's unit wrench at its two pieces' centres of mass, the shadow's negated; a joint
   limit's and a velocity limit's covector ``+-e_c``, a mimic's ``e_f - c e_l``;
 - **the walk** (:func:`.tree_factor.walk_paths_prelude`): each seed walked up its root path into the packed sink at its
-  side's entries, two seeds on one tree adding where their paths meet. A wrench enters as ``J`` at the step's frames
-  (:meth:`.tree_factor.TreeFactor.walk_geometry`) and the refresh's factor whitens it, so a step between refreshes
-  whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body keeps its own 6x6 factor
-  (:func:`.response_builds_dense.whiten_six` of its six-coordinate ``J``), the frame of its free-body rows and its leave
-  until the free bodies convert;
-- **the header**: the diagonal ``|z|^2 + cfm``, the incident velocity ``J v_hat`` (each seed's wrench against its body's
-  predicted twist at its frame, :meth:`.tree_factor.TreeFactor.twists`; a covector against ``v_hat``) and the rhs by
-  the row law (:func:`.kernels.row_bias`).
+  side's entries, stored, a second seed on one tree adding where their paths meet. A wrench enters as ``J`` at the
+  step's frames (:meth:`.tree_factor.TreeFactor.walk_step`) and the refresh's factor whitens it, so a step between
+  refreshes whitens the step's ``J`` by the held factor, as the dense rows do. A free rigid body keeps its own 6x6
+  factor (:func:`.response_builds_dense.whiten_six` of its six-coordinate ``J``), the frame of its free-body rows and
+  its leave until the free bodies convert;
+- **the header**: the diagonal ``|z|^2 + cfm`` (the walks' sums of squares, or the row's entries where two seeds share
+  a side or a side slips), the incident velocity ``J v_hat`` (the step's ``J`` entries each walk passes, against
+  ``v_hat``; a free rigid body's six) and the rhs by the row law (:func:`.kernels.row_bias`).
 
 No ``J`` is formed. The rows and the general sweep's leave (:class:`.sweep_routes.FactorCoordinates`, ``walk``) share
 the walk's one frame (FL3_design §1.2).
@@ -65,18 +65,19 @@ def walk_wrench(
     point: wp.vec3,
     torque: bool,
     v_hat: wp.array[float],
+    add: int,
     packed_Z: wp.array3d[float],
     slot: int,
-) -> float:
+) -> wp.vec2:
     """Walk a row's seed at ``body``, the wrench of ``sign`` along ``direction`` at ``point`` (a pure ``torque`` about
-    it), into its side's entries of row ``slot``; return its part of the incident velocity, the wrench against the
-    body's predicted twist (a free rigid body's: its ``J`` against ``v_hat``). The wrench is taken at the body's frame at
-    the step's poses, where the walk's columns ``now`` hold the step's ``J``. A body without response coordinates adds
-    nothing."""
+    it), into its side's entries of row ``slot``: stored, or added with ``add`` (a second seed on the same side). Return
+    its part of the incident velocity ``J v_hat`` (the step's ``J`` entries the walk passes; a free rigid body's six
+    against ``v_hat``) and the sum of its footprints' squares. The wrench is taken at the body's frame at the step's
+    poses, where the walk's columns ``now`` hold the step's ``J``. A body without response coordinates adds nothing."""
     if body < 0 or art < 0:
-        return 0.0
+        return wp.vec2(0.0)
     if support.dofs[art] <= 0:
-        return 0.0
+        return wp.vec2(0.0)
     j = walk.body_joint[body]
     j0 = walk.joint_start[art]
     d = direction * sign
@@ -102,10 +103,15 @@ def walk_wrench(
             J[c] = wp.dot(column, w)
             incident += J[c] * v_hat[d0 + c]
         z = whiten_six(walk.L6, walk.group[art], J)
+        squares = float(0.0)
         for c in range(6):
-            packed_Z[at[0], slot, at[1] + c] += z[c]
-        return incident
-    walk_into(
+            if add != 0:
+                packed_Z[at[0], slot, at[1] + c] += z[c]
+            else:
+                packed_Z[at[0], slot, at[1] + c] = z[c]
+            squares += z[c] * z[c]
+        return wp.vec2(incident, squares)
+    return walk_into(
         walk,
         j0,
         walk.dof_start[art],
@@ -115,12 +121,13 @@ def walk_wrench(
         w,
         -1,
         0.0,
+        v_hat,
+        add,
         packed_Z,
         at[0],
         slot,
         at[1],
     )
-    return wp.dot(w, walk.twist[j])
 
 
 @wp.func
@@ -132,19 +139,20 @@ def walk_covector(
     dof: int,
     value: float,
     v_hat: wp.array[float],
+    add: int,
     packed_Z: wp.array3d[float],
     slot: int,
-) -> float:
-    """Walk a row's covector ``value e_dof`` (a joint row's seed) into its side's entries of row ``slot``; return its
-    part of the incident velocity, ``value v_hat[dof]``."""
+) -> wp.vec2:
+    """Walk a row's covector ``value e_dof`` (a joint row's seed) into its side's entries of row ``slot`` (added with
+    ``add``); return its part of the incident velocity, ``value v_hat[dof]``, and the sum of its footprints' squares."""
     if art < 0:
-        return 0.0
+        return wp.vec2(0.0)
     if support.dofs[art] <= 0:
-        return 0.0
+        return wp.vec2(0.0)
     d0 = walk.dof_start[art]
     j0 = walk.joint_start[art]
     at = jacobian_row(support, 0, art, sides)
-    walk_into(
+    return walk_into(
         walk,
         j0,
         d0,
@@ -154,12 +162,21 @@ def walk_covector(
         wp.spatial_vector(),
         dof - d0,
         value,
+        v_hat,
+        add,
         packed_Z,
         at[0],
         slot,
         at[1],
     )
-    return value * v_hat[dof]
+
+
+@wp.func
+def slips_on(walk: WalkTrees, art: int) -> int:
+    """Whether articulation ``art`` (-1 for none) slips this step: its rows take the frame."""
+    if art < 0:
+        return 0
+    return walk.slips[art]
 
 
 @wp.func
@@ -235,7 +252,7 @@ def write_walked_rows(
 ):
     """The one writer: a world's ``lanes`` threads stride over its rows (``dim = (worlds, lanes)``). Each row's entries
     are cleared, its seeds walked into them (:func:`walk_wrench`, :func:`walk_covector`), and its diagonal
-    ``|z|^2 + cfm`` (squares in entry order), incident velocity and rhs (:func:`.kernels.row_bias`) stored."""
+    ``|z|^2 + cfm``, incident velocity and rhs (:func:`.kernels.row_bias`) stored."""
     world, lane = wp.tid()
     capacity = packed_Z.shape[1]
     count = wp.min(counts[world], capacity)
@@ -248,19 +265,27 @@ def write_walked_rows(
         kind = source >> UNIT_SHIFT
         index = source & ((1 << UNIT_SHIFT) - 1)
         sides = rows.sides[line, slot]
-        incident = float(0.0)
+        # The seeds' incident and squares; a second seed on one side adds to the first, so its squares do not sum.
+        walked = wp.vec2(0.0)
+        summed = True
         if kind == UNIT_CONTACT:
             c = index // 4
             r = index - 4 * c
             body_a, body_b, normal, point, _phi, tangent0, tangent1, friction_point = contact_frame(data, law, c)
             direction, row_point = contact_row_frame(r, normal, tangent0, tangent1, point, friction_point)
             spin = r == CONTACT_SPIN_ROW
-            incident += walk_wrench(
-                walk, support, sides, body_a, data.art0[c], 1.0, direction, row_point, spin, v_hat, packed_Z, slot
+            art_a = data.art0[c]
+            art_b = data.art1[c]
+            shared = int(0)
+            if art_a >= 0 and art_a == art_b:
+                shared = 1
+            walked += walk_wrench(
+                walk, support, sides, body_a, art_a, 1.0, direction, row_point, spin, v_hat, 0, packed_Z, slot
             )
-            incident += walk_wrench(
-                walk, support, sides, body_b, data.art1[c], -1.0, direction, row_point, spin, v_hat, packed_Z, slot
+            walked += walk_wrench(
+                walk, support, sides, body_b, art_b, -1.0, direction, row_point, spin, v_hat, shared, packed_Z, slot
             )
+            summed = shared == 0
         elif kind == UNIT_LINK:
             k = index // LINK_ROWS
             row = index - LINK_ROWS * k
@@ -269,62 +294,52 @@ def write_walked_rows(
             angular = row >= 3
             primary = link_primary[k]
             shadow = link_shadow[k]
+            art_p = body_to_articulation[primary]
+            art_s = body_to_articulation[shadow]
+            shared = int(0)
+            if art_p >= 0 and art_p == art_s:
+                shared = 1
             point_p = wp.transform_point(body_q[primary], body_com[primary])
             point_s = wp.transform_point(body_q[shadow], body_com[shadow])
-            incident += walk_wrench(
-                walk,
-                support,
-                sides,
-                primary,
-                body_to_articulation[primary],
-                1.0,
-                direction,
-                point_p,
-                angular,
-                v_hat,
-                packed_Z,
-                slot,
+            walked += walk_wrench(
+                walk, support, sides, primary, art_p, 1.0, direction, point_p, angular, v_hat, 0, packed_Z, slot
             )
-            incident += walk_wrench(
-                walk,
-                support,
-                sides,
-                shadow,
-                body_to_articulation[shadow],
-                -1.0,
-                direction,
-                point_s,
-                angular,
-                v_hat,
-                packed_Z,
-                slot,
+            walked += walk_wrench(
+                walk, support, sides, shadow, art_s, -1.0, direction, point_s, angular, v_hat, shared, packed_Z, slot
             )
+            summed = shared == 0
         elif kind == UNIT_LIMIT or kind == UNIT_VELOCITY:
             dof = index // 2
             value = 1.0 - 2.0 * float(index - 2 * dof)
             if kind == UNIT_VELOCITY:
                 value = velocity_limit_sign[index]
-            incident += walk_covector(walk, support, sides, sides[0], dof, value, v_hat, packed_Z, slot)
+            walked += walk_covector(walk, support, sides, sides[0], dof, value, v_hat, 0, packed_Z, slot)
         elif kind == UNIT_MIMIC:
-            incident += walk_covector(walk, support, sides, sides[0], mimic_dof0[index], 1.0, v_hat, packed_Z, slot)
-            incident += walk_covector(
-                walk, support, sides, sides[0], mimic_dof1[index], -mimic_coef1[index], v_hat, packed_Z, slot
+            walked += walk_covector(walk, support, sides, sides[0], mimic_dof0[index], 1.0, v_hat, 0, packed_Z, slot)
+            walked += walk_covector(
+                walk, support, sides, sides[0], mimic_dof1[index], -mimic_coef1[index], v_hat, 1, packed_Z, slot
             )
+            summed = False
         # The block's first phase: the slips' frame on each side that slips (the closure follows, on these rows).
-        frame_side(walk, support, sides, sides[0], packed_Z, slot)
-        if sides[1] != sides[0]:
+        if slips_on(walk, sides[0]) != 0:
+            frame_side(walk, support, sides, sides[0], packed_Z, slot)
+            summed = False
+        if sides[1] != sides[0] and slips_on(walk, sides[1]) != 0:
             frame_side(walk, support, sides, sides[1], packed_Z, slot)
-        norm = float(0.0)
-        for e in range(width):
-            z = packed_Z[line, slot, e]
-            norm += z * z
+            summed = False
+        norm = walked[1]
+        if not summed:
+            norm = float(0.0)
+            for e in range(width):
+                z = packed_Z[line, slot, e]
+                norm += z * z
         rows.diag[line, slot] = norm + rows.row_cfm[line, slot]
-        row_incident[line, slot] = incident
+        row_incident[line, slot] = walked[0]
         row_bias(
             rows,
             line,
             slot,
-            incident,
+            walked[0],
             dt,
             contact_speculative_scale,
             contact_w,

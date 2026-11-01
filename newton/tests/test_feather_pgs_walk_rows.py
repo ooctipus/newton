@@ -11,7 +11,8 @@
   ``I + B C^-1 B^T`` of the float64 walk, and the rows the writer stores give the decided operator ``J A_F^-1 J^T``,
   not the all-``K`` one: without the frame a row on a slipping joint takes ``(I + K) / I`` its impulse.
 - **One frame per placement** (general worlds, the CPU catalogue): every walked row against its physical ``J v_hat``
-  (``Z_i^T L^T P v_hat`` against the twists' incident velocity), and the step's leave against the float64 walk's.
+  (``Z_i^T L^T P v_hat`` against the incident velocity its walk summed), and the step's leave against the float64
+  walk's.
 """
 
 import unittest
