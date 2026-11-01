@@ -17,10 +17,13 @@
 - **The sparse diagonal** (FL3.5, CUDA): its arm's rows of a slipping tree, released along the slips' paths (W9's
   ``R``), give the decided operator, and the keyboard's rows (arm and keys) and its arm's leave hold the same invariant
   on each of its routes.
+- **The Jacobi tiers' release** (FL3.7, CUDA): the tiers walk their keyed rows in the kernel, or read the writer's, and
+  leave by the release's transpose; on saturating drives their step is the decided operator's, as the general sweep's.
 """
 
 import unittest
 import warnings
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -493,6 +496,41 @@ class TestSupportSlipRelease(unittest.TestCase):
         walk = solver.factor.walk(joint_q, 0)
         expected = walk.down(R.T @ du[0].astype(np.float64))[0]
         self.assertLess(np.linalg.norm(v_out.numpy() - expected) / np.linalg.norm(expected), 1.0e-5)
+
+
+def _hinges_step(pins: dict, iterations: int = 30) -> tuple:
+    """One step of :func:`slipping_hinges` on CUDA under route ``pins``: the solver and its published velocity."""
+    model, control = slipping_hinges("cuda:0")
+    with patch.dict(SolverFeatherPGS._route_pins, pins), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=iterations, enable_joint_limits=True)
+    state, out = model.state(), model.state()
+    solver.step(state, out, control, None, 1.0 / 60.0)
+    return solver, out.joint_qd.numpy().astype(np.float64)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "the Jacobi tiers run on CUDA")
+class TestTierSlipFrame(unittest.TestCase):
+    """The Jacobi tiers on the walk (FL3.7): their rows and leave carry the release ``R`` of the decided operator (the
+    keyed rows walked in the kernel and the one writer's rows take ``R``, the leave ``R^T``), so their step is the
+    decided operator's."""
+
+    def test_tiers_take_the_decided_operator(self):
+        # The general sweep's step on the walk, whose rows and leave take the release (TestSlipRelease).
+        general, reference = _hinges_step({"tiers": 0})
+        self.assertFalse(general.sweep.tiers)
+        self.assertEqual(int(general.factor.walk_view().release.count.numpy()[0]), 3)
+        scale = float(np.linalg.norm(reference))
+        for producer in (None, "general"):
+            # The conformance routes' pins: the tiers on any class whose rows they hold (keyed_parallel, mf_parallel).
+            pins = {"tiers": 32, **({"producer": producer} if producer else {})}
+            with self.subTest(producer=producer or "keyed"):
+                solver, qd = _hinges_step(pins)
+                self.assertTrue(solver.sweep.tiers)
+                self.assertEqual(solver.placement.keyed_rows is not None, producer is None)
+                # The keyed rows and the writer's rows release their slips along their paths (R).
+                self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
+                self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

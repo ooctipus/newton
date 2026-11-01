@@ -974,6 +974,7 @@ class TreeFactor:
         # slip's release is stored by its path's steps, leaf first, as deep as the class's deepest root path.
         slips = 0
         depth = 1
+        self.walk_limited = np.zeros(max(int(model.articulation_count), 1), dtype=np.int64)
         if self.parallel_drives and model.joint_dof_count:
             ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
             damping, limit = self.passive_joint_damping.numpy(), model.joint_effort_limit.numpy()
@@ -981,7 +982,8 @@ class TreeFactor:
             limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
             starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
             for art in arts.tolist():
-                slips = max(slips, int(np.count_nonzero(limited[starts[art] : starts[art] + counts[art]])))
+                self.walk_limited[art] = int(np.count_nonzero(limited[starts[art] : starts[art] + counts[art]]))
+                slips = max(slips, int(self.walk_limited[art]))
                 j0, j1 = int(start[art]), int(end[art])
                 reach = np.zeros(j1 - j0, dtype=np.int64)
                 for j in range(j0, j1):
@@ -1004,6 +1006,12 @@ class TreeFactor:
         self.walk_release_work = wp.zeros((trees, 2, width), dtype=wp.float32, device=device)
         self.walk_release_status = wp.zeros(1, dtype=wp.int32, device=device)
         self.walk_trees = view
+
+    def slip_capacity(self, articulations) -> int:
+        """The most slips any of ``articulations`` can release: its limited drives, at most :data:`RELEASE_SLIPS` (0
+        where none can slip, so a consumer compiles no release)."""
+        arts = np.asarray(articulations, dtype=np.int64)
+        return min(int(self.walk_limited[arts].max()) if arts.size else 0, RELEASE_SLIPS)
 
     def walk_slips(self) -> WalkSlips:
         """What the one writer's release phase reads (:class:`WalkSlips`, :func:`walk_release_tree`): the predictor's
@@ -1607,10 +1615,11 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
     };
     // The slips' release of tree art (WalkRelease, walk_release_tree; W9's verdict: R = L_F^-1 L_K, tree-lower, so
     // every row keeps its support), slip j's steps along its root path leaf first at release.*[art, j, :]:
-    // WALK_RELEASE(release, art, z): a row's footprints z <- R z, the first slip first, each leaf first.
+    // WALK_RELEASE(release, art, z, stride): a row's footprints z <- R z (coordinate c at z[c * stride]), the first
+    // slip first, each leaf first.
     // WALK_RELEASE_T(release, art, u): the leave's u <- R^T u, the last slip first, each root first.
     // WALK_RELEASE_IT(release, art, u): the audit's coordinates u <- R^-T u, the first slip first, each root first.
-    const auto WALK_RELEASE = [&](const auto& release, const int art, float* z) {
+    const auto WALK_RELEASE = [&](const auto& release, const int art, float* z, const int stride = 1) {
         const int cap = release.b.shape[1], steps = release.b.shape[2];
         for (int j = 0; j < release.count.data[art]; ++j) {
             const size_t at = ((size_t)art * cap + j) * steps;
@@ -1620,9 +1629,9 @@ _WALK = """    // The walk of a tree factor (Z_UNION section 1.2, tree_factor.Tr
             for (int k = 0; k < steps; ++k) {
                 const int c = coordinate[k];
                 if (c < 0) break;
-                const float x = z[c] - b[k] * s;
+                const float x = z[c * stride] - b[k] * s;
                 s += a[k] * x;
-                z[c] = g[k] * x;
+                z[c * stride] = g[k] * x;
             }
         }
     };

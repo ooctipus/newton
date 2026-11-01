@@ -38,6 +38,7 @@ from .row_build import contact_torsion_mu, endpoint_projection, write_contact_ro
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 from .step_plan import JOINT_TOPOLOGY, TopologyPin
+from .tree_factor import WALK_FRAME, WALK_LINK
 
 ROW_MAPS = FieldGroup(
     Field("groups", wp.int32, ("world", "size"), owner="maps"),
@@ -118,69 +119,54 @@ ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
 
 
 def _row_source(*, layout, patch=False, weighted=False, torsion=False):
-    """Decode a dense row from its key into the parallel tiers' row ``Zi`` and its records.
+    """Decode a dense row from its key and walk its seeds into the parallel tiers' row ``Zi`` (``TIER_WALK``,
+    :class:`.response_operator.WalkedRows`), its incident velocity and its records.
 
-    A prefix row's key ``~(2 d + side)`` gives a unit coefficient. A contact row takes its geometry, frame, target,
-    materials and Jacobian entries from the contact laws and its rhs from the row laws (:data:`ROW_PRELUDES`).
+    A prefix row's key ``~(2 d + side)`` gives its seed, the covector ``+-e_d`` on the tree holding world coordinate
+    ``d``. A contact row takes its geometry, frame, target and materials from the contact laws and its rhs from the row
+    laws (:data:`ROW_PRELUDES`); its seed on each body of a tree of the world is the wrench of its direction at its row
+    point, ``(d, (p - o) x d)`` at the body's frame ``o`` at the step's poses (the spin row's ``(0, n)``), the second
+    body's negated. No Jacobian is formed.
     ``patch`` writes the persistent patch row law: tangent rows act at the patch friction location for both the
-    Jacobian and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
+    seed and the prescribed target, carry the anchor's tangential phi and correct it with ``patch_law.beta``;
     every row's type, parent and coefficient stay as :func:`scatter_contact_keys` and the patch link left them.
     ``weighted`` writes each row's weight (the relative regularization's, 1 for a firing rebound) and, under
     ``contact_compliance``, a material contact's law as :func:`.row_build.write_contact_row` does: its normal's rhs
     and compliance (:func:`.row_laws.contact_material_rhs`, zero on every other row), no restitution and its
     tangents' friction scale; the tiers form its weight from that compliance. Under contact ``torsion`` a key's fourth
-    direction is the spin row (:func:`.row_build.write_contact_row`'s): its entries ``n . S_ang``, its coefficient the
-    shapes' torsional friction, its rhs minus the prescribed spin.
+    direction is the spin row (:func:`.row_build.write_contact_row`'s): its seed the torque ``(0, n)``, its coefficient
+    the shapes' torsional friction, its rhs minus the prescribed spin.
     """
-    dofs, output = layout.dofs, "Zi[q * ZS]"
-    entry = "ContactLaw::jacobian_entry(S, direction, row_point, c.origin.data[art])"
     kind = "r == 0 ? 0 : 2"
     target = "ContactLaw::prescribed_target(ba, aa, bb, ab, row_point, direction, c.prescribed, c.origin, c.body_v)"
     if torsion:
-        entry = f"(r == 3 ? ContactLaw::spin_entry(S, direction) : {entry})"
         kind = f"r == 0 ? 0 : (r == 3 ? {int(PGS_CONSTRAINT_TYPE_TORSION)} : 2)"
         target = f"r == 3 ? ContactLaw::prescribed_spin_target(ba, aa, bb, ab, normal, c.prescribed, c.body_v)\n            : {target}"
-    prefix = substitute(
-        """
+    prefix = f"""
         const int token = ~key, d = token / 2;
         const float sign = (token & 1) == 0 ? 1.0f : -1.0f;
-        #pragma unroll
-        for (int q = 0; q < $DOFS; ++q) {
-            $OUTPUT = q == d ? sign : 0.0f;
-        }
-    """,
-        DOFS=dofs,
-        OUTPUT=output,
-    )
-    physical_projection = f"""
-            const int n = c.response_dofs.data[art], local = {layout.local("q")};
-            if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
-                || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
-            const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
-            value += sign * {entry};
+        const int side = {layout.primary_test("d")} ? 0 : 1, k = {layout.local("d")};
+        TIER_WALK(side, walk.dof_body.data[walk.dof_start.data[side == 0 ? art_a : art_b] + k], k, &sign);
     """
-    projection = substitute(
-        """
-        #pragma unroll
-        for (int q = 0; q < $DOFS; ++q) {
-            float value = 0.0f;
-            for (int side = 0; side < 2; ++side) {
-                const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
-                if (body < 0 || art < 0) continue;
-                const float sign = side == 0 ? 1.0f : -1.0f;
-                $PROJECT
-            }
-            $OUTPUT = value;
-        }
-        """,
-        DOFS=dofs,
-        PROJECT=physical_projection,
-        OUTPUT=output,
-    )
-    incident = (
-        f"relative += {output} * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)]"
-        f" + {layout.local('q')}];"
-    )
+    spin = "r == 3" if torsion else "false"
+    seeds = f"""
+        // Each body's seed on its tree of the world: the row's wrench at the body's frame at the step's poses.
+        for (int end = 0; end < 2; ++end) {{
+            const int body = end == 0 ? ba : bb, art = end == 0 ? aa : ab;
+            const int side = art >= 0 && art == art_a ? 0 : (art >= 0 && art == art_b ? 1 : -1);
+            if (body < 0 || side < 0) continue;
+            const int joint = walk.body_joint.data[body];
+            const float* o = walk.now_link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
+            const float sign = end == 0 ? 1.0f : -1.0f;
+            const float d0 = sign * direction[0], d1 = sign * direction[1], d2 = sign * direction[2];
+            const float r0 = row_point[0] - o[0], r1 = row_point[1] - o[1], r2 = row_point[2] - o[2];
+            const bool torque = {spin};
+            const float seed[6] = {{torque ? 0.0f : d0, torque ? 0.0f : d1, torque ? 0.0f : d2,
+                                    torque ? d0 : r1 * d2 - r2 * d1, torque ? d1 : r2 * d0 - r0 * d2,
+                                    torque ? d2 : r0 * d1 - r1 * d0}};
+            TIER_WALK(side, joint - walk.joint_start.data[art], -1, seed);
+        }}
+"""
     if patch:
         friction_location = "const wp::vec3 friction_point = patch_law.patches.point.data[contact];"
         tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
@@ -262,16 +248,14 @@ ${PREFIX}
         const auto [direction, row_point] = ContactLaw::contact_row_frame(r, normal, t0, t1, point, friction_point);
         const float target = ${TARGET};
 ${MATERIALS}
-${PROJECTION}
+${SEEDS}
         const float phi = r == 0 ? gap : ${TANGENT_PHI};
         const float normal_beta = r == 0 ? RowLaw::contact_capped_beta(phi, c.beta, RowLaw::contact_depenetration_cap(
             aa >= 0 && c.response_dofs.data[aa] > 0 ? ba : -1, ab >= 0 && c.response_dofs.data[ab] > 0 ? bb : -1,
             c.max_depenetration_velocity), c.dt) : 0.0f;
 ${RHS}
         if (r == 0 && restitution > 0.0f) {
-            float relative = -target;
-            #pragma unroll
-            for (int q = 0; q < ${DOFS}; ++q) { ${INCIDENT} }
+            const float relative = incident - target;
             const auto bounce = RowLaw::contact_restitution_rhs(phi, relative, target, restitution, c.dt,
                                                                 c.restitution_threshold);
             ${BOUNCE}
@@ -289,12 +273,10 @@ ${WEIGHT}${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
         BOUNCE=bounce,
         WEIGHT=weight,
         FRICTION_LOCATION=friction_location,
-        PROJECTION=projection,
-        INCIDENT=incident,
+        SEEDS=seeds,
         TANGENT_PHI=tangent_phi,
         ROW_LAW=row_law,
         PRIVATE_METADATA=metadata,
-        DOFS=dofs,
         TARGET=target,
     )
 
@@ -366,7 +348,7 @@ def _key_kind(key: str, torsion: bool) -> str:
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False, weighted=False, torsion=False):
-    """Decode physical endpoints in the ordinary factor stage.
+    """Decode each row from its key and walk its seeds in the tier's row stage (:func:`_row_source`).
 
     ``patch`` writes the persistent patch row law and reads every row's parent and
     coefficient as the scatter and the patch link left them; point friction builds
@@ -403,8 +385,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
     """
     )
     return ParallelRowInputs(
-        stage=None,
-        physical_row=reader,
+        read=reader,
         preludes=ROW_PRELUDES,
         arguments=arguments,
         row_type=f"({key} >= 0 ? ({_key_kind(key, torsion)}) : world_row_type.data[off_dense + i])",

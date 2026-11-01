@@ -94,15 +94,6 @@ class CholeskySolve:
     1 - step``), the loop form NVCC unrolls like the forward solve's when the
     solution is a register array.
 
-    With ``inverse`` the reciprocal diagonal lives in an array of its own
-    (``inverse[row] = 1 / L_ii``, staged by :meth:`stage_inverse` without a
-    zero convention: the factor of a positive definite matrix has no zero
-    diagonal) and the factor keeps its diagonal. ``masked`` keeps the forward
-    solve's row loop rolled and runs each row's terms over every column,
-    masked to the columns before the row: NVCC then holds one row's chain at
-    a time, the form whose registers stay bounded when the solution lives in
-    strided shared memory.
-
     ``lower`` is the factor's row-major storage (a pointer expression read as
     ``lower[row * size + col]``, which staging needs) or a :data:`Matrix`
     operand. ``unroll`` unrolls both solves' loops (a compile-time ``size``),
@@ -110,16 +101,13 @@ class CholeskySolve:
 
     The zero-diagonal conventions, by option: a zero diagonal produces zero
     (Z0, the default: ``d != 0 ? v / d : 0``); ``reciprocal`` multiplies by a
-    staged ``d != 0 ? 1 / d : 0`` (Zr0); ``inverse`` multiplies by an unguarded
-    staged ``1 / d`` (Zr-inf).
+    staged ``d != 0 ? 1 / d : 0`` (Zr0).
     """
 
     size: int | str
     lower: str | Matrix
     reciprocal: bool = False
     ascending: bool = False
-    inverse: str | None = None
-    masked: bool = False
     unroll: bool = False
 
     def _entry(self, row: str, col: str) -> str:
@@ -135,26 +123,14 @@ class CholeskySolve:
         return vector(leaf_first(self.size, index))
 
     def _finish(self) -> str:
-        if self.inverse is not None:
-            return f"value*({self.inverse})[row]"
         return "value*diagonal" if self.reciprocal else "diagonal!=0.0f?value/diagonal:0.0f"
 
     def _diagonal(self) -> str:
-        """The step's read of the factor's diagonal, on a line of its own (none with a separate inverse)."""
-        if self.inverse is not None:
-            return ""
+        """The step's read of the factor's diagonal, on a line of its own."""
         return f"\n            const float diagonal={self._entry('row', 'row')};"
 
     def whiten(self, rhs: Vector, output: Vector) -> str:
         """Whiten: solve ``L x = P rhs`` in increasing row order."""
-        if self.masked:
-            return f"""#pragma unroll 1
-        for(int row=0;row<{self.size};++row){{
-            float value={self._at(rhs, "row")};
-            #pragma unroll
-            for(int k=0;k<{self.size};++k)if(k<row)value-={self._entry("row", "k")}*{self._at(output, "k")};{self._diagonal()}
-            {self._at(output, "row")}={self._finish()};
-        }}"""
         rows = _unrolled(f"for(int row=0;row<{self.size};++row){{", "        ", self.unroll)
         terms = _unrolled("for(int k=0;k<row;++k)", "            ", self.unroll)
         return f"""{rows}
@@ -170,7 +146,7 @@ class CholeskySolve:
             if self.ascending
             else f"for(int row={self.size}-1;row>=0;--row){{"
         )
-        post = f"\n            {post_row}" if post_row or self.inverse is None else ""
+        post = f"\n            {post_row}"
         terms = _unrolled(f"for(int k=row+1;k<{self.size};++k)", "            ", self.unroll)
         return f"""{_unrolled(head, "        ", self.unroll)}
             float value={self._at(rhs, "row")};
@@ -197,11 +173,6 @@ class CholeskySolve:
             {self._coordinate(rhs, "row", "            ", self.unroll)}
             {self._at(output, "row")}=value;
         }}"""
-
-    def stage_inverse(self, lane: str) -> str:
-        """Stage the reciprocal diagonal of :attr:`inverse`, one row per lane (the lanes cover the rows)."""
-        n = self.size
-        return f"if ({lane} < {n}) ({self.inverse})[{lane}] = 1.0f / ({self.lower})[{lane} * {n} + {lane}];"
 
     def stage(self, source: Vector, lane: str, width: int | str) -> str:
         """Copy the factor from ``source`` into ``lower``, lane-strided; a reciprocal solve's diagonal becomes ``1 / L_ii``.
@@ -1040,53 +1011,23 @@ def _push_apply(delta: str, column: Callable[[str], str], lanes: Lanes, dofs: in
 
 
 @dataclass(frozen=True)
-class Articulation:
-    """One articulation's block of a whitened row: ``size`` coordinates from ``offset`` (a constant named
-    ``offset_name``), its factor in the size group ``group`` of ``L``, its factor staged from ``first`` in ``s_L``
-    (its reciprocal diagonal from ``first_inverse`` in ``s_Dinv``)."""
+class WalkedRows:
+    """A world's rows in the walk's coordinates, built in the kernel: each row's seeds walked up its trees' root paths
+    (:func:`.tree_factor.walk_paths_prelude`), ``Z_i`` at the row's world coordinates.
 
-    size: int
-    offset: int
-    offset_name: str
-    group: str
-    L: str
-    first: int
-    first_inverse: int
-    guard: str = ""
-    """A condition for the articulation's presence in a world (none for the primary)."""
-
-    @property
-    def factor(self) -> CholeskySolve:
-        lower = f"s_L + {self.first}" if self.first else "s_L"
-        inverse = f"s_Dinv + {self.first_inverse}" if self.first_inverse else "s_Dinv"
-        return CholeskySolve(self.size, lower, inverse=inverse, masked=True)
-
-    def guarded(self, text: str, indent: str = "    ") -> str:
-        """``text`` under the articulation's presence."""
-        return f"if ({self.guard}) {{\n{_lines([text], indent)}\n}}" if self.guard else text
-
-
-@dataclass(frozen=True)
-class WhitenedRows:
-    """A world's rows in whitened coordinates, built in the kernel: ``Z_i = L^-1 J_i^T`` per articulation.
-
-    ``H = L L^T`` block by block: the world's ``primary`` articulation from
-    coordinate ``primary_offset`` and at most one ``secondary`` from
-    ``secondary_offset``, each a size group of the response's factors
-    (``ink_L_a``, ``ink_L_b``; the world's group indices in ``ink_meta``),
-    staged with their reciprocal diagonals. ``A = Z^T Z``, so ``Z`` serves as
-    both ``J^T`` and ``Y``. Each lane whitens its row of ``rows``: it stages
-    the row's physical Jacobian, the world's packed rows, which the build
-    leaves as Jacobians in these worlds (``packed_Z``,
-    ``capacity`` rows a world), or the statements ``read`` (which write
-    coordinate ``q`` to ``Zi[q * ZS]``), folds ``J_i v`` into the row's
-    right-hand side, solves ``L Z_i = J_i^T`` in place per articulation
-    (:class:`CholeskySolve`, masked) and keeps ``Z_i`` in its registers
-    (``Jr``). A staged row's coordinates lie ``stride`` apart. ``staged``
-    replaces the factor staging and the whitening (rows a row input stages
-    itself). The diagonal ``A_ii + cfm`` is formed from the rows; the velocity
-    change of the applied impulses, ``u = Z^T delta``, returns to physical
-    coordinates through ``L^-T`` per articulation (:meth:`publish`).
+    A world holds the ``primary`` tree of ``primary`` coordinates from world coordinate ``primary_offset`` and at most
+    one ``secondary`` tree from ``secondary_offset``: its articulations ``art_a`` and ``art_b`` (``ink_meta``, ``-1``
+    for none). Each lane takes its row of ``rows``: the row input's statements ``read`` write its footprints at
+    ``Zi[q * ZS]`` (world coordinate ``q``, a staged row's coordinates ``stride`` apart) and its incident velocity
+    ``J_i v_hat`` into ``incident``, which folds into the row's right-hand side. A row input that walks its rows in the
+    kernel calls ``TIER_WALK(side, body, k, seed)``: the wrench ``seed[0:6]`` at local ``body`` of the world's tree
+    ``side`` (``k < 0``), or the covector ``seed[0] e_k`` at its local coordinate ``k`` (``body`` its body), walked into
+    the row and its ``J`` entries against ``v_hat`` into ``incident``; with ``walked`` each slipping tree's release ``R``
+    (``walk.release``, :class:`.tree_factor.WalkRelease`) then takes the decided factor's row, as the rows the one
+    writer stored hold it already. ``frame`` is each tree's slip capacity, 0 where none of the class's trees of that
+    size can slip: its release compiles out. ``A = Z^T Z``, so ``Z`` serves as both ``J^T`` and ``Y``; the lane keeps
+    ``Z_i`` in its registers (``Jr``). The velocity change of the applied impulses, ``u = Z^T delta``, leaves by the
+    walk down in the rows' square root, ``P^T L^-T R^T u``, a tree per lane (:meth:`publish`).
     """
 
     primary: int
@@ -1094,121 +1035,124 @@ class WhitenedRows:
     primary_offset: int
     secondary_offset: int
     dofs: int
-    capacity: int
     stride: int
     lanes: Lanes
-    read: str | None = None
-    staged: str | None = None
+    read: str
+    walked: bool = False
+    frame: tuple[int, int] = (0, 0)
     rows: str = "n_rows"
 
-    @property
-    def articulations(self) -> tuple[Articulation, ...]:
-        """The primary articulation, then the secondary (in the worlds that hold one)."""
-        na, nb = self.primary, self.secondary
-        primary = Articulation(na, self.primary_offset, "ink_oa", "ink_ga", "ink_L_a", 0, 0)
-        if not nb:
-            return (primary,)
-        secondary = Articulation(
-            nb, self.secondary_offset, "ink_ob", "ink_gb", "ink_L_b", na * na, na, guard="ink_gb >= 0"
-        )
-        return primary, secondary
+    def _tree(self) -> list[str]:
+        """The world's trees (every lane): ``art_a``, ``art_b``."""
+        return ["const int art_a = ink_meta.data[world * 4];", "const int art_b = ink_meta.data[world * 4 + 2];"]
 
-    def buffers(self, *, velocity: bool) -> tuple[Buffer, ...]:
-        """The staged factors and reciprocal diagonals (after ``s_dv`` when ``velocity``: the operator has none)."""
-        na, nb, D = self.primary, self.secondary, self.dofs
-        dv = (Buffer("s_dv", "float", (D + 3) & ~3, align=16),) if velocity else ()
-        return (*dv, Buffer("s_L", "float", na * na + nb * nb), Buffer("s_Dinv", "float", na + nb))
+    def _walk(self) -> str:
+        """``TIER_WALK``: one seed of row ``i`` on the world's tree ``side`` (:func:`.tree_factor.walk_into`'s walk), its
+        footprints added at the tree's world coordinates and its ``J`` entries against ``s_v`` into ``incident``."""
+        from .tree_factor import WALK_COORDINATE, WALK_LINK, WALK_NOW  # noqa: PLC0415
 
-    def registers(self, indent: str) -> str:
-        """Declare each lane's row registers ``Jr``, zero."""
-        D = self.dofs
-        return f"{indent}float Jr[{D}];\n{indent}#pragma unroll\n{indent}for (int d = 0; d < {D}; ++d) Jr[d] = 0.0f;"
+        return f"""const auto TIER_WALK = [&](const int side, const int body, const int k, const float* seed) {{
+    const int art = side == 0 ? art_a : art_b, offset = side == 0 ? {self.primary_offset} : {self.secondary_offset};
+    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+    WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[art] - j0, walk.dofs.data[art]);
+    const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
+    const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
+    const float* now = walk.now.data + (size_t)d0 * {WALK_NOW};
+    const float* now_link = walk.now_link.data + (size_t)j0 * {WALK_LINK};
+    const auto sink = [&](int, int c, float z, float j) {{
+        Zi[(offset + c) * ZS] += z;
+        incident += j * s_v[offset + c];
+    }};
+    float p[6], w[6];
+    int top = WALK_FIRST_OF(body + 1) - 1;
+    for (int e = 0; e < 6; ++e) p[e] = w[e] = k < 0 ? seed[e] : 0.0f;
+    if (k >= 0) {{
+        WALK_SEED(data, k, seed, p, sink);
+        top = k - 1;
+        now = nullptr;
+    }}
+    WALK_UP(data, link, now, now_link, body, top, p, w, sink);
+}};"""
 
-    def _read(self) -> str:
-        """Stage the row's physical Jacobian from the world's packed rows (:mod:`.packed_rows`, dense: entry ``q`` is
-        coordinate ``q``), coordinate ``q`` at ``Zi[q * ZS]``: each articulation's entries where it is a side of the
-        row (the build leaves these worlds' rows unpadded)."""
-        lines = [
-            "const wp::vec2i sides_i = row_sides.data[(size_t)dense_first.data[world] * row_sides.shape[1] + i];",
-            "const int first_0 = sides_i[0] >= 0 ? articulation_world_dof_offset.data[sides_i[0]] : -1;",
-            "const int first_1 = sides_i[1] >= 0 ? articulation_world_dof_offset.data[sides_i[1]] : -1;",
-            f"const float* J_row = &packed_Z.data[((size_t)dense_first.data[world] * {self.capacity} + i) * packed_Z.shape[2]];",
-        ]
-        for art in self.articulations:
-            read = [
-                f"if (first_0 == {art.offset_name} || first_1 == {art.offset_name}) {{",
-                "    #pragma unroll",
-                f"    for (int d = 0; d < {art.size}; ++d) Zi[({art.offset_name} + d) * ZS] = J_row[{art.offset_name} + d];",
-                "}",
-            ]
-            lines.append(art.guarded("\n".join(read)))
-        return _lines(lines, "        ")
+    def _sides(self) -> tuple[tuple[int, int, str], ...]:
+        """The trees whose slips' release compiles: ``(side, coordinates, articulation)``."""
+        trees = ((0, self.primary, self.frame[0], "art_a"), (1, self.secondary, self.frame[1], "art_b"))
+        return tuple((side, n, art) for side, n, cap, art in trees if n and cap)
+
+    def _release_rows(self) -> list[str]:
+        """The release on the lane's row, each side whose tree slips: ``z <- R z`` (``WALK_RELEASE`` on the row's
+        coordinates, ``ZS`` apart), the decided factor's row, inside the row's support."""
+        lines = []
+        for side, _, art in self._sides():
+            offset = self.primary_offset if side == 0 else self.secondary_offset
+            lines.append(f"if ({art} >= 0) WALK_RELEASE(walk.release, {art}, &Zi[{offset} * ZS], ZS);")
+        return lines
 
     def stage(self, target: str, *, indent: str) -> str:
-        """Stage the factors, then whiten each lane's row into ``target`` (``Zi = &target[i]``) and its registers."""
-        if self.staged is not None:
-            return self.staged
-        lane, width, D = self.lanes.lane, self.lanes.width, self.dofs
-        lines = [
-            f"const int {art.group} = ink_meta.data[world * 4 + {2 * k}];" for k, art in enumerate(self.articulations)
-        ]
-        lines += [f"constexpr int {art.offset_name} = {art.offset};" for art in self.articulations]
-        for art in self.articulations:
-            n = art.size
-
-            def source(index, art=art, n=n):
-                return f"{art.L}.data[(size_t){art.group} * {n} * {n} + {index}]"
-
-            lines.append(art.guarded(art.factor.stage(source, lane, width)))
-        lines.append("SYNC();")
-        lines += [art.guarded(art.factor.stage_inverse(lane)) for art in self.articulations]
-        lines.append("SYNC();")
+        """Walk each lane's row into ``target`` (``Zi = &target[i]``) and its registers, its incident velocity folded
+        into its right-hand side."""
+        D = self.dofs
         row = [
-            f"if ({lane} < {self.rows}) {{",
-            f"    const int i = {lane};",
+            f"if ({self.lanes.lane} < {self.rows}) {{",
+            *("    " + line for line in self._tree()),
+            f"    const int i = {self.lanes.lane};",
             f"    float* Zi = &{target}[i];",
             f"    constexpr int ZS = {self.stride};",
             "    #pragma unroll",
             f"    for (int d = 0; d < {D}; ++d) Zi[d * ZS] = 0.0f;",
-            "    {",
-            self._read() if self.read is None else self.read,
-            "    }",
-            "    // J_i v, folded into the row's right-hand side.",
-            "    float bjv = 0.0f;",
-            "    #pragma unroll",
-            f"    for (int d = 0; d < {D}; ++d) bjv += Zi[d * ZS] * s_v[d];",
-            "    s_rhs[i] += bjv;",
+            "    // J_i v_hat, folded into the row's right-hand side.",
+            "    float incident = 0.0f;",
         ]
-        for art in self.articulations:
-
-            def z(index, art=art):
-                return f"(Zi + {art.offset_name} * ZS)[{index} * ZS]"
-
-            row.append(_lines([art.guarded(art.factor.whiten(z, z))], "    "))
-        row += ["    #pragma unroll", f"    for (int d = 0; d < {D}; ++d) Jr[d] = Zi[d * ZS];", "}"]
-        return _lines([*lines, *row], indent)
+        if self.walked:
+            row.append(_lines([self._walk()], "    "))
+        row += ["    {", self.read, "    }", "    s_rhs[i] += incident;"]
+        if self.walked:
+            row.append(_lines(self._release_rows(), "    "))
+        row.append("}")
+        # Each lane's registers take its row only now (a lane past the rows zero), so they are not live during the walk.
+        row += [
+            "#pragma unroll",
+            f"for (int d = 0; d < {D}; ++d) Jr[d] = {self.lanes.lane} < {self.rows} ? {target}[d * {self.stride} + {self.lanes.lane}] : 0.0f;",
+        ]
+        return _lines(row, indent)
 
     def publish(self, z: Callable[[str], str], applied: Callable[[str], str], indent: str) -> str:
-        """``v = v_in + L^-T u`` with ``u = sum_i Z_i applied_i`` (``z(i)``: ``Z_i`` at coordinate ``d``), in row
-        order; each articulation's backward solve on one lane (the primary's on lane 0, the secondary's on the next
-        warp's first lane, or lane 1 in one warp)."""
+        """``v = v_in + P^T L^-T R^T u`` with ``u = sum_i Z_i applied_i`` (``z(i)``: ``Z_i`` at coordinate ``d``), in row
+        order; each tree's walk down on one lane (the primary's on lane 0, the secondary's on the next warp's first
+        lane, or lane 1 in one warp), its twists in the walk's scratch. The world's trees are read here again, not held
+        through the sweeps."""
+        from .tree_factor import WALK_COORDINATE, WALK_LINK  # noqa: PLC0415
+
         lane, width, D = self.lanes.lane, self.lanes.width, self.dofs
+        frames = {side: n for side, n, _ in self._sides()}
+        trees = (
+            (0, "art_a", self.primary_offset, "0"),
+            (1, "art_b", self.secondary_offset, "32" if width > 32 else "1"),
+        )
+        leaves = list(self._tree())
+        for side, art, offset, owner in trees[: 2 if self.secondary else 1]:
+
+            # The rows' square root of the decided operator, transposed: the release R^T (the keyed rows' and the one
+            # writer's rows both carry R).
+            release = [f"WALK_RELEASE_T(walk.release, {art}, &s_dv[{offset}]);"] if side in frames else []
+            leave = [
+                *release,
+                f"const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];",
+                f"WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0,",
+                f"          walk.dofs.data[{art}]);",
+                f"WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},",
+                f"          &s_dv[{offset}], &s_dv[{offset}], reinterpret_cast<float*>(walk.scratch.data + j0));",
+            ]
+            leaves += [f"if ({art} >= 0 && {lane} == {owner}) {{", *("    " + line for line in leave), "}"]
         lines = [
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
             *("    " + line for line in _applied_sum("u", "0.0f", z, applied, self.rows)),
             "    s_dv[d] = u;",
             "}",
             "SYNC();",
-        ]
-        owners = ("0", "32" if width > 32 else "1")
-        for art, owner in zip(self.articulations, owners, strict=False):
-
-            def dv(index, art=art):
-                return f"s_dv[{art.offset_name} + {index}]"
-
-            test = f"{art.guard} && {lane} == {owner}" if art.guard else f"{lane} == {owner}"
-            lines += [f"if ({test}) {{", _lines([art.factor.leave(dv, dv)], "    "), "}"]
-        lines += [
+            "{",
+            *("    " + line for line in leaves),
+            "}",
             "SYNC();",
             f"for (int d = {lane}; d < {D}; d += {width}) {{",
             "    const int global_dof = world_dof_indices.data[dof_map_base + d];",
@@ -1217,17 +1161,9 @@ class WhitenedRows:
         ]
         return _lines(lines, indent)
 
-    def push_prologue(self, z: Callable[[str, str], str], indent: str) -> str:
-        """``w = Z^T x`` before the last word's pushes (``z(row, coordinate)``)."""
-        return _lines(_push_prologue(z, self.lanes, self.dofs, self.rows), indent)
-
     def push_velocity(self, out: str, z: Callable[[str, str], str], lanes: Lanes, indent: str) -> str:
         """``float out = Z_i w`` and ``zz = |Z_i|^2`` of the pushed row ``i`` over ``lanes``, in one ladder."""
         return _lines(_push_velocity(out, lambda d: z("i", d), lanes, self.dofs), indent)
-
-    def push_apply(self, delta: str, z: Callable[[str, str], str], lanes: Lanes, indent: str) -> str:
-        """``w += Z_i delta`` after a push of row ``i``."""
-        return _lines(_push_apply(delta, lambda d: z("i", d), lanes, self.dofs), indent)
 
     def push_diagonal(self) -> str:
         """``A_ii = |Z_i|^2 + cfm_i``, from the squares :meth:`push_velocity` reduced."""
@@ -1236,9 +1172,9 @@ class WhitenedRows:
 
 @dataclass(frozen=True)
 class TransposedResponse(ResponseOperator):
-    """Whitened rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row.
+    """Walked rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row.
 
-    The rows are whitened in the kernel (:class:`WhitenedRows`), so ``Z``
+    The rows are walked in the kernel or read from the one writer's store (:class:`WalkedRows`), so ``Z``
     serves as both ``J^T`` and ``Y``. Each lane holds its row in registers
     (``Jr``); the block stages ``Z`` coordinate-major, ``s_Yt[d * stride + i]
     = Z_i[d]`` (``stride = capacity + 4``: past the rows by a float4, so that
@@ -1255,13 +1191,13 @@ class TransposedResponse(ResponseOperator):
 
     dofs: int
     capacity: int
-    whitened: WhitenedRows
+    walked: WalkedRows
     lanes: Lanes = Lanes()
     rows: str = "n_rows"
 
     def __post_init__(self):
-        if self.whitened is None:
-            raise ValueError("the transposed response holds whitened rows")
+        if self.walked is None:
+            raise ValueError("the transposed response holds walked rows")
 
     diagonal: Callable[[str], str] | None = None
     inverse: Callable[[str], str] | None = None
@@ -1280,18 +1216,17 @@ class TransposedResponse(ResponseOperator):
         return f"s_Yt[{coordinate} * {self.stride} + {row}]"
 
     def buffers(self, capacity: int) -> tuple[Buffer, ...]:
-        """The staged block, the column sums of the bound, ``w`` and the chunks' partial ``w``, the whitened factors."""
+        """The staged block, the column sums of the bound, ``w`` and the chunks' partial ``w``."""
         D = self.dofs
         buffers = [Buffer("s_Yt", "float", self.stride * D, align=16), Buffer("s_colsum", "float", D)]
         buffers.append(Buffer("s_dv", "float", (D + 3) & ~3, align=16))
         if self.chunks > 1:
             buffers.append(Buffer("s_dvp", "float", self.chunks * D))
-        return (*buffers, *self.whitened.buffers(velocity=False))
+        return tuple(buffers)
 
     def registers(self, indent: str) -> str:
-        """Declare each lane's row registers ``Jr``, zero."""
-        D = self.dofs
-        return f"{indent}float Jr[{D}];\n{indent}#pragma unroll\n{indent}for (int d = 0; d < {D}; ++d) Jr[d] = 0.0f;"
+        """Declare each lane's row registers ``Jr``, which the stage fills (:meth:`WalkedRows.stage`)."""
+        return f"{indent}float Jr[{self.dofs}];"
 
     def jacobi_stage(
         self,
@@ -1302,12 +1237,12 @@ class TransposedResponse(ResponseOperator):
         idle: str,
         counted: Callable[[str], str],
     ) -> str:
-        """Whiten and stage the rows, mark the rows that cannot move (``idle``) and set each step scale
+        """Walk and stage the rows, mark the rows that cannot move (``idle``) and set each step scale
         (:meth:`jacobi_steps`): ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the row's residual ``b'_i`` at
         zero impulse; ``padding`` pads the rows' impulses.
         """
         lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
-        stage = [self.whitened.stage("s_Yt", indent=indent)]
+        stage = [self.walked.stage("s_Yt", indent=indent)]
         lines = [
             f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
             "    const int d = e >> 2;",
@@ -1402,7 +1337,7 @@ class TransposedResponse(ResponseOperator):
 
     def publish(self, indent: str = "    ", *, applied: Callable[[str], str]) -> str:
         """``v = v_hat + P^T L^-T sum_i Z_i applied_i`` in row order from the staged block."""
-        return self.whitened.publish(lambda row: self._yt(row, "d"), applied, indent)
+        return self.walked.publish(lambda row: self._yt(row, "d"), applied, indent)
 
     def push_prologue(self, indent: str) -> str:
         """``w = Y^T x`` before the pushes of the last word."""
@@ -1410,7 +1345,7 @@ class TransposedResponse(ResponseOperator):
 
     def push_velocity(self, out: str, lanes: Lanes, indent: str) -> str:
         """``float out = Z_i w`` and ``zz = |Z_i|^2`` over ``lanes``."""
-        return self.whitened.push_velocity(out, self._yt, lanes, indent)
+        return self.walked.push_velocity(out, self._yt, lanes, indent)
 
     def push_apply(self, delta: str, lanes: Lanes, indent: str) -> str:
         """``w += Y_i delta`` after a push of row ``i``."""
@@ -1418,7 +1353,7 @@ class TransposedResponse(ResponseOperator):
 
     def push_diagonal(self) -> str:
         """``A_ii`` of a pushed row, formed from its row."""
-        return self.whitened.push_diagonal()
+        return self.walked.push_diagonal()
 
 
 @dataclass(frozen=True)

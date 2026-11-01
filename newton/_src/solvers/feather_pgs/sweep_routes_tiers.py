@@ -7,10 +7,10 @@
 descriptor (:class:`.kernel_template.SweepTier`).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
-(:class:`.sweep.JacobiRows`). The rows are whitened in the kernel (:class:`.response_operator.WhitenedRows`, from the
-group rows or the keyed rows) and step together under the Jacobi law with Nesterov momentum
-(:func:`.sweep.jacobi_sweeps`) over the matrix-free response, ``Z`` in registers and staged transposed
-(:class:`.response_operator.TransposedResponse`).
+(:class:`.sweep.JacobiRows`). The rows are the walk's (:class:`.response_operator.WalkedRows`): the keyed rows walk their
+seeds in the kernel, and the other rows are the one writer's stored ``Z`` (:mod:`.walk_rows`). They step together under
+the Jacobi law with Nesterov momentum (:func:`.sweep.jacobi_sweeps`) over the matrix-free response, ``Z`` in registers
+and staged transposed (:class:`.response_operator.TransposedResponse`), and leave by the walk down.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from .device_preludes import RING, SHARED_STORAGE, cuda_native, lane_group
 from .kernel_template import KernelTemplate, SweepTier
 from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW
-from .response_operator import Lanes, TransposedResponse, WhitenedRows
+from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_metadata import _validate_dense_metadata_encoding
 from .solve_policy import DEFAULT_POLICY, SolvePolicy, block_argmax
 from .staging import Buffer, Staging, arch_budget, resident_blocks
@@ -43,17 +43,18 @@ from .sweep import (
     material_arguments,
 )
 from .sweep_routes import MF_GS_ABI
+from .tree_factor import WalkTrees, walk_paths_prelude
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
     ("ink_meta", wp.array[int]),
-    ("ink_L_a", wp.array3d[float]),
-    ("ink_L_b", wp.array3d[float]),
     ("world_row_cfm", wp.array2d[float]),
+    ("walk", WalkTrees),
     ("v_out", wp.array[float]),
 )
-"""The parallel tiers' native ABI: the matrix-free sweep's, then the in-kernel response's operands before ``v_out``;
-keyed rows insert theirs after ``world_row_cfm``."""
+"""The parallel tiers' native ABI: the matrix-free sweep's, then the worlds' trees (``ink_meta``: each world's
+articulation of each size and its first coordinate), the rows' cfm and the walk before ``v_out``; keyed rows insert
+theirs after ``world_row_cfm``."""
 
 # The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
 # every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
@@ -114,8 +115,8 @@ def _operands(
     inkernel_response: tuple[int, int, int, int],
     row_inputs,
 ):
-    """Validate the tier's options; return the in-kernel response's group sizes and offsets and the keyed rows'
-    operands (``None`` without)."""
+    """Validate the tier's options; return the worlds' tree sizes and offsets and the keyed rows' operands (``None``
+    without)."""
     _validate_dense_metadata_encoding(max_constraints)
     M_D, D, AM = max_constraints, max_world_dofs, int(rows)
     if AM <= 0 or AM > M_D or AM > TIER_MAX_ROWS:
@@ -130,6 +131,17 @@ def _operands(
         raise ValueError("min_rows must be in [0, rows)")
     operands = row_inputs(NA, NB, OA, OB, D, M_D) if row_inputs is not None else None
     return groups, operands
+
+
+def _stored_row(max_constraints: int, dofs: int) -> str:
+    """Read the lane's row as the one writer stored it (:mod:`.walk_rows`: the packed sink at its world coordinates, the
+    slips' frame applied) and its incident velocity ``J v_hat`` (``row_incident``)."""
+    return (
+        f"        const float* Z_row = &packed_Z.data[((size_t)line * {max_constraints} + i) * packed_Z.shape[2]];\n"
+        "        #pragma unroll\n"
+        f"        for (int q = 0; q < {dofs}; ++q) Zi[q * ZS] = Z_row[q];\n"
+        "        incident = row_incident.data[off_dense + i];"
+    )
 
 
 def parallel_source(
@@ -147,19 +159,22 @@ def parallel_source(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    frame: tuple[int, int] = (0, 0),
 ) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``, more than ``min_rows``) under the
     Jacobi law, a thread per row; under ``torsion`` a contact's spin row steps and projects with its pair.
 
-    The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then whitens the rows in the kernel
-    (:class:`.WhitenedRows`, ``inkernel_response = (NA, NB, OA, OB)``), from the group Jacobians or the keyed rows'
-    operands (``row_inputs``: their metadata, physical rows and arguments), into the matrix-free response
-    (:class:`.TransposedResponse`: ``Z`` in registers and staged transposed, its step scale bounded by the column
-    sums). It runs at most ``sweeps`` Jacobi sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected
-    on their patch ring's pooled load with ``linked_rows``, a world stopped under ``solve_policy``), with
-    ``velocity_limit_pass`` the velocity limits' last word, then publishes the velocity and the impulses. With
-    ``weighted`` contact rows step by their weights (the relative regularization's; ``material``: a material
-    contact's ``d / (d + eps)`` from the diagonal the tier forms).
+    The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the rows in the walk's coordinates
+    (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): the keyed rows' operands
+    (``row_inputs``: their metadata, their walked rows and arguments) walk their seeds in the kernel, with the release
+    of each tree that can slip (``frame``: the class's slip capacity of each tree; FL3.4's release ``R``, the leave
+    ``R^T``); the other rows are the one writer's stored ``Z``, its frame ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
+    registers and staged transposed, its step scale bounded by the column sums). It runs at most ``sweeps`` Jacobi
+    sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected on their patch ring's pooled load with
+    ``linked_rows``, a world stopped under ``solve_policy``), with ``velocity_limit_pass`` the velocity limits' last
+    word, then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
+    weights (the relative regularization's; ``material``: a material contact's ``d / (d + eps)`` from the diagonal the
+    tier forms).
 
     Returns the body and its staging.
     """
@@ -179,19 +194,19 @@ def parallel_source(
     store = JacobiRows(
         AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=bool(weighted), torsion=torsion
     )
-    whitened = WhitenedRows(
+    walked = WalkedRows(
         NA,
         NB,
         OA,
         OB,
         D,
-        M_D,
         AM + 4,
         lanes,
-        read=operands.physical_row if operands is not None else None,
-        staged=operands.stage if operands is not None else None,
+        read=operands.read if operands is not None else _stored_row(M_D, D),
+        walked=operands is not None,
+        frame=tuple(int(cap) for cap in frame),
     )
-    op = TransposedResponse(D, AM, whitened, lanes)
+    op = TransposedResponse(D, AM, walked, lanes)
     dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 else ()
     # A block of several warps reduces the trace's largest change over its warps.
     trace_reduction, trace = "", ()
@@ -247,7 +262,8 @@ def parallel_source(
         *row_preludes,
         *law_preludes(PROJECTION_LAW, *((CONE_LAW,) if torsion else ())),
     )
-    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes)), staging
+    # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
+    return cuda_native(body, preludes=(*preludes, *solve_policy.preludes, walk_paths_prelude(1))), staging
 
 
 @cache
@@ -268,14 +284,16 @@ def parallel_kernel(
     solve_policy: SolvePolicy = DEFAULT_POLICY,
     weighted: bool = False,
     material: bool = False,
+    frame: tuple[int, int] = (0, 0),
 ) -> SweepTier:
     """A parallel tier: its kernel (:data:`PARALLEL_ABI`, the world queue) and its launch descriptor.
 
     A thread per row: the block's threads cover ``rows`` in whole warps, and its working set fits the static budget
     of ``device_arch`` (:func:`.staging.arch_budget`). The tier owns no world with free-body rows (its kernel's name
     carries the solver's free-body capacity ``mf_max_constraints``) and admits its velocity-limit rows as unilateral
-    rows. Its worlds' packed rows (:mod:`.packed_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
-    With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance.
+    rows. Its worlds' stored rows (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row.
+    With ``weighted`` its contact rows step by their weights, ``material`` contacts' from their compliance; ``frame``
+    is each tree's slip capacity (:class:`.WalkedRows`).
     """
     if material and not weighted:
         raise ValueError("material contacts step by their weights: their tiers are weighted")
@@ -296,6 +314,7 @@ def parallel_kernel(
         solve_policy=solve_policy,
         weighted=weighted,
         material=material,
+        frame=frame,
     )
     staging.check("the parallel tier", arch_budget(device_arch))
     (NA, NB, OA, OB), operands = _operands(max_constraints, max_world_dofs, **options)
@@ -304,6 +323,7 @@ def parallel_kernel(
     name = (
         f"sweep_{'parallel' if row_inputs is None else 'keyed_parallel'}_{max_constraints}_{mf_max_constraints}"
         f"_{max_world_dofs}_rows{AM}_min{int(min_rows)}_sweeps{int(sweeps)}_nt{NT}_ink{NA}_{NB}_o{OA}_{OB}"
+        + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
         + ("_linked" if linked_rows else "")
         + ("_lw" if velocity_limit_pass else "")
         + ("_weighted" if weighted else "")

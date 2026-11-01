@@ -14,17 +14,16 @@ from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout, prefix
 
 class TestKeyedRowLayout(unittest.TestCase):
     def test_single_floating_tree_has_a_generated_reader(self):
-        """Generate physical inputs for one floating tree."""
+        """Generate the walked row reader for one floating tree."""
         layout = KeyedLayout(18, 0, 0, 0, 48, False, 0)
         inputs = rows.get_direct_parallel_inputs(layout, 18, 0, 0, 0, 18, 72)
-        self.assertIsNone(inputs.stage)
-        self.assertIsNotNone(inputs.physical_row)
+        self.assertIn("TIER_WALK(", inputs.read)
 
     def test_reversed_pair_offsets_are_valid(self):
         """Accept independent blocks in reversed world order."""
         layout = KeyedLayout(9, 6, 6, 0, 32, True, (1 << 15) - 1)
         inputs = rows.get_direct_parallel_inputs(layout, 9, 6, 6, 0, 15, 64)
-        self.assertIsNotNone(inputs.physical_row)
+        self.assertIn("TIER_WALK(", inputs.read)
 
     def test_reject_overlapping_layout(self):
         """Reject overlapping coordinate blocks."""

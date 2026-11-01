@@ -1324,7 +1324,7 @@ class JacobiRows:
     ``limits``, which rows are joint velocity limits are staged (``s_vlim``, for
     the last word: :func:`jacobi_limit_pass`). Every row is admitted
     provisionally: the operator forms its diagonal from the
-    staged rows (whitened in the kernel), and a row whose formed diagonal is
+    staged rows (walked in the kernel or read from the store), and a row whose formed diagonal is
     not positive is frozen once every lane has read the staged kinds (its
     lane's ``frozen``). The lane keeps its row's diagonal in a register
     (``row_diag``), which the exit law scales the row's impulse by; with

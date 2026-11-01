@@ -137,19 +137,18 @@ class StoredLocalRows:
 
 @dataclass(frozen=True)
 class ParallelRowInputs:
-    """Factor-coordinate staging and initial metadata for the parallel policy.
+    """Walked rows and initial metadata for the parallel policy.
 
-    The stage must initialize Z, incident velocity in factor coordinates,
-    factor scratch for decoding, and complete admitted row metadata. Prefix
-    metadata may already exist; deferred contacts must not read stale fields.
+    :attr:`read` walks the lane's row into ``Zi`` (``TIER_WALK``, :class:`.response_operator.WalkedRows`), its
+    incident velocity into ``incident``, and completes the admitted row's metadata. Prefix metadata may already exist;
+    deferred contacts must not read stale fields.
     """
 
-    stage: str | None
+    read: str
     arguments: tuple[RowArgument, ...]
     row_type: str
     rhs: str
     parent: str
     mu: str
-    physical_row: str | None = None
     preludes: tuple = ()
-    """Device preludes (``device_preludes.DevicePrelude``) that :attr:`physical_row` calls into."""
+    """Device preludes (``device_preludes.DevicePrelude``) that :attr:`read` calls into."""

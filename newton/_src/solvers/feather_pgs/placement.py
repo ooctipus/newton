@@ -70,7 +70,7 @@ __all__ = ["Placement"]
 
 # Per-world preset of the first rejected row slot: no reservation was rejected.
 _ROW_SLOT_UNBOUNDED = ROW_SLOT_UNBOUNDED
-# The largest articulation the tiers whiten in-kernel: its factor is staged in the block (case K4).
+# The largest articulation the tiers hold (case K4): a lane keeps its row's coordinates in registers.
 _INKERNEL_MAX_DOF = 32
 
 
@@ -635,8 +635,9 @@ class Placement:
     def inkernel_response_meta(self) -> tuple[tuple[int, int, int, int] | None, str]:
         """Return the in-kernel response's group sizes and offsets ``(NA, NB, OA, OB)``, or ``None``, and why.
 
-        The parallel tiers form the response of up to two size groups, one articulation of each size per world with
-        a primary in every world, at one world DOF offset per size when the response is written in world layout.
+        The parallel tiers walk the rows of up to two size groups, one articulation of each size per world with a
+        primary in every world, at one world DOF offset per size when the response is written in world layout:
+        ``ink_meta`` holds each world's articulation of each size and its first world coordinate (``-1`` for none).
         """
         if self.forest.art_to_world is None:
             return None, "No articulation->world map."
@@ -644,7 +645,7 @@ class Placement:
             return None, f"{len(self.forest.size_groups)} size groups; the in-kernel response takes one or two."
         sizes = sorted((int(s) for s in self.forest.size_groups), reverse=True)
         if sizes[0] > _INKERNEL_MAX_DOF:
-            return None, f"Size {sizes[0]} exceeds the in-kernel whitening's {_INKERNEL_MAX_DOF} coordinates."
+            return None, f"Size {sizes[0]} exceeds the tiers' {_INKERNEL_MAX_DOF} coordinates a row."
         art_to_world = self.forest.art_to_world.numpy()
         dof_off = self.forest.articulation_world_dof_offset.numpy()
         meta = -np.ones((self.forest.world_count, 4), dtype=np.int32)
@@ -660,7 +661,7 @@ class Placement:
                 # The register rows use compile-time offsets.
                 return None, f"The world DOF offsets of size {size} differ."
             offsets[col] = int(off[0]) if off.size else 0
-            meta[worlds, 2 * col] = np.arange(g2a.size, dtype=np.int32)
+            meta[worlds, 2 * col] = g2a
             meta[worlds, 2 * col + 1] = off
         if np.any(meta[:, 0] < 0):
             return None, "A world has no primary articulation."
@@ -668,9 +669,7 @@ class Placement:
         if offsets[0] + sizes[0] > self.forest.max_world_dofs or (nb and offsets[1] + nb > self.forest.max_world_dofs):
             return None, "The group DOFs exceed the world DOF count."
         self.ink_meta = wp.array(meta.reshape(-1), dtype=wp.int32, device=self.model.device)
-        return (sizes[0], nb, offsets[0], offsets[1]), (
-            f"The parallel tiers whiten the rows of sizes {sizes} in the kernel."
-        )
+        return (sizes[0], nb, offsets[0], offsets[1]), f"The parallel tiers walk the rows of sizes {sizes}."
 
     def allocate_status(self):
         """The capacity status, the overflow warning and the row telemetry."""
@@ -1025,16 +1024,8 @@ class Placement:
         return int(getattr(self, "ink_rows", 0))
 
     def inkernel_response_inputs(self) -> dict:
-        """The parallel tiers' in-kernel response operands: the worlds' group indices, the primary and secondary
-        groups' factors (the primary's for a model without a secondary) and the rows' cfm."""
-        na, nb = self.ink_sizes[0], self.ink_sizes[1]
-        L_b = self.factor.L_by_size[nb] if nb else self.factor.L_by_size[na]
-        return {
-            "ink_meta": self.ink_meta,
-            "ink_L_a": self.factor.L_by_size[na],
-            "ink_L_b": L_b,
-            "world_row_cfm": self.row_cfm,
-        }
+        """The parallel tiers' operands beside the walk: the worlds' trees (``ink_meta``) and the rows' cfm."""
+        return {"ink_meta": self.ink_meta, "world_row_cfm": self.row_cfm}
 
     # ---------------------------------------------------------------------------------------------------------------
     # Step: the whitening and the diagonals
@@ -1054,8 +1045,8 @@ class Placement:
         whitened where they are written (:mod:`.walk_rows`)."""
         if not self.mf_sweeps or self.walks:
             return
-        # The parallel tiers and the local owners whiten their worlds' rows in the kernel: the build leaves them, and
-        # keyed rows and the row packets keep them out of the store.
+        # The local owners whiten their worlds' rows in the kernel and the keyed tiers walk theirs: the build leaves them,
+        # and keyed rows and the row packets keep them out of the store.
         # A compact or sparse size keeps a placeholder factor: its rows have no dense factor.
         sizes = tuple(sorted(size for size in self.forest.size_groups if self.factor.L_by_size[size].shape[1] == size))
         wp.launch(

@@ -28,8 +28,8 @@ coordinates on lanes read. Bilateral elimination widens them (:data:`WIDE`): a c
 block, past its two sides, so the layout is dense and the sides no longer bound a row's coordinates. The producers
 write each row's sides whole, zeros included, and record its sides: the
 rows are never cleared. The build (:func:`pack_kernel`, one launch) whitens the rows the routes read, zeroes their
-entries past the sides and forms their diagonals (the parallel tiers whiten their worlds' rows in the kernel from
-the rows' sides: the build leaves them). Bilateral pre-elimination corrects them
+entries past the sides and forms their diagonals (the keyed tiers walk their worlds' rows in the kernel: the build
+leaves them). Bilateral pre-elimination corrects them
 (:func:`.response_builds_rows.elimination`).
 """
 
@@ -132,8 +132,9 @@ def _pack_abi(sizes: tuple[int, ...]) -> tuple:
 
 
 def _kept(world: str) -> str:
-    """The worlds whose rows a sweep whitens in the kernel: the parallel tiers' (at most ``skip_rows_le`` rows and no
-    free-body rows; ``skip_rows_le`` 0: none) and the local owners'. Their rows stay Jacobians."""
+    """The worlds whose rows a sweep forms in the kernel: the keyed tiers' (at most ``skip_rows_le`` rows and no
+    free-body rows; ``skip_rows_le`` 0: none), whose rows the keyed decode walks, and the local owners'. Their rows stay
+    Jacobians."""
     count = f"world_constraint_count.data[{world}]"
     tier = f"(skip_rows_le > 0 && {count} <= skip_rows_le && mf_constraint_count.data[{world}] == 0)"
     return f"{tier} || local_solve_owner.data[{world}] != {PGS_LOCAL_SOLVE_OWNER_GENERAL}"

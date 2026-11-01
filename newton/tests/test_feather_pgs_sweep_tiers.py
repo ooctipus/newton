@@ -20,7 +20,7 @@ from unittest import mock
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes_tiers
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.keyed_rows import get_direct_parallel_inputs
-from newton._src.solvers.feather_pgs.response_operator import CholeskySolve, Lanes, TransposedResponse, WhitenedRows
+from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedResponse, WalkedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.staging import Buffer, Staging
 from newton._src.solvers.feather_pgs.sweep import (
@@ -99,9 +99,9 @@ def _source(args, kwargs) -> str:
 
 
 def _operator() -> TransposedResponse:
-    """A 32-row tier's response operator over 18 coordinates, whitened from groups of 12 and 6."""
+    """A 32-row tier's response operator over 18 coordinates, the walked rows of trees of 12 and 6."""
     lanes = Lanes(32)
-    return TransposedResponse(18, 32, WhitenedRows(12, 6, 0, 12, 18, 64, 36, lanes), lanes)
+    return TransposedResponse(18, 32, WalkedRows(12, 6, 0, 12, 18, 36, lanes, read=""), lanes)
 
 
 class TestParallelTier(unittest.TestCase):
@@ -211,21 +211,33 @@ class TestJacobiLaw(unittest.TestCase):
 
 
 class TestResponseOperators(unittest.TestCase):
-    """The tiers' response operator: the whitened rows' triangular solves."""
+    """The tiers' response operator: rows by the walk, the leave by the walk down, no factor staged."""
 
-    def test_a_separate_reciprocal_diagonal(self):
-        solve = CholeskySolve(6, "s_L + 144", inverse="s_Dinv + 12", masked=True)
-        forward = solve.whiten(lambda k: f"z[{k}]", lambda k: f"z[{k}]")
-        self.assertTrue(forward.startswith("#pragma unroll 1\n"))
-        # The leaf-first factor: factor coordinate ``k`` of a vector sits at position ``6 - 1 - k``.
-        self.assertIn("for(int k=0;k<6;++k)if(k<row)value-=(s_L + 144)[row*6+k]*z[(6-1-(k))];", forward)
-        self.assertIn("z[(6-1-(row))]=value*(s_Dinv + 12)[row];", forward)
-        self.assertNotIn("diagonal", forward)
-        transpose = solve.leave(lambda k: f"v[{k}]", lambda k: f"v[{k}]")
-        self.assertIn("v[(6-1-(row))]=value*(s_Dinv + 12)[row];\n        }", transpose)
-        self.assertEqual(
-            solve.stage_inverse("lane"), "if (lane < 6) (s_Dinv + 12)[lane] = 1.0f / (s_L + 144)[lane * 6 + lane];"
-        )
+    def test_the_tiers_walk_their_rows_and_leave_by_the_walk(self):
+        for label, args, kwargs in CALLS:
+            with self.subTest(label):
+                source = _source(args, kwargs)
+                self.assertNotIn("s_L", source)
+                # Each tree leaves by the walk down; the keyed rows walk their seeds, the others read the one writer's.
+                self.assertEqual(source.count("WALK_DOWN("), 2 if kwargs["inkernel_response"][1] else 1)
+                keyed = "row_inputs" in kwargs
+                self.assertEqual("TIER_WALK(" in source, keyed)
+                self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not keyed)
+                self.assertIn("s_rhs[i] += incident;", source)
+
+    def test_the_release_compiles_where_a_tree_can_slip(self):
+        """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the keyed rows and its transpose on the
+        leave (``WALK_RELEASE_T``); the stored rows carry ``R`` from their writer, so their leave takes ``R^T`` too. Only
+        on the trees of the capacity the tier names."""
+        for label, args, kwargs in (CALLS[0], CALLS[2]):
+            with self.subTest(label):
+                self.assertNotIn("WALK_RELEASE(walk.release", _source(args, kwargs))
+                self.assertNotIn("WALK_RELEASE_T(walk.release", _source(args, kwargs))
+                framed = _source(args, {**kwargs, "frame": (4, 0)})
+                self.assertNotIn("WALK_RELEASE_T(walk.release, art_b", framed)
+                self.assertEqual(framed.count("WALK_RELEASE_T(walk.release, art_a"), 1)
+                keyed = "row_inputs" in kwargs
+                self.assertEqual(framed.count("WALK_RELEASE(walk.release, art_a"), 1 if keyed else 0)
 
 
 def _kernel_sass():

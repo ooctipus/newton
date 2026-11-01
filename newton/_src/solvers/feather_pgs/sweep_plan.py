@@ -981,7 +981,7 @@ class Sweep:
                     (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
                     (
                         not self.factor.eliminates,
-                        "Bilateral pre-elimination corrects the packed rows, which the tiers whiten anew.",
+                        "Bilateral pre-elimination corrects the packed rows, which the tiers walk anew.",
                     ),
                     (
                         bool(pinned) or (self.forest.has_free_rigid_bodies and self.forest.has_non_free_articulations),
@@ -999,6 +999,29 @@ class Sweep:
             elif sizes is not None:
                 reason = f"The dense row capacity {self.placement.dense_max_constraints} holds no tier of four rows."
         self.routes.reasons["K4"] = reason
+
+    def _hold_tier_release(self) -> None:
+        """The keyed tiers' trees whose slips the release builds each step (:meth:`release_tiers`): every articulation
+        of a tier size whose trees can slip (:meth:`_tier_frame`); none where no tree of theirs can slip."""
+        sizes = [size for size, cap in zip(self.placement.ink_sizes[:2], self._tier_frame(), strict=True) if cap]
+        if not sizes:
+            return
+        arts = np.concatenate([self.forest.group_to_art[size].numpy() for size in sizes]).astype(np.int32)
+        self.tier_release_arts = wp.array(arts, dtype=wp.int32, device=self.model.device)
+
+    def release_tiers(self, v_hat: wp.array) -> None:
+        """The keyed tiers' release this step, of every tree whose predictor decided a set
+        (:func:`.walk_rows.walk_release_kernel`): their rows take ``R`` and their leave ``R^T``. Nothing where no tree of
+        theirs can slip."""
+        if self.tier_release_arts is None:
+            return
+        self._release(self.tier_release_arts, self.tier_release_arts.shape[0], v_hat)
+
+    def _tier_frame(self) -> tuple[int, int]:
+        """Each of the tiers' trees' slip capacity (:meth:`.tree_factor.TreeFactor.slip_capacity`): the release its rows
+        and leave compile, none where no tree of that size holds a limited drive."""
+        na, nb = self.placement.ink_sizes[0], self.placement.ink_sizes[1]
+        return tuple(self.factor.slip_capacity(self.forest.group_to_art[size].numpy()) if size else 0 for size in (na, nb))
 
     def _parallel_velocity_limit_pass(self) -> bool:
         """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
@@ -1346,9 +1369,10 @@ class Sweep:
         self.mf_gs_block_count = int(
             self.local_general_solver_blocks if self.placement.local_internal_fast_path else self.forest.world_count
         )
-        # The Jacobi tiers ahead of the matrix-free sweep (SweepTier).
+        # The Jacobi tiers ahead of the matrix-free sweep (SweepTier), and their keyed rows' release.
         self.tiers = []
         self.tier_worlds = None
+        self.tier_release_arts = None
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
         if self.placement.mf_sweeps:
@@ -1443,6 +1467,8 @@ class Sweep:
                     parallel_factory = get_parallel_factory(parallel_factory, self.placement.keyed_rows.layout)
                 tiers = [(min(first + 32, parallel_rows), first) for first in range(0, parallel_rows, 32)]
                 self.par_tiers = list(tiers)
+                if self.placement.keyed_rows is not None:
+                    self._hold_tier_release()
                 if len(tiers) >= _TIER_LIST_MIN_TIERS:
                     dev = model.device
                     self.tier_lo = wp.array([lo for _, lo in tiers], dtype=wp.int32, device=dev)
@@ -1469,6 +1495,7 @@ class Sweep:
                         linked_rows=self.laws.friction_anchors_enabled,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         weighted=self.laws.set.weighted,
+                        frame=self._tier_frame(),
                         **({"torsion": True} if self.laws.contact_torsion_enabled else {}),
                     )
                     self.tiers.append(dataclasses.replace(tier, tier=tier_index))

@@ -46,6 +46,7 @@ from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.route_table import RouteTable
 from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep
+from newton._src.solvers.feather_pgs.tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines, unpacked_rows
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -1278,19 +1279,56 @@ def _dummy(arg):
     return arg.type(0)
 
 
+def identity_walk(dofs: int, device) -> WalkTrees:
+    """The walk of one body of ``dofs`` coordinates whose factor is the identity (``s = ut = 0``, ``ell = 1``): its
+    rows are the coordinates' own, and its leave is ``u`` itself."""
+    walk = WalkTrees()
+    data = np.zeros((dofs, WALK_COORDINATE), np.float32)
+    data[:, 12] = 1.0
+    walk.data = wp.array(data, dtype=wp.float32, device=device)
+    walk.link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    walk.path = wp.array([(-1, 0)], dtype=wp.vec2i, device=device)
+    walk.now = wp.zeros((dofs, 6), dtype=wp.float32, device=device)
+    walk.now_link = wp.zeros((1, WALK_LINK), dtype=wp.float32, device=device)
+    walk.twist = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    walk.scratch = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    for name, values in (
+        ("joint_start", [0]),
+        ("joint_end", [1]),
+        ("dof_start", [0]),
+        ("dofs", [dofs]),
+        ("dof_body", [0] * dofs),
+        ("body_joint", [0]),
+        ("free", [0]),
+        ("group", [0]),
+        ("slips", [0]),
+    ):
+        setattr(walk, name, wp.array(values, dtype=wp.int32, device=device))
+    walk.L6 = wp.zeros((1, 6, 6), dtype=wp.float32, device=device)
+    walk.basis = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+    walk.scale = wp.zeros((1, 1, 1), dtype=wp.float32, device=device)
+    return walk
+
+
 def _launch_parallel(tier, case, *, device):
-    """Launch one world through a parallel tier, its response formed in-kernel, and return its impulses and velocity."""
+    """Launch one world through a parallel tier and return its impulses and velocity.
+
+    The tier reads the one writer's stored rows and leaves by the walk. The case is posed in its factor's coordinates
+    so the walk is the identity: the rows are ``Z = L^-1 P J^T``, the velocity ``u = M^-1 v`` with ``M = P^T L^-T P``
+    (``dv = M Z^T lambda``), the incident velocity ``J v_hat``; the published velocity maps back by ``M``."""
     kernel = tier.kernel
     count = len(case["J"])
     padded = np.zeros((1, _CAPACITY))
+    L = case["L"]
 
     def rows(values, dtype=wp.float32):
         out = padded.copy().astype(np.float32 if dtype == wp.float32 else np.int32)
         out[0, :count] = values
         return wp.array(out, dtype=dtype, device=device)
 
-    J = np.zeros((1, _CAPACITY, _DOFS), np.float32)
-    J[0, :count] = case["J"]
+    v_hat = case["velocity"] - case["impulses"] @ case["Y"]
+    Z = np.zeros((1, _CAPACITY, _DOFS), np.float32)
+    Z[0, :count] = case["Z"]
     values = {
         "general_world_count": wp.array([1], dtype=wp.int32, device=device),
         "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),
@@ -1301,10 +1339,11 @@ def _launch_parallel(tier, case, *, device):
         "dense_phase_bounds": wp.zeros((1, 2), dtype=wp.int32, device=device),
         "world_dof_indices": wp.array(np.arange(_DOFS, dtype=np.int32)[None], dtype=wp.int32, device=device),
         "rhs_bias": rows(case["rhs"]),
+        "row_incident": rows(case["J"] @ v_hat),
         "world_diag": rows(case["diag"]),
         "world_impulses": rows(case["impulses"]),
-        # The world's packed rows (dense): every row on articulation 0, its coordinates from 0.
-        "packed_Z": wp.array(J, dtype=wp.float32, device=device),
+        # The world's stored rows (dense): every row on articulation 0, its coordinates from 0.
+        "packed_Z": wp.array(Z, dtype=wp.float32, device=device),
         "world_row_type": rows(case["types"], wp.int32),
         "world_row_parent": rows(case["parents"], wp.int32),
         "world_row_mu": rows(case["mu"]),
@@ -1312,12 +1351,10 @@ def _launch_parallel(tier, case, *, device):
         "iterations": 1,
         "omega": 1.0,
         # The predictor: the case's velocity less the response of its starting impulses, which the tier applies.
-        "v_out": wp.array(
-            (case["velocity"] - case["impulses"] @ case["Y"]).astype(np.float32), dtype=wp.float32, device=device
-        ),
+        "v_out": wp.array((L.T @ v_hat[::-1])[::-1].astype(np.float32), dtype=wp.float32, device=device),
+        "walk": identity_walk(_DOFS, device),
     }
     values["ink_meta"] = wp.array([0, 0, -1, 0], dtype=wp.int32, device=device)
-    values["ink_L_a"] = wp.array(case["L"].astype(np.float32)[None], dtype=wp.float32, device=device)
     values["row_sides"] = wp.array(np.tile([0, -1], (1, _CAPACITY, 1)).astype(np.int32), dtype=wp.vec2i, device=device)
     values["response_dofs"] = wp.array([_DOFS], dtype=wp.int32, device=device)
     values["articulation_world_dof_offset"] = wp.zeros(1, dtype=wp.int32, device=device)
@@ -1328,7 +1365,8 @@ def _launch_parallel(tier, case, *, device):
         for name in inspect.signature(kernel.func).parameters
     ]
     wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.block_dim, device=device)
-    return values["world_impulses"].numpy()[0, :count], values["v_out"].numpy()
+    u = values["v_out"].numpy().astype(np.float64)
+    return values["world_impulses"].numpy()[0, :count], np.linalg.solve(L.T, u[::-1])[::-1]
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")

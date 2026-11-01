@@ -713,15 +713,14 @@ class SolverFeatherPGS(SolverBase):
         # local owners (case K3, FL3.6) whiten and leave their rows by the walk (FL3.3): the factor holds the walk's data
         # for every responding tree, a free rigid body's six coordinates included, and the one writer, the free bodies'
         # writer and the sweeps' leaves read it. The local owners' packets walk their seeds in their kernel and the one
-        # writer their general worlds' rows; every local kernel leaves by the walk. Rows that the tiers sweep (case K4,
-        # their keyed rows) keep the old pack until their owner converts (FL3.7): its sweep whitens its worlds' J in the
-        # kernel. The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support
-        # sink.
+        # writer their general worlds' rows; every local kernel leaves by the walk. The Jacobi tiers (case K4, FL3.7)
+        # read the one writer's rows, or walk their keyed rows in the kernel, and leave by the walk; the keyed rows'
+        # general worlds keep their J until they convert. The support placement (case K1, FL3.4) whitens and leaves its
+        # rows by the walk too, into its support sink.
         general = self.routes.case == "K1" or bool(
-            self.routes.case in ("K6", "K5", "K3")
+            self.routes.case in ("K6", "K5", "K3", "K4")
             and self.placement.mf_sweeps
             and self.placement.keyed_rows is None
-            and not self.placement.ink_skip_rows()
             and np.any(self.forest.response_dof_count > 0)
         )
         # The sparse diagonal (case K2, FL3.5) walks each world's dense arm into its rows' dense parts and leaves it
@@ -735,7 +734,8 @@ class SolverFeatherPGS(SolverBase):
             )
         if self.placement.local_internal_fast_path and not self.placement.walks:
             raise ValueError("The local owners walk their rows and leave (FL3.6): their class must walk.")
-        if general:
+        if general or self.placement.ink_skip_rows():
+            # Every responding tree; the keyed tiers walk their keyed rows in the kernel.
             self.factor.plan_walk(np.flatnonzero(self.forest.response_dof_count > 0))
         elif diagonal:
             self.factor.plan_walk(self.placement.sparse_diagonal_dense_arts_host)
@@ -1188,6 +1188,8 @@ class SolverFeatherPGS(SolverBase):
             else:
                 self.placement.pack_rows(self.v_hat, write_diag=packed_diag)
                 self.laws.write_rhs(self, dt)
+                # The keyed tiers walk their rows in the kernel and release their trees' slips along their paths.
+                self.sweep.release_tiers(self.v_hat)
 
         # MF: whiten the rows (Z = L^-1 J^T), their mf_rhs, mf_eff_mass_inv and incident velocities
         if self.forest.has_free_rigid_bodies:
