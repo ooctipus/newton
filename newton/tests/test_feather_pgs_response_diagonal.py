@@ -1801,8 +1801,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[True].laws.contact_torsion_enabled)
         self.assertTrue(solvers[True].placement.local_internal_fast_path)
         kernels = (
-            *solvers[True].sweep.local_pair_kernels.values(),
-            *solvers[True].sweep.local_residual_kernels.values(),
+            *solvers[True].sweep.local_pair.kernels.values(),
+            *solvers[True].sweep.local_residual.kernels.values(),
         )
         self.assertTrue(kernels)
         self.assertTrue(all("_torsion" in kernel.key for kernel in kernels))

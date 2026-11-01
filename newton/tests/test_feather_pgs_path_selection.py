@@ -838,8 +838,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 routes = selected["routes"]
                 # Owners are reported only where their kernels were built.
                 owners = routes["free_rigid_bodies"]["owners"]
-                self.assertEqual("local_pair" in owners, bool(solver.sweep.local_pair_kernels))
-                self.assertEqual("local_residual" in owners, bool(solver.sweep.local_residual_kernels))
+                self.assertEqual("local_pair" in owners, bool(solver.sweep.local_pair.kernels))
+                self.assertEqual("local_residual" in owners, bool(solver.sweep.local_residual.kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
                 self.assertEqual(pack["launched"], solver.placement.pack_mf_meta_kernel is not None)
                 # The MF-GS kernel's name spells the storage the record reports.

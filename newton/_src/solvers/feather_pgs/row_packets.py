@@ -481,7 +481,7 @@ def plan(solver):
 
 def topology_supported(solver, primary, mimics):
     """Check all prefix entries, not only currently enabled or valid mimic rows."""
-    if primary not in solver.sweep.local_pair_active_counts or primary not in solver.sweep.local_residual_active_counts:
+    if primary not in solver.sweep.local_pair.active_counts or primary not in solver.sweep.local_residual.active_counts:
         return False
     if np.any(solver.sweep.local_primary_articulation.numpy() < 0):
         return False
@@ -526,12 +526,12 @@ class LocalRowPackets:
         self._absent_mimics["mimic_start"] = placeholder(wp.int32, (solver.model.articulation_count + 1,))
         # The capacity status is allocated after tiled-kernel construction; prepare_prefix binds it.
         size = SimpleNamespace(
-            pair_count=solver.sweep.local_pair_active_counts[self.primary],
-            pair=solver.sweep.local_pair_active_candidates[self.primary],
-            pair_secondary=solver.sweep.local_pair_active_secondaries[self.primary],
-            residual_count=solver.sweep.local_residual_active_counts[self.primary],
-            residual=solver.sweep.local_residual_active_candidates[self.primary],
-            residual_pair=solver.sweep.local_residual_active_secondaries[self.primary],
+            pair_count=solver.sweep.local_pair.active_counts[self.primary],
+            pair=solver.sweep.local_pair.active_candidates[self.primary],
+            pair_secondary=solver.sweep.local_pair.active_secondaries[self.primary],
+            residual_count=solver.sweep.local_residual.active_counts[self.primary],
+            residual=solver.sweep.local_residual.active_candidates[self.primary],
+            residual_pair=solver.sweep.local_residual.active_secondaries[self.primary],
         )
         self.queue = field_group.bind(
             QueueData, sweep=solver.sweep, placement=solver.placement, forest=solver.forest, size=size, status=None

@@ -440,9 +440,9 @@ def _local_solve(solver) -> dict:
     enabled = row.case == "K3"
     return {
         "enabled": enabled,
-        "internal_articulations_by_dof": _counts(solver.sweep.local_internal_art_counts) if enabled else {},
-        "pair_articulations_by_dof": _counts(solver.sweep.local_pair_art_counts) if enabled else {},
-        "residual_articulations_by_dof": _counts(solver.sweep.local_residual_art_counts) if enabled else {},
+        "internal_articulations_by_dof": _counts(solver.sweep.local_internal.counts) if enabled else {},
+        "pair_articulations_by_dof": _counts(solver.sweep.local_pair.counts) if enabled else {},
+        "residual_articulations_by_dof": _counts(solver.sweep.local_residual.counts) if enabled else {},
         "reason": row.reasons["K3"],
     }
 
@@ -535,9 +535,9 @@ def _sweep(solver) -> dict:
     if row.case == "K3":
         local = {
             "factory": "row_packets" if row.producer == "local_packets" else "local_owned",
-            "internal": _keys_by_size(solver.sweep.local_internal_kernels),
-            "pair": _keys_by_size(solver.sweep.local_pair_kernels),
-            "residual": _keys_by_size(solver.sweep.local_residual_kernels),
+            "internal": _keys_by_size(solver.sweep.local_internal.kernels),
+            "pair": _keys_by_size(solver.sweep.local_pair.kernels),
+            "residual": _keys_by_size(solver.sweep.local_residual.kernels),
         }
     record = {
         "route": route,
@@ -719,9 +719,9 @@ def _free_rigid_bodies(solver) -> dict:
         if solver.sweep.paired_response_primary_size is not None:
             owners.append("paired_factor" if row.case == "K5" else "paired_response")
         # Built local kernels only.
-        if solver.sweep.local_pair_kernels:
+        if solver.sweep.local_pair.kernels:
             owners.append("local_pair")
-        if solver.sweep.local_residual_kernels:
+        if solver.sweep.local_residual.kernels:
             owners.append("local_residual")
         owners.append("matrix_free_rows")
     return {

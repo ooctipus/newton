@@ -361,17 +361,14 @@ def _owner_solver(device, *, anchors, beta=0.0):
         )
     }
     rows = {name: ints(worlds) for name in ("mf_constraint_count", "constraint_count", "local_solve_owner")}
-    active = {
-        name: {PRIMARY: ints(worlds)}
-        for name in (
-            "local_pair_active_counts",
-            "local_pair_active_candidates",
-            "local_pair_active_secondaries",
-            "local_residual_active_counts",
-            "local_residual_active_candidates",
-            "local_residual_active_secondaries",
+
+    def active():
+        return SimpleNamespace(
+            active_counts={PRIMARY: ints(worlds)},
+            active_candidates={PRIMARY: ints(worlds)},
+            active_secondaries={PRIMARY: ints(worlds)},
         )
-    }
+
     solver = SimpleNamespace(
         model=SimpleNamespace(device=wp.get_device(device), articulation_count=2 * worlds),
         sweep=SimpleNamespace(
@@ -379,8 +376,9 @@ def _owner_solver(device, *, anchors, beta=0.0):
             local_residual_max_rows=PACKETS,
             local_residual_mf_max_rows=4,
             local_general_world_count=ints(1),
+            local_pair=active(),
+            local_residual=active(),
             **queue,
-            **active,
         ),
         placement=SimpleNamespace(
             **rows,
