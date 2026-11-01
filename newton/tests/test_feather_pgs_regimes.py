@@ -585,7 +585,8 @@ class TestQ09Gyroscopic(unittest.TestCase):
 
 
 class TestQ10MassRatio(unittest.TestCase):
-    """Q10: heavy on light. The rigid claim holds to a mass ratio set by the budget."""
+    """Q10: heavy on light. The rigid claim holds to a mass ratio of about half the budget; past it the light box sinks
+    and the stack topples, until load-path rows carry the heavy box's load through the light one."""
 
     @staticmethod
     def _overlap(ratio, sweeps):
@@ -607,6 +608,35 @@ class TestQ10MassRatio(unittest.TestCase):
         _roll(model, 240, each=each, pgs_iterations=sweeps, friction_anchor_beta=0.0)
         return -worst[0]
 
+    @staticmethod
+    def _motion(densities, sweeps):
+        """Boxes of 10 cm stacked on the ground, box ``k`` (from the bottom) of density ``1000 densities[k]``.
+
+        Returns the bottom box's deepest sink into the ground [m], the top box's deepest overlap into the box under it
+        while every box stands upright (tilt under 5 degrees) [m], and the largest tilt of any box [degrees].
+        """
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -G0))
+        for k, density in enumerate(densities):
+            cfg = newton.ModelBuilder.ShapeConfig(density=1000.0 * density, mu=0.5, gap=0.005)
+            body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05 + 0.1001 * k), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        builder.add_ground_plane()
+        model = builder.finalize(device=DEVICE)
+        worst = {"sink": 0.0, "overlap": 0.0, "tilt": 0.0}
+
+        def each(state, solver, contacts, step):
+            q = state.body_q.numpy().astype(np.float64)
+            # A box's tilt is the angle between its z axis and the world's, from its quaternion (x, y, z, w).
+            cosines = np.clip(1.0 - 2.0 * (q[:, 3] ** 2 + q[:, 4] ** 2), -1.0, 1.0)
+            tilt = float(np.degrees(np.arccos(cosines)).max())
+            worst["tilt"] = max(worst["tilt"], tilt)
+            worst["sink"] = max(worst["sink"], 0.05 - q[0, 2])
+            if tilt < 5.0:
+                worst["overlap"] = max(worst["overlap"], 0.1 - (q[-1, 2] - q[-2, 2]))
+
+        _roll(model, 240, each=each, pgs_iterations=sweeps, friction_anchor_beta=0.0)
+        return worst["sink"], worst["overlap"], worst["tilt"]
+
     def test_ratio_within_the_budget(self):
         """A ratio up to half the budget holds to a millimetre."""
         self.assertLess(self._overlap(12.0, 24), 1.0e-3)
@@ -621,11 +651,23 @@ class TestQ10MassRatio(unittest.TestCase):
                 self.assertLess(overlap, 3.0 * scale)
 
     @known_failure(
-        LIMIT, "what N sweeps can do under PGS: past a mass ratio of about 10 N the box ends inside the other"
+        "H: heavy on light, the load-path rows",
+        "Gauss-Seidel contracts the heavy box's six transmission modes through a light box by 1 - c / ratio per sweep "
+        "in every row order, so a cold solve leaves exp(-c N / ratio) of the load unsolved: the light box sinks and the "
+        "stack topples",
     )
     def test_ratio_past_the_budget(self):
-        """Past ``ratio = 10 N`` the budget cannot carry the load: the heavy box ends inside the light one."""
-        self.assertLess(self._overlap(300.0, 24), 5.0e-3)
+        """Past the budget, to a mass ratio of 1e4 at 24 sweeps, the stack neither sinks nor tilts.
+
+        Main sinks 17-79 mm from 300:1 and topples or squeezes the light box out; three boxes topple from 100:1.
+        Load-path rows solve the transmission in about 8 sweeps at any ratio.
+        """
+        failures = {}
+        for densities in ((1.0, 300.0), (1.0, 1.0e3), (1.0, 1.0e4), (1.0, 1.0, 1.0e4)):
+            sink, overlap, tilt = self._motion(densities, 24)
+            if not (sink < 1.0e-3 and overlap < 1.0e-3 and tilt < 1.0):
+                failures[densities] = {"sink": sink, "overlap": overlap, "tilt": tilt}
+        self.assertFalse(failures, failures)
 
 
 class TestQ11Stack(unittest.TestCase):
