@@ -4,8 +4,8 @@
 """The regime suite: FeatherPGS against absolute references, across regimes the tasks do not reach.
 
 Conformance compares the solver with itself at a larger budget, so a wrong law is common-mode and passes. Here each
-family Q1-Q19 has a reference that shares nothing with the solver: a closed form, a float64 discrete law, quadrature,
-float64 RK4 (:mod:`newton.tests.feather_pgs_references`), or a manufactured solution.
+family Q1-Q20 has a reference that shares nothing with the solver: a closed form, a float64 discrete law, quadrature,
+float64 RK4 (:mod:`newton.tests.feather_pgs_references`), a manufactured solution, or the same problem at the origin.
 
 A known failure is an expected failure that names its phase or says it is a documented limit (:func:`known_failure`):
 when the phase lands, its test reports an unexpected success and the mark goes. Where a family holds in one regime and
@@ -19,6 +19,7 @@ import functools
 import itertools
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -1714,6 +1715,113 @@ class TestQ18ManufacturedCUDA(unittest.TestCase):
                     if point >= TestQ18Manufactured.TOLERANCE:
                         wrong[name, seed] = point
         self.assertEqual(wrong, {})
+
+
+FAR = (158.75, 158.75, 0.0)
+"""The benchmark's farthest env origin [m]: 16,384 worlds on a centred 128 by 128 grid at 2.5 m spacing put the corner
+worlds 224.5 m from the origin, at 158.75 m on each axis, where a float32 coordinate's spacing is 2^-16 m (15.3 um)."""
+
+
+def _move(builder, offset):
+    """Move every world of ``builder`` by ``offset`` [m], as the cloner places a world at its env origin
+    (:meth:`newton.ModelBuilder.replicate` with ``xforms``): static shapes, the parent frames of roots that are not free,
+    and free roots' coordinates."""
+    shift = wp.transform(wp.vec3(*offset), wp.quat_identity())
+    for shape, body in enumerate(builder.shape_body):
+        if body == -1:
+            builder.shape_transform[shape] = wp.transform_multiply(shift, wp.transform(*builder.shape_transform[shape]))
+    for joint, parent in enumerate(builder.joint_parent):
+        if parent != -1:
+            continue
+        frame = wp.transform(*builder.joint_X_p[joint])
+        if builder.joint_type[joint] == int(newton.JointType.FREE):
+            start = builder.joint_q_start[joint]
+            local = wp.transform_multiply(wp.transform_multiply(wp.transform_inverse(frame), shift), frame)
+            moved = wp.transform_multiply(local, wp.transform(*builder.joint_q[start : start + 7]))
+            builder.joint_q[start : start + 7] = [float(x) for x in moved]
+        else:
+            builder.joint_X_p[joint] = wp.transform_multiply(shift, frame)
+    builder.body_q = [wp.transform_multiply(shift, wp.transform(*q)) for q in builder.body_q]
+
+
+def far(scene):
+    """``scene`` with every world moved to :data:`FAR`."""
+    finalize = scenes._finalize
+
+    def build(device):
+        def moved(builder, device):
+            _move(builder, FAR)
+            return finalize(builder, device)
+
+        with mock.patch.object(scenes, "_finalize", moved):
+            return scene.build(device)
+
+    return dataclasses.replace(scene, name=f"{scene.name}_far", build=build)
+
+
+class TestQ20WorldOffset(unittest.TestCase):
+    """Q20: a world's physics does not depend on where it sits. Reference: the same problem at the origin.
+
+    Isaac Lab simulates each world at its env origin (``builder.replicate(..., xforms=env origins)``) and Newton's state
+    holds float32 world positions. At the benchmark's farthest origin (:data:`FAR`) a coordinate's spacing is 15.3 um:
+
+    - a body's step ``v h`` under half of it rounds away: at 1/240 s a slide slower than 1.8 mm/s does not move;
+    - a contact's gap ``n . (p_a - p_b)`` is formed from rounded world points (``contact_laws.contact_points``), so a row
+      whose normal is horizontal holds a ``b`` off by up to a spacing over ``h``: 2.2e-3 m/s on the gripper's pads,
+      against bodies and static shapes alike.
+
+    A normal along z reads only heights, so resting, stacking and walking on the ground hold. The fix is the owner's: a
+    world simulated in its own frame, with env origins applied at the observation and render boundary.
+    """
+
+    CREEP = 1.0e-3
+    """The slide [m/s]: 4.2 um a step at 1/240 s, under half the spacing at :data:`FAR`."""
+
+    def test_manufactured_problems_far_from_the_origin(self):
+        """Q18's problems whose normals are along z return the same solution at :data:`FAR`: all its scenes but the
+        gripper."""
+        entries = [
+            (lambda build=entry[0]: far(build()), *entry[1:])
+            for entry in TestQ18Manufactured.SCENES
+            if entry[0] is not scenes.gripper
+        ]
+        check_regular_scenes(self, entries, conformance.CPU, DEVICE, count=2)
+
+    @known_failure(
+        LIMIT,
+        "float32 world positions: a contact's gap is formed from rounded world points, so a horizontal normal holds a b "
+        "off by up to ulp(|x|) / h, 2.2e-3 m/s at 159 m",
+    )
+    def test_horizontal_normals_far_from_the_origin(self):
+        """The gripper's pads, normals across x, hold the stated ``b`` at :data:`FAR` as they do at the origin."""
+        with wp.ScopedDevice(DEVICE):
+            prepared = ManufacturedScene(far(scenes.gripper()), conformance.CPU, DEVICE, settle=60)
+            problem, _solver = prepared.solve(0)
+        self.assertLess(np.abs(problem.offsets).max(), TestQ18Manufactured.HELD_B / prepared.scene.dt)
+
+    def _creep(self, origin):
+        """A frictionless box sliding at :attr:`CREEP` for 2 s on the ground, its world at ``origin``: how far it went."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -G0))
+        cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.0, gap=0.005)
+        body = builder.add_body(xform=wp.transform((origin[0], origin[1], 0.05), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05, cfg=cfg)
+        builder.add_ground_plane(cfg=cfg)
+        model = builder.finalize(device=DEVICE)
+        _solver, state = _roll(model, round(2.0 / H), setup=lambda state: _set_qd(state, {0: self.CREEP}))
+        return float(state.body_q.numpy()[0, 0]) - origin[0]
+
+    def test_creep_at_the_origin(self):
+        """At the origin the box slides ``2 CREEP``."""
+        self.assertAlmostEqual(self._creep((0.0, 0.0)), 2.0 * self.CREEP, delta=0.01 * 2.0 * self.CREEP)
+
+    @known_failure(
+        LIMIT,
+        "float32 world positions: a step under half the coordinate's spacing rounds away, so a 1 mm/s slide stops past "
+        "128 m in a coordinate (the corner world sits at 158.75 m)",
+    )
+    def test_creep_far_from_the_origin(self):
+        """At :data:`FAR` the box slides ``2 CREEP`` too."""
+        self.assertAlmostEqual(self._creep(FAR), 2.0 * self.CREEP, delta=0.01 * 2.0 * self.CREEP)
 
 
 class TestRegimeSuite(unittest.TestCase):
