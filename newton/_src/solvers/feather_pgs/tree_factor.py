@@ -2476,8 +2476,12 @@ def walk_schedule(classes: tuple[WalkClass, ...], trees: int, sms: int) -> bool:
     return max(walk.coordinates for walk in classes) <= WALK_THREAD_COORDINATES
 
 
-WALK_THREAD_COORDINATES = 22
-"""The most coordinates of a class whose refresh runs a thread a tree (WM §2: A7r wins up to about 22 on the PRO)."""
+WALK_THREAD_COORDINATES = 0
+"""The most coordinates of a class whose refresh runs a thread a tree. Measured on the PRO at 16,384 trees with the
+step's geometry kept as the lane-strided loop (one thread then walks its tree's joints through the generic joint
+branches): a thread a tree is 1.3-2.0x slower than the lane feed on cartpole (2 coordinates), franka-reach (9),
+franka, allegro, kuka and g1, its geometry half alone 1.3-2.6x slower. WM's A7r, which wins up to about 22, compiles
+the geometry in as well; no class qualifies until the geometry half leaves this kernel."""
 
 WALK_THREAD_CLASSES = 4
 """The most classes one thread-a-tree launch compiles in (a switch over them)."""
