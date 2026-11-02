@@ -1140,7 +1140,7 @@ class WalkedRows:
                 f"const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];",
                 f"WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0,",
                 f"          walk.dofs.data[{art}]);",
-                f"WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},",
+                f"WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK},",
                 f"          &s_dv[{offset}], &s_dv[{offset}], reinterpret_cast<float*>(walk.scratch.data + j0));",
             ]
             leaves += [f"if ({art} >= 0 && {lane} == {owner}) {{", *("    " + line for line in leave), "}"]
@@ -1804,7 +1804,7 @@ class LocalBlock(ResidualBlock):
 
     def leave(self, indent: str) -> str:
         """The committed velocity change leaves the walk's coordinates in place, ``dv = P^T L^-T R^T u``: on lane 0 the
-        primary tree's release transposed (``WALK_RELEASE_T``) and its walk down (``WALK_DOWN``), on lane 1 the paired
+        primary tree's release transposed (``WALK_RELEASE_T``) and its walk down (``WALK_DOWN_PATHS``), on lane 1 the paired
         free body's walk down."""
         lane = self.lanes.lane
         primary, free = self.twists()
@@ -1812,14 +1812,14 @@ class LocalBlock(ResidualBlock):
             f"if ({lane} == 0) {{",
             *(["    WALK_RELEASE_T(walk.release, art, s_v);"] if self.release else []),
             "    walk_primary();",
-            f"    WALK_DOWN(walk_data, walk_link, s_v, s_v, {primary});",
+            f"    WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v, {primary});",
             "}",
         ]
         if self.secondary:
             lines += [
                 f"if ({lane} == 1) {{",
                 "    walk_free();",
-                f"    WALK_DOWN(free_data, free_link, s_v + {self.primary}, s_v + {self.primary}, {free});",
+                f"    WALK_DOWN_PATHS(free_data, free_link, s_v + {self.primary}, s_v + {self.primary}, {free});",
                 "}",
             ]
         return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))

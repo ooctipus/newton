@@ -132,7 +132,7 @@ class TestSweepRoutesDiagSources(unittest.TestCase):
             self.assertIn("v_out.data[global_dof] += diagonal_scale > 0.0f ? s_v[d] * diagonal_scale : s_v[d];", text)
             self.assertIn("sqrtf(diagonal_inverse_mass.data[global_dof])", text)
             self.assertLess(text.index("for (int iteration = 0;"), text.index("dv = P^T L^-T R^T u"))
-            self.assertLess(text.index("dv = P^T L^-T R^T u"), text.rindex("WALK_DOWN("))
+            self.assertLess(text.index("dv = P^T L^-T R^T u"), text.rindex("WALK_DOWN_PATHS("))
 
 
 class TestSweepRoutesDiagOperators(unittest.TestCase):

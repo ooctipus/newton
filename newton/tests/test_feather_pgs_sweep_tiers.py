@@ -219,7 +219,7 @@ class TestResponseOperators(unittest.TestCase):
                 source = _source(args, kwargs)
                 self.assertNotIn("s_L", source)
                 # Each tree leaves by the walk down; the keyed rows walk their seeds, the others read the one writer's.
-                self.assertEqual(source.count("WALK_DOWN("), 2 if kwargs["inkernel_response"][1] else 1)
+                self.assertEqual(source.count("WALK_DOWN_PATHS("), 2 if kwargs["inkernel_response"][1] else 1)
                 keyed = "row_inputs" in kwargs
                 self.assertEqual("TIER_WALK(" in source, keyed)
                 self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not keyed)

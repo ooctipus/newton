@@ -96,7 +96,7 @@ MF_GS_ABI = kernel_template.params(
 def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") -> str:
     """Articulation ``art``'s tree leaves the walk's coordinates in place on its ``size`` values at the native pointer
     ``values``: ``dv = P^T L^-T R^T du``, the slips' release transposed first where the class can slip (``frame``,
-    :func:`.tree_kinetic_state.border_solve`, the predictor's border), then the walk down (``WALK_DOWN`` of
+    :func:`.tree_kinetic_state.border_solve`, the predictor's border), then the walk down (``WALK_DOWN_PATHS`` of
     :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch). Every placement that walks its rows
     leaves by it, so the rows and the leave share one frame (FL3_design §1.2)."""
     slipped = ""
@@ -106,7 +106,7 @@ def walk_leave(art: str, values: str, size: str, *, frame: bool, pad: str = "") 
     text = f"""{{
 const int j0 = walk.joint_start.data[{art}], d0 = walk.dof_start.data[{art}];
 {slipped}WALK_TREE(reinterpret_cast<const int*>(walk.path.data + j0), walk.joint_end.data[{art}] - j0, {size});
-WALK_DOWN(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK}, {values}, {values},
+WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * {WALK_COORDINATE}, walk.link.data + (size_t)j0 * {WALK_LINK}, {values}, {values},
           reinterpret_cast<float*>(walk.scratch.data + j0));
 }}"""
     return indent(text, pad)
@@ -156,7 +156,7 @@ class FactorCoordinates:
     def walk_leave(self, first: str, values: str) -> str:
         """The walk down of the free body (a one-body tree) whose first world coordinate is ``first``, in place on its
         six ``values``: ``v = P^T L^-T u``."""
-        return self._walked(first, f"WALK_DOWN(data, link, {values}, {values}, twist)")
+        return self._walked(first, f"WALK_DOWN_PATHS(data, link, {values}, {values}, twist)")
 
     def walk_enter(self, first: str, velocity: str, out: str) -> str:
         """The walk in of that free body: ``out = L^T P velocity``."""
@@ -193,7 +193,7 @@ class FactorCoordinates:
     ) -> str:
         """Every marked articulation leaves factor coordinates in place, a thread per bitmap word. With ``walk`` (the
         general placement's one writer, :mod:`.walk_rows`) every tree, a free rigid body's six coordinates too, leaves
-        by the walk down (``WALK_DOWN`` of :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch),
+        by the walk down (``WALK_DOWN_PATHS`` of :func:`.tree_factor.walk_paths_prelude`, its twists in the walk's scratch),
         with ``frame`` (a class whose drives can saturate) after its rows' frame."""
         factors = self.op.factors
         coordinates = lambda k: f"s_v[d + {k}]"  # noqa: E731

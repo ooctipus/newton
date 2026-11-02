@@ -5,7 +5,7 @@
 
 :func:`.tree_factor.walk_prelude` declares the walk for both devices: the class's path table in constant memory, a lane
 per seed walking its rows up (``WALK_UP``, ``WALK_SEED``) into the caller's sink, with the step's ``J`` entry each
-footprint whitens, and a lane per tree walking down (the leave, ``WALK_DOWN``). These tests run it on
+footprint whitens, and a lane per tree walking down (the leave, ``WALK_DOWN_PATHS``). These tests run it on
 the CPU and, where there is one, on a CUDA device, against the float64 walk (:class:`.tree_factor.TreeWalk`, which
 :mod:`.test_feather_pgs_walk` holds to the factor), and hold every placement to one frame:
 
@@ -39,7 +39,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import tree_factor
-from newton._src.solvers.feather_pgs.device_preludes import substitute
+from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.kernel_template import THREADS, KernelTemplate, params
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
@@ -115,7 +115,14 @@ _TREE = """    if (tid >= u.shape[0]) return;
     const int n = data.shape[1], bodies = link.shape[1];
     const float* d = data.data + (size_t)tree.data[tid] * n * $coordinate;
     const float* l = link.data + (size_t)tree.data[tid] * bodies * $link;
-    WALK_DOWN(d, l, u.data + (size_t)tid * n, qd.data + (size_t)tid * n, twist.data + (size_t)tid * bodies * 6);
+    const float* in = u.data + (size_t)tid * n;
+    float* out = qd.data + (size_t)tid * n;
+    float* twists = twist.data + (size_t)tid * bodies * 6;
+    WALK_DOWN(
+        0, d, l, [&](const int c) -> float { return in[c]; }, [&](const int c, const float q) { out[c] = q; },
+        [&](const int b, const float* V) {
+            for (int k = 0; k < 6; ++k) twists[6 * b + k] = V[k];
+        });
 """
 
 _UP_PARAMS = params(
@@ -144,7 +151,8 @@ _TREE_PARAMS = params(
 
 @functools.cache
 def walk_kernels(table: tuple, rows: int) -> tuple:
-    """The rows kernel (a thread per seed) and the tree kernel (a thread per tree) of one path table."""
+    """The rows kernel (a thread per seed) and the tree kernel (a thread per tree, the class's emitted walk down) of
+    one path table."""
     prelude = tree_factor.walk_prelude(*table, rows)
     tag = hashlib.sha256(repr(table).encode()).hexdigest()[:12]
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK, "now": WALK_NOW}
@@ -156,7 +164,7 @@ def walk_kernels(table: tuple, rows: int) -> tuple:
         _TREE_PARAMS,
         substitute(_TREE, coordinate=WALK_COORDINATE, link=WALK_LINK),
         THREADS,
-        (prelude,),
+        (tree_factor.walk_down_prelude((tree_factor.WalkClass(*table),)),),
         dual=True,
     )
     return up.kernel(), tree.kernel()
@@ -652,6 +660,98 @@ def cuda_placements() -> list:
     ]
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The class emitter in both directions
+# ---------------------------------------------------------------------------------------------------------------------
+
+_BOTH = """    if (tid >= weights.shape[0]) return;
+    const int n = values.shape[1], bodies = weights.shape[1];
+    WALK_BOTH(weights.data + (size_t)tid * bodies, values.data + (size_t)tid * n, path.data + (size_t)tid * n,
+              subtree.data + (size_t)tid * bodies);
+"""
+_BOTH_PARAMS = params(
+    ("weights", wp.array2d[float]),
+    ("values", wp.array2d[float]),
+    ("path", wp.array2d[float]),
+    ("subtree", wp.array2d[float]),
+)
+
+
+@functools.cache
+def both_ways_kernel(table: tuple):
+    """A thread per case of one class: root first, each coordinate's sum of the weights of the bodies and the values of
+    the coordinates on its root path up to it (``path``); leaf first, each body's sum over its subtree (``subtree``)."""
+    walk = tree_factor.WalkClass(*table)
+
+    def text(cuda: bool) -> str:
+        down = walk.walk(
+            "$V[0] = $P[0];", "$V[0] += x[$c];\ndown[$c] = $V[0];", begin="$V[0] += w[$b];", width=1, cuda=cuda
+        )
+        up = walk.walk(
+            "$P[0] += $V[0];",
+            "$V[0] += x[$c];",
+            begin="$V[0] += w[$b];",
+            end="up[$b] = $V[0];",
+            root_first=False,
+            width=1,
+            cuda=cuda,
+        )
+        return f"""    const auto WALK_BOTH = [&](const float* w, const float* x, float* down, float* up) {{
+        {{
+{tree_factor.indent_text(down, 12)}
+        }}
+        {{
+{tree_factor.indent_text(up, 12)}
+        }}
+    }};"""
+
+    prelude = DevicePrelude(f"walk_both_{walk.tag}", text(True), cpu=text(False))
+    return KernelTemplate(f"walk_both_{walk.tag}", _BOTH_PARAMS, _BOTH, THREADS, (prelude,), dual=True).kernel()
+
+
+def both_ways(table: tuple, device, rng) -> tuple:
+    """Integer weights and values (sums exact in float32) walked both ways by the emitted class, against numpy."""
+    parent, first = table
+    bodies, n = len(parent), first[-1]
+    cases = 4
+    weights = rng.integers(-8, 9, size=(cases, bodies)).astype(np.float32)
+    values = rng.integers(-8, 9, size=(cases, n)).astype(np.float32)
+    path, subtree = np.zeros((cases, n), np.float32), np.zeros((cases, bodies), np.float32)
+    for case in range(cases):
+        acc = np.zeros(bodies)
+        for b in range(bodies):
+            acc[b] = (acc[parent[b]] if parent[b] >= 0 else 0.0) + weights[case, b]
+            for c in range(first[b], first[b + 1]):
+                acc[b] += values[case, c]
+                path[case, c] = acc[b]
+        sub = weights[case].astype(np.float64) + [values[case, first[b] : first[b + 1]].sum() for b in range(bodies)]
+        for b in reversed(range(bodies)):
+            if parent[b] >= 0:
+                sub[parent[b]] += sub[b]
+        subtree[case] = sub
+    outputs = (wp.zeros((cases, n), dtype=float, device=device), wp.zeros((cases, bodies), dtype=float, device=device))
+    wp.launch(
+        both_ways_kernel(table),
+        dim=cases,
+        inputs=[wp.array(weights, dtype=float, device=device), wp.array(values, dtype=float, device=device), *outputs],
+        device=device,
+    )
+    return outputs[0].numpy(), path, outputs[1].numpy(), subtree
+
+
+def emitter_tables(rng) -> list:
+    """Classes on both sides of ``WALK_UNROLL``: random trees (free and scalar joints, several roots, joins whose spans
+    nest and follow each other), a chain and a star."""
+    tables = []
+    for bodies, roots in ((5, 1), (12, 2), (30, 1), (48, 3)):
+        parent = [-1] + [int(rng.integers(-1, b)) if b < roots else int(rng.integers(0, b)) for b in range(1, bodies)]
+        counts = [int(rng.choice((1, 1, 1, 3, 6))) for _ in range(bodies)]
+        tables.append((tuple(parent), tuple(np.concatenate(([0], np.cumsum(counts))).tolist())))
+    tables.append((tuple(range(-1, 105)), tuple(range(107))))
+    tables.append(((-1, *([0] * 69)), (0, *range(6, 76))))
+    return tables
+
+
 def checked(result: dict) -> bool:
     """Whether a run held rows the check could read: worlds the general sweep solves from the store, or worlds
     whitened in a kernel."""
@@ -716,6 +816,19 @@ class TestWalkDevice(unittest.TestCase):
                 result = placement_frames(solver, joint_q, capture)
                 for name in ("rows", "frame", "tight", "leave", "kernel"):
                     self.assertLessEqual(result[name], BOUND, f"{name}: {result}")
+
+    def test_the_class_emitter_walks_both_ways(self):
+        """The class emitter's walk root first and leaf first, unrolled and in the loop form, on trees with joins and
+        several roots: exact sums along each root path and over each subtree."""
+        tables = emitter_tables(np.random.default_rng(1102))
+        self.assertTrue(any(first[-1] <= tree_factor.WALK_UNROLL for _, first in tables))
+        self.assertTrue(any(first[-1] > tree_factor.WALK_UNROLL for _, first in tables))
+        for device in devices():
+            for table in tables:
+                with self.subTest(device=device, coordinates=table[1][-1]):
+                    down, path, up, subtree = both_ways(table, device, np.random.default_rng(len(table[0])))
+                    np.testing.assert_array_equal(down, path)
+                    np.testing.assert_array_equal(up, subtree)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA placements")
     def test_f1_on_the_cuda_placements(self):

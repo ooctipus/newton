@@ -667,7 +667,6 @@ def writer_kernel(solver) -> wp.Kernel:
     return walked_rows_kernel(blocks, bool(blocks and solver.options.enable_bilateral_preelimination))
 
 
-
 # ---------------------------------------------------------------------------------------------------------------------
 # The support placement (case K1, FL3.4): the support sink, a lane per unit, the release and the leave
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1126,7 +1125,7 @@ _PUBLISH = """    if (tid >= arts.shape[0]) return;
     for (int c = 0; c < $n; ++c) u[c] = du[SUPPORT_NODE[c]];
     // The release's transpose, the last slip first, each along its path root first (the predictor's border's R).
     WALK_RELEASE_T(release, art, u);
-    WALK_DOWN(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, u, u,
+    WALK_DOWN_PATHS(walk.data.data + (size_t)d0 * $coordinate, walk.link.data + (size_t)j0 * $link, u, u,
               reinterpret_cast<float*>(walk.scratch.data + j0));
     for (int c = 0; c < $n; ++c) v_out.data[d0 + c] = v_hat.data[d0 + c] + u[c];
 """
@@ -1136,7 +1135,7 @@ _PUBLISH = """    if (tid >= arts.shape[0]) return;
 def support_publish_kernel(parent: tuple[int, ...], first: tuple[int, ...], node: tuple[int, ...]) -> wp.Kernel:
     """The support placement's leave (case K1), a thread per tree: ``v = v_hat + P^T L^-T R^T du`` from a world's
     velocity change in factor coordinates (``delta``, by the support's coordinates): the release's transpose, then the
-    walk down (``WALK_DOWN``) in the rows' frame."""
+    walk down (``WALK_DOWN_PATHS``) in the rows' frame."""
     body = substitute(_PUBLISH, n=len(node), coordinate=WALK_COORDINATE, link=WALK_LINK)
     return KernelTemplate(
         f"support_publish_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}",

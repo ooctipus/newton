@@ -136,12 +136,12 @@ class TestLocalOwnedRoute(unittest.TestCase):
         # contactless owners included.
         self.assertNotIn("s_L", body)
         self.assertIn("WALK_TREE(", body)
-        self.assertIn("WALK_DOWN(walk_data, walk_link, s_v, s_v,", body)
+        self.assertIn("WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v,", body)
         self.assertNotIn("value/diagonal", body)
         # A paired owner walks its free body down too; the packets' owner stages the walk in shared memory.
         paired, _ = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)
         self.assertNotIn("s_L", paired)
-        self.assertIn("WALK_DOWN(free_data, free_link, s_v + 9, s_v + 9,", paired)
+        self.assertIn("WALK_DOWN_PATHS(free_data, free_link, s_v + 9, s_v + 9,", paired)
         _, staged = sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2, row_inputs=_row_inputs(9))
         self.assertGreater(
             staged.bytes, sweep_routes_local.local_owned_source(192, 20, 9, 6, warps_per_block=2)[1].bytes
@@ -304,8 +304,8 @@ class TestResponseOperators(unittest.TestCase):
             leave = source.leave("")
             self.assertIn("WALK_RELEASE_T(walk.release, art, s_v);", leave)
             self.assertIn("if (lane == 1) {", leave)
-            self.assertIn("WALK_DOWN(free_data, free_link, s_v + 9, s_v + 9,", leave)
-        self.assertIn("WALK_DOWN(walk_data, walk_link, s_v, s_v, s_Z);", block.leave(""))
+            self.assertIn("WALK_DOWN_PATHS(free_data, free_link, s_v + 9, s_v + 9,", leave)
+        self.assertIn("WALK_DOWN_PATHS(walk_data, walk_link, s_v, s_v, s_Z);", block.leave(""))
 
     def test_factor_rows_fuse_a_pair_ladder(self):
         rows = FactorRows(23, (FactorComponent(17, "o", "l", "L", "b"),), Lanes(32), diagonal=lambda r: f"s_diag[{r}]")
