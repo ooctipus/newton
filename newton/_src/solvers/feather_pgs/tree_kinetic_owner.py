@@ -103,6 +103,11 @@ _CLASSIFY_BLOCK_DIM = 64
 _CLASSIFIED_GRIDS = 2
 
 
+WALK_SOLVE_THREADS = 32
+"""Threads a block of the walk's solve, a thread a tree root (WALK_MAPPING E5): one warp, so g1's 16,384 trees spread
+over every SM (512 blocks)."""
+
+
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W.
 
@@ -400,14 +405,25 @@ class TreeKineticState:
             body_velocity=self._body_velocity,
             clocked=self.clocked,
         )
+        classes = self._walk_classes()
+        self.force_kernel = native.get_force_kernel(
+            self.schedules, layout=layout, response=self._response, classes=classes
+        )
+        self.walk_solve_kernel = native.get_walk_solve_kernel(layout=layout, classes=classes)
         self.predictor_kernel = native.get_predictor_kernel(
             self.schedules,
             layout=layout,
             response=self._response,
             clocked=self.clocked,
             twists=self._predicts_twists,
-            classes=self._walk_classes(),
+            classes=classes,
         )
+        # The trial's words between the predictor's halves and the walk's solve, at their global coordinates.
+        if getattr(self, "trial", None) is None:
+            dofs = max(int(self.solver.model.joint_dof_count), 1)
+            self.trial = native.TrialWords()
+            self.trial.force = wp.zeros(dofs, dtype=float, device=self.solver.model.device)
+            self.trial.response = wp.zeros(dofs, dtype=float, device=self.solver.model.device)
 
     def _walk_classes(self):
         """Each root's walking class (:class:`.tree_factor.WalkClass`, its path table in the walk the predictor solves
@@ -742,13 +758,23 @@ class TreeKineticState:
             raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
-        inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, self._walk()]
+        walk = self._walk()
+        inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, walk, self.trial]
+        device = solver.model.device
+        # The force half, the walk's solve (a thread a tree root), the response half (Z4.2).
         wp.launch_tiled(
-            self.predictor_kernel,
-            dim=[self.launch_count],
-            inputs=inputs,
-            block_dim=self.block_dim,
-            device=solver.model.device,
+            self.force_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
+        )
+        roots = len(self.layout.roots)
+        wp.launch(
+            self.walk_solve_kernel,
+            dim=self.group_count * roots,
+            inputs=[self.group_count, self.sparse.plan, self.plan, walk, self.trial],
+            block_dim=WALK_SOLVE_THREADS,
+            device=device,
+        )
+        wp.launch_tiled(
+            self.predictor_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
         )
 
     def finish(self, state_in, state_aug, state_out, dt, next_refresh):

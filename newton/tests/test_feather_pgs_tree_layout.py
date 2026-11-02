@@ -15,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_plan, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
+from newton._src.solvers.feather_pgs.tree_factor import WalkClass
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -30,6 +31,27 @@ _LAYOUTS = (
 _LONG_CHAIN = TreePlan.build(np.arange(-1, 105), np.r_[6, np.ones(105, np.int64)])
 # Warp-level intrinsics whose first argument is a lane mask.
 _MASKED = re.compile(r"__(?:shfl_sync|shfl_down_sync|syncwarp|all_sync|any_sync)\(([^,)]*)")
+
+
+def walk_classes(layout):
+    """A chain class per root of ``layout`` (the predictor solves by the walk): the root body holds its root's
+    coordinates, every next body one."""
+    bounds, families = (*layout.roots, layout.bodies), layout.root_families if layout.forest else (layout.dofs,)
+    classes = []
+    for r, family in enumerate(families):
+        if family == 0:
+            classes.append(None)
+            continue
+        bodies = bounds[r + 1] - bounds[r]
+        counts = [min(layout.root_coordinates[r] or 1, family)] + [0] * (bodies - 1)
+        for b in range(1, bodies):
+            counts[b] = min(1, family - sum(counts))
+        counts[-1] += family - sum(counts)
+        first = [0]
+        for count in counts:
+            first.append(first[-1] + count)
+        classes.append(WalkClass(tuple(range(-1, bodies - 1)), tuple(first)))
+    return tuple(classes)
 
 
 class TestLargeTrees(unittest.TestCase):
@@ -116,6 +138,7 @@ class TestTreeLayoutRender(unittest.TestCase):
                         layout=layout,
                         response="cholesky",
                         twists=tree_kinetic_state.publishes_twists(layout, schedules, cuda=True),
+                        classes=walk_classes(layout),
                     )
                     predictor_natives = [
                         f for f in predictor.adj.get_references()[2] if getattr(f, "native_snippet", None)

@@ -696,6 +696,59 @@ $CLOCK4    if(moved!=0) {
 $TWIST_BLOCK$CLOCK5"""
 
 
+_FORCE_HALF = (
+    _PREDICT[: _PREDICT.index("    $TRIAL")]
+    + r"""$FORCE_STAGE    for(int i=lane;i<$DOFS;i+=stride)trial.force.data[ds+i]=s[$SIX_BODIES+i];
+"""
+)
+"""The predictor's force half (Z4.2): the external wrenches' reduction and the force on each coordinate
+(:data:`_FORCE_STAGE`), stored to ``trial.force`` at its global coordinate for the walk's solve (:func:`get_walk_solve_kernel`),
+which answers in ``trial.response``."""
+
+_RESPONSE_HALF = r"""    $PHYSICAL_TABLE
+
+    const int art=p.group_to_art.data[group];
+    const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
+#if defined(__CUDA_ARCH__)
+    const int lane=LANE,stride=STRIDE;
+    $SCRATCH
+    __shared__ int moved_all[$PACK];int& moved=moved_all[SUB];
+    const auto MOVE=[&](int bits){atomicOr(&moved,bits);};
+#else
+    const int lane=0,stride=1;
+    float s[$PRED_SCRATCH];int moved=0;
+    const auto MOVE=[&](int bits){moved|=bits;};
+#endif
+    if(lane==0)moved=0;
+$CLOCK0    for(int i=lane;i<$DOFS;i+=stride) {
+        s[$SIX_BODIES+i]=trial.force.data[ds+i];
+        s[$WHITE+i]=trial.response.data[ds+i];
+    }
+#if defined(__CUDA_ARCH__)
+    SYNC();
+#endif
+$CLOCK1    $TRIAL
+$CLOCK4    if(moved!=0) {
+    $SATURATE
+    $BORDER
+    $SECOND_RESPONSE
+    }
+    // A prescribed (kinematic) free root keeps its given velocity: no transport.
+    $TRANSPORT_BLOCK
+$TWIST_BLOCK$CLOCK5"""
+"""The predictor's response half (Z4.2): the force and the walk's response read back into the block, then the trial's
+response (``qdd``, ``v_hat``), the drives' decision and the border's decided step, the root transport and the twists."""
+
+
+@wp.struct
+class TrialWords:
+    """The trial's words between the predictor's halves and the walk's solve (Z4.2): each coordinate's force and its
+    response ``P^T L^-T L^-1 P f``, at its global coordinate."""
+
+    force: wp.array[float]
+    response: wp.array[float]
+
+
 QUIET_DRIVE = r"""const wp::vec4 drive=f.drive.data[dof];
         if(drive[0]>0.0f&&drive[2]>0.0f) {
             const float u0=drive[3],limited=Spatial::limited_drive_force(u0,drive[2]);
@@ -1651,8 +1704,8 @@ def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
 
 
 def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
-    """The operands of a predictor's trial (:data:`_SOLVE`): the force's, and the response by the walk (Z4.2,
-    :func:`walk_tree`) on the all-``K`` walk, the trees' one factor."""
+    """The operands of the predictor's force (:data:`_FORCE_STAGE`) and of its response's status and velocity; the
+    response itself is the walk's solve (:func:`get_walk_solve_kernel`)."""
     solve = {
         "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
         # Passive springs act on no root coordinate.
@@ -1662,9 +1715,6 @@ def _solve_operations(layout: TreeLayout, classes: tuple) -> dict[str, str]:
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "STATUS": "d.status.data[group]",
-        "FORWARD_STAGE": walk_trial(layout, classes),
-        "TRANSPOSE_ACTION": "float value=s[$WHITE+col];",
-        "RESPONSE_PHYSICAL": "col",
     }
     return {name: substitute(text, layout.sizes()) for name, text in solve.items()}
 
@@ -2208,6 +2258,13 @@ def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
     return [(0, 0, layout.dofs)]
 
 
+PREDICTOR_UNROLL = 0
+"""Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_factor.WALK_UNROLL`): none. The
+predictor's launch bound holds 56 registers on g1's block (:func:`_predictor_bounds`), and a straight walk's hoisted
+loads spill there (g1 3,808 B of stack, offline sm_120); the loop form keeps a chain's state in registers, its loads
+on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4)."""
+
+
 _UP_STEP = """{
     const float* d = data + $coordinate * ($c);
     const auto s = WALK_RECORD(d), t = WALK_RECORD(d + 4), w = WALK_RECORD(d + 8);
@@ -2275,7 +2332,7 @@ def walk_fetch(layout: TreeLayout, classes: tuple, guard: str = "") -> str:
     return f"#if defined(__CUDA_ARCH__)\n{text}#endif\n"
 
 
-def walk_up(cls) -> str:
+def walk_up(cls, unroll: int = PREDICTOR_UNROLL) -> str:
     """Native statements of the walk up of class ``cls`` (the emitter's leaf-first walk, straight-line up to
     :data:`.tree_factor.WALK_UNROLL` coordinates): ``u = L^-1 P x``, with ``x``, ``u``, ``data`` and ``link`` in
     scope."""
@@ -2287,9 +2344,9 @@ def walk_up(cls) -> str:
     joint = Template(_UP_JOINT).safe_substitute(link=WALK_LINK)
     return (
         "{\n#if defined(__CUDA_ARCH__)\n"
-        + cls.walk(joint, step, root_first=False, cuda=True, unroll=PREDICTOR_UNROLL)
+        + cls.walk(joint, step, root_first=False, cuda=True, unroll=unroll)
         + "\n#else\n"
-        + cls.walk(joint, step, root_first=False, cuda=False, unroll=PREDICTOR_UNROLL)
+        + cls.walk(joint, step, root_first=False, cuda=False, unroll=unroll)
         + "\n#endif\n}"
     )
 
@@ -2319,12 +2376,6 @@ def walk_tree(layout: TreeLayout, classes: tuple, *, up: bool, down: bool, guard
     text = "if(lane==0) {\n" + "\n".join(blocks) + "\n}\n#if defined(__CUDA_ARCH__)\nSYNC();\n#endif\n"
     return substitute(text, layout.sizes())
 
-
-PREDICTOR_UNROLL = 0
-"""Coordinates up to which the predictor's walks are straight-line code (:data:`.tree_factor.WALK_UNROLL`): none. The
-predictor's launch bound holds 56 registers on g1's block (:func:`_predictor_bounds`), and a straight walk's hoisted
-loads spill there (g1 3,808 B of stack, offline sm_120); the loop form keeps a chain's state in registers, its loads
-on the path the group's lanes fetched into L1 (WALK_MAPPING §4: B3 against B4)."""
 
 PREDICTOR_THREADS = 1152
 """Threads an SM keeps of a predictor: main's g1 predictor before the saturation law, 18 blocks of 64 at 56 registers
@@ -2448,149 +2499,72 @@ def held_lambdas(layout: TreeLayout) -> str:
     return f"#if defined(__CUDA_ARCH__)\n{lambdas}\n#endif\n"
 
 
-def walk_trial(layout: TreeLayout, classes: tuple) -> str:
-    """Native statements of the trial's response (Z4.2): each walked root's walk up of the force words into the response
-    words and the walk down in place. On CUDA, a tree whose walk a lane holds in two words (:func:`_held_words`) is
-    walked by its segment in lockstep on the walk held in registers (``HOLD_LOAD``, ``HELD_UP``, ``HELD_DOWN``: one
-    parallel load trip, then every step's values by shuffle, no global load on the chain); otherwise, and on the CPU,
-    lane 0 runs the class emitter's walks (:func:`walk_tree`)."""
-    emitted = walk_fetch(layout, classes) + walk_tree(layout, classes, up=True, down=True)
-    if not _held_words(layout):
-        return emitted
-    walked = {r for r, _, _ in _walked(layout, classes)}
-    held, zeros = [], []
-    for r, offset, _ in _walk_roots(layout):
-        if r not in walked:
-            zeros.append(f"for(int k=0;k<{layout.root_coordinates[r]};++k)s[$WHITE+{offset}+k]=0.0f;")
-            continue
-        held.append(
-            "{" + _walk_head(layout, r) + "const int n=walk.dofs.data[a],nb=walk.joint_end.data[a]-j0;"
-            "WalkHold h;HOLD_LOAD(h,data,link,reinterpret_cast<const int*>(walk.path.data+j0),n,nb);"
-            f"HELD_UP(h,n,nb,s+$SIX_BODIES+{offset},s+$WHITE+{offset},s);"
-            f"HELD_DOWN(h,n,nb,s+$WHITE+{offset},s+$WHITE+{offset},s);}}"
-        )
-    text = (
-        "if(lane<WIDTH) {\n"
-        + "\n".join(held)
-        + "\n}\n"
-        + ("if(lane==0) {" + "".join(zeros) + "}\n" if zeros else "")
-        + "SYNC();\n"
-    )
-    return f"#if defined(__CUDA_ARCH__)\n{substitute(text, layout.sizes())}#else\n{emitted}#endif\n"
-
-
 def clear_slips(layout: TreeLayout) -> str:
     """Native statements of lane 0 clearing each root's slip count (``walk.release.count``): only a changed root's border
     sets it."""
     return "".join(f"walk.release.count.data[{_root_articulation(layout, r)}]=0;" for r, _, _ in _walk_roots(layout))
 
 
-@functools.cache
-def get_predictor_kernel(
-    schedules: HeldSchedules,
-    *,
-    layout: TreeLayout = REFERENCE_LAYOUT,
-    response="sparse",
-    clocked: bool = False,
-    twists: bool,
-    classes: tuple,
-):
-    """The predictor: the current external and control force on every coordinate, solved by the walk.
-
-    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``clocked`` adds the
-    predictor stage counters (see :func:`get_helpers`);
-    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``classes`` holds each
-    root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root): the trial is the walk up
-    and down of the force on the all-``K`` walk (Z4.2, :func:`walk_tree`, the class emitter's straight-line walk), and a
-    world whose drives moved takes its decided step by the border on the same walks (:func:`border_solve`), from the
-    trial's force plus the decision's change of it. ``response`` names only the factor data still bound as ``d``.
-    """
+def _predictor_operations(layout: TreeLayout, schedules: HeldSchedules) -> dict[str, str]:
+    """The fragments of the predictor's force half that the external wrenches and the root transport take."""
     reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
-    operations = {
+    return {
         "PHYSICAL_TABLE": layout.physical_table(),
         "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
         "SHIFT": cached_force.shift_wrench(
             "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
         ),
-        "TRANSPORT_BLOCK": (
+        "REDUCE": reduction,
+    }
+
+
+def _transport_block(layout: TreeLayout) -> str:
+    """Native statements of the free roots' transport of the predicted velocity."""
+    if not layout.forest:
+        return (
             "if($FREE_ROOT&&lane==0&&f.kinematic_joint.data[js]==0) {\n        "
             + _FORCE.transport("ds", "f.vhat.data[ds+k]")
             + "\n    }"
-            if not layout.forest
-            else "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
-            "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
-            + _FORCE.transport("rd", "f.vhat.data[rd+k]")
-            + "\n    }"
-        ),
-        "REDUCE": reduction,
-    }
-    if response not in ("sparse", "cholesky", "diagonal"):
-        raise ValueError("Unknown held tree response representation")
-    data_type = sparse_factor.SparseData if response == "sparse" else HeldResponse
-    operations["TWIST_BLOCK"] = _twist_block() if twists else ""
-    clocks = _native_clocks(clocked, "f", stages=5, column=8)
-    if len(classes) != len(_walk_roots(layout)):
-        raise ValueError("The predictor needs a walking class (or None) for each root")
-    trial = _solve_operations(layout, classes)
-    # The decided step's response: the border's words, on the roots it changed.
-    changed = f"if(!(moved&(2<<{_root(layout).replace('[i]', '[col]')})))continue;"
-    second = {
-        "FORWARD_STAGE": "",
-        "TRANSPOSE_ACTION": changed + "float value=s[$WHITE+col];",
-        "RESPONSE_PHYSICAL": "col",
-        "STATUS": trial["STATUS"],
-        "VELOCITY": trial["VELOCITY"],
-    }
-    from .tree_factor import walk_down_prelude  # noqa: PLC0415
-
-    walked = tuple(cls for cls in classes if cls is not None)
-    source = layout.native(
-        _PREDICT,
-        preludes=(
-            *SPATIAL.preludes(),
-            walk_tree_prelude(),
-            *((walk_down_prelude(walked, PREDICTOR_UNROLL),) if walked else ()),
-        ),
-        SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
-        CLEAR_SLIPS=clear_slips(layout),
-        TRIAL=held_lambdas(layout)
-        + substitute(
-            _SOLVE,
-            layout.sizes(),
-            **trial,
-            START_FORWARD=clocks["CLOCK2"],
-            START_RESPONSE=clocks["CLOCK3"],
-            DECIDE=QUIET_DRIVE,
-        ),
-        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
-        BORDER=border_solve(layout, classes),
-        SECOND_RESPONSE=substitute(
-            _RESPONSE_STAGE, layout.sizes(), **second, START_FORWARD="", START_RESPONSE="", DECIDE=""
-        ),
-        **operations,
-        **{name: text for name, text in clocks.items() if name not in ("CLOCK2", "CLOCK3")},
+        )
+    return (
+        "if(lane<$FREE_ROOTS&&f.kinematic_joint.data[js+plan.free_root_local.data[lane]]==0) {\n"
+        "        const int rd=ds+plan.free_root_dof.data[lane];\n        "
+        + _FORCE.transport("rd", "f.vhat.data[rd+k]")
+        + "\n    }"
     )
 
-    _, _, _sub, _ = _thread_helpers(layout)
-    name = f"tree_kinetic_predict{layout.dofs}"
+
+def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | None, response: str, classes) -> str:
+    name = f"{prefix}{layout.dofs}"
     if layout.forest:
         name += f"_forest{len(layout.roots)}"
     if layout.pack > 1:
         name += f"_l{layout.lanes}"
-    name += schedules.tag
+    if schedules is not None:
+        name += schedules.tag
     if response != "sparse":
         name += "_" + response
-    name += "_w" + hashlib.sha256(repr(walked).encode()).hexdigest()[:8]
+    walked = tuple(cls for cls in classes if cls is not None)
+    return name + "_w" + hashlib.sha256(repr(walked).encode()).hexdigest()[:8]
+
+
+def _predictor_params(response: str):
     from .tree_factor import WalkTrees  # noqa: PLC0415
 
-    params = (
+    data_type = sparse_factor.SparseData if response == "sparse" else HeldResponse
+    return (
         ("p", sparse_factor.SparsePlan),
         ("d", data_type),
         ("plan", HeldPlan),
         ("cache", KineticData),
         ("f", ForceInput),
         ("walk", WalkTrees),
+        ("trial", TrialWords),
     )
+
+
+def _tiled(layout: TreeLayout, name: str, params, source: str):
+    _, _, _sub, _ = _thread_helpers(layout)
     return KernelTemplate(
         name,
         params,
@@ -2605,3 +2579,162 @@ def get_predictor_kernel(
         composed=True,
         launch_bounds=_predictor_bounds(layout),
     ).kernel()
+
+
+@functools.cache
+def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse", classes):
+    """The predictor's force half (Z4.2, :data:`_FORCE_HALF`): the force on every coordinate into ``trial.force``; it
+    clears each root's slip count for the response half's border."""
+    if response not in ("sparse", "cholesky", "diagonal"):
+        raise ValueError("Unknown held tree response representation")
+    force = {
+        name: text
+        for name, text in _solve_operations(layout, classes).items()
+        if name in ("PROJECT", "SPRING_GUARD", "PASSIVE")
+    }
+    source = layout.native(
+        _FORCE_HALF,
+        preludes=(*SPATIAL.preludes(),),
+        SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
+        CLEAR_SLIPS=clear_slips(layout),
+        FORCE_STAGE=substitute(_FORCE_STAGE, layout.sizes(), **force),
+        CLOCK0="",
+        CLOCK1="",
+        **_predictor_operations(layout, schedules),
+    )
+    name = _predictor_name("tree_kinetic_force", layout, schedules, response, classes)
+    return _tiled(layout, name, _predictor_params(response), source)
+
+
+WALK_SOLVE_UNROLL = 0
+"""Coordinates up to which the walk's solve emits straight-line code: none (see :func:`get_walk_solve_kernel`)."""
+
+_WALK_SOLVE = r"""    const int group = tid / $ROOT_COUNT, r = tid - group * $ROOT_COUNT;
+    if (group >= groups) return;
+    const int art = p.group_to_art.data[group];
+    switch (r) {
+$ROOTS
+    }
+"""
+
+
+@functools.cache
+def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
+    """The walk's solve of the trial (Z4.2, WALK_MAPPING E5): a thread a tree root, the class's walk compiled into
+    straight-line code (:meth:`.tree_factor.WalkClass.walk` up to :data:`.tree_factor.WALK_UNROLL` coordinates), the
+    walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
+    all-``K`` walk. A prescribed root responds with zero."""
+    from .kernel_template import THREADS  # noqa: PLC0415
+    from .tree_factor import WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude  # noqa: PLC0415
+
+    walked = {r: k for r, _, k in _walked(layout, classes)}
+    cases = []
+    for r, offset, _family in _walk_roots(layout):
+        if r not in walked:
+            body = (
+                f"const int ds = p.art_dof_start.data[art];"
+                f"for (int k = 0; k < {layout.root_coordinates[r]}; ++k) trial.response.data[ds + {offset} + k] = 0.0f;"
+            )
+        else:
+            cls = classes[r]
+            body = (
+                f"const int a = {_root_articulation(layout, r)};\n"
+                "const int j0 = walk.joint_start.data[a], d0 = walk.dof_start.data[a];\n"
+                f"const float* __restrict__ data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};\n"
+                f"const float* __restrict__ link = walk.link.data + (size_t)j0 * {WALK_LINK};\n"
+                "const float* __restrict__ x = trial.force.data + d0;\n"
+                "float* __restrict__ out = trial.response.data + d0;\n"
+                f"float u[{max(cls.coordinates, 1)}];\n"
+                + walk_up(cls, WALK_SOLVE_UNROLL)
+                + f"\nWALK_DOWN({walked[r]}, data, link, [&](const int c) {{ return u[c]; }},"
+                " [&](const int c, const float q) { out[c] = q; }, [](const int, const float*) {});"
+            )
+        cases.append(f"    case {r}: {{\n{body}\n        break;\n    }}")
+    walked_classes = tuple(cls for cls in classes if cls is not None)
+    source = substitute(_WALK_SOLVE, ROOT_COUNT=len(_walk_roots(layout)), ROOTS="\n".join(cases))
+    name = _predictor_name("tree_kinetic_walk", layout, None, "sparse", classes)
+    return KernelTemplate(
+        name,
+        (
+            ("groups", int),
+            ("p", sparse_factor.SparsePlan),
+            ("plan", HeldPlan),
+            ("walk", WalkTrees),
+            ("trial", TrialWords),
+        ),
+        source,
+        THREADS,
+        preludes=(walk_down_prelude(walked_classes, WALK_SOLVE_UNROLL),) if walked_classes else (),
+        dual=True,
+        native_name="tree_kinetic_walk_native",
+    ).kernel()
+
+
+@functools.cache
+def get_predictor_kernel(
+    schedules: HeldSchedules,
+    *,
+    layout: TreeLayout = REFERENCE_LAYOUT,
+    response="sparse",
+    clocked: bool = False,
+    twists: bool,
+    classes: tuple,
+):
+    """The predictor's response half (Z4.2, :data:`_RESPONSE_HALF`), after the force half (:func:`get_force_kernel`) and
+    the walk's solve (:func:`get_walk_solve_kernel`): the trial's response read back into the block, ``qdd`` and
+    ``v_hat``, the drives' saturation decision, and a world whose drives moved takes its decided step by the border on
+    the walk (:func:`border_solve`), from the trial's force plus the decision's change of it.
+
+    ``schedules`` are the scans' schedules; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`);
+    ``twists`` holds the twist publication (:func:`publishes_twists`), which only CUDA builds; ``classes`` holds each
+    root's walking class (:class:`.tree_factor.WalkClass`, ``None`` for a prescribed root). ``response`` names only
+    the factor data still bound as ``d``.
+    """
+    if response not in ("sparse", "cholesky", "diagonal"):
+        raise ValueError("Unknown held tree response representation")
+    if len(classes) != len(_walk_roots(layout)):
+        raise ValueError("The predictor needs a walking class (or None) for each root")
+    clocks = _native_clocks(clocked, "f", stages=5, column=8)
+    trial = _solve_operations(layout, classes)
+    response_ops = {
+        "FORWARD_STAGE": "",
+        "TRANSPOSE_ACTION": "float value=s[$WHITE+col];",
+        "RESPONSE_PHYSICAL": "col",
+        "STATUS": trial["STATUS"],
+        "VELOCITY": trial["VELOCITY"],
+    }
+    # The decided step's response: the border's words, on the roots it changed.
+    changed = f"if(!(moved&(2<<{_root(layout).replace('[i]', '[col]')})))continue;"
+    second = {**response_ops, "TRANSPOSE_ACTION": changed + "float value=s[$WHITE+col];"}
+    from .tree_factor import walk_down_prelude  # noqa: PLC0415
+
+    walked = tuple(cls for cls in classes if cls is not None)
+    source = layout.native(
+        _RESPONSE_HALF,
+        preludes=(
+            *SPATIAL.preludes(),
+            walk_tree_prelude(),
+            *((walk_down_prelude(walked, PREDICTOR_UNROLL),) if walked else ()),
+        ),
+        PHYSICAL_TABLE=layout.physical_table(),
+        SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
+        TRIAL=held_lambdas(layout)
+        + substitute(
+            _RESPONSE_STAGE,
+            layout.sizes(),
+            **response_ops,
+            START_FORWARD=clocks["CLOCK2"],
+            START_RESPONSE=clocks["CLOCK3"],
+            DECIDE=QUIET_DRIVE,
+        ),
+        SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
+        BORDER=border_solve(layout, classes),
+        SECOND_RESPONSE=substitute(
+            _RESPONSE_STAGE, layout.sizes(), **second, START_FORWARD="", START_RESPONSE="", DECIDE=""
+        ),
+        TRANSPORT_BLOCK=_transport_block(layout),
+        TWIST_BLOCK=_twist_block() if twists else "",
+        **{name: text for name, text in clocks.items() if name not in ("CLOCK2", "CLOCK3")},
+    )
+    name = _predictor_name("tree_kinetic_predict", layout, schedules, response, classes)
+    return _tiled(layout, name, _predictor_params(response), source)
